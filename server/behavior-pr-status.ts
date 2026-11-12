@@ -560,7 +560,11 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
     // recorded cause from the matching failure row (which kept the Caller
     // error code), else from the incident text. Never a guess: anything
     // unrecognized stays `held_result`.
-    const held: PrStatusHeld[] = (incidentsByPr.get(key) ?? []).map((incident) => {
+    const historical: string[] = []
+    const held: PrStatusHeld[] = []
+    const liveOnCurrentHead = !!currentHead && claim?.expectedHead?.toLowerCase() === currentHead
+    const quarantined = states.some((state) => state.quarantine !== null)
+    for (const incident of incidentsByPr.get(key) ?? []) {
       let code = incident.diagnostic?.code ?? 'unknown'
       if (code === 'held_result' && incident.callId
         && (BEHAVIOR_KEYS as readonly string[]).includes(incident.behavior)) {
@@ -572,13 +576,31 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
         const textCode = classifyBehaviorDiagnostic(incident.error).code
         if (textCode !== 'unknown') code = textCode
       }
-      return {
+      // A target may have been launched again. Only this incident's Call can
+      // supply launch evidence; disagreement with a head-pinned target stays held.
+      const review = incident.behavior === 'review-new-prs' || incident.behavior === 'approve-prs'
+      const targetHead = /(?:@|\/)head=([a-f0-9]{40})(?=$|[/:])/i.exec(incident.target)?.[1].toLowerCase()
+      const launch = incident.callId ? states.find((state) => state.key === incident.behavior
+        && state.target === incident.target && state.callId === incident.callId) : undefined
+      const launchHead = launch?.expectedHead?.toLowerCase()
+      const head = targetHead ?? launchHead
+      const consistent = (!launch || (!!launchHead && (!targetHead || targetHead === launchHead)
+        && (!launch.headSha || launch.headSha.toLowerCase() === launchHead)
+        && (!incident.actor || launch.actor?.toLowerCase() === incident.actor.toLowerCase())
+        && (!incident.source || launch.source === incident.source)))
+        && incidentKey({ repo: null, pr: null, target: incident.target }) === key
+      if (review && liveOnCurrentHead && !quarantined && code !== 'invalid_agent_result'
+        && consistent && head && /^[a-f0-9]{40}$/.test(head) && head !== currentHead) {
+        historical.push(`past review: ${incident.behavior} ${code} on ${head} since ${incident.createdAt}`)
+        continue
+      }
+      held.push({
         behavior: incident.behavior,
         code,
         since: incident.createdAt,
         ...(incident.nextRetryAt ? { nextRetryAt: incident.nextRetryAt } : {}),
-      }
-    })
+      })
+    }
 
     const computed = computePrBlocker({
       refusal, held,
@@ -597,6 +619,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       mergePrsEnabled, mergePrsPaused, mergeRetryAt, greyPending,
       evidenceFresh: cacheUsable, evidenceWhy,
     })
+    computed.details = [...computed.details, ...historical].slice(0, 8)
 
     const tracked = trackBlocker(key, computed.id, computed.key, asOf)
 
