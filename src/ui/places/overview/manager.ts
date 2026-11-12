@@ -49,7 +49,7 @@ export function mountManager(ctx: PartContext, box: HTMLElement, sessions: () =>
 
   function paint(): void {
     const m = managerOf(getSettings())
-    if (!m) {
+    if (!m || error) {
       box.innerHTML = `<p class="onote${error ? ' is-warn' : ''}" role="status" data-ref="ov.read">${esc(error ? `The Manager’s controls could not be read: ${error}.` : 'Reading the Manager’s controls…')}</p>`
       return
     }
@@ -110,6 +110,13 @@ export function mountManager(ctx: PartContext, box: HTMLElement, sessions: () =>
   const judge = () => { error = !settingsLoadOk() && !settingsLoaded() && managerOf(getSettings()) ? '' : !settingsLoadOk() ? 'Settings could not be read' : managerOf(getSettings()) ? '' : 'the service answered without them' }
   judge()
   paint()
-  window.addEventListener('poise:settings-read', () => { if (!saving && !$('[data-act]:focus', box)) { judge(); paint() } }, { signal: ctx.signal })
+  // The card always shows what a click acts on, so a focused control is repainted and keeps its focus.
+  window.addEventListener('poise:settings-read', () => {
+    if (saving) return
+    const focused = $('[data-act]:focus', box)?.dataset.act
+    judge()
+    paint()
+    if (focused) $(`[data-act="${focused}"]`, box)?.focus()
+  }, { signal: ctx.signal })
   return { sessionsChanged: () => { if (!saving && !$('[data-act]:focus', box)) paint() } }
 }

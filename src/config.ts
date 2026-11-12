@@ -67,7 +67,7 @@ function rememberedSettings(): AppSettings | null {
   }
   return remembered
 }
-const daysAndScope = (s: AppSettings): string => JSON.stringify([s.timezone, (s.organizations ?? []).map((org) => [org.login, org.status])])
+const daysAndScope = (s: AppSettings): string => JSON.stringify([s.me, s.timezone, (s.organizations ?? []).map((org) => [org.login, org.status])])
 
 export function loadSettings(options: { fresh?: boolean } = {}): Promise<AppSettings> {
   // Post-write reads supersede any snapshot captured before that write.
@@ -115,8 +115,8 @@ export function settingsLoaded(): boolean {
 /** Settings for a place that is opening: the last answer stands while a
  *  fresh one is read behind it. The page's first read is awaited only when
  *  this browser has never read them; otherwise the place opens on the ones it
- *  remembers, and if the fresh ones change its days or organizations, it is
- *  told as for a change of organization. */
+ *  remembers, and if the fresh ones change its days, organizations or GitHub
+ *  user, it is told as for a change of organization. */
 export function placeSettings(): Promise<AppSettings> {
   if (!loaded) {
     const last = rememberedSettings()

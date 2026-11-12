@@ -143,6 +143,8 @@ export const mount: MountPlace = async (ctx: PlaceContext) => {
   // A Stop, Replay, Hold, Resume or review sent and not yet answered holds a reload onto a new build.
   const unguard = registerReloadGuard(() => ([...parts.values()].some((view) => view.busy()) ? ['command'] : []))
   show(current, false)
+  // Opened on remembered settings: when the fresh ones no longer hold the organization, it is no longer read.
+  window.addEventListener('poise:settings-read', () => { paintScope(); if (org && !readyOrganizations().includes(org)) scope.set('', false) }, { signal })
   return () => {
     unguard()
     for (const view of parts.values()) view.leave()
