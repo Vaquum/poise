@@ -458,6 +458,7 @@ class GitHubClient:
             "timed out",
             "unexpected EOF",
             "unexpected end of JSON input",
+            "Something went wrong while executing your query",
             "can't assign requested address",
             "cannot assign requested address",
             "read tcp ",

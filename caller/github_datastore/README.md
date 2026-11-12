@@ -129,8 +129,9 @@ Invalid identities and cursors still reject the sync. If a complete
 incremental enumeration omits a cached PR, sync enumerates that repository
 again. It removes only PRs absent from both complete reads. An incomplete
 confirmation or a newly missing PR fails the sync without advancing freshness.
-Read-only GraphQL transport retries include `unexpected end of JSON input`,
-with at most five attempts using the same request and token. Exhaustion retains
+Read-only GraphQL transport retries include `unexpected end of JSON input` and
+`Something went wrong while executing your query`, with at most five attempts
+using the same request and token. Exhaustion retains
 the underlying diagnostic; authentication, access, schema and quota handling
 remain unchanged.
 A primary quota failure raises `GitHubRateLimitError` with `reset_at` (Unix seconds)

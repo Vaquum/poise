@@ -10,6 +10,11 @@ from github_datastore.github_api import GitHubApiError, GitHubClient
 QUERY = "query($org: String!) { organization(login: $org) { login } }"
 VARIABLES = {"org": "Autonomio", "count": 100, "cursor": None}
 DATA = {"organization": {"login": "Autonomio"}}
+INTERNAL_GRAPHQL_FAILURE = subprocess.CompletedProcess(
+    ["gh"], 1,
+    stdout=json.dumps({"data": None, "errors": [{"message": "Something went wrong while executing your query"}]}),
+    stderr="gh: Something went wrong while executing your query",
+)
 
 
 def failed(message: str) -> subprocess.CompletedProcess[str]:
@@ -59,9 +64,9 @@ class GitHubTransportRetryTest(unittest.TestCase):
             "-f", "org=Autonomio", "-F", "count=100",
         ]
         environment = {"GH_TOKEN": "selected-test-credential", "GH_HOST": "github.com"}
-        for error in errors:
-            with self.subTest(error=error), patch.dict(os.environ, environment, clear=True):
-                with patch("github_datastore.github_api.subprocess.run", side_effect=[failed(error), succeeded()]) as run:
+        for response in [failed(error) for error in errors] + [INTERNAL_GRAPHQL_FAILURE]:
+            with self.subTest(error=response.stderr), patch.dict(os.environ, environment, clear=True):
+                with patch("github_datastore.github_api.subprocess.run", side_effect=[response, succeeded()]) as run:
                     with patch("github_datastore.github_api.time.sleep") as sleep:
                         self.assertEqual(GitHubClient().graphql(QUERY, VARIABLES), DATA)
                 self.assertEqual(run.call_count, 2)
@@ -87,13 +92,19 @@ class GitHubTransportRetryTest(unittest.TestCase):
                     self.assertEqual(request.kwargs["env"], environment)
 
     def test_exhausted_retries_raise_the_original_transport_diagnostic(self) -> None:
-        for error in ["Post https://github.example/graphql: unexpected EOF", "unexpected end of JSON input"]:
-            with self.subTest(error=error):
-                with patch("github_datastore.github_api.subprocess.run", return_value=failed(error)) as run:
+        responses = [
+            failed("Post https://github.example/graphql: unexpected EOF"),
+            failed("unexpected end of JSON input"),
+            INTERNAL_GRAPHQL_FAILURE,
+        ]
+        for response in responses:
+            with self.subTest(error=response.stderr):
+                with patch("github_datastore.github_api.subprocess.run", return_value=response) as run:
                     with patch("github_datastore.github_api.time.sleep") as sleep:
                         with self.assertRaises(GitHubApiError) as raised:
                             GitHubClient().graphql(QUERY, VARIABLES)
-                self.assertEqual(str(raised.exception), f"GraphQL request failed: {error}")
+                diagnostic = f"{response.stderr}\n{response.stdout}" if response.stdout else response.stderr
+                self.assertEqual(str(raised.exception), f"GraphQL request failed: {diagnostic}")
                 self.assertEqual(run.call_count, 5)
                 self.assertEqual(sleep.call_args_list, [call(1)] * 4)
 
