@@ -502,7 +502,9 @@ export class Orchestrator {
     if (!callId) return false
     try {
       const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
-      return health.ok && health.nativeCleanupHold?.callId === callId
+      if (!health.ok || health.nativeCleanupHold?.callId !== callId) return false
+      if (health.draining) await this.releaseDrain(handle, login, 'original native cleanup remains held')
+      return true
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       this.deps.log.warn('workspace.upgrade.native-check.failed', { handle, callId, error: errorMessage(error) })

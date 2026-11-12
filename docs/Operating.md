@@ -984,7 +984,9 @@ Pending or unknown native cleanup without a live Caller releases the drain
 immediately. A recorded terminal cleanup failure also releases the drain if
 other Caller work is active. The gateway logs the blocking Call and its
 available reason, and later passes read health before admitting another drain
-for that Call. Ordinary maintenance continues to retry cleanup between passes.
+for that Call. If the previous resume failed and health still reports a drain,
+the gateway retries resume. Ordinary maintenance continues to retry cleanup
+between passes.
 After starting the replacement the gateway
 waits for its health before declaring the upgrade finished, within the two-minute
 idle-to-ready bound; past it the miss is recorded (`workspace.upgrade.ready.missed`),
