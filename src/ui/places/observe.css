@@ -14,7 +14,8 @@
 .obv-tabs [role="tab"][aria-selected="true"]::after { content: ""; position: absolute; left: var(--sp-3); right: var(--sp-3); bottom: calc(var(--line-hair) * -1); height: var(--line-focus); border-radius: var(--r-pill); background: var(--c-text-soft); }
 .obv-tabs .n { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--fs-micro); font-weight: var(--fw-regular); color: var(--c-text-muted); }
 .obv-tabs .n:empty { display: none; }
-.obv-gloss { flex: 1; min-width: 0; }
+/* One line: a tab's number arriving never wraps it and moves the page. */
+.obv-gloss { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .obv-scope { display: inline-flex; align-items: center; gap: var(--sp-2); }
 .obv-scope[hidden] { display: none; }
 .obv-scope .t-micro { font-size: var(--fs-tiny); }

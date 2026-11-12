@@ -111,6 +111,7 @@ export const mount: MountPlace = async (ctx: PlaceContext) => {
     })
     $$('[data-panel]', root).forEach((panel: HTMLElement) => { panel.hidden = panel.dataset.panel !== next })
     $('[data-gloss]', root).textContent = GLOSS[next]
+    $('[data-gloss]', root).title = GLOSS[next]
     paintScope()
     // The address names the part shown, so a reload or a copied link opens it again.
     const url = new URL(location.href)
