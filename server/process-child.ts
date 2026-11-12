@@ -52,10 +52,49 @@ export interface SerializedError {
 // message that a teardown could exit before.
 export const CALL_STATE = 0
 export const CALL_PID = 1
+/** Set by an abort; the worker reads it as soon as spawn() returns. */
+export const CALL_ABORT = 2
 export const CALL_IDLE = 0
 export const CALL_STARTING = 1
 export const CALL_STARTED = 2
 export const CALL_ABORTED = 3
+
+export function createCallSlot(): Int32Array {
+  return new Int32Array(new SharedArrayBuffer(3 * Int32Array.BYTES_PER_ELEMENT))
+}
+
+// Only the group: a direct kill after the child was reaped could reach a
+// process that reused its pid. The worker still runs the full termination.
+export function killGroup(pid: number, signal: NodeJS.Signals): void {
+  try { process.kill(-pid, signal) } catch { /* the group has already gone */ }
+}
+
+/** The main thread's side of an abort. A call the worker has not started is
+ *  claimed, so it never starts. A spawn() under way is waited for, as this
+ *  thread once waited inside spawn() itself; `waitMs` only guards against a
+ *  wedged worker, and if it passes, the worker stops the child as soon as
+ *  spawn() returns. The child's group is then stopped here, at once. */
+export function abortWorkerCall(slot: Int32Array, killSignal: NodeJS.Signals, waitMs: number): void {
+  Atomics.store(slot, CALL_ABORT, 1)
+  const was = Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_ABORTED)
+  if (was === CALL_IDLE) return
+  if (was === CALL_STARTING) Atomics.wait(slot, CALL_STATE, CALL_STARTING, waitMs)
+  const pid = Atomics.load(slot, CALL_PID)
+  if (pid) killGroup(pid, killSignal)
+}
+
+/** The worker's side: null when an abort claimed the call first; otherwise
+ *  starts the child, publishes its pid, and stops it at once if an abort came
+ *  while spawn() ran. */
+export function startWorkerCall(request: ChildRequest, slot: Int32Array): RunningChild | null {
+  if (Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_STARTING) !== CALL_IDLE) return null
+  const child = startChild(request)
+  Atomics.store(slot, CALL_PID, child.pid ?? 0)
+  Atomics.store(slot, CALL_STATE, CALL_STARTED)
+  Atomics.notify(slot, CALL_STATE)
+  if (Atomics.load(slot, CALL_ABORT)) child.abort()
+  return child
+}
 
 export type ProcessWorkerRequest =
   | { type: 'run', id: number, request: ChildRequest, slot: Int32Array }

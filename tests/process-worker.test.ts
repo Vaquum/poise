@@ -173,3 +173,43 @@ describe('the process worker', () => {
     }
   })
 })
+
+// The slot an abort and the worker share, one side at a time: the worker's
+// spawn() cannot be paused mid-call, so each interleaving is set up directly.
+describe('the call slot', () => {
+  const sleeper = { args: ['-e', 'setInterval(() => {}, 1_000)'], env: process.env, maxBuffer: 1024, timeoutMs: 30_000, killSignal: 'SIGKILL' as const }
+
+  it('keeps a call the worker has not started from ever starting', async () => {
+    const { abortWorkerCall, createCallSlot, startWorkerCall } = await import('../server/process-child')
+    const slot = createCallSlot()
+    abortWorkerCall(slot, 'SIGKILL', 30_000)
+    expect(startWorkerCall({ file: process.execPath, ...sleeper }, slot)).toBeNull()
+    expect(mainThread.spawns).toBe(0)
+  })
+
+  it('waits for a spawn() under way only as long as its bound, then leaves the stop to the worker', async () => {
+    const { CALL_ABORT, CALL_STARTING, CALL_STATE, abortWorkerCall, createCallSlot } = await import('../server/process-child')
+    const slot = createCallSlot()
+    Atomics.store(slot, CALL_STATE, CALL_STARTING)
+    const started = performance.now()
+    abortWorkerCall(slot, 'SIGKILL', 100)
+    const waited = performance.now() - started
+    expect(waited).toBeGreaterThanOrEqual(90)
+    expect(waited).toBeLessThan(2_000)
+    expect(Atomics.load(slot, CALL_ABORT)).toBe(1)
+  })
+
+  it('stops the child the moment spawn() returns when an abort came while it ran', async () => {
+    const { CALL_ABORT, CALL_PID, CALL_STARTED, CALL_STATE, createCallSlot, startWorkerCall } = await import('../server/process-child')
+    const slot = createCallSlot()
+    // The abort's flag landed before the worker's claim, or its wait expired:
+    // either way the worker finds it as soon as spawn() returns.
+    Atomics.store(slot, CALL_ABORT, 1)
+    const child = startWorkerCall({ file: process.execPath, ...sleeper }, slot)
+    expect(child?.pid).toBeGreaterThan(0)
+    expect(Atomics.load(slot, CALL_STATE)).toBe(CALL_STARTED)
+    expect(Atomics.load(slot, CALL_PID)).toBe(child!.pid)
+    expect((await child!.outcome).termination).toEqual({ kind: 'abort' })
+    await waitFor(() => processStopped(child!.pid!) ? true : null)
+  })
+})

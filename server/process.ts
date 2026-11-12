@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { CALLER_COMMANDS, callerBinRoot } from '../scripts/caller.mjs'
 import {
-  CALL_ABORTED, CALL_IDLE, CALL_PID, CALL_STARTING, CALL_STATE, restoreError, startChild,
+  CALL_PID, abortWorkerCall, createCallSlot, killGroup, restoreError, startChild,
   type ChildOutcome, type ChildRequest, type ChildTermination, type ProcessWorkerReply, type ProcessWorkerRequest, type RunningChild, type SerializedError,
 } from './process-child'
 
@@ -548,11 +548,6 @@ interface WorkerCall {
   aborted: boolean
 }
 
-// The longest an abort waits for a spawn() already under way in the worker:
-// the wait this thread used to spend inside spawn() itself, bounded so that a
-// wedged worker cannot hold this thread.
-const STARTING_WAIT_MS = 2_000
-
 interface ProcessWorker {
   worker: Worker
   ready: boolean
@@ -563,27 +558,12 @@ let processWorker: ProcessWorker | null = null
 let processWorkerStart: Promise<boolean> | null = null
 let nextWorkerCall = 1
 
-// Only the group: a direct kill after the child was reaped could reach a
-// process that reused its pid. The worker still runs the full termination.
-function killGroup(pid: number, signal: NodeJS.Signals): void {
-  try { process.kill(-pid, signal) } catch { /* the group has already gone */ }
-}
-
-// The child's pid for an abort, read at once: a call the worker has not
-// started is claimed so it never starts, and a spawn() under way is waited for.
-function startedPid(slot: Int32Array): number {
-  const was = Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_ABORTED)
-  if (was === CALL_IDLE) return 0
-  if (was === CALL_STARTING) Atomics.wait(slot, CALL_STATE, CALL_STARTING, STARTING_WAIT_MS)
-  return Atomics.load(slot, CALL_PID)
-}
-
 function runChild(request: ChildRequest): RunningChild {
   void processWorkerReady()
   const state = processWorker
   if (!state?.ready) return startChild(request)
   const id = nextWorkerCall++
-  const slot = new Int32Array(new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT))
+  const slot = createCallSlot()
   const call: WorkerCall = { resolve: () => {}, killSignal: request.killSignal, slot, aborted: false }
   const outcome = new Promise<ChildOutcome>((resolve) => { call.resolve = resolve })
   state.calls.set(id, call)
@@ -602,9 +582,9 @@ function runChild(request: ChildRequest): RunningChild {
       if (call.aborted) return
       call.aborted = true
       // Stop the group now, as an in-thread abort does: a teardown may exit
-      // before the worker reads the message below.
-      const pid = startedPid(slot)
-      if (pid) killGroup(pid, call.killSignal)
+      // before the worker reads the message below. The wait for a spawn()
+      // under way is bounded by the call's own timeout.
+      abortWorkerCall(slot, call.killSignal, request.timeoutMs)
       state.worker.postMessage({ type: 'abort', id } satisfies ProcessWorkerRequest)
     },
   }
