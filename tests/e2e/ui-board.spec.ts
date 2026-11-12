@@ -310,3 +310,65 @@ test('another organization’s runs never stand for the one chosen', async ({ pa
   await expect(page.locator('[data-ref="cur.partial"]')).toContainText('the runs going now')
   await expect(card(page, 'Beta’s own issue')).toHaveAttribute('data-state', '')
 })
+
+/** Settings as the service answers them, with this GitHub user and these organizations. */
+async function settings(page: Page, as: () => { me: string, orgs?: string[] }): Promise<void> {
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const response = await route.fetch()
+    const { me, orgs } = as()
+    const body = await response.json()
+    return route.fulfill({ response, json: { ...body, me, ...(orgs ? { organizations: orgs.map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })) } : {}) } })
+  })
+}
+const hold = (page: Page) => page.route('**/api/gh', async () => { await new Promise(() => {}) })
+
+test('a reload paints Board’s last read at once, while it reads again', async ({ page }) => {
+  await settings(page, () => ({ me: 'octocat' }))
+  await board(page, { records: RECORDS })
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // GitHub's reads are held; the reload paints the last read anyway.
+  await hold(page)
+  await page.reload()
+  await expect(card(page, 'Opened today')).toBeVisible({ timeout: 2_000 })
+  await expect(card(page, 'A pull request')).toBeVisible()
+})
+
+test('Board never paints another GitHub user’s last read', async ({ page }) => {
+  let me = 'octocat'
+  await settings(page, () => ({ me }))
+  await board(page, { records: RECORDS })
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // Settings now name another GitHub user, and GitHub's reads are held.
+  me = 'someone-else'
+  await hold(page)
+  await page.reload()
+  await expect(page.locator('.lanes .lane')).toHaveCount(5)
+  await page.waitForTimeout(500)
+  await expect(card(page, 'Opened today')).toHaveCount(0)
+})
+
+test('Board keeps nothing for an unknown GitHub user', async ({ page }) => {
+  await settings(page, () => ({ me: '' }))
+  await board(page, { records: RECORDS })
+  await expect(card(page, 'Opened today')).toBeVisible()
+  await hold(page)
+  await page.reload()
+  await expect(page.locator('.lanes .lane')).toHaveCount(5)
+  await page.waitForTimeout(500)
+  await expect(card(page, 'Opened today')).toHaveCount(0)
+})
+
+test('All orgs never stands for another set of organizations', async ({ page }) => {
+  let orgs = ['acme', 'beta']
+  await settings(page, () => ({ me: 'octocat', orgs }))
+  await board(page, { records: RECORDS })
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // beta is removed elsewhere; GitHub's reads are held.
+  orgs = ['acme']
+  await hold(page)
+  await page.reload()
+  await expect(page.locator('.lanes .lane')).toHaveCount(5)
+  await page.waitForTimeout(500)
+  await expect(card(page, 'Opened today')).toHaveCount(0)
+})
