@@ -363,6 +363,11 @@ API (`GET /config/`) to confirm every gateway handler has the retry window.
 record the old and new gateway container IDs, start public requests while the
 gateway listener is absent, and wait for their completed results through the
 successor. Include a POST handled exactly once; readiness alone is insufficient.
+The deployment test runs on an isolated Docker Engine with
+`"userland-proxy": false`, so the published port refuses dials until the gateway
+listens. Docker's userspace proxy can accept a connection during startup and
+then reset it before the gateway listens. Caddy treats that reset as a
+connected failure and returns 502 for a POST whose delivery it cannot verify.
 
 Point the DNS records at the proxy. The OAuth App and everything after it
 are the same as above.
