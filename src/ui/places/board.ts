@@ -61,7 +61,7 @@ type FilterKey = keyof Filters
  *  Board's view, what its time means and Who are its own (`poise-board`). */
 const BOARD_KEY = 'poise-board'
 /** Board's last read, kept across visits: a return paints it at once, then reads again. */
-let lastRead: { key: string, cards: Card[], items: Item[], statuses: Awaited<ReturnType<typeof readPrStatus>> | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean } | null = null
+let lastRead: { key: string, cards: Card[], items: Item[], statuses: Awaited<ReturnType<typeof readPrStatus>> | undefined, runs: Awaited<ReturnType<typeof readRunning>> | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean } | null = null
 function readFilters(): Filters {
   const saved = store.get<Record<string, unknown>>(CURRENT_FILTER_KEY, {})
   const own = { ...saved, ...store.get<Record<string, unknown>>(BOARD_KEY, {}) }
@@ -450,7 +450,7 @@ export const mount: MountPlace = (ctx) => {
         if (cardsRead) cards = cardsRead
         if (live) {
           truncated = live.truncated
-          items = live.records.map((record) => toItem({ record, status: statusesRead?.get(itemKey(record.repo, record.number)), chain: null, run: null, labelled: assigned.has(itemKey(record.repo, record.number)), closing: null }))
+          items = live.records.map((record) => toItem({ record, status: statusesRead?.get(itemKey(record.repo, record.number)), chain: null, run: runsRead ? runsRead.get(itemKey(record.repo, record.number)) ?? null : undefined, labelled: assigned.has(itemKey(record.repo, record.number)), closing: null }))
           liveRead = true
         }
         render(false)
@@ -512,7 +512,7 @@ export const mount: MountPlace = (ctx) => {
       }
     }
     readOnce = true
-    if (live) lastRead = { key: readKey(), cards, items, statuses: statusesRead, intake, capacity, chats, truncated }
+    if (live) lastRead = { key: readKey(), cards, items, statuses: statusesRead, runs: runsRead, intake, capacity, chats, truncated }
     paintPartial()
     if (first || !busy()) render(!first)
     else summary()
@@ -1108,6 +1108,7 @@ export const mount: MountPlace = (ctx) => {
   if (lastRead?.key === readKey()) {
     ({ cards, items, intake, capacity, chats, truncated } = lastRead)
     statusesRead = lastRead.statuses
+    runsRead = lastRead.runs
     readOnce = liveRead = true
   }
   paintHead()
