@@ -66,8 +66,12 @@ publication. An unverified settlement retains ownership and reports remaining
 PIDs, process names and states.
 The [service contract](../../docs/Service-architecture.md#workspace-behavior-observation)
 defines support, teardown and uncertainty. Same-supervisor claimed disk recovery
-uses the maintenance path below; forced-container lifecycle proof and complete
-resource acceptance remain pending under #806.
+uses the maintenance path below. Losing its original witnesses through forced
+supervisor/container replacement retains the disk and reservation, without an
+eventual-reclamation guarantee. Complete resource acceptance remains pending
+under #806. Legacy review parents stay retained with a warning through Caller's
+sweep; age, names and empty path scans grant no cleanup authority
+([retention policy](../../docs/Operating.md#storage-maintenance)).
 
 Cleanup recovery uses the existing maintenance/runtime triggers and the same
 original Call. Its private `resource_cleanup` column records a bounded cleanup

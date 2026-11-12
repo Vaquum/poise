@@ -563,6 +563,10 @@ computer.
 - Caller itself runs from the image: its CLIs from `CALLER_BIN_ROOT`,
   `agent-interface` in `AGENT_INTERFACE_ROOT`.
 
+Legacy review parents are retained under the
+[storage retention policy](Operating.md#storage-maintenance); only original
+native resource receipts can authorize maintenance reclamation of owned Calls.
+
 Poise delegates GitHub-mirror cache eviction to Caller's local, account-free
 `github-interface --prune-mirrors` behavior. Caller retains each
 `owner/repo.lock` inode and owner directory, locks nonblockingly against

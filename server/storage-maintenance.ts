@@ -38,9 +38,6 @@ export const WORKSPACE_CLOSED_GRACE_MS = 24 * 60 * 60_000
 export const WORKSPACE_IDLE_PRUNE_MS = 3 * 24 * 60 * 60_000
 /** Incident snapshots expire after this unless pinned with a KEEP file. */
 export const INCIDENT_RECOVERY_RETENTION_MS = 30 * 24 * 60 * 60_000
-/** Crashed issue-review runs expire after this. Caller sweeps stale runs
- *  itself within hours; this is the backstop (reviews never run this long). */
-export const ISSUE_REVIEW_RUN_RETENTION_MS = 7 * 24 * 60 * 60_000
 /** Full maintenance runs on this timer, and at startup. */
 export const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60_000
 /** Disk pressure is re-measured this often; a statfs, not a tree walk. */
@@ -639,7 +636,7 @@ async function capMirrors(root: string, capBytes: number, now: number, dryRun: b
 
 async function expireEntries(
   root: string, retentionMs: number, now: number, dryRun: boolean, report: MaintenanceReport,
-  options: { pinFile?: string, namePattern?: RegExp } = {},
+  options: { pinFile?: string } = {},
 ): Promise<void> {
   let entries
   try {
@@ -652,7 +649,6 @@ async function expireEntries(
     if (entry.isSymbolicLink()) continue
     // Lock files coordinate live processes; maintenance never touches them.
     if (entry.name.endsWith('.lock')) continue
-    if (options.namePattern && !options.namePattern.test(entry.name)) continue
     const path = join(root, entry.name)
     let mtimeMs = 0
     try {
@@ -793,7 +789,16 @@ export async function runStorageMaintenance(options: MaintenanceOptions = {}): P
     }
   }
   const snapshots = () => expireEntries(join(stateRoot, 'incident-recovery'), INCIDENT_RECOVERY_RETENTION_MS, now, dryRun, report, { pinFile: 'KEEP' })
-  const reviewRuns = () => expireEntries(caches.agentWork, ISSUE_REVIEW_RUN_RETENTION_MS, now, dryRun, report, { namePattern: HEX32 })
+  const reviewRuns = async () => {
+    try {
+      await lstat(caches.agentWork)
+      report.held.push({ path: caches.agentWork,
+        reason: 'Legacy review resources retained: original ownership and process termination are unverified; native resources require their original cleanup receipts' })
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') report.errors.push({ path: caches.agentWork,
+        message: `Legacy review resource inventory unavailable: ${messageOf(error)}` })
+    }
+  }
   const capCaches = async () => {
     await capCacheDir('pip', caches.pip, caps.pip, now, dryRun, report)
     await capCacheDir('uv', caches.uv, caps.uv, now, dryRun, report)
