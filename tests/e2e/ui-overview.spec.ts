@@ -337,7 +337,7 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   for (const [completed, errors, perItem, value, note] of [
     [0, 0, null, 'Unavailable', '0 errors across 0 items completed · rate requires a nonempty, complete lifetime cohort'],
     [2, 2, null, 'Unavailable', '2 errors across 2 items completed · rate requires a nonempty, complete lifetime cohort'],
-    [2, 0, 0, '0 per item', '0 errors across 2 items completed'],
+    [2, 0, 0, '0.0 per item', '0 errors across 2 items completed'],
   ] as const) {
     rate = { completed, errors, perItem, items: [] }
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
