@@ -954,10 +954,11 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           let snapshot: Awaited<ReturnType<typeof fetchAgentLogSnapshot>> | null = null
           let agentLogsError: string | null = null
           try {
+            // Behaviors' table takes the last snapshot at once; it is read again behind.
             snapshot = await fetchSelectedAgentLogSnapshot({
               latest: triggers.flatMap(([behavior, source]) => accounts.map(account => ({ behavior, source, owner: account.login }))),
               ids: [...pending].sort(),
-            })
+            }, { lastObserved: true })
             logs = snapshot.entries
             if (snapshot.quarantined.length > 0) agentLogsError = `${snapshot.quarantined.length} unreadable worker log row(s) quarantined`
           } catch (error) {

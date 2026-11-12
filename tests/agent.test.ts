@@ -1315,6 +1315,27 @@ describe('selected agent-log reads', () => {
     expect(Object.isFrozen(snapshot)).toBe(true)
   })
 
+  it('answers a reader of the last snapshot at once past its five seconds, and reads again behind it', async () => {
+    const own = { latest: [{ behavior: 'pr_approve', source: 'poise:approve-prs', owner: 'last-observed' }], ids: [] }
+    mocks.runFile.mockResolvedValueOnce({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    const first = await fetchSelectedAgentLogSnapshot(own)
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 6_000)
+    let answer!: (value: { stdout: string, stderr: string }) => void
+    mocks.runFile.mockImplementation(() => new Promise(resolve => { answer = resolve }))
+    try {
+      // The read behind is held: the answer still comes, the last snapshot.
+      expect(await fetchSelectedAgentLogSnapshot(own, { lastObserved: true })).toBe(first)
+      expect(mocks.runFile).toHaveBeenCalledTimes(2)
+      // A second reader joins the read already behind, never a new one.
+      expect(await fetchSelectedAgentLogSnapshot(own, { lastObserved: true })).toBe(first)
+      expect(mocks.runFile).toHaveBeenCalledTimes(2)
+      answer({ stdout: JSON.stringify([logRow({ id: 'b'.repeat(32) })]), stderr: '' })
+      await vi.waitFor(async () => expect((await fetchSelectedAgentLogSnapshot(own, { lastObserved: true })).entries[0]!.id).toBe('b'.repeat(32)))
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   it('keeps large selections on the same off-thread decoder as history', async () => {
     const rows = Array.from({ length: 1000 }, (_, index) => logRow({
       id: index.toString(16).padStart(32, '0'), prompt: 'x'.repeat(4000),
