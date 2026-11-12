@@ -432,14 +432,15 @@ describe('image upgrades', () => {
     h.workspace.health.activeChatTurns = 1
     h.workspace.health.runningCallerCalls = 2
     const upgrade = h.orchestrator.upgradePass()
-    await waitFor(() => h.workspace.serviceRequests.some((request) => request.url === '/api/service/health'), 'a busy workspace health poll')
+    await waitFor(() => h.workspace.serviceRequests.filter(request => request.url === '/api/service/health').length >= 2,
+      'a busy workspace health poll after the drain')
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
     expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
     h.workspace.health.activeChatTurns = 0
     h.workspace.health.runningCallerCalls = 0
     await upgrade
 
-    const drain = h.workspace.serviceRequests[0]
+    const drain = h.workspace.serviceRequests[1]
     expect(drain.method).toBe('POST')
     expect(drain.url).toBe('/api/service/drain')
     expect(drain.headers.host).toBe(ALICE)
@@ -447,7 +448,7 @@ describe('image upgrades', () => {
       .toMatchObject({ aud: 'workspace:alice', sub: 'Alice', scope: 'admin' })
     // Health while it waits, then the drain again just before the container stops,
     // then one health check that the replacement answers before the upgrade finishes.
-    expect(h.workspace.serviceRequests.slice(1, -2).every((request) => request.url === '/api/service/health')).toBe(true)
+    expect(h.workspace.serviceRequests.slice(2, -2).every((request) => request.url === '/api/service/health')).toBe(true)
     expect(h.workspace.serviceRequests.at(-2)).toMatchObject({ method: 'POST', url: '/api/service/drain' })
     expect(h.workspace.serviceRequests.at(-1)).toMatchObject({ method: 'GET', url: '/api/service/health' })
     expect(h.workspace.serviceRequests.length).toBeGreaterThan(3)
@@ -458,10 +459,10 @@ describe('image upgrades', () => {
       'GET /images/poise-runtime:latest/json',
       'GET /containers/json',
       `GET /containers/${aliceId}/json`,
-      'GET /containers/poise-ws-alice/json',
       // Before the first call to the workspace, the gateway makes sure it is on its network.
       'GET /networks/poise-net-alice',
       'GET /containers/poise-gateway/json',
+      'GET /containers/poise-ws-alice/json',
       'GET /containers/poise-ws-alice/json',
       'POST /containers/poise-ws-alice/stop',
       'DELETE /containers/poise-ws-alice',
@@ -598,11 +599,56 @@ describe('image upgrades', () => {
     expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/resume')).toHaveLength(3)
   }, 5000)
 
+  it.each([
+    { draining: false, resumeStatus: 200, resumeRequests: 0 },
+    { draining: true, resumeStatus: 200, resumeRequests: 1 },
+    { draining: true, resumeStatus: 503, resumeRequests: 2 },
+  ])('skips a new drain for a reported cleanup hold (draining $draining, resume $resumeStatus)', async ({ draining, resumeStatus, resumeRequests }) => {
+    await start()
+    const before = h.docker.containers.get('poise-ws-alice')?.id
+    const hold = { callId: 'a'.repeat(32), reason: 'Original native resource handle is unavailable' }
+    Object.assign(h.workspace.health, { unsettledNativeCalls: 1, backgroundWork: 1, nativeCleanupHold: hold, draining })
+    h.workspace.resumeStatus = resumeStatus
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.health.draining).toBe(resumeStatus === 503)
+    expect(h.logs.filter(entry => entry.event === 'workspace.upgrade.native-pending')).toEqual([
+      expect.objectContaining({ callId: hold.callId, cleanupReason: hold.reason, unsettledNativeCalls: 1 }),
+    ])
+
+    // A new Caller launch does not change the original failed cleanup.
+    h.workspace.resumeStatus = 200
+    Object.assign(h.workspace.health, { unsettledNativeCalls: 2, backgroundWork: 2, runningCallerCalls: 1 })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.health.draining).toBe(false)
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(before)
+    expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/drain')).toHaveLength(0)
+    expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/resume')).toHaveLength(resumeRequests)
+
+    delete h.workspace.health.nativeCleanupHold
+    Object.assign(h.workspace.health, { unsettledNativeCalls: 0, backgroundWork: 0, runningCallerCalls: 0 })
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')?.id).not.toBe(before)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('releases an admitted drain when Caller records a terminal cleanup failure', async () => {
+    await start()
+    const hold = { callId: 'a'.repeat(32), reason: 'Original native resource handle is unavailable' }
+    h.workspace.onServiceRequest = ({ url }) => {
+      if (url !== '/api/service/drain') return
+      Object.assign(h.workspace.health, { unsettledNativeCalls: 2, backgroundWork: 2, runningCallerCalls: 1, nativeCleanupHold: hold })
+    }
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.health.draining).toBe(false)
+    expect(events(h.logs, 'workspace.drain.released')).toHaveLength(1)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+  })
+
   it('notices a drain lifted while it waits instead of silently draining again', async () => {
     await start({ drainRenewMs: 200 })
     h.workspace.health.runningCallerCalls = 1
     const upgrade = h.orchestrator.upgradePass()
-    await waitFor(() => h.workspace.serviceRequests.length > 0, 'the drain request')
+    await waitFor(() => h.workspace.health.draining, 'the drain request')
     // The owner lifts the drain mid-wait while Caller work still runs.
     h.workspace.health.draining = false
     await waitFor(() => events(h.logs, 'workspace.drain.lifted').length > 0, 'the lifted drain to be noticed')
@@ -616,7 +662,7 @@ describe('image upgrades', () => {
     await start({ env: { POISE_DRAIN_TIMEOUT: '30' } })
     h.workspace.health.runningCallerCalls = 1
     const upgrade = h.orchestrator.upgradePass()
-    await waitFor(() => h.workspace.serviceRequests.length > 0, 'the drain request')
+    await waitFor(() => h.workspace.health.draining, 'the drain request')
     expect(h.workspace.health.draining).toBe(true)
     // A poll reaches nothing, so the gateway looks at its network again; by then it cannot join it.
     h.workspace.reachable = false
@@ -821,7 +867,7 @@ describe('image upgrades', () => {
       expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.started' && entry.handle === handle))
         .toMatchObject({ reason: 'changed drain timeout' })
       expect(h.workspace.serviceRequests.filter((request) => request.headers.host === workspaceHost(handle)).map((request) => request.url))
-        .toEqual(['/api/service/drain', '/api/service/drain', '/api/service/health'])
+        .toEqual(['/api/service/health', '/api/service/drain', '/api/service/drain', '/api/service/health'])
       expect(containerEnv(h, handle)).toContain('POISE_DRAIN_TIMEOUT=600')
       expect(h.docker.containers.get(`poise-ws-${handle}`)).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
     }
@@ -1521,7 +1567,7 @@ describe('a recreated gateway container', () => {
     }, 60)
     await h.orchestrator.joinWorkspaceNetworks()
     await h.orchestrator.upgradePass()
-    expect(h.workspace.serviceRequests[0]).toMatchObject({ method: 'POST', url: '/api/service/drain' })
+    expect(h.workspace.serviceRequests[1]).toMatchObject({ method: 'POST', url: '/api/service/drain' })
     expect(events(h.logs, 'workspace.')).toEqual([
       'workspace.network.connected',
       'workspace.upgrade.started',
@@ -1540,11 +1586,12 @@ describe('a recreated gateway container', () => {
     await start({ POISE_DRAIN_TIMEOUT: '2' })
     addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true, { gatewayJoined: false })
     await h.orchestrator.upgradePass()
-    // The drain, the drain again just before the container stops, and the replacement's health.
-    expect(h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)).toEqual(['POST /api/service/drain', 'POST /api/service/drain', 'GET /api/service/health'])
+    expect(h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)).toEqual([
+      'GET /api/service/health', 'POST /api/service/drain', 'POST /api/service/drain', 'GET /api/service/health',
+    ])
     expect(events(h.logs, 'workspace.')).toEqual([
-      'workspace.upgrade.started',
       'workspace.network.connected',
+      'workspace.upgrade.started',
       'workspace.drain.requested',
       'workspace.container.stopped',
       'workspace.container.removed',
@@ -1581,7 +1628,7 @@ describe('a recreated gateway container', () => {
     addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true)
     h.workspace.health.activeChatTurns = 1
     const pass = h.orchestrator.upgradePass()
-    await waitFor(() => h.workspace.serviceRequests.length > 0, 'the drain request')
+    await waitFor(() => h.workspace.health.draining, 'the drain request')
     h.docker.containers.get('poise-gateway')?.networks.delete('poise-net-alice')
     await waitFor(() => events(h.logs, 'workspace.network.connected').length > 0, 'the gateway to join again')
     h.workspace.health.activeChatTurns = 0
@@ -1605,7 +1652,11 @@ describe('a recreated gateway container', () => {
     const cookie = await start({ POISE_DRAIN_TIMEOUT: '5' }, 1000)
     addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true)
     expect((await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })).status).toBe(200)
-    h.docker.containers.get('poise-gateway')?.networks.delete('poise-net-alice')
+    h.workspace.onServiceRequest = ({ url }) => {
+      if (url !== '/api/service/health') return
+      h.docker.containers.get('poise-gateway')?.networks.delete('poise-net-alice')
+      h.workspace.onServiceRequest = undefined
+    }
     const pass = h.orchestrator.upgradePass()
     await waitFor(() => events(h.logs, 'workspace.drain.request.failed').length > 0, 'the drain to reach nothing')
     const page = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
