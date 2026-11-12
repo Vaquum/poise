@@ -263,7 +263,7 @@ describe('how CI and the commands reach the choice', () => {
     expect(gate.env.GH_TOKEN).toBe('${{ github.token }}')
     expect(gate.env.REPO).toBe('${{ github.repository }}')
     expect(steps.indexOf(gate)).toBeLessThan(steps.indexOf(merge))
-    expect(merge.if).toBe("vars.POISE_DEPLOY_HOST == '' || steps.gate.outputs.proceed == 'true'")
+    expect(merge.if).toBe("vars.POISE_UPSTREAM_SYNC == 'true' && (vars.POISE_DEPLOY_HOST == '' || steps.gate.outputs.proceed == 'true')")
     expect(sync.concurrency).toEqual({ group: 'sync-upstream', 'cancel-in-progress': false })
     expect(deploy.concurrency).toEqual({ group: 'deploy', 'cancel-in-progress': false })
   })
