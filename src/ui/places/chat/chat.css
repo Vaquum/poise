@@ -18,8 +18,6 @@
 #view-chat .chat-layout { --chat-head-h: 0; }
 @media (max-width: 1000px) { #view-chat .chat-switchboard-pane, #view-chat .chat-memories-pane { top: var(--chat-head-h); } }
 
-/* A turn off screen is not laid out: a long transcript arrives and returns without one long task. */
-#view-chat .chat-turn { content-visibility: auto; contain-intrinsic-size: auto calc(var(--sp-unit) * 40); }
 
 /* Chat's own values hold whichever place's copy of a classic rule loads after Chat's stylesheet
    (once the page preloads the places, every place's stylesheet is present). */
