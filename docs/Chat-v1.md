@@ -179,7 +179,7 @@ fields, except `role`, which only REST accepts. Card/document handoffs supply
 context, not permission to check out another repository.
 
 At most one session per subject exists in a Poise instance, enforced by a
-unique SQLite index over the stored subject. A Current card's subject is its
+unique SQLite index over the stored subject. A Board card's subject is its
 legacy chat id; opening the card resolves its session, and the first message
 or attach creates it and imports the earlier conversation as the session's
 first event. Creating for a subject that already has a session returns it.
