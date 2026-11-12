@@ -4,7 +4,7 @@
 # merges autonomio/poise's main into this repository's main, as the Sync fork
 # button does. Deployment-enabled forks hold their tip through CI and Deploy,
 # then coalesce waiting upstream changes into the next candidate.
-# Sync also recovers a missed Deploy wake or failed attempt.
+# Deploy completion wakes Sync to advance a held merge or recover a failure.
 #
 # GitHub lets the workflow's own token change no workflow file. When
 # autonomio/poise changes one, the merge fails until the fork is synced by
@@ -70,7 +70,9 @@ jobs:
 
   sync:
     name: Merge autonomio/poise's main
-    if: (vars.POISE_UPSTREAM_SYNC == 'true' || vars.POISE_DEPLOY_HOST != '') && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'success')
+    if: >-
+      vars.POISE_UPSTREAM_SYNC == 'true'
+      || (vars.POISE_DEPLOY_HOST != '' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -85,6 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          SUCCESSFUL_DEPLOY_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.id || '' }}
         run: deploy/actions/sync-gate.sh
 
       - name: Merge autonomio/poise's main into main
