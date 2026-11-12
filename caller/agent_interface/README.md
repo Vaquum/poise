@@ -462,19 +462,24 @@ after an atomic file save, so clients can fetch new text when storage recovers.
 ### Capped review rounds
 
 `--pr-approve ... --review-cap-reached --review-round N --review-cap N` runs
-the capped round: the run must not request changes again. It files that
-round's findings as one follow-up issue via `github-interface
---create-pr-linked-issue` and approves; a round with no findings approves
-without filing. The issue body starts with a marker for its pull request and
+the capped round. On and after the cap, any verified `p0` (breaks a common path)
+keeps the whole atomic change request blocking, including mixed p0/p1/p2
+findings. Missing or unrecognized severity also stays blocking. Only when all
+finding bodies explicitly start with `[p1]` or `[p2]` (case-insensitive) does it
+file one follow-up issue via `github-interface --create-pr-linked-issue` and
+approve; a round with no findings approves without filing. New findings carry
+a severity prefix; reaffirmed threads keep their original bodies.
+The issue body starts with a marker for its pull request and
 head (`<!-- poise:review-cap #N@sha -->`), then one finding per section, each
 pinned to the reviewed head — or to its base for removed-side findings.
 A rejected filing approves nothing and raises a contract violation;
 an uncertain filing (timeout, transient GitHub error, exit 0 without a
 receipt) raises a submission error for Poise to reconcile, and the retry
-reuses the marked issue instead of filing again. Structured providers review
-as usual and the harness converts a change-request verdict deterministically;
-Claude receives the capped tool contract (file the issue, then approve) and
-must submit nothing when filing fails.
+reuses the marked issue instead of filing again. An existing marked issue
+never bypasses the breaking-finding check. Structured providers review as usual
+and the harness converts only explicitly nonbreaking change requests;
+Claude receives the same severity policy and can request changes or file the
+issue then approve. It must submit nothing when filing fails.
 
 ### Staged and follow-up reviews
 

@@ -1,9 +1,8 @@
-"""The capped review round: file findings as one follow-up issue, then approve.
+"""Deferrable capped review findings: file one follow-up issue, then approve.
 
 When Poise launches an approve-prs run at or past the configured review-round
-cap, the run must not request changes again. It files that round's findings as
-one follow-up issue in the pull request's repository and approves, so review
-ping-pong cannot stall the queue forever. The issue carries a marker for its
+cap, only findings explicitly classified as p1/p2 can be deferred. Other findings
+retain the ordinary atomic change request. The issue carries a marker for its
 pull request and head, so a retry or replay reuses it instead of filing again.
 """
 from __future__ import annotations
