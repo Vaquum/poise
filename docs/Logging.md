@@ -200,6 +200,9 @@ opening prompts or response/reasoning artifacts. Process capture excludes argv,
 stdout and environments; credential commands also exclude stderr. Sync phases,
 input admission limits, model-discovery outcomes, lock acquisition failures and
 temporary-filesystem pressure retain measurements known at the source.
+Managed datastore failures are reported once by `datastore.sync` or
+`datastore.activate`, retaining the process exit code and stderr alongside retry
+and freshness context. Standalone datastore process failures are still reported.
 
 Untyped GitHub 5xx and transport failures from `github-interface`,
 `github-datastore` and Caller completions retain Warning evidence. A bare exit
@@ -215,6 +218,15 @@ timeouts with no process diagnostic object, so delayed collection and replay
 retain one occurrence. Missing or unreadable results, rejected capture and
 independent process errors or signals keep the worker failure visible. Retry
 and publication rules are unchanged.
+
+The same correlation covers initial-review and approval workers that exit 1
+after a matching GitHub 503 explicitly recorded as `not_started / preflight_failed`,
+with no executed head, review ID, comments or receipts. A fresh readable Caller
+history must confirm the original Call and remaining retry budget, with no
+ambiguous evidence or retained hold and the behavior still runnable. Logging
+accepts that Call's diagnostic at its adapter severity, including Warning, before
+omitting the duplicate worker Error. Publication-time 503s, exhausted or held
+retries and unverifiable evidence retain the worker failure and original Call.
 
 Claude auth status probes from the auth monitor and Connected accounts treat a
 recognized sign-in requirement returned with exit 1 as an ongoing condition,
