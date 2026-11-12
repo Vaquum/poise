@@ -6,6 +6,7 @@ import { mkdirSync } from 'node:fs'
 import { isolatedEnvironment } from '../fixtures/cli-isolation'
 import { expect, test, type Page } from './fixtures/classic'
 import { BEHAVIORS, type BehaviorDiagnostics } from '../../src/behaviors'
+import { REVIEW_BUDGET_STOPPED } from '../../server/behavior-diagnostics'
 import type { Notice } from '../../src/notices'
 import { freeze, resume, settled } from './fixtures/motion'
 import { emptyAnalyticsReport } from './fixtures/analytics'
@@ -897,6 +898,12 @@ test('real producers resolve exact notice, distinct-attempt and pre-launch evide
     await card(page, changed.id).getByRole('button', { name: 'View in Logging', exact: true }).click()
     await expect(page.locator('#view-logging')).toContainText('changed retained cause')
     expect(new URL(page.url()).searchParams.get('event')).toBe(changed.evidence!.eventId)
+    produce('held-stopped')
+    const stopped = (await (await page.request.get('/api/notices')).json()).notices.find((row: Notice) => row.kind === 'behavior_held') as Notice
+    expect(stopped).toMatchObject({ body: REVIEW_BUDGET_STOPPED, target: { swarm: '4'.repeat(32) } })
+    await page.goto('/'); await openRail(page); await expand(page, stopped.id)
+    await expect(card(page, stopped.id)).toContainText(REVIEW_BUDGET_STOPPED)
+    await expect(card(page, stopped.id).getByRole('button', { name: 'Open the run in Swarm', exact: true })).toBeVisible()
     produce('recover')
     produce('prelaunch')
     const preparation = (await (await page.request.get('/api/behaviors')).json()).diagnostics as BehaviorDiagnostics
