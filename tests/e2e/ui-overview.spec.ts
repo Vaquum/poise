@@ -30,6 +30,8 @@ interface Workspace {
   decisions: unknown[]
   /** How the Switchboard answers an answer: delay, then status and body. */
   answerDecision?: { delay: Promise<void>, status: number, body: unknown }
+  /** The chats read fails from the start. */
+  chatsFail?: boolean
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -63,7 +65,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       await workspace.answerDecision.delay
       return json(route, workspace.answerDecision.body, workspace.answerDecision.status)
     }
-    if (path === '/api/chat/sessions') return json(route, { instance: 'poise-dev:test', sessions: [] })
+    if (path === '/api/chat/sessions') return workspace.chatsFail ? json(route, { error: 'the chat service did not answer' }, 503) : json(route, { instance: 'poise-dev:test', sessions: [] })
     if (path === '/api/editor/reviews') return json(route, { publications: [], sweep: { publications: 0, longestDelayMinutes: 15 } })
     if (path === '/api/behavior-chains') return json(route, { chains: [], attention: [] })
     if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
@@ -294,3 +296,44 @@ for (const width of [375, 768, 1000]) {
     expect(sizes.ova[0]).toBeLessThanOrEqual(sizes.ova[1])
   })
 }
+
+test('System health reads its five cards live, and a failed read keeps them, with when', async ({ page }) => {
+  let fail = false
+  const now = Date.now()
+  await page.route('**/api/analytics/system-health*', (route) => fail ? json(route, { error: 'evidence store unavailable' }, 503) : json(route, {
+    readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
+    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    blocked: { count: 3, oldestProgressAt: now - 26 * 3_600_000, largestStage: 'Repair: 2', items: [] },
+    recovery: { automatic: [{}, {}], intervention: [{}], unknown: 0 },
+    lastError: { error: { at: now - 15 * 60_000, work: 'autonomio/poise#496', journal: '', summary: '' }, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now },
+    coverage: [
+      { name: 'Chain journal', scope: 'All configured accounts', status: 'verified v2', lastReadAt: null, intervals: null },
+      { name: 'Caller receipts', scope: 'Instance-wide', status: 'ok', lastReadAt: null, intervals: [{ since: now - 100, until: now - 4, state: 'covered' }, { since: now - 4, until: now, state: 'unknown' }] },
+    ],
+  }))
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const card = (ref: string) => page.locator(`[data-ref="ov.health"] [data-ref="${ref}"]`)
+  await expect(card('ov.h.errors')).toContainText('0.5 per item')
+  await expect(card('ov.h.errors')).toContainText('3 errors across 6 items completed')
+  await expect(card('ov.h.blocked')).toContainText('oldest 1d 2h without verified progress · Repair: 2')
+  await expect(card('ov.h.recovery')).toContainText('1 needed outside help')
+  await expect(card('ov.h.lasterror')).toContainText('at ')
+  await expect(card('ov.h.coverage').getByRole('img')).toHaveAttribute('aria-label', '96% covered, 4% unknown')
+  await expect(page.getByText('Planned · #1101')).toHaveCount(0)
+
+  fail = true
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await expect(page.locator('[data-healthfail]')).toContainText('System health could not be read: evidence store unavailable. Last read at')
+  await expect(card('ov.h.errors')).toContainText('0.5 per item')
+
+  // Another organization's figures never stand for the one chosen.
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:organization-filter-changed')))
+  await expect(card('ov.h.errors')).toContainText('—')
+  await expect(page.locator('[data-healthfail]')).toContainText('Not read yet.')
+})
+
+test('In motion says what was never read, rather than zero or clear', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1, chatsFail: true })
+  await expect(page.locator('[data-counts="people"] b').first()).toHaveText('—')
+  await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
+})

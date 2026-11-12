@@ -962,7 +962,7 @@ each have a "Skip repositories" list:
 
 Review New Issues stays opt-in.
 
-**Replay checks.** A replay from Swarm passes the same eligibility checks the
+**Replay checks.** A replay from Observe → Behaviors passes the same eligibility checks the
 scheduler applies, or it is refused with HTTP 409 and the failed check named:
 - **Issue review:** the repository is opted in, the issue is open, and its
   author is a trusted author.
@@ -971,8 +971,8 @@ scheduler applies, or it is refused with HTTP 409 and the failed check named:
   repository.
 
 The facts are read fresh from the datastore the scheduler reads; when they
-cannot be read the replay answers 502 and launches nothing. Swarm shows a
-refusal under the row whose Replay was pressed.
+cannot be read the replay answers 502 and launches nothing. Observe → Behaviors
+shows a refusal under the row whose Replay was pressed.
 
 **Pausing.** A behavior can be paused until a time (`pausedUntil` on `POST
 /api/behaviors/<key>`, `null` clears). The pause is stored apart from the

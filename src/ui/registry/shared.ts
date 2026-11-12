@@ -256,3 +256,24 @@ Object.assign(SHARED, {
   'side.hold': { name: 'Why it is held', kind: 'Display', what: 'The hold’s reason, in the chain’s words, and what Resume does.', values: [['A queue removal by hand', 'Someone took it out of the merge queue, or Poise cannot tell why it left. A failed check or a conflict in the queue is not a hold: it goes to a fresh repair.'], ['A reported blocker', 'Implementation or repair said what stops it. Nothing restarts by itself.'], ['Over its memory or disk ceiling', 'The run was stopped as soon as it measured over, or after five seconds without a full measurement; other runs carry on.'], ['You stopped a run', 'It holds until you Resume, even if nothing was written.'], ['Cleanup not proven', 'Its memory and disk stay reserved: a restart cannot prove they were released.']] },
   'side.timeline': { name: 'Timeline', kind: 'Display', what: 'Every step of the task with its time, newest first: runs with their model and slot, events, holds, and what could not be confirmed.', does: 'Held still while you read it; new steps wait until you look away.', source: 'The chain’s journal, which never changes once written.' }
 });
+
+// The Manager's controls: Overview's Manager card and Settings → Manager draw them both.
+Object.assign(SHARED, {
+  'mgr.effective': { name: 'In effect', kind: 'Display', what: 'Your Manager controls read together, with what they govern.', now: (el: any) => (el.querySelector('.sentence') ?? el).textContent.replace(/\s+/g, ' ').trim(), scope: 'Work the Manager runs in this workspace.', source: 'The same settings, live.' },
+  'mgr.rhythm': {
+    name: 'Rhythm', kind: 'Manager control', what: 'How many workers the Manager keeps on tasks at once: 1 to 10 slots.',
+    does: 'Each worker holds a slot from the moment it takes a task until its chat is closed. A free slot gets the Manager’s next ticket, as a new worker, on its next turn.',
+    now: (el: any) => { const r = el.closest('.omgr')?.querySelector('[data-rhythm]'); if (!r) return ''; const { limit, used } = r.dataset; return used === undefined ? `${limit} slots.` : `${limit} slots; ${used} held by workers.` },
+    values: [['1', 'One task at a time: slow and easy to follow.'], ['5', 'Default.'], ['10', 'The most parallel work Poise allows; more to watch.']],
+    scope: 'Workers the Manager runs in this workspace.',
+    when: 'From the Manager’s next turn, which carries it. Lowering it below current use lets each worker finish its task, and starts nothing new until use is below the limit.',
+    unchanged: 'Running at once, chats you run yourself, Stability ↔ Expansion and Autonomy.',
+    source: 'The same setting as Settings → Manager → Rhythm.',
+  },
+  'mgr.paused': {
+    name: 'Pause new work', kind: 'Manager control', what: 'Tells the Manager that new work waits until you resume. It still wakes, watches and answers; it gives out no new ticket.',
+    now: (el: any) => ((el.closest('[aria-pressed]') ?? el).getAttribute('aria-pressed') === 'true' ? 'Paused: new work waits until you resume.' : 'Not paused.'),
+    when: 'From the Manager’s next turn.', unchanged: 'Workers already on tasks, which finish them; wake-ups; Hold, which is separate.',
+    source: 'The paused flag in the Manager controls, the same setting as Settings → Manager.',
+  }
+});

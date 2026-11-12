@@ -19,6 +19,7 @@ interface World {
   labelled?: string[]
   prs?: { [key: string]: { number: number, url: string }[] }
   intakeFails?: boolean
+  liveFails?: boolean
   assign?: 'ok' | 'refused'
   chainEnabled?: boolean
   assigned?: string[]
@@ -46,6 +47,7 @@ async function board(page: Page, world: World, address = '/?view=board'): Promis
   await page.route('**/api/gh', async (route) => {
     const body = JSON.parse(route.request().postData() || '{}') as { operation: string, updated_since?: string, repository_full_name?: string, issue_number?: number }
     if (body.operation === 'list') {
+      if (world.liveFails) return route.fulfill({ status: 502, json: { error: 'GitHub answered 502' } })
       const since = body.updated_since ? Date.parse(body.updated_since) : -Infinity
       return route.fulfill({ json: { records: world.records.filter((r) => Date.parse(r.updated_at) >= since) } })
     }
@@ -189,3 +191,56 @@ for (const width of [375, 768, 1000]) {
     }
   })
 }
+
+test('while the pointer is on the board, a changed item repaints in place, and the update is held', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  await card(page, 'A pull request').hover()
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [{ status: 'running', repo: 'acme/site', pr_id: 44, behavior: 'review-prs', started_at: iso(10), started_at_precise: iso(10) }] } }))
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(card(page, 'A pull request').locator('.card-state')).toContainText('Review running')
+  await expect(card(page, 'A pull request')).toHaveClass(/is-changed/)
+  await expect(page.locator('[data-ref="cur.held"]')).toHaveText('1 update held')
+})
+
+test('opening an issue keeps its writer open and guarded until GitHub answers', async ({ page }) => {
+  let answer: () => void = () => {}
+  await board(page, { records: RECORDS })
+  await page.route('**/api/gh', async (route) => {
+    const body = JSON.parse(route.request().postData() || '{}') as { operation: string }
+    if (body.operation !== 'open_issue') return route.fallback()
+    await new Promise<void>((resolve) => { answer = resolve })
+    return route.fulfill({ json: { record: record('issue', 45, 'A new issue', { created_at: iso(0), updated_at: iso(0) }), labels_dropped: [] } })
+  })
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.getByLabel('Issue title').fill('A new issue')
+  await page.getByRole('button', { name: 'Open issue' }).click()
+  await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
+  // Neither a new writer, Cancel nor more typing takes the one whose answer is on its way.
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await expect(page.locator('[data-writer="issue"]').getByRole('button', { name: 'Cancel' })).toHaveAttribute('aria-disabled', 'true')
+  await expect(page.getByLabel('Issue title')).not.toBeEditable()
+  await expect(page.getByLabel('Issue title')).toHaveValue('A new issue')
+  await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
+  answer()
+  await expect(page.locator('[data-writer="issue"]')).toHaveCount(0)
+  await expect(card(page, 'A new issue')).toBeVisible()
+})
+
+test('a GitHub read that never succeeded reads as not read, never as zero', async ({ page }) => {
+  await board(page, { records: RECORDS, liveFails: true })
+  await expect(page.locator('.lane[data-lane="issue"] .empty')).toHaveText('Not read yet.')
+  await expect(page.locator('.lane[data-lane="issue"] [data-ref="lane.count"]')).toHaveText('—')
+  await expect(page.locator('[data-ref="cur.count"] .n').first()).toHaveText('—')
+})
+
+test('a held repaint leaves an armed Assign armed', async ({ page }) => {
+  const world: World = { records: RECORDS.map((r) => ({ ...r })) }
+  await board(page, world)
+  await card(page, 'Opened today').getByRole('button', { name: 'Assign to Poise' }).click()
+  await expect(card(page, 'Opened today').getByRole('button', { name: 'Sure?' })).toBeVisible()
+  await card(page, 'A pull request').focus()
+  world.records = world.records.map((r) => (r.number === 42 ? { ...r, title: 'Opened today, retitled' } : r))
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(page.locator('[data-ref="cur.held"]')).toHaveText('1 update held')
+  await expect(card(page, 'Opened today').getByRole('button', { name: 'Sure?' })).toBeVisible()
+})

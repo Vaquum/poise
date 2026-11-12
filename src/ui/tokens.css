@@ -203,6 +203,7 @@
   --ease-spring: var(--p-spring);
   --ease-out: ease-out;
   --foot-h: 0px; /* the foot strips' height while they show; src/ui/states.ts measures it */
+  --editor-head-h: calc(var(--sp-unit) * 12); /* the Editor's header, taller where it wraps; places/editor.ts measures it */
   --z-raise: 1;
   --z-sticky: 5;
   --z-panel: 20;

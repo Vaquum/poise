@@ -543,7 +543,7 @@ function timeStep(ctx: StepContext): StepView {
         <button type="button" data-rate="1m">Every minute</button>
         <button type="button" data-rate="5m">Every 5 minutes</button>
       </div>
-      <div class="st-help st-help-info">How often Current, Swarm and Archive pull fresh data.</div>
+      <div class="st-help st-help-info">How often Overview, Board and Observe read fresh data.</div>
     </div>`)
   const select = view.querySelector<HTMLSelectElement>('#ob-timezone')!
   const picker = view.querySelector<HTMLElement>('.ob-refresh')!
@@ -887,7 +887,7 @@ function finishStep(ctx: StepContext): StepView {
 const STEPS: StepSpec[] = [
   { id: 'github', name: 'GitHub', title: 'Connect your GitHub account', intro: (owner) => `Poise reads GitHub as you, ${owner}, through gh, GitHub's own command-line tool in your workspace.`, render: githubStep },
   { id: 'agent', name: 'Agent', title: 'Add the agent account', intro: () => 'Reviews, approvals and comments are posted as a separate GitHub account, such as a bot. It signs in to gh here too, and Poise confirms it works.', skippable: true, render: agentStep },
-  { id: 'organizations', name: 'Organizations', title: 'Add your organizations', intro: () => 'The GitHub organizations, and personal accounts, whose work Poise follows: Current, Swarm, Archive and your automations read them.', render: organizationsStep },
+  { id: 'organizations', name: 'Organizations', title: 'Add your organizations', intro: () => 'The GitHub organizations, and personal accounts, whose work Poise follows: Board, Observe and your automations read them.', render: organizationsStep },
   { id: 'time', name: 'Time', title: 'Time zone and refresh rate', intro: () => 'How Poise tells time, and how often it looks for news.', render: timeStep },
   { id: 'ai', name: 'AI accounts', title: 'Sign in to your AI accounts', intro: () => 'Connect the ones you use. Each opens its own login in a terminal here; the CLI keeps what it signs in with in your workspace, and Poise never reads it.', render: aiStep },
   { id: 'models', name: 'Models', title: 'Choose your models', intro: () => 'Which model each place in Poise launches. Only providers you signed in to are offered.', render: modelsStep },

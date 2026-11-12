@@ -82,6 +82,23 @@ test('the Settings menu opens each section with a route back, and the Style pane
   expect(await density()).toBe('0.8')
 })
 
+test('the Style panel’s Reset to Poise asks “Sure?” first, and Undo puts your style back', async ({ page }) => {
+  await open(page)
+  await nav(page).getByRole('button', { name: 'Settings' }).click()
+  await page.getByRole('menu', { name: 'Settings' }).getByRole('menuitem', { name: 'Style panel' }).click()
+  const panel = page.getByRole('complementary', { name: 'Style' })
+  const density = () => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--ctl-density').trim())
+  const poise = await density()
+  await panel.getByRole('button', { name: /Compact/ }).click()
+  await panel.getByRole('button', { name: 'Reset to Poise' }).click()
+  expect(await density()).toBe('0.8')
+  await panel.getByRole('button', { name: 'Sure?' }).click()
+  expect(await density()).toBe(poise)
+  await panel.getByRole('button', { name: 'Undo' }).click()
+  expect(await density()).toBe('0.8')
+  await expect(panel.getByRole('button', { name: 'Reset to Poise' })).toBeVisible()
+})
+
 test('the reference names what the pointer rests on, and explains it in full on ?', async ({ page }) => {
   await open(page)
   const board = nav(page).getByRole('link', { name: 'Board' })
@@ -182,4 +199,21 @@ test('Claude’s subscription sits at the foot and the page makes room; updating
   await open(page, '/', { updating: true })
   await expect(page.locator('.up-backdrop')).toContainText('Updating to the latest version')
   await expect(page.locator('.frame')).toHaveAttribute('inert', '')
+})
+
+test('a move takes the tooltip with it, and a place enters only the first time it opens', async ({ page }) => {
+  await open(page, '/?view=board&back=overview')
+  // What the pointer rests on in the next place may show its own tooltip; the back link's never follows.
+  const backTip = () => page.evaluate(() => [...document.querySelectorAll('[role="tooltip"]')].some((tip) => tip.textContent?.includes('Returns to where you were')))
+  const back = page.getByRole('link', { name: 'Back to Overview' })
+  await back.hover()
+  await expect(page.getByRole('tooltip')).toContainText('Returns to where you were')
+  await back.click()
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
+  expect(await backTip()).toBe(false)
+
+  await page.waitForFunction(() => !document.querySelector('[data-place-root][data-flow-enter]'))
+  await nav(page).getByRole('link', { name: 'Board' }).click()
+  await expect(page.locator('.lanes')).toBeVisible()
+  expect(await page.locator('[data-place-root]').getAttribute('data-flow-enter')).toBeNull()
 })

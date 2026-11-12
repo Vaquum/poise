@@ -113,6 +113,7 @@ describe('the work in the seven states', () => {
     expect(chatState({ status: 'stopping' })).toEqual({ state: 'running', note: 'Stopping…' })
     expect(chatState({ status: 'waiting', pendingRequests: ['a', 'b'] })).toEqual({ state: 'needs-you', note: '2 requests wait for you' })
     expect(chatState({ status: 'queued', queuedBehind: 'waiting for a free agent slot' })).toEqual({ state: 'waiting', note: 'waiting for a free agent slot' })
+    expect(chatState({ status: 'queued', queuedBehind: 'Fix the login' })).toEqual({ state: 'waiting', note: 'queued behind Fix the login' })
     expect(chatState({ status: 'interrupted' }).state).toBe('needs-you')
     expect(chatState({ status: 'idle' }).state).toBe('idle')
     expect(chatState({ status: 'closed' })).toEqual({ state: 'idle', note: 'Closed' })

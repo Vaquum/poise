@@ -753,7 +753,7 @@ export function createLogging(ctx: PartContext): ObservePart {
   return {
     show() {
       active = true
-      if (!started) { started = true; void initialRead(); return }
+      if (!started) { started = true; void initialRead(); if (ctx.query.get('data') === '1') $('#lg-data', root).showPopover(); return }
       render()
       if (!page) void initialRead()
       else if (pageIndex === 0) void poll()

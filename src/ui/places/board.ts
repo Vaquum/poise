@@ -130,6 +130,8 @@ export const mount: MountPlace = (ctx) => {
   let chats = new Map<string, ChatOn>()
   let truncated = false
   let readOnce = false
+  /** GitHub's issues and pull requests have been read at least once: until then nothing reads as zero. */
+  let liveRead = false
   const failures = new Map<string, string>()
   /** Issues opened here, shown at once until GitHub's copy arrives. */
   const pending = new Map<string, Item>()
@@ -288,7 +290,7 @@ export const mount: MountPlace = (ctx) => {
       const n = w.labels.length
       const pop = w.labelsOpen ? labelsHTML(w) : ''
       const blocked = !!w.conflict || w.busy
-      return `<div class="writer" data-writer="issue">${w.edit ? `<span class="t-micro" data-ref="composer.editing">Edit ${esc(w.repo)}#${w.edit.number}</span>` : ''}<input data-w="issue-title" placeholder="Issue title" aria-label="Issue title" data-ref="composer.title" value="${esc(w.title)}"><textarea data-w="issue-body" rows="3" placeholder="What should happen, in plain words (optional)" aria-label="Issue body" data-ref="composer.body">${esc(w.body)}</textarea><div class="row"><select data-w="issue-repo" aria-label="Repository" data-ref="composer.repo"${w.edit ? ' disabled' : ''}>${repoOptions(w.repo, false)}</select>${w.edit ? '' : `<button class="ib${n ? ' is-on' : ''}" data-act="labels" aria-label="Labels${n ? `, ${n} chosen` : ''}" aria-expanded="${w.labelsOpen}" data-ref="composer.labels">${icon('tag', 'sm')}${n ? `<span class="n">${n}</span>` : ''}</button>`}<span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="issue" data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-open-issue"${blocked ? ' aria-disabled="true"' : ''} data-ref="${w.edit ? 'composer.save-issue' : 'composer.open'}">${w.edit ? 'Save issue' : 'Open issue'}</button></div>${pop}${w.conflict ? `<p class="w-err" role="alert">${esc(w.conflict)} <button class="lnk" data-act="w-theirs">Load the latest</button></p>` : ''}${w.err ? `<p class="w-err" role="alert">${esc(w.err)}</p>` : ''}${w.cleared ? `<p class="t-gloss">Cleared ${w.cleared} label${w.cleared > 1 ? 's' : ''} chosen for the previous repository.</p>` : ''}</div>`
+      return `<div class="writer" data-writer="issue">${w.edit ? `<span class="t-micro" data-ref="composer.editing">Edit ${esc(w.repo)}#${w.edit.number}</span>` : ''}<input data-w="issue-title" placeholder="Issue title" aria-label="Issue title" data-ref="composer.title" value="${esc(w.title)}"${w.busy ? ' readonly' : ''}><textarea data-w="issue-body" rows="3" placeholder="What should happen, in plain words (optional)" aria-label="Issue body" data-ref="composer.body"${w.busy ? ' readonly' : ''}>${esc(w.body)}</textarea><div class="row"><select data-w="issue-repo" aria-label="Repository" data-ref="composer.repo"${w.edit || w.busy ? ' disabled' : ''}>${repoOptions(w.repo, false)}</select>${w.edit ? '' : `<button class="ib${n ? ' is-on' : ''}" data-act="labels" aria-label="Labels${n ? `, ${n} chosen` : ''}" aria-expanded="${w.labelsOpen}"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.labels">${icon('tag', 'sm')}${n ? `<span class="n">${n}</span>` : ''}</button>`}<span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="issue"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-open-issue"${blocked ? ' aria-disabled="true"' : ''} data-ref="${w.edit ? 'composer.save-issue' : 'composer.open'}">${w.edit ? 'Save issue' : 'Open issue'}</button></div>${pop}${w.conflict ? `<p class="w-err" role="alert">${esc(w.conflict)} <button class="lnk" data-act="w-theirs">Load the latest</button></p>` : ''}${w.err ? `<p class="w-err" role="alert">${esc(w.err)}</p>` : ''}${w.cleared ? `<p class="t-gloss">Cleared ${w.cleared} label${w.cleared > 1 ? 's' : ''} chosen for the previous repository.</p>` : ''}</div>`
     }
     if (lane.kind === 'mine' && W.has(`add.${lane.key}`)) {
       return `<div class="writer" data-writer="add.${lane.key}"><textarea data-w="add-text" rows="3" placeholder="Write a card…" aria-label="Card text" data-ref="composer.text"></textarea><div class="row"><select data-w="add-repo" aria-label="Link a repository" data-ref="composer.repo">${repoOptions(null)}</select><span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="add.${lane.key}" data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-add" data-lane="${lane.key}" data-ref="composer.add">Add</button></div></div>`
@@ -329,11 +331,11 @@ export const mount: MountPlace = (ctx) => {
     const count = open.length + done.length
     const add = lane.key === 'issue' ? `<button class="lane-add" data-act="add-issue" data-ref="lane.add-issue">${icon('plus', 'sm')}Add issue</button>`
       : lane.kind === 'mine' ? `<button class="lane-add" data-act="add" data-lane="${lane.key}" data-ref="lane.add">${icon('plus', 'sm')}Add</button>` : ''
-    const empty = count ? '' : !readOnce && live ? '<div class="empty">Reading GitHub…</div>' : `<div class="empty" data-ref="cur.empty">${filtersOn() || F.org ? `Nothing here under your filters.${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}` : live ? 'Nothing here.' : 'No cards yet. Add one, or drag one here.'}</div>`
+    const empty = count ? '' : live && !liveRead ? `<div class="empty">${failures.has('live') ? 'Not read yet.' : 'Reading GitHub…'}</div>` : `<div class="empty" data-ref="cur.empty">${filtersOn() || F.org ? `Nothing here under your filters.${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}` : live ? 'Nothing here.' : 'No cards yet. Add one, or drag one here.'}</div>`
     const fold = done.length ? `<div class="done-fold${folds[lane.key] ? ' open' : ''}"><button class="done-h" data-act="fold" data-lane="${lane.key}" aria-expanded="${!!folds[lane.key]}" data-ref="cur.done">${icon('chev', 'sm')}<span class="t-micro">${term('state.done')}</span><span class="n">${done.length}</span><span class="t-gloss">merged and closed</span></button><div class="lane-list done-list">${done.map(liveHTML).join('')}</div></div>` : ''
     const trunc = live && truncated ? '<p class="trunc" data-ref="cur.trunc">Older items are not loaded: Board shows the 200 most recently updated issues and pull requests, combined.</p>' : ''
     return `<section class="lane" data-lane="${lane.key}" data-kind="${lane.kind}" aria-label="${lane.label}">`
-      + `<header class="lane-h"><span class="station"></span><span class="name"><span class="t-micro" data-ref="lane.${lane.key}">${lane.label}</span><span class="count" data-ref="lane.count">${count}${live && truncated ? '+' : ''}</span></span>${add}</header>`
+      + `<header class="lane-h"><span class="station"></span><span class="name"><span class="t-micro" data-ref="lane.${lane.key}">${lane.label}</span><span class="count" data-ref="lane.count">${live && !liveRead ? '—' : count}${live && truncated ? '+' : ''}</span></span>${add}</header>`
       + `<p class="lane-gloss">${lane.gloss}</p>`
       + `<div class="lane-body" data-body="${lane.key}">${lane.key === 'issue' ? '<div class="drop-hint" data-ref="lane.drop">Drop to open this card as an issue</div>' : ''}${writerHTML(lane)}<div class="lane-list" data-list="${lane.key}">${body}</div>${empty}${fold}${trunc}</div></section>`
   }
@@ -341,7 +343,7 @@ export const mount: MountPlace = (ctx) => {
   function summary(): void {
     const counts = Object.fromEntries(STATES.map((s) => [s, 0])) as Record<StateKey, number>
     for (const it of shown()) if (it.state) counts[it.state]++
-    sumEl.innerHTML = `<span class="t-micro" data-ref="cur.summary">In motion</span>${STATES.map((s) => `<button class="st" data-state="${s}" data-n="${counts[s]}" aria-pressed="${only === s}" data-act="state" data-ref="cur.count"><span data-term="state.${s}">${term(`state.${s}`)}</span><span class="n">${counts[s]}</span></button>`).join('')}${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}`
+    sumEl.innerHTML = `<span class="t-micro" data-ref="cur.summary">In motion</span>${STATES.map((s) => `<button class="st" data-state="${s}" data-n="${counts[s]}" aria-pressed="${only === s}" data-act="state" data-ref="cur.count"><span data-term="state.${s}">${term(`state.${s}`)}</span><span class="n">${liveRead ? counts[s] : '—'}</span></button>`).join('')}${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}`
     sumEl.classList.toggle('is-filtered', !!only)
   }
 
@@ -453,7 +455,8 @@ export const mount: MountPlace = (ctx) => {
     if (statuses) statusesRead = statuses
     if (live) {
       truncated = live.truncated
-      const before = new Map(items.map((it) => [it.id, `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`]))
+      const sig = (it: Item) => `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`
+      const before = new Map(items.map((it) => [it.id, sig(it)]))
       items = live.records.map((record) => {
         const key = itemKey(record.repo, record.number)
         return toItem({
@@ -462,11 +465,28 @@ export const mount: MountPlace = (ctx) => {
         })
       })
       for (const id of [...pending.keys()]) if (items.some((it) => it.id === id) || now() - (pending.get(id)?.openedAt ?? 0) > 3_600_000) pending.delete(id)
-      const changed = items.filter((it) => before.has(it.id) && before.get(it.id) !== `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`).length
+      const changed = items.filter((it) => before.has(it.id) && before.get(it.id) !== sig(it)).length
         + items.filter((it) => !before.has(it.id)).length * (readOnce ? 1 : 0)
       readOnce = true
+      liveRead = true
       paintPartial()
-      if (busy() && changed && !first) { held += changed; showHeld(); summary(); return }
+      if (busy() && changed && !first) {
+        // Their state words change at once, in place; their new places wait (cur.held).
+        for (const it of items) {
+          const card = before.has(it.id) && before.get(it.id) !== sig(it) ? $(`.card[data-id="${CSS.escape(it.id)}"]`, lanesEl) as HTMLElement | null : null
+          const focused = document.activeElement
+          if (!card || armedAssign === it.id || (focused !== card && card.contains(focused))) continue
+          const fresh = document.createElement('div')
+          fresh.innerHTML = liveHTML(it)
+          const next = fresh.firstElementChild as HTMLElement
+          card.innerHTML = next.innerHTML
+          card.dataset.state = next.dataset.state ?? ''
+          card.setAttribute('aria-label', next.getAttribute('aria-label') ?? '')
+          card.classList.add('is-changed')
+          hydrateIcons(card)
+        }
+        held += changed; showHeld(); summary(); return
+      }
     }
     readOnce = true
     paintPartial()
@@ -479,6 +499,8 @@ export const mount: MountPlace = (ctx) => {
   // ---------- Writing: one writer at a time; a draft you leave is kept ----------
   const stash = () => $$('[data-writer]', lanesEl).forEach((w: HTMLElement) => { drafts.set(w.dataset.writer ?? '', Object.fromEntries($$('[data-w]', w).map((f: HTMLInputElement) => [f.dataset.w, f.value]))) })
   function openWriter(key: string, data: unknown = {}): void {
+    // An issue on its way to GitHub keeps its writer, so the answer lands where it was asked.
+    if (issueW()?.busy) return
     stash()
     W.clear()
     W.set(key, data)
@@ -493,6 +515,7 @@ export const mount: MountPlace = (ctx) => {
     w.scrollIntoView({ block: 'nearest' })
   }
   function closeWriter(key: string, focusTo?: () => void): void {
+    if (issueW()?.busy) return
     drafts.delete(key)
     W.delete(key)
     render(false)
@@ -582,15 +605,10 @@ export const mount: MountPlace = (ctx) => {
     }
     const source = w.source
     const repo = w.repo, title = w.title, body = w.body, chosen = w.labels
-    W.delete('issue')
-    drafts.delete('issue')
-    const temp = `${repo}#new-${Date.now()}`
-    LIFE.set(temp, ['Accepted', clock(), true])
-    render(false)
     try {
-      life(temp, 'Executing', 'opening on GitHub')
       const { record, dropped } = await openIssue({ repo, title, body, labels: chosen })
-      LIFE.delete(temp)
+      W.delete('issue')
+      drafts.delete('issue')
       if (record) {
         const it = toItem({ record, status: null, chain: null, run: null, labelled: !!intake?.label && chosen.includes(intake.label), closing: intake ? [] : null })
         pending.set(it.id, { ...it, openedAt: now() })
@@ -606,8 +624,8 @@ export const mount: MountPlace = (ctx) => {
       toast(`${source !== null ? `Opened ${where} from your card; the card is removed.` : `Opened ${where}${chosen.length ? `, labelled ${chosen.filter((l) => !dropped.includes(l)).join(', ') || 'nothing'}` : ''}.`}${dropped.length ? ` GitHub did not apply ${dropped.join(', ')}: the account may lack permission.` : ''}${hidden ? ' Your filters hide it; clear them to see it.' : ''}${intake?.label && chosen.includes(intake.label) ? ` With ${intake.label}, it enters the chain.` : ''}`, 'done')
       if (record) $(`.card[data-id="${CSS.escape(`${record.repo}#${record.number}`)}"]`, lanesEl)?.focus({ preventScroll: true })
     } catch (error) {
-      LIFE.delete(temp)
-      W.set('issue', newIssueWriter({ repo, title, body, labels: chosen, source, err: `The issue was not opened: ${(error as Error).message}` }))
+      w.busy = false
+      w.err = `The issue was not opened: ${(error as Error).message}`
       render(false)
     }
   }

@@ -1180,7 +1180,7 @@ test('shows the card under a card session\'s title in the sidebar', async ({ pag
   await installRoutes(page, state)
   await installSocket(page)
   await page.goto('/?view=chat')
-  await expect(page.locator('.chat-session-subject')).toHaveText('From Current · acme/app#12')
+  await expect(page.locator('.chat-session-subject')).toHaveText('From Board · acme/app#12')
 })
 
 test('runs /content and /consensus from the Chat composer and shows their results', async ({ page }) => {

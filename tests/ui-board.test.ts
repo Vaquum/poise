@@ -34,7 +34,7 @@ describe('Board puts every live item in the seven states', () => {
     expect(item({ record: record({ state: 'closed' }) })).toMatchObject({ state: 'idle', detail: 'closed' })
     // A pull request whose status could not be read has no state word.
     expect(item({ status: undefined })).toMatchObject({ state: null, detail: '' })
-    expect(item({ run: 'Review', status: status('awaiting_review') })).toMatchObject({ state: 'running', who: { kind: 'run', tag: 'Review' } })
+    expect(item({ run: { name: 'Review', since: 1_000 }, status: status('awaiting_review') })).toMatchObject({ state: 'running', since: 1_000, who: { kind: 'run', tag: 'Review' } })
   })
 
   it('marks the chain’s label as Poise, and an open issue nobody has as Idle', () => {

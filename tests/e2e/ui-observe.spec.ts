@@ -304,3 +304,8 @@ for (const width of [375, 768, 1000]) {
     await expect(page.getByRole('tab', { name: /^Logging/ })).toHaveAttribute('aria-selected', 'true')
   })
 }
+
+test('System health’s coverage link opens Logging with Data and collection open', async ({ page }) => {
+  await open(page, '/?view=observe&part=logging&data=1&back=overview')
+  await expect(page.locator('#lg-data')).toBeVisible()
+})

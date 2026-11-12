@@ -12,23 +12,25 @@
   .foot-copy { flex-basis: 80%; }
 }
 @media (max-width: 760px) {
+  /* A place's stylesheet loads after this one, so a rule its own would override is scoped by .place. */
+
   /* Chat: the list floats over the chat, and a chosen row folds it away (places/chat/view.ts) */
   #view-chat .chat-layout { position: relative; }
   #view-chat .chat-sidebar { position: absolute; top: 0; bottom: 0; left: 0; z-index: var(--z-panel); max-width: 100%; }
   #view-chat:not(.chat-sidebar-collapsed) .chat-sidebar { box-shadow: var(--shadow-dialog); }
   #view-chat .chat-sidebar-resize { display: none; }
-  .jev-title { flex-basis: 100%; order: -1; }
+  .place .jev-title { flex-basis: 100%; order: -1; }
   .chat-head { padding-inline: var(--sp-3); }
 
   /* Board: lanes scroll inside themselves, and a card's chat takes the place */
   .cur { position: relative; }
   .cur-head { padding-inline: var(--sp-3); }
-  .cur-filters .push { margin-left: 0; }
+  .place .cur-filters .push { margin-left: 0; }
   .cur-head .fgrp, .cur-sumrow, .cur-sum { flex-wrap: wrap; min-width: 0; max-width: 100%; }
   .cur-partial { overflow-wrap: anywhere; }
   .lanes { padding-inline: var(--sp-3); scroll-snap-type: x proximity; }
   .lane { scroll-snap-align: start; }
-  .bside { position: absolute; top: 0; right: 0; bottom: 0; left: 0; z-index: var(--z-panel); border-left: 0; }
+  .place .bside { position: absolute; top: 0; right: 0; bottom: 0; left: 0; z-index: var(--z-panel); border-left: 0; }
 
   /* Overview: Answer here, then the rest, in one column */
   .ova { grid-template-columns: minmax(0, 1fr); overflow-y: auto; }
@@ -45,12 +47,12 @@
   .obv-tabs > * { flex: none; }
 
   /* Settings: its sections scroll across the top, and a row stacks */
-  .set { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-  .set-nav { padding: var(--sp-2) var(--sp-3); border-right: 0; border-bottom: var(--line-hair) solid var(--c-line); overflow: visible; }
-  .set-secs { flex-direction: row; overflow-x: auto; scrollbar-width: none; }
-  .set-secs > * { flex: none; width: auto; }
+  .place .set { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .place .set-nav { padding: var(--sp-2) var(--sp-3); border-right: 0; border-bottom: var(--line-hair) solid var(--c-line); overflow: visible; }
+  .place .set-secs { flex-direction: row; overflow-x: auto; scrollbar-width: none; }
+  .place .set-secs > * { flex: none; width: auto; }
   .set-go > :not(.t) { display: none; }
-  .srow { grid-template-columns: minmax(0, 1fr); }
+  .place .srow { grid-template-columns: minmax(0, 1fr); }
 
   /* Setup */
   .ob-scrim { padding: var(--sp-2); }

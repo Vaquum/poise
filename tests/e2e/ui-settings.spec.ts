@@ -318,6 +318,15 @@ for (const width of [375, 768, 1000]) {
   })
 }
 
+test('at 375 pixels Settings stacks: its sections run across the top, and a row stacks', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 })
+  await settings(page)
+  const columns = (selector: string) => page.locator(selector).first().evaluate((el) => getComputedStyle(el).gridTemplateColumns.split(' ').length)
+  expect(await columns('.set')).toBe(1)
+  expect(await columns('.srow')).toBe(1)
+  expect(await page.locator('.set-secs').evaluate((el) => getComputedStyle(el).flexDirection)).toBe('row')
+})
+
 test('Snippets, Extensions, Publishing and Behaviors open as classic holds them, and leave cleanly', async ({ page }) => {
   const errors: string[] = []
   page.on('pageerror', (error) => errors.push(`${error.message} ${error.stack?.split('\n')[1] ?? ''}`))
@@ -335,4 +344,10 @@ test('behind the gateway, a workspace still to be set up opens setup at GitHub, 
   await settings(page, { mode: 'service', onboarding: { status: 'pending', step: 'theme' } }, '/?view=overview')
   await expect(page.getByRole('dialog')).toBeVisible()
   await expect(page.locator('#ob-title')).toHaveText('Connect your GitHub account')
+})
+
+test('Settings → Manager explains Rhythm on a direct load, without Overview', async ({ page }) => {
+  await settings(page, {}, '/?view=settings&settings=manager')
+  await page.locator('[data-ref="mgr.rhythm"]').first().hover()
+  await expect(page.getByRole('tooltip')).toContainText('How many workers the Manager keeps on tasks at once')
 })

@@ -36,12 +36,18 @@ export const mount: MountPlace = async ({ root, address, query }) => {
   await initEditorView()
   // The route back sits first in the Editor's own header, never over its controls.
   viewEl.querySelector(':scope > .view-header')?.prepend(back)
+  // The document chat opens under the header, however many rows it wraps to.
+  const head = viewEl.querySelector<HTMLElement>(':scope > .view-header')
+  const sizes = new ResizeObserver(() => { if (head) document.body.style.setProperty('--editor-head-h', `${head.offsetHeight}px`) })
+  if (head) sizes.observe(head)
   // A document another place asked for opens once the Editor is up.
   const slug = query.get('doc')
   const doc = takeEditorDoc() ?? (slug ? { slug } : null)
   if (doc) window.dispatchEvent(new CustomEvent('poise:editor-load-doc', { detail: doc }))
   return () => {
     back.remove()
+    sizes.disconnect()
+    document.body.style.removeProperty('--editor-head-h')
     stopEditorRefresh()
     // As classic's views do on leaving: the document chat closes, releasing its
     // hold on the chat, so Chat reads the conversation whole if it opens next.

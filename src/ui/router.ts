@@ -1,7 +1,7 @@
 // Moving between places (#556, Design). One page: the frame stays, and the
 // place the address names mounts under it. Each move is a history entry, so
 // Back and Forward work; a place's listeners, timers and polling stop when it
-// leaves, and it arrives through the motion runtime, once per mount.
+// leaves, and it arrives through the motion runtime once: returning is instant.
 import { reveal } from '../motion'
 import { PLACE_NAMES, readAddress, type Address, type Place } from './address'
 import { closeMenus, showPlace } from './shell'
@@ -34,6 +34,8 @@ const PLACES: Record<Place, () => Promise<PlaceModule>> = {
 }
 // As classic's: Chat, the Manager and the Editor only fade in.
 const FADE_ONLY = new Set<Place>(['chat', 'manager', 'editor'])
+// A place enters once, when it is first opened; returning to it is instant (DESIGN-BRIEF, Motion).
+const entered = new Set<Place>()
 
 let root: HTMLElement
 let current: { place: Place, controller: AbortController, leave?: () => void } | null = null
@@ -70,7 +72,7 @@ async function mountAddress(): Promise<void> {
   if (current?.controller !== controller) { if (typeof leave === 'function') leave(); return }
   if (typeof leave === 'function') current.leave = leave
   paintTerms(root)
-  reveal(root, FADE_ONLY.has(address.place) ? { distance: 0 } : {})
+  if (!entered.has(address.place)) { entered.add(address.place); reveal(root, FADE_ONLY.has(address.place) ? { distance: 0 } : {}) }
 }
 
 /** Moves to `href`, a link within this page, as a new history entry. */
