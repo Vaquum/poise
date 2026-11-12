@@ -11,7 +11,8 @@
 # started by hand checks the same gate, so applying settings needs green
 # CI on the tip too. Deploys therefore land once CI passes, about ten to
 # twenty minutes after the push, and a commit CI never tested never
-# deploys.
+# deploys. The host apply and exact-release proof are distinct steps so Sync
+# can retry a failed apply and resume an applied rollout's proof separately.
 name: Deploy
 
 on:
@@ -78,4 +79,12 @@ jobs:
           POISE_GITHUB_CLIENT_SECRET: ${{ secrets.POISE_GITHUB_CLIENT_SECRET }}
           POISE_GOOGLE_CLIENT_SECRET: ${{ secrets.POISE_GOOGLE_CLIENT_SECRET }}
           POISE_TEST_RENDER_API_KEY: ${{ secrets.POISE_TEST_RENDER_API_KEY }}
+          APPLY_ONLY: 'true'
         run: deploy/actions/deploy.sh
+
+      - name: Verify rollout ${{ steps.gate.outputs.sha }}
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          SHA: ${{ steps.gate.outputs.sha }}
+          DEPLOY_PATH: ${{ vars.POISE_DEPLOY_PATH || '/srv/poise' }}
+        run: deploy/actions/verify.sh

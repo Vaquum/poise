@@ -1185,6 +1185,8 @@ bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
 receipt through the existing workspace health/image proof without initiating
 another rollout; [Upgrades](Operating.md#upgrades) defines its outcomes and
 retained evidence. This adds no gateway or workspace API.
+Fork Deploy verifies the receipt in a separate step after host apply. Sync
+rechecks the current applied receipt after the bounded wait.
 The Sync workflow's separate release observer uses the existing five-minute
 schedule and Actions summary even when upstream sync is disabled. It reads
 exact-main workflow evidence, retained rollout inventory and fresh workspace

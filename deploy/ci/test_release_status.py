@@ -179,6 +179,8 @@ class ReleaseStatusTest(unittest.TestCase):
         self.actions.green()
         self.actions.deploy_run(conclusion='failure', apply='failure')
         self.assertIn('Deploy: failure', self.observe())
+        self.actions.deploy_run(conclusion='failure', apply='success')
+        self.assertIn('The host applied the release.', self.observe())
 
     def test_vanished_inventory_only_workspace_keeps_episode_open(self):
         self.actions.fixture('upstream-tip.json', {'sha': self.actions.TIP})

@@ -489,6 +489,7 @@ The wake sends only `ref: main`, never a candidate SHA. The fork still requires
 `POISE_UPSTREAM_SYNC=true`; forks cannot dispatch the production wake themselves.
 
 Sync retains its five-minute schedule to reconcile missed or failed wakes.
+A failed Deploy completion also wakes Sync.
 Duplicate or stale wakes enter the same serialized Sync, which reads current
 main: they introduce no additional deployment or rollback. This does not prevent
 an operator from reapplying settings through Deploy on the same green tip.
@@ -500,19 +501,24 @@ release the candidate, nor does a successful Deploy that skipped its apply
 step. If the completion wake is missed after both required workflows pass,
 Sync dispatches the normal gated Deploy and retains the candidate for that
 tick, even with nothing new upstream. Queued or running Deploys suppress
-recovery, as does a successful run's `Deploy <sha>` step: a run recorded on an
+recovery, as does a successful `Deploy <sha>` step: a run recorded on an
 older head can deploy the current tip.
 Then Sync merges directly to the newest upstream main, coalescing changes
 that arrived during verification. Forks without deployment keep syncing every
 five minutes. GitHub may start a scheduled run some minutes late when it is busy.
 
-Missing verification, a failed or cancelled required workflow or Deploy attempt,
-or two hours since verification began lets the next sync admit a newer fix;
-it never permits deployment without that fix's own required CI. API errors stop
-the sync visibly. Sync's Actions summary names waiting, blocked and superseded
-SHAs and links the available runs. A completed Deploy attempt alone is not a
-serving claim: the existing [workspace verification](#upgrades) and
-`/api/service/health`'s `release` establish the commit actually serving.
+Missing verification, a failed or cancelled required workflow or host apply,
+or two hours since verification began lets Sync admit a newer fix with its own
+required CI. When the fork stays on the same candidate, Sync retries the first
+failed, cancelled or timed-out CI, Caller or host apply attempt once. An
+exhausted retry remains visible in Actions. Deployment-enabled forks reconcile
+their own main even with upstream merging disabled. API errors stop Sync visibly.
+Its summary names waiting, blocked and superseded SHAs and links the runs.
+
+Deploy records host apply and workspace proof as separate steps. The
+[workspace verifier](#upgrades) establishes the commit actually serving.
+After a proof timeout or interruption, Sync rechecks the current applied
+rollout using the original workspace inventory and image ID.
 A change to Poise alone then reaches the running workspaces within five more
 minutes. A change to the system under `deploy/runtime/` first waits for their
 running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
@@ -942,6 +948,11 @@ use the original image ID, even if another build has retagged `latest`.
 Timeout, missing workspaces and unreadable health remain `pending`, and the
 command exits nonzero. Invoke it again later to observe activation. A different
 `desiredRelease` alone never establishes failure or supersession.
+
+Deployment-enabled forks recheck pending host-applied rollouts on the Sync
+schedule. The proof uses the exact active release and build and requires no
+pending switch. The recheck performs only inventory and health reads and
+updates the retained receipt. Check a legacy receipt by its rollout ID.
 
 The outcome becomes `complete` only after every expected workspace passes the
 proof. A supervisor `failed` marker for the exact target release establishes

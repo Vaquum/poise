@@ -158,7 +158,9 @@ def workspace_proof(deploy, candidate, remembered=frozenset()):
             serving.append(f'{handle}: {release}')
             notes.append(f'{handle}: active {release}; desired {health.get("desiredRelease")}; '
                          f'switching {health.get("switching")}; pending since {health.get("pendingSince")}; '
-                         f'waiting on {health.get("switchWaitingOn")}')
+                         f'waiting on {health.get("switchWaitingOn")}; drain {health.get("draining")}; '
+                         f'running Caller {health.get("runningCallerCalls")}; '
+                         f'unsettled native Calls {health.get("unsettledNativeCalls")}')
             if release == candidate and not health.get('switching'):
                 proven.add(handle)
             if release != candidate:
@@ -219,9 +221,9 @@ def stage(evidence, proof):
         steps = run.get('steps', [])
         attempted = [step for step in steps if step.get('name') == f'Deploy {evidence["candidate"]}'
                      and step.get('conclusion') not in (None, 'skipped')]
-        if run['conclusion'] == 'success' and any(step['conclusion'] == 'success' for step in attempted):
+        if any(step['conclusion'] == 'success' for step in attempted):
             return 'workspace switch: intended release not verified serving', \
-                'Inspect the workspace health and retained rollout on the deployment host; allow the normal switch/drain to finish. ' \
+                'The host applied the release. Sync rechecks the retained proof while the gateway handles activation. ' \
                 f'[Deploy evidence]({run["html_url"]}).', False
         admitted = any(step.get('name') == 'Refuse any tip whose required CI did not pass on it'
                        and (step.get('started_at') or '') >= verified_at for step in steps)
