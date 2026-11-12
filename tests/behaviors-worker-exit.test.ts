@@ -2,7 +2,8 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { DetachedProcessExit, DetachedSpawnOptions } from '../server/process'
-import { agentLog, fixture, launchReviewBeforeCrash, mocks } from './behaviors-runtime-fixture'
+import checkoutSuperseded from './fixtures/review-checkout-superseded.json'
+import { agentLog, fixture, HEAD_SHA, NEXT_HEAD_SHA, launchReviewBeforeCrash, mocks } from './behaviors-runtime-fixture'
 
 async function reviewWorker() {
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
@@ -39,6 +40,22 @@ async function reviewWorker() {
 }
 
 describe('review worker exit diagnostics', () => {
+  it.each([HEAD_SHA, NEXT_HEAD_SHA])('suppresses a generic worker error only for its durable supersession (%s)', async (head) => {
+    const worker = await reviewWorker()
+    try {
+      const superseded = { ...worker.timeout, ...checkoutSuperseded, head_sha: head, response: 'retained supersession audit' }
+      fixture.agentLogs = [superseded]
+      await worker.exit({ code: 1, signal: null })
+
+      expect(worker.events().filter((event) => event.severity === 'error')).toEqual([])
+      expect(fixture.agentLogs).toEqual([superseded])
+      expect(worker.database.listBehaviorLaunchClaims('review-new-prs')[0]).toMatchObject({
+        claimId: worker.claim.claimId, launchError: 'worker exited exit 1; awaiting durable agent result',
+      })
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    } finally { await worker.logging.stopLogging() }
+  })
+
   it.each([null, {
     version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'reviewing',
     outcome: 'timeout', timeout_seconds: 1413, provider_started: true,
@@ -182,9 +199,11 @@ describe('review worker exit diagnostics', () => {
     'missing result', 'unreadable logs', 'malformed diagnostic', 'unavailable evidence', 'foreign invocation',
     'different head', 'different reviewer', 'different source', 'older result', 'unfinished result',
     'different failure', 'signal', 'process error', 'different exit', 'rejected capture',
-  ])('keeps a visible worker failure for %s', async (scenario) => {
+  ].flatMap((scenario) => (scenario === 'rejected capture' ? [false] : [false, true])
+    .map((superseded) => ({ scenario, superseded }))))('keeps a visible worker failure for $scenario (superseded=$superseded)', async ({ scenario, superseded }) => {
     const worker = await reviewWorker()
     try {
+      if (superseded) Object.assign(worker.timeout, checkoutSuperseded)
       fixture.agentLogs = [worker.timeout]
       const result: DetachedProcessExit = { code: 1, signal: null }
       if (scenario === 'missing result') fixture.agentLogs = []

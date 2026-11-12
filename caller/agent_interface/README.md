@@ -370,6 +370,14 @@ observed head, preserving the launch provenance. Poise then reconsiders the PR
 through its existing scheduler. Normal completion still uses the existing
 terminal head checks and authoritative review outcomes.
 
+Before provider invocation, verified head or base drift at either PR packet guard
+also settles as `superseded`. The packet CLI returns the original repository and
+PR with the validated observed head; Caller checks that target before caching or
+launching a provider. Base-only drift may retain the expected head. The audit
+response and launch provenance remain durable, and normal reconciliation admits
+the current revision. Missing or malformed revisions and packet-read failures
+remain errors.
+
 ### Several reviewers on one head
 
 Every submission answers with GitHub's `review_id`, and a run records it as

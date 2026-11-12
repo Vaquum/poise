@@ -113,6 +113,12 @@ Each behavior follows one transaction shape:
    an expected action/outcome pair on the expected head.
 6. Dead-letter uncertain terminal work. Never retry an ambiguous side effect.
 
+Verified PR packet head or base drift settles through Caller's existing
+`superseded` outcome before provider invocation or publication. A matching,
+durable, no-publication supersession also suppresses a generic review worker
+exit Error; missing, unreadable or mismatched evidence and independent process
+failures remain visible. Normal reconciliation reconsiders the current revision.
+
 Managed accounts interleave ordinary refreshes with resumable daily
 reconciliation chunks (20-second work budget, plus in-flight GraphQL work).
 Partial maintenance is not a completed daily reconciliation and does not

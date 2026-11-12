@@ -3038,7 +3038,9 @@ function settleClaimAfterExit(
         const snapshot = parseAgentLogList(rows)
         const call = snapshot.entries[0]
         if (rows.length === 1 && snapshot.quarantined.length === 0
-          && call.status === 'failed' && call.error_code === 'review_budget_exhausted'
+          && ((call.status === 'failed' && call.error_code === 'review_budget_exhausted')
+            || (call.status === 'superseded' && call.outcome === 'superseded' && call.action === null
+              && call.review_id == null && !call.error && call.error_code == null))
           && call.behavior === 'pr_review' && call.behavior === claim.launchBehavior
           && call.repo === claim.launchRepo && call.pr_id === String(claim.launchPr)
           && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
@@ -3049,6 +3051,11 @@ function settleClaimAfterExit(
           && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
           && Date.parse(call.completed_at ?? '') >= Date.parse(agentCallStartedAt(call))) {
           const row = objectValue(rows[0], 'worker exit Caller evidence') as Record<string, unknown>
+          if (call.status === 'superseded') {
+            if (row.evidence_unavailable == null && row.diagnostic == null) return
+            console.error(message)
+            return
+          }
           // Match periodic --diagnostics truncation and its 64 KiB envelope
           // fallback so delayed collection replays exactly.
           let error = typeof row.error === 'string' ? truncateCodePoints(row.error, 8192) : row.error

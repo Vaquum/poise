@@ -90,6 +90,18 @@ class TestReviewSummaries(IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "GitHub review read failed"):
             await self.packet()
 
+    async def test_missing_or_malformed_revisions_never_prove_packet_supersession(self):
+        initial = {"head": {"sha": HEAD}, "base": {"sha": BASE}}
+        for phase in ("before", "after"):
+            for field in ("head", "base"):
+                for invalid in (None, {}, {"sha": ""}, {"sha": "z" * 40}):
+                    observed = {"head": {"sha": "c" * 40}, "base": {"sha": "d" * 40}, field: invalid}
+                    with self.subTest(phase=phase, field=field, invalid=invalid), \
+                            patch.object(pr_review, "get_pull", AsyncMock(side_effect=[observed] if phase == "before" else [initial, observed])), \
+                            patch.object(pr_review, "review_diff", AsyncMock(return_value={})), \
+                            self.assertRaises(ValueError):
+                        await self.packet()
+
     async def test_review_summary_overflow_fails_instead_of_dropping_blockers(self):
         with patch.object(rd, "MAX_PACKET_BYTES", 6000):
             await self.packet()

@@ -46,6 +46,7 @@ tests/behaviors-approval.test.ts
 tests/behaviors-cutover.test.ts
 tests/behaviors-merge.test.ts
 tests/behaviors-outcomes.test.ts
+tests/behaviors-worker-exit.test.ts
 tests/behaviors-issue-review.test.ts
 tests/behaviors-resolve.test.ts
 tests/behaviors-stale-mirror.test.ts
