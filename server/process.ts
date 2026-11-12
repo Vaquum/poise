@@ -569,7 +569,13 @@ function runChild(request: ChildRequest): RunningChild {
   const call: WorkerCall = { resolve: () => {}, killSignal: request.killSignal, pid: null, aborted: false }
   const outcome = new Promise<ChildOutcome>((resolve) => { call.resolve = resolve })
   state.calls.set(id, call)
-  state.worker.postMessage({ type: 'run', id, request } satisfies ProcessWorkerRequest)
+  try {
+    state.worker.postMessage({ type: 'run', id, request } satisfies ProcessWorkerRequest)
+  } catch {
+    // Nothing started: a request the worker cannot take starts here instead.
+    state.calls.delete(id)
+    return startChild(request)
+  }
   return {
     // An abort taken here before the outcome arrived wins over an exit the
     // worker saw first, as an abort before the child's close always has.
