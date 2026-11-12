@@ -19,6 +19,7 @@ from .db import (
     init_db,
     list_users,
     prune_items_for_repo,
+    prune_missing_pulls,
     prune_repos,
     replace_associations,
     replace_child_rows,
@@ -29,7 +30,14 @@ from .db import (
     utc_now,
 )
 from .extract import extract_associations
-from .github_api import ITEM_GRAPH_BATCH_SIZE, GitHubClient, GitHubOrgReader, GitHubRateLimitError, parse_graphql_datetime
+from .github_api import (
+    ITEM_GRAPH_BATCH_SIZE,
+    GitHubClient,
+    GitHubOrgReader,
+    GitHubRateLimitError,
+    PullReconciliation,
+    parse_graphql_datetime,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -296,6 +304,7 @@ def changed_items_for_repos(
     since: str | None,
 ) -> dict[str, list[dict[str, Any]]]:
     changed = {}
+    reconciliations = []
     # Keep each batch's connection set uniform; disabled Issues never exclude PRs.
     for include_issues in (True, False):
         batch = [repo for repo in repos if bool(repo.get("has_issues")) == include_issues]
@@ -310,7 +319,17 @@ def changed_items_for_repos(
         )
         if set(result) != set(names):
             raise RuntimeError("changed-item batch does not cover the requested repositories")
-        changed.update(result)
+        for repo in batch:
+            name = repo["full_name"]
+            items = result[name]
+            if isinstance(items, PullReconciliation):
+                reconciliations.append((int(repo["id"]), items.missing_ids))
+                changed[name] = items.items
+            else:
+                changed[name] = items
+    with conn:
+        for repo_id, missing_ids in reconciliations:
+            prune_missing_pulls(conn, repo_id, missing_ids)
     return changed
 
 

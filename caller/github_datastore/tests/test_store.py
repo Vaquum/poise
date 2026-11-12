@@ -13,6 +13,7 @@ from github_datastore.db import (
     set_state,
     upsert_repo,
 )
+from github_datastore.github_api import PullReconciliation
 from github_datastore.store import (
     apply_repo_filter,
     stored_pr_updated_at_by_id,
@@ -737,6 +738,39 @@ class StoreTest(unittest.TestCase):
                 stored_pr_updated_at_by_id(conn, 10),
                 {100: "2026-08-29T12:01:00Z"},
             )
+
+    def test_incremental_sync_prunes_only_confirmed_missing_prs(self) -> None:
+        watermark = "2026-08-29T12:00:00Z"
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            initialize_sync_state(db_path, watermark)
+            conn = connect(db_path)
+            self.addCleanup(conn.close)
+            store_expanded(conn, base_expanded("keep this issue", []))
+            for item_id, number in ((101, 2), (102, 3)):
+                expanded = base_expanded("cached pull request", [])
+                node_id = f"PR_{item_id}"
+                expanded["is_pr"] = True
+                expanded["issue"].update(
+                    id=item_id, node_id=node_id, number=number, pull_request={"node_id": node_id},
+                    updated_at=watermark,
+                )
+                expanded["pull"] = {
+                    "id": item_id, "node_id": node_id, "requested_reviewers": [], "assignees": [],
+                    "merged_by": None, "merged_at": None, "updated_at": watermark,
+                }
+                store_expanded(conn, expanded)
+
+            with patch("github_datastore.store.GitHubOrgReader") as reader:
+                reader.return_value.list_org_repos.return_value = [repo_row()]
+                reader.return_value.list_repos_changed_items.return_value = {
+                    "Vaquum/Test": PullReconciliation([], {101}),
+                }
+                self.assertTrue(sync_once(db_path, workers=1))
+
+            self.assertEqual([row[0] for row in conn.execute("SELECT item_id FROM items ORDER BY item_id")], [100, 102])
+            self.assertEqual([row[0] for row in conn.execute("SELECT item_id FROM item_fts ORDER BY item_id")], [100, 102])
+            self.assertGreater(get_state(conn, "org", "last_sync_at"), watermark)
 
     def test_rebuild_replaces_associations_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

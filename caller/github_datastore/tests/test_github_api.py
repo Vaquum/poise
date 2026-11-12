@@ -9,6 +9,7 @@ from github_datastore.github_api import (
     GitHubApiError,
     GitHubEnumerationDriftError,
     GitHubOrgReader,
+    PullReconciliation,
 )
 
 
@@ -756,7 +757,6 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
         cases = [
             (self.batch_result("owner/repo", [], [], issue_total_count=1), [], {}, drifting),
             (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)], pull_total_count=2), [], {}, drifting),
-            (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)]), [], {999: WATERMARK}, 1),
             (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)] * 2), [], {}, 1),
             (self.batch_result("owner/repo", [], [], pull_has_next=True, pull_cursor="cursor", pull_total_count=2),
              [{"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], True, "cursor", 2)}], {}, 1),
@@ -770,6 +770,48 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
                     responses.append({"repo_0": copy.deepcopy(first)})
                     responses.extend(copy.deepcopy(continuations))
                 GitHubOrgReader(ScriptedClient(responses)).list_repos_changed_items(["owner/repo"], WATERMARK, {"owner/repo": stored})
+
+    def test_batch_reconciles_only_pr_ids_absent_from_both_complete_reads(self) -> None:
+        name = "owner/repo"
+        other = "owner/sibling"
+        first = self.batch_result(name, [], [pull_stub(1, WATERMARK)])
+        second = self.batch_result(name, [], [pull_stub(1, WATERMARK), pull_stub(2, WATERMARK)])
+        sibling = self.batch_result(other, [], [pull_stub(4, WATERMARK)])
+        client = ScriptedClient([{"repo_0": first, "repo_1": sibling}, {"repo_0": second}])
+        stored = {name: {101: WATERMARK, 102: "2026-08-29T11:00:00Z", 103: WATERMARK}}
+
+        result = GitHubOrgReader(client).list_repos_changed_items([name, other], WATERMARK, stored)
+
+        self.assertIsInstance(result[name], PullReconciliation)
+        self.assertEqual(result[name].missing_ids, {103})
+        self.assertEqual([row["id"] for row in result[name].items], [102])
+        self.assertEqual([row["id"] for row in result[other]], [104])
+        client.assert_exhausted()
+
+    def test_batch_rejects_a_newly_missing_pr_in_the_confirmation(self) -> None:
+        name = "owner/repo"
+        client = ScriptedClient([
+            {"repo_0": self.batch_result(name, [], [pull_stub(1, WATERMARK)])},
+            {"repo_0": self.batch_result(name, [], [pull_stub(2, WATERMARK)])},
+        ])
+
+        with self.assertRaisesRegex(GitHubApiError, r"missing from GraphQL.*\[101\]"):
+            GitHubOrgReader(client).list_repos_changed_items(
+                [name], WATERMARK, {name: {101: WATERMARK, 102: WATERMARK}}
+            )
+        client.assert_exhausted()
+
+    def test_batch_rejects_incomplete_confirmation(self) -> None:
+        name = "owner/repo"
+        first = self.batch_result(name, [], [pull_stub(1, WATERMARK)])
+        partial = self.batch_result(name, [], [pull_stub(1, WATERMARK)], pull_total_count=2)
+        client = ScriptedClient([{"repo_0": first}] + [{"repo_0": partial}] * ENUMERATION_DRIFT_MAX_ATTEMPTS)
+
+        with self.assertRaises(GitHubEnumerationDriftError):
+            GitHubOrgReader(client).list_repos_changed_items(
+                [name], WATERMARK, {name: {101: WATERMARK, 102: WATERMARK}}
+            )
+        client.assert_exhausted()
 
     def test_continuations_reject_incomplete_duplicate_and_inaccessible_data(self) -> None:
         first = self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)], pull_has_next=True, pull_cursor="first", pull_total_count=2)

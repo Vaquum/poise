@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, TypeVar
 
@@ -29,6 +30,18 @@ class GitHubEnumerationDriftError(GitHubApiError):
     first page with the original watermark. Drift past the attempt budget
     still fails loudly.
     """
+
+
+class GitHubStoredPullsMissingError(GitHubApiError):
+    def __init__(self, full_name: str, ids: set[int]) -> None:
+        self.ids = ids
+        super().__init__(f"stored pull requests missing from GraphQL for {full_name}: {sorted(ids)}")
+
+
+@dataclass(frozen=True)
+class PullReconciliation:
+    items: list[dict[str, object]]
+    missing_ids: set[int]
 
 
 _T = TypeVar("_T")
@@ -566,14 +579,14 @@ class GitHubOrgReader:
         stored_pr_updated_at: dict[str, dict[int, str]],
         *,
         include_issues: bool = True,
-    ) -> dict[str, list[dict[str, Any]]]:
+    ) -> dict[str, list[dict[str, Any]] | PullReconciliation]:
         if len({name.casefold() for name in full_names}) != len(full_names):
             raise ValueError("duplicate repositories in changed-item batch")
         if since is None:
             return {name: self.list_repo_issues(name) if include_issues else
                     self.list_repo_issues(name, include_issues=False) for name in full_names}
         parse_graphql_datetime(since, "repository batch watermark")
-        result: dict[str, list[dict[str, Any]]] = {}
+        result: dict[str, list[dict[str, Any]] | PullReconciliation] = {}
         # Only minimal stubs are batched. Their complete expanded graphs still
         # supply all direct-association evidence through the existing reader.
         for start in range(0, len(full_names), 20):
@@ -582,8 +595,22 @@ class GitHubOrgReader:
                 lambda: self._list_changed_item_chunk(names, since, include_issues=include_issues)
             )
             for full_name, (issues, pulls) in completed.items():
-                pulls = self._changed_pull_nodes(full_name, pulls, stored_pr_updated_at.get(full_name, {}))
-                result[full_name] = self._merge_item_nodes(full_name, issues, pulls)
+                stored = stored_pr_updated_at.get(full_name, {})
+                missing_ids: set[int] = set()
+                try:
+                    pulls = self._changed_pull_nodes(full_name, pulls, stored)
+                except GitHubStoredPullsMissingError as error:
+                    # Confirm absence with a fresh, complete repository enumeration.
+                    repeated = _retry_enumeration_on_drift(
+                        lambda: self._list_changed_item_chunk([full_name], since, include_issues=include_issues)
+                    )
+                    issues, pulls = repeated[full_name]
+                    missing_ids = error.ids - {int(required_id(node, "pr")) for node in pulls}
+                    pulls = self._changed_pull_nodes(
+                        full_name, pulls, {pull_id: updated for pull_id, updated in stored.items() if pull_id not in missing_ids}
+                    )
+                items = self._merge_item_nodes(full_name, issues, pulls)
+                result[full_name] = PullReconciliation(items, missing_ids) if missing_ids else items
         return result
 
     def _list_changed_item_chunk(
@@ -824,11 +851,9 @@ class GitHubOrgReader:
             if updated_at != stored_at:
                 changed.append(node)
 
-        missing_ids = sorted(set(stored_pr_updated_at) - set(current))
+        missing_ids = set(stored_pr_updated_at) - current.keys()
         if missing_ids:
-            raise GitHubApiError(
-                f"stored pull requests missing from GraphQL for {full_name}: {missing_ids}"
-            )
+            raise GitHubStoredPullsMissingError(full_name, missing_ids)
         return changed
 
     def _merge_item_nodes(
