@@ -327,6 +327,22 @@ only after persistence. The operator owns delivery/retry and must not forward
 unrelated business-service logs. No public or workspace ingestion endpoint is
 added. Unconfigured external ingress coverage remains unknown, not healthy.
 
+The deployment verifier uses the same private socket through the operator
+`deployment` command, with a bounded health snapshot. An observed replacement
+drain that exhausts its positive verification budget (normally 600 seconds)
+retains one `workspace.deployment.pause` Error per full rollout ID and workspace.
+Zero-second receipt reads and routine waits create no Error. The requested
+revision comes from the receipt; health's desired release and switch age remain
+context, with unavailable blocker/retry evidence unknown. The first accepted
+snapshot retains the exhausted budget, elapsed seconds, serving revision and
+admission state unchanged across verifier processes. Durable observation state
+prevents delayed evidence from reopening a recovered pause. A Warning in the
+same incident records observed restored admissions or the same rollout's exact
+completion proof; missing health, supersession and another rollout's completion
+cannot establish recovery. The rollout stays pending until its existing release
+and build/image verification gates pass. Diagnostic delivery failure is visible
+on stderr and does not change those gates.
+
 External Caddy installations can instead run the bounded continuous
 [operator reader](../deploy/ingress/README.md). A dedicated forced-command SSH
 key reaches only `ingress-stream`. Its version-1 handshake returns the configured

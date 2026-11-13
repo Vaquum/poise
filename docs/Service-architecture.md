@@ -1370,6 +1370,11 @@ at its last confirmed time; restart remains initializing until a fresh scan.
 Canonical host selection and redaction run on the edge before transmission,
 then attribution and normalization run again at the gateway. See the
 [external reader installation contract](../deploy/ingress/README.md).
+The host deployment verifier also sends bounded observations through that
+private operator socket. The gateway retains rollout/workspace deadline and
+recovery diagnostics using the existing v1 envelope/store, without a public
+ingestion route or a release/replacement control change; [Logging](Logging.md#collection-and-operation)
+defines the budget, deduplication and recovery contract.
 The edge also derives the fixed `/api/link/events` route label before removing
 the URI. All ingress paths apply the narrow native cancellation exception and
 retain other redacted causes as defined in [Logging](Logging.md#collection-and-operation).

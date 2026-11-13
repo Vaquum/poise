@@ -4,10 +4,11 @@ import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { once } from 'node:events'
 import { receiveIngress, receiveManualIngress } from './ingress.js'
+import { receiveDeployment } from './deployment.js'
 import type { DiagnosticRuntime } from './runtime.js'
 
 /** A forced-command process relays bytes; only the gateway owns a writable store. */
-export async function relayIngress(path: string, command: 'ingress' | 'ingress-stream', stdin: AsyncIterable<Buffer | string>, write: (line: string) => void): Promise<void> {
+export async function relayIngress(path: string, command: 'ingress' | 'ingress-stream' | 'deployment', stdin: AsyncIterable<Buffer | string>, write: (line: string) => void): Promise<void> {
   const socket = createConnection({ path })
   const timer = setTimeout(() => socket.destroy(new Error('Ingress relay exceeded 30 seconds')), 30_000)
   let reply = '', size = 0, lines = 0
@@ -30,9 +31,9 @@ export async function relayIngress(path: string, command: 'ingress' | 'ingress-s
     socket.write(command + '\n')
     await Promise.all([ended, pipeline(Readable.from(stdin), new Transform({ transform(chunk: Buffer, _encoding, done) {
       size += chunk.length
-      done(size > (command === 'ingress' ? 64 * 1024 : 1024 * 1024) ? new Error('Ingress input exceeds its bound') : null, chunk)
+      done(size > (command === 'ingress-stream' ? 1024 * 1024 : 64 * 1024) ? new Error('Ingress input exceeds its bound') : null, chunk)
     } }), socket)])
-    if (reply || lines !== (command === 'ingress' ? 1 : size ? 2 : 1)) throw new Error('Ingress acknowledgement is incomplete')
+    if (reply || lines !== (command === 'ingress-stream' && size ? 2 : 1)) throw new Error('Ingress acknowledgement is incomplete')
   } finally { clearTimeout(timer); socket.destroy() }
 }
 
@@ -76,6 +77,7 @@ export async function startIngressSocket(runtime: DiagnosticRuntime, path: strin
       const write = (line: string) => { if (!socket.write(line + '\n')) throw new Error('Ingress client cannot consume its bounded reply') }
       if (command === 'ingress-stream') await receiveIngress(runtime.query((db) => db), domain, input(), write)
       else if (command === 'ingress') await receiveManualIngress(runtime.query((db) => db), domain, input(), write)
+      else if (command === 'deployment') await receiveDeployment(runtime.query((db) => db), input(), write)
       else throw new Error('Unknown ingress command')
       socket.end(() => socket.destroy())
     })().catch(() => { if (!socket.destroyed) socket.end('{"error":"Ingress delivery rejected"}\n', () => socket.destroy()) }).finally(() => { active = null })

@@ -75,6 +75,11 @@ elif args[:1] == ['inspect']:
     if missing:
         sys.exit(1)
 elif args[:1] == ['exec']:
+    if args[1:6] == ['-i', 'poise-gateway', 'node', 'dist/diagnostics/cli.js', 'deployment']:
+        state.setdefault('pause_reports', []).append({'args': args[6:], 'health': json.load(sys.stdin)})
+        save()
+        print('{"accepted":true,"events":0}')
+        sys.exit(0)
     if args[2] == 'sh':
         failure = state.get('failed_releases', {}).get(args[-1])
         if failure is None:
@@ -487,10 +492,11 @@ class VerifyTest(LibTest):
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'rollout records use Linux flock, as on the deployment host')
 class RolloutTest(LibTest):
-    def start(self, state, sha=NEW):
+    def start(self, state, sha=NEW, timeout=0):
         return self.lib('expected=$(workspace_handles) || exit 1; '
                         f'start_rollout {sha} poise-runtime:latest "$expected"; '
-                        'verify_timeout_seconds=0; '
+                        f'verify_timeout_seconds={timeout}; '
+                        'sleep() { SECONDS=$((SECONDS + verify_timeout_seconds)); }; '
                         f'verify_workspaces {sha} poise-runtime:latest "$expected"',
                         {'image_id': IMAGE_ID, 'image_release': sha, 'containers': [], 'health': {}, **state})
 
@@ -519,6 +525,44 @@ class RolloutTest(LibTest):
             state = json.load(file)
         with open(self.state, 'w') as file:
             json.dump({**state, **changes}, file)
+
+    def test_reports_the_real_verifier_budget_and_observed_recovery_with_receipt_identity(self):
+        alice = f'alice {OLD_IMAGE_ID} true /poise-ws-alice'
+        paused = json.loads(health(OLD))
+        paused['draining'] = True
+        result = self.start({'containers': [alice], 'health': {'poise-ws-alice': [json.dumps(paused)]}}, timeout=600)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rollout = self.current()
+
+        def reports():
+            with open(self.state) as file:
+                return json.load(file)['pause_reports']
+
+        first = reports()[0]
+        self.assertEqual(first['args'][:3], [rollout, 'alice', '600'])
+        self.assertGreaterEqual(int(first['args'][3]), 600)
+        self.assertEqual(first['args'][5], 'false')
+        self.assertEqual(first['health']['desiredRelease'], OLD)
+        self.assertEqual(first['health']['release'], OLD)
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        # A fresh receipt-only process observes the same drain without declaring
+        # its intentional zero-second wait an exhausted replacement budget.
+        self.assertEqual(self.resume(rollout).returncode, 1)
+        self.assertEqual(len(reports()), 1)
+        paused['draining'] = False
+        self.change_state(health={'poise-ws-alice': [json.dumps(paused)]})
+        self.assertEqual(self.resume(rollout).returncode, 1)
+        self.assertEqual(reports()[-1]['args'][2], '0')
+        self.assertEqual(reports()[-1]['args'][5], 'false')
+        self.assertFalse(reports()[-1]['health']['draining'])
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        self.change_state(health={'poise-ws-alice': [health(NEW)]})
+        self.assertEqual(self.resume(rollout).returncode, 0)
+        self.assertEqual(reports()[-1]['args'][5], 'true')
+        self.assertEqual(self.record(rollout)[4], 'complete')
+        count = len(reports())
+        self.assertEqual(self.resume(rollout).returncode, 0)
+        self.assertEqual(len(reports()), count)
 
     def test_timeout_then_new_process_observes_completion_without_deploying(self):
         alice = f'alice {IMAGE_ID} true /poise-ws-alice'
