@@ -7,7 +7,7 @@ export interface NoticeDiagnosticIdentity {
   organization?: string
   phase?: string
   deadline?: number
-  progress?: Record<string, string | number | null>
+  progress?: Record<string, string | number | null | Array<Record<string, string | number | null>>>
 }
 const context = new AsyncLocalStorage<NoticeDiagnosticIdentity>()
 const failures = new WeakMap<object, NoticeDiagnosticIdentity>()

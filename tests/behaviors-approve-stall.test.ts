@@ -230,27 +230,61 @@ describe('approve-prs under load', () => {
     expect(stored.nextRetryAtMs - stored.lastFailureAtMs).toBe(60 * 60_000)
   })
 
-  it('retains one cycle failure and the original Call when the deadline leaves another PR unread', async () => {
+  it.each([
+    { count: 4, evidence: 'owned' },
+    { count: 11, evidence: 'owned' },
+    { count: 11, evidence: 'missing' },
+    { count: 11, evidence: 'conflicting' },
+    { count: 11, evidence: 'uncertain writes' },
+    { count: 11, evidence: 'unreadable' },
+    { count: 11, evidence: 'unscheduled' },
+  ])('retains one deadline diagnostic with $evidence launch evidence and $count eligible PRs', async ({ count, evidence }) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
     const startedAt = Date.now()
-    const open = Array.from({ length: 11 }, (_, index) => ({
+    const open = Array.from({ length: count }, (_, index) => ({
       ...pr, number: 17 + index, url: `https://github.com/${pr.repo}/pull/${17 + index}`,
     }))
     const { database: db, behaviors: runtime } = await startApproving(open)
+    if (evidence === 'unscheduled') await runtime.stopBehaviorsRuntime()
+    openLaunchBudget(runtime)
+    const peerClaims = [18, 19].map((number) => db.claimPrOperationOwned(`${pr.repo}#${number}`, 600_000)!)
+    const peersEntered = deferred<void>()
+    const claimOperation = db.claimPrOperationOwned
+    const peersAttempted = new Set<number>()
+    vi.spyOn(db, 'claimPrOperationOwned').mockImplementation((target, leaseMs) => {
+      const number = Number(target.slice(target.lastIndexOf('#') + 1))
+      if (number === 18 || number === 19) peersAttempted.add(number)
+      if (peersAttempted.size === 2) peersEntered.resolve()
+      return claimOperation(target, leaseMs)
+    })
+    const changes = { entered: deferred<void>(), release: deferred<void>() }
+    const activity = { entered: deferred<void>(), release: deferred<void>() }
+    let readChanges = false, readActivity = false, timedOut = false
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
       if (command === 'agent-interface' && args[0] === '--diagnostics') return {
         stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
       }
+      if (command === 'agent-interface' && args[0] === '--logs' && timedOut && evidence === 'unreadable') {
+        throw new Error('launch evidence unreadable')
+      }
+      if (command === 'github-interface' && args.includes('--requests-json')) {
+        if (args[0] === '--requested-changes-addressed' && !readChanges) {
+          readChanges = true; changes.entered.resolve(); await changes.release.promise
+        }
+        if (args[0] === '--review-activity-since' && !readActivity) {
+          readActivity = true; activity.entered.resolve(); await activity.release.promise
+        }
+      }
       const result = await original(command, args, options)
       if (command !== 'github-interface' || args[0] !== '--requested-changes-addressed' || !args.includes('--requests-json')) return result
       const packet = JSON.parse(result.stdout)
-      // Only #17 in the first batch has an author response. #27 is still
-      // eligible, but its batch must not be read before the deadline expires.
+      // Four approvals are prepared. #18/#19 wait on peer claims, #20 is
+      // queued, and (in the larger fixture) #27 has not been read yet.
       return { ...result, stdout: JSON.stringify({ ...packet,
         records: (packet.records as Array<{ pull_number: number }>).map((record) =>
-          record.pull_number > 17 && record.pull_number < 27
+          record.pull_number > 20 && record.pull_number < 27
             ? { ...record, status: false, commits_after_request: 0, author_commits_after_request: 0, response_count: 0 } : record),
       }) }
     })
@@ -265,8 +299,11 @@ describe('approve-prs under load', () => {
     const callId = 'b'.repeat(32)
     mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
       if (args[1] !== '#17') return
-      fixture.agentLogs.push(agentLog({ id: callId, behavior: 'pr_approve',
-        correlation_id: args[args.indexOf('--correlation-id') + 1], expected_head: HEAD_SHA }))
+      const call = agentLog({ id: callId, behavior: 'pr_approve',
+        correlation_id: args[args.indexOf('--correlation-id') + 1], expected_head: HEAD_SHA,
+        ...(evidence === 'uncertain writes' ? { status: 'failed', error: 'publication outcome uncertain', review_id: 91 } : {}) })
+      if (evidence !== 'missing') fixture.agentLogs.push(call)
+      if (evidence === 'conflicting') fixture.agentLogs.push({ ...call, id: 'c'.repeat(32) })
       launched.resolve()
       await released.promise
     })
@@ -275,15 +312,23 @@ describe('approve-prs under load', () => {
     logging.startLogging()
     try {
       const run = runtime.runEnabledBehaviorsOnce()
+      await changes.entered.promise
+      await vi.advanceTimersByTimeAsync(25_000)
+      changes.release.resolve()
+      await activity.entered.promise
+      await vi.advanceTimersByTimeAsync(25_000)
+      activity.release.resolve()
       await preparing.promise
       // Preparation pauses the work clock: the retained deadline must come
       // from that clock, rather than startedAt + the 55-second work budget.
       await vi.advanceTimersByTimeAsync(3_000)
       prepared.resolve()
       await launched.promise
+      await peersEntered.promise
       const claim = db.listBehaviorLaunchClaims('approve-prs')[0]!
-      expect(claim.launchCorrelationId).toBe(fixture.agentLogs[0]!.correlation_id)
-      await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+      if (evidence !== 'missing') expect(claim.launchCorrelationId).toBe(fixture.agentLogs[0]!.correlation_id)
+      await vi.advanceTimersByTimeAsync(5_000)
+      timedOut = true
       released.resolve()
       await run
 
@@ -292,12 +337,22 @@ describe('approve-prs under load', () => {
         return logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false })).events
           .filter((event) => event.operation === 'application.behaviors')
       }
+      const proven = evidence === 'owned'
       expect(events()).toEqual([expect.objectContaining({
-        severity: 'error', occurrences: 1, behavior: 'approve-prs', phase: 'launch', exitCode: null,
+        severity: proven ? 'warning' : 'error', occurrences: 1, behavior: 'approve-prs', phase: 'launch', exitCode: null,
         message: 'The operation was aborted due to timeout',
         context: expect.objectContaining({ organization: 'Vaquum', deadline: startedAt + 58_000,
           exceptionName: 'TimeoutError', exceptionCode: 23,
-          progress: { eligiblePrs: 11, checksPending: 1, changeChecksRead: 10, activityChecksRead: 1, launched: 1, publication: 'unverified' } }),
+          progress: expect.objectContaining({ eligiblePrs: count, checksPending: count === 11 ? 1 : 0,
+            changeChecksRead: Math.min(count, 10), activityChecksRead: 4, launchesPending: 3,
+            launched: 1, publication: 'unverified', cursor: `${pr.repo}#19`,
+            disposition: proven ? 'deferred' : 'unresolved',
+            continuationAt: evidence === 'unscheduled' ? null : startedAt + 60_000,
+            ownershipError: evidence === 'unreadable' ? 'launch evidence unreadable' : null,
+            launches: [expect.objectContaining({ target: claim.target, claimId: claim.claimId,
+              correlationId: claim.launchCorrelationId, expectedHead: HEAD_SHA,
+              ownership: proven || evidence === 'unscheduled' ? 'owned' : 'unresolved',
+              ...(proven ? { callId, status: 'running' } : {}) })] }) }),
       })])
       expect(mocks.spawnDetached).toHaveBeenCalledOnce()
       expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual([])
@@ -308,32 +363,200 @@ describe('approve-prs under load', () => {
         command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json'))
         .flatMap(([, args]) => JSON.parse(args[args.indexOf('--requests-json') + 1]) as Array<{ number: number }>)
       expect(requests().some((request) => request.number === 27)).toBe(false)
+      if (!proven) return
 
-      // The next sweep reconciles the original running Call. The unread PR
-      // stays behind its existing retry gate until its next eligible sweep.
+      for (const peer of peerClaims) db.releasePrOperationOwned(peer)
+      // Drive the existing ticker: its next sweep reconciles the original
+      // Call and reconsiders the prepared-but-unstarted approvals. The unread
+      // PR stays behind its existing retry gate until a later scheduled tick.
       const retryAt = Date.now() + 60_000
       db.setMeta(`behavior_approve_prs_failure:${pr.repo}#27:check`, JSON.stringify({
         kind: 'operation', consecutiveFailures: 1, lastFailureAtMs: Date.now(), nextRetryAtMs: retryAt, error: 'check timed out',
       }))
       await resetLogCache()
-      await runtime.runEnabledBehaviorsOnce()
-      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      const resumed = deferred<void>()
+      const spawn = mocks.spawnDetached.getMockImplementation()!
+      mocks.spawnDetached.mockImplementation(async (...args) => {
+        await spawn(...args)
+        if (mocks.spawnDetached.mock.calls.length === 4) resumed.resolve()
+      })
+      await vi.advanceTimersByTimeAsync(2_000)
+      await resumed.promise
+      await vi.waitFor(() => expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual([]))
+      expect(mocks.spawnDetached.mock.calls.map(([, args]) => args[1]).sort()).toEqual(['#17', '#18', '#19', '#20'])
       expect(requests().some((request) => request.number === 27)).toBe(false)
       expect(db.listBehaviorLaunchClaims('approve-prs')).toContainEqual(expect.objectContaining({
         claimId: claim.claimId, launchCorrelationId: claim.launchCorrelationId, launchCallId: callId,
       }))
-      vi.setSystemTime(retryAt + 1)
-      await runtime.runEnabledBehaviorsOnce()
-      expect(mocks.spawnDetached.mock.calls.map(([, args]) => args[1])).toEqual(['#17', '#27'])
+      if (count === 11) {
+        const unreadLaunch = deferred<void>()
+        mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
+          if (args[1] === '#27') unreadLaunch.resolve()
+        })
+        await vi.advanceTimersByTimeAsync(60_000)
+        await unreadLaunch.promise
+        await vi.waitFor(() => expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual([]))
+        expect(Date.now()).toBeGreaterThan(retryAt)
+        expect(mocks.spawnDetached.mock.calls.map(([, args]) => args[1]).sort()).toEqual(['#17', '#18', '#19', '#20', '#27'])
+      }
       expect(db.listBehaviorLaunchClaims('approve-prs')).toContainEqual(expect.objectContaining({
         claimId: claim.claimId, launchCorrelationId: claim.launchCorrelationId, launchCallId: callId,
       }))
       expect(fixture.agentLogs).toEqual([expect.objectContaining({ id: callId, correlation_id: claim.claimId, status: 'running' })])
       expect(events()).toHaveLength(1)
     } finally {
+      changes.release.resolve()
+      activity.release.resolve()
       prepared.resolve()
       released.resolve()
       await logging.stopLogging()
+    }
+  })
+
+  it('retains prepared approvals when the deadline expires during a later activity log read', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const open = [17, 18].map((number) => ({
+      ...pr, number, url: `https://github.com/${pr.repo}/pull/${number}`,
+    }))
+    const { database: db, behaviors: runtime } = await startApproving(open)
+    recordCompletedInitialReview(db, { pull: open[1]!, callId: 'c'.repeat(32) })
+    openLaunchBudget(runtime)
+    const { resetAgentLogCache } = await import('../server/agent')
+    const original = mocks.runFile.getMockImplementation()!
+    let activityDone = false
+    const logGate = { entered: deferred<void>(), release: deferred<void>() }
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json')) {
+        const result = await original(command, args, options)
+        const packet = JSON.parse(result.stdout)
+        return { ...result, stdout: JSON.stringify({ ...packet,
+          records: (packet.records as Array<{ pull_number: number }>).map((record) =>
+            record.pull_number === 18
+              ? { ...record, status: false, has_change_request: false, reviewer_latest_state: null, reviewer_latest_commit: null,
+                latest_request_at: null, commits_after_request: 0, author_commits_after_request: 0, response_count: 0 }
+              : record),
+        }) }
+      }
+      if (command === 'github-interface' && args[0] === '--review-activity-since' && args.includes('--requests-json')) {
+        const result = await original(command, args, options)
+        activityDone = true
+        resetAgentLogCache()
+        return result
+      }
+      if (command === 'agent-interface' && args[0] === '--logs' && activityDone) {
+        logGate.entered.resolve()
+        await logGate.release.promise
+      }
+      return original(command, args, options)
+    })
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const run = runtime.runEnabledBehaviorsOnce()
+      await logGate.entered.promise
+      await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+      logGate.release.resolve()
+      await run
+      logging.loggingRuntime()!.flush()
+      const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
+      expect(events.filter((event) => event.operation === 'application.behaviors')).toEqual([expect.objectContaining({
+        severity: 'error', behavior: 'approve-prs', phase: 'review-activity',
+        message: 'The operation was aborted due to timeout',
+        context: expect.objectContaining({
+          progress: expect.objectContaining({ eligiblePrs: 2, launchesPending: 1, launched: 0,
+            publication: 'unverified', disposition: 'unresolved' }) }),
+      })])
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    } finally {
+      logGate.release.resolve()
+      await logging.stopLogging()
+    }
+  })
+
+  it('cancels the deadline diagnostic read when shutdown clears the runtime first', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const startedAt = Date.now()
+    const { database: db, behaviors: runtime } = await startApproving([pr])
+    openLaunchBudget(runtime)
+    const original = mocks.runFile.getMockImplementation()!
+    let stopping: Promise<void> | undefined
+    let shutdownStarted = false
+    let freshReadSpawned = false
+    const hangRelease = deferred<void>()
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      if (command === 'agent-interface' && args[0] === '--logs' && shutdownStarted) {
+        // The diagnostic's fresh read must cancel instead of spawning another
+        // 30-second CLI wait while shutdown is awaiting this cycle.
+        freshReadSpawned = true
+        const signal = (options as { signal?: AbortSignal } | null)?.signal
+        if (signal) await new Promise<void>((_resolve, reject) => {
+          if (signal.aborted) reject(signal.reason)
+          else signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        else await hangRelease.promise
+        throw new Error('unreachable')
+      }
+      return original(command, args, options)
+    })
+    // Shutdown lands between the deadline and the diagnostic's fresh read:
+    // the finally lists its claims first, so starting the stop there clears
+    // the controller before the read evaluates its signal.
+    const listClaims = db.listBehaviorLaunchClaims
+    const listSpy = vi.spyOn(db, 'listBehaviorLaunchClaims').mockImplementation((...args: Parameters<typeof listClaims>) => {
+      const result = listClaims(...args)
+      if (!shutdownStarted && Date.now() >= startedAt + runtime.BEHAVIOR_OPERATION_TIMEOUT_MS) {
+        shutdownStarted = true
+        stopping = runtime.stopBehaviorsRuntime()
+      }
+      return result
+    })
+    const launched = deferred<void>(), released = deferred<void>()
+    const callId = 'b'.repeat(32)
+    mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[1] !== '#17') return
+      fixture.agentLogs.push(agentLog({ id: callId, behavior: 'pr_approve',
+        correlation_id: args[args.indexOf('--correlation-id') + 1], expected_head: HEAD_SHA }))
+      launched.resolve()
+      await released.promise
+    })
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const run = runtime.runEnabledBehaviorsOnce()
+      await launched.promise
+      await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+      released.resolve()
+      // Both the cycle and the stop settle without another CLI timeout.
+      let runSettled = false
+      void run.then(() => runSettled = true, () => runSettled = true)
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(stopping).toBeDefined()
+      expect(runSettled).toBe(true)
+      await run
+      await stopping!
+      expect(freshReadSpawned).toBe(false)
+      // Shutdown suppresses the cycle failure by design; the shutdown itself
+      // is the assertion: no second CLI wait, nothing left busy or failing.
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual([])
+      expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+      expect(runtime.getBehaviorsRuntimeHealth().running).toBe(false)
+    } finally {
+      hangRelease.resolve()
+      released.resolve()
+      listSpy.mockRestore()
+      await logging.stopLogging()
+      await runtime.stopBehaviorsRuntime()
     }
   })
 
@@ -361,7 +584,7 @@ describe('approve-prs under load', () => {
       expect(events.filter((event) => event.operation === 'application.behaviors')).toEqual([expect.objectContaining({
         severity: 'error', occurrences: 1, behavior: 'approve-prs', phase: 'listing', message: 'eligible pull requests unreadable',
         context: expect.objectContaining({ organization: 'Vaquum', deadline: expect.any(Number),
-          progress: { eligiblePrs: null, checksPending: null, changeChecksRead: 0, activityChecksRead: 0, launched: 0, publication: 'unverified' } }),
+          progress: { eligiblePrs: null, checksPending: null, changeChecksRead: 0, activityChecksRead: 0, launchesPending: 0, launched: 0, publication: 'unverified' } }),
       })])
       expect(mocks.spawnDetached).not.toHaveBeenCalled()
     } finally { await logging.stopLogging() }
@@ -408,7 +631,8 @@ describe('approve-prs under load', () => {
         && event.message === 'The operation was aborted due to timeout')).toEqual([expect.objectContaining({
         severity: 'error', behavior: 'approve-prs', phase: 'launch',
         context: expect.objectContaining({
-          progress: { eligiblePrs: 2, checksPending: 1, changeChecksRead: 2, activityChecksRead: 1, launched: 1, publication: 'unverified' } }),
+          progress: expect.objectContaining({ eligiblePrs: 2, checksPending: 1, changeChecksRead: 2,
+            activityChecksRead: 1, launchesPending: 0, launched: 1, publication: 'unverified', disposition: 'unresolved' }) }),
       })])
       expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     } finally {

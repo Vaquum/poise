@@ -292,10 +292,16 @@ rail names a timed-out sweep as stalled instead of repeating the timeout text.
 An approval cycle failure retains its organization, last known phase, live
 effective deadline and observed check/launch counts in diagnostic context before
 clock cleanup, including a tick that returns on abort. Pending checks include
-unread or failed reads; read counts do not prove completed evaluation, and a
-launch does not prove publication. The existing cycle failure remains visible
-while publication is unverified; ownership and retry gates still govern later
-sweeps.
+unread or failed reads; prepared approvals still awaiting dispatch are counted
+separately. A deadline record retains the cursor, original launch claim,
+correlation, expected head and observed Call, plus the next scheduled tick.
+Only a proven deferral with matching, unambiguous running Call evidence and an
+available scheduled continuation is captured as Warning at the approval cycle.
+Missing or conflicting ownership, uncertain writes and unavailable continuation
+remain Errors. Read counts do not prove completed evaluation, and a launch does
+not prove publication: publication stays unverified until reconciliation proves
+its outcome. The next tick reconciles original launches before reconsidering
+unread and queued work under the existing eligibility, cursor and retry gates.
 
 Process-lock contenders within one server queue by normalized path, so only
 the local owner polls SQLite for cross-process ownership. Queueing and SQLite
