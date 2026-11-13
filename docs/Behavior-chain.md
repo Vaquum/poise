@@ -632,24 +632,30 @@ Repair and PR review reporting requires at least three settled original Caller
 receipts for the same phase, current head, review basis and slot after the last
 Resume, each with positive resource release, `action=not_started`, retained
 `outcome=preflight_failed` and no
-publication plan or action receipts. All matching attempts must share one cause:
+publication plan or action receipts. All matching repair attempts must share one cause:
 `repair_incomplete_replies` requires `error_code=atomic_work_failed` and the specific
 incomplete-reply error; `repair_execution_budget_exhausted` requires
 `error_code=atomic_work_execution_budget_exhausted`.
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
-The reporter also accepts `review_budget_exhausted` for native `review-pr`
+The reporter also accepts `review_budget_exhausted` and `review_inspection_timeout`,
+including a mixture of the two, for native `review-pr`
 admissions by the reviewer account, pinned with `--expected-head`. Their basis
 includes `reviewContext` (base SHA, title and body), distinct from repair's
 `reviewRevision`. Each original receipt must retain the pre-submission `reviewing`
-phase and `error_code=review_budget_exhausted`; differing raw messages do not
-change that typed cause. `submitting_review` cannot prove no action even without
-a returned review ID.
+phase and one of those timeout codes; differing raw messages do not change their
+typed causes. Each report lists the original code for every attempt and bounded
+diagnostic operation, phase and timeout in seconds where retained. Missing step
+evidence stays unknown; raw errors, paths and inspection arguments are excluded.
+Both codes reuse the existing review report intent and marker. `submitting_review`
+cannot prove no action even without a returned review ID.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads or PR review contexts leave reporting pending,
 including title, body or base changes on an unchanged head. Other causes remain
-visible in their ordinary holds without an issue report; mixed repair or review causes cannot qualify.
+visible in their ordinary holds without an issue report; mixed repair causes or
+review causes outside these two timeouts cannot qualify. Closed or merged targets
+remain ineligible for a new review exhaustion report.
 Revoking repository scope during verification prevents publication and leaves the
 creation intent unconsumed, so re-enabling can still report once.
 

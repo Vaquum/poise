@@ -1596,7 +1596,7 @@ no-publication shape and retry requirements are defined in
 Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
 opt-in enables verified repair incomplete-reply, repair execution-budget
-or PR review-budget exhaustion, verified automatic implementation holds before a PR,
+or PR review timeout exhaustion, verified automatic implementation holds before a PR,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
 sources without an explicit hold, supplied by trusted service configuration or the
