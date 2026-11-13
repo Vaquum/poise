@@ -5,8 +5,10 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 // status ledger, the chains and the running jobs are stood in for here; your
 // cards are the test server's own.
 
-// Midday of a fixed day, with each page's clock set to it, so "today" never
-// crosses midnight while a test runs: records an hour old stay today's.
+// Midday of a fixed day in the browser's own zone, pinned to UTC (Settings name
+// none, so Board's Today follows the browser), with each page's clock set to it:
+// "today" never crosses midnight while a test runs, on any runner.
+test.use({ timezoneId: 'UTC' })
 const NOW = Date.parse('2026-10-15T12:00:00Z')
 const iso = (minutesAgo: number) => new Date(NOW - minutesAgo * 60_000).toISOString()
 
