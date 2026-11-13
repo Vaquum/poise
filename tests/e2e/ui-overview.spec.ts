@@ -344,6 +344,7 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   for (const [completed, errors, perItem, unsettled, withheld, value, note] of [
     [0, 0, null, 0, 'no v2 work merged in the last 24 hours', 'None completed', '0 errors across 0 items completed · no v2 work merged in the last 24 hours'],
     [2, 2, null, 0, unknownMerge, 'Unknown', `2 errors across 2 items completed · ${unknownMerge}`],
+    [0, 0, null, 0, unknownMerge, 'Unknown', `0 errors across 0 items completed · ${unknownMerge}`],
     [2, 0, 0, 0, null, '0.0 per item', '0 errors across 2 items completed'],
     [6, 3, 0.5, 2, null, 'at least 0.5 per item', '3 errors across 6 items completed · 2 still have runs being reconciled, so the rate may rise'],
   ] as const) {

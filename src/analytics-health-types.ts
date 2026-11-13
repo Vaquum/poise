@@ -9,6 +9,9 @@ export interface WorkRecovery extends HealthEvidence {
   failedCall: string, actionSequence: number, actionAt: number, progressAt: number
   origin: 'automatic' | 'operator', interventionAt: number | null
 }
+/** Why the error rate is withheld when nothing completed: the one reason the card calls None completed. */
+export const EMPTY_COHORT = 'no v2 work merged in the last 24 hours'
+
 export interface AnalyticsHealth {
   readAt: number, window: { since: number, until: number }, scope: string, limits: string[]
   /** `perItem` is a lower bound while `unsettled` items still have a run being reconciled;

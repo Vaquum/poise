@@ -1,5 +1,5 @@
 import { setImmediate } from 'node:timers/promises'
-import type { AnalyticsHealth, HealthInterval, WorkError, WorkRecovery } from '../src/analytics-health-types'
+import { EMPTY_COHORT, type AnalyticsHealth, type HealthInterval, type WorkError, type WorkRecovery } from '../src/analytics-health-types'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { normalize } from '../gateway/src/diagnostics/contract'
 import { behaviorChainJournal } from './behavior-chain-journal'
@@ -417,7 +417,7 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
   }
   if (result.recovery.unknown) addLimit('Older, ambiguous or uncorrelated recovery origins remain unknown')
   result.blocked.largestStage = [...stages].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([stage, count]) => `${stage}: ${count}`)[0] ?? null
-  if (!result.rate.completed) withhold('no v2 work merged in the last 24 hours')
+  if (!result.rate.completed) withhold(EMPTY_COHORT)
   result.rate.perItem = complete ? result.rate.errors / result.rate.completed : null
   if (result.rate.perItem !== null) result.rate.withheld = null
   const intervals = healthIntervals(history, lifetimeStart, now)

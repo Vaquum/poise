@@ -89,6 +89,15 @@ it('withholds only a zero-denominator or unknown merge-time rate, in words, whil
   expect(unknown.rate).toMatchObject({ completed: 1, errors: 1, perItem: null, withheld: expect.stringContaining('merge time for acme/repo#2 is unknown') })
 })
 
+it('never calls an unknown cohort empty: missing GitHub evidence or merge time withholds with its own reason', async () => {
+  const f = setup()
+  f.input.dependencies.datastore[0].status = 'stale'
+  expect((await f.read()).rate).toMatchObject({ completed: 0, perItem: null, withheld: 'GitHub evidence for acme is stale, so merges may be missing' })
+  f.input.dependencies.datastore[0].status = 'ok'
+  f.append(f.seed(2), { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: 'acme/repo', pull_number: 102, merged: true, merge_sha: MERGE } }, NOW)
+  expect((await f.read()).rate).toMatchObject({ completed: 0, perItem: null, withheld: expect.stringContaining('merge time for acme/repo#2 is unknown') })
+})
+
 it('verifies a merge from GitHub\'s merge facts in any observation: a lagging publication or an existing pull request (#1381)', async () => {
   const f = setup()
   // The first merged read still has Poise's publication open on its head; the next agrees.
