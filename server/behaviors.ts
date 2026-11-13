@@ -3494,10 +3494,68 @@ async function recoverSnapshotReviews(
   setMeta(SNAPSHOT_RECOVERY_META, '1')
 }
 
+async function retainPrSweepProgress(
+  key: 'review-new-prs' | 'approve-prs',
+  progress: Record<string, string | number | null> & { launched: number },
+  attemptedClaims: Set<string>,
+  lifecycleSignal: AbortSignal | undefined,
+): Promise<void> {
+  const context = diagnosticIdentity()
+  if (!context) return
+  context.progress = progress
+  const reason = behaviorSignal()?.reason
+  if (reason instanceof DOMException && reason.name === 'TimeoutError') {
+    const claims = listBehaviorLaunchClaims(key).filter((claim) => attemptedClaims.has(claim.claimId))
+    let snapshot: AgentLogSnapshot | null = null
+    let ownershipError: string | null = null
+    try {
+      // The work deadline has expired, but Caller may have registered a
+      // launch since the last read. Observe it without admitting more work.
+      snapshot = await fetchAgentLogSnapshot({ fresh: true, signal: lifecycleSignal })
+    } catch (error) { ownershipError = behaviorErrorMessage(error) }
+    const launches = claims.map((claim) => {
+      const call = snapshot?.entries.find((row) => row.correlation_id === claim.launchCorrelationId)
+      const owned = snapshot && call && !claim.launchQuarantine && !claim.launchError
+        && unambiguousAgentCall(snapshot, call)
+        && claim.launchCorrelationId === claim.claimId
+        && (!claim.launchCallId || claim.launchCallId === call.id)
+        && claim.launchBehavior === upstreamBehavior(key) && call.behavior === claim.launchBehavior
+        && call.repo === claim.launchRepo && String(call.pr_id) === String(claim.launchPr)
+        && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
+        && claim.launchSource === `poise:${key}` && call.source === claim.launchSource
+        && call.expected_head === claim.launchExpectedHead
+        && Number.isFinite(Date.parse(claim.launchRequestedAt))
+        && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
+        && RUNNING_AGENT_STATUSES.has(call.status.toLowerCase())
+        && call.action == null && call.outcome == null && call.head_sha == null
+        && call.review_id == null && call.receipts == null && call.review_comments == null
+      return { target: claim.target, claimId: claim.claimId, correlationId: claim.launchCorrelationId,
+        expectedHead: claim.launchExpectedHead, callId: call?.id ?? claim.launchCallId,
+        status: call?.status ?? null, ownership: owned ? 'owned' : 'unresolved' }
+    })
+    const org = currentOrganization()
+    const continuationAt = tickerStarted && tickTimer && isRunnable(key)
+      && !releaseBackgroundPaused() && !releaseSwitchPending()
+      && org && readyOrganizations().some((ready) => ready.login === org.login && ready.datastorePath === org.datastorePath)
+      ? nextTickAtMs : null
+    context.progress = { ...progress, cursor: getMeta(key === 'review-new-prs' ? 'behavior_review_new_prs_prepare_cursor' : 'behavior_approve_prs_cursor'), launches, ownershipError,
+      continuationAt, disposition: continuationAt !== null && launches.length > 0
+        && launches.length === progress.launched && launches.every((launch) => launch.ownership === 'owned')
+        ? 'deferred' : 'unresolved' }
+  }
+}
+
 async function tickReviewNewPrs(): Promise<void> {
   if (!isEnabled('review-new-prs')) return
   const author = getMeta('me') || ''
   if (!author) return
+  const context = diagnosticIdentity()
+  const progress = { eligiblePrs: null as number | null, checksPending: null as number | null,
+    prepared: 0, launched: 0, publication: 'unverified' }
+  const attemptedClaims = new Set<string>()
+  const lifecycleSignal = behaviorAbortController?.signal
+  const sweepSignal = behaviorSignal()
+  if (context) context.progress = progress
   // Settle launch claims before any eligibility read in this tick. The
   // approve-prs tick runs concurrently and evaluates against settled
   // review state, so reconciliation keeps its historical tick-head
@@ -3518,6 +3576,7 @@ async function tickReviewNewPrs(): Promise<void> {
 
   if (await initializeReviewBaseline()) return
   try {
+    if (context && !sweepSignal?.aborted) context.phase = 'listing'
     const reviewerCount = getReviewers('review-new-prs')
     await retireStaleReviewerTrips()
     // Admission remembers the configured panel; only launches slide past
@@ -3531,6 +3590,7 @@ async function tickReviewNewPrs(): Promise<void> {
       : availableReviewSlots(await launchReviewPanel(reviewerCount, 'pr_review'))
     if (guard.length === 0) return
     const prs = await listEligiblePrs('review-new-prs', author)
+    progress.eligiblePrs = prs.length
     await recoverSnapshotReviews(prs)
     let failure: unknown
     const ordered = orderByCursor(prs, 'behavior_review_new_prs_prepare_cursor')
@@ -3570,6 +3630,8 @@ async function tickReviewNewPrs(): Promise<void> {
     // one process per candidate at once, and the cursor rotates coverage so
     // the next sweep prepares the rest.
     const prepared: PreparedReviewTarget[] = []
+    progress.checksPending = candidates.length
+    if (context && !sweepSignal?.aborted) context.phase = 'preparation'
     await forEachPool(candidates, REVIEW_PREPARE_CONCURRENCY, async ([pr, key, slot]) => {
       const target = reviewSlotTarget(key, slot)
       const checkTarget = `${target}:check`
@@ -3577,7 +3639,8 @@ async function tickReviewNewPrs(): Promise<void> {
       setMeta('behavior_review_new_prs_prepare_cursor', key)
       try {
         const bundle = await prepareReviewTarget(pr, key, slot)
-        if (bundle) prepared.push(bundle)
+        if (bundle) { prepared.push(bundle); progress.prepared++ }
+        if (!behaviorAborted()) progress.checksPending! -= 1
       } catch (err) {
         if (behaviorAborted()) return
         if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
@@ -3609,6 +3672,7 @@ async function tickReviewNewPrs(): Promise<void> {
       }
     }
     try {
+      if (context && !sweepSignal?.aborted) context.phase = 'claim'
       await underLifecycleSignal(() => withBehaviorProcessLock('review-new-prs', async () => {
         // Read the ceiling here, closest to the spawn: narrowing it in the
         // view must take effect on launches already being prepared.
@@ -3699,6 +3763,7 @@ async function tickReviewNewPrs(): Promise<void> {
               [...admittedSlots],
             )) { ownedClaimId = null; releaseLeases(claimId); continue }
             claimed.push({ prepared: bundle, claimId, setting })
+            attemptedClaims.add(claimId)
             ownedClaimId = null
           } catch (err) {
             if (behaviorAborted()) {
@@ -3727,6 +3792,7 @@ async function tickReviewNewPrs(): Promise<void> {
     // The next tick prepares fresh on the new head; Caller's exact-head
     // checks still backstop the remaining race.
     const verified: { prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting }[] = []
+    if (context && !sweepSignal?.aborted) context.phase = 'head-verification'
     await underLifecycleSignal(() => forEachPool(claimed, REVIEW_PREPARE_CONCURRENCY, async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target } = bundle
       try {
@@ -3758,6 +3824,7 @@ async function tickReviewNewPrs(): Promise<void> {
     // without the behavior lock: the atomic claim plus launch intent is the
     // ownership. The checkout runs here, under the lifecycle signal, so a
     // cold clone can't consume the sweep deadline.
+    if (context && !sweepSignal?.aborted) context.phase = 'launch'
     await underLifecycleSignal(() => Promise.all(verified.map(async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target, checkTarget } = bundle
       let checkoutReady = false
@@ -3794,6 +3861,7 @@ async function tickReviewNewPrs(): Promise<void> {
         }
         checkoutReady = true
         await spawnReviewLaunch(bundle, claimId, setting, pwd)
+        progress.launched++
         if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, bundle.actor)
         console.log(`[behaviors] review-new-prs fired for ${pr.repo}#${pr.number} (p=${setting}, ${slot})`)
       } catch (err) {
@@ -3815,8 +3883,10 @@ async function tickReviewNewPrs(): Promise<void> {
     })))
     if (failure) throw failure
   } catch (err) {
-    if (!(err instanceof BehaviorLogFeedError) && !staleDatastoreFailure(err)) console.error('[behaviors] tick failed:', err)
+    if (!behaviorAborted() && !(err instanceof BehaviorLogFeedError) && !staleDatastoreFailure(err)) console.error('[behaviors] tick failed:', err)
     throw err
+  } finally {
+    await retainPrSweepProgress('review-new-prs', progress, attemptedClaims, lifecycleSignal)
   }
 }
 
@@ -5254,49 +5324,7 @@ async function tickApprovePrs(): Promise<void> {
     }
     if (failure) throw failure
   } finally {
-    if (context) {
-      context.progress = progress
-      const reason = behaviorSignal()?.reason
-      if (reason instanceof DOMException && reason.name === 'TimeoutError') {
-        const claims = listBehaviorLaunchClaims('approve-prs').filter((claim) => attemptedClaims.has(claim.claimId))
-        let snapshot: AgentLogSnapshot | null = null
-        let ownershipError: string | null = null
-        try {
-          // The work deadline has expired, but Caller may have registered a
-          // launch since the last read. Observe it without admitting more work.
-          snapshot = await fetchAgentLogSnapshot({ fresh: true, signal: lifecycleSignal })
-        } catch (error) { ownershipError = behaviorErrorMessage(error) }
-        const launches = claims.map((claim) => {
-          const call = snapshot?.entries.find((row) => row.correlation_id === claim.launchCorrelationId)
-          const owned = snapshot && call && !claim.launchQuarantine && !claim.launchError
-            && unambiguousAgentCall(snapshot, call)
-            && claim.launchCorrelationId === claim.claimId
-            && (!claim.launchCallId || claim.launchCallId === call.id)
-            && claim.launchBehavior === 'pr_approve' && call.behavior === claim.launchBehavior
-            && call.repo === claim.launchRepo && String(call.pr_id) === String(claim.launchPr)
-            && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
-            && claim.launchSource === 'poise:approve-prs' && call.source === claim.launchSource
-            && call.expected_head === claim.launchExpectedHead
-            && Number.isFinite(Date.parse(claim.launchRequestedAt))
-            && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
-            && RUNNING_AGENT_STATUSES.has(call.status.toLowerCase())
-            && call.action == null && call.outcome == null && call.head_sha == null
-            && call.review_id == null && call.receipts == null && call.review_comments == null
-          return { target: claim.target, claimId: claim.claimId, correlationId: claim.launchCorrelationId,
-            expectedHead: claim.launchExpectedHead, callId: call?.id ?? claim.launchCallId,
-            status: call?.status ?? null, ownership: owned ? 'owned' : 'unresolved' }
-        })
-        const org = currentOrganization()
-        const continuationAt = tickerStarted && tickTimer && isRunnable('approve-prs')
-          && !releaseBackgroundPaused() && !releaseSwitchPending()
-          && org && readyOrganizations().some((ready) => ready.login === org.login && ready.datastorePath === org.datastorePath)
-          ? nextTickAtMs : null
-        context.progress = { ...progress, cursor: getMeta('behavior_approve_prs_cursor'), launches, ownershipError,
-          continuationAt, disposition: continuationAt !== null && launches.length > 0
-            && launches.length === progress.launched && launches.every((launch) => launch.ownership === 'owned')
-            ? 'deferred' : 'unresolved' }
-      }
-    }
+    await retainPrSweepProgress('approve-prs', progress, attemptedClaims, lifecycleSignal)
   }
 }
 
@@ -8012,7 +8040,7 @@ function serializeBehaviorOperation<T>(
     const lifecycle = behaviorAbortController?.signal
     const signal = lifecycle ? AbortSignal.any([lifecycle, deadline]) : deadline
     behaviorOperationDeadline.set(signal, clock)
-    const context = key === 'approve-prs' ? diagnosticIdentity() : undefined
+    const context = key === 'approve-prs' || key === 'review-new-prs' ? diagnosticIdentity() : undefined
     if (context) context.deadline = clock.expiresAt
     try {
       const result = await behaviorOperationSignal.run(signal, operation)
@@ -8326,7 +8354,12 @@ async function runBehaviorCycle(
     const lifecycle = behaviorAbortController?.signal
     if (readBehaviorFailure(key)?.kind === 'worker') clearBehaviorFailure(key)
     try {
-      const recovered = await serializeBehaviorOperation(key, operation)
+      const context = diagnosticIdentity()
+      const run = () => serializeBehaviorOperation(key, operation)
+      // A target can attach its identity to the shared deadline exception.
+      // Reattach the sweep identity before failure bookkeeping and capture.
+      const recovered = context && (key === 'approve-prs' || key === 'review-new-prs')
+        ? await withNoticeDiagnosticIdentity(context, run) : await run()
       if (recovered || readBehaviorFailure(key)?.kind === 'operation') {
         clearBehaviorFailure(key)
       }
@@ -8339,7 +8372,7 @@ async function runBehaviorCycle(
       if (lifecycle?.aborted !== true) {
         recordBehaviorFailure(key, 'operation', error)
         if (!(error instanceof BehaviorLogFeedError) && !staleDatastoreFailure(error)) {
-          const deferred = key === 'approve-prs' && error instanceof DOMException && error.name === 'TimeoutError'
+          const deferred = (key === 'approve-prs' || key === 'review-new-prs') && error instanceof DOMException && error.name === 'TimeoutError'
             && diagnosticIdentity()?.progress?.disposition === 'deferred'
           const report = deferred ? console.warn : console.error
           report(`[behaviors] ${key} operation failed:`, error)
@@ -8347,7 +8380,7 @@ async function runBehaviorCycle(
       }
     }
   }
-  return key === 'approve-prs' ? withNoticeDiagnosticIdentity({
+  return key === 'approve-prs' || key === 'review-new-prs' ? withNoticeDiagnosticIdentity({
     correlationId: randomUUID(), behavior: key, target: null, repository: null, account: null,
     organization: currentOrganization()?.login, phase: 'reconciliation',
   }, cycle) : cycle()
