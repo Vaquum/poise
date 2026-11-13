@@ -551,4 +551,37 @@ describe('behavior database lifecycle', () => {
     expect(markBehaviorLaunchIntentOwned({ ...intent, target: 'Vaquum/Origo#502', claimId: other, pr: 502, correlationId: other })).toBe(true)
     expect(listBehaviorLaunchClaims('review-new-issues').find((claim) => claim.target === 'Vaquum/Origo#502')!.launchCovers).toEqual([])
   })
+
+  it('lists failed launches awaiting their outcome from their own index, never every row a behavior has seen', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const {
+      claimSeenOwned,
+      completeSeenOwned,
+      db,
+      linkBehaviorLaunchCallOwned,
+      markBehaviorLaunchIntentOwned,
+      recordSeen,
+      setBehaviorLaunchErrorOwned,
+    } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    for (let pr = 1; pr <= 50; pr++) recordSeen('review-new-prs', `Vaquum/Origo#${pr}`)
+    const target = 'Vaquum/Origo#500'
+    const claimId = claimSeenOwned('review-new-prs', target)!
+    expect(markBehaviorLaunchIntentOwned({
+      key: 'review-new-prs', target, claimId, launchBehavior: 'pr_review', repo: 'Vaquum/Origo', pr: 500,
+      requestedAt: '2026-09-24T07:00:00.000Z', expectedHead: 'a'.repeat(40), actor: 'bit-mis', source: 'poise:review-new-prs', correlationId: claimId,
+    })).toBe(true)
+    expect(linkBehaviorLaunchCallOwned('review-new-prs', target, claimId, 'b'.repeat(32))).toBe(true)
+    expect(setBehaviorLaunchErrorOwned('review-new-prs', target, claimId, 'provider exited 1')).toBe(true)
+    expect(completeSeenOwned('review-new-prs', target, claimId)).toBe(true)
+    const failed = `SELECT target FROM behavior_seen AS launch INDEXED BY idx_behavior_seen_failed_launches
+      WHERE key = ? AND claim_id = '' AND launch_call_id IS NOT NULL
+        AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL`
+    expect(db.prepare(failed).pluck().all('review-new-prs')).toEqual([target])
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${failed}`).all('review-new-prs') as Array<{ detail: string }>).map((row) => row.detail).join('\n')
+    expect(plan).toMatch(/USING (COVERING )?INDEX idx_behavior_seen_failed_launches/)
+    // The index holds the failed launch alone, never the fifty targets only seen.
+    expect(db.prepare(`SELECT count(*) FROM behavior_seen INDEXED BY idx_behavior_seen_failed_launches
+      WHERE claim_id = '' AND launch_requested_at IS NOT NULL AND launch_call_id IS NOT NULL
+        AND launch_error IS NOT NULL AND launch_outcome IS NULL`).pluck().get()).toBe(1)
+  })
 })

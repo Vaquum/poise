@@ -413,6 +413,13 @@ const migrateSchema = db.transaction(() => {
       WHERE claim_id <> '' AND launch_requested_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_behavior_seen_target
       ON behavior_seen(launch_repo, launch_pr);
+    -- Failed launches still awaiting their outcome, which every behaviors read
+    -- lists per behavior: released claims are kept forever, so reading a
+    -- behavior's rows grew with everything it ever saw.
+    CREATE INDEX IF NOT EXISTS idx_behavior_seen_failed_launches
+      ON behavior_seen(key, target)
+      WHERE claim_id = '' AND launch_requested_at IS NOT NULL AND launch_call_id IS NOT NULL
+        AND launch_error IS NOT NULL AND launch_outcome IS NULL;
     CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_created
       ON behavior_dead_letters(created_at DESC);
     -- The open dead letters each behaviors tick checks against closed pull
