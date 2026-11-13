@@ -217,13 +217,13 @@ function installedHtml(current: Data): string {
     <div class="ext-table-wrap"><table class="ext-matrix" aria-label="Extensions by workspace">
       <thead><tr><th class="ext-col-server">Server</th><th class="ext-col-status">Status</th>
         ${current.workspaces.map((workspace) => `<th class="ext-col-ws"><code>${esc(workspace.label)}</code></th>`).join('')}
-        <th class="ext-col-ws ext-col-new" title="Workspaces chats use for the first time start with this switch">New workspaces</th><th class="ext-col-go"></th></tr></thead>
+        <th class="ext-col-ws ext-col-new" data-help="Workspaces chats use for the first time start with this switch">New workspaces</th><th class="ext-col-go"></th></tr></thead>
       <tbody>${current.servers.map((server) => {
         const state = stateText(server)
         return `<tr data-id="${server.id}" data-open="${server.id}" tabindex="0" class="${server.id === selected ? 'is-selected' : ''}">
           <td class="ext-col-server"><div class="ext-server">${tile(server.title)}<div><b>${esc(server.title)}</b><span>${server.source === 'directory' ? 'Directory' : 'Custom'} · ${esc(server.transport === 'stdio' ? `Local · ${server.command ?? ''}` : 'Remote')}</span></div></div></td>
           <td class="ext-col-status"><span class="ext-state ext-state-${state.tone}">${esc(state.text)}</span>${server.status.state === 'signin' ? ` <button type="button" class="ext-link" data-sign-in="${server.id}">Sign in</button>` : ''}</td>
-          ${current.workspaces.map((workspace) => `<td class="ext-col-ws"><label class="toggle" title="${esc(server.title)} in ${esc(workspace.label)}"><input type="checkbox" data-switch="${server.id}" data-workspace="${esc(workspace.id)}" ${enabledIn(server, workspace.id) ? 'checked' : ''} aria-label="${esc(server.title)} in ${esc(workspace.label)}"><span class="toggle-slider"></span></label></td>`).join('')}
+          ${current.workspaces.map((workspace) => `<td class="ext-col-ws"><label class="toggle" data-help="${esc(server.title)} in ${esc(workspace.label)}"><input type="checkbox" data-switch="${server.id}" data-workspace="${esc(workspace.id)}" ${enabledIn(server, workspace.id) ? 'checked' : ''} aria-label="${esc(server.title)} in ${esc(workspace.label)}"><span class="toggle-slider"></span></label></td>`).join('')}
           <td class="ext-col-ws ext-col-new"><label class="toggle"><input type="checkbox" data-default="${server.id}" ${server.enabled.default ? 'checked' : ''} aria-label="${esc(server.title)} in new workspaces"><span class="toggle-slider"></span></label></td>
           <td class="ext-col-go">${CHEVRON}</td></tr>`
       }).join('')}</tbody></table></div>
@@ -269,7 +269,7 @@ function rowsHtml(rows: Row[], list: 'env' | 'headers', locked: boolean): string
   return rows.map((row, index) => `<div class="ext-pair">
     <input class="st-input" value="${esc(row.name)}" placeholder="${list === 'env' ? 'NAME' : 'Header-Name'}" data-list="${list}" data-field="name" data-index="${index}" aria-label="${list === 'env' ? 'Variable name' : 'Header name'}" autocomplete="off" spellcheck="false" ${locked ? 'disabled' : ''}>
     <input class="st-input" type="${row.secret ? 'password' : 'text'}" value="${esc(row.value)}" placeholder="${row.secret && row.set ? 'Saved — type to replace' : 'value'}" data-list="${list}" data-field="value" data-index="${index}" aria-label="Value" autocomplete="off" spellcheck="false">
-    <button type="button" class="ext-icon-btn${row.secret ? ' is-on' : ''}" data-secret="${list}" data-index="${index}" aria-pressed="${row.secret}" title="${row.secret ? 'Secret: stored write-only' : 'Mark as secret'}" ${locked ? 'disabled' : ''}>${LOCK}</button>
+    <button type="button" class="ext-icon-btn${row.secret ? ' is-on' : ''}" data-secret="${list}" data-index="${index}" aria-label="Store as secret" aria-pressed="${row.secret}" data-help="${row.secret ? 'Secret: stored write-only' : 'Mark as secret'}" ${locked ? 'disabled' : ''}>${LOCK}</button>
     <button type="button" class="ext-icon-btn" data-remove-row="${list}" data-index="${index}" aria-label="Remove" ${locked ? 'disabled' : ''}>&times;</button></div>`).join('')
 }
 
@@ -393,7 +393,7 @@ function serverPanelHtml(p: Extract<Panel, { kind: 'server' }>): string {
         <div class="tp-group-label">Connection</div>
         <div class="ext-facts">${rows.map(([key, value]) => `<div><span>${esc(key)}</span><div>${value}</div></div>`).join('')}</div>
         <div class="tp-group-label">Reaches</div>
-        <div class="ext-reach">${reaches(server.transport).map((reach) => `<span class="ext-reach-chip${reach.ok ? '' : ' is-no'}" title="${esc(reach.reason ?? `Delivered to ${AGENT_LABEL[reach.agent]} chats`)}">${AGENT_LABEL[reach.agent]}</span>`).join('')}</div>
+        <div class="ext-reach">${reaches(server.transport).map((reach) => `<span class="ext-reach-chip${reach.ok ? '' : ' is-no'}" data-help="${esc(reach.reason ?? `Delivered to ${AGENT_LABEL[reach.agent]} chats`)}">${AGENT_LABEL[reach.agent]}</span>`).join('')}</div>
         <div class="tp-group-label">Workspaces</div>
         <p class="ext-scope">${esc(scopeText(server, data?.workspaces ?? []))}. <span class="st-help-info">Change it in the grid.</span></p>
         ${server.registry ? `<div class="tp-group-label">Directory</div><p class="ext-scope"><code>${esc(server.registry.name)}</code> ${esc(server.registry.version)}${server.registry.websiteUrl ? ` · <a href="${esc(server.registry.websiteUrl)}" target="_blank" rel="noopener noreferrer">Website</a>` : ''}</p>` : ''}

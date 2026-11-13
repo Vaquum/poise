@@ -72,7 +72,7 @@ describe('cutover launch boundary', () => {
       phase: 'inspection', outcome: 'timed_out', stderr: '', stderr_truncated: false, timeout_seconds: 30,
       repository: pr.repo, pr: 17, expected_head: HEAD_SHA })!
     Object.assign(calls[0], { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
-      error_code: code, error: code === 'review_budget_exhausted'
+      artifact: { phase: 'reviewing' }, error_code: code, error: code === 'review_budget_exhausted'
         ? 'cannot inspect review repository: --requests-json [{"query":"rate limit; not signed in"}] timed out'
         : 'Local review repository inspection timed out after 30 seconds',
       diagnostic, completed_at: new Date().toISOString() })

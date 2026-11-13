@@ -59,7 +59,9 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
             ...('outcome' in event ? { outcome: event.outcome } : {}),
             ...(event.type === 'chain.resumed' ? { recovery: event.recovery ?? null } : {}),
             ...('evidence' in event ? { callId: 'callId' in event ? event.callId : event.evidence.nativeCallId ?? event.evidence.callId ?? null,
-              evidence: { diagnostic: event.evidence.diagnostic } } : {}) }
+              evidence: { diagnostic: event.evidence.diagnostic,
+                ...(event.type === 'chain.merged' && typeof event.evidence.review_complete === 'boolean'
+                  ? { review_complete: event.evidence.review_complete } : {}) } } : {}) }
         })
         return reply(res, 200, { chain: summary(chain), events, next: rows.length === 20 ? rows.at(-1)!.sequence : null,
           cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })

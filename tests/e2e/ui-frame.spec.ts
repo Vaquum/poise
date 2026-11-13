@@ -127,9 +127,9 @@ test('a tooltip waits for the pointer to rest half a second; leaving or pressing
   const tip = page.getByRole('tooltip')
   // Resting: nothing for the first moments, then the tooltip.
   await heading.hover()
-  await page.clock.runFor(400)
+  await page.clock.runFor(499)
   await expect(tip).toHaveCount(0)
-  await page.clock.runFor(200)
+  await page.clock.runFor(1)
   await expect(tip).toContainText('Overview')
   // Pressing hides it, and the pressed element stays quiet while the pointer rests on it.
   await page.mouse.down()

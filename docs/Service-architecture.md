@@ -581,6 +581,12 @@ its own instead of refusing with dirty_unowned.
   with `x-poise-updating: 1`: "Updating to the latest version" for a page, 503
   `workspace_updating` for anything else. Poise dims the open page with the
   same notice and reloads it once Poise answers again (`src/updating.ts`).
+  A GET/HEAD connection reset before response headers uses this same response
+  only for a known switch whose fresh health probe cannot reach the workspace
+  or finds it healthy on the requested release. A healthy old release keeps
+  the ordinary 502. The reset invalidates cached readiness, so recovery freshly
+  verifies `/api/service/health` on the requested release. `proxy.failed` retains
+  its Error with request and requested-release evidence; no request is replayed.
 - **Everything else.** An image of another base, a workspace started without
   the supervisor, or a changed container setting still gets a new container,
   drained first ([Deployment](#deployment)). The gateway makes the new image's
@@ -1545,6 +1551,10 @@ defines its reconciliation rules.
 Atomic publication also retains its original pre-write phase: a proven no-write
 failure settles through the existing Caller receipt after resource release;
 missing original push evidence stays visible in the chain wait with its fence intact.
+PR review and approval deadlines likewise carry validated no-publication results
+through Caller completion and native resource settlement under those same
+[recovery rules](Behavior-chain.md#authority-and-recovery); a diagnostic or
+cleanup alone cannot release an unknown publication effect.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
@@ -1686,6 +1696,7 @@ Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
 opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review timeout exhaustion, verified automatic implementation holds before a PR,
+terminal uncertain implementation publication,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
 sources without an explicit hold, supplied by trusted service configuration or the
@@ -1697,6 +1708,11 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Uncertain implementation reports instead require the original failed `publishing`
+Call, verified resource release and fresh open-source eligibility and publication
+reconciliation. They preserve its missing-push-evidence action and execution fence,
+reusing verified matching linked reports even when closed and markerless; they
+authorize neither replacement implementation nor a second push.
 Durable creation intent prevents another POST after an uncertain result; the source state,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. Closed-PR continuations verify existing source/PR

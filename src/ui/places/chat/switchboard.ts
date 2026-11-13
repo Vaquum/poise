@@ -101,7 +101,7 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
   el.id = 'chat-switchboard-pane'
   el.className = 'chat-switchboard-pane'
   el.setAttribute('aria-label', 'Switchboard')
-  el.innerHTML = `<div class="sb-resize" role="separator" aria-orientation="vertical" aria-label="Resize Switchboard" aria-controls="chat-switchboard-pane" tabindex="0" title="Drag to resize · double-click for one third"></div><div class="sb-inner"></div>`
+  el.innerHTML = `<div class="sb-resize" role="separator" aria-orientation="vertical" aria-label="Resize Switchboard" aria-controls="chat-switchboard-pane" tabindex="0" data-help="Drag to resize · double-click for one third"></div><div class="sb-inner"></div>`
   const handle = el.querySelector<HTMLElement>('.sb-resize')!
   const inner = el.querySelector<HTMLElement>('.sb-inner')!
   const badge = toggle.querySelector<HTMLElement>('.chat-switchboard-badge')!
@@ -303,9 +303,9 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
     // A new explanation needs a running Switchboard; one already asked for can always be shown.
     const unavailable = item.explanation.state !== 'ready' && item.explanation.state !== 'pending' && state?.status !== 'live' && state?.status !== 'paused'
     return `<div class="sb-actions">
-      <button type="button" class="sb-action" data-act="explain" data-id="${item.id}" aria-expanded="${shown}" aria-controls="sb-expl-${where}-${item.id}"${unavailable ? ' disabled title="The Switchboard is not running"' : ''}>${ICON_EXPLAIN}${shown ? 'Hide explanation' : 'Explain'}</button>
-      ${where === 'card' ? `<button type="button" class="sb-action" data-act="open" data-src="${escapeHtml(item.source.sessionId)}"${item.source.exists ? '' : ' disabled title="This chat was deleted"'}>${ICON_OPEN}Open chat</button>` : ''}
-      <button type="button" class="sb-action" data-act="dismiss" data-dismiss-id="${item.id}" title="Hide this update. The chat is told nothing.">${ICON_CLOSE}Dismiss</button>
+      <button type="button" class="sb-action" data-act="explain" data-id="${item.id}" aria-expanded="${shown}" aria-controls="sb-expl-${where}-${item.id}"${unavailable ? ' disabled data-help="The Switchboard is not running"' : ''}>${ICON_EXPLAIN}${shown ? 'Hide explanation' : 'Explain'}</button>
+      ${where === 'card' ? `<button type="button" class="sb-action" data-act="open" data-src="${escapeHtml(item.source.sessionId)}"${item.source.exists ? '' : ' disabled data-help="This chat was deleted"'}>${ICON_OPEN}Open chat</button>` : ''}
+      <button type="button" class="sb-action" data-act="dismiss" data-dismiss-id="${item.id}" data-help="Hide this update. The chat is told nothing.">${ICON_CLOSE}Dismiss</button>
     </div>`
   }
   function explanation(item: SwitchboardItem, where: 'card' | 'line'): string {
@@ -334,7 +334,7 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
     const choices = item.options ?? []
     const other = answering.has(item.id) || !choices.length
     return `<article class="sb-decision" data-key="decision-${item.id}" aria-label="Decision from ${escapeHtml(item.source.title)}">
-      <div class="sb-src">${lamp('decision', true)}<span class="sb-src-title">${escapeHtml(item.source.title)}</span>${agentPill(item)}<time class="sb-time" datetime="${escapeHtml(item.createdAt)}" title="${escapeHtml(clock(item.createdAt))}">${age(item.createdAt, now)}</time></div>
+      <div class="sb-src">${lamp('decision', true)}<span class="sb-src-title">${escapeHtml(item.source.title)}</span>${agentPill(item)}<time class="sb-time" datetime="${escapeHtml(item.createdAt)}" data-help="${escapeHtml(clock(item.createdAt))}">${age(item.createdAt, now)}</time></div>
       <p class="sb-q">${escapeHtml(item.text)}</p>
       ${item.detail ? `<p class="sb-ctx">${escapeHtml(item.detail)}</p>` : ''}
       ${item.source.turnsSince ? `<p class="sb-stale">${escapeHtml(item.source.title)} has started ${item.source.turnsSince === 1 ? 'a turn' : `${item.source.turnsSince} turns`} since it asked; the question may be out of date.</p>` : ''}
@@ -373,12 +373,12 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
       <button type="button" class="sb-line-head" data-act="line" data-src="${escapeHtml(source)}" aria-expanded="${isOpen}" aria-controls="sb-line-${escapeHtml(source)}">
         ${lamp(kind, kind === 'progress' || kind === 'blocked')}
         <span class="sb-line-title"><b>${escapeHtml(head.source.title)}</b>${agentPill(head)}${asks ? '<span class="sb-asks">Asks you</span>' : ''}</span>
-        <span class="sb-line-side"><time class="sb-time" datetime="${escapeHtml(head.createdAt)}" title="${escapeHtml(clock(head.createdAt))}">${age(head.createdAt, now)}</time><span class="sb-chev">${ICON_CHEV}</span></span>
+        <span class="sb-line-side"><time class="sb-time" datetime="${escapeHtml(head.createdAt)}" data-help="${escapeHtml(clock(head.createdAt))}">${age(head.createdAt, now)}</time><span class="sb-chev">${ICON_CHEV}</span></span>
         <span class="sb-line-text"><span class="sb-state">${STATE_LABEL[kind]}</span><span>${escapeHtml(headline)}</span></span>
       </button>
       <div class="sb-line-body" id="sb-line-${escapeHtml(source)}"${isOpen ? '' : ' hidden'}>
         <ol class="sb-updates">${items.slice(0, LINE_ITEMS).map(update).join('')}</ol>
-        <div class="sb-line-foot"><button type="button" class="chat-h-btn" data-act="open" data-src="${escapeHtml(source)}"${head.source.exists ? '' : ' disabled title="This chat was deleted"'}>${ICON_OPEN}Open ${escapeHtml(head.source.title)}</button></div>
+        <div class="sb-line-foot"><button type="button" class="chat-h-btn" data-act="open" data-src="${escapeHtml(source)}"${head.source.exists ? '' : ' disabled data-help="This chat was deleted"'}>${ICON_OPEN}Open ${escapeHtml(head.source.title)}</button></div>
       </div>
     </div>`
   }

@@ -7,6 +7,8 @@ import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavio
 import { chainSummaryFixture } from './fixtures/behavior-chain-summary'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
 import { parseProcessDiagnostic } from '../server/process-diagnostic'
+import { eventWords, readJournalPage, taskState, timelineLines } from '../src/ui/places/observe/chains'
+import { readFrom } from '../src/ui/places/observe/journal'
 
 const native = vi.hoisted(() => ({ support: { status: 'supported', error: null as string | null } }))
 vi.mock('../server/native-cleanup-support', () => ({
@@ -125,6 +127,18 @@ it('projects confirmed merges without obsolete queue waits while retaining origi
       reconciliation: { waitingForResourceRelease: true },
       invocations: [{ id: 'pending-original', state: 'uncertain', outcome: 'original response missing' }] })
     expect(detail.events).toContainEqual(expect.objectContaining({ type: 'chain.waiting', reason: queueWait }))
+    expect(detail.chain.reviewPending).toBe(true)
+    const pendingPage = readJournalPage(detail)
+    const pendingMerge = pendingPage.events.find(event => event.type === 'chain.merged')!
+    expect(pendingMerge.reviewComplete).toBe(false)
+    expect(eventWords(pendingMerge, new Map()).text).toBe('Merged')
+    expect(taskState(pendingPage.chain!)).toEqual({ state: 'waiting', reason: 'Merged as aaaaaaa · review evidence pending' })
+    const legacy = await (await fetch(`${base}?id=${encodeURIComponent(complete.id)}`)).json()
+    expect(legacy.events.at(-1).evidence).not.toHaveProperty('review_complete')
+    const legacyPage = readJournalPage(legacy)
+    expect(legacyPage.chain).toMatchObject({ reviewPending: null, reviewStatus: 'not-recorded' })
+    expect(legacyPage.events.at(-1)).not.toHaveProperty('reviewComplete')
+    expect(eventWords(legacyPage.events.at(-1)!, new Map()).text).toBe('Merged')
     const canonical = journal.read(pending.id)!
     expect(canonical).toEqual(pending)
     expect(detail.chain).toEqual(behaviorChainSummary(canonical, { at: journal.reconciliationAt(canonical) }))
@@ -416,5 +430,52 @@ it('batches exact work-impact lookups through the existing classifier without ch
     bounded.append('callId', call); bounded.append('correlationId', '')
     expect((await fetch(`${base}?${bounded}`)).status).toBe(400)
     expect([journal.history(fixture.chain.id), journal.history(completed.chain.id)]).toEqual(before)
+  } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+})
+
+it('keeps merge confirmation and original review completion distinct across history pages and settlement links', async () => {
+  const journal = behaviorChainJournal()
+  const at = Date.now() - 60_000
+  let chain = journal.append('api/history#1564', 'history-seed', 0, { type: 'chain.admitted', repository: 'api/history', issue: 1564,
+    branch: 'poise/issue-1564', author: 'author', reviewer: 'reviewer' }, at)
+  for (let index = 0; index < 18; index++) chain = journal.append(chain.id, `history-wait-${index}`, chain.sequence,
+    { type: 'chain.waiting', reason: 'exact-head CI is still running' }, at + index + 1)
+  const evidence = { repository: chain.repository, pull_number: 1565, merged: true, merge_sha: 'd'.repeat(40), callId: 'c'.repeat(32) }
+  const merged = journal.append(chain.id, 'history-merge', chain.sequence, { type: 'chain.merged', mergeSha: evidence.merge_sha,
+    evidence: { ...evidence, review_complete: false } }, at + 1000)
+  chain = journal.append(chain.id, 'history-review-complete', merged.sequence, { type: 'chain.merged', mergeSha: evidence.merge_sha,
+    evidence: { ...evidence, review_complete: true } }, at + 1324)
+  const before = journal.history(chain.id)
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains?id=${encodeURIComponent(chain.id)}`
+  const read = async (after: number) => {
+    const response = await fetch(`${base}&after=${after}`)
+    expect(response.status).toBe(200)
+    return readJournalPage(await response.json())
+  }
+  try {
+    const first = await read(0)
+    expect(first.events).toHaveLength(20)
+    expect(first.next).toBe(merged.sequence)
+    expect(first.events.at(-1)).toMatchObject({ type: 'chain.merged', reviewComplete: false })
+    // The latest summary already knows completion; the earlier event must still say Merged.
+    expect(first.chain).toMatchObject({ mergeSha: evidence.merge_sha, reviewPending: false, reviewStatus: 'complete' })
+    const second = await read(first.next!)
+    expect(second.next).toBeNull()
+    expect(second.events).toHaveLength(1)
+    expect(second.events[0]).toMatchObject({ type: 'chain.merged', reviewComplete: true })
+    const lines = timelineLines([...first.events, ...second.events], null).filter(line => line.event.type === 'chain.merged')
+    expect(lines.map(({ event, folded }) => ({ sequence: event.sequence, at: event.at, folded, ...eventWords(event, new Map()) }))).toEqual([
+      { sequence: chain.sequence, at: at + 1324, folded: 1, kind: 'event', text: 'Original review evidence complete', call: evidence.callId },
+      { sequence: merged.sequence, at: at + 1000, folded: 1, kind: 'event', text: 'Merged', call: evidence.callId },
+    ])
+    const linked = await readFrom(read, merged.sequence)
+    expect(linked.events).toEqual(second.events)
+    expect(eventWords(linked.events[0], new Map()).text).toBe('Original review evidence complete')
+    expect(journal.history(chain.id)).toEqual(before)
+    expect(journal.read(chain.id)).toEqual(chain)
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })

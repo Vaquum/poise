@@ -105,6 +105,8 @@ remains eligible; this fence does not change manual Chat binding controls.
 
 Settings → Behaviors contains the chain preference fields, their save/reload actions and the guarded Switch to v2 or Cancel cutover action while applicable. Operational output lives in Observe → Tasks: cutover state and legacy ownership, capacity, the chain list and per-chain journal. The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. Hold/Resume retains the current journal sequence check. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while Tasks is open. Unavailable reads disable writes instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
+History exposes each `chain.merged` event's recorded `evidence.review_complete` boolean. Explicit `true` reads “Original review evidence complete”; `false` or legacy absence reads “Merged”. Each event keeps its own disposition across pages and links, independently of the current chain summary. Legacy absence establishes neither review completion nor a pending obligation.
+
 Notifications lists each delayed or held admitted issue's step,
 progress age, hold, exact-head CI/review gates and next known action, with issue,
 PR links and a Journal evidence action that opens the same journal in Observe → Tasks. Held, uncertain and pending-original-review work
@@ -258,6 +260,9 @@ existing resume event records `ciRecovery`. The normal decision path then
 rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
+Work impact and attention describe this automatic CI recheck instead of asking
+for Resume; attention retains the scheduled `reconciliation.nextObservationAt`.
+Unsettled original receipts and resources still require reconciliation first.
 
 Merged `merge-pr` and `resolve-threads` uncertainty uses original journal
 receipts only. A missing original response schedules no GitHub read; retaining
@@ -438,6 +443,18 @@ pre-push checkpoint or conclusive push result and retains the original fence.
 The plan contains metadata, not a replayable checkout. Closed-target
 reconciliation still forbids late publication and retains pending review evidence,
 including when a parent of an uncertain repair commit has merged.
+
+PR review and approval deadlines retain `failed` and their timeout code. Caller
+records `not_started` / `preflight_failed` only when the original durable phase
+is still `reviewing`, no publication receipt exists, and a successful recovery
+read validates the target/head and complete, unchanged reviewer inventory with
+no pending review. A diagnostic alone cannot supply that proof. Native
+settlement also matches the admitted PR/head, rejects contradictory receipts or
+submission phases, and waits for positive resource release. Ordinary backoff
+then permits at most three failed attempts before an explicit hold, retained
+across restart. Failed or incomplete recovery reads and an attempted POST keep
+the original effect fenced for receipt reconciliation; cleanup cannot promote
+them to no action.
 
 Durable model admissions use the existing semaphore's behavior-lane ceiling, including its interactive reserve. A fresh server process cannot fill that reserve with another background invocation merely because surviving workers hold no slots in its new in-memory semaphore. Existing work above a lowered ceiling finishes normally while new admissions wait. The journal's capacity check also precedes provider preparation, so waiting work cannot consume a provider recovery probe without launching; admission still rechecks capacity transactionally afterward.
 
@@ -624,7 +641,8 @@ Reporting is off by default. An operator can set
 `POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
 list of explicit `owner/repo` names, up to 8192 bytes so the workspace can echo
 it in health for gateway reconciliation. Enabled v2 chains check both new and existing
-repair holds, automatic implementation holds before a PR, and uncertain merge
+repair holds, automatic implementation holds before a PR, uncertain implementation
+publication, and uncertain merge
 submissions during their ordinary bounded reconciliation, including open `poise`
 seeds whose only PR closed unmerged; no Resume or extra poller is needed.
 Reporting preserves the source hold, uncertainty and ownership and does not
@@ -693,6 +711,23 @@ the bounded, redacted blocker as **worker-reported** and available structured Ca
 diagnostic facts. Caller's blocked result does not independently verify the worker's
 health-check, test-relay or other runner explanation. Its next action is to inspect
 the original Call, remedy the blocker and explicitly Resume for a fresh implementation.
+
+`implementation_publication_uncertain` qualifies an original `implement-issue`
+invocation that remains uncertain after recovery, including an unheld source.
+Its failed terminal Call is retained in `evidence.callId` while `invocation.callId`
+is still null. The original receipt must retain the `publishing` phase, completion
+time and positive resource-release proof without a conclusive publication result.
+Fresh reconciliation must still verify the same open, eligible source with no
+attributable pushed branch, bound PR or competing linked work. Reporting keeps
+the source fenced and names the original invocation, Call, bounded cause and
+missing pre-push no-write checkpoint or conclusive push result. It authorizes
+neither replacement implementation nor a second push. Its existing intent uses
+cause + source chain + original invocation. Before creation, source-body links
+and comments by configured accounts can identify an existing report, including a
+closed markerless issue by either configured account. Its body must verify the
+same source, invocation, Call and uncertain publication with missing original
+push evidence; an ordinary reference or another failure cannot qualify. Adoption
+retains that issue in the intent across restart without another POST or marker edit.
 
 `merge_submission_uncertain` separately qualifies the original pending `merge-pr`
 invocation after recovery rereads the journal, even without an explicit chain hold.

@@ -63,9 +63,12 @@ requests share seven states, each with one meaning and one colour:
 
 ## The reference
 
+Poise shows tooltips after the pointer has rested on their element for half a
+second (`--dur-tip`). Icon labels and contextual help use the same delay.
+
 Any element marked with `data-ref` explains itself. Resting the pointer on it,
-focusing it from the keyboard or a long press on touch shows a tooltip after
-`--dur-tip` (half a second). Moving away, pressing or clicking cancels a pending
+focusing it from the keyboard or a long press on touch shows its tooltip after
+that delay. Moving away, pressing or clicking cancels a pending
 tooltip and hides a shown one, and a pressed element shows none again until the
 pointer leaves it. `?` opens the full reference, which dims the page, keeps the element
 lit and answers what it is, what it does, what its current value means, its other
