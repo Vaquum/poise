@@ -286,6 +286,25 @@ describe('Skip repositories API', () => {
     expect(logged).toHaveBeenCalledWith('[behaviors] merge-prs last triggered could not be read:', expect.any(Error))
   })
 
+  it('requires positive whole days before enabling and shares days and skips across accounts', async () => {
+    expect((await behaviorState())['close-old-prs']).toMatchObject({ enabled: false, days: null, skipRepos: [], lastTriggered: null })
+    expect((await post('/api/behaviors/close-old-prs', { enabled: true })).status).toBe(400)
+    for (const days of [0, -1, 1.5, '30', null]) {
+      expect((await post('/api/behaviors/close-old-prs', { enabled: true, days, skipRepos: [REPO] })).status).toBe(400)
+      expect((await behaviorState())['close-old-prs']).toMatchObject({ enabled: false, days: null, skipRepos: [] })
+    }
+    expect((await post('/api/behaviors/close-old-prs?org=beta', { enabled: true, days: 30, skipRepos: [REPO] })).status).toBe(200)
+    for (const query of ['', '?org=beta']) {
+      expect((await behaviorState(query))['close-old-prs']).toMatchObject({ enabled: true, days: 30, skipRepos: [REPO] })
+    }
+    expect(database!.getMeta('org:beta:behavior_close_old_prs_days')).toBeNull()
+    expect((await post('/api/behaviors/merge-prs', { days: 30 })).status).toBe(400)
+    expect((await post('/api/behaviors/close-old-prs', { enabled: false })).status).toBe(200)
+    const fired = { at: new Date().toISOString(), target: REPO + '#1', url: 'https://github.com/' + REPO + '/pull/1' }
+    database!.setMeta('behavior_close_old_prs_last_fired', JSON.stringify(fired))
+    expect((await behaviorState())['close-old-prs']!.lastTriggered).toEqual(fired)
+  })
+
   it('starts grey CI recovery off and persists its global toggle and repository skips', async () => {
     expect((await behaviorState())['rerun-grey-ci']).toMatchObject({ enabled: false, skipRepos: [], lastTriggered: null, lastSucceeded: null })
     expect((await post('/api/behaviors/rerun-grey-ci?org=beta', { enabled: true, skipRepos: [REPO] })).status).toBe(200)

@@ -29,7 +29,7 @@ export interface BehaviorDiagnosticGroup extends DiagnosticClassification {
 
 // The PR behaviors a repository hold gates, in Behaviors-view row order.
 // (src/behaviors.ts imports this module, so the list cannot come from there.)
-const HELD_PR_BEHAVIORS = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'rerun-grey-ci', 'merge-prs']
+const HELD_PR_BEHAVIORS = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'rerun-grey-ci', 'merge-prs', 'close-old-prs']
 
 // A held name worth linking: owner/name as GitHub spells it. The server
 // holds the same shape; anything else links nowhere rather than wrongly.

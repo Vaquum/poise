@@ -192,7 +192,7 @@ describe('behavior diagnostic groups', () => {
       severity: 'warning', code: 'github_access', scope: 'Vaquum/field-data-api',
       message: 'agent account has no access to Vaquum/field-data-api',
       details: ['PR behaviors held for Vaquum/field-data-api — GitHub 404: Not Found'],
-      entries: ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'rerun-grey-ci', 'merge-prs'].map((behavior) => ({
+      entries: ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'rerun-grey-ci', 'merge-prs', 'close-old-prs'].map((behavior) => ({
         behavior, target: null, at: '2026-10-23T09:17:00.000Z', next: '2026-10-23T10:17:00.000Z',
         detail: 'PR behaviors held for Vaquum/field-data-api — GitHub 404: Not Found',
         link: { label: 'Invite the agent account or resend its pending invitation', url: 'https://github.com/Vaquum/field-data-api/settings/access' },
@@ -260,7 +260,7 @@ it('links a held repository to its access settings, naming the agent and the pen
   diagnostics.holds.push({ actor: 'review-bot', repo: 'org/repo', error: 'GitHub 404: Not Found', heldAt: '', nextRecheckAt: '' })
   const [group] = behaviorDiagnosticGroups(diagnostics)
   expect(group?.message).toBe('review-bot has no access to org/repo')
-  expect(group?.entries).toHaveLength(5)
+  expect(group?.entries).toHaveLength(6)
   for (const entry of group?.entries ?? []) {
     expect(entry.link).toEqual({
       label: 'Invite review-bot or resend its pending invitation',

@@ -1,7 +1,7 @@
 # Behavior ledger
 
 The workspace exposes a compact, read-only view of individual firings of its
-six existing Behaviors and their downstream attempts. Each retained instance
+existing Behaviors and their downstream attempts. Each retained instance
 has a permanent 64-character hexadecimal hash. The ledger observes work; its
 state never controls eligibility, claims, retries, locks, metrics or launches.
 Capture does not wait for storage and adds no Caller reads.
@@ -229,7 +229,7 @@ slots before temporary authentication/capacity filtering. Missing slots remain
 pending. Disabling or shrinking a panel does not invent a completion.
 Manual reviews and explicit replays create fresh firings; their ancestry is
 unknown unless native replay adoption supplies evidence for the original work.
-Each actual direct resolve, merge or CI-rerun invocation creates its own firing.
+Each actual direct resolve, merge, CI-rerun or age-close invocation creates its own firing.
 
 Records carry target, source, actor, times, state, activity and bounded native
 references. A panel root has no single head; its children can have different

@@ -8,7 +8,7 @@ import { recordHandling } from './alerts/handling'
 import type { AnalyticsWindow } from './analytics'
 import { db } from './db'
 
-type DirectBehavior = 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci'
+type DirectBehavior = 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci' | 'close-old-prs'
 interface Run {
   behavior: BehaviorKey
   startedAt: string
