@@ -43,6 +43,15 @@ db.pragma('busy_timeout = 5000')
 // Deleted credential bytes must be overwritten rather than left on SQLite's
 // freelist. Set this before the migration that removes the retired PAT row.
 db.pragma('secure_delete = ON')
+/** How much of cache.db a connection maps: the most this SQLite build maps
+ *  (SQLITE_MAX_MMAP_SIZE, just under 2 GiB). */
+const MMAP_BYTES = 0x7fff0000
+// Pages are read through a mapping of the file instead of a read call each.
+// Another connection's commit resets this one's page cache, and a table larger
+// than the cache is read again on every scan; a read call per page is costly
+// under gVisor. Only SQLite shrinks cache.db, and its locks keep a checkpoint
+// from cutting a file another connection is reading.
+db.pragma(`mmap_size = ${MMAP_BYTES}`)
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS meta (
@@ -522,6 +531,7 @@ function cursorConnection(): Database.Database {
   cursorDb.pragma('synchronous = NORMAL')
   // Checkpoints stay with the main connection.
   cursorDb.pragma('wal_autocheckpoint = 0')
+  cursorDb.pragma(`mmap_size = ${MMAP_BYTES}`)
   return cursorDb
 }
 
