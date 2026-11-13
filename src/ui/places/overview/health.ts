@@ -1,7 +1,7 @@
 // System health in Overview (#1101, served since #1137): five live cards over
 // the last 24 hours of v2 chain work, each opening the evidence behind it.
 // Classic Analytics' read and figures (src/analytics-health.ts), in the mocks' words.
-import type { AnalyticsHealth, HealthSource } from '../../../analytics-health-types'
+import { EMPTY_COHORT, type AnalyticsHealth, type HealthSource } from '../../../analytics-health-types'
 import { formatCount, formatDuration, formatRate } from '../../../analytics-format'
 import { getOrganizations, getSettings } from '../../../config'
 import { getSelectedOrganization, organizationUrl } from '../../../organizations'
@@ -71,7 +71,13 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
       return
     }
     const { rate, blocked, recovery, lastError: { error, lastObserved, coveredSince, coveredUntil } } = data
-    card('ov.h.errors', rate.perItem === null ? 'Unavailable' : `${esc(formatRate(rate.perItem))}<span class="t-gloss"> per item</span>`, `${formatCount(rate.errors)} errors across ${formatCount(rate.completed)} items completed${rate.perItem === null ? ' · rate requires a nonempty, complete lifetime cohort' : ''}`)
+    // A rate, a lower bound while a counted item's run is still being reconciled, or why there is none.
+    const counts = `${formatCount(rate.errors)} errors across ${formatCount(rate.completed)} items completed`
+    // Nothing completed is a fact only when the cohort is known: missing evidence makes it Unknown.
+    card('ov.h.errors', rate.perItem === null ? (rate.withheld === EMPTY_COHORT ? 'None completed' : 'Unknown')
+      : `${rate.unsettled ? '<span class="t-gloss">at least </span>' : ''}${esc(formatRate(rate.perItem))}<span class="t-gloss"> per item</span>`,
+    rate.perItem === null ? `${counts} · ${rate.withheld ?? 'the cohort is not known'}`
+      : rate.unsettled ? `${counts} · ${formatCount(rate.unsettled)} still ${rate.unsettled === 1 ? 'has a run' : 'have runs'} being reconciled, so the rate may rise` : counts)
     card('ov.h.blocked', esc(formatCount(blocked.count)), blocked.oldestProgressAt === null ? 'none without verified progress' : `oldest ${formatDuration(data.readAt - blocked.oldestProgressAt)} without verified progress${blocked.largestStage ? ` · ${blocked.largestStage}` : ''}`)
     card('ov.h.recovery', esc(formatCount(recovery.automatic.length)), `${formatCount(recovery.intervention.length)} needed outside help`)
     card('ov.h.lasterror', error ? esc(formatDuration(data.readAt - error.at)) : coveredSince !== null && coveredUntil !== null ? 'None' : 'Unavailable',

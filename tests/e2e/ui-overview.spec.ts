@@ -306,7 +306,7 @@ for (const width of [375, 768, 1000, 1280]) {
 
 test('System health reads its five cards live, and a failed read keeps them, with when', async ({ page }) => {
   let fail = false
-  let rate: AnalyticsHealth['rate'] = { completed: 6, errors: 3, perItem: 0.5, items: [] }
+  let rate: AnalyticsHealth['rate'] = { completed: 6, errors: 3, perItem: 0.5, unsettled: 0, withheld: null, items: [] }
   const now = Date.now()
   await page.route('**/api/analytics/system-health*', (route) => fail ? json(route, { error: 'evidence store unavailable' }, 503) : json(route, {
     readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
@@ -341,12 +341,16 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   await expect(page.locator('[data-healthfail]')).toContainText('Not read yet.')
 
   fail = false
-  for (const [completed, errors, perItem, value, note] of [
-    [0, 0, null, 'Unavailable', '0 errors across 0 items completed · rate requires a nonempty, complete lifetime cohort'],
-    [2, 2, null, 'Unavailable', '2 errors across 2 items completed · rate requires a nonempty, complete lifetime cohort'],
-    [2, 0, 0, '0.0 per item', '0 errors across 2 items completed'],
+  // Never a bare Unavailable (#1381): a rate, a lower bound, or why there is none, in words.
+  const unknownMerge = 'GitHub’s merge time for acme/site#7 is unknown, so it may belong to these 24 hours'
+  for (const [completed, errors, perItem, unsettled, withheld, value, note] of [
+    [0, 0, null, 0, 'no v2 work merged in the last 24 hours', 'None completed', '0 errors across 0 items completed · no v2 work merged in the last 24 hours'],
+    [2, 2, null, 0, unknownMerge, 'Unknown', `2 errors across 2 items completed · ${unknownMerge}`],
+    [0, 0, null, 0, unknownMerge, 'Unknown', `0 errors across 0 items completed · ${unknownMerge}`],
+    [2, 0, 0, 0, null, '0.0 per item', '0 errors across 2 items completed'],
+    [6, 3, 0.5, 2, null, 'at least 0.5 per item', '3 errors across 6 items completed · 2 still have runs being reconciled, so the rate may rise'],
   ] as const) {
-    rate = { completed, errors, perItem, items: [] }
+    rate = { completed, errors, perItem, unsettled, withheld, items: [] }
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await expect(card('ov.h.errors').locator('.osmall-v')).toHaveText(value)
     await expect(card('ov.h.errors').locator(':scope > .t-gloss')).toHaveText(note)
@@ -379,7 +383,7 @@ test('a reload paints System health’s last read at once while it reads again, 
   const now = Date.now()
   await page.route('**/api/analytics/system-health*', (route) => json(route, {
     readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
-    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    rate: { completed: 6, errors: 3, perItem: 0.5, unsettled: 0, withheld: null, items: [] },
     blocked: { count: 0, oldestProgressAt: null, largestStage: null, items: [] },
     recovery: { automatic: [], intervention: [], unknown: 0 },
     lastError: { error: null, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now }, coverage: [],
@@ -418,7 +422,7 @@ test('System health’s last read never stands once an organization that was not
   const beta = { login: 'beta', managed: false, status: 'initializing', stage: 'syncing', error: null, activatedAt: null }
   await page.route('**/api/analytics/system-health*', (route) => json(route, {
     readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
-    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    rate: { completed: 6, errors: 3, perItem: 0.5, unsettled: 0, withheld: null, items: [] },
     blocked: { count: 0, oldestProgressAt: null, largestStage: null, items: [] },
     recovery: { automatic: [], intervention: [], unknown: 0 },
     lastError: { error: null, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now }, coverage: [],
