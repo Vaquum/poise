@@ -1008,7 +1008,10 @@ command exits nonzero. Invoke it again later to observe activation. A different
 Deployment-enabled forks recheck pending host-applied rollouts on the Sync
 schedule. The proof uses the exact active release and build and requires no
 pending switch. The recheck performs only inventory and health reads and
-updates the retained receipt. Check a legacy receipt by its rollout ID.
+updates the retained receipt and its [deployment pause diagnostics](Logging.md#collection-and-operation).
+Check a legacy receipt by its rollout ID. An observed replacement drain still
+active at the verifier's positive deadline retains an Error in Logging while
+the rollout remains pending; receipt-only zero-second waits do not raise it.
 
 The outcome becomes `complete` only after every expected workspace passes the
 proof. A supervisor `failed` marker for the exact target release establishes

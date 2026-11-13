@@ -9,6 +9,7 @@ import { maintainIngressSocket, startIngressSocket } from '../src/diagnostics/in
 import { DiagnosticRuntime } from '../src/diagnostics/runtime.js'
 import { DiagnosticStore } from '../src/diagnostics/store.js'
 import { executeLoggingRead } from '../src/diagnostics/query-worker.js'
+import type { LoggingPage } from '../src/diagnostics/query-contract.js'
 
 const cleanups: Array<() => Promise<void>> = []
 beforeAll(() => {
@@ -25,9 +26,9 @@ async function writer() {
   cleanups.push(async () => { await server.close(); runtime.stop(); rmSync(directory, { recursive: true, force: true }) })
   return { directory, path, socket, runtime }
 }
-function cli(directory: string, command: string, payload: string | ((hello: Record<string, unknown>) => string)) {
+function cli(directory: string, command: string | string[], payload: string | ((hello: Record<string, unknown>) => string)) {
   return new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-    const child = spawn(process.execPath, ['dist/diagnostics/cli.js', command], { env: { ...process.env, POISE_GATEWAY_DATA: directory, POISE_DOMAIN: 'poise.test' }, stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn(process.execPath, ['dist/diagnostics/cli.js', ...(typeof command === 'string' ? [command] : command)], { env: { ...process.env, POISE_GATEWAY_DATA: directory, POISE_DOMAIN: 'poise.test' }, stdio: ['pipe', 'pipe', 'pipe'] })
     const lines: Array<Record<string, unknown>> = []; let pending = '', error = ''
     const timer = setTimeout(() => { child.kill(); reject(new Error('Compiled ingress CLI stalled')) }, 10_000)
     child.stderr.on('data', (chunk: Buffer) => { error += chunk.toString() })
@@ -76,6 +77,68 @@ it('preserves the legacy manual identity and refuses strict-host violations at t
   for (const host of ['admin.poise.test', 'nested.alice.poise.test', 'alice.poise.test:99999', 'poise.test.attacker.test']) {
     await expect(cli(w.directory, 'ingress', JSON.stringify({ request: { host }, level: 'error', msg: 'excluded' }))).rejects.toThrow()
   }
+})
+
+it('retains one replacement deadline Error per rollout and workspace through fresh verifier processes', async () => {
+  const w = await writer(), requested = 'a'.repeat(40), serving = 'b'.repeat(40)
+  const rollout = requested + '.FIRST1', later = requested + '.SECOND', at = Date.now() - 60_000
+  const health = { ok: true, version: serving, release: serving, draining: true, desiredRelease: serving, pendingSince: null,
+    activeChatTurns: 0, runningCallerCalls: 2, backgroundWork: 0, unsettledNativeCalls: null, switchWaitingOn: null,
+    environment: { SECRET: 'excluded' } }
+  const observe = (id: string, workspace: string, seconds: number, budget: number, elapsed: number, snapshot: unknown, complete = false) =>
+    cli(w.directory, ['deployment', id, workspace, String(budget), String(elapsed), new Date(at + seconds * 1000).toISOString(), String(complete)], JSON.stringify(snapshot))
+  const read = (workspace: string | null = null, operator = true) => {
+    const reply = executeLoggingRead({ path: w.path, policy: w.runtime.health().policy, now: Date.now(), operation: 'list', access: { workspace, operator }, filter: {} })
+    expect(reply.status).toBe(200)
+    return JSON.parse(reply.body) as LoggingPage
+  }
+  expect((await observe(rollout, 'alice', 0, 600, 599, health))[0].events).toBe(0)
+  expect((await observe(rollout, 'alice', 1, 0, 0, health))[0].events).toBe(0)
+  expect((await observe(rollout, 'alice', 1, 600, 600, { ...health, release: requested, version: requested }))[0].events).toBe(0)
+  expect(read().total).toBe(0)
+  await observe(rollout, 'alice', 2, 600, 604, health)
+  const first = read().events[0]
+  expect(first).toMatchObject({ severity: 'error', operation: 'workspace.deployment.pause', phase: 'deadline', release: requested,
+    target: rollout, workspace: 'alice', timeoutMs: 600_000, occurrences: 1,
+    context: { rollout, requestedRevision: requested, servingRevision: serving, budget: 'deployment-verifier', budgetSeconds: 600,
+      elapsedSeconds: 604, admissionState: 'drained', blocker: 'runningCallerCalls', nextRetry: null,
+      health: { desiredRelease: serving, pendingSince: null, runningCallerCalls: 2, unsettledNativeCalls: null } } })
+  expect(JSON.stringify(first)).not.toContain('SECRET')
+  await observe(rollout, 'alice', 3, 600, 900, { ...health, runningCallerCalls: 1 })
+  await observe(rollout, 'alice', 1, 600, 605, health)
+  await observe(rollout, 'alice', 4, 0, 0, null)
+  await observe(rollout, 'alice', 5, 0, 0, health) // A resume attempt is not proof.
+  expect(read().events).toEqual([first])
+  expect(read('alice', false).events).toEqual([first])
+  expect(read('bob', false).total).toBe(0)
+  // Another rollout of the same SHA and another workspace have independent identities.
+  await observe(later, 'alice', 6, 600, 600, health)
+  await observe(rollout, 'bob', 6, 600, 600, health)
+  await observe(later, 'alice', 7, 0, 0, { ...health, draining: false, release: requested, version: requested }, true)
+  expect(read().events.filter((event) => event.target === rollout && event.workspace === 'alice')).toEqual([first])
+  await observe(rollout, 'alice', 8, 0, 0, { ...health, draining: false })
+  const recovered = read().events.find((event) => event.target === rollout && event.workspace === 'alice' && event.phase === 'recovered')
+  expect(recovered).toMatchObject({ severity: 'warning', incidentId: first.incidentId, context: { recovery: 'admissions_restored', admissionState: 'open' } })
+  // Neither delayed evidence nor a later drained snapshot reopens this pause.
+  await observe(rollout, 'alice', 7, 600, 1200, health)
+  await observe(rollout, 'alice', 9, 600, 1200, health)
+  expect(read().events.filter((event) => event.severity === 'error')).toHaveLength(3)
+  expect(read().events.find((event) => event.id === first.id)).toEqual({ ...first, occurrences: 2 })
+})
+
+it('keeps completed pauses closed and rejects malformed deployment evidence at the private boundary', async () => {
+  const w = await writer(), rollout = 'a'.repeat(40) + '.DONE01', at = Date.now() - 1000
+  const args = ['deployment', rollout, 'alice', '0', '0', new Date(at).toISOString(), 'true']
+  await cli(w.directory, args, 'null') // The verifier proved the stopped image.
+  await cli(w.directory, ['deployment', rollout, 'alice', '600', '600', new Date(at - 1).toISOString(), 'false'], '{"ok":true,"draining":true}')
+  await cli(w.directory, ['deployment', rollout, 'alice', '600', '600', new Date(at + 1).toISOString(), 'false'], '{"ok":true,"draining":true}')
+  const db = new DiagnosticStore(w.path, undefined, Date.now, true)
+  try { expect(db.query({ workspace: null, operator: true }).total).toBe(0) }
+  finally { db.close() }
+  for (const invalid of [['deployment', 'invalid', ...args.slice(2)], [...args.slice(0, 3), '-1', ...args.slice(4)]]) {
+    await expect(cli(w.directory, invalid, 'null')).rejects.toThrow()
+  }
+  await expect(cli(w.directory, args, 'x'.repeat(64 * 1024))).rejects.toThrow()
 })
 
 

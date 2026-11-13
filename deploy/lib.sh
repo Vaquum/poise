@@ -668,6 +668,21 @@ pending_line() {
   printf '%s, pending %s)\n' "$line" "$(pending_age "$since")"
 }
 
+# The verifier owns this budget; health's switch target/age do not describe
+# container replacement. The private Logging writer retains the first snapshot.
+report_rollout_pauses() {
+  [ -n "${rollout_file:-}" ] || return 0
+  local budget=$1 elapsed=$2 complete=$3 index
+  for index in "${!pause_handles[@]}"; do
+    if [ "$budget" -eq 0 ] && [ "$complete" = false ] \
+      && ! [[ ${pause_health[index]} =~ \"draining\":[[:space:]]*false ]]; then continue; fi
+    if ! printf '%s' "${pause_health[index]}" | docker exec -i "$gateway" node dist/diagnostics/cli.js deployment \
+      "${rollout_file##*/}" "${pause_handles[index]}" "$budget" "$elapsed" "${pause_observed[index]}" "$complete" >/dev/null; then
+      warn "cannot retain the deployment pause observation for ${rollout_file##*/}, workspace ${pause_handles[index]}."
+    fi
+  done
+}
+
 # Proves every managed workspace serves the deployed commit SHA: a running one
 # answers its health check with that active release, a stopped one is on the
 # new image and serves it on its next start. Waits up to
@@ -677,8 +692,9 @@ pending_line() {
 verify_workspaces() {
   [ $# -eq 3 ] || die "verify_workspaces needs the workspace handles captured before building the image."
   local sha=$1 image=$2 expected=$3
-  local image_id inventory ids lines pending waiting serving deadline announced observed failed failure
-  local handle id running name health active desired installed has_installed since
+  local image_id inventory ids lines pending waiting serving started deadline announced observed failed failure
+  local handle id running name health active desired installed has_installed since observed_at
+  local -a pause_handles=() pause_health=() pause_observed=()
   if [ -z "$sha" ]; then
     say "This is a development build, which reports no release; skipping workspace verification."
     return 0
@@ -697,7 +713,8 @@ verify_workspaces() {
     image_id=$(docker image inspect --format '{{.Id}}' "$image") || die "cannot read the workspace image $image."
   fi
   say "Waiting for every workspace to serve $sha."
-  deadline=$((SECONDS + verify_timeout_seconds))
+  started=$SECONDS
+  deadline=$((started + verify_timeout_seconds))
   announced=$SECONDS
   while :; do
     pending=''
@@ -705,6 +722,7 @@ verify_workspaces() {
     serving=''
     observed=''
     failed=''
+    pause_handles=() pause_health=() pause_observed=()
     # The gateway replaces containers as it recreates them, so list them anew every poll.
     inventory=$(docker ps --all --filter label=poise.managed=true --format '{{.ID}} {{.Label "poise.workspace"}}') \
       || die "cannot list the managed workspaces."
@@ -748,7 +766,9 @@ verify_workspaces() {
           record_rollout pending 'Workspace inventory extended.' "$expected"
         fi
         if [ "$running" = true ]; then
+          observed_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
           if health=$(docker exec "$name" curl -fsS --max-time 10 http://127.0.0.1:5555/api/service/health 2>/dev/null); then
+            pause_handles+=("$handle") pause_health+=("$health") pause_observed+=("$observed_at")
             active=$(health_field "$health" release)
             if [ "$active" = "$sha" ] && [ "$(health_field "$health" version)" = "$sha" ] \
               && [ -z "$(health_field "$health" switching)" ]; then
@@ -771,6 +791,7 @@ verify_workspaces() {
           fi
         elif [ "$id" = "$image_id" ]; then
           serving="$serving$handle (stopped) "
+          pause_handles+=("$handle") pause_health+=(null) pause_observed+=("$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)")
         else
           pending="$pending  $handle: stopped, still on an older image\n"
         fi
@@ -788,6 +809,9 @@ verify_workspaces() {
       show_rollout
       [ "$rollout_status" = complete ]
       return
+    fi
+    if [ -n "$pending" ] && [ "$SECONDS" -lt "$deadline" ]; then
+      report_rollout_pauses 0 "$((SECONDS - started))" false
     fi
     if [ -n "$failed" ]; then
       record_rollout failed "$(printf '%b' "$failed")" "$expected"
@@ -810,6 +834,7 @@ verify_workspaces() {
         record_rollout complete "Every workspace serves $sha: ${serving% }." "$expected"
         show_rollout
         [ "$rollout_status" = complete ] || return 1
+        report_rollout_pauses 0 "$((SECONDS - started))" true
       else
         clear_workspace_proof
       fi
@@ -817,6 +842,7 @@ verify_workspaces() {
       return 0
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
+      report_rollout_pauses "$verify_timeout_seconds" "$((SECONDS - started))" false
       if [ -n "${rollout_file:-}" ]; then show_rollout; fi
       if [ "$verify_pending_ok" = true ]; then return 0; fi
       die "the deploy of $sha is still pending after ${verify_timeout_seconds}s: these workspaces do not serve it yet:
