@@ -1,5 +1,6 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 import { normalize, type LogEvent } from '../../gateway/src/diagnostics/contract'
+import { gatewayDiagnostic } from '../../gateway/src/diagnostics/collectors'
 import { callerDiagnostic, workspaceEnvelope } from '../../gateway/src/diagnostics/sources'
 
 // Observe in the new interface (#556): Tasks with the chain's evidence,
@@ -259,6 +260,20 @@ test('Logging’s entry addresses open the exact diagnostic, an incident or say 
 
   await page.goto('/?view=logging&event=evt_nope')
   await expect(logging(page).locator('[data-ref="lg.linked"]')).toContainText('The diagnostic link is invalid.')
+})
+
+test('Logging shows workspace disk usage and budget in the existing Warning detail', async ({ page }) => {
+  const event = normalize(gatewayDiagnostic('warn', 'disk.workspace.over_budget', {
+    handle: 'local', bytes: 189628338659, budget: 53687091200,
+  }), NOW)!
+  await open(page, `/?view=observe&part=logging&event=${event.id}`, { diagnostics: [{ ...event, occurrences: 1 }] })
+  const row = logging(page).locator(`tr[data-ev="${event.id}"]`)
+  await expect(row.locator('[data-ref="lg.severity"]')).toHaveText('Warning')
+  const detail = logging(page).locator(`#lg-detail-${event.id}`)
+  await expect(detail).toBeVisible()
+  const context = detail.locator('.lg-ev', { has: page.getByRole('heading', { name: 'Context · as recorded', exact: true }) }).locator('pre')
+  await expect(context).toContainText('"bytes": 189628338659')
+  await expect(context).toContainText('"budget": 53687091200')
 })
 
 test('Logging keeps review deadline group and budget causes in the existing event detail', async ({ page }) => {
