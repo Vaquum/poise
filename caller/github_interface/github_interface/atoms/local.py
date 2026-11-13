@@ -1,14 +1,16 @@
 import base64
 import fcntl
 import os
+import re
 import shutil
 import subprocess
+from contextlib import ExitStack
 from pathlib import Path
 from threading import Thread
 from time import monotonic
 from urllib.parse import urlparse
 
-from .process_diagnostic import StderrCapture, failure
+from .process_diagnostic import GitProcessError, StderrCapture, failure
 
 # One bare mirror per repository, outside ~/dev, so a fresh checkout is a
 # local clone instead of a full download.
@@ -86,19 +88,59 @@ def checkout_repo(
               "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], token, basic)
         _run(["git", "clone", "--quiet", "--no-checkout", "--branch", branch, str(mirror), str(path)], token)
 
-    with open(mirror.parent / f"{repo}.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    def discard(directory: Path, descriptor: int) -> bool:
         try:
-            refresh()
-        except RuntimeError:
-            # A git killed mid-fetch can leave the mirror locked or partial.
-            # Nobody else uses it while we hold the lock: start it over once.
-            shutil.rmtree(mirror, ignore_errors=True)
-            shutil.rmtree(path, ignore_errors=True)
-            refresh()
-    # The snapshot owns its objects. Slow filters and working-tree writes must
-    # not hold up other checkouts or make their caller's deadline expire.
-    _run(["git", "-C", str(path), "reset", "--hard", "--quiet", "HEAD"], token)
+            if not os.path.samestat(directory.lstat(), os.fstat(descriptor)):
+                return False
+        except FileNotFoundError:
+            return True
+        shutil.rmtree(directory)
+        return True
+
+    with open(mirror.parent / f"{repo}.lock", "w") as lock:
+        # Refresh, snapshot and materialization share one recovery allowance.
+        for attempt in range(2):
+            with ExitStack() as owned:
+                materializing = False
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    try:
+                        # Reserve the destination before Git runs; an earlier
+                        # absence check cannot authorize deleting a later arrival.
+                        path.mkdir(parents=True)
+                        snapshot_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                        owned.callback(os.close, snapshot_fd)
+                        mirror.mkdir(exist_ok=True)
+                        mirror_fd = os.open(mirror, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                        owned.callback(os.close, mirror_fd)
+                        refresh()
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    # Independent objects let both materializations run outside
+                    # the flock, even when another checkout replaces the mirror.
+                    materializing = True
+                    _run(["git", "-C", str(path), "reset", "--hard", "--quiet", "HEAD"], token)
+                except RuntimeError as error:
+                    if materializing and not (
+                        isinstance(error, GitProcessError)
+                        and error.diagnostic["operation"] == "reset"
+                        and error.diagnostic["outcome"] == "exit"
+                        and error.diagnostic["exit_code"] == 128
+                        and re.search(r"(?m)^fatal: unable to read tree (?:[0-9a-f]{40}|[0-9a-f]{64})$", error.diagnostic["stderr"])
+                    ):
+                        raise
+                    if not discard(path, snapshot_fd):
+                        raise RuntimeError(f"checkout destination changed during recovery: {path}") from error
+                    if attempt:
+                        raise
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    try:
+                        # A replacement generation belongs to its new owner.
+                        discard(mirror, mirror_fd)
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    continue
+                break
     _run(["git", "-C", str(path), "remote", "set-url", "origin", remote], token)
     return {"branch": branch, "head_sha": _run(["git", "-C", str(path), "rev-parse", "HEAD"], token)}
 
