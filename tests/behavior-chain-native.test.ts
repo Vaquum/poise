@@ -11,6 +11,7 @@ import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/beh
 import type { Organization } from '../server/organizations'
 import type { NativeChainHooks } from '../server/behavior-chain-native'
 import { completedReviewCall } from './review-response-fixture'
+import { behaviorChainAttention, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), health: vi.fn(async () => {}) }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn() }))
@@ -28,6 +29,7 @@ const { spawnDetached } = await import('../server/process')
 
 let directory = ''
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllEnvs()
   if (directory) rmSync(directory, { recursive: true, force: true })
   directory = ''
@@ -526,6 +528,100 @@ it.each(['verified', 'edited merge', 'missing proof', 'wrong ref', 'wrong head',
       ['--list-failing-ci', '21', '--base-update-from', failed, '--token-user', 'reviewer'],
     ])
   })
+
+it('retains a Caller-produced CI-only hold through settlement and restart, then recovers a same-head rerun', async () => {
+  const failedHead = 'fcea77111bf5842239e81afb5e069b1fafa78fd6'
+  const failedCheck = { type: 'check_run', name: 'Unit & integration (1)', state: 'completed', conclusion: 'failure',
+    check_run_id: 132038286724, log_id: 132038286724,
+    url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286724' }
+  const ci = { action: 'list_failing_ci', repository: chain.repository, pull_number: 21, head_sha: failedHead,
+    checks: [failedCheck], failing: [failedCheck], mergeable: true, mergeable_state: 'clean' }
+  let green = false, wire = '[]', released = '', reviewers: typeof reviewer[] = []
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    if (command === 'agent-interface') {
+      expect(argv[0]).toBe('--logs')
+      return { stdout: wire }
+    }
+    const evidence: Record<string, unknown> = {
+      '--chain-seed': { repository: chain.repository, issue_number: 7, actor: 'author', branch: chain.branch,
+        issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+        publication: { existing_pulls: [], pull_number: 21, head_sha: failedHead, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
+      '--pull-action-state': { pull_number: 21, state: 'open', head_sha: failedHead, review_context: 'b'.repeat(64),
+        merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
+      '--pr-readiness': { head_sha: failedHead, draft: false, checks_state: green ? 'SUCCESS' : 'FAILURE',
+        reviewer_approved_current_head: false, unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0,
+        green: false, blockers: ['reviewer_not_approved_current_head', ...(green ? [] : ['checks_failed'])] },
+      '--list-failing-ci': green ? { ...ci, failing: [], checks: [{ ...failedCheck, conclusion: 'success',
+        check_run_id: 132038286725, log_id: 132038286725,
+        url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286725' }] } : ci,
+    }
+    if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
+    return { stdout: JSON.stringify(evidence[argv[0]]) }
+  })
+  const native = actionOperations({ roster: async () => ({ issueReviewers: [], prReviewers: reviewers,
+    implementer: reviewer, repairer: reviewer, approver: reviewer }) })
+  const launch = vi.fn<ChainRuntimeOperations['launch']>(async invocation => {
+    if (invocation.behavior === 'repair-pr') {
+      const receipts = JSON.parse(execFileSync('python3', ['tests/fixtures/ci-only-repair.py'], {
+        input: JSON.stringify({ argv: invocation.request.argv, ci }), encoding: 'utf8', timeout: 10_000,
+        env: { ...process.env, PYTHONPATH: resolve('caller/agent_interface') },
+      })) as { pending: unknown[], released: unknown[] }
+      wire = JSON.stringify(receipts.pending)
+      released = JSON.stringify(receipts.released)
+    }
+    return true
+  })
+  const operations = { ...native, discover: async () => [], launch }
+  const db = new Database(':memory:')
+  try {
+    let journal = new BehaviorChainJournal(db)
+    journal.append(chain.id, 'seed', 0, { type: 'chain.admitted', repository: chain.repository, issue: chain.issue,
+      branch: chain.branch, author: chain.author, reviewer: chain.reviewer })
+    let runtime = new BehaviorChainRuntime(journal, operations)
+    await runtime.run()
+    expect(launch).toHaveBeenCalledTimes(1)
+    const snapshot = parseAgentLogList(JSON.parse(released))
+    expect(snapshot.quarantined).toEqual([])
+    const call = snapshot.entries[0]
+    expect(call).toMatchObject({ status: 'failed', behavior: 'repair_pr', action: 'not_started', head_sha: null,
+      error_code: 'atomic_work_blocked', review_id: null, receipts: null,
+      artifact: { phase: 'executing', ci_blocker: { action: ci.action, repository: ci.repository,
+        pull_number: ci.pull_number, head_sha: failedHead, failing: [failedCheck] } } })
+    expect(call.artifact).not.toHaveProperty('plan_sha')
+    const hold = { invocationId: call.correlation_id, callId: call.id, head: failedHead }
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.parse(call.completed_at!) + 1000)
+    await runtime.run()
+    expect(journal.read(chain.id)).toMatchObject({ held: call.error, ciHold: hold, invocations: [{ state: 'uncertain' }] })
+    expect(behaviorChainWorkImpact(journal, call.id, null)?.nextAction).toContain('original invocation receipt')
+    wire = released
+    await runtime.run()
+    const settled = journal.read(chain.id)!
+    expect(settled).toMatchObject({ held: call.error, ciHold: hold, invocations: [{ state: 'settled' }] })
+    const next = 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
+    expect(behaviorChainWorkImpact(journal, call.id, null)).toMatchObject({ impact: 'blocked', retryAt: null, nextAction: next })
+    expect(behaviorChainAttention(journal)).toMatchObject([{ nextAction: next,
+      reconciliation: { nextObservationAt: journal.reconciliationAt(settled), waitingForResourceRelease: false } }])
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    journal = new BehaviorChainJournal(db)
+    runtime = new BehaviorChainRuntime(journal, operations)
+    expect(journal.read(chain.id)).toEqual(settled)
+    await runtime.run()
+    expect(journal.history(chain.id)).toEqual(history)
+    green = true
+    reviewers = [reviewer]
+    vi.setSystemTime(journal.reconciliationAt(settled)!)
+    await runtime.run()
+    const recovered = journal.read(chain.id)!
+    expect(recovered.held).toBeNull()
+    expect(recovered.ciHold).toBeUndefined()
+    expect(recovered.invocations[0]).toEqual(settled.invocations[0])
+    expect(recovered.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
+    expect(launch).toHaveBeenCalledTimes(2)
+    expect(journal.history(chain.id).map(row => JSON.parse(row.payload))).toContainEqual({ type: 'chain.resumed', ciRecovery: hold })
+  } finally { db.close() }
+})
 
 const invoke = (behavior: string) => ({ kind: 'invoke', behavior })
 const gatesUnsatisfied = { kind: 'wait', reason: 'native repository readiness gates are not satisfied' }
