@@ -16,6 +16,8 @@ curl -fsSL https://get.docker.com | sh
 # The workspace's Python, including python3 for children of offloaded npm scripts.
 curl -fsSL https://astral.sh/uv/0.12.22/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
 UV_PYTHON_INSTALL_DIR=/opt/python UV_PYTHON_BIN_DIR=/usr/local/bin uv python install --default 3.13
+# The checkout brings its own interpreter to these paths, unpacked as uid 10001.
+chown -R 10001:10001 /opt/python /usr/local/bin/python3*
 
 # The workspace's Node: a checkout's native modules are built for it, and it comes first on PATH.
 node=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | sed -n 's/.*  \(node-v22[^ ]*-linux-x64\.tar\.xz\)$/\1/p')

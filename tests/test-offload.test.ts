@@ -1706,6 +1706,8 @@ describe('what a box starts from', () => {
     expect(setup).toContain(`https://astral.sh/uv/${uv}/install.sh`)
     expect(setup).toContain('UV_UNMANAGED_INSTALL=/usr/local/bin')
     expect(setup).toContain(`UV_PYTHON_INSTALL_DIR=${directory} UV_PYTHON_BIN_DIR=/usr/local/bin uv python install --default ${python}`)
+    // The checkout's own interpreter lands on these paths, unpacked as uid 10001.
+    expect(setup).toContain('chown -R 10001:10001 /opt/python')
   })
 
   it('has the Chromium this repository\'s Playwright expects', () => {
