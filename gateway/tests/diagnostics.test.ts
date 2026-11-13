@@ -275,6 +275,22 @@ describe('retained authorized queries', () => {
     } finally { counted.mockRestore() }
   })
 
+  it('holds the tombstone cap again after a rejected append rolled back the check made inside it', () => {
+    const policy = { retentionMs: 30 * 86_400_000, maxBytes: 4 * 1024 * 1024, maxEvents: 2048 }
+    const db = store(policy)
+    const counted = vi.spyOn(Database.prototype, 'prepare')
+    try {
+      const counts = () => counted.mock.calls.filter(([sql]) => String(sql).includes('COUNT(*) AS count FROM log_expired')).length
+      // The batch's first prune holds the cap, then its invalid record rolls the whole append back.
+      expect(() => db.append([event('kept-then-rolled-back'), { ...event('rejected'), version: 2 } as unknown as LogEvent])).toThrow()
+      expect(counts()).toBe(1)
+      db.prune()
+      expect(counts()).toBe(2)
+      db.prune()
+      expect(counts()).toBe(2)
+    } finally { counted.mockRestore() }
+  })
+
   it('bounds actual bytes and never resurrects a tombstoned replay', () => {
     const policy = { retentionMs: 100_000, maxBytes: 20_000, maxEvents: 100 }
     const db = store(policy)

@@ -114,7 +114,7 @@ export class DiagnosticStore {
 
   append(events: readonly LogEvent[]): number {
     if (events.length > 100) throw new Error('Logging ingestion batch exceeds 100 events')
-    return this.db.transaction(() => {
+    return this.capChecked(() => this.db.transaction(() => {
       let inserted = 0
       this.prune()
       for (const event of events) {
@@ -150,13 +150,24 @@ export class DiagnosticStore {
       }
       this.prune()
       return inserted
-    })()
+    })())
+  }
+
+  /** A write that rolls back also undoes a tombstone cap held inside it, so the
+   *  next prune holds the cap again. */
+  private capChecked<T>(write: () => T): T {
+    try {
+      return write()
+    } catch (error) {
+      this.tombstonesSinceCap = Number.POSITIVE_INFINITY
+      throw error
+    }
   }
 
   prune(reserve = 0): void {
     if (reserve > this.policy.maxBytes) throw new Error('Logging event exceeds the configured storage budget')
     const cutoff = new Date(this.now() - this.policy.retentionMs).toISOString()
-    this.db.transaction(() => {
+    this.capChecked(() => this.db.transaction(() => {
       this.db.prepare('DELETE FROM log_expired WHERE expired_at < ?').run(cutoff)
       // Release payload/index pages before allocating their smaller tombstones.
       const expired = this.db.prepare("DELETE FROM log_events WHERE ingested_at < ? RETURNING id,workspace,visibility,strftime('%Y-%m-%dT%H:%M:%fZ',ingested_at,?) AS expired_at")
@@ -174,7 +185,7 @@ export class DiagnosticStore {
         const { count } = this.db.prepare('SELECT COUNT(*) AS count FROM log_expired').get() as { count: number }
         if (count > cap) this.db.prepare('DELETE FROM log_expired WHERE id IN (SELECT id FROM log_expired ORDER BY expired_at ASC,id ASC LIMIT ?)').run(count - cap)
       }
-    })()
+    })())
   }
 
   private rememberExpired(rows: readonly ExpiredRow[]): void {
