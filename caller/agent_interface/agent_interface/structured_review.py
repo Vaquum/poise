@@ -601,7 +601,15 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 # Each group was validated against the bounded provider schema.
                 # The aggregate's capacity is a publication constraint.
                 verdict = {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}
-            review_receipt.retain_verdict(verdict, head)
+            try:
+                review_receipt.retain_verdict(verdict, head)
+            except OSError as error:
+                cause = bounded_cause(str(error))
+                raise review_budget.ReviewLimitError(
+                    f"Completed review could not retain its findings: {cause}; no review submitted",
+                    "review_contract_violation",
+                    diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
+                                        stderr=cause, provider=model.provider, submission="none")) from error
             if len(verdict["comments"]) > 100:
                 raise review_budget.ReviewLimitError(
                     f"Completed review has {len(verdict['comments'])} findings; the single-review inline limit is 100; "
