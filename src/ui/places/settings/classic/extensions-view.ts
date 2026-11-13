@@ -269,7 +269,7 @@ function rowsHtml(rows: Row[], list: 'env' | 'headers', locked: boolean): string
   return rows.map((row, index) => `<div class="ext-pair">
     <input class="st-input" value="${esc(row.name)}" placeholder="${list === 'env' ? 'NAME' : 'Header-Name'}" data-list="${list}" data-field="name" data-index="${index}" aria-label="${list === 'env' ? 'Variable name' : 'Header name'}" autocomplete="off" spellcheck="false" ${locked ? 'disabled' : ''}>
     <input class="st-input" type="${row.secret ? 'password' : 'text'}" value="${esc(row.value)}" placeholder="${row.secret && row.set ? 'Saved — type to replace' : 'value'}" data-list="${list}" data-field="value" data-index="${index}" aria-label="Value" autocomplete="off" spellcheck="false">
-    <button type="button" class="ext-icon-btn${row.secret ? ' is-on' : ''}" data-secret="${list}" data-index="${index}" aria-pressed="${row.secret}" data-help="${row.secret ? 'Secret: stored write-only' : 'Mark as secret'}" ${locked ? 'disabled' : ''}>${LOCK}</button>
+    <button type="button" class="ext-icon-btn${row.secret ? ' is-on' : ''}" data-secret="${list}" data-index="${index}" aria-label="Store as secret" aria-pressed="${row.secret}" data-help="${row.secret ? 'Secret: stored write-only' : 'Mark as secret'}" ${locked ? 'disabled' : ''}>${LOCK}</button>
     <button type="button" class="ext-icon-btn" data-remove-row="${list}" data-index="${index}" aria-label="Remove" ${locked ? 'disabled' : ''}>&times;</button></div>`).join('')
 }
 
