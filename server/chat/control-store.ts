@@ -296,7 +296,7 @@ export function internalTurn(turnId: string): boolean {
 }
 export interface Watch { id: string, owner: string, targets: string, instruction: string, interval_ms: number, next_at: number, enabled: number }
 export function watches(instance: string, owner?: string): Watch[] {
-  return db.prepare('SELECT id, owner, targets, instruction, interval_ms, next_at, enabled FROM chat_control_watches WHERE instance = ? AND (? IS NULL OR owner = ?)')
+  return cachedStatement(db, 'SELECT id, owner, targets, instruction, interval_ms, next_at, enabled FROM chat_control_watches WHERE instance = ? AND (? IS NULL OR owner = ?)')
     .all(instance, owner ?? null, owner ?? null) as Watch[]
 }
 export function addWatch(instance: string, owner: string, targets: string[], minutes: number, instruction: string): string {
@@ -650,7 +650,7 @@ export function allTimersHeld(instance: string): { held: boolean, since: number 
 
 /** Every live timer, oldest first. */
 export function liveTimers(instance: string): TimerView[] {
-  const rows = db.prepare(`SELECT ${TIMER_COLUMNS} FROM chat_control_timers WHERE instance = ? AND state IN ${LIVE_STATES}
+  const rows = cachedStatement(db, `SELECT ${TIMER_COLUMNS} FROM chat_control_timers WHERE instance = ? AND state IN ${LIVE_STATES}
     ORDER BY created_at, id`).all(instance) as TimerRow[]
   return rows.map(viewOf)
 }
@@ -769,7 +769,7 @@ export function recordTimerTurn(instance: string, id: string, outcome: 'ok' | 'f
 /** A clock that moved backward clamps a `next_at` more than one interval
  *  ahead back to `now + interval`. */
 export function clampTimerClocks(instance: string, now: number): number {
-  return db.prepare(`UPDATE chat_control_timers SET next_at = ? + interval_ms, updated_at = ?
+  return cachedStatement(db, `UPDATE chat_control_timers SET next_at = ? + interval_ms, updated_at = ?
     WHERE instance = ? AND state IN ('active','held') AND next_at IS NOT NULL AND next_at > ? + interval_ms`)
     .run(now, now, instance, now).changes
 }
@@ -779,7 +779,7 @@ export interface SweptTimers { targets: Array<{ id: string, target: string }>, s
 /** End timers whose target is gone, purged or foreign, and timers set by a
  *  chat that is gone; drop hold rows of chats that no longer exist. */
 export const sweepStaleTimers = db.transaction((instance: string, now: number): SweptTimers => {
-  const targets = db.prepare(`SELECT t.id, t.target FROM chat_control_timers t WHERE t.instance = ? AND t.state IN ${LIVE_STATES}
+  const targets = cachedStatement(db, `SELECT t.id, t.target FROM chat_control_timers t WHERE t.instance = ? AND t.state IN ${LIVE_STATES}
     AND NOT EXISTS (SELECT 1 FROM chat_sessions s WHERE s.id = t.target AND s.instance = t.instance)`)
     .all(instance) as Array<{ id: string, target: string }>
   for (const timer of targets) {
@@ -787,7 +787,7 @@ export const sweepStaleTimers = db.transaction((instance: string, now: number): 
     db.prepare(`UPDATE chat_control_timers SET state = 'done', reason = 'target_deleted', next_at = NULL,
       updated_at = ?, ended_at = ? WHERE id = ?`).run(now, now, timer.id)
   }
-  const setters = db.prepare(`SELECT t.id, t.target FROM chat_control_timers t WHERE t.instance = ? AND t.state IN ${LIVE_STATES}
+  const setters = cachedStatement(db, `SELECT t.id, t.target FROM chat_control_timers t WHERE t.instance = ? AND t.state IN ${LIVE_STATES}
     AND t.set_by_kind = 'chat' AND NOT EXISTS (SELECT 1 FROM chat_sessions s WHERE s.id = t.set_by_session AND s.instance = t.instance)`)
     .all(instance) as Array<{ id: string, target: string }>
   for (const timer of setters) {
@@ -795,7 +795,7 @@ export const sweepStaleTimers = db.transaction((instance: string, now: number): 
     db.prepare(`UPDATE chat_control_timers SET state = 'cancelled', reason = 'creator_deleted', next_at = NULL,
       updated_at = ?, ended_at = ? WHERE id = ?`).run(now, now, timer.id)
   }
-  db.prepare(`DELETE FROM chat_control_holds WHERE instance = ?
+  cachedStatement(db, `DELETE FROM chat_control_holds WHERE instance = ?
     AND NOT EXISTS (SELECT 1 FROM chat_sessions s WHERE s.id = session AND s.instance = ?)`).run(instance, instance)
   return { targets, setters }
 })
@@ -820,7 +820,7 @@ export const retainTimers = db.transaction((instance: string, now: number): { ti
 
 /** Pending timer rows with their timers, for delivery waits and warnings. */
 export function timerPendingWaits(instance: string): Array<{ seq: number, timer_id: string, recipient: string, timer_missed: number, created_at: number }> {
-  return db.prepare(`SELECT i.seq, i.timer_id, i.recipient, i.timer_missed, i.created_at FROM chat_control_inbox i
+  return cachedStatement(db, `SELECT i.seq, i.timer_id, i.recipient, i.timer_missed, i.created_at FROM chat_control_inbox i
     JOIN chat_control_timers t ON t.id = i.timer_id
     WHERE i.instance = ? AND i.state = 'pending' AND i.timer_id IS NOT NULL AND t.state = 'active'
     ORDER BY i.seq`).all(instance) as Array<{ seq: number, timer_id: string, recipient: string, timer_missed: number, created_at: number }>
