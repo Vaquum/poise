@@ -841,8 +841,11 @@ class TestRecovery(TestCase):
                 self.assertEqual(row['error_code'], 'review_inspection_timeout' if phase == 'inspection'
                                  else 'review_budget_exhausted', row['error'])
                 diagnostic = row['diagnostic']
-                self.assertEqual(diagnostic['phase'], limiting_phase)
-                self.assertEqual(diagnostic['outcome'], 'timed_out')
+                handoff = limiting_phase == 'provider_analysis'
+                self.assertEqual(diagnostic['phase'], 'analysis' if handoff else limiting_phase)
+                self.assertEqual(diagnostic['outcome'], 'handoff' if handoff else 'timed_out')
+                if handoff:
+                    self.assertEqual(diagnostic['operation'], 'provider.review')
                 self.assertEqual(diagnostic['submission'], 'none')
                 self.assertIn(f'file group {group} of 22', diagnostic['message'])
                 self.assertIn('Incomplete analysis', diagnostic['message'])

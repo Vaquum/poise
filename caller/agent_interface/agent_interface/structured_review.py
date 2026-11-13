@@ -410,13 +410,22 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
         except review_budget.ReviewLimitError:
             remaining = 0
         remaining = max(0, min(remaining, deadline - monotonic()))
-        message = (f"Incomplete analysis in file group {group_number} of {total_groups}: {phase} deadline; "
+        # A provider-ceiling expiry hands the review to the next model: type it
+        # as an analysis handoff, not a terminal timeout.
+        handoff = phase == "provider_analysis"
+        emitted_phase = "analysis" if handoff else phase
+        outcome = "handoff" if handoff else "timed_out"
+        message = (f"Incomplete analysis in file group {group_number} of {total_groups}: {emitted_phase} deadline; "
                    f"elapsed {monotonic() - group_started:.1f}s; remaining analysis {remaining:.1f}s. "
                    "No review submitted; reduce the review scope if required coverage cannot fit.")
-        diagnostic = {**(diagnostic or diagnostic_envelope(operation="provider.review", phase=phase,
-                                                         outcome="timed_out", provider=model.provider)),
-                      "phase": phase, "message": message[:500], "elapsed_ms": round((monotonic() - group_started) * 1000),
+        diagnostic = {**(diagnostic or diagnostic_envelope(operation="provider.review", phase=emitted_phase,
+                                                         outcome=outcome, provider=model.provider)),
+                      "phase": emitted_phase, "outcome": outcome, "message": message[:500],
+                      "elapsed_ms": round((monotonic() - group_started) * 1000),
                       "timeout_seconds": max(0, timeout), "submission": "none"}
+        if handoff:
+            # An inspect timeout carries operation github-interface; handoffs are typed provider.review.
+            diagnostic["operation"] = "provider.review"
         return review_budget.ReviewLimitError(_time_limit_message(model.provider, phase),
                                              "review_inspection_timeout" if phase == "inspection" else "review_budget_exhausted",
                                              diagnostic)
@@ -428,7 +437,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             raise timed_out("overall", 0) from error
         limits = [(overall, "overall")]
         if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS or correction_attempted:
-            limits.append((deadline - monotonic(), "provider_analysis"))
+            # The shared analysis deadline only hands off when the provider
+            # ceiling binds; a shorter grant is an overall timeout.
+            ceiling = PROVIDER_ANALYSIS_SECONDS.get(model.provider, timeout_s) < timeout_s
+            limits.append((deadline - monotonic(), "provider_analysis" if ceiling else "overall"))
         if group_deadline is not None:
             limits.append((group_deadline - monotonic(), "file_group"))
         if cap is not None:
