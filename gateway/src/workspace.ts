@@ -233,7 +233,7 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
   const route = url.pathname.startsWith('/api/') ? url.pathname.split('/').slice(0, 3).join('/') : '/'
   const evidence = () => ({ requestId, method: req.method, route, upstream: `${target.host}:${target.port}`,
     container: target.host, durationMs: Math.round(performance.now() - requestStarted), disconnect: 'upstream error reported while client remains answerable' })
-  proxyRequest(req, res, target, headers, ctx.agent, (error) => {
+  proxyRequest(req, res, target, headers, ctx.agent, async (error) => {
     // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
     try {
       if (error instanceof RequestTooLargeError) {
@@ -248,7 +248,13 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
         starting(ctx, req, res, owner, null)
         return
       }
-      log.error('proxy.failed', { handle: owner.handle, error: error.message, errno: error.code ?? null, ...evidence() })
+      log.error('proxy.failed', { handle: owner.handle, error: error.message, errno: error.code ?? null,
+        release: orchestrator.updatingTo(owner.handle), ...evidence() })
+      if (error.code === 'ECONNRESET' && (req.method === 'GET' || req.method === 'HEAD')
+        && await orchestrator.restartingForUpdate(owner.handle, owner.login)) {
+        starting(ctx, req, res, owner, null)
+        return
+      }
       if (isNavigation(req)) {
         sendHtml(res, 502, messagePage('Your workspace did not answer', 'The connection to your workspace failed. Reload to try again.'), ctx.pageHeaders)
       } else {
