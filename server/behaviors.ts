@@ -5023,6 +5023,7 @@ async function tickApprovePrs(): Promise<void> {
                 seenTarget: `${pr.repo}#${pr.number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${check.headSha}`,
                 firedReason: `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}inline+${check.authorPrCommentsAfterRequest}pr-comment+${check.resolvedRequestThreads}resolved, head=${check.headSha.slice(0, 8)}`,
                 admittedReviewer: reviewer })
+              progress.launchesPending++
             } else {
               const review = request.review!
               const basisCall = (await readBehaviorLogSnapshot()).entries.find((call) => call.id === review.callId)
@@ -5066,6 +5067,7 @@ async function tickApprovePrs(): Promise<void> {
                 seenTarget: `${pr.repo}#${pr.number}@head=${activity.headSha}${freshContextNeeded ? `/context=${activity.reviewContext}` : ''}`,
                 firedReason: `${request.clean ? 'clean' : 'dismissed'} review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`,
                 admittedReviewer: request.admittedReviewer, dismissedRecovery: !request.clean })
+              progress.launchesPending++
             }
           } catch (err) {
             if (behaviorAborted()) return
@@ -5076,7 +5078,6 @@ async function tickApprovePrs(): Promise<void> {
       }
       // Launches run in a small pool: preparations overlap the way the
       // provider layer expects, while the sweep stays bounded.
-      progress.launchesPending += launches.length
       if (context) context.phase = 'launch'
       await forEachPool(launches, APPROVE_FIRE_CONCURRENCY, async (launch) => {
         if (!isRunnable('approve-prs') || behaviorAborted()) return

@@ -413,6 +413,71 @@ describe('approve-prs under load', () => {
     }
   })
 
+  it('retains prepared approvals when the deadline expires during a later activity log read', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const open = [17, 18].map((number) => ({
+      ...pr, number, url: `https://github.com/${pr.repo}/pull/${number}`,
+    }))
+    const { database: db, behaviors: runtime } = await startApproving(open)
+    recordCompletedInitialReview(db, { pull: open[1]!, callId: 'c'.repeat(32) })
+    openLaunchBudget(runtime)
+    const { resetAgentLogCache } = await import('../server/agent')
+    const original = mocks.runFile.getMockImplementation()!
+    let activityDone = false
+    const logGate = { entered: deferred<void>(), release: deferred<void>() }
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json')) {
+        const result = await original(command, args, options)
+        const packet = JSON.parse(result.stdout)
+        return { ...result, stdout: JSON.stringify({ ...packet,
+          records: (packet.records as Array<{ pull_number: number }>).map((record) =>
+            record.pull_number === 18
+              ? { ...record, status: false, has_change_request: false, reviewer_latest_state: null, reviewer_latest_commit: null,
+                latest_request_at: null, commits_after_request: 0, author_commits_after_request: 0, response_count: 0 }
+              : record),
+        }) }
+      }
+      if (command === 'github-interface' && args[0] === '--review-activity-since' && args.includes('--requests-json')) {
+        const result = await original(command, args, options)
+        activityDone = true
+        resetAgentLogCache()
+        return result
+      }
+      if (command === 'agent-interface' && args[0] === '--logs' && activityDone) {
+        logGate.entered.resolve()
+        await logGate.release.promise
+      }
+      return original(command, args, options)
+    })
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const run = runtime.runEnabledBehaviorsOnce()
+      await logGate.entered.promise
+      await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+      logGate.release.resolve()
+      await run
+      logging.loggingRuntime()!.flush()
+      const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
+      expect(events.filter((event) => event.operation === 'application.behaviors')).toEqual([expect.objectContaining({
+        severity: 'error', behavior: 'approve-prs', phase: 'review-activity',
+        message: 'The operation was aborted due to timeout',
+        context: expect.objectContaining({
+          progress: expect.objectContaining({ eligiblePrs: 2, launchesPending: 1, launched: 0,
+            publication: 'unverified', disposition: 'unresolved' }) }),
+      })])
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    } finally {
+      logGate.release.resolve()
+      await logging.stopLogging()
+    }
+  })
+
   it('retains one actionable cycle failure when eligible work cannot be established', async () => {
     const { behaviors: runtime } = await startApproving([pr, secondPr])
     const original = mocks.runFile.getMockImplementation()!
