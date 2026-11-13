@@ -307,6 +307,9 @@ function chainFacts(journal: BehaviorChainJournal, chain: BehaviorChain, now: nu
 
 /** Only canonical v2 ownership enters this population. Nothing here observes
  * GitHub, reads Caller again, or changes chain decisions. */
+/** Longest stretch the projection keeps the server's thread before yielding. */
+const HEALTH_SLICE_MS = 8
+
 export async function projectAnalyticsHealth(journal: BehaviorChainJournal, input: HealthInput): Promise<AnalyticsHealth> {
   const { now, scope, organizations, dependencies, history } = input
   const since = now - DAY
@@ -331,6 +334,7 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
   const accountsComplete = complete
   let memo = factsByJournal.get(journal)
   if (!memo) { memo = new Map(); factsByJournal.set(journal, memo) }
+  let slice = performance.now()
   let after = ''
   for (;;) {
     const page = journal.page(after, 100, null)
@@ -394,7 +398,14 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
       }
       if (unknownRecovery) result.recovery.unknown++
       for (const [origin, outcome] of outcomes) result.recovery[origin === 'automatic' ? 'automatic' : 'intervention'].push(outcome)
-      await setImmediate()
+      // Requests get the thread back after each slice of work, not after
+      // every chain: under load each turn of the loop costs tens of
+      // milliseconds, and a turn per chain over the whole journal took
+      // a read 16 s on production right after a restart.
+      if (performance.now() - slice >= HEALTH_SLICE_MS) {
+        await setImmediate()
+        slice = performance.now()
+      }
     }
     if (page.length < 100) break
     after = page.at(-1)!.id
