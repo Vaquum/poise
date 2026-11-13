@@ -32,6 +32,7 @@ import { isSwitchboardSession } from './switchboard-store'
 import { SWITCHBOARD_LOOKUPS, SWITCHBOARD_OPERATIONS, SWITCHBOARD_PERSON, SWITCHBOARD_READS, type SwitchboardControl } from './switchboard'
 import { BEHAVIOR_KEYS } from '../../src/behavior-types'
 import { organizationArgs, organizationForRepository, readyOrganizations, type Organization } from '../organizations'
+import { datastoreViewOrCli } from '../datastore-reader'
 
 const PATH = '/api/chat/control'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -269,11 +270,9 @@ export async function readWorkTargetStatus(target: store.WorkTarget): Promise<Wo
   const org = organizationForRepository(target.repo)
   if (!org) return 'unknown'
   try {
-    const view = target.kind === 'pull' ? 'pr' : 'issue'
-    const { stdout } = await runFile('github-datastore',
-      organizationArgs(org, ['view', view, '--repo', target.repo, '--number', String(target.number), '--format', 'json']),
-      { timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })
-    const parsed: unknown = JSON.parse(stdout)
+    const args = ['view', target.kind === 'pull' ? 'pr' : 'issue', '--repo', target.repo, '--number', String(target.number), '--format', 'json']
+    const parsed = await datastoreViewOrCli(org.datastorePath, args, async () =>
+      (await runFile('github-datastore', organizationArgs(org, args), { timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })).stdout)
     if (!Array.isArray(parsed) || parsed.length > 1) return 'unknown'
     const row = parsed[0] as { repo?: unknown, number?: unknown, status?: unknown } | undefined
     if (!row || String(row.repo ?? '').toLowerCase() !== target.repo || Number(row.number) !== target.number) return 'unknown'
