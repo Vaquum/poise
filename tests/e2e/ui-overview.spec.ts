@@ -35,6 +35,8 @@ interface Workspace {
   chatsFail?: boolean
   /** The runs read fails from the start. */
   runsFail?: boolean
+  /** The behavior-metrics reads asked, as their search parameters. */
+  metricsAsked?: URLSearchParams[]
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -79,7 +81,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       return json(route, { periods: bounds.slice(1).map((until, i) => ({ since: bounds[i], until, ...day })), errors: [] })
     }
     if (path === '/api/github-quota') return json(route, { accounts: [] })
-    if (path === '/api/behavior-metrics') return json(route, { behaviors: {}, error: null })
+    if (path === '/api/behavior-metrics') { (workspace.metricsAsked ??= []).push(url.searchParams); return json(route, { behaviors: {}, error: null }) }
     if (path === '/api/behavior-estimates') return json(route, { estimates: [] })
     if (path === '/api/agent-logs') return workspace.runsFail ? json(route, { error: 'agent-interface did not answer' }, 503) : json(route, { logs: [] })
     if (path === '/api/gh') return json(route, { records: [], held: [], errors: [] })
@@ -258,6 +260,52 @@ test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {
   await entry(page, 'notice:disk').getByRole('button', { name: 'Undo' }).click()
   await expect(entry(page, 'notice:disk').getByRole('button', { name: 'Dismiss' })).toBeVisible()
   expect(sent).toEqual([])
+})
+
+test('the right-hand side has one day, one search and the organization; Behaviors follows the day (#1380)', async ({ page }) => {
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1 }
+  await open(page, workspace)
+  const filters = page.locator('[data-ref="ov.filters"]')
+  await expect(filters.locator('[data-ref="ov.day"]')).toBeVisible()
+  await expect(filters.getByRole('searchbox', { name: 'Filter this side' })).toBeVisible()
+  // No time filter of its own in any panel.
+  await expect(page.locator('.ova-main [data-ref="ov.range"], .ova-main [data-range]')).toHaveCount(0)
+  await expect(page.locator('[data-ref="ov.behaviors.day"]')).toContainText('Today')
+  await expect.poll(() => workspace.metricsAsked?.at(-1)?.get('since') ?? null).not.toBeNull()
+  const today = workspace.metricsAsked!.at(-1)!
+
+  await filters.getByRole('button', { name: 'Previous day' }).click()
+  await expect(page.locator('[data-ref="ov.behaviors.day"]')).toContainText('Yesterday')
+  await expect.poll(() => workspace.metricsAsked!.at(-1)!.get('until')).toBe(today.get('since'))
+  await expect(page.locator('[data-livenote="motion"]')).toContainText('not for Yesterday')
+  await expect(page.locator('[data-livenote="health"]')).toContainText('not for Yesterday')
+  await filters.getByRole('button', { name: 'Next day' }).click()
+  await expect(page.locator('[data-livenote="motion"]')).not.toContainText('not for')
+
+  // One search narrows every panel and says so where nothing matches.
+  const search = filters.getByRole('searchbox', { name: 'Filter this side' })
+  await search.fill('merg')
+  await expect(page.locator('[data-tile="Pull requests merged"]')).toBeVisible()
+  await expect(page.locator('[data-tile="Pull requests opened"]')).toHaveCount(0)
+  await expect(page.locator('[data-beh]')).toHaveCount(1)
+  await expect(page.locator('[data-beh="merge-prs"]')).toBeVisible()
+  await expect(page.locator('[data-worklist]')).toContainText('Nothing here matches “merg”.')
+  await expect(page.locator('[data-ref="ov.h.blocked"]')).toBeHidden()
+  await search.press('Escape')
+  await expect(page.locator('[data-tile="Pull requests opened"]')).toBeVisible()
+  await expect(page.locator('[data-beh]')).not.toHaveCount(1)
+  await expect(page.locator('[data-ref="ov.h.blocked"]')).toBeVisible()
+})
+
+test('each Show level says how many entries it shows (#1380)', async ({ page }) => {
+  const notice = (id: string, kind: string) => ({ id, kind, title: `${kind} title`, body: '', since: ago(5), due: ago(5), silenceable: false, target: null })
+  await open(page, { notices: [notice('n1', 'storage_low'), notice('n2', 'ledger_queue_stalled'), notice('n3', 'chat_turn_finished')], requests: [], decisions: [], revision: 1 })
+  const level = (name: string) => answers(page).getByRole('radio', { name: new RegExp(`^${name.replace('+', '\\+')},`) })
+  await expect(level('Only you')).toHaveAccessibleName('Only you, 1 entry')
+  await expect(level('+ Faults')).toHaveAccessibleName('+ Faults, 2 entries')
+  await expect(level('+ Done')).toHaveAccessibleName('+ Done, 3 entries')
+  await expect(level('Everything')).toHaveAccessibleName('Everything, 3 entries')
+  await expect(level('+ Faults')).toContainText('2')
 })
 
 test('a decision whose chat is gone says so, and Dismiss puts it away', async ({ page }) => {

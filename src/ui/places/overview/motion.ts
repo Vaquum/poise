@@ -13,6 +13,7 @@ import {
   chatState, countStates, issueState, PHASES, phaseWords, pullState, STATES, taskPhase, taskState,
   type ChainLike, type HeldReason, type Phase, type State,
 } from './states'
+import type { RightFilter } from './find'
 import { chatOpening } from './targets'
 import { json, reason, readLine, reportRead, unread, whileVisible, type Read, type PartContext } from './util'
 
@@ -50,7 +51,7 @@ function rememberedMotion(): LastMotion | null {
   }
 }
 
-export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
+export function mountMotion(ctx: PartContext, card: HTMLElement, find: RightFilter): Motion {
   const { signal } = ctx
   const sessions: Read<Map<string, SessionRecord>> = { ...unread<Map<string, SessionRecord>>(), data: null }
   let items: Read<GhRecord[]> = unread()
@@ -135,16 +136,18 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   }
 
   function paint(): void {
-    const list = work()
+    // The search narrows the counts too, and lists every match whatever its state.
+    const list = work().filter((entry) => find.matches(entry.title, entry.note))
     $('[data-counts="people"]', card).innerHTML = countsHTML(list, 'people')
     $('[data-counts="items"]', card).innerHTML = countsHTML(list, 'items')
     $('[data-phases]', card).innerHTML = phasesHTML(list)
     const chosen = pick
-    const listed = 'phase' in chosen
-      ? list.filter((entry) => entry.group === 'tasks' && entry.phase === chosen.phase)
-      : list.filter((entry) => entry.group !== 'tasks' && entry.state === chosen.state)
+    const listed = find.query() ? list
+      : 'phase' in chosen
+        ? list.filter((entry) => entry.group === 'tasks' && entry.phase === chosen.phase)
+        : list.filter((entry) => entry.group !== 'tasks' && entry.state === chosen.state)
     const unread = 'phase' in chosen ? !chains.data : unreadGroup(chosen.group)
-    const empty = unread ? 'Not read yet.' : 'phase' in chosen ? 'No task at this phase right now.' : `Nothing ${term(`state.${chosen.state}`)} right now.`
+    const empty = find.query() ? find.none() : unread ? 'Not read yet.' : 'phase' in chosen ? 'No task at this phase right now.' : `Nothing ${term(`state.${chosen.state}`)} right now.`
     $('[data-worklist]', card).innerHTML = listed.length
       ? listed.map((entry) => `<li><span class="sc" data-state="${entry.state}" data-ref="state"></span><a href="${esc(entry.href)}">${esc(entry.title)}</a>${entry.note ? `<span class="onote">${esc(entry.note)}</span>` : ''}</li>`).join('')
       : `<li class="onote">${esc(empty)}</li>`
@@ -213,6 +216,7 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   whileVisible(ctx, 60_000, () => { void readSessions(); void readItems() })
   // Fresh settings naming other organizations, or another one chosen: what was read for the last ones goes at once.
   window.addEventListener('poise:organization-filter-changed', () => { void readItems() }, { signal })
+  find.onChange(paint)
 
   return {
     setChains(next, error, at) { chains = error ? { ...chains, error } : { data: next, error: '', at }; paint(); if (!error) remember() },

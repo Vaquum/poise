@@ -6,12 +6,13 @@
 import { formatShortDuration } from '../../../analytics-format'
 import type { BehaviorMetricsReport } from '../../../behavior-metrics'
 import { BEHAVIORS, getLastTriggered, getPausedUntil, isBehaviorStateLoaded, isEnabled, setEnabled, type BehaviorKey } from '../../../behaviors'
-import { TIME_RANGES, timeRangeWindow, type TimeRange } from '../../../time-range'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
 import { toast } from '../../shell'
 import { bar } from './charts'
+import type { ChosenDay } from './day'
 import type { Entry } from './entries'
+import type { RightFilter } from './find'
 import { ago, clockAt, json, reason, readLine, reportRead, unread, whileVisible, type Read, type PartContext } from './util'
 
 /** The agent behaviors' log names, as /api/behavior-estimates names them. */
@@ -25,11 +26,13 @@ export interface BehaviorsTable {
   stateChanged(error: string): void
   /** Answer here's entries changed: the chips count them. */
   entriesChanged(entries: readonly Entry[]): void
+  /** The right-hand side's day changed: runs, time and success follow it (#1380). */
+  dayChanged(day: ChosenDay): void
 }
 
-export function mountBehaviors(ctx: PartContext, box: HTMLElement): BehaviorsTable {
+export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFilter): BehaviorsTable {
   const { signal } = ctx
-  let range: TimeRange = 'today'
+  let day: ChosenDay | null = null
   let metrics: Read<BehaviorMetricsReport> = unread()
   let estimates: Read<Estimate[]> = unread()
   let stateError = ''
@@ -82,18 +85,20 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement): BehaviorsTab
       metrics.data?.error ? metrics.data.error : '',
       readLine('What is running now', estimates),
     ].filter(Boolean)
+    const rows = BEHAVIORS.filter((meta) => find.matches(meta.label, getLastTriggered(meta.key)?.target))
     box.innerHTML = `<div class="obeh" data-ref="ov.behaviors">
-      <div class="obeh-h"><div class="seg" role="group" aria-label="Range" data-ref="ov.range">${TIME_RANGES.map((r) => `<button aria-pressed="${r.key === range}" data-range="${r.key}">${esc(r.label)}</button>`).join('')}</div>
+      <div class="obeh-h"><span class="t-gloss" data-ref="ov.behaviors.day">Runs, time and success for ${esc(day?.label ?? 'the chosen day')}, as the day above</span>
       <a class="lnk" href="${esc(placeHref('settings', { settings: 'behaviors', back: 'overview' }))}">Settings for each behavior</a></div>
       ${notes.map((note) => `<p class="onote is-warn" role="status" data-ref="${note === metrics.data?.error ? 'ov.partial' : 'ov.read'}">${esc(note)}</p>`).join('')}
       <div class="otable-wrap"><table class="otable"><thead><tr><th scope="col"><span class="sr">On</span></th><th scope="col">Behavior</th><th scope="col">Last run</th><th scope="col" class="num">Runs</th><th scope="col" class="num">Time</th><th scope="col" class="num">Success</th><th scope="col"><span class="sr">In Answer here</span></th></tr></thead>
-      <tbody>${BEHAVIORS.map((meta) => row(meta.key, meta.label)).join('')}</tbody></table></div></div>`
+      <tbody>${rows.length ? rows.map((meta) => row(meta.key, meta.label)).join('') : `<tr><td colspan="7"><span class="onote" role="status">${esc(find.none())}</span></td></tr>`}</tbody></table></div></div>`
   }
 
   async function readMetrics(): Promise<void> {
+    if (!day) return
     const mine = ++generation
     try {
-      const data = await json<BehaviorMetricsReport>(`/api/behavior-metrics?${new URLSearchParams(timeRangeWindow(range))}`)
+      const data = await json<BehaviorMetricsReport>(`/api/behavior-metrics?${new URLSearchParams({ since: day.since, until: day.until })}`)
       if (!data?.behaviors) throw new Error('the service answered with something this page cannot read')
       if (mine !== generation) return
       metrics = { data, error: '', at: Date.now() }
@@ -118,8 +123,6 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement): BehaviorsTab
 
   box.addEventListener('click', (e) => {
     const target = e.target as Element
-    const pick = target.closest<HTMLElement>('[data-range]')
-    if (pick) { range = pick.dataset.range as TimeRange; metrics = { ...metrics, data: null }; paint(); void readMetrics(); return }
     const chip = target.closest<HTMLElement>('[data-act="to-answers"]')
     if (chip) { e.preventDefault(); (document.querySelector(`[data-answers] [data-notice="${CSS.escape(chip.dataset.entry ?? '')}"]`) as HTMLElement | null ?? document.querySelector('[data-answers] [data-ref="ov.answer"]') as HTMLElement | null)?.focus(); return }
     const toggle = target.closest<HTMLElement>('[data-act="beh-toggle"]')
@@ -139,7 +142,15 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement): BehaviorsTab
 
   paint()
   whileVisible(ctx, 60_000, () => { void readMetrics(); void readEstimates() })
+  find.onChange(paint)
   return {
+    dayChanged(next) {
+      if (day && next.since === day.since && next.until === day.until) return
+      day = next
+      metrics = { ...metrics, data: null }
+      paint()
+      void readMetrics()
+    },
     stateChanged(error) { stateError = error; paint() },
     entriesChanged(next) {
       const before = entries.map((entry) => `${entry.id}:${entry.group}`).join()
