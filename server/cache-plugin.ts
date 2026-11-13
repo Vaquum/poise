@@ -1267,7 +1267,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           if (res.destroyed) close()
           try {
             const query = new URLSearchParams(url.split('?')[1] || '')
-            const report = path === '/api/analytics/system-health' ? await readAnalyticsHealth(selectedOrg, controller.signal)
+            const report = path === '/api/analytics/system-health' ? await readAnalyticsHealth(selectedOrg)
               : path === '/api/analytics/history'
               ? await readAnalyticsHistory(parseBounds(query.get('bounds')), selectedOrg, controller.signal)
               : await readAnalytics(parseWindow(query.get('since'), query.get('until')), selectedOrg, query.has('dailyBounds') ? parseBounds(query.get('dailyBounds')) : undefined, controller.signal)
