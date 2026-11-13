@@ -66,6 +66,36 @@ def test_a_cleared_path_after_response_persistence_failure_remains_an_error(caps
     assert capsys.readouterr().out == ""
 
 
+def test_a_persistence_failure_with_an_earlier_diagnostic_remains_an_error(capsys):
+    call_id = api.track("fixture", "prompt")
+    shutil.rmtree(api.RESPONSES)
+    api.finish(call_id, "completed", response="promised",
+               diagnostic={"operation": "provider.review", "phase": "submitting", "outcome": "exit"})
+    with api.db() as conn:
+        row = conn.execute("select response_path,diagnostic from calls where id=?", (call_id,)).fetchone()
+    assert row["response_path"] is None
+    stored = json.loads(row["diagnostic"])
+    assert (stored["phase"], stored["outcome"]) == ("response_persist", "persist_failed")
+    assert stored["prior"]["phase"] == "submitting"
+    with pytest.raises(SystemExit, match=f"Call {call_id}: response persistence failed") as failure:
+        api.read_response(call_id)
+    assert failure.value.code != 3
+    assert capsys.readouterr().out == ""
+
+
+def test_a_fenced_superseded_call_without_a_response_is_ordinary_absence(capsys):
+    fenced = api.fence_closed_behavior(model="original-model", actor="author", repository="example/repo",
+                                       number=17, behavior="repair_pr", correlation_id="test-fence",
+                                       expected_head="a" * 40)
+    with pytest.raises(SystemExit) as failure:
+        api.read_response(fenced["id"])
+    assert failure.value.code == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"id": fenced["id"], "disposition": "unavailable",
+                                        "reason": "The Call ended without a response"}
+    assert captured.err == ""
+
+
 @pytest.mark.parametrize("evidence", [
     {"behavior": "native_action"},
     {"artifact": json.dumps({"response_sha": "a" * 64})},

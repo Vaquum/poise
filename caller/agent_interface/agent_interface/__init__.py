@@ -682,12 +682,20 @@ def finish(
             caller_store.response(Path(path), RESPONSES).write_text(response)
         except OSError as persist_error:
             # The row is terminal; a response persistence failure must not
-            # reopen it. Clear the dangling path and retain the cause.
+            # reopen it. Clear the dangling path and retain the cause, keeping
+            # an earlier diagnostic nested so neither failure is lost.
+            envelope = diagnostic_envelope(operation="call.finalize", phase="response_persist",
+                                           outcome="persist_failed",
+                                           stderr=str(persist_error)[:500], call_id=id_)
             with db() as conn:
-                conn.execute("update calls set response_path=null, diagnostic=coalesce(diagnostic, ?) where id=?",
-                             (json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
-                                                             outcome="persist_failed",
-                                                             stderr=str(persist_error)[:500], call_id=id_)), id_))
+                prior = conn.execute("select diagnostic from calls where id=?", (id_,)).fetchone()
+                if prior is not None and prior["diagnostic"] is not None:
+                    try:
+                        envelope["prior"] = json.loads(prior["diagnostic"])
+                    except ValueError:
+                        pass
+                conn.execute("update calls set response_path=null, diagnostic=? where id=?",
+                             (json.dumps(envelope), id_))
     return ended_at
 
 
@@ -1198,7 +1206,7 @@ def read_response(short: str):
             if artifact.get("response_sha") is not None or (row["status"] == "completed"
                     and row["behavior"] in {"native_action", "native_publication"}):
                 raise ValueError("required response receipt is missing")
-            if row["status"] not in {"running", "completed", "failed", "cancelled"}:
+            if row["status"] not in {"running", "completed", "failed", "cancelled", "superseded"}:
                 raise ValueError("invalid Call status")
             reason = "The Call is still running" if row["status"] == "running" else "The Call ended without a response"
         print(json.dumps({"id": short.lower(), "disposition": "unavailable", "reason": reason}))

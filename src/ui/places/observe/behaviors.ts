@@ -79,7 +79,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
   let searchQuery = ''
   let pageIndex = 0
   let searchDebounce = 0
-  const expanded = new Map<string, { body: string | null, loading: boolean, error: string, unavailable: string }>()
+  const expanded = new Map<string, { body: string | null, loading: boolean, error: string, unavailable: string, running: boolean }>()
   const expandedGroups = new Set<string>()
   let displayedGroups = new Map<string, RunGroup>()
   const reasoning = new Map<string, { chars: number, body: string, loading: boolean, error: string }>()
@@ -640,26 +640,28 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     for (const entry of entries) {
       const state = expanded.get(entry.id)
       if (state && openReasoning.has(entry.id)) void loadReasoning(entry.id)
-      if (state && !state.loading && state.body === null && !state.error && entry.response) void loadResponse(entry.id)
+      if (state && !state.loading && state.body === null && !state.error
+        && (entry.response || (state.unavailable !== '' && state.running && !isRunning(entry)))) void loadResponse(entry.id)
     }
   }
   async function loadResponse(id: string): Promise<void> {
-    expanded.set(id, { body: null, loading: true, error: '', unavailable: '' })
+    expanded.set(id, { body: null, loading: true, error: '', unavailable: '', running: false })
     render()
-    let next: { body: string | null, loading: boolean, error: string, unavailable: string }
+    let next: { body: string | null, loading: boolean, error: string, unavailable: string, running: boolean }
     try {
       const response = await fetch(`/api/agent-response/${encodeURIComponent(id)}`, { cache: 'no-store', signal: ctx.signal })
       if (!response.ok) throw new Error(await failureOf(response))
       const data = await response.json() as { body?: unknown, disposition?: unknown, reason?: unknown }
       if (data.disposition === 'unavailable' && typeof data.reason === 'string' && data.reason) {
-        next = { body: null, loading: false, error: '', unavailable: data.reason }
+        const entry = entries.find((e) => e.id === id)
+        next = { body: null, loading: false, error: '', unavailable: data.reason, running: entry ? isRunning(entry) : false }
       } else {
         if (data.disposition !== undefined || typeof data.body !== 'string') throw new Error('the answer is incomplete')
-        next = { body: data.body, loading: false, error: '', unavailable: '' }
+        next = { body: data.body, loading: false, error: '', unavailable: '', running: false }
       }
     } catch (error) {
       if (aborted(error)) return
-      next = { body: null, loading: false, error: `The response could not be read: ${message(error)}`, unavailable: '' }
+      next = { body: null, loading: false, error: `The response could not be read: ${message(error)}`, unavailable: '', running: false }
     }
     // The row may have been folded while the response was out.
     if (!expanded.has(id)) return

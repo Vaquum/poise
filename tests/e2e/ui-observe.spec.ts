@@ -301,6 +301,30 @@ for (const state of ['unavailable', 'missing-file', 'incomplete']) {
   })
 }
 
+test('a detail opened while running rereads its unavailable reason after the run ends without a response', async ({ page }) => {
+  await open(page, '/?view=observe&part=behaviors')
+  const id = hex(32, 'd')
+  let reads = 0
+  await page.route(`/api/agent-response/${id}`, route => route.fulfill({ json: ++reads === 1
+    ? { id, disposition: 'unavailable', reason: 'The Call is still running' }
+    : { id, disposition: 'unavailable', reason: 'The Call ended without a response' } }))
+  const behaviors = page.locator('[data-panel="behaviors"]')
+  await behaviors.locator(`tr[data-run="${id}"]`).getByRole('button', { name: 'Show detail' }).click()
+  const detail = behaviors.locator(`tr[data-detail-for="${id}"]`)
+  await expect(detail).toContainText('Unavailable: The Call is still running')
+  const finished = { ...RUNS[0], status: 'completed', completed_at: iso(NOW - minutes(1)), outcome: 'approved', time_elapsed: '3m 1s' }
+  await page.route((url) => url.pathname === '/api/agent-logs', route => {
+    const url = new URL(route.request().url())
+    const wanted = url.searchParams.get('id')
+    const logs = wanted ? [finished].filter((r) => r.id === wanted)
+      : url.searchParams.get('status') === 'running' ? [] : [finished, RUNS[1], RUNS[2]]
+    return route.fulfill({ json: { logs, quarantined: [], total: logs.length, nextCursor: null } })
+  })
+  await page.evaluate(() => dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(detail).toContainText('Unavailable: The Call ended without a response')
+  expect(reads).toBe(2)
+})
+
 test('a GitHub link opens its row, widening the filters for that visit only', async ({ page }) => {
   await page.addInitScript(() => { localStorage.setItem('poise-observe-github', JSON.stringify({ types: ['action'], ci: 'failed', status: 'open', time: 'today' })) })
   await open(page, '/?view=observe&part=github&item=acme/site%23496')
