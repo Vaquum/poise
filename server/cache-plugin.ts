@@ -404,7 +404,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (url === '/api/health/live' && req.method === 'GET') {
           return json(res, 200, livenessSnapshot())
         }
-        // Where the main thread stalls (server/stall-observer.ts): in-memory, no I/O.
+        // Where the main thread stalls (server/stall-observer.ts): in-memory, plus
+        // the kernel's own counters for the container; no disk I/O.
         if (url === '/api/health/stalls' && req.method === 'GET') {
           return json(res, 200, stallSnapshot())
         }
