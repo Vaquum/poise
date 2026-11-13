@@ -639,6 +639,7 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertEqual(run.elapsed, 800)
         self.assertEqual(run.error.code, "review_budget_exhausted")
         self.assertEqual(str(run.error), GROK_HANDOFF)
+        self.assertEqual(run.error.diagnostic["phase"], "provider_analysis")
         run.submit.assert_not_called()
 
     def test_inspection_rounds_stop_at_the_ceiling(self):
@@ -691,6 +692,7 @@ class TestGrokAnalysisCeiling(TestCase):
                                    repository=INSPECTED, **kwargs)
                 self.assertEqual(run.launches, expected)
                 self.assertEqual(run.error.code, "review_budget_exhausted")
+                self.assertEqual(run.error.diagnostic["phase"], "overall" if name == "whole budget" else "provider_analysis")
 
     def test_other_providers_keep_the_remaining_analysis_budget(self):
         for name, turns, reply, repository, expected in (
@@ -702,6 +704,7 @@ class TestGrokAnalysisCeiling(TestCase):
                 self.assertEqual(run.launches, expected)
                 self.assertEqual(run.elapsed, 1293)
                 self.assertEqual(run.error.code, "review_budget_exhausted")
+                self.assertEqual(run.error.diagnostic["phase"], "overall")
                 self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
 
 
@@ -1103,7 +1106,7 @@ class TestSincePositions(TestCase):
                 packet = self._packet(None, self.REMOVAL)
                 verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [
                     {"path": path, "line": line, "side": side, "body": "A confirmed blocking defect."}]}
-                with patch.object(structured_review, "_review_once", return_value=(json.dumps(verdict), verdict)), \
+                with patch.object(structured_review, "_review_once", return_value=(json.dumps(verdict), verdict, 0)), \
                         patch.object(structured_review.subprocess, "run", return_value=SimpleNamespace(
                             returncode=0, stdout='{"action":"requested_changes","review_id":91}', stderr="")) as submit, \
                         patch.object(structured_review, "fetch_packet") as fetch:
