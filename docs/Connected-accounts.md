@@ -164,3 +164,25 @@ Google identity. Disconnect forgets that owner's grant and retains its documents
 The operator configures the integration once; users enter no client IDs or secrets.
 [Google connections](Google-connections.md) describes the flow, saved-draft return,
 status, configuration and old-file authorization limits.
+
+## Sign in on your phone
+
+In service mode, Settings → Accounts → **Sign in on your phone** signs your
+phone in to this Poise as you, with no password.
+1. **Show the code** shows a QR code.
+2. Scan it with the phone's camera. Poise opens on the phone and says to
+   approve it on your computer.
+3. Settings shows the phone's request: its kind and browser, such as iPhone ·
+   Safari. **Approve** signs it in, and both screens say so. **Deny** refuses
+   it.
+
+A code works once, for two minutes, and only on the first device that opens
+it. While it is shown, Settings replaces it before it expires, for about ten
+minutes. After that it says the code expired, with **Show a new code**.
+Approve only a phone you are holding: anyone who photographed the code could
+open it too, and would then wait for your approval.
+
+The phone gets a sign-in of its own, which lasts 14 days like any other.
+**Phones signed in with a code** lists them, each with **Sign out**, which asks
+"Sure?" and ends that phone's sign-in at once. How it works:
+[Service architecture](Service-architecture.md#sign-in-and-sessions).

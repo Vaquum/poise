@@ -8,6 +8,7 @@ import { Context, type GatewayDeps } from './context.js'
 import { classifyHost } from './hosts.js'
 import { header, HttpError, sendHtml, sendJson } from './http.js'
 import * as link from './link.js'
+import * as phone from './phone.js'
 import { errorMessage } from './log.js'
 import { messagePage } from './pages.js'
 import { rejectUpgrade } from './proxy.js'
@@ -35,6 +36,8 @@ const APEX_ROUTES: Record<string, Record<string, Handler>> = {
   '/auth/google/callback': { GET: google.callback },
   '/_gateway/google': { POST: google.api },
   '/auth/logout': { GET: auth.logoutPage, POST: auth.logout },
+  // A phone opens this from the QR code in Settings; it holds no session yet.
+  [phone.PHONE_PATH]: { GET: phone.phonePage },
   // Approving a code and the device list are in Settings; Poise Link still opens /link.
   '/link': { GET: link.toSettings },
   '/link/devices': { GET: link.toSettings },
