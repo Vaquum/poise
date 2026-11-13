@@ -174,10 +174,15 @@ describe('production shutdown', () => {
       releaseRuntime = resolve
     }))
     const production = await import('../server/production')
-    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const logging = await import('../server/logging')
     const server = production.createProductionServer()
     const exits: number[] = []
-    const shutdown = production.createProductionShutdown(server, (code) => { exits.push(code) })
+    const shutdown = production.createProductionShutdown(server, (code) => {
+      logging.loggingRuntime()!.flush()
+      expect(failures()).toEqual([expect.objectContaining({ severity: 'error', operation: 'process.shutdown',
+        phase: 'shutdown_deadline', exitCode: 1, timeoutMs: 10_000, context: { requestedExitCode: 0, pendingPhases: ['runtime_stop'] } })])
+      exits.push(code)
+    })
 
     shutdown()
     shutdown()
@@ -191,8 +196,6 @@ describe('production shutdown', () => {
     await vi.advanceTimersByTimeAsync(1)
     expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
     expect(exits).toEqual([1])
-    expect(errors).toHaveBeenCalledExactlyOnceWith('[poise] shutdown timed out after 10000ms; pending: runtime_stop')
-
     expect(failures()).toEqual([expect.objectContaining({ severity: 'error', operation: 'process.shutdown',
       phase: 'shutdown_deadline', exitCode: 1, timeoutMs: 10_000, context: { requestedExitCode: 0, pendingPhases: ['runtime_stop'] } })])
 

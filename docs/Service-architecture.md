@@ -546,9 +546,12 @@ its own instead of refusing with dirty_unowned.
   work or admitted launches. The gateway asks again on later passes until health reports the
   release, which the request makes idempotent.
 - **Shutdown.** Active HTTP responses finish before their keep-alive sockets
-  retire. Clean shutdown waits for runtime cleanup and HTTP closure, closes
-  SQLite, then exits 75. The existing ten-second deadline still exits 1;
-  errors name pending shutdown phases and retain known cleanup failure causes.
+  retire. Storage-pressure passes, including native Caller cleanup and receipt
+  reconciliation, join the background barrier: a release switch waits for the
+  admitted pass before starting shutdown. Clean shutdown waits for runtime cleanup
+  and HTTP closure, closes SQLite, then exits 75. The existing ten-second deadline
+  still exits 1 with one structured Error naming pending shutdown phases and
+  retaining known cleanup failure causes.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
   unreachable past the switch grace gets a new container, drained first.
