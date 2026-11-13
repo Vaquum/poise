@@ -66,6 +66,8 @@ jobs:
           REPO: ${{ github.repository }}
           UPSTREAM_SYNC: ${{ vars.POISE_UPSTREAM_SYNC }}
           DEPLOY_PATH: ${{ vars.POISE_DEPLOY_PATH || '/srv/poise' }}
+          POISE_RELEASE_REPORT_REPOSITORY: ${{ vars.POISE_RELEASE_REPORT_REPOSITORY }}
+          POISE_RELEASE_REPORT_TOKEN: ${{ secrets.POISE_RELEASE_REPORT_TOKEN }}
         run: python3 deploy/release-status.py
 
   sync:
