@@ -103,6 +103,10 @@ function resourceArtifact(prior: unknown, value: unknown): Record<string, unknow
 // contradictory historical releases. Index the projection so settled history
 // cannot turn each capacity/observation read into a full journal scan.
 const LIVE_MODEL_SQL = 'resource_pending = 1'
+/** Automatic holds for review-issue's authentication failures, which the
+ *  runtime retires once Claude is signed in again: few chains, read every pass. */
+const AUTHENTICATION_HOLD_SQL = "merged = 0 AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%'"
+
 const ACTIVE_WORK_SQL = `CASE WHEN (json_extract(state, '$.mergeSha') IS NULL AND json_extract(state, '$.supersession') IS NULL AND json_extract(state, '$.held') IS NULL)
   OR (${LIVE_MODEL_SQL}) THEN 1 ELSE 0 END`
 const RECHECK_AT_SQL = `CASE
@@ -283,6 +287,8 @@ export class BehaviorChainJournal {
         lower(json_extract(state, '$.repository')), merged, json_extract(state, '$.branch'));
       CREATE INDEX IF NOT EXISTS behavior_chain_reconciliation ON behavior_chain_current(
         merged, (${ACTIVE_WORK_SQL}), (${RECHECK_AT_SQL}), chain_id);
+      CREATE INDEX IF NOT EXISTS behavior_chain_authentication_holds ON behavior_chain_current(chain_id)
+        WHERE ${AUTHENTICATION_HOLD_SQL};
     `)
   }
 
@@ -373,9 +379,9 @@ export class BehaviorChainJournal {
   }
 
   authenticationHolds(after: string): BehaviorChain[] {
-    const rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE merged = 0 AND chain_id > ?
-      AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%'
-      ORDER BY chain_id LIMIT 100`).all(after) as Array<{ chain_id: string }>
+    // Every runtime pass asks; its partial index answers without reading any other chain's state.
+    const rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current INDEXED BY behavior_chain_authentication_holds
+      WHERE ${AUTHENTICATION_HOLD_SQL} AND chain_id > ? ORDER BY chain_id LIMIT 100`).all(after) as Array<{ chain_id: string }>
     return rows.map(row => this.read(row.chain_id)!)
   }
 
