@@ -130,6 +130,16 @@ function preferObservationError(current: Error | null, candidate: Error): Error 
   return current
 }
 
+function capacityWait(reason: string): boolean {
+  return reason === 'shared native invocation capacity is occupied' || reason === 'waiting for the shared native behavior capacity'
+}
+
+function modelDecisionBasis(chain: BehaviorChain, observation: ChainObservation, now: number): string | null {
+  const decision = decideBehaviorChain(chain, observation, now)
+  return decision.kind === 'invoke' && decision.reviewer
+    ? chainBasis([decision.behavior, decision.basis, decision.actor, decision.reviewer]) : null
+}
+
 export class MissingPublicationPlanError extends Error {
   constructor(readonly callId: string, readonly planSha: string) {
     super(`Original Call ${callId} has no durable publication plan`)
@@ -160,6 +170,38 @@ export class BehaviorChainRuntime {
     const current = this.journal.read(chain.id)
     if (!current) throw new Error('behavior chain disappeared while its invocation was running')
     return current
+  }
+
+  /** The first capacity refusal for this uninterrupted behavior/basis/slot.
+   * Observations retain waiting, so the reason alone cannot date the episode. */
+  private capacityWaitSequence(chain: BehaviorChain): number | null {
+    const observation = chain.observation as ChainObservation | null
+    const basis = observation && modelDecisionBasis(chain, observation, observation.checkedAt)
+    if (!basis) return null
+    let first: number | null = null, matching = false, after = 0
+    while (true) {
+      const events = this.journal.history(chain.id, after)
+      for (const row of events) {
+        const event = JSON.parse(row.payload) as ChainEvent
+        if (event.type === 'chain.observed') {
+          matching = modelDecisionBasis(chain, event.observation as ChainObservation, row.at) === basis
+          if (!matching) first = null
+        } else if (event.type === 'chain.waiting' && capacityWait(event.reason) && matching) {
+          first ??= row.sequence
+        } else {
+          first = null
+          matching = false
+        }
+      }
+      if (events.length < 100) return first
+      after = events.at(-1)!.sequence
+    }
+  }
+
+  private waitForCapacity(chain: BehaviorChain, reason: string): void {
+    if (chain.waiting !== reason || this.capacityWaitSequence(chain) === null) {
+      this.append(chain, { type: 'chain.waiting', reason })
+    }
   }
 
   /** Durable-budget wait reason for one more reservation, or null when the
@@ -261,6 +303,11 @@ export class BehaviorChainRuntime {
       }
       let observationError: Error | null = null
       const conflicted = new Set<string>()
+      const waiters = this.journal.capacityWaiters().flatMap(chain => {
+        const sequence = this.capacityWaitSequence(chain)
+        return sequence === null ? [] : [{ chain, sequence }]
+      }).sort((a, b) => a.sequence - b.sequence)
+      const offered = new Set<string>()
       for (const deferred of [false, true]) {
         if (Date.now() - began > 45_000) break
         const cursorKey = deferred ? 'reconciliationCursor' : 'cursor'
@@ -271,11 +318,19 @@ export class BehaviorChainRuntime {
         }
         if (!page.length) { this[cursorKey] = ''; continue }
         const snapshot = await this.readInvocations(page.filter(chain => !conflicted.has(chain.id)))
-        for (let chain of page) {
+        const work: Array<{ chain: BehaviorChain, priority: number | null, cursor: boolean }> = page.map(chain => ({ chain, priority: null, cursor: true }))
+        for (let index = 0; index < work.length; index++) {
+          let { chain } = work[index]
           if (Date.now() - began > 45_000) break
-          this[cursorKey] = chain.id
+          if (work[index].cursor) this[cursorKey] = chain.id
           if (conflicted.has(chain.id)) continue
-          let chainSnapshot = snapshot
+          if (work[index].priority === null && offered.has(chain.id)) continue
+          if (work[index].priority !== null) {
+            if (!this.operations.available() || !this.journal.modelCapacityAvailable(this.operations.capacity())) continue
+            chain = this.current(chain)
+            offered.add(chain.id)
+          }
+          let chainSnapshot = work[index].priority !== null ? await this.readInvocations([chain]) : snapshot
           let phase = 'reconciliation'
           let conflictPhase: string | null = null
           let conflictDeferred = false
@@ -392,15 +447,31 @@ export class BehaviorChainRuntime {
               } else if (decision.kind === 'hold') {
                 if (!chain.held || automaticClosureHold(chain.held)) chain = this.append(chain, { type: 'chain.held', reason: decision.reason })
                 if (this.operations.reportHold) await this.reportHold(chain)
-              } else if (decision.kind === 'invoke' && this.operations.enabled() && (!decision.reviewer || this.operations.available()) && this.operations.permitted(chain, decision)) {
+              } else if (decision.kind === 'invoke' && this.operations.enabled() && this.operations.permitted(chain, decision)) {
                 const closed = closedChainTarget(chain, observation, decision.behavior)
                 if (closed) {
                   if (!chain.held) this.append(chain, { type: 'chain.held', reason: `No new ${decision.behavior}: ${closed}` })
                   continue
                 }
+                if (work[index].priority !== null && this.capacityWaitSequence(chain) !== work[index].priority) continue
+                if (decision.reviewer && this.operations.available() && this.journal.modelCapacityAvailable(this.operations.capacity())) {
+                  // A receipt can free capacity midway through the cursor page.
+                  // Offer older waiters that turn before preparing this work.
+                  const older = waiters.filter(waiter => !offered.has(waiter.chain.id)
+                    && waiter.sequence < (work[index].priority ?? Infinity))
+                  if (older.length) {
+                    work.splice(index + 1, 0, ...older.map(waiter => ({ chain: waiter.chain, priority: waiter.sequence, cursor: false })),
+                      { chain, priority: work[index].priority, cursor: false })
+                    continue
+                  }
+                }
+                if (decision.reviewer && !this.operations.available()) {
+                  this.waitForCapacity(chain, 'waiting for the shared native behavior capacity')
+                  continue
+                }
                 if (decision.reviewer && !this.journal.modelCapacityAvailable(this.operations.capacity())) {
                   const reason = 'shared native invocation capacity is occupied'
-                  if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                  this.waitForCapacity(chain, reason)
                   continue
                 }
                 // Resource-aware admission precedes provider preparation like the
@@ -490,7 +561,8 @@ export class BehaviorChainRuntime {
                   const reason = !this.journal.modelCapacityAvailable(this.operations.capacity()) ? 'shared native invocation capacity is occupied'
                     : resources ? this.resourceWaitReason(resources) ?? 'shared native invocation capacity is occupied'
                     : 'shared native invocation capacity is occupied'
-                  this.append(chain, { type: 'chain.waiting', reason })
+                  if (capacityWait(reason)) this.waitForCapacity(chain, reason)
+                  else this.append(chain, { type: 'chain.waiting', reason })
                   continue
                 }
                 chain = admitted
@@ -498,7 +570,7 @@ export class BehaviorChainRuntime {
                 await this.start(chain, chain.invocations.at(-1)!)
               } else {
                 const reason = decision.kind === 'wait' ? decision.reason : !this.operations.enabled() ? 'behavior chain admissions are paused'
-                  : !this.operations.available() ? 'waiting for the shared native behavior capacity' : `${decision.behavior} is disabled or held by its behavior controls`
+                  : `${decision.behavior} is disabled or held by its behavior controls`
                 if (reason !== chain.waiting) this.append(chain, { type: 'chain.waiting', reason })
               }
             } catch (error) {
