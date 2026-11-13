@@ -460,6 +460,22 @@ describe('native admission and recovery', () => {
     }
   })
 
+  it('pages authentication holds from their own partial index, never reading other chains', () => {
+    const { db, journal, chain } = setup()
+    const seed = (issue: number) => journal.append(chainIdentity('Example/Repo', issue), `seed-${issue}`, 0, { type: 'chain.admitted',
+      repository: 'Example/Repo', issue, branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' }, NOW)
+    record(journal, chain, { type: 'chain.held', reason: 'review-issue failed before publication three times: Refresh credential was rejected' })
+    record(journal, seed(8), { type: 'chain.held', reason: 'repair-pr failed before publication three times: required CI shard failed' })
+    seed(9)
+    expect(journal.authenticationHolds('').map(held => held.id)).toEqual([chain.id])
+    expect(journal.authenticationHolds(chain.id)).toEqual([])
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN SELECT chain_id FROM behavior_chain_current INDEXED BY behavior_chain_authentication_holds
+      WHERE merged = 0 AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%' AND chain_id > ?`)
+      .all('') as Array<{ detail: string }>).map(row => row.detail).join('\n')
+    expect(plan).toMatch(/USING (COVERING )?INDEX behavior_chain_authentication_holds/)
+    expect(db.prepare('SELECT count(*) FROM behavior_chain_current INDEXED BY behavior_chain_authentication_holds WHERE merged = 0 AND json_extract(state, \'$.held\') LIKE \'review-issue failed before publication three times:%\'').pluck().get()).toBe(1)
+  })
+
   it('recovers a later slot despite an earlier slot failure and success', async () => {
     const { journal, chain } = setup()
     const obs = { ...observation(), checkedAt: Date.now() }
