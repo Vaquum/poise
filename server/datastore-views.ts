@@ -171,3 +171,20 @@ export function selectView(db: Database.Database, query: DatastoreViewQuery): Re
   }
   return rows
 }
+
+// Every view reads `items`, and `user` reads `associations` too. Caller commits
+// its own bookkeeping every few seconds, so the file changes far more often
+// than any item does. This mark changes whenever an item is added, removed or
+// updated (GitHub moves `updated_at` on every change) and whenever evidence is
+// added; it reads only an index and the evidence table's last rowid.
+const CONTENT = `SELECT count(*) AS items, coalesce(max(updated_at), '') AS latest,
+    coalesce(sum((item_id % 2147483647) * (coalesce(unixepoch(updated_at), 0) % 2147483647) % 2147483647), 0) AS spread,
+    coalesce((SELECT max(rowid) FROM associations), 0) AS evidence
+  FROM items`
+
+/** What the views' answers depend on, as one string: equal marks mean no item
+ *  or evidence changed between two reads. */
+export function datastoreContent(db: Database.Database): string {
+  const mark = db.prepare(CONTENT).get() as { items: number, latest: string, spread: number, evidence: number }
+  return `${mark.items}|${mark.latest}|${mark.spread}|${mark.evidence}`
+}
