@@ -9,8 +9,7 @@
 // unresolved conditions retain their identity until authoritative resolution.
 
 import { EventEmitter } from 'node:events'
-import { ALERT_ID_EPOCH_KEY, db, getMeta, writeObservation } from '../db'
-import type Database from 'better-sqlite3'
+import { ALERT_ID_EPOCH_KEY, db, getMeta } from '../db'
 import { cachedStatement } from '../statements'
 import { recordHandling, type HandlingActor } from './handling'
 
@@ -121,26 +120,21 @@ function assertInput(input: AlertInput): void {
   if (input.target !== undefined && !isAlertTarget(input.target)) throw new Error(`an alert's notice cannot open ${JSON.stringify(input.target)}`)
 }
 
-export function pruneAlerts(now = Date.now(), connection: Database.Database = db): number {
-  return cachedStatement(connection, "DELETE FROM alerts WHERE created_at < ? AND (resolved_at IS NOT NULL OR kind = 'chat_turn_finished')").run(new Date(now - ALERT_RETENTION_MS).toISOString()).changes
+export function pruneAlerts(now = Date.now()): number {
+  return db.prepare("DELETE FROM alerts WHERE created_at < ? AND (resolved_at IS NOT NULL OR kind = 'chat_turn_finished')").run(new Date(now - ALERT_RETENTION_MS).toISOString()).changes
 }
 
 /** Records an alert unless one for the same key is still unresolved.
  *  Returns the new alert, or null when it was a duplicate. */
 export function raiseAlert(input: AlertInput, now = Date.now()): Alert | null {
   assertInput(input)
+  pruneAlerts(now)
   const createdAt = new Date(now).toISOString()
-  // An alert reports a condition its producer checks again, which raises it
-  // again if a power cut lost it, so pruning and raising commit together as
-  // an observation, without waiting for the disk on the server's thread.
-  const info = writeObservation((connection) => {
-    pruneAlerts(now, connection)
-    return cachedStatement(connection, `
-      INSERT INTO alerts(kind, title, body, url, created_at, dedupe_key, target, cause)
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING
-    `).run(input.kind, input.title, input.body, input.path, createdAt, input.dedupeKey, input.target ? JSON.stringify(input.target) : null, input.cause ?? null)
-  })
+  const info = db.prepare(`
+    INSERT INTO alerts(kind, title, body, url, created_at, dedupe_key, target, cause)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING
+  `).run(input.kind, input.title, input.body, input.path, createdAt, input.dedupeKey, input.target ? JSON.stringify(input.target) : null, input.cause ?? null)
   if (info.changes !== 1) return null
   announce()
   const seq = Number(info.lastInsertRowid)
