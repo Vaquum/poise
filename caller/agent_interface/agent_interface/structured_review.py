@@ -456,11 +456,11 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
         timeout, phase = wait_allowance()
         if groups_remaining is not None and repository is not None and not initializing and group_deadline is None:
             share = timeout / groups_remaining
-            # Reserve the observed cost of later groups, letting a slower group
-            # borrow slack. The equal share remains a minimum, not a fixed cap.
+            # Cap each later group's estimated reserve at half the equal share,
+            # leaving borrowing room even after an expensive early prefix.
             allowance = timeout
             if expected_group_seconds is not None:
-                allowance = max(share, timeout - expected_group_seconds * (groups_remaining - 1))
+                allowance = max(share, timeout - min(expected_group_seconds, share / 2) * (groups_remaining - 1))
             group_deadline = monotonic() + allowance
             inspection_cutoff = monotonic() + share / 2
             timeout, phase = wait_allowance()

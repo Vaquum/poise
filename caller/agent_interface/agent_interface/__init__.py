@@ -2288,7 +2288,8 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             message = f"{recovery.identity} recovery failed; needs attention: {recovery_error}"
             if reverdict:
                 message = f"{message}; prior: {failure}"
-            raise review_budget.ReviewLimitError(message, "review_recovery_failed") from recovery_error
+            raise review_budget.ReviewLimitError(
+                message, "review_recovery_failed", getattr(recovery_error, "diagnostic", None)) from recovery_error
 
 
 # A sibling that submitted a moment ago may not have recorded its review id
