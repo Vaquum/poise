@@ -13,7 +13,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 import agent_interface
-from agent_interface import issue_review, review_budget
+from agent_interface import issue_review, resource_ownership, review_budget
 from agent_interface.atoms import AgentPreflightError
 from agent_interface.model_catalog import CATALOG, ModelCatalogError
 
@@ -343,6 +343,7 @@ class TestRevisionBoundReview(IssueReviewCase):
         diagnostic, = agent_interface.diagnostics()["events"]
         self.assertEqual(diagnostic["id"], row["id"])
         self.assertIsNone(diagnostic["resource_error"])
+        self.assertIsNone(diagnostic["ownership_error"])
         for omitted in ("receipts", "artifact", "resource_ownership", "resources_settled_at"):
             self.assertNotIn(omitted, diagnostic)
         repo = Path(__file__).resolve().parents[3]
@@ -430,6 +431,7 @@ class TestRevisionBoundReview(IssueReviewCase):
         diagnostic, = agent_interface.diagnostics()["events"]
         self.assertEqual(diagnostic["id"], row["id"])
         self.assertEqual(diagnostic["resource_error"], "cleanup_failed")
+        self.assertIsNone(diagnostic["ownership_error"])
         self.assertNotIn("artifact", diagnostic)
         repo = Path(__file__).resolve().parents[3]
         output = repo / "test-results"
@@ -447,6 +449,56 @@ class TestRevisionBoundReview(IssueReviewCase):
             projected = subprocess.run(["node", str(root / "contract.mjs"), str(wire)], cwd=repo,
                                        env=environment, capture_output=True, text=True, timeout=30)
             self.assertEqual(projected.returncode, 0, projected.stderr)
+
+    def test_a_behavior_chain_revision_fence_with_ownership_failure_stays_visible(self):
+        call = agent_interface.track("opus-5-max", "note", "452", REPO, ACTOR, "issue_review",
+                                     source="poise:behavior-chain", correlation_id="ownership-1")
+        root = resource_ownership.allocate(agent_interface.DB, call,
+                                           resource_ownership.call_directory(agent_interface.DB, call))
+        agent_interface.finish(call, "failed", error="seed issue changed during review; no comments posted",
+                               error_code="issue_revision_changed", outcome="preflight_failed", action="not_started")
+        with patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                patch.object(resource_ownership, "_remove_directory", side_effect=PermissionError("deletion denied")):
+            resource_ownership.cleanup_remaining(agent_interface.DB, call)
+        with agent_interface.db() as conn:
+            row = conn.execute("select * from calls where id=?", (call,)).fetchone()
+        self.assertEqual((row["status"], row["error_code"], row["action"], row["outcome"]),
+                         ("failed", "issue_revision_changed", "not_started", "preflight_failed"))
+        self.assertTrue(json.loads(row["resource_ownership"])["errors"])
+        self.assertIsNone(json.loads(row["artifact"] or "{}").get("resource_error"))
+        diagnostic, = agent_interface.diagnostics()["events"]
+        self.assertEqual(diagnostic["id"], call)
+        self.assertIsNone(diagnostic["resource_error"])
+        self.assertEqual(diagnostic["ownership_error"], "ownership_failed")
+        self.assertNotIn("resource_ownership", diagnostic)
+
+    def test_a_late_cleanup_failure_requeues_its_diagnostic_after_checkpoint(self):
+        call = agent_interface.track("opus-5-max", "note", "452", REPO, ACTOR, "issue_review",
+                                     correlation_id="late-artifact-1")
+        agent_interface.finish(call, "failed", error="seed issue changed during review; no comments posted",
+                               error_code="issue_revision_changed", outcome="preflight_failed", action="not_started")
+        first = agent_interface.diagnostics()
+        self.assertEqual([event["id"] for event in first["events"]], [call])
+        self.assertIsNone(first["events"][0]["resource_error"])
+        agent_interface.record_cleanup_failure(call)
+        second = agent_interface.diagnostics(first["cursor"])
+        self.assertEqual([event["id"] for event in second["events"]], [call])
+        self.assertEqual(second["events"][0]["resource_error"], "cleanup_failed")
+
+    def test_a_late_ownership_failure_requeues_its_diagnostic_after_checkpoint(self):
+        call = agent_interface.track("opus-5-max", "note", "452", REPO, ACTOR, "issue_review",
+                                     source="poise:behavior-chain", correlation_id="late-ownership-1")
+        root = resource_ownership.allocate(agent_interface.DB, call,
+                                           resource_ownership.call_directory(agent_interface.DB, call))
+        agent_interface.finish(call, "failed", error="seed issue changed during review; no comments posted",
+                               error_code="issue_revision_changed", outcome="preflight_failed", action="not_started")
+        first = agent_interface.diagnostics()
+        self.assertEqual([event["id"] for event in first["events"]], [call])
+        self.assertIsNone(first["events"][0]["ownership_error"])
+        resource_ownership.failure(agent_interface.DB, call, "deletion denied", root)
+        second = agent_interface.diagnostics(first["cursor"])
+        self.assertEqual([event["id"] for event in second["events"]], [call])
+        self.assertEqual(second["events"][0]["ownership_error"], "ownership_failed")
 
     def test_child_only_output_cannot_fulfill_a_revision_bound_request(self):
         expected = issue_review.revision({"title": "Issue 452", "body": "Body 452"})

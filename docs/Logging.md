@@ -35,9 +35,11 @@ Caller status nor publication, retry or hold rules.
 
 The typed pre-publication [issue revision fence](Issue-review.md#when-a-reviewer-fails)
 is routine supersession and creates no new Logging event or work-error count.
-The metadata-only diagnostic feed carries that invariant without receipts or
-publication artifacts, but with artifact cleanup failures; omitted fields alone
-never prove that nothing was posted. This correction applies to future collection.
+The metadata-only diagnostic feed carries that invariant without receipts,
+publication artifacts or ownership, but with artifact and ownership cleanup
+failures; omitted fields alone never prove that nothing was posted. A cleanup
+failure recorded after the terminal result requeues its diagnostic, so a poll
+that already passed still sees it. This correction applies to future collection.
 Retained events are immutable, so an Error already stored for a stale review keeps
 its original classification.
 

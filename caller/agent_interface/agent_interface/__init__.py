@@ -1135,13 +1135,18 @@ def diagnostics(after: int = 0, limit: int = 3) -> dict:
         rows = conn.execute(f"""select d.seq,{columns},c.started_at,c.ended_at,
             substr(c.error,1,8192) as error,substr(c.diagnostic,1,65536) as diagnostic,
             case when c.artifact is null then null when json_valid(c.artifact)
-            then substr(json_extract(c.artifact,'$.resource_error'),1,512) else 'invalid_artifact' end as resource_error
+            then substr(json_extract(c.artifact,'$.resource_error'),1,512) else 'invalid_artifact' end as resource_error,
+            case when c.resource_ownership is null then null when json_valid(c.resource_ownership)
+            then case when json_array_length(c.resource_ownership,'$.errors') is null then 'invalid_ownership'
+            when json_array_length(c.resource_ownership,'$.errors') > 0 then 'ownership_failed' else null end
+            else 'invalid_ownership' end as ownership_error
             from diagnostic_calls d join calls c on c.id=d.call_id
             where d.seq>? order by d.seq limit ?""", (after, limit + 1)).fetchall()
     events = []
     for row in rows[:limit]:
         entry = {field: row[field] for field in fields}
         entry.update(seq=row["seq"], error=row["error"], resource_error=row["resource_error"],
+                     ownership_error=row["ownership_error"],
                      started_at_precise=utc_stamp(row["started_at"]),
                      completed_at=utc_stamp(row["ended_at"]) if row["ended_at"] else None)
         try:
@@ -1219,11 +1224,13 @@ def run_pr_review(
 def record_cleanup_failure(call_id: str) -> None:
     """A run directory that survived deletion keeps its resources unsettled:
     the failure is durable and visible. A legacy sweep cannot retry deletion
-    without original ownership and process-termination proof."""
+    without original ownership and process-termination proof. The diagnostic
+    entry is requeued so a poll that already passed still sees the failure."""
     try:
         with db() as conn:
             conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.resource_error','cleanup_failed') where id=?",
                          (call_id,))
+            conn.execute("delete from diagnostic_calls where call_id=?", (call_id,))
     except Exception as error:
         print(f"call {call_id} cleanup failed and its record could not be updated: {error}", file=sys.stderr)
 
