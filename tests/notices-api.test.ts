@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, statfs } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,10 +10,19 @@ vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 // The notices through the HTTP API the page's notification island uses, and
 // the Notifications setting that turns them off.
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
+vi.mock('node:fs/promises', async (original) => {
+  const actual = await original<typeof import('node:fs/promises')>()
+  return { ...actual, statfs: vi.fn(actual.statfs) }
+})
 vi.mock('../server/process', async (original) => ({
   ...(await original<typeof import('../server/process')>()),
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
+}))
+// Host disk pressure must not add alerts to the notification API fixture.
+vi.mock('../server/storage-maintenance', async (original) => ({
+  ...(await original<typeof import('../server/storage-maintenance')>()),
+  startStorageMaintenanceRuntime: vi.fn(),
 }))
 vi.mock('../server/content-jobs', async (original) => ({
   ...(await original<typeof import('../server/content-jobs')>()),
@@ -180,6 +189,7 @@ describe('the notices API', () => {
     await readGithubQuota()
     expect((await call('GET', '/api/notices')).body.notices).toEqual([])
     expect(mocks.runFile.mock.calls.filter(([command]) => command === 'gh')).toHaveLength(2)
+    expect(statfs).not.toHaveBeenCalled()
   })
 
   it('gives an existing failed-behavior notice its exact Swarm call', async () => {
@@ -271,6 +281,7 @@ describe('the notices API', () => {
     expect((await call('GET', '/api/notices')).body.notices.map((notice: any) => notice.kind)).toEqual(['chat_waiting'])
     // Turned on, the check ran at once; with no GitHub account set it asked GitHub nothing.
     expect(mocks.runFile.mock.calls.filter(([command]) => command === 'github-datastore' || command === 'github-interface')).toEqual([])
+    expect(statfs).not.toHaveBeenCalled()
   })
 })
 
