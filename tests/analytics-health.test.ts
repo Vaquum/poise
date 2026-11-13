@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 import { afterEach, expect, it, vi } from 'vitest'
-import { projectAnalyticsHealth, healthIntervals, workError, retryProven } from '../server/analytics-health'
+import { keepHistory, projectAnalyticsHealth, healthIntervals, workError, retryProven } from '../server/analytics-health'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { nativeActionReceipt } from '../server/behavior-chain-action'
 import type { ChainObservation } from '../server/behavior-chain-decision'
@@ -845,3 +845,39 @@ it('keeps the thread in slices across the journal rather than yielding after eve
   expect(turns).toBeLessThan(10)
 })
 
+
+it('reads a chain\'s history once and then only its new events, projecting what a fresh read projects', async () => {
+  const f = setup()
+  let chain = f.seed(1)
+  // Past one page of history, so the kept rows span pages.
+  for (let n = 0; n < 130; n++) chain = f.observe(chain, NOW - 40 * HOUR + n * 1000)
+  chain = f.fail(chain, 'first', NOW - 2 * HOUR)
+  await f.read()
+  const history = vi.spyOn(f.journal, 'history')
+  chain = f.fail(chain, 'second', NOW - HOUR)
+  const kept = await f.read()
+  const reads = history.mock.calls.filter(([id]) => id === chain.id)
+  expect(reads.length).toBeGreaterThan(0)
+  expect(reads.every(([, after]) => Number(after) > 0)).toBe(true)
+  history.mockRestore()
+  // A journal with nothing kept reads the whole history and projects the same.
+  expect(kept).toEqual(await projectAnalyticsHealth(new BehaviorChainJournal(f.db), f.input))
+  expect(kept.lastError.error?.at).toBe(NOW - HOUR)
+})
+
+it('keeps chain histories within their bound, the least recently read first out, and never one longer than the bound', () => {
+  const kept = new Map<string, number[]>()
+  keepHistory(kept, 'a', [1, 2, 3], 5)
+  keepHistory(kept, 'b', [1, 2], 5)
+  expect([...kept.keys()]).toEqual(['a', 'b'])
+  keepHistory(kept, 'c', [1, 2], 5)
+  expect([...kept.keys()]).toEqual(['b', 'c'])
+  // Read again, a chain is the most recent.
+  keepHistory(kept, 'b', [1, 2, 3], 5)
+  expect([...kept.keys()]).toEqual(['c', 'b'])
+  // A chain longer than the bound alone is not kept, and evicts nothing.
+  keepHistory(kept, 'd', [1, 2, 3, 4, 5, 6], 5)
+  expect([...kept.keys()]).toEqual(['c', 'b'])
+  keepHistory(kept, 'b', [1, 2, 3, 4, 5, 6], 5)
+  expect([...kept.keys()]).toEqual(['c'])
+})
