@@ -395,9 +395,11 @@ const META_PREFIX = 'behavior_'
 function enabledKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_enabled' }
 function settingKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_setting' }
 
-export function isEnabled(key: BehaviorKey): boolean {
+/** Whether a behavior is switched on, here: in an account's scope, only while
+ *  that account is ready. `ready` passes accounts the caller already read. */
+export function isEnabled(key: BehaviorKey, ready?: readonly Organization[]): boolean {
   const org = behaviorOrganization.getStore()
-  if (org && !readyOrganizations().some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
+  if (org && !(ready ?? readyOrganizations()).some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
     && candidate.datastorePath === org.datastorePath)) return false
   const saved = getMeta(enabledKey(key))
   return saved === '1' || (saved === null && (key === 'implement-issues' || key === 'repair-prs'))
@@ -8579,6 +8581,15 @@ export interface BehaviorsRuntimeHealth {
 }
 
 function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): BehaviorsRuntimeHealth {
+  // Each behavior's switch, read once for this report: the checks below ask
+  // again and again, and each ask read every account afresh.
+  const ready = readyOrganizations()
+  const switches = new Map<BehaviorKey, boolean>()
+  const enabled = (key: BehaviorKey): boolean => {
+    let on = switches.get(key)
+    if (on === undefined) switches.set(key, on = isEnabled(key, ready))
+    return on
+  }
   const now = Date.now()
   const busyEntries = [...behaviorOperationStartedAt.entries()].filter(([key]) => key.startsWith(`${currentOrganization()?.login.toLowerCase() ?? 'legacy'}:`))
   const busy = busyEntries.map(([key, since]) => ({
@@ -8594,7 +8605,7 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
     .some(([key, startedAt]) => now > (behaviorOperationClocks.get(key)?.expiresAt ?? startedAt + BEHAVIOR_OPERATION_TIMEOUT_MS) + BEHAVIOR_HEALTH_GRACE_MS)
   const staleEpisodes = openStaleMirrors(currentOrganization())
   const failures = BEHAVIOR_KEYS.flatMap((behavior) => {
-    if (!isEnabled(behavior)) return []
+    if (!enabled(behavior)) return []
     return [undefined, ...behaviorFailureTargets(behavior)].flatMap((target) => {
       const failure = readBehaviorFailure(behavior, target)
       let recovered = false
@@ -8643,14 +8654,14 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
   for (const episode of staleEpisodes) {
     for (const behavior of episode.behaviors) {
       if (!(BEHAVIOR_KEYS as readonly string[]).includes(behavior)
-        || !isEnabled(behavior as BehaviorKey)
+        || !enabled(behavior as BehaviorKey)
         || failures.some((failure) => failure.behavior === behavior && failure.correlationId === episode.id)) continue
       failures.push({ behavior: behavior as BehaviorKey, kind: 'operation', consecutiveFailures: 1,
         failingSince: episode.startedAt, lastFailureAt: episode.startedAt, nextRetryAt: '', error: staleMirrorMessage(episode),
         diagnostic: diagnosticClassification('datastore_stale'), correlationId: episode.id })
     }
   }
-  const enabledForRuntime = (key: BehaviorKey) => isEnabled(key)
+  const enabledForRuntime = (key: BehaviorKey) => enabled(key)
     && (key !== 'implement-issues' && key !== 'repair-prs' || getBehaviorChainSettings().enabled)
   const anyEnabled = BEHAVIOR_KEYS.some(enabledForRuntime)
   let reviewer: string | null = null
