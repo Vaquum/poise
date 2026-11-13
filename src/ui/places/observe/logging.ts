@@ -307,7 +307,7 @@ export function createLogging(ctx: PartContext): ObservePart {
     for (const input of root.querySelectorAll<HTMLInputElement>('[data-column]')) {
       input.checked = columns.some(([key]) => key === input.dataset.column)
       input.disabled = EXACT.some(([key]) => key === input.dataset.column && !!preferences[key])
-      input.parentElement!.title = input.disabled ? 'Clear the column’s filter before hiding it' : ''
+      input.parentElement!.dataset.help = input.disabled ? 'Clear the column’s filter before hiding it' : ''
     }
     for (const button of root.querySelectorAll<HTMLButtonElement>('[data-level]')) button.setAttribute('aria-pressed', String(preferences.severities.some((level) => level === button.dataset.level)))
     for (const button of root.querySelectorAll<HTMLButtonElement>('[data-time]')) button.setAttribute('aria-pressed', String(button.dataset.time === preferences.time))
@@ -334,17 +334,17 @@ export function createLogging(ctx: PartContext): ObservePart {
   }
 
   function cell(event: LoggingEvent, key: Column): string {
-    if (key === 'time') return `<td class="lg-c-time" data-ref="lg.time"><time datetime="${esc(event.eventTime ?? event.ingestedAt)}" title="${esc(`${event.eventTime ? 'Source time' : 'Ingestion time; the source gave none'} · ${effectiveTimezone()}`)}">${esc(date(event.eventTime ?? event.ingestedAt))}</time>${event.eventTime ? '' : '<span class="note">Ingested</span>'}</td>`
+    if (key === 'time') return `<td class="lg-c-time" data-ref="lg.time"><time datetime="${esc(event.eventTime ?? event.ingestedAt)}" data-help="${esc(`${event.eventTime ? 'Source time' : 'Ingestion time; the source gave none'} · ${effectiveTimezone()}`)}">${esc(date(event.eventTime ?? event.ingestedAt))}</time>${event.eventTime ? '' : '<span class="note">Ingested</span>'}</td>`
     if (key === 'impact') {
       const work = impacts.get(event.id)?.value
       const summary = work ? [work.impact, work.target, work.stage].filter(Boolean).join(' · ') : 'unknown'
-      return `<td class="lg-c-impact${work ? ` is-${work.impact}` : ' dim'}" title="${esc(summary)}" data-ref="lg.impact">${esc(summary)}</td>`
+      return `<td class="lg-c-impact${work ? ` is-${work.impact}` : ' dim'}" data-help="${esc(summary)}" data-ref="lg.impact">${esc(summary)}</td>`
     }
     if (key === 'severity') return `<td class="lg-c-severity"><span class="sev is-${event.severity}" data-ref="lg.severity">${label(event.severity)}</span></td>`
     if (key === 'source') return `<td class="lg-c-source" data-ref="lg.source">${esc(event.source)}</td>`
-    if (key === 'occurrences') return `<td class="num" title="Retained occurrences in this incident">${(event.occurrences ?? 0).toLocaleString('en-US')}</td>`
+    if (key === 'occurrences') return `<td class="num" data-help="Retained occurrences in this incident">${(event.occurrences ?? 0).toLocaleString('en-US')}</td>`
     const value = String(event[key as keyof LoggingEvent] ?? '') || '—'
-    return `<td class="lg-c-${key}${key.endsWith('Id') ? ' t-mono' : ''}" title="${esc(value)}">${esc(value)}</td>`
+    return `<td class="lg-c-${key}${key.endsWith('Id') ? ' t-mono' : ''}" data-help="${esc(value)}">${esc(value)}</td>`
   }
 
   function render(): void {
@@ -422,7 +422,7 @@ export function createLogging(ctx: PartContext): ObservePart {
     const issue = queryUnavailable || !!healthMessage || (!!state && state !== 'connected') || queryState === 'unavailable'
     const button = $('#lg-data-button', root)
     $('[data-lg-dot]', root).className = `sdot${issue ? ' is-warn' : state === 'connected' ? ' is-saved' : ''}`
-    button.title = `Data and collection · ${queryUnavailable ? 'Query unavailable' : healthMessage ? 'Health unavailable' : word(state)}`
+    button.dataset.help = `Data and collection · ${queryUnavailable ? 'Query unavailable' : healthMessage ? 'Health unavailable' : word(state)}`
     if (!opening && !$('#lg-data', root).matches(':popover-open')) return
     patchContent($('[data-lg-health]', root), `<dl class="lg-facts is-two">${field('Collection now', word(state))}${field('Query service', word(queryState))}
       ${field('Snapshot', lastSuccess ? date(new Date(lastSuccess).toISOString()) : null)}${field('Collection read', health ? date(health.collection.checkedAt) : null)}
@@ -432,7 +432,7 @@ export function createLogging(ctx: PartContext): ObservePart {
       <table class="lg-sources" aria-label="Diagnostic sources"><thead><tr><th>Source</th><th>Now</th><th>Last observed</th><th>History</th></tr></thead><tbody>${sources.map((source) => {
         const now = currentCoverageStatus(source)
         const text = health && !healthFresh ? 'Stale' : source.optional && now === 'not-configured' ? 'Not applicable' : word(now)
-        return `<tr><td>${esc(source.source)}<span class="dim t-mono"> ${esc(source.id)}</span></td><td title="${esc(source.error ?? '')}">${capsule(now === 'connected' ? 'done' : now === 'unavailable' ? 'failed' : 'waiting')}${esc(text)}${source.error && now !== 'connected' ? `<small>${esc(source.error)}</small>` : ''}</td><td>${esc(source.observedAt ? date(source.observedAt) : '—')}</td><td>${coverageHistory(source)}</td></tr>`
+        return `<tr><td>${esc(source.source)}<span class="dim t-mono"> ${esc(source.id)}</span></td><td data-help="${esc(source.error ?? '')}">${capsule(now === 'connected' ? 'done' : now === 'unavailable' ? 'failed' : 'waiting')}${esc(text)}${source.error && now !== 'connected' ? `<small>${esc(source.error)}</small>` : ''}</td><td>${esc(source.observedAt ? date(source.observedAt) : '—')}</td><td>${coverageHistory(source)}</td></tr>`
       }).join('')}</tbody></table>`)
   }
 

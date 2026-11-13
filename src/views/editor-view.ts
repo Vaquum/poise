@@ -353,15 +353,15 @@ function renderShell(): string {
   return `
     <header class="view-header editor-bar">
       <div class="editor-bar-left">
-        <button type="button" class="editor-bar-btn editor-focus-btn"  title="Writer mode" aria-label="Toggle writer mode" aria-pressed="false">${ICON_FOCUS_ENTER}</button>
-        <button type="button" class="editor-bar-btn editor-new-btn"    title="New (⌘N)" aria-label="New">${ICON_PLUS}</button>
-        <button type="button" class="editor-bar-btn editor-import-btn" title="Import markdown file" aria-label="Import markdown file">${ICON_IMPORT}</button>
+        <button type="button" class="editor-bar-btn editor-focus-btn"  data-help="Writer mode" aria-label="Toggle writer mode" aria-pressed="false">${ICON_FOCUS_ENTER}</button>
+        <button type="button" class="editor-bar-btn editor-new-btn"    data-help="New (⌘N)" aria-label="New">${ICON_PLUS}</button>
+        <button type="button" class="editor-bar-btn editor-import-btn" data-help="Import markdown file" aria-label="Import markdown file">${ICON_IMPORT}</button>
         <input type="file" class="editor-import-file" accept=".md,.markdown,.txt" hidden />
-        <button type="button" class="editor-bar-btn editor-copy-btn"   title="Copy document" aria-label="Copy document">${ICON_COPY}</button>
-        <button type="button" class="editor-bar-btn editor-chat-btn"   title="Chat about this document (pane)" aria-label="Open chat">${ICON_CHAT}</button>
-        <button type="button" class="editor-bar-btn editor-chat-session-btn" title="Chat about this document" aria-label="Chat about this document">${ICON_CHAT_SESSION}</button>
-        <button type="button" class="editor-bar-btn editor-publish-btn" title="Publish" aria-label="Publish" aria-haspopup="dialog" aria-expanded="false">${ICON_PUBLISH}</button>
-        <button type="button" class="editor-bar-btn editor-delete-btn" title="Delete" aria-label="Delete">${ICON_TRASH}</button>
+        <button type="button" class="editor-bar-btn editor-copy-btn"   data-help="Copy document" aria-label="Copy document">${ICON_COPY}</button>
+        <button type="button" class="editor-bar-btn editor-chat-btn"   data-help="Chat about this document (pane)" aria-label="Open chat">${ICON_CHAT}</button>
+        <button type="button" class="editor-bar-btn editor-chat-session-btn" data-help="Chat about this document" aria-label="Chat about this document">${ICON_CHAT_SESSION}</button>
+        <button type="button" class="editor-bar-btn editor-publish-btn" data-help="Publish" aria-label="Publish" aria-haspopup="dialog" aria-expanded="false">${ICON_PUBLISH}</button>
+        <button type="button" class="editor-bar-btn editor-delete-btn" data-help="Delete" aria-label="Delete">${ICON_TRASH}</button>
       </div>
       <div class="editor-bar-right">
         <div class="editor-doc-wrap">
@@ -392,13 +392,13 @@ function renderShell(): string {
            annotation + open panel. Issue → open the issue composer
            prefilled with the selected snippet as body. Both are 24px
            r-999 circles, anchored just above-right of the selection. -->
-      <button type="button" class="editor-comment-btn" id="editor-comment-btn" hidden aria-label="Add comment">
+      <button type="button" class="editor-comment-btn" id="editor-comment-btn" hidden aria-label="Add comment" data-tooltip>
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2.5 4a1.5 1.5 0 0 1 1.5-1.5h6A1.5 1.5 0 0 1 11.5 4v4a1.5 1.5 0 0 1-1.5 1.5H6.5L4 12V9.5a1.5 1.5 0 0 1-1.5-1.5V4z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
       </button>
-      <button type="button" class="editor-comment-btn editor-issue-btn" id="editor-issue-btn" hidden aria-label="Create issue from selection">
+      <button type="button" class="editor-comment-btn editor-issue-btn" id="editor-issue-btn" hidden aria-label="Create issue from selection" data-tooltip>
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.2"/><circle cx="7" cy="7" r="1.4" fill="currentColor"/></svg>
       </button>
-      <button type="button" class="editor-comment-btn editor-snippet-btn" id="editor-snippet-btn" hidden aria-label="Save selection as snippet">
+      <button type="button" class="editor-comment-btn editor-snippet-btn" id="editor-snippet-btn" hidden aria-label="Save selection as snippet" data-tooltip>
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M8 1.5L3.5 8H6.5L6 12.5L10.5 6H7.5z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
       </button>
     </main>
@@ -2186,7 +2186,7 @@ function setTriggerTitle() {
   const d = currentDoc()
   const full = d?.title || 'Untitled'
   triggerTitleEl.textContent = truncateTitleForTrigger(full)
-  triggerTitleEl.title = full     // hover-tooltip shows the full title
+  triggerTitleEl.dataset.help = full
 }
 
 let docsRead: Promise<boolean> | null = null
@@ -2217,7 +2217,7 @@ function renderDocMenu() {
                 class="editor-doc-item${isActive ? ' is-active' : ''}"
                 data-slug="${escapeHtml(d.slug)}"
                 role="menuitem"
-                title="${escapeHtml(d.title)}">
+                data-help="${escapeHtml(d.title)}">
           <span class="editor-doc-title">${escapeHtml(d.title)}</span>
           <span class="editor-doc-time">${escapeHtml(relTime(d.updated_at))}</span>
         </button>
@@ -3232,7 +3232,7 @@ function renderAnnotationOverlay(): void {
     mark.style.top    = (rect.top    - pageRect.top)  + 'px'
     mark.style.width  = rect.height + 'px'
     mark.style.height = rect.height + 'px'
-    mark.title = a.comment ? `Passage changed: ${a.comment.slice(0, 200)}` : 'Passage changed'
+    mark.dataset.help = a.comment ? `Passage changed: ${a.comment.slice(0, 200)}` : 'Passage changed'
     overlayEl.appendChild(mark)
   }
 
@@ -3250,7 +3250,7 @@ function renderAnnotationOverlay(): void {
       mark.style.top    = (rect.top    - pageRect.top)  + 'px'
       mark.style.width  = rect.width  + 'px'
       mark.style.height = rect.height + 'px'
-      mark.title = a.comment ? a.comment.slice(0, 200) : 'Comment'
+      mark.dataset.help = a.comment ? a.comment.slice(0, 200) : 'Comment'
       overlayEl.appendChild(mark)
     }
   }
@@ -3857,6 +3857,7 @@ function openThreadForAnnotation(id: string): void {
       del.type = 'button'
       del.className = 'editor-annotation-delete'
       del.setAttribute('aria-label', 'Delete')
+      del.dataset.tooltip = ''
       del.innerHTML = ICON_TRASH
       del.addEventListener('click', () => deleteAnnotation(id))
       section.appendChild(del)

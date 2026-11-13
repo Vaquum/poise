@@ -47,7 +47,7 @@ export function createCommandModels(input: HTMLTextAreaElement, handlers: Handle
       row.dataset.identity = choice.identity; row.dataset.index = String(i)
       row.setAttribute('role', 'option'); row.setAttribute('aria-disabled', String(!choice.available))
       row.textContent = `${choice.label}${choice.available ? '' : ' · Unavailable'}`
-      row.title = choice.reason || choice.identity
+      row.dataset.help = choice.reason || choice.identity
       list.appendChild(row)
     })
     el.querySelector('.chat-history-count')!.textContent = visible.length ? String(visible.length) : ''
