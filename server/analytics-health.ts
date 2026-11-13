@@ -12,7 +12,7 @@ import { nativeResourcesPending, resourceReleaseContradicted } from './behavior-
 import { dependencySnapshot, type LedgerHistory, type Dependencies } from './health'
 import { getOrganizations, type Organization } from './organizations'
 import { HttpError } from './http'
-import { servedRead, type ServedRead } from './served-read'
+import { refreshServed, servedRead, type ServedRead } from './served-read'
 
 const DAY = 86_400_000
 
@@ -495,7 +495,7 @@ const healthReads = new Map<string, ServedRead<AnalyticsHealth>>()
  *  HEALTH_SERVED_MS old, and its result answers the next read. Each result
  *  carries the time it was read at. */
 export function readAnalyticsHealth(scope = ''): Promise<AnalyticsHealth> {
-  const organizations = getOrganizations().filter(org => !scope || org.login.toLowerCase() === scope.toLowerCase())
+  const organizations = healthOrganizations(scope)
   if (scope && !organizations.length) throw new HttpError(400, 'GitHub account is not configured')
   const key = healthReadKey(scope, organizations)
   let state = healthReads.get(key)
@@ -504,9 +504,62 @@ export function readAnalyticsHealth(scope = ''): Promise<AnalyticsHealth> {
     // Another account set is rare; the oldest are dropped past a few.
     if (healthReads.size > 8) healthReads.delete(healthReads.keys().next().value!)
   }
-  return servedRead(state, async () => {
+  healthWatched.set(key, { scope, readAt: Date.now() })
+  scheduleHealthRefresh()
+  return servedRead(state, projectHealth(scope, organizations),
+    { waitMs: HEALTH_WAIT_MS, servedMs: HEALTH_SERVED_MS, freshMs: HEALTH_FRESH_MS })
+}
+
+// Projecting costs the server's thread most of a second while chains move,
+// and Overview reads it on every load and every open tab's minute. While
+// anyone has read it in the last HEALTH_WATCHED_MS it is projected again in
+// the background once a minute, HEALTH_REFRESH_SECOND past the minute: away
+// from the behavior tick and the tabs' refresh on the minute. A projection
+// younger than HEALTH_FRESH_MS answers a read at once, so a page load neither
+// waits for one nor shares the thread with one.
+const HEALTH_FRESH_MS = 90_000
+const HEALTH_WATCHED_MS = 10 * 60_000
+const HEALTH_REFRESH_SECOND = 40
+const healthWatched = new Map<string, { scope: string, readAt: number }>()
+let healthRefresh: ReturnType<typeof setTimeout> | null = null
+
+function healthOrganizations(scope: string): Organization[] {
+  return getOrganizations().filter(org => !scope || org.login.toLowerCase() === scope.toLowerCase())
+}
+
+function projectHealth(scope: string, organizations: Organization[]): () => Promise<AnalyticsHealth> {
+  return async () => {
     const snapshot = dependencySnapshot()
     return projectAnalyticsHealth(behaviorChainJournal(), { now: Date.now(), scope, organizations,
       dependencies: snapshot.dependencies, history: snapshot.history.ledger })
-  }, { waitMs: HEALTH_WAIT_MS, servedMs: HEALTH_SERVED_MS })
+  }
+}
+
+/** Milliseconds from `now` to the next HEALTH_REFRESH_SECOND past a minute. */
+export function untilHealthRefresh(now: number): number {
+  return (HEALTH_REFRESH_SECOND * 1000 - now % 60_000 + 60_000) % 60_000 || 60_000
+}
+
+function scheduleHealthRefresh(): void {
+  if (healthRefresh) return
+  healthRefresh = setTimeout(refreshWatchedHealth, untilHealthRefresh(Date.now()))
+  healthRefresh.unref?.()
+}
+
+function refreshWatchedHealth(): void {
+  healthRefresh = null
+  const now = Date.now()
+  for (const [key, watch] of healthWatched) {
+    const state = healthReads.get(key)
+    let organizations: Organization[]
+    try { organizations = healthOrganizations(watch.scope) } catch { continue }
+    // Unwatched, or the accounts changed since the read: the next read
+    // projects under its own key.
+    if (now - watch.readAt >= HEALTH_WATCHED_MS || !state || healthReadKey(watch.scope, organizations) !== key) {
+      healthWatched.delete(key)
+      continue
+    }
+    refreshServed(state, projectHealth(watch.scope, organizations))
+  }
+  if (healthWatched.size) scheduleHealthRefresh()
 }
