@@ -70,6 +70,8 @@ export class Context {
   readonly agent = new http.Agent({ keepAlive: true, timeout: 4_000 })
   /** Recent user-code submissions per apex session, for the /link rate limit. */
   readonly codeAttempts = new Map<string, number[]>()
+  /** Recent opens of phone codes that do not exist, per client, for the /auth/phone rate limit. */
+  readonly phoneMisses = new Map<string, number[]>()
   /** The Link event streams open through this gateway, per paired device. */
   readonly linkStreams = new LinkStreams()
 

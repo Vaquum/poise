@@ -123,6 +123,47 @@ only these exact apex public paths and methods without that additional login.
   and back (`src/signed-out.ts`). A server that cannot be reached at all is not
   an ended sign-in.
 
+**Sign in on a phone.** Settings → Accounts → Sign in on your phone signs a
+phone in to the owner's account with a QR code, without GitHub
+(`gateway/src/phone.ts`).
+- A code is a one-time token of 128 bits, stored as its hash and valid for 2
+  minutes. The QR holds `https://<POISE_DOMAIN>/auth/phone?t=<token>`. One
+  sign-in, across its hosts, may mint 30 codes in 15 minutes.
+- The first device to open the code is bound to it. The gateway sets a random
+  secret on that device in `poise_phone` (host-only on the apex,
+  `Path=/auth/phone`, `Secure`, `HttpOnly`, `SameSite=Lax`, 10 minutes). It
+  records the device's kind and browser from its `User-Agent`, and redirects
+  to `/auth/phone`.
+  - Another device gets 409, and an unknown or expired code 410.
+  - A client that opens 20 unknown codes in 10 minutes gets 429 for the rest
+    of that window. The client is the first `X-Forwarded-For` entry, which the
+    deployment's proxy sets.
+  - A device already signed in goes through the code all the same, because a
+    login proxy in front may have ended its sign-in there.
+- `/auth/phone` reloads itself every 2 seconds while the owner decides, for up
+  to 2 minutes. The page has no script.
+- Settings shows the device with Approve and Deny. Approving sends the code's
+  grant, the SHA-256 of the device's secret in lower-case hex, as `GET
+  /_poise/api/phone` reports it.
+- Within 2 minutes of approval, the device's next `/auth/phone` gives it a new
+  apex session and binding of its own (`poise_gw`, `poise_bind`) and clears
+  `poise_phone`. Its page then goes on through a ticket to the workspace. The
+  owner's session is never copied, and a code signs in once.
+- Settings lists these phones while their sessions live: 14 days, like any apex
+  session. Signing one out there ends its apex session and every workspace
+  session made from it.
+- Codes, secrets and grants are never logged. The log names the login and the
+  device only.
+- **A login proxy in front**, such as Vaquum's Portal, must let `GET
+  /auth/phone` on the apex through without its own login. It must also give the
+  approved phone its own session.
+  - The owner's approval and sign-out pass the proxy with the owner's session,
+    and carry the grant in the query.
+  - The phone's `/auth/phone` carries `poise_phone`, and the SHA-256 of that
+    value is the grant.
+  - So the proxy can record the approval and start the phone's session on the
+    phone's next request, without knowing anything else of the gateway's.
+
 **Gateway API on workspace hosts.** Poise's Settings calls the gateway at
 `/_poise/api/*` on its own host; the gateway answers itself and nothing reaches
 the workspace.
@@ -145,6 +186,21 @@ the workspace.
   15 minutes answers 429 `too_many_requests` with `Retry-After`.
 - `POST /_poise/api/devices/revoke` with `{ id }` returns `{ devices }`, or 404
   for a device that is not the owner's.
+- `GET /_poise/api/phone` returns `{ codes, phones }`.
+  - `codes` are the owner's codes of the last 15 minutes, each `{ id, state,
+    device, grant, createdAt, expiresAt, scannedAt, decidedAt, finishedAt }`.
+    `state` is one of `waiting`, `scanned`, `approved`, `denied`, `signed_in`
+    or `expired`. `grant` is set once a device opened the code.
+  - `phones` are the phones signed in with a code, each `{ id, device, grant,
+    createdAt }`.
+- `POST /_poise/api/phone/start` returns `{ code, url }`. Past its rate limit
+  it answers 429 `too_many_requests` with `Retry-After`.
+- `POST /_poise/api/phone/approve?grant=<grant>` and `POST
+  /_poise/api/phone/deny`, each with `{ id }`, return `{ code }`. A missing
+  grant or another device's answers 400, and a code that is no longer waiting
+  answers 409.
+- `POST /_poise/api/phone/revoke?grant=<grant>` with `{ id }` returns `{ phones
+  }`. A grant that is not that phone's answers 400.
 - For admins only (403 otherwise): `GET /_poise/api/admin` returns `{ users,
   allowed, admins, allowedOrgs, dockerError, disk }`. Each user is `{ handle,
   login, admin, access, lastLoginAt, disabled, workspace, lastError, disk }`,
@@ -224,7 +280,7 @@ client sent.
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
   `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers. It
   forwards no `Cookie` header at all: neither its own cookies (`poise_gw`,
-  `poise_ws`, `poise_bind`, `poise_oauth`) nor any other the browser sends,
+  `poise_ws`, `poise_bind`, `poise_oauth`, `poise_phone`) nor any other the browser sends,
   such as a login cookie that a parent domain shares with every host below
   it. Nor does it forward a device token's `Authorization` header.
 - Workspaces cannot set cookies: the gateway drops every `Set-Cookie` from

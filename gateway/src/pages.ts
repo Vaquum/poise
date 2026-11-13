@@ -123,14 +123,14 @@ const STYLE = `
   main.refreshing { animation: none; }
 `
 
-export function page(title: string, body: Html, options: { refreshSeconds?: number; wide?: boolean; footer?: string } = {}): string {
+export function page(title: string, body: Html, options: { refreshSeconds?: number; refreshUrl?: string; wide?: boolean; footer?: string } = {}): string {
   return html`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-${options.refreshSeconds ? html`<meta http-equiv="refresh" content="${options.refreshSeconds}">` : ''}
+${options.refreshSeconds ? html`<meta http-equiv="refresh" content="${options.refreshSeconds}${options.refreshUrl ? `; url=${options.refreshUrl}` : ''}">` : ''}
 <title>${title} · Poise</title>
 <link rel="stylesheet" href="${FONT_ORIGIN}/inter/inter.css">
 <style>${new Html(STYLE)}</style>
@@ -199,6 +199,27 @@ ${input.lastError ? html`<p class="error">The last start failed: ${input.lastErr
 ${input.problem ? html`<p class="error">${input.problem}</p>` : ''}
 ${input.adminHref && input.lastError ? html`<p class="muted">As an admin you can restart it from the <a href="${input.adminHref}">admin page</a>.</p>` : ''}
 </div>`, { refreshSeconds: 2 })
+}
+
+/** The phone's page while the owner decides on the computer; it reloads by itself. */
+export function phoneWaitingPage(input: { device: string }): string {
+  return page('Approve on your computer', html`<div class="card">
+<div class="label">Sign in on this phone</div>
+<h1>Approve on your computer</h1>
+<p>Poise on your computer shows this phone as <strong>${input.device}</strong>. Approve it there, in Settings → Accounts, to sign in here.</p>
+<div class="loader" aria-hidden="true"><span></span><span></span><span></span></div>
+<p class="muted">This page moves on by itself.</p>
+</div>`, { refreshSeconds: 2 })
+}
+
+/** The phone's page once it is signed in; it goes on into the workspace by itself. */
+export function phoneSignedInPage(input: { login: string; href: string }): string {
+  return page('Signed in', html`<div class="card">
+<div class="label">Sign in on this phone</div>
+<h1>Signed in</h1>
+<p>This phone is signed in to Poise as <strong>${input.login}</strong>.</p>
+<div class="actions"><a class="button" href="${input.href}">Open Poise</a></div>
+</div>`, { refreshSeconds: 2, refreshUrl: input.href })
 }
 
 /** While a workspace restarts onto a new release; Poise's own page shows the same over itself. */

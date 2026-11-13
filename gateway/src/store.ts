@@ -85,6 +85,36 @@ const SCHEMA = `
     last_error TEXT,
     last_error_at INTEGER
   );
+
+  -- A QR code shown in Settings for signing in on a phone. The first device to open it is bound
+  -- to it by the hash of a secret only that device holds; the owner then approves or denies it.
+  CREATE TABLE IF NOT EXISTS phone_codes (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    handle TEXT NOT NULL REFERENCES users(handle),
+    apex_session_hash TEXT NOT NULL REFERENCES sessions(id_hash) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK (state IN ('waiting', 'scanned', 'approved', 'denied', 'signed_in')),
+    bind_hash TEXT UNIQUE,
+    device TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    scanned_at INTEGER,
+    decided_at INTEGER,
+    finished_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS phone_codes_handle ON phone_codes(handle);
+  CREATE INDEX IF NOT EXISTS phone_codes_session ON phone_codes(apex_session_hash);
+
+  -- A phone signed in through a code: its own apex session, which ends this row with it.
+  CREATE TABLE IF NOT EXISTS phones (
+    id TEXT PRIMARY KEY,
+    session_hash TEXT NOT NULL UNIQUE REFERENCES sessions(id_hash) ON DELETE CASCADE,
+    handle TEXT NOT NULL REFERENCES users(handle),
+    device TEXT NOT NULL,
+    grant_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS phones_handle ON phones(handle);
 `
 
 export function newSecret(): string {
@@ -157,6 +187,36 @@ export interface Device {
   revokedAt: number | null
 }
 
+export type PhoneCodeState = 'waiting' | 'scanned' | 'approved' | 'denied' | 'signed_in'
+
+export interface PhoneCode {
+  id: string
+  handle: string
+  state: PhoneCodeState
+  /** The hash of the bound device's secret: what a login proxy in front records as the grant. */
+  bindHash: string | null
+  device: string | null
+  createdAt: number
+  /** Until when the code can be scanned, the scanned device decided on, or the approved one finish. */
+  expiresAt: number
+  scannedAt: number | null
+  decidedAt: number | null
+  finishedAt: number | null
+}
+
+export type PhoneScan =
+  | { ok: true; code: PhoneCode }
+  | { ok: false; reason: 'unknown' | 'expired' | 'used' }
+
+/** A phone signed in through a code, for as long as its apex session lives. */
+export interface Phone {
+  id: string
+  handle: string
+  device: string
+  grant: string
+  createdAt: number
+}
+
 export interface WorkspaceRecord {
   handle: string
   login: string
@@ -216,6 +276,27 @@ interface DeviceRow {
   revoked_at: number | null
 }
 
+interface PhoneCodeRow {
+  id: string
+  handle: string
+  state: PhoneCodeState
+  bind_hash: string | null
+  device: string | null
+  created_at: number
+  expires_at: number
+  scanned_at: number | null
+  decided_at: number | null
+  finished_at: number | null
+}
+
+interface PhoneRow {
+  id: string
+  handle: string
+  device: string
+  grant_hash: string
+  created_at: number
+}
+
 interface WorkspaceRow {
   handle: string
   login: string
@@ -262,6 +343,25 @@ function toDevice(row: DeviceRow): Device {
   }
 }
 
+function toPhoneCode(row: PhoneCodeRow): PhoneCode {
+  return {
+    id: row.id,
+    handle: row.handle,
+    state: row.state,
+    bindHash: row.bind_hash,
+    device: row.device,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    scannedAt: row.scanned_at,
+    decidedAt: row.decided_at,
+    finishedAt: row.finished_at,
+  }
+}
+
+function toPhone(row: PhoneRow): Phone {
+  return { id: row.id, handle: row.handle, device: row.device, grant: row.grant_hash, createdAt: row.created_at }
+}
+
 function isUniqueViolation(error: unknown): boolean {
   return error instanceof Database.SqliteError && error.code === 'SQLITE_CONSTRAINT_UNIQUE'
 }
@@ -277,6 +377,7 @@ export function deviceState(device: Device, now: number): 'active' | 'revoked' |
   if (now - (device.lastUsedAt ?? device.createdAt) >= DEVICE_IDLE_LIMIT_MS) return 'expired'
   return 'active'
 }
+const PHONE_CODE_RETENTION_MS = 60 * 60_000
 // Expired device codes linger so a late poll still hears expired_token rather than invalid_grant.
 const EXPIRED_DEVICE_CODE_RETENTION_MS = 60 * 60_000
 
@@ -567,10 +668,128 @@ export class Store {
     this.db.prepare('UPDATE workspaces SET last_error = ?, last_error_at = ? WHERE handle = ?').run(message, this.now(), handle)
   }
 
+  /** A new code for the owner, minted from their apex session. The token goes into the QR and is stored only as its hash. */
+  createPhoneCode(handle: string, apexSessionHash: string, ttlMs: number): { token: string; code: PhoneCode } {
+    const token = randomBytes(16).toString('base64url')
+    const id = randomUUID()
+    const now = this.now()
+    this.db.prepare(`
+      INSERT INTO phone_codes (id, token_hash, handle, apex_session_hash, state, created_at, expires_at)
+      VALUES (?, ?, ?, ?, 'waiting', ?, ?)
+    `).run(id, hashSecret(token), handle, apexSessionHash, now, now + ttlMs)
+    const code = this.phoneCode(handle, id)
+    if (!code) throw new Error('a phone code that was just stored cannot be read back')
+    return { token, code }
+  }
+
+  /** When one apex session minted each of its codes since `since`, oldest first, for its rate limit. */
+  phoneCodeTimes(apexSessionHash: string, since: number): number[] {
+    return this.db.prepare<[string, number], { created_at: number }>(
+      'SELECT created_at FROM phone_codes WHERE apex_session_hash = ? AND created_at > ? ORDER BY created_at',
+    ).all(apexSessionHash, since).map((row) => row.created_at)
+  }
+
+  /** The code behind a QR's token, whatever its state. */
+  phoneCodeByToken(token: string): PhoneCode | null {
+    const row = this.db.prepare<[string], PhoneCodeRow>('SELECT * FROM phone_codes WHERE token_hash = ?').get(hashSecret(token))
+    return row ? toPhoneCode(row) : null
+  }
+
+  phoneCode(handle: string, id: string): PhoneCode | null {
+    const row = this.db.prepare<[string, string], PhoneCodeRow>('SELECT * FROM phone_codes WHERE id = ? AND handle = ?').get(id, handle)
+    return row ? toPhoneCode(row) : null
+  }
+
+  /** The owner's codes minted since `since`, newest first. */
+  phoneCodes(handle: string, since: number): PhoneCode[] {
+    return this.db.prepare<[string, number], PhoneCodeRow>(
+      'SELECT * FROM phone_codes WHERE handle = ? AND created_at > ? ORDER BY created_at DESC, id',
+    ).all(handle, since).map(toPhoneCode)
+  }
+
+  /**
+   * Binds a waiting code to the first device that opens it, by the hash of a secret only that device holds.
+   * That spends the code: every later scan is refused as used.
+   */
+  scanPhoneCode(token: string, bindValue: string, device: string, decisionTtlMs: number): PhoneScan {
+    const tokenHash = hashSecret(token)
+    return this.db.transaction((): PhoneScan => {
+      const row = this.db.prepare<[string], PhoneCodeRow>('SELECT * FROM phone_codes WHERE token_hash = ?').get(tokenHash)
+      if (!row) return { ok: false, reason: 'unknown' }
+      if (row.state !== 'waiting') return { ok: false, reason: 'used' }
+      const now = this.now()
+      if (row.expires_at <= now) return { ok: false, reason: 'expired' }
+      const scanned: PhoneCodeRow = {
+        ...row, state: 'scanned', bind_hash: hashSecret(bindValue), device, scanned_at: now, expires_at: now + decisionTtlMs,
+      }
+      this.db.prepare(`
+        UPDATE phone_codes SET state = 'scanned', bind_hash = ?, device = ?, scanned_at = ?, expires_at = ? WHERE id = ?
+      `).run(scanned.bind_hash, device, now, scanned.expires_at, row.id)
+      return { ok: true, code: toPhoneCode(scanned) }
+    })()
+  }
+
+  /** The code a device is bound to, found by the secret the device holds. */
+  phoneCodeByBinding(bindValue: string): PhoneCode | null {
+    const row = this.db.prepare<[string], PhoneCodeRow>('SELECT * FROM phone_codes WHERE bind_hash = ?').get(hashSecret(bindValue))
+    return row ? toPhoneCode(row) : null
+  }
+
+  /** Approves or denies the owner's scanned, unexpired code; null when there is no such code. */
+  decidePhoneCode(handle: string, id: string, approve: boolean, finishTtlMs: number): PhoneCode | null {
+    const now = this.now()
+    const changed = this.db.prepare(`
+      UPDATE phone_codes SET state = ?, decided_at = ?, expires_at = CASE WHEN ? THEN ? ELSE expires_at END
+      WHERE id = ? AND handle = ? AND state = 'scanned' AND expires_at > ?
+    `).run(approve ? 'approved' : 'denied', now, approve ? 1 : 0, now + finishTtlMs, id, handle, now).changes
+    return changed === 1 ? this.phoneCode(handle, id) : null
+  }
+
+  /**
+   * Signs in the approved device holding `bindValue`, once: a new apex session of the code's owner, recorded
+   * as their phone under the grant a login proxy in front knows it by. Null when nothing approved waits for it.
+   */
+  finishPhoneCode(bindValue: string, sessionTtlMs: number): { id: string; session: Session; phone: Phone } | null {
+    const bindHash = hashSecret(bindValue)
+    return this.db.transaction(() => {
+      const row = this.db.prepare<[string], PhoneCodeRow>('SELECT * FROM phone_codes WHERE bind_hash = ?').get(bindHash)
+      const now = this.now()
+      if (!row || row.state !== 'approved' || row.expires_at <= now) return null
+      this.db.prepare("UPDATE phone_codes SET state = 'signed_in', finished_at = ? WHERE id = ?").run(now, row.id)
+      const { id, session } = this.createApexSession(row.handle, sessionTtlMs)
+      const phone: Phone = { id: randomUUID(), handle: row.handle, device: row.device ?? 'Unknown device', grant: bindHash, createdAt: now }
+      this.db.prepare('INSERT INTO phones (id, session_hash, handle, device, grant_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(phone.id, session.idHash, phone.handle, phone.device, phone.grant, now)
+      return { id, session, phone }
+    })()
+  }
+
+  /** The owner's phones whose sessions are live, newest first. */
+  listPhones(handle: string): Phone[] {
+    return this.db.prepare<[string, number], PhoneRow>(`
+      SELECT phones.* FROM phones JOIN sessions ON sessions.id_hash = phones.session_hash
+      WHERE phones.handle = ? AND sessions.expires_at > ? ORDER BY phones.created_at DESC, phones.id
+    `).all(handle, this.now()).map(toPhone)
+  }
+
+  /** Ends the owner's phone's session, and with it its workspace sessions; null when there is no such phone. */
+  signOutPhone(handle: string, id: string): Phone | null {
+    return this.db.transaction(() => {
+      const row = this.db.prepare<[string, string], PhoneRow & { session_hash: string }>(
+        'SELECT * FROM phones WHERE id = ? AND handle = ?',
+      ).get(id, handle)
+      if (!row) return null
+      this.db.prepare('DELETE FROM sessions WHERE id_hash = ?').run(row.session_hash)
+      return toPhone(row)
+    })()
+  }
+
   purgeExpired(): void {
     const now = this.now()
     this.db.transaction(() => {
       this.db.prepare('DELETE FROM tickets WHERE expires_at <= ?').run(now)
+      // Kept for an hour, so Settings can still say how a recent code ended and its rate limit can count it.
+      this.db.prepare('DELETE FROM phone_codes WHERE expires_at <= ?').run(now - PHONE_CODE_RETENTION_MS)
       this.db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now)
       this.db.prepare('DELETE FROM oauth_states WHERE expires_at <= ?').run(now)
       this.db.prepare("DELETE FROM device_codes WHERE status = 'consumed' OR expires_at <= ?")
