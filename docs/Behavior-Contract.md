@@ -301,10 +301,14 @@ is counted separately. A review timeout keeps the sweep identity even when a
 target attached its identity to the same exception. A deadline record retains
 the cursor, original launch claim,
 correlation, expected head and observed Call, plus the next scheduled tick.
-Only a proven deferral with matching, unambiguous running Call evidence and an
-available scheduled continuation is captured as Warning at the sweep cycle.
-Missing or conflicting ownership, uncertain writes and unavailable continuation
-remain Errors. Read counts do not prove completed evaluation, and a launch does
+Only a proven deferral with a successful final evidence read and an available
+scheduled continuation is captured as Warning at the sweep cycle: either
+prepared approvals remain before any launch attempt, or every attempted claim
+has matching, unambiguous running Call evidence. An approval deferral requires
+every attempted claim to stay visible: released attempts cannot be hidden by
+surviving owned launches. Missing or conflicting ownership, unreadable
+evidence, uncertain writes and unavailable continuation remain Errors.
+Read counts do not prove completed evaluation, and a launch does
 not prove publication: publication stays unverified until reconciliation proves
 its outcome. The next tick reconciles original launches before reconsidering
 unread and queued work under the existing eligibility, cursor and retry gates.

@@ -3540,10 +3540,18 @@ async function retainPrSweepProgress(
       && !releaseBackgroundPaused() && !releaseSwitchPending()
       && org && readyOrganizations().some((ready) => ready.login === org.login && ready.datastorePath === org.datastorePath)
       ? nextTickAtMs : null
-    context.progress = { ...progress, cursor: getMeta(key === 'review-new-prs' ? 'behavior_review_new_prs_prepare_cursor' : 'behavior_approve_prs_cursor'), launches, ownershipError,
-      continuationAt, disposition: continuationAt !== null && launches.length > 0
+    // Approve-prs also defers when prepared approvals remain before any launch
+    // attempt, proven by an empty attempted-claims set; every attempted claim
+    // must stay visible, so a released attempt cannot hide behind a survivor.
+    const deferred = key === 'approve-prs'
+      ? continuationAt !== null && snapshot !== null
+        && launches.length === attemptedClaims.size && launches.length === progress.launched
+        && (launches.length > 0 || Number(progress.launchesPending ?? 0) > 0)
+        && launches.every((launch) => launch.ownership === 'owned')
+      : continuationAt !== null && launches.length > 0
         && launches.length === progress.launched && launches.every((launch) => launch.ownership === 'owned')
-        ? 'deferred' : 'unresolved' }
+    context.progress = { ...progress, cursor: getMeta(key === 'review-new-prs' ? 'behavior_review_new_prs_prepare_cursor' : 'behavior_approve_prs_cursor'), launches, ownershipError,
+      continuationAt, disposition: deferred ? 'deferred' : 'unresolved' }
   }
 }
 
