@@ -4,8 +4,9 @@
 // src/views/behaviors-view.ts reads it, and /api/behavior-estimates for what
 // is running now.
 import { formatShortDuration } from '../../../analytics-format'
-import type { BehaviorMetrics, BehaviorMetricsReport } from '../../../behavior-metrics'
+import { BEHAVIOR_METRICS_COVERAGE_ERROR, type BehaviorMetrics, type BehaviorMetricsReport } from '../../../behavior-metrics'
 import { BEHAVIORS, getLastTriggered, getPausedUntil, isBehaviorStateLoaded, isEnabled, setEnabled, type BehaviorKey } from '../../../behaviors'
+import { noticeFeed } from '../../../notices'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
 import { toast } from '../../shell'
@@ -112,8 +113,17 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
     try {
       const data = await json<BehaviorMetricsReport>(`/api/behavior-metrics?${new URLSearchParams({ since: day.since, until: day.until })}`)
       if (!data?.behaviors) throw new Error('the service answered with something this page cannot read')
-      if (mine !== generation) return
+      if (mine !== generation || signal.aborted) return
       metrics = { data, error: '', at: Date.now() }
+      // Only a successful read of this exact range can retire its coverage
+      // fault. Refresh failures and navigation leave the evidence standing.
+      const source = `overview-metrics-coverage:${day.since}:${day.until}`
+      if (day.isToday && data.error?.startsWith(BEHAVIOR_METRICS_COVERAGE_ERROR)) {
+        noticeFeed.reportLocalNotices(source, [{ key: source, kind: 'behavior_metrics_incomplete',
+          title: 'Today’s behavior metrics lack evidence', body: data.error }])
+      } else if (!data.error && BEHAVIORS.every(({ key }) => data.behaviors[key] != null)) {
+        noticeFeed.reportLocalNotices(source, [])
+      }
     } catch (error) {
       if (mine !== generation) return
       metrics = { ...metrics, error: reason(error) }

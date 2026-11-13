@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { BEHAVIOR_KEYS, type BehaviorKey } from '../src/behavior-types'
-import type { BehaviorMetrics, BehaviorMetricsReport } from '../src/behavior-metrics'
+import { BEHAVIOR_METRICS_COVERAGE_ERROR, type BehaviorMetrics, type BehaviorMetricsReport } from '../src/behavior-metrics'
 import type { LogEntry } from './agent'
 import type { QuarantinedAgentLog } from './agent-log-parse'
 import type { LedgerOutcome } from './behavior-ledger-contract'
 import { recordHandling } from './alerts/handling'
 import type { AnalyticsWindow } from './analytics'
 import { db } from './db'
+import { diagnostic } from './logging'
 
 type DirectBehavior = 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci' | 'close-old-prs'
 interface Run {
@@ -208,10 +209,13 @@ function quarantineMayAffect(row: QuarantinedAgentLog, identities: ReadonlySet<s
   return !row.startedAt || inWindow(row.startedAt, window)
 }
 
+const reportedCoverage = new Map<string, string>()
+
 export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, error: string | null,
   quarantined: readonly QuarantinedAgentLog[] = []): BehaviorMetricsReport {
   const direct = readDirectMetrics(window)
-  let unreadable = false
+  const affected: BehaviorKey[] = []
+  const unreadable = new Set<QuarantinedAgentLog>()
   // Every readable record's identity, in any window and behavior: a damaged
   // record sharing one is a contradictory duplicate and is never counted.
   const readable = new Set(logs.flatMap((log) => [`call:${log.id.toLowerCase()}`, ...(log.correlation_id ? [`correlation:${log.correlation_id}`] : [])]))
@@ -223,15 +227,18 @@ export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, e
       const identities = new Set(selected.filter((log) => inWindow(log.started_at_precise || log.started_at, window))
         .flatMap((log) => [`call:${log.id}`, ...(log.correlation_id ? [`correlation:${log.correlation_id}`] : [])]))
       const placed: Run[] = []
+      let incomplete = false
       for (const row of quarantined) {
         if (!quarantineMayAffect(row, identities, key, behavior, window)) continue
         const run = placedRun(row, readable, key as BehaviorKey, behavior)
         if (!run) {
-          unreadable = true
-          return [key, null]
+          incomplete = true
+          unreadable.add(row)
+        } else {
+          placed.push(run)
         }
-        placed.push(run)
       }
+      if (incomplete) { affected.push(key); return [key, null] }
       const runs = selected
         .map((log): Run => ({ behavior: key as BehaviorKey, startedAt: log.started_at_precise || log.started_at,
           completedAt: log.completed_at ?? null, status: log.status }))
@@ -239,5 +246,24 @@ export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, e
     }
     return [key, direct.get(key) ?? { totalRuns: 0, durationMinutes: 0, successRate: null }]
   })) as BehaviorMetricsReport['behaviors']
-  return { behaviors, error: error || (unreadable ? 'Some worker logs are unreadable; affected behavior metrics are unavailable.' : null) }
+  const range = JSON.stringify(window)
+  if (error) return { behaviors, error }
+  if (!unreadable.size) { reportedCoverage.delete(range); return { behaviors, error: null } }
+  // Feed positions change as history grows. Keep only source evidence in the
+  // report, ordered independently of the snapshot's order.
+  const records = [...unreadable].map((row) => ({
+    historyRowId: row.historyRowId ?? null, callId: row.id, correlationId: row.correlationId,
+    repository: row.repo, target: row.prId, behavior: row.behavior, source: row.source ?? null,
+    status: row.status ?? null, startedAt: row.startedAt ?? null,
+    reason: row.error.replace(/^(Caller History|agent-interface log) row [0-9]+\b/, '$1 record'),
+  })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  const metrics = ['totalRuns', 'durationMinutes', 'successRate']
+  const coverageError = `${BEHAVIOR_METRICS_COVERAGE_ERROR} Range: [${window.since ?? 'unbounded'}, ${window.until ?? 'unbounded'}). Behaviors: ${affected.join(', ')}. Metrics: ${metrics.join(', ')}.\n${records.map((row) =>
+    `History row: ${row.historyRowId ?? 'unknown'} · Call: ${row.callId ?? 'unknown'} · Correlation: ${row.correlationId ?? 'unknown'} · Target: ${row.repository ?? 'unknown'}${row.target ? `#${row.target}` : ''} · ${row.reason}`).join('\n')}`
+  if (reportedCoverage.get(range) !== coverageError && diagnostic({ level: 'error', operation: 'behavior.metrics.coverage',
+    message: coverageError, context: { range: window, behaviors: affected, metrics, records } })) {
+    reportedCoverage.set(range, coverageError)
+    if (reportedCoverage.size > 8) reportedCoverage.delete(reportedCoverage.keys().next().value!)
+  }
+  return { behaviors, error: coverageError }
 }
