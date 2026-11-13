@@ -253,6 +253,29 @@ it.each(['merge-if-ready', 'update-branch-if-behind'])('persists one policy refu
     .toMatchObject({ status: 'failed', note: expect.stringContaining(`op=${primitive}`) })
 })
 
+it('keeps a killed branch-update process unknown despite read-stage output', async () => {
+  const script = `process.stdout.write(JSON.stringify({ phase: 'read' })); setInterval(() => {}, 1000)`
+  const { database, behaviors } = await start('update-branch-if-behind', script, true)
+  await behaviors.runEnabledBehaviorsOnce()
+  const commandIndex = mocks.runFile.mock.calls.findIndex(([, args]) => args[0] === '--update-branch-if-behind')
+  await expect(mocks.runFile.mock.results[commandIndex]!.value).rejects.toMatchObject({ stdout: JSON.stringify({ phase: 'read' }), stderr: '' })
+  const admission = mocks.captureAdmission.mock.calls[0]![0]
+  const retry = behaviors.getBehaviorFailureState('merge-prs', TARGET)!
+  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1 })
+  expect(Date.parse(retry.nextRetryAt) - Date.parse(retry.lastFailureAt)).toBe(60_000)
+  expect(events()).toEqual([expect.objectContaining({
+    operation: 'github-interface.update-branch-if-behind', behavior: 'merge-prs', severity: 'error',
+    target: TARGET, correlationId: admission.nativeId, phase: 'command',
+    exitCode: null, signal: 'SIGKILL', stderr: '',
+    context: expect.objectContaining({ killed: true, nativeId: admission.nativeId, retry }),
+  })])
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+    nativeId: admission.nativeId, state: 'unknown', activity: 'unknown',
+  }))
+  expect(database.db.prepare('SELECT status, note FROM behavior_runs WHERE id = ?').get(admission.nativeId))
+    .toMatchObject({ status: 'failed', note: expect.stringContaining('op=update-branch-if-behind') })
+})
+
 it.each([RESOLVE, 'merge-if-ready'])('retains unverified successful command output as a validation Error (%s)', async (primitive) => {
   const { behaviors } = await start(primitive, "process.stdout.write('{}')")
   await behaviors.runEnabledBehaviorsOnce()
