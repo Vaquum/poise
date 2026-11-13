@@ -351,6 +351,24 @@ describe('behavior database lifecycle', () => {
     expect(plan).toMatch(/USING (COVERING )?INDEX idx_behavior_dead_letters_open/)
   })
 
+  it('checks a failed launch against its open dead letters by index, never every dead letter kept', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const { db } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const dead = db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, correlation_id, call_id, error, created_at, retired_at)
+      VALUES (?, 'review-new-prs', ?, 'acme/repo', ?, ?, NULL, 'failed', '2026-09-24T07:00:00.000Z', ?)`)
+    for (let i = 0; i < 40; i++) dead.run(`retired-${i}`, `acme/repo#${i}`, i, `corr-${i}`, '2026-09-25T07:00:00.000Z')
+    dead.run('open', 'acme/repo#7', 7, 'corr-7', null)
+    const exists = `SELECT 1 FROM behavior_dead_letters AS incident
+      WHERE incident.behavior = ? AND incident.target = ? AND incident.correlation_id = ? AND incident.retired_at IS NULL`
+    expect(db.prepare(exists).pluck().all('review-new-prs', 'acme/repo#7', 'corr-7')).toEqual([1])
+    expect(db.prepare(exists).pluck().all('review-new-prs', 'acme/repo#8', 'corr-8')).toEqual([])
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${exists}`).all('review-new-prs', 'acme/repo#7', 'corr-7') as Array<{ detail: string }>).map((row) => row.detail).join('\n')
+    expect(plan).toMatch(/USING (COVERING )?INDEX idx_behavior_dead_letters_open_target/)
+    // The index holds the open dead letter alone, never the forty retired ones.
+    expect(db.prepare(`SELECT count(*) FROM behavior_dead_letters INDEXED BY idx_behavior_dead_letters_open_target
+      WHERE retired_at IS NULL`).pluck().get()).toBe(1)
+  })
+
   it('persists quarantine occupancy independently of the invalid result and never loses running uncertainty', async () => {
     tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
     const path = join(tempRoot, 'cache.db')

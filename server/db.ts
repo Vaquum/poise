@@ -427,6 +427,11 @@ const migrateSchema = db.transaction(() => {
     CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_open
       ON behavior_dead_letters(behavior, repo, pr, id)
       WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL;
+    -- Open dead letters by what each failed launch checks for: its behavior,
+    -- target and correlation. Retired rows are kept forever, and the
+    -- failed-launch read scanned them all once for every failed launch.
+    CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_open_target
+      ON behavior_dead_letters(behavior, target, correlation_id) WHERE retired_at IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_one_unresolved
       ON alerts(dedupe_key) WHERE resolved_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_alerts_created
