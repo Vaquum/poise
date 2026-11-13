@@ -198,13 +198,39 @@ class LogsIncrementalCase(TestCase):
         rows = json.loads(result.stdout)
         self.assertEqual([row["id"] for row in rows], [f"{number:032x}" for number in range(4)])
         self.assertEqual([rows[0]["prompt"], rows[3]["prompt"]], ["prompt 0", "prompt 3"])
+        lifecycle = lambda n: {  # noqa: E731 - the seeded row's intact status, start and end
+            "status": "completed", "started_at": agent_interface.stamp(1761000000.0 + n),
+            "started_at_precise": agent_interface.utc_stamp(1761000000.0 + n),
+            "completed_at": agent_interface.utc_stamp(1761000060.0 + n),
+        }
         self.assertEqual(rows[1], {
             "id": f"{1:032x}", "repo": "acme/project", "pr_id": "12", "behavior": "pr_review",
             "correlation_id": "historical-review", "history_read_error": "INVALID_UTF8", "history_rowid": "2",
+            **lifecycle(1),
         })
         self.assertEqual(rows[2], {
-            "id": f"{2:032x}", "history_read_error": "INVALID_RECORD", "history_rowid": "3",
+            "id": f"{2:032x}", "history_read_error": "INVALID_RECORD", "history_rowid": "3", **lifecycle(2),
         })
+
+    def test_full_history_reports_only_the_lifecycle_columns_that_read_cleanly(self):
+        self.seed(3, running=1)
+        with agent_interface.db() as conn:
+            # A zeroed JSON column with intact times, as production's damaged rows read.
+            conn.execute("update calls set behavior='implement_issue', status='failed', diagnostic=? where rowid=1", ("\x00" * 64,))
+            # A damaged start and status: no time or status is reported for it.
+            conn.execute("update calls set started_at='garbage', status='Not A Status', artifact='{' where rowid=2")
+            conn.execute("update calls set artifact='{' where rowid=3")
+
+        rows = {row["id"]: row for row in json.loads(self.cli("--logs").stdout)}
+        failed, damaged, running = rows[f"{0:032x}"], rows[f"{1:032x}"], rows[f"{2:032x}"]
+        self.assertEqual((failed["history_read_error"], failed["behavior"], failed["status"]), ("INVALID_RECORD", "implement_issue", "failed"))
+        self.assertEqual(failed["started_at_precise"], agent_interface.utc_stamp(1761000000.0))
+        self.assertEqual(failed["completed_at"], agent_interface.utc_stamp(1761000060.0))
+        self.assertEqual(damaged["history_read_error"], "INVALID_RECORD")
+        self.assertEqual({"status", "started_at", "started_at_precise"} & damaged.keys(), set())
+        self.assertEqual(damaged["completed_at"], agent_interface.utc_stamp(1761000061.0))
+        self.assertEqual((running["status"], running["started_at_precise"]), ("running", agent_interface.utc_stamp(1761000002.0)))
+        self.assertNotIn("completed_at", running)
 
     def test_full_history_sorts_positions_before_loading_retained_payloads(self):
         self.seed(6276, running=3)

@@ -146,7 +146,8 @@ function readDirectMetrics(window: AnalyticsWindow, now = Date.now()): Map<Behav
     }
     return [summary.behavior, {
       totalRuns: summary.totalRuns,
-      durationMinutes: unknownDurations ? null : durationMs / 60_000,
+      durationMinutes: durationMs / 60_000,
+      ...(unknownDurations ? { untimedRuns: unknownDurations } : {}),
       successRate: summary.finished ? (summary.finished - summary.failed) / summary.finished * 100 : null,
     }]
   }))
@@ -159,7 +160,7 @@ export function computeBehaviorMetrics(runs: Run[], window: AnalyticsWindow, now
       && (!window.until || at < Date.parse(window.until))
   })
   let durationMs = 0
-  let durationKnown = true
+  let untimed = 0
   let finished = 0
   let failed = 0
   for (const run of selected) {
@@ -168,12 +169,14 @@ export function computeBehaviorMetrics(runs: Run[], window: AnalyticsWindow, now
     const active = ['pending', 'queued', 'running', 'in_progress'].includes(run.status)
     const end = run.completedAt ? Date.parse(run.completedAt) : active ? now : NaN
     const duration = end - Date.parse(run.startedAt)
-    if (!Number.isFinite(duration) || duration < 0) durationKnown = false
+    // A run whose end is unknown adds no invented time; it is counted as untimed instead.
+    if (!Number.isFinite(duration) || duration < 0) untimed++
     else durationMs += duration
   }
   return {
     totalRuns: selected.length,
-    durationMinutes: durationKnown ? durationMs / 60_000 : null,
+    durationMinutes: durationMs / 60_000,
+    ...(untimed ? { untimedRuns: untimed } : {}),
     successRate: finished ? (finished - failed) / finished * 100 : null,
   }
 }
@@ -188,6 +191,16 @@ function behaviorSource(key: string): string {
   return key === 'implement-issues' || key === 'repair-prs' ? 'poise:behavior-chain' : `poise:${key}`
 }
 
+/** A damaged record Caller still places from its intact columns: this behavior,
+ *  its own source, a status and a start, and no readable record with its
+ *  identity. Anything less leaves the behavior's numbers unknown. */
+function placedRun(row: QuarantinedAgentLog, readable: ReadonlySet<string>, key: BehaviorKey, behavior: string): Run | null {
+  if (row.behavior !== behavior || !row.source || (row.source !== behaviorSource(key) && row.source !== 'poise:behavior-chain')) return null
+  if (!row.status || !row.startedAt) return null
+  if (row.id && readable.has(`call:${row.id.toLowerCase()}`) || row.correlationId && readable.has(`correlation:${row.correlationId}`)) return null
+  return { behavior: key, startedAt: row.startedAt, completedAt: row.completedAt ?? null, status: row.status }
+}
+
 function quarantineMayAffect(row: QuarantinedAgentLog, identities: ReadonlySet<string>, key: string, behavior: string, window: AnalyticsWindow): boolean {
   // A duplicate's contradictory provenance cannot hide a corrupt in-window row.
   if (row.id && identities.has(`call:${row.id}`) || row.correlationId && identities.has(`correlation:${row.correlationId}`)) return true
@@ -199,6 +212,9 @@ export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, e
   quarantined: readonly QuarantinedAgentLog[] = []): BehaviorMetricsReport {
   const direct = readDirectMetrics(window)
   let unreadable = false
+  // Every readable record's identity, in any window and behavior: a damaged
+  // record sharing one is a contradictory duplicate and is never counted.
+  const readable = new Set(logs.flatMap((log) => [`call:${log.id.toLowerCase()}`, ...(log.correlation_id ? [`correlation:${log.correlation_id}`] : [])]))
   const behaviors = Object.fromEntries(BEHAVIOR_KEYS.map((key) => {
     if (key in AGENT_BEHAVIORS) {
       if (error) return [key, null]
@@ -206,14 +222,20 @@ export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, e
       const selected = logs.filter((log) => log.behavior === behavior && (log.source === behaviorSource(key) || log.source === 'poise:behavior-chain'))
       const identities = new Set(selected.filter((log) => inWindow(log.started_at_precise || log.started_at, window))
         .flatMap((log) => [`call:${log.id}`, ...(log.correlation_id ? [`correlation:${log.correlation_id}`] : [])]))
-      if (quarantined.some((row) => quarantineMayAffect(row, identities, key, behavior, window))) {
-        unreadable = true
-        return [key, null]
+      const placed: Run[] = []
+      for (const row of quarantined) {
+        if (!quarantineMayAffect(row, identities, key, behavior, window)) continue
+        const run = placedRun(row, readable, key as BehaviorKey, behavior)
+        if (!run) {
+          unreadable = true
+          return [key, null]
+        }
+        placed.push(run)
       }
       const runs = selected
-        .map((log) => ({ behavior: key, startedAt: log.started_at_precise || log.started_at,
+        .map((log): Run => ({ behavior: key as BehaviorKey, startedAt: log.started_at_precise || log.started_at,
           completedAt: log.completed_at ?? null, status: log.status }))
-      return [key, computeBehaviorMetrics(runs, window)]
+      return [key, computeBehaviorMetrics([...runs, ...placed], window)]
     }
     return [key, direct.get(key) ?? { totalRuns: 0, durationMinutes: 0, successRate: null }]
   })) as BehaviorMetricsReport['behaviors']

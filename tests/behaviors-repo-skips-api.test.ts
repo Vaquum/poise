@@ -263,11 +263,23 @@ describe('Skip repositories API', () => {
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
-  it('contains unsupported diagnostics to their behavior and period through the metrics API', async () => {
+  it('counts a record with an unsupported diagnostic by its readable status and times through the metrics API', async () => {
     agentRows = [{ id: 'a'.repeat(32), repo: REPO, pr_id: '1', actor: 'review-bot', model: 'model',
       behavior: 'pr_review', source: 'poise:review-new-prs', prompt: '',
       started_at: '2026-10-17T10:00:00Z', completed_at: '2026-10-17T10:01:00Z', time_elapsed: '1m',
       status: 'failed', expected_head: HEAD, correlation_id: 'unreadable-call', error: 'Review failed', diagnostic: { version: 2 } }]
+    const all = await fetch(`${base}/api/behavior-metrics`)
+    expect(await all.json()).toMatchObject({ error: null, behaviors: {
+      'review-new-prs': { totalRuns: 1, durationMinutes: 1, successRate: 0 }, 'approve-prs': { totalRuns: 0 },
+    } })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('contains a record with no readable status to its behavior and period through the metrics API', async () => {
+    agentRows = [{ id: 'a'.repeat(32), repo: REPO, pr_id: '1', actor: 'review-bot', model: 'model',
+      behavior: 'pr_review', source: 'poise:review-new-prs', prompt: '',
+      started_at: '2026-10-17T10:00:00Z', completed_at: '2026-10-17T10:01:00Z', time_elapsed: '1m',
+      status: null, expected_head: HEAD, correlation_id: 'unreadable-call', error: 'Review failed' }]
     const all = await fetch(`${base}/api/behavior-metrics`)
     expect(await all.json()).toMatchObject({ error: expect.stringContaining('unreadable'), behaviors: {
       'review-new-prs': null, 'approve-prs': { totalRuns: 0 }, 'review-new-issues': { totalRuns: 0 },

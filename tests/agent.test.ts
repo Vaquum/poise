@@ -316,6 +316,7 @@ describe('agent log quarantine', () => {
       error: 'agent-interface log row 1 has invalid actor',
       source: null,
       startedAt: '2026-07-17T09:00:00.000Z',
+      completedAt: '2026-07-17T09:01:00.000Z',
       id: 'b'.repeat(32),
       correlationId: 'claim-1',
       repo: 'owner/repo',

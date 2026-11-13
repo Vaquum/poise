@@ -638,6 +638,13 @@ unreadable positions. Those positions count toward the page and preserve its
 cursor. Swarm reports them alongside the readable history. Receipt lookups
 retain their existing integrity checks.
 
+The full-history read quarantines an unreadable record with what still reads
+cleanly: its identity (`id`, `repo`, `pr_id`, `behavior`, `correlation_id`,
+`session_id`, `source`) and its lifecycle columns (`status`, `started_at`,
+`started_at_precise`, `completed_at`), each only when it decodes. Damage usually
+hits the JSON columns, so Poise can still count the call in run metrics; the
+lifecycle never stands in for the unreadable result.
+
 `--logs --id CALL_ID` reads one exact History record. A primary-key index
 lookup first verifies the requested ID; an unreadable record returns that ID
 with the existing typed `history_read_error` cause. Missing IDs return an empty
