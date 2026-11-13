@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
+import { cachedStatement } from './statements'
 import type { BehaviorCutoverState } from '../src/behavior-cutover'
 import { budgetShortfall, validateExecutionLimits, type BehaviorExecutionLimits, type BehaviorResourceBudget, type BehaviorResourceReservation } from './behavior-resources'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
@@ -427,12 +428,12 @@ export class BehaviorChainJournal {
   /** Bounded status lookup, including completed chains while the datastore
    * still lists their PR. The journal hash validates the selected projection. */
   forPull(repository: string, number: number, identity?: { headRef: string | null, headRepo: string | null }): BehaviorChain | null {
-    let rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current
+    let rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current
       WHERE lower(json_extract(state, '$.repository')) = lower(?)
         AND json_extract(state, '$.observation.publication.pull_number') = ? LIMIT 2`)
       .all(repository, number) as Array<{ chain_id: string }>
     if (!rows.length && identity?.headRef && identity.headRepo?.toLowerCase() === repository.toLowerCase()) {
-      rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current
+      rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current
         WHERE merged = 0 AND lower(json_extract(state, '$.repository')) = lower(?) AND json_extract(state, '$.branch') = ? LIMIT 2`)
         .all(repository, identity.headRef) as Array<{ chain_id: string }>
     }
