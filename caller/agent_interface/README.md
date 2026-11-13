@@ -275,6 +275,12 @@ never a refused submission. Claude's pinned
 inspection root is also carried in its explicit settings so shell tools retain
 repository access.
 
+Review and approval deadlines persist a failed no-action result only after
+validating the original pre-POST phase and quiet, complete live inventory.
+Failed recovery reads retain uncertainty through cleanup. The durable retry,
+resource-release and receipt rules are in
+[Behavior chain](../../docs/Behavior-chain.md#authority-and-recovery).
+
 When live GitHub state confirms the pull request closed or merged — at
 preparation, after provider execution, or during publication reconciliation —
 the obsolete round settles `superseded` under `review_target_closed`, never
@@ -454,6 +460,11 @@ inspection rounds. With no verdict by then the run stops, posts nothing and fail
 with `review_budget_exhausted`, which Poise reads as a hand-off to the next slot. A
 verdict returned inside the ceiling still submits within the shared budget. Other
 providers and Grok issue reviews are unchanged.
+The existing v1 diagnostic records this planned handoff as `provider.review`,
+phase `analysis`, outcome `handoff`, and positive `submission: none` evidence.
+A shorter overall or file-group deadline remains a terminal timeout, not a
+provider handoff. [Logging](../../docs/Logging.md#observe--logging) requires
+attributed successor evidence before displaying the handoff as Warning.
 
 On an Opus output-limit error or a repeat-only publication refusal, Caller can recover
 once with the recovery model using the same immutable packet and remaining budget.
@@ -533,8 +544,18 @@ Provider execution and inspection stay within the group's deadline and the share
 analysis cutoff. Deadline failures retain the limiting phase (`file_group`,
 `provider_analysis`, `inspection` or `overall`), group/count, elapsed time and
 remaining analysis allowance in bounded diagnostics. Every stage's findings
-combine into the single verdict the harness submits; a packet that fits in one
-group needs no staging.
+combine into one verdict; a packet that fits in one group needs no staging.
+Before finalization, the original Call retains the complete verdict in its
+response file, readable with `agent-interface --read-response CALL_ID` after
+temporary review cleanup, including on failure. Finding bodies stay outside
+the bounded log artifact. Each provider group remains limited to 100 findings;
+an aggregate exceeding the existing 100-inline-finding publication limit holds
+with all findings retained instead of truncating or submitting another review.
+Position remapping and capped follow-up filing also leave both 60-second
+reserves. Exhaustion after completed analysis holds the review rather than
+handing it to another model. Rejected writes remain distinct from possibly
+accepted writes; a lost issue or review POST response holds without replay or
+approval.
 A follow-up (`--pr-approve`) round reviews the diff since
 the reviewer's last submitted review instead of the whole PR again: new
 findings on current lines stay on current-head lines, while a defect caused

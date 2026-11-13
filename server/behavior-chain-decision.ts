@@ -265,6 +265,9 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       `diagnose and repair GitHub queue rejection ${removal.id}: ${removal.reason}; PR-head green checks do not prove integration success`, now)
     queueVerification ??= chainBasis(['queue-verification', pull.head, removal.id, repair.id])
   }
+  const repairBasis = chainBasis(['repair', pull.head, pull.failing, pull.conflict, pull.behind, pull.changesRequested, pull.unresolved, pull.reviewRevision, observation.issue.revision])
+  if (pull.conflict) return propose(chain, 'repair-pr', repairBasis, chain.author, observation.repairer,
+    'repair the confirmed branch conflict before reviewing the current head', now)
   const reviewedHeadBasis = chainBasis(['pr', pull.head, pull.reviewContext])
   for (const reviewer of observation.prReviewers) {
     const reviewed = reviewComplete(chain, 'review-pr', reviewedHeadBasis, reviewer, observation)
@@ -274,7 +277,6 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   const grey = pull.greyRuns[0]
   if (grey) return propose(chain, 'rerun-grey-ci', chainBasis(['grey', pull.head, grey.id, grey.attempt]), chain.reviewer, null,
     `recover completed grey workflow ${grey.id} attempt ${grey.attempt} through the existing native guard`, now)
-  const repairBasis = chainBasis(['repair', pull.head, pull.failing, pull.conflict, pull.behind, pull.changesRequested, pull.unresolved, pull.reviewRevision, observation.issue.revision])
   const answered = chain.invocations.some((invocation) => invocation.behavior === 'repair-pr' && succeeded(invocation)
     && invocation.request.context?.head === pull.head && invocation.request.context.reviewRevision === pull.reviewRevision)
   const publishedRepair = chain.invocations.some((invocation) => invocation.behavior === 'repair-pr' && succeeded(invocation)

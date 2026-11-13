@@ -486,6 +486,16 @@ test('Snippets, Extensions, Publishing and Behaviors open as classic holds them,
   expect(errors).toEqual([])
 })
 
+test('Extensions’ secret toggle keeps its accessible name in both states', async ({ page }) => {
+  await settings(page, {}, '/?view=settings&settings=extensions')
+  await page.getByRole('tab', { name: 'Custom server' }).click()
+  await page.getByRole('button', { name: 'Local command' }).click()
+  const toggle = page.getByRole('button', { name: 'Store as secret' })
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false')
+  await toggle.press('Space')
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+})
+
 test('behind the gateway, a workspace still to be set up opens setup at GitHub, not at a theme', async ({ page }) => {
   await settings(page, { mode: 'service', onboarding: { status: 'pending', step: 'theme' } }, '/?view=overview')
   await expect(page.getByRole('dialog')).toBeVisible()

@@ -1,4 +1,4 @@
-import { createReadStream, writeSync, type Stats } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, realpathSync, statSync, writeSync, type Stats } from 'node:fs'
 import { realpath, stat } from 'node:fs/promises'
 import { STATUS_CODES, createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
@@ -235,6 +235,57 @@ async function resolveStaticFile(staticDir: string, candidate: string): Promise<
   return fileStat.isFile() ? { path, root, fileStat } : null
 }
 
+/** index.html, kept while its file is the same: a page answers from memory
+ *  after a few synchronous file-system calls, instead of a chain of them that
+ *  queues behind every other read in libuv's small pool (seconds, while a
+ *  restart reads everything at once). Null when it cannot be read: the
+ *  ordinary path then answers. */
+let indexDocument: { key: string, body: Buffer, file: ResolvedStaticFile } | null = null
+function readIndexDocument(staticDir: string): { body: Buffer, file: ResolvedStaticFile } | null {
+  try {
+    const root = realpathSync(staticDir)
+    const path = realpathSync(resolve(staticDir, 'index.html'))
+    const fromRoot = relative(root, path)
+    if (isAbsolute(fromRoot) || fromRoot === '..' || fromRoot.startsWith(`..${sep}`)) return null
+    const fileStat = statSync(path)
+    if (!fileStat.isFile()) return null
+    const key = `${path}:${fileStat.ino}:${fileStat.size}:${fileStat.mtimeMs}`
+    if (indexDocument?.key !== key) {
+      const body = readFileSync(path)
+      if (body.length !== fileStat.size) return null
+      indexDocument = { key, body, file: { path, root, fileStat } }
+    }
+    return indexDocument
+  } catch {
+    return null
+  }
+}
+
+/** Sets a static file's headers; true when that already answers the request
+ *  (not modified, or HEAD). */
+function writeStaticHeaders(req: IncomingMessage, res: ServerResponse, file: ResolvedStaticFile): boolean {
+  const { path, root, fileStat } = file
+  const etag = `W/\"${fileStat.size}-${Math.trunc(fileStat.mtimeMs)}\"`
+  setStaticSecurityHeaders(res)
+  res.setHeader('ETag', etag)
+  res.setHeader('Content-Length', fileStat.size)
+  res.setHeader('Content-Type', MIME_TYPES[extname(path).toLowerCase()] || 'application/octet-stream')
+  const relativePath = relative(root, path)
+  res.setHeader('Cache-Control', relativePath.startsWith(`assets${sep}`)
+    ? 'public, max-age=31536000, immutable'
+    : 'no-cache')
+  if (req.headers['if-none-match'] === etag) {
+    res.statusCode = 304
+    res.end()
+    return true
+  }
+  if (req.method === 'HEAD') {
+    res.end()
+    return true
+  }
+  return false
+}
+
 async function serveStatic(
   req: IncomingMessage,
   res: ServerResponse,
@@ -246,6 +297,17 @@ async function serveStatic(
   const requestUrl = new URL(req.url || '/', 'http://localhost')
   const requestedPath = safeStaticPath(staticDir, requestUrl.pathname)
   if (!requestedPath) return sendJson(res, 400, { error: 'invalid path' })
+
+  // The page itself, or a page route that names no file, as the SPA fallback
+  // below would answer it.
+  if (requestedPath === resolve(staticDir, 'index.html') || ((req.headers.accept || '').includes('text/html')
+    && !extname(requestUrl.pathname) && !existsSync(requestedPath))) {
+    const page = readIndexDocument(staticDir)
+    if (page) {
+      if (!writeStaticHeaders(req, res, page.file)) res.end(page.body)
+      return
+    }
+  }
 
   let file: ResolvedStaticFile | null
   try {
@@ -265,26 +327,8 @@ async function serveStatic(
     }
     if (!file) return sendJson(res, 503, { error: 'client build is unavailable' })
   }
-  const { path, root, fileStat } = file
-
-  const etag = `W/\"${fileStat.size}-${Math.trunc(fileStat.mtimeMs)}\"`
-  setStaticSecurityHeaders(res)
-  res.setHeader('ETag', etag)
-  res.setHeader('Content-Length', fileStat.size)
-  res.setHeader('Content-Type', MIME_TYPES[extname(path).toLowerCase()] || 'application/octet-stream')
-  const relativePath = relative(root, path)
-  res.setHeader('Cache-Control', relativePath.startsWith(`assets${sep}`)
-    ? 'public, max-age=31536000, immutable'
-    : 'no-cache')
-  if (req.headers['if-none-match'] === etag) {
-    res.statusCode = 304
-    res.end()
-    return
-  }
-  if (req.method === 'HEAD') {
-    res.end()
-    return
-  }
+  if (writeStaticHeaders(req, res, file)) return
+  const { path } = file
 
   await new Promise<void>((resolveStream, rejectStream) => {
     const stream = createReadStream(path)

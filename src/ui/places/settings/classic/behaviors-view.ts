@@ -45,9 +45,9 @@ function metricCells(key: BehaviorKey): string {
   const minutes = metrics?.durationMinutes
   const untimed = metrics?.untimedRuns ? ` + ${metrics.untimedRuns.toLocaleString()} untimed` : ''
   const duration = `${minutes === 0 ? '0s' : formatShortDuration(minutes == null ? null : minutes * 60_000)}${untimed}`
-  return `<td class="behavior-metric behavior-metrics-start" title="${escapeHtml(note)}">${format(metrics?.totalRuns)}</td>
-    <td class="behavior-metric" title="${escapeHtml(note)}">${duration}</td>
-    <td class="behavior-metric" title="${escapeHtml(note)}">${metrics?.successRate == null ? '—' : `${format(metrics.successRate, 1)}%`}</td>`
+  return `<td class="behavior-metric behavior-metrics-start" data-help="${escapeHtml(note)}">${format(metrics?.totalRuns)}</td>
+    <td class="behavior-metric" data-help="${escapeHtml(note)}">${duration}</td>
+    <td class="behavior-metric" data-help="${escapeHtml(note)}">${metrics?.successRate == null ? '—' : `${format(metrics.successRate, 1)}%`}</td>`
 }
 
 function refreshMetricCells(): void {
@@ -91,7 +91,7 @@ let tickListening = false
 
 // Attribute-safe HTML escape. textContent → innerHTML only escapes &,
 // <, >; we also need to escape " and ' so attribute interpolations
-// like `title="${escapeHtml(text)}"` don't break on quoted content.
+// like `data-help="${escapeHtml(text)}"` don't break on quoted content.
 function escapeHtml(s: string): string {
   return String(s).replace(/[&<>"']/g, (c) => (
     c === '&' ? '&amp;' :
@@ -115,7 +115,7 @@ function ownerCell(username: string | null): string {
   const src = humanAvatarFallback(username)
   return `
     <span class="behavior-owner">
-      <img class="${classes.join(' ')}" src="${src}" alt="${escapeHtml(username)}" title="${escapeHtml(username)}" loading="lazy" decoding="async" />
+      <img class="${classes.join(' ')}" src="${src}" alt="${escapeHtml(username)}" data-help="${escapeHtml(username)}" loading="lazy" decoding="async" />
       <span class="behavior-owner-name">${escapeHtml(username)}</span>
     </span>
   `
@@ -158,7 +158,7 @@ function toggleCell(key: BehaviorKey): string {
   const on = isEnabled(key)
   const { disabled, unknown, title } = togglePresentation(key)
   return `
-    <label class="toggle${unknown ? ' toggle-unknown' : ''}" aria-label="Toggle ${escapeHtml(key)}" title="${escapeHtml(title)}">
+    <label class="toggle${unknown ? ' toggle-unknown' : ''}" aria-label="Toggle ${escapeHtml(key)}" data-help="${escapeHtml(title)}">
       <input type="checkbox" data-behavior="${escapeHtml(key)}" ${on ? 'checked' : ''}${disabled ? ' disabled' : ''} />
       <span class="toggle-slider"></span>
     </label>
@@ -177,7 +177,7 @@ function repaintToggle(key: BehaviorKey, toggle: HTMLInputElement): void {
   const label = toggle.closest<HTMLElement>('.toggle')
   if (label) {
     label.classList.toggle('toggle-unknown', unknown)
-    label.title = title
+    label.dataset.help = title
   }
   toggle.disabled = disabled
   // A write in flight owns the position until it settles; anything else and
@@ -226,23 +226,23 @@ function lastTriggeredUnavailable(): boolean {
 function lastTriggeredCell(key: BehaviorKey): string {
   const last = getLastTriggered(key)
   if (!last && (stateUnknown() || key !== 'merge-prs' && key !== 'rerun-grey-ci' && key !== 'close-old-prs' && lastTriggeredUnavailable())) {
-    return '<span class="last-dash" title="The latest history could not be read, so this is unknown — not necessarily never.">?</span>'
+    return '<span class="last-dash" data-help="The latest history could not be read, so this is unknown — not necessarily never.">?</span>'
   }
   if (key === 'rerun-grey-ci') {
     const succeeded = getLastSucceeded(key)
-    const checked = succeeded ? ` <span class="behavior-last-checked" title="Last completed scan: ${escapeHtml(succeeded.at)}">· checked ${escapeHtml(relTime(succeeded.at))} ago</span>` : ''
+    const checked = succeeded ? ` <span class="behavior-last-checked" data-help="Last completed scan: ${escapeHtml(succeeded.at)}">· checked ${escapeHtml(relTime(succeeded.at))} ago</span>` : ''
     if (!last) return `<span class="last-dash">—</span>${checked}`
     if (!last.url || !/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/actions\/runs\/[1-9]\d*$/.test(last.url)) return `<span class="last-dash">?</span>${checked}`
-    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(last.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>${checked}`
+    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(last.url)}" target="_blank" rel="noopener noreferrer" data-help="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>${checked}`
   }
   if (!last) return '<span class="last-dash">—</span>'
   if (key === 'merge-prs' || key === 'close-old-prs') {
     const match = last.target.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/)
     if (!match) return '<span class="last-dash">?</span>'
     const href = `https://github.com/${match[1]}/pull/${match[2]}`
-    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
+    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" data-help="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
   }
-  return `<a class="behavior-last-link" href="#" data-target="${escapeHtml(last.target)}" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
+  return `<a class="behavior-last-link" href="#" data-target="${escapeHtml(last.target)}" data-help="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
 }
 
 // Every behavior with something to set shows one pill that opens its Setting
@@ -267,7 +267,7 @@ function reviewersCell(meta: typeof BEHAVIORS[number]): string {
   const reviews = meta.reviews ?? { place: 'PR review', item: 'pull request' }
   const title = `How many of the ${reviews.place} models (Settings → Models) review each new ${reviews.item}`
   return `
-    <select class="behavior-reviewers" data-behavior="${escapeHtml(meta.key)}" aria-label="Reviewers for ${escapeHtml(meta.key)}" title="${escapeHtml(title)}"${stateUnknown() || reviewersInFlight.has(meta.key) ? ' disabled' : ''}>
+    <select class="behavior-reviewers" data-behavior="${escapeHtml(meta.key)}" aria-label="Reviewers for ${escapeHtml(meta.key)}" data-help="${escapeHtml(title)}"${stateUnknown() || reviewersInFlight.has(meta.key) ? ' disabled' : ''}>
       ${opts}
     </select>
   `
@@ -387,7 +387,7 @@ function triggersPresentation(key: BehaviorKey) {
 function triggersCell(key: BehaviorKey): string {
   const { none, unknown, label, title, open } = triggersPresentation(key)
   return `
-    <button type="button" class="behavior-triggers-btn${none ? ' is-empty' : ''}" data-behavior="${escapeHtml(key)}" aria-haspopup="dialog" aria-expanded="${open}" title="${escapeHtml(title)}"${unknown ? ' disabled' : ''}>
+    <button type="button" class="behavior-triggers-btn${none ? ' is-empty' : ''}" data-behavior="${escapeHtml(key)}" aria-haspopup="dialog" aria-expanded="${open}" data-help="${escapeHtml(title)}"${unknown ? ' disabled' : ''}>
       <span class="behavior-triggers-label">${escapeHtml(label)}</span>
     </button>
   `
@@ -406,7 +406,7 @@ function refreshTriggersCell(key: BehaviorKey) {
   }
   const view = triggersPresentation(key)
   label.textContent = view.label
-  button.title = view.title
+  button.dataset.help = view.title
   button.classList.toggle('is-empty', view.none)
   button.setAttribute('aria-expanded', String(view.open))
   button.disabled = view.unknown
@@ -486,7 +486,7 @@ function renderTriggerRepos() {
 function triggerRepoRow(repo: string, grouped: boolean): HTMLElement {
   const row = document.createElement('label')
   row.className = grouped ? 'bt-repo bt-grouped' : 'bt-repo'
-  row.title = repo
+  row.dataset.help = repo
   row.dataset.key = `repo:${repo}`
   // Under its account a repository shows its own name; the full name stays
   // its accessible name, as in the flat list.
@@ -499,7 +499,7 @@ function triggerRepoRow(repo: string, grouped: boolean): HTMLElement {
 function groupRow(owner: string, name: string): HTMLElement {
   const row = document.createElement('label')
   row.className = 'bt-repo bt-group'
-  row.title = `Select all ${name} repositories`
+  row.dataset.help = `Select all ${name} repositories`
   row.dataset.key = `group:${owner}`
   row.innerHTML = `<input type="checkbox" data-group="${escapeHtml(owner)}" aria-label="Select all ${escapeHtml(name)}" /><span>${escapeHtml(name)}</span><span class="bt-select-all">Select all</span>`
   return row
@@ -551,11 +551,11 @@ function buildTriggersPanel(): HTMLElement {
     </div>
     <div class="bt-section bt-days" hidden>
       <label class="bt-label" for="bt-days">Close after days</label>
-      <input id="bt-days" class="st-input bt-days-input" type="number" min="1" step="1" required title="Elapsed 24-hour days since opening. Existing old pull requests qualify on the first run." />
+      <input id="bt-days" class="st-input bt-days-input" type="number" min="1" step="1" required data-help="Elapsed 24-hour days since opening. Existing old pull requests qualify on the first run." />
     </div>
     <div class="bt-section bt-review-cap" hidden>
       <label class="bt-label" for="bt-review-cap">Review cap (legacy only)</label>
-      <select id="bt-review-cap" class="behavior-setting bt-review-cap-select" title="From this round on, Approve files the round's findings as one follow-up issue and approves instead of requesting changes. Off disables the cap.">${caps}</select>
+      <select id="bt-review-cap" class="behavior-setting bt-review-cap-select" data-help="From this round on, Approve files the round's findings as one follow-up issue and approves instead of requesting changes. Off disables the cap.">${caps}</select>
     </div>
     <div class="bt-section">
       <label class="bt-label bt-repos-label" for="bt-filter">Repositories</label>
@@ -811,7 +811,7 @@ function memoryCell(meta: typeof BEHAVIORS[number]): string {
   const filled = !!note
   const title = filled ? note.slice(0, 140) : 'Add behavior memory'
   return `
-    <button type="button" class="behavior-memory-btn${filled ? ' has-note' : ''}" data-behavior="${escapeHtml(meta.key)}" title="${escapeHtml(title)}" aria-label="Edit memory for ${escapeHtml(meta.key)}"${stateUnknown() ? ' disabled' : ''}>
+    <button type="button" class="behavior-memory-btn${filled ? ' has-note' : ''}" data-behavior="${escapeHtml(meta.key)}" data-help="${escapeHtml(title)}" aria-label="Edit memory for ${escapeHtml(meta.key)}"${stateUnknown() ? ' disabled' : ''}>
       <span class="behavior-memory-dot" aria-hidden="true"></span>
       <span class="behavior-memory-label">${filled ? 'Edit' : 'Add'}</span>
     </button>
@@ -1097,9 +1097,9 @@ function renderShell(): string {
             <th class="col-reviewers">Reviewers</th>
             <th class="col-memory">Memory</th>
             <th class="col-last">Last triggered</th>
-            <th class="col-runs behavior-metric behavior-metrics-start" title="Runs started in the selected period">Total runs</th>
-            <th class="col-duration behavior-metric" title="Total elapsed run duration">Duration</th>
-            <th class="col-success behavior-metric" title="Completed runs that did not fail; unfinished runs are excluded">Success <span class="behavior-unit">(%)</span></th>
+            <th class="col-runs behavior-metric behavior-metrics-start" data-help="Runs started in the selected period">Total runs</th>
+            <th class="col-duration behavior-metric" data-help="Total elapsed run duration">Duration</th>
+            <th class="col-success behavior-metric" data-help="Completed runs that did not fail; unfinished runs are excluded">Success <span class="behavior-unit">(%)</span></th>
           </tr>
         </thead>
         <tbody id="behaviors-tbody"></tbody>
@@ -1114,8 +1114,8 @@ function renderRow(meta: typeof BEHAVIORS[number]): HTMLTableRowElement {
   const owner = behaviorOwners[meta.key] || null
   tr.innerHTML = `
     <td class="behavior-active-cell">${toggleCell(meta.key)}</td>
-    <td class="title-cell" title="${escapeHtml(meta.label)}"><span class="behavior-name">${escapeHtml(meta.label)}</span></td>
-    <td class="behavior-status-cell"><span class="behavior-notifications">${notificationChips(meta.key)}</span>${meta.key === 'implement-issues' || meta.key === 'repair-prs' ? `<button type="button" class="st-clear" data-behavior-pause="${meta.key}" title="Pause future invocations; a running worker continues"${stateUnknown() || pausesInFlight.has(meta.key) ? ' disabled' : ''}>${getPausedUntil(meta.key) ? 'Resume' : 'Pause 15 min'}</button>` : ''}</td>
+    <td class="title-cell" data-help="${escapeHtml(meta.label)}"><span class="behavior-name">${escapeHtml(meta.label)}</span></td>
+    <td class="behavior-status-cell"><span class="behavior-notifications">${notificationChips(meta.key)}</span>${meta.key === 'implement-issues' || meta.key === 'repair-prs' ? `<button type="button" class="st-clear" data-behavior-pause="${meta.key}" data-help="Pause future invocations; a running worker continues"${stateUnknown() || pausesInFlight.has(meta.key) ? ' disabled' : ''}>${getPausedUntil(meta.key) ? 'Resume' : 'Pause 15 min'}</button>` : ''}</td>
     <td class="behavior-owner-cell">${ownerCell(owner)}</td>
     <td class="behavior-setting-cell">${settingCell(meta)}</td>
     <td class="behavior-reviewers-cell">${reviewersCell(meta)}</td>
@@ -1153,7 +1153,7 @@ const CHIP_GROUPS: { group: ItemGroup, tone: string, words: (n: number) => strin
 function notificationChips(key: BehaviorKey): string {
   const counts = notificationCountsFor(key)
   return CHIP_GROUPS.filter(({ group }) => counts[group] > 0).map(({ group, tone, words }) =>
-    `<button type="button" class="nr-count-chip" data-tone="${tone}" data-notifications-behavior="${escapeHtml(key)}" data-group="${group}" data-opens-notifications title="Show in notifications">${words(counts[group])}</button>`,
+    `<button type="button" class="nr-count-chip" data-tone="${tone}" data-notifications-behavior="${escapeHtml(key)}" data-group="${group}" data-opens-notifications data-help="Show in notifications">${words(counts[group])}</button>`,
   ).join('')
 }
 

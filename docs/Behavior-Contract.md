@@ -293,17 +293,20 @@ the reviews it managed to prepare, and an `approve-prs` sweep still fires the
 approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
-An approval cycle failure retains its organization, last known phase, live
+Review and approval cycle failures retain their organization, last known phase, live
 effective deadline and observed check/launch counts in diagnostic context before
 clock cleanup, including a tick that returns on abort. Pending checks include
-unread or failed reads; prepared approvals still awaiting dispatch are counted
-separately. A deadline record retains the cursor, original launch claim,
+unfinished review preparation and unread or failed approval reads; prepared work
+is counted separately. A review timeout keeps the sweep identity even when a
+target attached its identity to the same exception. A deadline record retains
+the cursor, original launch claim,
 correlation, expected head and observed Call, plus the next scheduled tick.
 Only a proven deferral with a successful final evidence read and an available
-scheduled continuation is captured as Warning at the approval cycle: either
+scheduled continuation is captured as Warning at the sweep cycle: either
 prepared approvals remain before any launch attempt, or every attempted claim
-has matching, unambiguous running Call evidence. Released attempts cannot be
-hidden by surviving owned launches. Missing or conflicting ownership, unreadable
+has matching, unambiguous running Call evidence. An approval deferral requires
+every attempted claim to stay visible: released attempts cannot be hidden by
+surviving owned launches. Missing or conflicting ownership, unreadable
 evidence, uncertain writes and unavailable continuation remain Errors.
 Read counts do not prove completed evaluation, and a launch does
 not prove publication: publication stays unverified until reconciliation proves

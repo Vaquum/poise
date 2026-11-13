@@ -54,7 +54,7 @@ ownership, capacity, active/held work, sequence-checked Hold/Resume and
 paginated journal history. Notifications' Journal evidence action opens its
 recorded journal cursor there, including after reload. These are reads of the
 canonical chain journal, separate from Logging's diagnostics and their Work impact;
-they create no new Logging events or severity mapping. General keeps only chain
+they create no new Logging events. General keeps only chain
 preferences and guarded cutover controls.
 
 Column headers own the severity, time, source and exact identity filters. Columns selects optional workspace/account/repository/call/correlation/incident fields; an active filter keeps its field visible until cleared. Search and the event count remain in the native toolbar. Filters stay usable after a failed query.
@@ -85,6 +85,16 @@ unreadable associations show unknown. A failed workspace read leaves retained
 Logging evidence usable, including in service mode. Source severity and Count
 (retained event/occurrence count) keep their separate meanings. This annotation
 neither starts work nor changes execution or holds.
+For a new typed analysis handoff with positive no-submission evidence, the
+displayed severity is Warning only after a later admission for that original
+Call's same PR, head, review basis and slot, or its attributed substantive
+successor verdict. A changed head, green CI, an earlier or independent sibling
+review, or generic work progress cannot confirm the handoff. No successor,
+failed recovery, a current hold, uncertain publication or unavailable evidence
+keeps Error. The active blocker and next action remain visible. The retained
+source event stays Error: severity filters, counts and exports continue to use
+that immutable source severity. Refresh replaces the displayed work assessment;
+historical rows without typed no-submission proof remain unproven.
 For a verified merge with a pending native review obligation, the next action is
 to reconcile original pre-merge review evidence, including when a durable hold
 is retained. Resume cannot start a new review after merge.

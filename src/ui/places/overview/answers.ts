@@ -253,7 +253,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const isOpenDetail = opened.has(entry.id)
     const answerable = !p?.settled && !busy
     // Only what acts is a button; its digit answers from the keyboard.
-    const opts = answerable ? entry.options.map((o, i) => `<button class="btn ${o.primary ? 'btn-primary' : 'btn-line'}" data-act="answer" data-option="${esc(o.key)}" data-ref="ov.option" aria-keyshortcuts="${i + 1}"${off(blocked)}${o.detail ? ` title="${esc(o.detail)}"` : ''}>${esc(o.label)}</button>`).join('') : ''
+    const opts = answerable ? entry.options.map((o, i) => `<button class="btn ${o.primary ? 'btn-primary' : 'btn-line'}" data-act="answer" data-option="${esc(o.key)}" data-ref="ov.option" aria-keyshortcuts="${i + 1}"${off(blocked)}${o.detail ? ` data-help="${esc(o.detail)}"` : ''}>${esc(o.label)}</button>`).join('') : ''
     const typed = !entry.remembered && (!entry.options.length || replying.has(entry.id))
     // Your own words stay on screen while an answer is on its way, so typing
     // goes on; a failed send keeps what is there now.
@@ -302,7 +302,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       ${statusHTML(p)}
       ${p?.uncertain && entry.open ? `<p class="nc-fail"><a class="lnk" href="${esc(entry.open.href)}" data-act="open" data-ref="ov.open">${esc(entry.open.label)}</a> to see what happened.</p>` : ''}
       ${acts}${typed ? reply : ''}${form}
-      <div class="card-meta"><span class="nc-kind">${esc(entry.kind)}</span>${fresh.has(entry.id) ? '<span class="new">New</span>' : ''}${entry.where ? `<span class="repo">${esc(entry.where)}</span>` : ''}${entry.since ? `<time datetime="${esc(entry.since)}" title="${esc(clockAt(entry.since))}">${esc(ago(entry.since))}</time>` : ''}</div>
+      <div class="card-meta"><span class="nc-kind">${esc(entry.kind)}</span>${fresh.has(entry.id) ? '<span class="new">New</span>' : ''}${entry.where ? `<span class="repo">${esc(entry.where)}</span>` : ''}${entry.since ? `<time datetime="${esc(entry.since)}" data-help="${esc(clockAt(entry.since))}">${esc(ago(entry.since))}</time>` : ''}</div>
       ${tools ? `<div class="card-acts">${tools}</div>` : ''}
     </article>`
   }

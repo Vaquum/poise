@@ -35,6 +35,9 @@ data, under the same authority, limits and freshness contract, with no
 additional Caller or GitHub collection. An empty or stale filtered result
 must not establish that no work is running; check `health` for pending,
 dropped, gaps and stale coverage.
+The store indexes the case-insensitive repository and target number, so sparse
+and absent target lookups seek within that target. Opening an existing store
+adds this index without changing its identities, coverage or cursors.
 Start with a list request without a cursor. Its `watermark` is a changes cursor;
 follow `nextCursor` until null, then consume changes from that watermark.
 List pages freeze their creation boundary. Apply upserts by increasing record
