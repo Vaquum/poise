@@ -338,8 +338,15 @@ export class BehaviorChainJournal {
       if (this.db.prepare('SELECT 1 FROM behavior_chain_events WHERE chain_id = ? LIMIT 1').get(id)) throw new Error('behavior projection is missing; rebuild it before continuing')
       return null
     }
-    if (row.sequence !== row.latest || chainBasis(JSON.parse(row.state)) !== row.state_hash) throw new Error('behavior projection disagrees with the authoritative event journal')
-    return JSON.parse(row.state) as BehaviorChain
+    if (row.sequence !== row.latest) throw new Error('behavior projection disagrees with the authoritative event journal')
+    // The projection is written as the very text its basis hashes, so text that
+    // hashes to the journal's basis is that state; any other text is checked
+    // the long way, re-serialized from what it parses to, as before.
+    const state = JSON.parse(row.state) as BehaviorChain
+    if (createHash('sha256').update(row.state).digest('hex') !== row.state_hash && chainBasis(state) !== row.state_hash) {
+      throw new Error('behavior projection disagrees with the authoritative event journal')
+    }
+    return state
   }
 
   append(id: string, eventId: string, expectedSequence: number, event: ChainEvent, at = Date.now()): BehaviorChain {
