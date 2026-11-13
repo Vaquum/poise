@@ -123,7 +123,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   let handledOpen = false
   let inFlight = 0
   // The last read, painted at once until each source reads afresh (LAST_ANSWERS_KEY).
-  const readKey = answersKey()
+  let readKey = answersKey()
   const last = rememberedAnswers(readKey)
   let remembered: Entry[] = last?.entries ?? []
   const rememberedAt = last?.at ?? 0
@@ -143,8 +143,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       ...reviewed,
     ]), dismissals.data ?? new Map()))
     if (!remembered.length) return read
-    // A source not read yet in this page shows what it had last time; once every one has read, the last read is gone.
-    const unreadSources = (Object.keys(ready) as Entry['source'][]).filter((source) => !ready[source]())
+    // A source not yet read afresh in this page shows what it had last time; once every one has, the last read is gone.
+    const unreadSources = (Object.keys(readAfresh) as Entry['source'][]).filter((source) => !readAfresh[source]())
     if (!unreadSources.length) { remembered = []; return read }
     const ids = new Set(read.map((entry) => entry.id))
     return ordered([...read, ...remembered.filter((entry) => unreadSources.includes(entry.source) && !ids.has(entry.id))])
@@ -153,7 +153,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   /** Keeps what is drawn, once every source has read afresh in this page: a
    *  moment after it settles, when it changed or a minute since, off the path of any paint. */
   function keepSoon(): void {
-    if (remembered.length || !(Object.keys(ready) as Entry['source'][]).every((source) => ready[source]())) return
+    if (remembered.length || !dismissals.data || !(Object.keys(readAfresh) as Entry['source'][]).every((source) => readAfresh[source]())) return
     window.clearTimeout(keepTimer)
     keepTimer = window.setTimeout(() => {
       // A place left, or settings changed since it read, keeps nothing.
@@ -371,6 +371,20 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   }
   const seeded = new Set<Entry['source']>()
   let chainsRead = false
+  /** Read afresh, successfully, in this page: only that replaces a source's last read, and only then is the list kept.
+   *  A failed read answers too (Behaviors' diagnostics carry its failure, a document's threads their error), but stands for nothing. */
+  const readAfresh: Record<Entry['source'], () => boolean> = {
+    notice: () => noticeFeed.answered, diagnostic: () => isBehaviorStateLoaded(), chain: () => chainsRead,
+    request: () => !!requests.data, decision: () => !!board.data, thread: () => !!reviews.data && [...threads.values()].every((read) => !read.error),
+  }
+  // Settings read afresh may name another GitHub user or other organizations than the page opened on:
+  // the last read no longer stands, and this page keeps nothing.
+  window.addEventListener('poise:settings-read', () => {
+    if (!readKey || answersKey() === readKey) return
+    readKey = ''
+    window.clearTimeout(keepTimer)
+    if (remembered.length) { remembered = []; paint() }
+  }, { signal })
 
   function paint(): void {
     current = compute()
