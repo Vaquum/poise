@@ -372,9 +372,10 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
 
   // ---------- Answering ----------
   function setProgress(id: string, next: Progress): void { progress.set(id, next); paint() }
-  function settle(entry: Entry, label: string, words: string, extra: Partial<Progress> = {}): void {
+  /** `revision`, for a card being put away: only that report goes; an answer settles the card whatever it reports next. */
+  function settle(entry: Entry, label: string, words: string, extra: Partial<Progress> = {}, revision?: string): void {
     const row: HandledRow = { title: entry.title, note: `${label} · ${words}`, at: Date.now(), ...(extra.undo ? { undo: entry.id } : {}),
-      ...(KEPT_DISMISSALS.includes(entry.source) ? { revision: entry.revision } : {}) }
+      ...(revision !== undefined ? { revision } : {}) }
     done.set(entry.id, row)
     settledHere.unshift(row)
     setProgress(entry.id, { stage: 'Completed', label, words, at: Date.now(), settled: true, ...extra })
@@ -492,7 +493,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     if (!(entry.notice || entry.decision || kept) || holds.has(entry.id)) return
     const timer = window.setTimeout(() => sendHeld(entry.id), HOLD_MS)
     holds.set(entry.id, { kind, notice: entry.notice, decision: entry.decision?.id, kept, timer })
-    settle(entry, kind === 'dismiss' ? 'Dismissed' : 'Silenced', kind === 'dismiss' ? `Put away: ${entry.dismissWords}` : 'No more reminders while it stays open', { undo: true })
+    settle(entry, kind === 'dismiss' ? 'Dismissed' : 'Silenced', kind === 'dismiss' ? `Put away: ${entry.dismissWords}` : 'No more reminders while it stays open', { undo: true }, kept?.revision)
   }
   /** An entry whose report changed mid-hold: its hold goes, its new report shows. */
   function forgetHold(id: string): void {

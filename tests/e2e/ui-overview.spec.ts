@@ -42,6 +42,9 @@ interface Workspace {
   dismissed?: unknown[]
   /** Every POST that could act on the chain. */
   chainActions?: unknown[]
+  /** Review publications and each document's threads; a reply appends to its thread. */
+  publications?: unknown[]
+  threads?: Record<string, { id: string, messages: { author: string, body: string, createdAt: string }[] }[]>
   /** What /api/behavior-metrics answers. */
   metrics?: unknown
   /** The behavior-metrics reads asked, as their search parameters. */
@@ -82,7 +85,18 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       return json(route, workspace.answerDecision.body, workspace.answerDecision.status)
     }
     if (path === '/api/chat/sessions') return workspace.chatsFail ? json(route, { error: 'the chat service did not answer' }, 503) : json(route, { instance: 'poise-dev:test', sessions: [] })
-    if (path === '/api/editor/reviews') return json(route, { publications: [], sweep: { publications: 0, longestDelayMinutes: 15 } })
+    if (path === '/api/editor/reviews') return json(route, { publications: workspace.publications ?? [], sweep: { publications: 0, longestDelayMinutes: 15 } })
+    const doc = /^\/api\/editor\/doc\/([^/]+)\/reviews(\/action)?$/.exec(path)
+    if (doc) {
+      const slug = decodeURIComponent(doc[1])
+      const rows = (workspace.threads ??= {})[slug] ??= []
+      if (doc[2] && method === 'POST') {
+        const body = route.request().postDataJSON() as { id: string, body: string }
+        rows.find((row) => row.id === body.id)?.messages.push({ author: 'me', body: body.body, createdAt: new Date().toISOString() })
+      }
+      const reviews = rows.map((row) => ({ ...row, kind: 'thread', repo: 'acme/site', site: 'site', pr: 3, prUrl: 'https://github.com/acme/site/pull/3', resolved: false, canReply: true, canResolve: true }))
+      return json(route, { reviews })
+    }
     if (path === '/api/behavior-chains' && method === 'POST') { (workspace.chainActions ??= []).push(route.request().postDataJSON()); return json(route, {}) }
     if (path === '/api/behavior-chains') return json(route, { chains: workspace.chains ?? [], attention: workspace.attention ?? [] })
     if (path === '/api/answers/dismissals' && method === 'POST') {
@@ -312,6 +326,22 @@ test('Answer here lists the newest first, and every card can be put away without
   // Putting it away sent nothing to any chat and resumed nothing.
   expect(socket.frames.map((frame) => frame.command.type).filter((type) => /respond|answer|resume|message|send|prompt/i.test(String(type)))).toEqual([])
   expect(workspace.chainActions ?? []).toEqual([])
+})
+
+test('a review thread answered here stays settled though the reply changes what it reports (#1379)', async ({ page }) => {
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1,
+    publications: [{ slug: 'notes', site: 'site', repo: 'acme/site', pr: 3, prUrl: '', checkedAt: ago(2), active: true, stale: false, problems: [], openThreads: 1 }],
+    threads: { notes: [{ id: 't1', messages: [{ author: 'ann', body: 'Typo in the title', createdAt: ago(10) }] }] } }
+  await open(page, workspace)
+  const card = entry(page, 'thread:notes:t1')
+  await card.getByRole('button', { name: 'Reply…' }).click()
+  await card.getByRole('textbox').fill('Fixed, thanks')
+  await card.getByRole('button', { name: 'Send reply' }).click()
+  await expect(card).toContainText('Replied on GitHub, as you')
+  await expect(card.getByRole('button', { name: 'Reply…' })).toHaveCount(0)
+  await page.mouse.move(1000, 600)
+  await expect(card).toHaveCount(0)
+  expect(workspace.threads!.notes[0].messages).toHaveLength(2)
 })
 
 test('a chain card whose report changes while it is being put away comes back with the new report, and the old one is not sent (#1379)', async ({ page }) => {
