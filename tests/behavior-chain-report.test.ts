@@ -864,7 +864,7 @@ it.each(['new report', 'lost acknowledgement', 'closed markerless link'])('repor
   expect(launch).not.toHaveBeenCalled(); expect(resumePublication).not.toHaveBeenCalled()
 })
 
-it.each(['mere reference', 'different source', 'different invocation', 'different Call', 'different failure', 'untrusted author', 'PR'])('does not adopt an unrelated uncertain implementation report: %s', async change => {
+it.each(['mere reference', 'different source', 'different invocation', 'different Call', 'different failure', 'untrusted author', 'PR', 'empty body'])('does not adopt an unrelated uncertain implementation report: %s', async change => {
   const { db, journal } = setup()
   const { call } = uncertainImplementation(journal)
   let body = `The #7 implementation remains uncertain after Call ${call.id}, invocation ${call.correlation_id}; no conclusive push result or publication receipt is available.`
@@ -877,6 +877,7 @@ it.each(['mere reference', 'different source', 'different invocation', 'differen
   linked.state = 'closed'
   if (change === 'untrusted author') linked.user.login = 'stranger'
   if (change === 'PR') Object.assign(linked, { pull_request: {}, html_url: 'https://github.com/acme/repo/pull/98' })
+  if (change === 'empty body') Object.assign(linked, { body: null })
   remote.push(linked); searchVisible = false
   sourceComments = [{ author: 'reviewer', body: 'See https://github.com/acme/repo/issues/98.' }]
   await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh,

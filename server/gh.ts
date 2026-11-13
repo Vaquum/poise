@@ -111,9 +111,13 @@ export async function reconcileRepairReport(repository: string, marker: string, 
     const author = object(issue.user)
     if (number !== null && linked && 'pull_request' in issue) return null
     if ('pull_request' in issue || !Number.isSafeInteger(issue.number) || Number(issue.number) < 1
-      || number !== null && issue.number !== number || typeof issue.body !== 'string' || typeof author.login !== 'string'
+      || number !== null && issue.number !== number || typeof author.login !== 'string'
       || !['open', 'closed'].includes(String(issue.state))
       || String(issue.html_url).toLowerCase() !== `https://github.com/${repository}/issues/${issue.number}`.toLowerCase()) {
+      throw new Error('Repair report issue identity differs from its durable intent')
+    }
+    if (typeof issue.body !== 'string') {
+      if (number !== null && linked) return null
       throw new Error('Repair report issue identity differs from its durable intent')
     }
     if (!issue.body.includes(marker) && number !== null && linked) {
