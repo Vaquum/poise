@@ -19,4 +19,5 @@ export const NOTIFICATION_PLACEMENT = {
   action_needed: { actor: 'user', logging: 'none', lifecycle: 'tab-dedupe-until-action-recovery' },
   action_finished: { actor: 'user', logging: 'none', lifecycle: 'tab-local-until-dismissed-or-cleared' },
   read_failed: { actor: 'user', logging: 'known-source-only', lifecycle: 'tab-dedupe-until-read-recovery' },
+  behavior_metrics_incomplete: { actor: 'poise', logging: 'range-and-record-evidence', lifecycle: 'tab-dedupe-until-range-coverage-verified' },
 } as const satisfies Record<NoticeKind, { actor: string; logging: string; lifecycle: string }>

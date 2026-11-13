@@ -1,5 +1,7 @@
 import { expect, test, type Locator, type Page, type Route, type WebSocketRoute } from '@playwright/test'
 import type { AnalyticsHealth } from '../../src/analytics-health-types'
+import { BEHAVIOR_KEYS } from '../../src/behavior-types'
+import { BEHAVIOR_METRICS_COVERAGE_ERROR } from '../../src/behavior-metrics'
 
 // Overview in the new interface (#556, PRD Support → Tests): Answer here with
 // a request answered elsewhere while held or focused, several requests at
@@ -51,6 +53,7 @@ interface Workspace {
   requestsLate?: Promise<void>
   /** What /api/behavior-metrics answers. */
   metrics?: unknown
+  metricsFail?: boolean
   /** The behavior-metrics reads asked, as their search parameters. */
   metricsAsked?: URLSearchParams[]
   /** The chain's tasks. */
@@ -144,7 +147,10 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       return json(route, { periods: bounds.slice(1).map((until, i) => ({ since: bounds[i], until, ...day })), errors: [] })
     }
     if (path === '/api/github-quota') return json(route, workspace.quota ?? { accounts: [] })
-    if (path === '/api/behavior-metrics') { (workspace.metricsAsked ??= []).push(url.searchParams); return json(route, workspace.metrics ?? { behaviors: {}, error: null }) }
+    if (path === '/api/behavior-metrics') {
+      (workspace.metricsAsked ??= []).push(url.searchParams)
+      return workspace.metricsFail ? json(route, { error: 'metrics refresh unavailable' }, 503) : json(route, workspace.metrics ?? { behaviors: {}, error: null })
+    }
     if (path === '/api/behavior-estimates') return json(route, { estimates: [] })
     if (path === '/api/agent-logs') return workspace.runsFail ? json(route, { error: 'agent-interface did not answer' }, 503) : json(route, { logs: [] })
     if (path === '/api/gh') return json(route, { records: [], held: [], errors: [] })
@@ -856,6 +862,61 @@ test('Behaviors gives every row its runs, time and success, or says why in words
   await expect(row('repair-prs')).toContainText('unknown: some of its run records cannot be read')
   // No value is a bare dash.
   for (const cell of await page.locator('[data-beh] td.num').allInnerTexts()) expect(cell.trim()).not.toBe('—')
+})
+
+test('Today’s coverage gap is an immediate stable fault until its range is verified (#1436)', async ({ page }) => {
+  await page.clock.install({ time: new Date('2026-11-13T12:00:30Z') })
+  const empty = { behaviors: Object.fromEntries(BEHAVIOR_KEYS.map((key) => [key, { totalRuns: 0, durationMinutes: 0, successRate: null }])), error: null }
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, metrics: empty }
+  await open(page, workspace)
+  const row = (key: string) => page.locator(`[data-beh="${key}"]`)
+  const fault = answers(page).locator('.nc.is-fault').filter({ hasText: 'Today’s behavior metrics lack evidence' })
+  await expect(row('repair-prs')).toContainText('no runs')
+  await expect(fault).toHaveCount(0)
+  const error = `${BEHAVIOR_METRICS_COVERAGE_ERROR} Range: [2026-11-13T00:00:00.000Z, 2026-11-14T00:00:00.000Z). Behaviors: repair-prs. Metrics: totalRuns, durationMinutes, successRate.\nHistory row: 1436 · Call: ${'a'.repeat(32)} · Correlation: gap-call · Target: acme/site#7 · agent-interface log record has invalid status`
+  const incomplete = { behaviors: { ...empty.behaviors,
+    'repair-prs': null, 'review-new-prs': { totalRuns: 12, durationMinutes: 30, successRate: 75 },
+    'merge-prs': { totalRuns: 2, durationMinutes: 1, untimedRuns: 1, successRate: null },
+  }, error }
+  workspace.metrics = incomplete
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await expect(fault).toBeVisible()
+  await expect(answers(page).locator('[data-key="g:fault"]')).toContainText('Faults')
+  await expect(page.locator('[data-bell]')).toHaveText('1')
+  await expect(page.locator('[data-bell]')).toHaveAttribute('data-tone', 'failed')
+  await expect(row('repair-prs')).toContainText('unknown: some of its run records cannot be read')
+  await expect(row('review-new-prs')).toContainText('75%')
+  await expect(row('review-new-prs').locator('td.num').first()).toHaveText('12')
+  await expect(row('merge-prs')).toContainText('+ 1 untimed')
+  await press(fault, 'Show more')
+  for (const detail of ['2026-11-13T00:00:00.000Z', 'repair-prs', 'totalRuns, durationMinutes, successRate', 'History row: 1436', 'a'.repeat(32), 'gap-call', 'invalid status']) await expect(fault).toContainText(detail)
+  await page.mouse.move(1000, 600)
+  const id = await fault.getAttribute('data-notice')
+  const since = await fault.locator('time').getAttribute('datetime')
+  const reads = workspace.metricsAsked!.length
+  await page.clock.fastForward(61_000)
+  await expect.poll(() => workspace.metricsAsked!.length).toBeGreaterThan(reads)
+  await expect(fault).toHaveAttribute('data-notice', id!)
+  await expect(fault.locator('time')).toHaveAttribute('datetime', since!)
+  workspace.metricsFail = true
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await expect(page.locator('[data-ref="ov.behaviors"]')).toContainText('metrics refresh unavailable')
+  await expect(fault).toHaveAttribute('data-notice', id!)
+  workspace.metricsFail = false
+  workspace.metrics = empty
+  await page.locator('[data-ref="ov.filters"]').getByRole('button', { name: 'Previous day' }).click()
+  await expect(row('repair-prs')).toContainText('no runs')
+  await expect(fault).toHaveAttribute('data-notice', id!)
+  await page.getByRole('navigation', { name: 'Poise' }).getByRole('link', { name: 'Board' }).click()
+  await expect(page.locator('[data-bell]')).toHaveText('1')
+  workspace.metrics = incomplete
+  await page.getByRole('navigation', { name: 'Poise' }).getByRole('link', { name: 'Overview' }).click()
+  await expect(fault).toHaveAttribute('data-notice', id!)
+  workspace.metrics = empty
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await expect(row('repair-prs')).toContainText('no runs')
+  await expect(fault).toHaveCount(0)
+  await expect(page.locator('[data-bell]')).toHaveText('0')
 })
 
 test('a reload paints System health’s last read at once while it reads again, and never another GitHub user’s', async ({ page }) => {

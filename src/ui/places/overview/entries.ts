@@ -82,6 +82,7 @@ const KIND_WORDS: Record<NoticeKind, string> = {
   github_quota_warning: 'GitHub API', github_quota_exhausted: 'GitHub API', storage_low: 'Storage', ledger_queue_stalled: 'Ledger',
   ledger_capture_loss: 'Ledger', worker_idle: 'Idle slots', read_failed: 'Read failed', action_failed: 'Action failed',
   action_needed: 'Action needed', action_finished: 'Finished',
+  behavior_metrics_incomplete: 'Incomplete metrics',
 }
 
 const GROUP_STATE: Record<Group, State | null> = { 'needs-you': null, fault: 'failed', auto: 'waiting' }

@@ -632,6 +632,13 @@ window it could affect, and that row says *unknown: some of its run records
 cannot be read*. Missing provenance stays conservative, and conflicting
 duplicate identities cannot escape through contradictory scope hints.
 Unavailable metrics remain unknown, never zero.
+On Overview, incomplete Today coverage also raises an immediate tab-local Poise
+fault. Its evidence names the range, affected behaviors and metrics, source
+reason and available Caller/history-row references; Logging retains the same
+diagnostic context. Repeated reads keep the fault's identity and dismissal.
+Failed refreshes, reading another day and leaving Overview do not clear it:
+only verified coverage of its exact range does. An empty verified day, independently
+identified older quarantine outside the range, and untimed history do not raise it.
 Historical Caller v1 diagnostics may omit outcome, stderr or truncation facts;
 these read as null, retaining submission uncertainty and the failed lifecycle.
 Present malformed fields and unsupported versions remain quarantined. Diagnostic

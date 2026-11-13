@@ -1,5 +1,7 @@
 import type { BehaviorKey } from './behavior-types'
 
+export const BEHAVIOR_METRICS_COVERAGE_ERROR = 'Some worker logs are unreadable; affected behavior metrics are unavailable.'
+
 export interface BehaviorMetrics {
   totalRuns: number
   /** The runs' time: live runs to now, finished runs to their end. Never null for a report since #1382. */
