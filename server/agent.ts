@@ -98,6 +98,8 @@ interface AgentLogRead {
   waiters: Set<AgentLogWaiter>
   started: boolean
   settled: boolean
+  /** The lane's generation when this read started. */
+  generation?: number
 }
 
 interface AgentLogLane {
@@ -108,6 +110,9 @@ interface AgentLogLane {
   cached: { snapshot: AgentLogSnapshot, expiresAt: number, readAt: number } | null
   /** The latest read failed: the last snapshot no longer answers a reader at once. */
   failed?: boolean
+  /** Bumped when the lane's calls changed under it (a stop): a read started
+   *  before answers only its own waiters and never becomes the last snapshot. */
+  generation?: number
 }
 
 const AGENT_LOG_SNAPSHOT_TTL_MS = 5_000
@@ -180,8 +185,10 @@ async function laneAgentLogSnapshot(
     if (!lane.running) startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
     return lane.cached.snapshot
   }
+  // A read started before the lane's calls changed is not joined: the next one is.
+  const current = lane.running !== null && lane.running.generation === (lane.generation ?? 0)
   const target = lane.running
-    ? (!options.fresh ? lane.running : (lane.queued ?? createLaneAgentLogRead(lane)))
+    ? (!options.fresh && current ? lane.running : (lane.queued ?? createLaneAgentLogRead(lane)))
     : startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
   return new Promise<AgentLogSnapshot>((resolve, reject) => {
     const waiter: AgentLogWaiter = { signal: options.signal, onAbort: () => {}, resolve, reject }
@@ -223,12 +230,15 @@ function startLaneAgentLogRead(
   readSnapshot: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
 ): AgentLogRead {
   read.started = true
+  read.generation = lane.generation ?? 0
   lane.running = read
   readSnapshot(read.controller.signal).then(
     (snapshot) => {
-      const readAt = Date.now()
-      lane.cached = { snapshot, expiresAt: readAt + AGENT_LOG_SNAPSHOT_TTL_MS, readAt }
-      lane.failed = false
+      if (read.generation === (lane.generation ?? 0)) {
+        const readAt = Date.now()
+        lane.cached = { snapshot, expiresAt: readAt + AGENT_LOG_SNAPSHOT_TTL_MS, readAt }
+        lane.failed = false
+      }
       settleLaneAgentLogRead(lane, read, { snapshot }, readSnapshot)
     },
     (error) => {
@@ -629,8 +639,12 @@ export async function stopAgentJob(callId: string): Promise<StopResult> {
   if (typeof value?.id !== 'string' || typeof value.stopped !== 'boolean' || typeof value.status !== 'string') {
     throw new Error('Update Caller: stopping a run is unavailable')
   }
-  // A stopped run must not stay in the running views' last snapshot.
-  if (value.stopped) runningAgentLogLane.cached = null
+  // A stopped run must not stay in the running views' last snapshot, nor
+  // come back with a read that started before it stopped.
+  if (value.stopped) {
+    runningAgentLogLane.cached = null
+    runningAgentLogLane.generation = (runningAgentLogLane.generation ?? 0) + 1
+  }
   return { id: value.id, stopped: value.stopped, status: value.status, error_code: typeof value.error_code === 'string' ? value.error_code : null }
 }
 

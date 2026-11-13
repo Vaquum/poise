@@ -954,6 +954,25 @@ describe('stopping a run', () => {
     expect((await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).entries).toEqual([])
     expect(mocks.runFile).toHaveBeenCalledTimes(3)
   })
+  it('keeps a running read started before a stop from answering later readers or becoming the last snapshot', async () => {
+    const { stopAgentJob } = await import('../server/agent')
+    const reads: Array<(value: { stdout: string, stderr: string }) => void> = []
+    mocks.runFile.mockImplementation((_command: string, args: string[]) => args[0] === '--stop'
+      ? Promise.resolve({ stdout: JSON.stringify({ id: 'a'.repeat(32), stopped: true, status: 'failed', error_code: 'stopped' }), stderr: '' })
+      : new Promise(resolve => { reads.push(resolve) }))
+    // In flight before the stop, and still seeing the run.
+    const before = fetchRunningAgentLogSnapshot()
+    expect(reads).toHaveLength(1)
+    await stopAgentJob('a'.repeat(32))
+    const after = fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })
+    reads[0]!({ stdout: JSON.stringify([logRow({ status: 'running', completed_at: null })]), stderr: '' })
+    expect((await before).entries).toHaveLength(1)
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!({ stdout: '[]', stderr: '' })
+    expect((await after).entries).toEqual([])
+    expect((await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).entries).toEqual([])
+    expect(reads).toHaveLength(2)
+  })
   it('refuses a malformed id before running anything, and an old Caller after', async () => {
     const { stopAgentJob } = await import('../server/agent')
     await expect(stopAgentJob('../etc')).rejects.toThrow('invalid agent call id')
