@@ -236,6 +236,22 @@ test('leaving Overview before it has mounted, the bell reads Answer here’s sou
   release()
 })
 
+test('the bell reads after the place it opens on, so the place’s own reads go first', async ({ page }) => {
+  const at: Record<string, number> = {}
+  const mark = (name: string) => { at[name] ??= Date.now() }
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
+  await page.route('**/api/behaviors', (route) => { mark('bell'); return route.fulfill({ json: {} }) })
+  await page.route('**/api/behavior-chains**', (route) => route.fulfill({ json: { chains: [], attention: [] } }))
+  await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [] } }))
+  await page.route('**/api/chat/switchboard', (route) => route.fulfill({ json: { revision: 1, items: [] } }))
+  await page.route('**/api/editor/reviews', (route) => route.fulfill({ json: { publications: [{ slug: 'notes', openThreads: 1 }] } }))
+  await page.route('**/api/current**', (route) => { mark('board'); return route.fallback() })
+  await open(page, '/?view=board')
+  await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('1', { timeout: 10_000 })
+  expect(at.board).toBeTruthy()
+  expect(at.bell - at.board).toBeGreaterThanOrEqual(2_000)
+})
+
 test('Claude’s subscription sits at the foot and the page makes room; updating dims the frame', async ({ page }) => {
   await open(page, '/', { claude: 'reauth_required' })
   const strip = page.locator('.foot #claude-auth-banner')
