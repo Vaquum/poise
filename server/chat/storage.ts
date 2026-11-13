@@ -111,7 +111,7 @@ db.exec(`
 // column is treated as present; any other error stops startup.
 try {
   db.transaction(() => {
-    const cols = db.prepare('PRAGMA table_info(chat_sessions)').all() as Array<{ name: string }>
+    const cols = cachedStatement(db, 'PRAGMA table_info(chat_sessions)').all() as Array<{ name: string }>
     if (!cols.some((c) => c.name === 'role')) {
       db.exec('ALTER TABLE chat_sessions ADD COLUMN role TEXT')
     }
@@ -128,7 +128,7 @@ try {
 const EVENT_MAX_BYTES = 4 * 1024 * 1024
 
 export function insertSession(record: SessionRecord): void {
-  db.prepare(`
+  cachedStatement(db, `
     INSERT INTO chat_sessions (id, record, agent, repo, checkout, branch, status, title, native_session_id, instance, created_at, updated_at, last_seq, role)
     VALUES (@id, @record, @agent, @repo, @checkout, @branch, @status, @title, @native, @instance, @created, @updated, 0, @role)
   `).run({
@@ -150,13 +150,13 @@ export function insertSession(record: SessionRecord): void {
 
 /** The instance's Manager, read from the role column, or null. */
 export function managerSession(instance: string): SessionRecord | null {
-  const row = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? AND role = \'manager\' LIMIT 1')
+  const row = cachedStatement(db, 'SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? AND role = \'manager\' LIMIT 1')
     .get(instance) as { record: string, last_seq: number, status: string, role: string | null } | undefined
   return row ? parseRecord(row) : null
 }
 
 export function saveSession(record: SessionRecord): void {
-  db.prepare(`
+  cachedStatement(db, `
     UPDATE chat_sessions
     SET record = @record, agent = @agent, repo = @repo, checkout = @checkout, branch = @branch,
         status = @status, title = @title, native_session_id = @native, updated_at = @updated
@@ -187,13 +187,13 @@ function parseRecord(row: { record: string, last_seq: number, status: string, ro
 }
 
 export function getSession(id: string): SessionRecord | null {
-  const row = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE id = ?').get(id) as { record: string, last_seq: number, status: string, role: string | null } | undefined
+  const row = cachedStatement(db, 'SELECT record, last_seq, status, role FROM chat_sessions WHERE id = ?').get(id) as { record: string, last_seq: number, status: string, role: string | null } | undefined
   return row ? parseRecord(row) : null
 }
 
 /** Which server owns the session, without parsing the record. */
 export function sessionInstance(id: string): string | null {
-  const row = db.prepare('SELECT instance FROM chat_sessions WHERE id = ?').get(id) as { instance: string } | undefined
+  const row = cachedStatement(db, 'SELECT instance FROM chat_sessions WHERE id = ?').get(id) as { instance: string } | undefined
   return row?.instance ?? null
 }
 
@@ -206,7 +206,7 @@ export interface CheckoutSession {
 /** Every session row claiming a checkout, across instances: a workspace
  *  another server's session uses is claimed, never unclaimed. */
 export function sessionsForCheckout(checkout: string): CheckoutSession[] {
-  const rows = db.prepare('SELECT id, status, updated_at FROM chat_sessions WHERE checkout = ?')
+  const rows = cachedStatement(db, 'SELECT id, status, updated_at FROM chat_sessions WHERE checkout = ?')
     .all(checkout) as Array<{ id: string, status: SessionStatus, updated_at: string }>
   return rows.map((row) => ({ id: row.id, status: row.status, updatedAt: row.updated_at }))
 }
@@ -219,7 +219,7 @@ export function listSessions(instance: string): SessionRecord[] {
 
 /** The subject's session id, in any state, or null. Keys compare exactly. */
 export function sessionForSubject(instance: string, surface: SubjectSurface, key: string): string | null {
-  const row = db.prepare(`SELECT id FROM chat_sessions WHERE instance = ?
+  const row = cachedStatement(db, `SELECT id FROM chat_sessions WHERE instance = ?
     AND json_extract(record, '$.subject.surface') = ? AND json_extract(record, '$.subject.key') = ? LIMIT 1`)
     .get(instance, surface, key) as { id: string } | undefined
   return row?.id ?? null
@@ -238,28 +238,28 @@ export const moveSubject: (from: SessionRecord, to: SessionRecord) => void = db.
 
 export function deleteSession(id: string): void {
   db.transaction(() => {
-    const session = db.prepare('SELECT instance FROM chat_sessions WHERE id = ?').get(id) as { instance: string } | undefined
+    const session = cachedStatement(db, 'SELECT instance FROM chat_sessions WHERE id = ?').get(id) as { instance: string } | undefined
     deleteMessageQueue(id)
-    db.prepare('DELETE FROM chat_events WHERE session_id = ?').run(id)
-    const pending = db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(id)
-    db.prepare('DELETE FROM chat_workers WHERE session_id = ?').run(id)
-    db.prepare('DELETE FROM chat_relays WHERE session_id = ?').run(id)
-    db.prepare('DELETE FROM chat_attachments WHERE session_id = ?').run(id)
-    db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(id)
+    cachedStatement(db, 'DELETE FROM chat_events WHERE session_id = ?').run(id)
+    const pending = cachedStatement(db, 'DELETE FROM chat_pending WHERE session_id = ?').run(id)
+    cachedStatement(db, 'DELETE FROM chat_workers WHERE session_id = ?').run(id)
+    cachedStatement(db, 'DELETE FROM chat_relays WHERE session_id = ?').run(id)
+    cachedStatement(db, 'DELETE FROM chat_attachments WHERE session_id = ?').run(id)
+    cachedStatement(db, 'DELETE FROM chat_sessions WHERE id = ?').run(id)
     if (session && pending.changes) bumpRequestRevision(session.instance)
   })()
 }
 
 export function setSessionStatus(id: string, status: SessionStatus): void {
-  db.prepare('UPDATE chat_sessions SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), id)
+  cachedStatement(db, 'UPDATE chat_sessions SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), id)
 }
 
 export function setOpenTurn(id: string, turnId: string | null, callId: string | null): void {
-  db.prepare('UPDATE chat_sessions SET open_turn_id = ?, open_call_id = ? WHERE id = ?').run(turnId, callId, id)
+  cachedStatement(db, 'UPDATE chat_sessions SET open_turn_id = ?, open_call_id = ? WHERE id = ?').run(turnId, callId, id)
 }
 
 export function getOpenTurn(id: string): { turnId: string, callId: string | null } | null {
-  const row = db.prepare('SELECT open_turn_id, open_call_id FROM chat_sessions WHERE id = ?').get(id) as { open_turn_id: string | null, open_call_id: string | null } | undefined
+  const row = cachedStatement(db, 'SELECT open_turn_id, open_call_id FROM chat_sessions WHERE id = ?').get(id) as { open_turn_id: string | null, open_call_id: string | null } | undefined
   return row?.open_turn_id ? { turnId: row.open_turn_id, callId: row.open_call_id } : null
 }
 
@@ -274,7 +274,7 @@ export const reserveQueueTurn = db.transaction((sessionId: string, turnId: strin
   if (getOpenTurn(sessionId)) throw new Error('A turn is already recorded for this session')
   if (internal !== undefined) {
     if (!Number.isSafeInteger(internal.seq) || internal.seq <= 0) throw new Error('Invalid internal message sequence')
-    const admitted = db.prepare(`UPDATE chat_control_inbox SET state = 'admitted', turn_id = ?, admitted_at = ?
+    const admitted = cachedStatement(db, `UPDATE chat_control_inbox SET state = 'admitted', turn_id = ?, admitted_at = ?
       WHERE seq = ? AND recipient = ? AND instance = (SELECT instance FROM chat_sessions WHERE id = ?) AND state = 'pending'`)
       .run(turnId, internal.at, internal.seq, sessionId, sessionId)
     if (admitted.changes !== 1) throw new Error('The internal message is no longer pending for this session')
@@ -296,7 +296,7 @@ export const reserveQueueTurn = db.transaction((sessionId: string, turnId: strin
 
 /** Sessions of this instance that had a turn open — a crash cut them. */
 export function listOpenTurns(instance: string): Array<{ sessionId: string, turnId: string, callId: string | null }> {
-  return (db.prepare('SELECT id, open_turn_id, open_call_id FROM chat_sessions WHERE instance = ? AND open_turn_id IS NOT NULL')
+  return (cachedStatement(db, 'SELECT id, open_turn_id, open_call_id FROM chat_sessions WHERE instance = ? AND open_turn_id IS NOT NULL')
     .all(instance) as Array<{ id: string, open_turn_id: string, open_call_id: string | null }>)
     .map((row) => ({ sessionId: row.id, turnId: row.open_turn_id, callId: row.open_call_id }))
 }
@@ -308,21 +308,21 @@ export const appendEvent = db.transaction((sessionId: string, event: ChatEvent, 
   if (Buffer.byteLength(encoded, 'utf8') > EVENT_MAX_BYTES) {
     throw new Error(`chat event exceeds ${EVENT_MAX_BYTES} bytes`)
   }
-  const row = db.prepare('SELECT last_seq, instance FROM chat_sessions WHERE id = ?').get(sessionId) as { last_seq: number, instance: string } | undefined
+  const row = cachedStatement(db, 'SELECT last_seq, instance FROM chat_sessions WHERE id = ?').get(sessionId) as { last_seq: number, instance: string } | undefined
   if (!row) throw new Error(`unknown chat session ${sessionId}`)
   const seq = row.last_seq + 1
-  db.prepare('INSERT INTO chat_events (session_id, seq, at, event) VALUES (?, ?, ?, ?)').run(sessionId, seq, at, encoded)
-  db.prepare('UPDATE chat_sessions SET last_seq = ?, updated_at = ? WHERE id = ?').run(seq, at, sessionId)
+  cachedStatement(db, 'INSERT INTO chat_events (session_id, seq, at, event) VALUES (?, ?, ?, ?)').run(sessionId, seq, at, encoded)
+  cachedStatement(db, 'UPDATE chat_sessions SET last_seq = ?, updated_at = ? WHERE id = ?').run(seq, at, sessionId)
   if (event.type === 'permission.requested') {
-    db.prepare('INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
+    cachedStatement(db, 'INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
       .run(event.id, sessionId, 'permission', seq, at)
     bumpRequestRevision(row.instance)
   } else if (event.type === 'question.asked') {
-    db.prepare('INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
+    cachedStatement(db, 'INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
       .run(event.id, sessionId, 'question', seq, at)
     bumpRequestRevision(row.instance)
   } else if (event.type === 'permission.resolved' || event.type === 'question.answered') {
-    const removed = db.prepare('DELETE FROM chat_pending WHERE request_id = ? AND session_id = ?').run(event.id, sessionId)
+    const removed = cachedStatement(db, 'DELETE FROM chat_pending WHERE request_id = ? AND session_id = ?').run(event.id, sessionId)
     if (removed.changes) bumpRequestRevision(row.instance)
   }
   return { seq, sessionId, at, event }
@@ -332,7 +332,7 @@ export const EVENT_PAGE_LIMIT = 5_000
 
 export function listEvents(sessionId: string, afterSeq: number, limit: number = EVENT_PAGE_LIMIT): { events: ChatEnvelope[], truncated: boolean } {
   const bounded = Math.max(1, Math.min(limit, EVENT_PAGE_LIMIT))
-  const rows = db.prepare('SELECT seq, at, event FROM chat_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?')
+  const rows = cachedStatement(db, 'SELECT seq, at, event FROM chat_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?')
     .all(sessionId, afterSeq, bounded + 1) as Array<{ seq: number, at: string, event: string }>
   const truncated = rows.length > bounded
   return {
@@ -351,7 +351,7 @@ export function lastTurnsStart(sessionId: string, turns: number, budget = Infini
     ORDER BY seq DESC LIMIT ?`).pluck().all(sessionId, turns + 1) as number[]
   const start = (count: number) => finishes[count] ?? 0
   if (!Number.isFinite(budget)) return start(turns)
-  const sizes = db.prepare('SELECT seq, length(event) AS size FROM chat_events WHERE session_id = ? AND seq > ? ORDER BY seq DESC')
+  const sizes = cachedStatement(db, 'SELECT seq, length(event) AS size FROM chat_events WHERE session_id = ? AND seq > ? ORDER BY seq DESC')
     .all(sessionId, start(turns)) as Array<{ seq: number, size: number }>
   // While a turn runs, its events follow the last finish, and it alone is the latest.
   const least = sizes.length > 0 && sizes[0].seq > start(0) ? 0 : 1
@@ -368,7 +368,7 @@ export function lastTurnsStart(sessionId: string, turns: number, budget = Infini
 }
 
 export function lastEvent(sessionId: string): ChatEnvelope | null {
-  const row = db.prepare('SELECT seq, at, event FROM chat_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1').get(sessionId) as { seq: number, at: string, event: string } | undefined
+  const row = cachedStatement(db, 'SELECT seq, at, event FROM chat_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1').get(sessionId) as { seq: number, at: string, event: string } | undefined
   return row ? { seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent } : null
 }
 
@@ -396,7 +396,7 @@ export interface PendingRequest { requestId: string, sessionId: string, kind: 'p
 /** One open request with its stored title and ask time, for the handling
  *  log. Read before the answering event deletes the pending row. */
 export function pendingRequestDetail(sessionId: string, requestId: string): { kind: 'permission' | 'question', title: string, createdAt: string } | null {
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT p.kind AS kind, p.created_at AS createdAt, e.event AS event
     FROM chat_pending p JOIN chat_events e ON e.session_id = p.session_id AND e.seq = p.seq
     WHERE p.session_id = ? AND p.request_id = ?
@@ -427,13 +427,13 @@ export function listPendingRequests(sessionId: string): PendingRequest[] {
 // grows, across restarts. Callers outside a transaction bump through this;
 // appendEvent, resetConversation and deleteSession bump inside their own.
 export function requestRevision(instance: string): number {
-  db.prepare('INSERT OR IGNORE INTO chat_request_revision(instance) VALUES(?)').run(instance)
-  return (db.prepare('SELECT revision FROM chat_request_revision WHERE instance = ?').get(instance) as { revision: number }).revision
+  cachedStatement(db, 'INSERT OR IGNORE INTO chat_request_revision(instance) VALUES(?)').run(instance)
+  return (cachedStatement(db, 'SELECT revision FROM chat_request_revision WHERE instance = ?').get(instance) as { revision: number }).revision
 }
 
 export function bumpRequestRevision(instance: string): number {
   requestRevision(instance)
-  return (db.prepare('UPDATE chat_request_revision SET revision = revision + 1 WHERE instance = ? RETURNING revision').get(instance) as { revision: number }).revision
+  return (cachedStatement(db, 'UPDATE chat_request_revision SET revision = revision + 1 WHERE instance = ? RETURNING revision').get(instance) as { revision: number }).revision
 }
 
 export const OPEN_CHAT_REQUEST_LIMIT = 200
@@ -455,7 +455,7 @@ export interface OpenChatRequest {
  *  scan. Foreign instances' rows stay out. */
 export const listOpenChatRequests = db.transaction((instance: string): { revision: number, complete: boolean, requests: OpenChatRequest[] } => {
   const revision = requestRevision(instance)
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     SELECT p.request_id AS requestId, p.session_id AS sessionId, p.kind AS kind, p.created_at AS createdAt,
       e.event AS event, s.title AS sessionTitle
     FROM chat_pending p
@@ -498,25 +498,25 @@ export interface WorkerRow {
 }
 
 export function recordWorker(row: WorkerRow): void {
-  db.prepare(`
+  cachedStatement(db, `
     INSERT OR REPLACE INTO chat_workers (session_id, gate_pid, gate_pgid, ident, checkout, lease_token, command, started_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(row.sessionId, row.gatePid, row.gatePgid, row.ident, row.checkout, row.leaseToken, row.command, row.startedAt)
 }
 
 export function setWorkerLeaseToken(sessionId: string, token: string | null): void {
-  db.prepare('UPDATE chat_workers SET lease_token = ? WHERE session_id = ?').run(token, sessionId)
+  cachedStatement(db, 'UPDATE chat_workers SET lease_token = ? WHERE session_id = ?').run(token, sessionId)
 }
 
 export function getWorker(sessionId: string): WorkerRow | null {
-  const row = db.prepare('SELECT * FROM chat_workers WHERE session_id = ?').get(sessionId) as {
+  const row = cachedStatement(db, 'SELECT * FROM chat_workers WHERE session_id = ?').get(sessionId) as {
     session_id: string, gate_pid: number, gate_pgid: number, ident: string, checkout: string, lease_token: string | null, command: string, started_at: string
   } | undefined
   return row ? { sessionId: row.session_id, gatePid: row.gate_pid, gatePgid: row.gate_pgid, ident: row.ident, checkout: row.checkout, leaseToken: row.lease_token, command: row.command, startedAt: row.started_at } : null
 }
 
 export function forgetWorker(sessionId: string): void {
-  db.prepare('DELETE FROM chat_workers WHERE session_id = ?').run(sessionId)
+  cachedStatement(db, 'DELETE FROM chat_workers WHERE session_id = ?').run(sessionId)
 }
 
 export interface RelayRow {
@@ -529,25 +529,25 @@ export interface RelayRow {
 }
 
 export function recordRelay(row: RelayRow): void {
-  db.prepare(`
+  cachedStatement(db, `
     INSERT OR REPLACE INTO chat_relays (session_id, relay_pid, relay_ident, socket, dir, started_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(row.sessionId, row.relayPid, row.relayIdent, row.socket, row.dir, row.startedAt)
 }
 
 export function getRelay(sessionId: string): RelayRow | null {
-  const row = db.prepare('SELECT * FROM chat_relays WHERE session_id = ?').get(sessionId) as {
+  const row = cachedStatement(db, 'SELECT * FROM chat_relays WHERE session_id = ?').get(sessionId) as {
     session_id: string, relay_pid: number, relay_ident: string, socket: string, dir: string, started_at: string
   } | undefined
   return row ? { sessionId: row.session_id, relayPid: row.relay_pid, relayIdent: row.relay_ident, socket: row.socket, dir: row.dir, startedAt: row.started_at } : null
 }
 
 export function forgetRelay(sessionId: string): void {
-  db.prepare('DELETE FROM chat_relays WHERE session_id = ?').run(sessionId)
+  cachedStatement(db, 'DELETE FROM chat_relays WHERE session_id = ?').run(sessionId)
 }
 
 export function listWorkers(): WorkerRow[] {
-  return (db.prepare('SELECT * FROM chat_workers').all() as Array<{
+  return (cachedStatement(db, 'SELECT * FROM chat_workers').all() as Array<{
     session_id: string, gate_pid: number, gate_pgid: number, ident: string, checkout: string, lease_token: string | null, command: string, started_at: string
   }>).map((row) => ({
     sessionId: row.session_id,
@@ -562,12 +562,12 @@ export function listWorkers(): WorkerRow[] {
 }
 
 export function insertAttachment(row: AttachmentRecord): void {
-  db.prepare('INSERT INTO chat_attachments (id, session_id, name, path, size, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+  cachedStatement(db, 'INSERT INTO chat_attachments (id, session_id, name, path, size, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(row.id, row.sessionId, row.name, row.path, row.size, row.sha256, row.createdAt)
 }
 
 export function getAttachment(id: string): AttachmentRecord | null {
-  const row = db.prepare('SELECT * FROM chat_attachments WHERE id = ?').get(id) as
+  const row = cachedStatement(db, 'SELECT * FROM chat_attachments WHERE id = ?').get(id) as
     { id: string, session_id: string, name: string, path: string, size: number, sha256: string, created_at: string } | undefined
   return row ? { id: row.id, sessionId: row.session_id, name: row.name, path: row.path, size: row.size, sha256: row.sha256, createdAt: row.created_at } : null
 }
@@ -586,16 +586,16 @@ export interface FinishOutboxRow {
 }
 
 export function queueFinish(row: Omit<FinishOutboxRow, 'queuedAt'>): void {
-  db.prepare('INSERT INTO chat_finish_outbox (call_id, instance, session_id, status, error, queued_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(call_id) DO NOTHING')
+  cachedStatement(db, 'INSERT INTO chat_finish_outbox (call_id, instance, session_id, status, error, queued_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(call_id) DO NOTHING')
     .run(row.callId, row.instance, row.sessionId, row.status, row.error, new Date().toISOString())
 }
 
 export function finishDelivered(callId: string): void {
-  db.prepare('DELETE FROM chat_finish_outbox WHERE call_id = ?').run(callId)
+  cachedStatement(db, 'DELETE FROM chat_finish_outbox WHERE call_id = ?').run(callId)
 }
 
 export function listFinishOutbox(instance: string): FinishOutboxRow[] {
-  return (db.prepare('SELECT * FROM chat_finish_outbox WHERE instance = ? ORDER BY queued_at').all(instance) as Array<{
+  return (cachedStatement(db, 'SELECT * FROM chat_finish_outbox WHERE instance = ? ORDER BY queued_at').all(instance) as Array<{
     call_id: string, instance: string, session_id: string, status: FinishOutboxRow['status'], error: string | null, queued_at: string
   }>).map((row) => ({ callId: row.call_id, instance: row.instance, sessionId: row.session_id, status: row.status, error: row.error, queuedAt: row.queued_at }))
 }
@@ -623,14 +623,14 @@ export const finalizeTurn = db.transaction((
   if (!previous && (!executor || executor === sessionId)) settleQueuedTurn(owner, terminal.turnId, canAdvanceQueue && terminal.stopReason === 'end_turn', terminal.error || (terminal.stopReason === 'cancelled' ? 'Stopped. This message was not retried.' : undefined))
   // Never clear another turn reserved after this one; callers publish the
   // completion only after this transaction is durable.
-  db.prepare('UPDATE chat_sessions SET open_turn_id = NULL, open_call_id = NULL WHERE id = ? AND open_turn_id = ?')
+  cachedStatement(db, 'UPDATE chat_sessions SET open_turn_id = NULL, open_call_id = NULL WHERE id = ? AND open_turn_id = ?')
     .run(sessionId, event.turnId)
   return envelope
 })
 
 /** Select one full immutable record without materializing the whole history. */
 export function getDiffEvent(sessionId: string, diffId: string): Extract<ChatEvent, { type: 'diff' }> | null {
-  const row = db.prepare(`SELECT event FROM chat_events WHERE session_id = ?
+  const row = cachedStatement(db, `SELECT event FROM chat_events WHERE session_id = ?
     AND json_extract(event, '$.type') = 'diff' AND json_extract(event, '$.diffId') = ? LIMIT 1`)
     .get(sessionId, diffId) as { event: string } | undefined
   return row ? JSON.parse(row.event) as Extract<ChatEvent, { type: 'diff' }> : null
@@ -639,15 +639,15 @@ export function getDiffEvent(sessionId: string, diffId: string): Extract<ChatEve
 /** Replace this chat's history atomically without reusing sequence numbers.
  * Receipts, queued future work, files and Caller outcomes remain independent. */
 export const resetConversation = db.transaction((current: SessionRecord): { session: SessionRecord, envelope: ChatEnvelope } => {
-  const row = db.prepare('SELECT last_seq FROM chat_sessions WHERE id = ?').get(current.id) as { last_seq: number } | undefined
+  const row = cachedStatement(db, 'SELECT last_seq FROM chat_sessions WHERE id = ?').get(current.id) as { last_seq: number } | undefined
   if (!row) throw new Error('unknown chat session')
   const session: SessionRecord = { ...current, status: 'idle', contextResetting: false, contextCompacting: false,
     contextResetSeq: row.last_seq + 1, lastSeq: row.last_seq + 1, pendingRequests: [],
     nativeSessionId: undefined, context: undefined, queuedHandoff: undefined,
     forkedFrom: undefined, staged: undefined, interruptedTurnId: undefined,
     orphanNotice: undefined, safeModePending: false, queuedBehind: undefined }
-  db.prepare('DELETE FROM chat_events WHERE session_id = ?').run(session.id)
-  const pending = db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(session.id)
+  cachedStatement(db, 'DELETE FROM chat_events WHERE session_id = ?').run(session.id)
+  const pending = cachedStatement(db, 'DELETE FROM chat_pending WHERE session_id = ?').run(session.id)
   if (pending.changes) bumpRequestRevision(current.instance)
   const envelope = appendEvent(session.id, { type: 'session.reset', session })
   saveSession(session)

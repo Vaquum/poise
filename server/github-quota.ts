@@ -5,7 +5,7 @@ import { diagnostic, diagnosticFailure } from './logging'
 import { GH_STORED_ACCOUNTS_ENV } from './accounts/clis'
 import { quotaRiskKey as riskKey } from './quota-risk'
 import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails } from './alerts/store'
-import { db, getMeta, setMeta, writeObservation } from './db'
+import { getMeta, setMeta, writeObservation } from './db'
 import { runFile } from './process'
 import { getNotificationSettings, getSettings, knownTimeZone } from './settings'
 import { zonedTime } from '../src/clock'
@@ -153,12 +153,14 @@ const conditionKey = (login: string, bucket: GithubQuotaBucket) => `${PREFIX}${l
 export function observeQuotaConditions(accounts: GithubQuotaAccount[], now = Date.now()): ReadonlySet<string> {
   const sustained = new Set<string>()
   // The windows are written together in one commit, each fsyncs alone otherwise;
-  // those observed before an invalid retained one still are, as before.
+  // those observed before an invalid retained one still are, as before. They
+  // record what the last snapshot showed, which the next one shows again, so
+  // they commit as an observation, without waiting for the disk.
   const windows: Array<[string, string]> = []
   try {
     observe(accounts, now, sustained, windows)
   } finally {
-    if (windows.length) db.transaction(() => { for (const [key, value] of windows) setMeta(key, value) })()
+    if (windows.length) writeObservation(() => { for (const [key, value] of windows) setMeta(key, value) })
   }
   return sustained
 }

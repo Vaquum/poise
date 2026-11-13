@@ -3,7 +3,8 @@
 // condition continues; a later clearing records another row. Retention is
 // measured from the handling time, not from when the notice was created.
 
-import { db } from '../db'
+import { db, writeObservation } from '../db'
+import { cachedStatement } from '../statements'
 
 export const HANDLING_RETENTION_MS = 30 * 24 * 60 * 60_000
 export const HANDLED_READ_LIMIT = 200
@@ -48,13 +49,16 @@ export function clipHandlingError(error: string | null | undefined): string | nu
   return clip(error, 500)
 }
 
-/** Record one handled action. Recording the same ref twice keeps one row. */
+/** Record one handled action. Recording the same ref twice keeps one row.
+ *  The log reports what was done, not what may be done, so it commits as an
+ *  observation: without waiting for the disk on the server's thread, which
+ *  took up to 0.7 s on a Dismiss. */
 export function recordHandling(input: HandlingInput, at = new Date().toISOString()): void {
-  db.prepare(`
+  writeObservation((connection) => cachedStatement(connection, `
     INSERT OR IGNORE INTO handling_log (at, kind, source, title, started_at, finished_at, outcome, error, actor, ref)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(at, input.kind, input.source, input.title, input.startedAt, input.finishedAt,
-    input.outcome, clipHandlingError(input.error), input.actor, input.ref)
+    input.outcome, clipHandlingError(input.error), input.actor, input.ref))
 }
 
 /** The newest handled actions inside retention, newest first, optionally

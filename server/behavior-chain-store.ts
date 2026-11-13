@@ -304,7 +304,7 @@ export class BehaviorChainJournal {
   }
 
   cutover(): BehaviorCutoverState {
-    const row = this.db.prepare('SELECT sequence, payload, state_hash FROM behavior_chain_events WHERE chain_id = ? ORDER BY sequence DESC LIMIT 1')
+    const row = cachedStatement(this.db, 'SELECT sequence, payload, state_hash FROM behavior_chain_events WHERE chain_id = ? ORDER BY sequence DESC LIMIT 1')
       .get(CUTOVER_ID) as { sequence: number, payload: string, state_hash: string } | undefined
     if (!row) return { sequence: 0, mode: 'v1', requestedAt: null, legacyPulls: [] }
     const event = JSON.parse(row.payload) as CutoverEvent
@@ -319,12 +319,12 @@ export class BehaviorChainJournal {
       if (current.sequence !== expectedSequence) throw new Error('behavior cutover changed; reload its current state')
       if (!((current.mode === 'v1' && mode === 'draining') || (current.mode === 'draining' && (mode === 'v1' || mode === 'v2')))) throw new Error('invalid behavior cutover transition')
       if (!Number.isSafeInteger(at) || at < 0 || legacyPulls.some((target) => !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+#[1-9][0-9]*$/.test(target))) throw new Error('invalid behavior cutover evidence')
-      const sequence = (this.db.prepare('SELECT coalesce(max(sequence), 0) + 1 AS next FROM behavior_chain_events').get() as { next: number }).next
+      const sequence = (cachedStatement(this.db, 'SELECT coalesce(max(sequence), 0) + 1 AS next FROM behavior_chain_events').get() as { next: number }).next
       const state: BehaviorCutoverState = { sequence, mode, requestedAt: mode === 'v1' ? null : current.requestedAt ?? at,
         legacyPulls: mode === 'v2' ? [...new Set(legacyPulls.map((target) => target.toLowerCase()))].sort() : [] }
       const payload = JSON.stringify({ type: 'admission.changed', state } satisfies CutoverEvent)
       if (Buffer.byteLength(payload) > MAX_EVENT_BYTES) throw new Error('legacy ownership boundary exceeds the journal event limit; cutover remains draining')
-      this.db.prepare('INSERT INTO behavior_chain_events(sequence, chain_id, event_id, at, payload, state_hash) VALUES (?, ?, ?, ?, ?, ?)')
+      cachedStatement(this.db, 'INSERT INTO behavior_chain_events(sequence, chain_id, event_id, at, payload, state_hash) VALUES (?, ?, ?, ?, ?, ?)')
         .run(sequence, CUTOVER_ID, `admission:${sequence}`, at, payload, chainBasis(state))
       commit?.()
       return state
@@ -332,12 +332,12 @@ export class BehaviorChainJournal {
   }
 
   read(id: string): BehaviorChain | null {
-    const row = this.db.prepare(`SELECT c.state, c.sequence, e.state_hash,
+    const row = cachedStatement(this.db, `SELECT c.state, c.sequence, e.state_hash,
       (SELECT max(sequence) FROM behavior_chain_events WHERE chain_id = c.chain_id) AS latest
       FROM behavior_chain_current c JOIN behavior_chain_events e ON e.sequence = c.sequence WHERE c.chain_id = ?`).get(id) as
       { state: string, sequence: number, state_hash: string, latest: number } | undefined
     if (!row) {
-      if (this.db.prepare('SELECT 1 FROM behavior_chain_events WHERE chain_id = ? LIMIT 1').get(id)) throw new Error('behavior projection is missing; rebuild it before continuing')
+      if (cachedStatement(this.db, 'SELECT 1 FROM behavior_chain_events WHERE chain_id = ? LIMIT 1').get(id)) throw new Error('behavior projection is missing; rebuild it before continuing')
       return null
     }
     if (row.sequence !== row.latest) throw new Error('behavior projection disagrees with the authoritative event journal')
@@ -357,7 +357,7 @@ export class BehaviorChainJournal {
     if (!id || !eventId || id.length > 256 || eventId.length > 512 || !Number.isSafeInteger(at) || at < 0
       || Buffer.byteLength(payload) > MAX_EVENT_BYTES) throw new Error('invalid or oversized behavior chain event')
     return this.db.transaction(() => {
-      const prior = this.db.prepare('SELECT chain_id, payload FROM behavior_chain_events WHERE event_id = ?').get(eventId) as { chain_id: string, payload: string } | undefined
+      const prior = cachedStatement(this.db, 'SELECT chain_id, payload FROM behavior_chain_events WHERE event_id = ?').get(eventId) as { chain_id: string, payload: string } | undefined
       if (prior) {
         if (prior.chain_id !== id || prior.payload !== payload) throw new Error('behavior event identity conflicts with its durable record')
         const existing = this.read(id)
@@ -367,14 +367,14 @@ export class BehaviorChainJournal {
       const current = this.read(id)
       if (event.type === 'chain.admitted' && this.cutover().mode === 'draining') throw new Error('behavior admissions are draining')
       if ((current?.sequence ?? 0) !== expectedSequence) throw new BehaviorChainRevisionConflict('behavior chain changed before event admission')
-      if (event.type === 'chain.admitted' && this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'chat_work_bindings'").get()
-        && this.db.prepare('SELECT 1 FROM chat_work_bindings WHERE lower(target) = lower(?) LIMIT 1')
+      if (event.type === 'chain.admitted' && cachedStatement(this.db, "SELECT 1 FROM sqlite_master WHERE name = 'chat_work_bindings'").get()
+        && cachedStatement(this.db, 'SELECT 1 FROM chat_work_bindings WHERE lower(target) = lower(?) LIMIT 1')
           .get(`https://github.com/${event.repository}/issues/${event.issue}`)) throw new Error('seed issue is already owned by an existing chat; active work cannot be migrated')
-      const sequence = (this.db.prepare('SELECT coalesce(max(sequence), 0) + 1 AS next FROM behavior_chain_events').get() as { next: number }).next
+      const sequence = (cachedStatement(this.db, 'SELECT coalesce(max(sequence), 0) + 1 AS next FROM behavior_chain_events').get() as { next: number }).next
       const next = reduceChain(current, event, sequence, id)
-      this.db.prepare('INSERT INTO behavior_chain_events(sequence, chain_id, event_id, at, payload, state_hash) VALUES (?, ?, ?, ?, ?, ?)')
+      cachedStatement(this.db, 'INSERT INTO behavior_chain_events(sequence, chain_id, event_id, at, payload, state_hash) VALUES (?, ?, ?, ?, ?, ?)')
         .run(sequence, id, eventId, at, payload, chainBasis(next))
-      this.db.prepare(`INSERT INTO behavior_chain_current(chain_id, sequence, state, merged, resource_pending) VALUES (?, ?, ?, ?, ?)
+      cachedStatement(this.db, `INSERT INTO behavior_chain_current(chain_id, sequence, state, merged, resource_pending) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(chain_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, merged=excluded.merged,
           resource_pending=excluded.resource_pending`)
         .run(id, next.sequence, JSON.stringify(next), next.mergeSha && !next.reviewPending ? 1 : 0,
@@ -402,14 +402,14 @@ export class BehaviorChainJournal {
     // choose, SQLite took the (merged, chain_id) index for the order and
     // evaluated both JSON expressions on every unmerged chain: on production
     // 76–244 ms a call, most of it for deferred passes that match few chains.
-    const rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current INDEXED BY behavior_chain_reconciliation WHERE merged = 0
+    const rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current INDEXED BY behavior_chain_reconciliation WHERE merged = 0
       AND (${ACTIVE_WORK_SQL}) = ? AND (${RECHECK_AT_SQL}) <= ? AND chain_id > ? ORDER BY chain_id LIMIT ?`)
       .all(deferred ? 0 : 1, now, after, limit) as Array<{ chain_id: string }>
     return rows.map((row) => this.read(row.chain_id)!)
   }
 
   reconciliationAt(chain: BehaviorChain): number | null {
-    const row = this.db.prepare(`SELECT CASE WHEN (${LIVE_MODEL_SQL}) AND (
+    const row = cachedStatement(this.db, `SELECT CASE WHEN (${LIVE_MODEL_SQL}) AND (
       json_extract(state, '$.mergeSha') IS NOT NULL
       OR json_extract(state, '$.observation.pull.merged') = 1
       OR json_extract(state, '$.observation.pull.state') != 'open'
@@ -425,10 +425,10 @@ export class BehaviorChainJournal {
    * observation of an already-merged target. Old history stays immutable. */
   preMergeObservation(id: string, mergedAt: number): Record<string, unknown> | null {
     if (!Number.isSafeInteger(mergedAt) || mergedAt < 0) return null
-    const firstMerge = this.db.prepare(`SELECT sequence FROM behavior_chain_events
+    const firstMerge = cachedStatement(this.db, `SELECT sequence FROM behavior_chain_events
       WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.merged' ORDER BY sequence LIMIT 1`)
       .get(id) as { sequence: number } | undefined
-    const row = this.db.prepare(`SELECT payload FROM behavior_chain_events
+    const row = cachedStatement(this.db, `SELECT payload FROM behavior_chain_events
       WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.observed' AND sequence < ?
         AND at <= ? AND json_extract(payload, '$.observation.checkedAt') <= ?
         AND json_extract(payload, '$.observation.pull.merged') = 0
@@ -437,7 +437,7 @@ export class BehaviorChainJournal {
   }
 
   firstMergedObservation(id: string): Record<string, unknown> | null {
-    const row = this.db.prepare(`SELECT payload FROM behavior_chain_events
+    const row = cachedStatement(this.db, `SELECT payload FROM behavior_chain_events
       WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.observed' AND sequence < (
         SELECT sequence FROM behavior_chain_events WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.merged'
         ORDER BY sequence LIMIT 1) ORDER BY sequence DESC LIMIT 1`).get(id, id) as { payload: string } | undefined
@@ -467,7 +467,7 @@ export class BehaviorChainJournal {
   /** Exact retained identities only; target proximity cannot associate a diagnostic. */
   forInvocation(callId: string | null, correlationId: string | null): { chain: BehaviorChain, invocation: ChainInvocation } | null {
     if (!callId && !correlationId) return null
-    const rows = this.db.prepare(`SELECT c.chain_id, CAST(i.key AS INTEGER) AS position
+    const rows = cachedStatement(this.db, `SELECT c.chain_id, CAST(i.key AS INTEGER) AS position
       FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
       WHERE json_extract(i.value, '$.id') = ? OR json_extract(i.value, '$.callId') = ?
         OR json_extract(i.value, '$.evidence.nativeCallId') = ? OR json_extract(i.value, '$.evidence.callId') = ? LIMIT 2`)
@@ -485,8 +485,8 @@ export class BehaviorChainJournal {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('behavior chain page must contain 1 to 100 records')
     // Closure only changes this view; incomplete or conflicting evidence stays visible.
     const rows = (merged === null
-      ? this.db.prepare('SELECT chain_id FROM behavior_chain_current WHERE chain_id > ? ORDER BY chain_id LIMIT ?').all(after, limit)
-      : this.db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE merged = ?
+      ? cachedStatement(this.db, 'SELECT chain_id FROM behavior_chain_current WHERE chain_id > ? ORDER BY chain_id LIMIT ?').all(after, limit)
+      : cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current WHERE merged = ?
         ${merged ? '' : `AND json_extract(state, '$.supersession') IS NULL AND NOT coalesce((
           json_type(state, '$.observation.issue.open') = 'false'
           AND json_type(state, '$.observation.existingPulls') = 'array'
@@ -512,7 +512,7 @@ export class BehaviorChainJournal {
 
   verifyProjection(): void {
     this.cutover()
-    const missing = this.db.prepare(`SELECT 1 FROM behavior_chain_events e LEFT JOIN behavior_chain_current c ON c.chain_id=e.chain_id
+    const missing = cachedStatement(this.db, `SELECT 1 FROM behavior_chain_events e LEFT JOIN behavior_chain_current c ON c.chain_id=e.chain_id
       WHERE e.chain_id != ? AND (c.chain_id IS NULL OR c.sequence < e.sequence) LIMIT 1`).get(CUTOVER_ID)
     if (missing) { this.rebuild(); return }
     for (const row of this.db.prepare('SELECT chain_id FROM behavior_chain_current').iterate() as Iterable<{ chain_id: string }>) this.read(row.chain_id)
@@ -545,7 +545,7 @@ export class BehaviorChainJournal {
   }
 
   liveModelInvocationCount(): number {
-    const row = this.db.prepare(`SELECT count(*) AS count FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+    const row = cachedStatement(this.db, `SELECT count(*) AS count FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
       WHERE c.resource_pending = 1 AND json_extract(i.value, '$.model') IS NOT NULL
         AND behavior_native_resources_pending(i.value) = 1`).get() as { count: number }
     return row.count
@@ -555,7 +555,7 @@ export class BehaviorChainJournal {
    * independent of organization readiness and behavior admission controls. */
   pendingResourcePage(after: { chain: string, position: number }, limit = 16): { chain: BehaviorChain, invocation: ChainInvocation, position: number }[] {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 16 || !Number.isSafeInteger(after.position)) throw new Error('invalid pending resource page')
-    const rows = this.db.prepare(`SELECT c.chain_id AS chain, CAST(i.key AS INTEGER) AS position
+    const rows = cachedStatement(this.db, `SELECT c.chain_id AS chain, CAST(i.key AS INTEGER) AS position
       FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
       WHERE c.resource_pending = 1 AND behavior_native_resources_pending(i.value) = 1
         AND (c.chain_id > ? OR (c.chain_id = ? AND CAST(i.key AS INTEGER) > ?))
@@ -572,7 +572,7 @@ export class BehaviorChainJournal {
    *  exactly once, while cleanup uncertainty retains it. `unaccounted`
    *  counts live invocations admitted without a reservation. */
   reservedResources(): BehaviorResourceReservation & { unaccounted: number } {
-    const row = this.db.prepare(`SELECT coalesce(sum(json_extract(i.value, '$.reservation.memoryBytes')), 0) AS memory,
+    const row = cachedStatement(this.db, `SELECT coalesce(sum(json_extract(i.value, '$.reservation.memoryBytes')), 0) AS memory,
       coalesce(sum(json_extract(i.value, '$.reservation.diskBytes')), 0) AS disk,
       coalesce(sum(CASE WHEN json_extract(i.value, '$.reservation.memoryBytes') IS NULL
         OR json_extract(i.value, '$.reservation.diskBytes') IS NULL THEN 1 ELSE 0 END), 0) AS unaccounted
@@ -586,12 +586,12 @@ export class BehaviorChainJournal {
 
   history(id: string, after = 0, limit = 100): StoredEvent[] {
     if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('invalid behavior event page')
-    return this.db.prepare('SELECT * FROM behavior_chain_events WHERE chain_id = ? AND sequence > ? ORDER BY sequence LIMIT ?').all(id, after, limit) as StoredEvent[]
+    return cachedStatement(this.db, 'SELECT * FROM behavior_chain_events WHERE chain_id = ? AND sequence > ? ORDER BY sequence LIMIT ?').all(id, after, limit) as StoredEvent[]
   }
 
   rebuild(): void {
     this.db.transaction(() => {
-      this.db.prepare('DELETE FROM behavior_chain_current').run()
+      cachedStatement(this.db, 'DELETE FROM behavior_chain_current').run()
       const states = new Map<string, BehaviorChain>()
       for (const row of this.db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').iterate() as Iterable<StoredEvent>) {
         if (row.chain_id === CUTOVER_ID) {
@@ -611,7 +611,7 @@ export class BehaviorChainJournal {
         if (chainBasis(next) !== hash) throw new Error('behavior journal state hash is invalid')
         states.set(row.chain_id, next)
       }
-      const save = this.db.prepare('INSERT INTO behavior_chain_current(chain_id, sequence, state, merged, resource_pending) VALUES (?, ?, ?, ?, ?)')
+      const save = cachedStatement(this.db, 'INSERT INTO behavior_chain_current(chain_id, sequence, state, merged, resource_pending) VALUES (?, ?, ?, ?, ?)')
       for (const state of states.values()) save.run(state.id, state.sequence, JSON.stringify(state), state.mergeSha && !state.reviewPending ? 1 : 0,
         state.invocations.some(invocation => nativeResourcesPending({ ...invocation })) ? 1 : 0)
     }).immediate()

@@ -409,7 +409,8 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
   const mergePrsPaused = isPaused('merge-prs')
   const mergePrsRunnable = mergePrsEnabled && !mergePrsPaused
   const cap = getReviewCap()
-  const reviewStates = listPrReviewStates()
+  // Only the reported pull requests' launches are looked up below.
+  const reviewStates = listPrReviewStates(inventory.map(({ pr }) => pr.number))
   const liveClaims = listLiveReviewClaims()
   const greyHeads = listGreyCiPendingHeads()
   const incidents = getBehaviorDiagnosticIncidents(null)

@@ -193,7 +193,7 @@ function globalPreference(key: string): string | null {
     }
     value = JSON.stringify([...repositories.values()].sort((a, b) => a.repo.localeCompare(b.repo)))
   }
-  db.prepare('INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)').run(key, value)
+  cachedStatement(db, 'INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)').run(key, value)
   return databaseGetMeta(key)
 }
 
@@ -234,7 +234,7 @@ function listBehaviorIncidents(limit = 50) {
 // Closure suppresses late failure evidence only until an exact open read
 // restores an active incident. Match the original reviewer/request target.
 function closedTargetIncidentRetired(behavior: string, target: string, correlationId: string): string | null {
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT dead.id FROM behavior_dead_letters AS dead
     WHERE dead.behavior = ? AND dead.target = ? AND dead.retired_at IS NOT NULL
       AND dead.resolution = 'superseded' AND json_valid(dead.resolution_evidence)
@@ -1699,7 +1699,7 @@ function settleClosedTargetFirings(results: DeadLetterReconcileResult[]): void {
 // launch are read. A reopened PR skips. The incident's retirement stamp is
 // the stable completion time so repeats settle to the same record.
 function settleClosedTargetHistoricalFirings(closed: ReadonlySet<string>): void {
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     SELECT seen.key AS behavior, seen.target AS target,
       seen.launch_repo AS repo, seen.launch_pr AS pr,
       seen.launch_correlation_id AS correlation_id, seen.launch_call_id AS call_id,
@@ -1738,7 +1738,7 @@ function settleClosedTargetHistoricalFirings(closed: ReadonlySet<string>): void 
 
 function recordQuarantineIncident(claim: BehaviorLaunchClaim, error: string, callId: string | null): void {
   if (claim.launchQuarantine === 'invalid_result') return
-  const updated = db.prepare(`
+  const updated = cachedStatement(db, `
     UPDATE behavior_dead_letters SET error = ?, call_id = COALESCE(call_id, ?)
     WHERE behavior = ? AND target = ? AND correlation_id = ? AND retired_at IS NULL
   `).run(error.slice(-4_000), callId, claim.key, claim.target, claim.launchCorrelationId)
@@ -1746,7 +1746,7 @@ function recordQuarantineIncident(claim: BehaviorLaunchClaim, error: string, cal
 }
 
 function retireQuarantineIncident(claim: BehaviorLaunchClaim): void {
-  db.prepare(`
+  cachedStatement(db, `
     UPDATE behavior_dead_letters SET retired_at = ?
     WHERE behavior = ? AND target = ? AND correlation_id = ? AND retired_at IS NULL
   `).run(new Date().toISOString(), claim.key, claim.target, claim.launchCorrelationId)
@@ -1783,7 +1783,7 @@ function quarantineClaim(
 }
 
 function quarantineBlocksLogCorrection(behavior: string, target: string): boolean {
-  return !!db.prepare(`
+  return !!cachedStatement(db, `
     SELECT 1 FROM behavior_seen
     WHERE key = ? AND target = ? AND (launch_quarantine = 'invalid_result'
       OR (launch_quarantine = 'unreadable' AND claim_id <> ''))
@@ -1795,7 +1795,7 @@ function quarantineBlocksLogCorrection(behavior: string, target: string): boolea
 function invalidPrResultHoldDetail(repo: string, pr: number): {
   callId: string | null, head: string, error: string | null,
 } | null {
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT launch_call_id AS callId, launch_expected_head AS head, launch_error AS error
     FROM behavior_seen
     WHERE key IN ('review-new-prs', 'approve-prs') AND (
@@ -1885,7 +1885,7 @@ function quarantineFailedClaim(
 ): void {
   if (kind === 'unreadable' && claim.launchError === REVIEW_BUDGET_STOPPED) error = REVIEW_BUDGET_STOPPED
   const changed = db.transaction(() => {
-    const changed = db.prepare(`
+    const changed = cachedStatement(db, `
       UPDATE behavior_seen
       SET launch_quarantine_may_run = CASE WHEN launch_quarantine IS NULL THEN ? ELSE MAX(launch_quarantine_may_run, ?) END,
           launch_quarantine = CASE WHEN launch_quarantine = 'invalid_result' THEN launch_quarantine ELSE ? END,
@@ -1955,7 +1955,7 @@ function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry |
   const message = claim.launchError === REVIEW_BUDGET_STOPPED ? REVIEW_BUDGET_STOPPED
     : call.error || `agent call terminated with status ${call.status.toLowerCase()}`
   db.transaction(() => {
-    const changed = db.prepare(`
+    const changed = cachedStatement(db, `
       UPDATE behavior_seen SET launch_quarantine = NULL, launch_error = ?, launch_quarantine_may_run = 1
       WHERE key = ? AND target = ? AND claim_id = '' AND launch_quarantine = 'unreadable'
         AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
@@ -2006,7 +2006,7 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
   // incident and the firing: without the outcome, action, completion time
   // and head, the approval basis and round accounting would still see no
   // completed work. The retired incident keeps the original failure text.
-  const settled = db.prepare(`
+  const settled = cachedStatement(db, `
     UPDATE behavior_seen SET launch_quarantine = NULL, launch_error = NULL,
       launch_outcome = ?, launch_action = ?, launch_completed_at = ?, launch_head_sha = ?
     WHERE key = ? AND target = ? AND claim_id = '' AND launch_outcome IS NULL AND launch_error IS NOT NULL
@@ -2040,7 +2040,7 @@ function failedBehaviorLaunches(behavior: string): BehaviorLaunchClaim[] {
 // incidents already retired: superseding an incident settles its firing,
 // but the retained launch keeps fencing its input against blind relaunch.
 function retainedFailedLaunchesForPr(behavior: string, repo: string, pr: number): BehaviorLaunchClaim[] {
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     SELECT target FROM behavior_seen AS launch
     WHERE key = ? AND claim_id = '' AND launch_call_id IS NOT NULL
       AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
@@ -2888,7 +2888,7 @@ function reconcileClosedTargetIncidents(): Promise<void> {
   const pending = closedTargetReconciliations.get(scope)
   if (pending) return pending
   const behaviors: BehaviorKey[] = ['review-new-issues', 'review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci', 'close-old-prs']
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     SELECT DISTINCT dead.behavior, dead.target, dead.repo, dead.pr, dead.error
     FROM behavior_dead_letters AS dead
     WHERE dead.repo IS NOT NULL AND dead.pr IS NOT NULL
@@ -3420,12 +3420,12 @@ async function recoverSnapshotReviews(
           id: entry.id, correlationId: entry.correlation_id,
         }, true))) {
         db.transaction(() => {
-          const changed = db.prepare(`
+          const changed = cachedStatement(db, `
             UPDATE behavior_seen SET launch_quarantine = 'unreadable', launch_error = 'snapshot review evidence is unreadable'
             WHERE key = 'review-new-prs' AND target = ? AND seen_at = ?
               AND claim_id = '' AND launch_requested_at IS NULL AND launch_quarantine IS NULL
           `).run(candidate.target, candidate.seenAt)
-          if (changed.changes) db.prepare(`
+          if (changed.changes) cachedStatement(db, `
             INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, actor, source, correlation_id, error, created_at)
             VALUES(?, 'review-new-prs', ?, ?, ?, ?, 'poise:snapshot-recovery', ?, 'snapshot review evidence is unreadable', ?)
           `).run(randomUUID(), candidate.target, repo, Number(prId), reviewer,
@@ -3435,18 +3435,18 @@ async function recoverSnapshotReviews(
         continue
       }
       const completed = matching.some((entry) => entry.status === 'completed')
-      const previouslyUnreadable = db.prepare(`
+      const previouslyUnreadable = cachedStatement(db, `
         SELECT 1 FROM behavior_seen WHERE key = 'review-new-prs' AND target = ? AND seen_at = ?
           AND claim_id = '' AND launch_requested_at IS NULL AND launch_quarantine IS NOT NULL
       `).get(candidate.target, candidate.seenAt)
       if (previouslyUnreadable) {
         if (!completed) { uncertain = true; continue }
-        db.prepare(`
+        cachedStatement(db, `
           UPDATE behavior_seen SET launch_quarantine = NULL, launch_error = NULL
           WHERE key = 'review-new-prs' AND target = ? AND seen_at = ?
             AND claim_id = '' AND launch_requested_at IS NULL AND launch_quarantine = 'unreadable'
         `).run(candidate.target, candidate.seenAt)
-        db.prepare(`
+        cachedStatement(db, `
           UPDATE behavior_dead_letters SET retired_at = ?
           WHERE behavior = 'review-new-prs' AND target = ? AND source = 'poise:snapshot-recovery'
             AND correlation_id = ? AND retired_at IS NULL
@@ -4102,7 +4102,7 @@ function ensureBudgetStopHold(
   const launchBehavior = upstreamBehavior(behavior)
   const source = `poise:${behavior}` as const
   if (activeClaimId) {
-    const converted = db.prepare(`
+    const converted = cachedStatement(db, `
       UPDATE behavior_seen SET claim_id = '', lease_until = NULL, seen_at = ?,
         launch_behavior = ?, launch_repo = ?, launch_pr = ?,
         launch_requested_at = ?, launch_call_id = ?, launch_error = ?,
@@ -4128,7 +4128,7 @@ function ensureBudgetStopHold(
     if (listBehaviorLaunchClaims(behavior).some((claim) => claim.target === target)) return
     if (getFailedBehaviorLaunch(behavior, target)) return
   }
-  db.prepare(`
+  cachedStatement(db, `
     INSERT INTO behavior_seen(key, target, seen_at, claim_id, launch_behavior, launch_repo, launch_pr,
       launch_requested_at, launch_call_id, launch_error, launch_expected_head, launch_actor, launch_source, launch_correlation_id)
     VALUES(?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -5421,7 +5421,7 @@ function archiveResolveRecovery(checkTarget: string, pending: ResolveRecovery, d
   const receipt = { ...pending, disposition: pending.sideEffects === 'none' ? 'failed' : disposition,
     targetDisposition: disposition, observedHead: head, observedAt: at }
   // This native receipt is durable before the optional observer is notified.
-  const stored = db.prepare("UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
+  const stored = cachedStatement(db, "UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
     .run(JSON.stringify({ target: checkTarget, ...receipt }), pending.nativeId)
   // Legacy releases used unrelated run/admission IDs. Do not invent their
   // correlation; retain their exact native receipt when no run row matches.
@@ -5447,7 +5447,7 @@ function retainResolveSupersededReceipt(checkTarget: string, attempt: ResolveRec
   const at = new Date().toISOString()
   const receipt = { ...single, disposition: 'superseded', targetDisposition: 'superseded' as const,
     observedHead, observedAt: at }
-  const stored = db.prepare("UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
+  const stored = cachedStatement(db, "UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
     .run(JSON.stringify({ target: checkTarget, ...receipt }), single.nativeId)
   if (!stored.changes) setMeta(`${resolveRecoveryKey(checkTarget)}:receipt:${single.nativeId}`, JSON.stringify(receipt))
 }
@@ -5499,7 +5499,7 @@ function retainResolveRecoveryFailure(checkTarget: string, detail: ResolveAttemp
   if (ownIndex < 0) {
     // A later native settlement owns the target now. Preserve its receipt
     // when the old process finally reports failure; never rearm its pointer.
-    const row = db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(detail.nativeId) as { note: string | null } | undefined
+    const row = cachedStatement(db, 'SELECT note FROM behavior_runs WHERE id = ?').get(detail.nativeId) as { note: string | null } | undefined
     const receipt = getMeta(`${resolveRecoveryKey(checkTarget)}:receipt:${detail.nativeId}`) ?? row?.note
     if (receipt?.startsWith('{')) {
       const settled = objectValue(parseJson(receipt, 'settled resolution receipt'), 'settled resolution receipt')
@@ -5554,7 +5554,7 @@ function retireResolveRecoveryAttempt(checkTarget: string, nativeId: string): vo
 }
 
 function discardResolveRun(runId: string, checkTarget: string): void {
-  const row = db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(runId) as { note: string | null } | undefined
+  const row = cachedStatement(db, 'SELECT note FROM behavior_runs WHERE id = ?').get(runId) as { note: string | null } | undefined
   if (row?.note?.startsWith('{')) {
     const receipt = objectValue(parseJson(row.note, 'resolution run receipt'), 'resolution run receipt')
     if (receipt.nativeId === runId && ['completed', 'superseded', 'failed'].includes(String(receipt.disposition))) {
@@ -5608,7 +5608,7 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
     ...(previous.length ? { previous } : {}) }
   db.transaction(() => {
     setMeta(resolveRecoveryKey(checkTarget), JSON.stringify(admitted))
-    db.prepare("UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
+    cachedStatement(db, "UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
       .run(JSON.stringify({ target: checkTarget, ...admitted }), nativeId)
   })()
   detail.nativeId = nativeId
@@ -6466,7 +6466,7 @@ async function tickRerunGreyCi(): Promise<void> {
       clearBehaviorFailure(behavior, target, actor)
       // Rehydrate every unconfirmed intent on this head, even when its CI is
       // now green or running and discovery no longer returns a grey candidate.
-      const pending = db.prepare(`SELECT launch_source AS source, launch_error AS error FROM behavior_seen
+      const pending = cachedStatement(db, `SELECT launch_source AS source, launch_error AS error FROM behavior_seen
         WHERE key = ? AND launch_repo = ? AND launch_expected_head = ? AND claim_id <> ''`)
         .all(GREY_CI_INTENT_KEY, pr.repo.toLowerCase(), row.head_sha) as Array<{ source: string, error: string | null }>
       for (const intent of pending) {
@@ -6513,7 +6513,7 @@ async function tickRerunGreyCi(): Promise<void> {
             || configuredReviewer(pr.author) !== actor) continue
           const claimed = db.transaction(() => {
             if (!claimSeenOwnedAs(claimKey, claimTarget, claimId, PR_OPERATION_EVALUATION_LEASE_MS)) return false
-            db.prepare(`UPDATE behavior_seen SET launch_requested_at = ?, launch_repo = ?, launch_pr = ?,
+            cachedStatement(db, `UPDATE behavior_seen SET launch_requested_at = ?, launch_repo = ?, launch_pr = ?,
               launch_expected_head = ?, launch_actor = ?, launch_source = ? WHERE key = ? AND target = ? AND claim_id = ?`)
               .run(new Date().toISOString(), pr.repo.toLowerCase(), pr.number, row.head_sha, actor, source, claimKey, claimTarget, claimId)
             return true
@@ -6672,7 +6672,7 @@ async function tickCloseOldPrs(): Promise<void> {
       }
       recordBehaviorFailure(behavior, 'operation', error, target, { actingAccount: actor })
       if (!readRepoAccessHold(pr.repo, actor)) {
-        db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, actor, source, correlation_id, error, created_at)
+        cachedStatement(db, `INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, actor, source, correlation_id, error, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomUUID(), behavior, target, pr.repo, pr.number,
           actor, 'poise:close-old-prs', runId, message, new Date().toISOString())
       }
@@ -7068,7 +7068,7 @@ async function planIssueReviews(
       .filter((call) => (row.id && call.id === row.id)
         || (row.correlationId && call.correlation_id === row.correlationId))
       .map((call) => ({ id: call.id, correlationId: call.correlation_id }))]
-    const launches = identities.flatMap((identity) => db.prepare(`
+    const launches = identities.flatMap((identity) => cachedStatement(db, `
       SELECT launch_repo AS repo, launch_pr AS number, launch_covers AS covers
       FROM behavior_seen WHERE launch_behavior = 'issue_review'
         AND ((? IS NOT NULL AND launch_call_id = ?) OR (? IS NOT NULL AND launch_correlation_id = ?))
@@ -7825,7 +7825,7 @@ async function replayTargetRefusal(
 // even after reconciliation retired its incident behind a sibling success:
 // the incident is visibility, the claim row is the obligation.
 function failedReviewSlotWithoutOutcome(repo: string, pr: number, head: string, actor: string): boolean {
-  return !!db.prepare(`
+  return !!cachedStatement(db, `
     SELECT 1 FROM behavior_seen
     WHERE key = 'review-new-prs' AND claim_id = '' AND launch_call_id IS NOT NULL
       AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
@@ -8046,8 +8046,8 @@ export function chainBehaviorKey(behavior: ChainBehavior): BehaviorKey | null {
 
 async function runBehaviorChains(): Promise<void> {
   const configured = databaseGetMeta('behavior_chain_settings')
-  if (!configured && (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()
-    || !db.prepare('SELECT 1 FROM behavior_chain_current WHERE merged = 0 LIMIT 1').get())) return
+  if (!configured && (!cachedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()
+    || !cachedStatement(db, 'SELECT 1 FROM behavior_chain_current WHERE merged = 0 LIMIT 1').get())) return
   const org = currentOrganization()
   if (!org) return
   if (!loadedCatalog() && providerSignInFailure('codex')?.verifiedAt != null) await loadCatalog()
@@ -8216,7 +8216,7 @@ async function runBehaviorChains(): Promise<void> {
         const existing = new Set<string>()
         if (!seeds.length) return existing
         const wanted = new Set(seeds.map((seed) => `${seed.repository.toLowerCase()}#${seed.number}`))
-        if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'chat_work_bindings'").get()) {
+        if (cachedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'chat_work_bindings'").get()) {
           for (const row of db.prepare('SELECT target FROM chat_work_bindings').iterate() as Iterable<{ target: string }>) {
             const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/([1-9][0-9]*)$/.exec(row.target)
             if (match) existing.add(`${match[1].toLowerCase()}#${match[2]}`)
@@ -8588,16 +8588,16 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
       const failure = readBehaviorFailure(behavior, target)
       let recovered = false
       if (failure?.kind === 'worker' && failure.diagnostic?.severity === 'info' && target
-        && db.prepare('SELECT 1 FROM behavior_seen WHERE key = ? AND target = ? AND launch_quarantine IS NOT NULL')
+        && cachedStatement(db, 'SELECT 1 FROM behavior_seen WHERE key = ? AND target = ? AND launch_quarantine IS NOT NULL')
           .get(behavior, target)) {
         failure.diagnostic = diagnosticClassification('held_result')
       }
       if (failure?.kind === 'worker' && failure.diagnostic?.severity === 'info' && target) {
         const ref = /^([^#]+)#(\d+)/.exec(target)
         const failedActor = failure.callId
-          ? (db.prepare('SELECT launch_actor FROM behavior_seen WHERE launch_call_id = ?').get(failure.callId) as { launch_actor: string } | undefined)?.launch_actor
+          ? (cachedStatement(db, 'SELECT launch_actor FROM behavior_seen WHERE launch_call_id = ?').get(failure.callId) as { launch_actor: string } | undefined)?.launch_actor
           : undefined
-        if (ref && failedActor && db.prepare(`
+        if (ref && failedActor && cachedStatement(db, `
           SELECT 1 FROM behavior_seen recovered
           WHERE recovered.key = ? AND recovered.launch_repo = ? AND recovered.launch_pr = ?
             AND lower(recovered.launch_actor) = lower(?) AND recovered.launch_source = ?

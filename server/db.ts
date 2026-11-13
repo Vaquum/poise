@@ -536,18 +536,19 @@ let observing: Database.Database | null = null
  *  quota samples): a power cut may lose its last commit, and the next
  *  observation records it again, so it need not wait for the disk on the
  *  server's thread. getMeta and setMeta inside it use that connection, and
- *  `write` must touch nothing else. Inside a transaction on the main
- *  connection it is simply part of that transaction. */
+ *  `write` runs any other statement on the connection it is given. Inside a
+ *  transaction on the main connection it is simply part of that transaction. */
 /** Whether an observation's transaction is open now. */
 export const observationOpen = (): boolean => observing !== null
 
-export function writeObservation<T>(write: () => T): T {
-  if (observing || db.inTransaction) return write()
+export function writeObservation<T>(write: (connection: Database.Database) => T): T {
+  if (observing) return write(observing)
+  if (db.inTransaction) return write(db)
   const connection = cursorConnection()
-  if (connection === db) return db.transaction(write).immediate()
+  if (connection === db) return db.transaction(() => write(db)).immediate()
   return connection.transaction(() => {
     observing = connection
-    try { return write() } finally { observing = null }
+    try { return write(connection) } finally { observing = null }
   }).immediate()
 }
 
@@ -1192,8 +1193,7 @@ export interface PrReviewState {
   quarantine: string | null
 }
 
-export function listPrReviewStates(): PrReviewState[] {
-  return db.prepare(`
+const PR_REVIEW_STATES_SQL = `
     SELECT key, target, launch_repo AS repo, launch_pr AS pr, launch_action AS action,
       launch_outcome AS outcome, launch_head_sha AS headSha, launch_expected_head AS expectedHead,
       launch_requested_at AS requestedAt, launch_completed_at AS completedAt,
@@ -1201,8 +1201,15 @@ export function listPrReviewStates(): PrReviewState[] {
       claim_id AS claimId, lease_until AS leaseUntil, launch_quarantine AS quarantine
     FROM behavior_seen
     WHERE key IN ('review-new-prs', 'approve-prs')
-      AND launch_repo IS NOT NULL AND launch_pr IS NOT NULL
-  `).all() as PrReviewState[]
+      AND launch_repo IS NOT NULL AND launch_pr IS NOT NULL`
+
+/** Review and approval launches; with `numbers`, only those of pull requests
+ *  with these numbers. behavior_seen keeps every launch ever made, and a
+ *  status read needs only the pull requests it reports. */
+export function listPrReviewStates(numbers?: readonly number[]): PrReviewState[] {
+  if (numbers === undefined) return cachedStatement(db, PR_REVIEW_STATES_SQL).all() as PrReviewState[]
+  return cachedStatement(db, `${PR_REVIEW_STATES_SQL} AND launch_pr IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify([...new Set(numbers)])) as PrReviewState[]
 }
 
 // Live review claims, including pre-launch ones whose launch row is not
