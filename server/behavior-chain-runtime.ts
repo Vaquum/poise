@@ -853,6 +853,13 @@ export class BehaviorChainRuntime {
       this.operations.wake()
       return
     }
+    if (resourcesSettled && invocation.state === 'uncertain' && typeof nativeId === 'string'
+      && ['implement-issue', 'repair-pr'].includes(invocation.behavior)
+      && (invocation.evidence?.artifact as Record<string, unknown> | null)?.phase === 'publishing'
+      && (observation.publication.head_invocation !== nativeId || !observation.publication.head_sha)) {
+      const reason = `${invocation.behavior} is uncertain; original Call ${nativeId} lacks a pre-push no-write checkpoint or a conclusive push result; reconcile that original push evidence before retrying`
+      if (chain.waiting !== reason) chain = this.append(chain, { type: 'chain.waiting', reason })
+    }
     if (await this.closeRecovery(chain, invocation, observation, snapshot)) return
     if (resourcesSettled && invocation.state === 'uncertain' && typeof nativeId === 'string'
       && invocation.behavior === 'repair-pr' && observation.workPublication?.callId === nativeId

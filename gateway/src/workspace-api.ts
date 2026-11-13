@@ -5,6 +5,7 @@ import {
 import type { Context, Principal } from './context.js'
 import { header, HttpError, readBody, sendJson } from './http.js'
 import { decideCode, listDevices, revokeDevice } from './link.js'
+import { decidePhone, grantOf, phoneOverview, signOutPhone, startPhoneCode } from './phone.js'
 import { linkInstallerUrl, linkReleasesUrl } from './pages.js'
 import type { User } from './store.js'
 import { gatewayLogging } from './logging-api.js'
@@ -27,7 +28,7 @@ interface Reply {
 interface Route {
   method: 'GET' | 'POST'
   admin?: boolean
-  run(ctx: Context, principal: Principal, body: Record<string, unknown>): Reply | Promise<Reply>
+  run(ctx: Context, principal: Principal, body: Record<string, unknown>, url: URL): Reply | Promise<Reply>
 }
 
 /** Only the owner's browser session: device tokens belong to /api/link/*, and nobody else's session reaches this. */
@@ -167,6 +168,35 @@ const ROUTES: Record<string, Route> = {
       return { body: { devices: listDevices(ctx, principal.user.handle) } }
     },
   },
+  phone: {
+    method: 'GET',
+    run: (ctx, principal) => ({ body: phoneOverview(ctx, principal) }),
+  },
+  'phone/start': {
+    method: 'POST',
+    run: (ctx, principal): Reply => {
+      const outcome = startPhoneCode(ctx, principal)
+      if (outcome.ok) return { body: { code: outcome.code, url: outcome.url } }
+      return {
+        status: 429,
+        body: { error: 'too_many_requests', message: outcome.message },
+        headers: { 'retry-after': String(outcome.retryAfterSeconds) },
+      }
+    },
+  },
+  // The grant rides in the query, where a login proxy in front can read it on its way past.
+  'phone/approve': {
+    method: 'POST',
+    run: (ctx, principal, body, url) => ({ body: { code: decidePhone(ctx, principal, text(body, 'id'), 'approve', grantOf(url)) } }),
+  },
+  'phone/deny': {
+    method: 'POST',
+    run: (ctx, principal, body) => ({ body: { code: decidePhone(ctx, principal, text(body, 'id'), 'deny', null) } }),
+  },
+  'phone/revoke': {
+    method: 'POST',
+    run: (ctx, principal, body, url) => ({ body: { phones: signOutPhone(ctx, principal, text(body, 'id'), grantOf(url)) } }),
+  },
   admin: {
     method: 'GET',
     admin: true,
@@ -204,6 +234,6 @@ export async function workspaceApi(ctx: Context, req: IncomingMessage, res: Serv
   const change = route.method === 'POST'
   requireOwnPage(ctx, req, owner, change)
   if (route.admin) requireAdmin(principal)
-  const reply = await route.run(ctx, principal, change ? await readJsonObject(req) : {})
+  const reply = await route.run(ctx, principal, change ? await readJsonObject(req) : {}, url)
   sendJson(res, reply.status ?? 200, reply.body, reply.headers)
 }

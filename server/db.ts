@@ -493,12 +493,67 @@ if (secureDeleteRebuilt !== 'complete') {
 // cheap and makes schema initialization safe to repeat.
 
 export function getMeta(key: string): string | null {
-  const row = cachedStatement(db, 'SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
+  const row = cachedStatement(observing ?? db, 'SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
   return row ? row.value : null
 }
 
+// Rotation cursors only say where a behavior's next sweep starts, and the
+// behaviors move them every batch. Each commit on the main connection waits
+// for the disk on the server's thread (0.3–1.1 s on production, 17 s an hour
+// for two cursors alone). Losing the last move to a power cut only starts a
+// rotation a little earlier, so cursors commit on a connection of their own
+// that does not wait for the disk. Inside a transaction a cursor goes with it.
+const ROTATION_CURSORS = new Set([
+  'behavior_review_new_prs_prepare_cursor',
+  'behavior_approve_prs_cursor',
+  'behavior_resolve_unblocking_cursor',
+  'behavior_resolve_unblocking_recovery_cursor',
+  'behavior_merge_prs_cursor',
+  'behavior_rerun_grey_ci_cursor',
+])
+let cursorDb: Database.Database | null = null
+
+function cursorConnection(): Database.Database {
+  if (DB_PATH === ':memory:' || !db.open) return db
+  if (cursorDb?.open) return cursorDb
+  cursorDb = new Database(DB_PATH)
+  cursorDb.pragma('busy_timeout = 5000')
+  cursorDb.pragma('secure_delete = ON')
+  cursorDb.pragma('synchronous = NORMAL')
+  // Checkpoints stay with the main connection.
+  cursorDb.pragma('wal_autocheckpoint = 0')
+  return cursorDb
+}
+
+// A managed organization's behaviors scope their keys as `org:<login>:<key>`.
+const isRotationCursor = (key: string): boolean => ROTATION_CURSORS.has(key.replace(/^org:[^:]+:/, ''))
+
+// The connection of the observation being written now (see `writeObservation`), if any.
+let observing: Database.Database | null = null
+
+/** Runs `write` as one transaction on the cursor connection, for state that
+ *  only records what Poise last observed (a datastore's freshness, GitHub
+ *  quota samples): a power cut may lose its last commit, and the next
+ *  observation records it again, so it need not wait for the disk on the
+ *  server's thread. getMeta and setMeta inside it use that connection, and
+ *  `write` must touch nothing else. Inside a transaction on the main
+ *  connection it is simply part of that transaction. */
+/** Whether an observation's transaction is open now. */
+export const observationOpen = (): boolean => observing !== null
+
+export function writeObservation<T>(write: () => T): T {
+  if (observing || db.inTransaction) return write()
+  const connection = cursorConnection()
+  if (connection === db) return db.transaction(write).immediate()
+  return connection.transaction(() => {
+    observing = connection
+    try { return write() } finally { observing = null }
+  }).immediate()
+}
+
 export function setMeta(key: string, value: string): void {
-  db.prepare('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
+  const connection = observing ?? (isRotationCursor(key) && !db.inTransaction ? cursorConnection() : db)
+  connection.prepare('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
 }
 
 // ── Behavior dedupe (atomic across runtimes) ──────────────────────────
@@ -1842,6 +1897,8 @@ export function clearSeenExceptLaunched(key: string, organization?: string): voi
 // Production servers call this during graceful shutdown. Kept explicit
 // rather than installing process-level signal handlers in a data module.
 export function closeDatabase(): void {
+  if (cursorDb?.open) cursorDb.close()
+  cursorDb = null
   if (!db.open) return
   try {
     db.pragma('wal_checkpoint(TRUNCATE)')

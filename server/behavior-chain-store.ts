@@ -396,7 +396,11 @@ export class BehaviorChainJournal {
    * normal-work page, including when its scheduled recheck becomes due. */
   reconcilable(after: string, now: number, deferred: boolean, limit = 100): BehaviorChain[] {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !Number.isSafeInteger(now) || now < 0) throw new Error('invalid behavior reconciliation page')
-    const rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE merged = 0
+    // The reconciliation index answers this from its own entries. Left to
+    // choose, SQLite took the (merged, chain_id) index for the order and
+    // evaluated both JSON expressions on every unmerged chain: on production
+    // 76–244 ms a call, most of it for deferred passes that match few chains.
+    const rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current INDEXED BY behavior_chain_reconciliation WHERE merged = 0
       AND (${ACTIVE_WORK_SQL}) = ? AND (${RECHECK_AT_SQL}) <= ? AND chain_id > ? ORDER BY chain_id LIMIT ?`)
       .all(deferred ? 0 : 1, now, after, limit) as Array<{ chain_id: string }>
     return rows.map((row) => this.read(row.chain_id)!)

@@ -768,3 +768,24 @@ it('replays only the chains whose journal changed, and reads as a fresh journal 
     expect(read).toEqual(await projectAnalyticsHealth(new BehaviorChainJournal(f.db), { ...f.input, now }))
   }
 })
+
+it('keeps the thread in slices across the journal rather than yielding after every chain', async () => {
+  const f = setup()
+  for (let issue = 1; issue <= 300; issue++) f.seed(issue)
+  // Turns of the event loop that pass while the projection runs.
+  let turns = 0
+  let counting = true
+  const count = () => { if (!counting) return; turns++; setImmediate(count) }
+  setImmediate(count)
+  // No time passes, so the whole journal fits in one slice.
+  const clock = vi.spyOn(performance, 'now').mockReturnValue(1_000)
+  try {
+    const read = await f.read()
+    expect(read.coverage.length).toBeGreaterThan(0)
+  } finally {
+    clock.mockRestore()
+    counting = false
+  }
+  expect(turns).toBeLessThan(10)
+})
+

@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 import { execFile } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, statfs, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -18,6 +18,7 @@ vi.mock('node:fs/promises', async (original) => {
   const actual = await original<typeof import('node:fs/promises')>()
   return {
     ...actual,
+    statfs: vi.fn(actual.statfs),
     // A busy machine, at the step of taking a datastore's lock.
     chmod: async (...args: Parameters<typeof actual.chmod>) => {
       if (mocks.lockStallMs && String(args[0]).endsWith('github.sqlite.lock')) await new Promise((resolve) => setTimeout(resolve, mocks.lockStallMs))
@@ -29,6 +30,11 @@ vi.mock('../server/process', async (original) => ({
   ...(await original<typeof import('../server/process')>()),
   runFile: mocks.runFile,
   spawnDetached: vi.fn(async () => { throw new Error('unexpected agent launch') }),
+}))
+// Host disk pressure must not add alerts to the organization-removal fixture.
+vi.mock('../server/storage-maintenance', async (original) => ({
+  ...(await original<typeof import('../server/storage-maintenance')>()),
+  startStorageMaintenanceRuntime: vi.fn(),
 }))
 vi.mock('../server/content-jobs', async (original) => ({
   ...(await original<typeof import('../server/content-jobs')>()),
@@ -864,6 +870,7 @@ describe('stopping following an organization', () => {
     expect((await remove('acme', true)).status).toBe(200)
     expect(openAlerts().map((entry) => entry.dedupeKey).sort()).toEqual(
       ['datastore-sync:legacy', 'pr-ready:legacy/repo#1', 'storage:low'])
+    expect(statfs).not.toHaveBeenCalled()
     expect(silencedKeys('review-requested:')).toEqual([])
 
     const behaviors = await (await fetch(`${base}/api/behaviors`)).json() as Record<string, Record<string, unknown>>

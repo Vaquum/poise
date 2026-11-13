@@ -351,7 +351,7 @@ describe('switching to another release', () => {
     try {
       expect(service.switchRelease('r2')).toEqual({ release: 'r2', switching: true })
       expect((await readFile(join(dir, 'next'), 'utf8')).trim()).toBe('r2')
-      // Nothing is refused while it waits, behavior ticks included.
+      // Browser launches remain available while recurring work yields.
       expect(background.releaseBackgroundPaused()).toBe(false)
       const launch = service.admitLaunch('POST', '/api/debate')
       expect(launch).toEqual(expect.any(Function))
@@ -474,7 +474,7 @@ describe('switching to another release', () => {
     }
   })
 
-  it('keeps admitting behavior launches while a switch is pending; only Chat turns wait', async () => {
+  it('keeps browser launches available while a switch is pending', async () => {
     const dir = await releases({ r2: 'b1' })
     const { service } = switching(dir)
     try {

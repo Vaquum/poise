@@ -142,6 +142,14 @@ class ManagedReceipts(TestCase):
         api.mark_managed_no_write(self.conn, CALL)
         self.assertEqual(self.conn.execute("select action from calls").fetchone()[0], "not_started")
 
+    def test_legacy_publication_head_and_unstarted_replies_do_not_prove_an_unattempted_push(self):
+        self.conn.execute("update calls set status='failed', behavior='repair_pr', resources_settled_at=1, action_plan='{}', artifact=?",
+                          (json.dumps({"phase": "publishing", "plan_sha": "c" * 64,
+                                       "publication_head": HEAD, "replies_started": False}),))
+        for _ in range(3):
+            api.mark_managed_no_write(self.conn, CALL)
+            self.assertEqual(self.conn.execute("select action,outcome from calls").fetchone(), (None, None))
+
     def test_resource_inspection_failure_preserves_publication_intent_and_prevents_handoff(self):
         self.conn.commit()
         with patch('agent_interface.issue_review.stop_leftovers'), patch('agent_interface.issue_review._cwd_pids', return_value=None):

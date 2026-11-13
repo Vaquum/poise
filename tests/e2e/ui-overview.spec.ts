@@ -42,6 +42,8 @@ interface Workspace {
   dismissed?: unknown[]
   /** Every POST that could act on the chain. */
   chainActions?: unknown[]
+  /** What /api/behavior-metrics answers. */
+  metrics?: unknown
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -94,7 +96,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       return json(route, { periods: bounds.slice(1).map((until, i) => ({ since: bounds[i], until, ...day })), errors: [] })
     }
     if (path === '/api/github-quota') return json(route, { accounts: [] })
-    if (path === '/api/behavior-metrics') return json(route, { behaviors: {}, error: null })
+    if (path === '/api/behavior-metrics') return json(route, workspace.metrics ?? { behaviors: {}, error: null })
     if (path === '/api/behavior-estimates') return json(route, { estimates: [] })
     if (path === '/api/agent-logs') return workspace.runsFail ? json(route, { error: 'agent-interface did not answer' }, 503) : json(route, { logs: [] })
     if (path === '/api/gh') return json(route, { records: [], held: [], errors: [] })
@@ -419,6 +421,26 @@ test('System health reads its five cards live, and a failed read keeps them, wit
     await expect(card('ov.h.errors').locator(':scope > .t-gloss')).toBeVisible()
     await expect(card('ov.h.errors')).toHaveAttribute('href', '?view=observe&part=logging&back=overview')
   }
+})
+
+test('Behaviors gives every row its runs, time and success, or says why in words (#1382)', async ({ page }) => {
+  const metrics = { error: 'Some worker logs are unreadable; affected behavior metrics are unavailable.', behaviors: {
+    'review-new-prs': { totalRuns: 12, durationMinutes: 30, successRate: 75 },
+    'resolve-unblocking': { totalRuns: 619, durationMinutes: 120, untimedRuns: 6, successRate: 16.2 },
+    'close-old-prs': { totalRuns: 0, durationMinutes: 0, successRate: null },
+    'implement-issues': { totalRuns: 2, durationMinutes: 5, successRate: null },
+    'repair-prs': null,
+  } }
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1, metrics })
+  const row = (key: string) => page.locator(`[data-beh="${key}"]`)
+  await expect(row('review-new-prs')).toContainText('75%')
+  await expect(row('review-new-prs').locator('td.num').first()).toHaveText('12')
+  await expect(row('resolve-unblocking')).toContainText('+ 6 untimed')
+  await expect(row('close-old-prs')).toContainText('no runs')
+  await expect(row('implement-issues')).toContainText('none finished')
+  await expect(row('repair-prs')).toContainText('unknown: some of its run records cannot be read')
+  // No value is a bare dash.
+  for (const cell of await page.locator('[data-beh] td.num').allInnerTexts()) expect(cell.trim()).not.toBe('—')
 })
 
 test('a reload paints System health’s last read at once while it reads again, and never another GitHub user’s', async ({ page }) => {

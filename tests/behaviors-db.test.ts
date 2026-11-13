@@ -24,6 +24,79 @@ afterEach(async () => {
   tempRoot = ''
 })
 
+describe('rotation cursors', () => {
+  it('commits a cursor on its own connection, visible at once and kept across a restart', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const path = join(tempRoot, 'cache.db')
+    let module = await loadIsolatedDb(path)
+    // Not on the main connection, which waits for the disk on every commit.
+    const main = vi.spyOn(module.db, 'prepare')
+    module.setMeta('behavior_merge_prs_cursor', 'alpha/one#1')
+    // A managed organization's behaviors scope the same cursor by its login.
+    module.setMeta('org:alpha:behavior_merge_prs_cursor', 'alpha/two#1')
+    expect(main).not.toHaveBeenCalled()
+    module.setMeta('org:alpha:behavior_merge_prs_skip_repos', '[]')
+    expect(main).toHaveBeenCalledTimes(1)
+    main.mockRestore()
+    expect(module.getMeta('org:alpha:behavior_merge_prs_cursor')).toBe('alpha/two#1')
+    expect(module.getMeta('behavior_merge_prs_cursor')).toBe('alpha/one#1')
+    module.setMeta('behavior_merge_prs_cursor', 'alpha/one#2')
+    expect(module.db.prepare("SELECT value FROM meta WHERE key = 'behavior_merge_prs_cursor'").get()).toEqual({ value: 'alpha/one#2' })
+    module.closeDatabase()
+    module = await loadIsolatedDb(path)
+    expect(module.getMeta('behavior_merge_prs_cursor')).toBe('alpha/one#2')
+  })
+
+  it('keeps a cursor written inside a transaction with that transaction', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const { db, getMeta, setMeta } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    setMeta('behavior_approve_prs_cursor', 'alpha/one#1')
+    expect(() => db.transaction(() => {
+      setMeta('behavior_approve_prs_cursor', 'alpha/one#2')
+      throw new Error('rolled back')
+    })()).toThrow('rolled back')
+    expect(getMeta('behavior_approve_prs_cursor')).toBe('alpha/one#1')
+    db.transaction(() => setMeta('behavior_approve_prs_cursor', 'alpha/one#3'))()
+    expect(getMeta('behavior_approve_prs_cursor')).toBe('alpha/one#3')
+  })
+})
+
+describe('observation writes', () => {
+  it('commits an observation on the cursor connection, reading its own writes, and rolls it back on failure', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const { db, getMeta, setMeta, writeObservation } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    setMeta('datastore_stale:acme', 'before')
+    const main = vi.spyOn(db, 'prepare')
+    const read = writeObservation(() => {
+      setMeta('datastore_stale:acme', 'observed')
+      return getMeta('datastore_stale:acme')
+    })
+    expect(read).toBe('observed')
+    expect(main).not.toHaveBeenCalled()
+    main.mockRestore()
+    expect(getMeta('datastore_stale:acme')).toBe('observed')
+    expect(() => writeObservation(() => {
+      setMeta('datastore_stale:acme', 'lost')
+      throw new Error('probe failed')
+    })).toThrow('probe failed')
+    expect(getMeta('datastore_stale:acme')).toBe('observed')
+  })
+
+  it('writes an observation inside an open transaction as part of that transaction', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const { db, getMeta, setMeta, writeObservation } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    setMeta('datastore_stale:acme', 'before')
+    expect(() => db.transaction(() => {
+      writeObservation(() => setMeta('datastore_stale:acme', 'inside'))
+      expect(getMeta('datastore_stale:acme')).toBe('inside')
+      throw new Error('outer rolled back')
+    })()).toThrow('outer rolled back')
+    expect(getMeta('datastore_stale:acme')).toBe('before')
+    writeObservation(() => writeObservation(() => setMeta('datastore_stale:acme', 'nested')))
+    expect(getMeta('datastore_stale:acme')).toBe('nested')
+  })
+})
+
 describe('behavior database lifecycle', () => {
   it('migrates legacy cards once, preserves content, and purges retired credentials', async () => {
     tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))

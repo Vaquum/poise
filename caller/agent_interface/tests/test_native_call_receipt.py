@@ -1,4 +1,5 @@
 """Real SQLite receipt transitions; not provider/workflow acceptance."""
+import asyncio
 import json
 import os
 import sqlite3
@@ -8,13 +9,14 @@ import tempfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import agent_interface as api
 from agent_interface import issue_review, native_cleanup, native_namespace, process_identity, resource_ownership as ownership, review_receipt
 from agent_interface.model_catalog import CATALOG
+from github_interface.behaviors import issue_work
 
 
 @pytest.fixture
@@ -368,6 +370,122 @@ def decode_failure(database):
             return json.loads(read.stdout)[0], json.loads(decoded.stdout)
 
         yield decode
+
+
+@pytest.mark.parametrize("database", ["/dev/shm" if sys.platform == "linux" else None], indirect=True)
+@pytest.mark.parametrize("scenario", ["implementation", "repair", "merged-parent"])
+@pytest.mark.parametrize("lost_push", [False, True], ids=["before-push", "lost-push-result"])
+def test_original_publication_boundary_reconciles_without_repeating_work(database, monkeypatch, scenario, lost_push):
+    parent, candidate = "b" * 40, "c" * 40
+    repair = scenario != "implementation"
+    pull = {"number": 3, "state": "open", "head": {"ref": "poise/issue-7", "sha": parent,
+            "repo": {"full_name": "example/repo"}}, "user": {"login": "author"},
+            "body": "<!-- poise-chain example/repo#7 -->"}
+    client = SimpleNamespace(token="fixture-token", post=AsyncMock())
+
+    async def get(path):
+        if path == "/repos/example/repo":
+            return {"full_name": "example/repo", "default_branch": "main"}
+        return pull if path.endswith("/pulls/3") else {"state": "open"}
+
+    async def paginate(path, *args):
+        if path.endswith("/comments"):
+            return [{"id": 17, "body": "Original finding", "user": {"login": "reviewer"}}]
+        return [pull] if repair else []
+
+    client.get, client.paginate = AsyncMock(side_effect=get), AsyncMock(side_effect=paginate)
+    client.graphql = AsyncMock(return_value={"repository": {
+        "ref": {"target": {"oid": parent, "message": "fix: original parent"}} if repair else None,
+        "defaultBranchRef": {"target": {"oid": parent}},
+        "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}})
+    committed, pushes = False, []
+
+    def git(command, *_secrets):
+        nonlocal committed
+        if command[-2:] == ["branch", "--show-current"]:
+            return "poise/issue-7"
+        if command[-3:] == ["remote", "get-url", "origin"]:
+            return "https://github.com/example/repo.git"
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            if committed and not lost_push:
+                raise RuntimeError("interrupted after local commit, before push intent")
+            return candidate if committed else parent
+        if "status" in command:
+            return " M seed.txt"
+        if "commit" in command:
+            committed = True
+        if "push" in command:
+            pushes.append(command)
+            raise RuntimeError("original push result lost")
+        return ""
+
+    def interface(*args, **_kwargs):
+        if args[0] == "--pr-review":
+            return {"review_threads": [{"root_comment_id": 17, "is_resolved": False}]}
+        if args[0] != "--issue-work":
+            return {}
+        mode = args[args.index("--mode") + 1]
+        if mode == "prepare":
+            return {"outcome": "prepared", "checkout_head": parent}
+        payload = {args[index][2:].replace("-", "_"): args[index + 1] for index in range(2, len(args), 2)}
+        payload["issue"] = 7
+        if repair:
+            payload["pull_number"] = 3
+        return asyncio.run(issue_work.run(client, payload))
+
+    def worker(_lease, _args, **kwargs):
+        (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+            "commitMessage": "fix: seed", "title": "fix: seed", "body": "Concrete seed change",
+            "replies": [{"commentId": 17, "body": "Fixed the finding"}] if repair else [], "blocked": None}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def execute():
+        with patch.object(api, "_native_cli", False):
+            api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain", "original-native", "fixture",
+                                "poise/issue-7", pull=3 if repair else None, expected_head=parent if repair else None)
+
+    monkeypatch.setattr(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _: SimpleNamespace(identity="fixture", provider="codex")))
+    monkeypatch.setattr(issue_review, "WORK_ROOT", database / "issue-review")
+    monkeypatch.setattr(api, "_main", execute)
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source",
+                                     "poise:behavior-chain", "--correlation-id", "original-native"])
+    with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+            patch.object(issue_review, "interface", side_effect=interface), \
+            patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+            patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+            patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+            patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker) as provider, \
+            patch.object(issue_work, "_run", side_effect=git), pytest.raises(RuntimeError, match="original push|before push"):
+        api.main()
+    provider.assert_called_once()
+    client.post.assert_not_awaited()
+    assert len(pushes) == int(lost_push)
+    call, = api.logs_selected({"latest": [], "ids": [], "correlations": ["original-native"]})
+    assert call["status"] == "failed" and call["resources_settled_at"]
+    assert call["action"] == (None if lost_push else "not_started")
+    assert call["outcome"] == (None if lost_push else "preflight_failed")
+    assert call["artifact"]["phase"] == ("publishing" if lost_push else "preparing_publication")
+    if lost_push:
+        assert call["artifact"]["publication_head"] == candidate
+        assert call["artifact"]["replies_started"] is False
+    assert api.read_action_plan(call["id"])["sha"] == call["artifact"]["plan_sha"]
+    repo = Path(__file__).resolve().parents[3]
+    output = repo / "test-results"
+    output.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="publication-recovery-", dir=output) as work:
+        root = Path(work)
+        wire = root / "receipt.json"
+        wire.write_text(json.dumps([call]))
+        bundle = root / "contract.mjs"
+        environment = {"PATH": os.environ["PATH"], "HOME": str(database)}
+        built = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"),
+                                str(repo / "tests/fixtures/publication-recovery-contract.ts"), "--bundle", "--platform=node",
+                                "--packages=external", "--format=esm", "--target=node22", f"--outfile={bundle}"],
+                               cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+        assert built.returncode == 0, built.stderr
+        consumed = subprocess.run(["node", str(bundle), str(wire), scenario], cwd=repo, env=environment,
+                                  capture_output=True, text=True, timeout=30)
+        assert consumed.returncode == 0, consumed.stderr
 
 
 # Real cleanup needs consistent file/directory device IDs on managed test boxes.
