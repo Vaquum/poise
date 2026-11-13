@@ -244,10 +244,13 @@ export function createTasks(ctx: PartContext): ObservePart {
       ? `Draining: v1 finishes its runs before v2 takes new work${cutover.blockers?.length ? ` (${cutover.blockers.join('; ')})` : ''}`
       : 'v2 owns new work'
     const runs = capacity?.status === 'available' && capacity.reservedModelInvocations !== null && capacity.modelInvocationLimit !== null
-      ? `${capacity.reservedModelInvocations} of ${capacity.modelInvocationLimit} model runs in use, shared with other heavy work${capacity.enabled === false ? ' · admissions paused' : ''}`
+      ? `${capacity.reservedModelInvocations} of ${capacity.modelInvocationLimit} model slots occupied across the workspace, shared with other heavy work${capacity.enabled === false ? ' · admissions paused' : ''}`
       : `model capacity unavailable${capacity?.error ? `: ${capacity.error}` : ''}`
+    const retained = capacity?.status === 'available' && capacity.retainedModelInvocations !== null
+      ? `${capacity.retainedModelInvocations} retained for unresolved cleanup, awaiting original resource evidence`
+      : 'retained cleanup count unknown'
     const errors = runtime.filter((r) => r.error).map((r) => `${r.organization}: ${r.error}`)
-    patchContent(box, `<span class="tk-st" role="status" data-ref="tk.status">${esc(owns)} · ${esc(runs)} · read ${esc(clockTime(readAt))}${loading ? ' <span class="spin"></span>' : ''}</span>${errors.length ? `<span class="tk-st is-warn" role="status">${esc(errors.join('; '))}</span>` : ''}${legacyHTML}`)
+    patchContent(box, `<span class="tk-st" role="status" data-ref="tk.status">${esc(owns)} · ${esc(runs)} · ${esc(retained)} · read ${esc(clockTime(readAt))}${loading ? ' <span class="spin"></span>' : ''}</span>${errors.length ? `<span class="tk-st is-warn" role="status">${esc(errors.join('; '))}</span>` : ''}${legacyHTML}`)
   }
 
   // ---------- The task: its state, evidence and controls ----------

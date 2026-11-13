@@ -62,6 +62,7 @@ export interface ChainCapacity {
   error: string | null
   modelInvocationLimit: number | null
   reservedModelInvocations: number | null
+  retainedModelInvocations: number | null
   mode: string | null
   enabled: boolean | null
   intake: { seedMode: string, label: string | null } | null
@@ -147,6 +148,7 @@ export function readChainsPage(value: unknown): ChainsPage {
   const capacity = object(value.capacity) ? {
     status: value.capacity.status === 'available' ? 'available' as const : 'unavailable' as const, error: text(value.capacity.error),
     modelInvocationLimit: count(value.capacity.modelInvocationLimit), reservedModelInvocations: count(value.capacity.reservedModelInvocations),
+    retainedModelInvocations: count(value.capacity.retainedModelInvocations),
     mode: text(value.capacity.mode), enabled: typeof value.capacity.enabled === 'boolean' ? value.capacity.enabled : null,
     intake: object(value.capacity.intake) ? { seedMode: String(value.capacity.intake.seedMode), label: text(value.capacity.intake.label) } : null,
   } : null

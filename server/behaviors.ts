@@ -8239,6 +8239,7 @@ export interface BehaviorChainCapacity {
   status: 'available' | 'unavailable'
   error: string | null
   reservedModelInvocations: number | null
+  retainedModelInvocations: number | null
   modelInvocationLimit: number
   enabled: boolean | null
   mode: 'v1' | 'draining' | 'v2' | null
@@ -8260,7 +8261,7 @@ export function getBehaviorChainCapacity(): BehaviorChainCapacity {
     const admission = readBehaviorResourceAdmission()
     const mode = journal.cutover().mode
     return { status: 'available', error: null, modelInvocationLimit, processLocal,
-      reservedModelInvocations: usage.modelInvocations, mode,
+      reservedModelInvocations: usage.modelInvocations, retainedModelInvocations: usage.retainedModelInvocations, mode,
       enabled: settings.enabled && mode === 'v2' && nativeCleanupSupport().status === 'supported',
       resources: { budget: admission?.budget ?? null,
         reserved: { memoryBytes: usage.reservations.memoryBytes, diskBytes: usage.reservations.diskBytes },
@@ -8268,7 +8269,7 @@ export function getBehaviorChainCapacity(): BehaviorChainCapacity {
       intake: { seedMode: settings.seedMode, label: settings.seedMode === 'label' ? settings.label : null } }
   } catch (error) {
     return { status: 'unavailable', error: error instanceof Error ? error.message : String(error),
-      modelInvocationLimit, processLocal, reservedModelInvocations: null, mode: null, enabled: null, intake: null, resources: null }
+      modelInvocationLimit, processLocal, reservedModelInvocations: null, retainedModelInvocations: null, mode: null, enabled: null, intake: null, resources: null }
   }
 }
 

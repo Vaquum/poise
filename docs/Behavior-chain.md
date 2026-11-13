@@ -105,6 +105,16 @@ remains eligible; this fence does not change manual Chat binding controls.
 
 Settings → Behaviors contains the chain preference fields, their save/reload actions and the guarded Switch to v2 or Cancel cutover action while applicable. Operational output lives in Observe → Tasks: cutover state and legacy ownership, capacity, the chain list and per-chain journal. The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. Hold/Resume retains the current journal sequence check. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while Tasks is open. Unavailable reads disable writes instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
+Tasks shows workspace-wide occupied model slots and the subset retained for
+uncertain invocations awaiting original resource evidence, independent of list
+pages and organization filters. The capacity response's nullable
+`retainedModelInvocations` uses the occupied count's resource predicate and
+requires an uncertain model invocation; unavailable or missing counts stay
+unknown. Needs attention retains each chain's blocker, next action and journal.
+Verified physical release removes a reservation from both counts even while
+publication remains uncertain and held. These reads change no admission, hold,
+retry or release authority.
+
 History exposes each `chain.merged` event's recorded `evidence.review_complete` boolean. Explicit `true` reads “Original review evidence complete”; `false` or legacy absence reads “Merged”. Each event keeps its own disposition across pages and links, independently of the current chain summary. Legacy absence establishes neither review completion nor a pending obligation.
 
 Notifications lists each delayed or held admitted issue's step,

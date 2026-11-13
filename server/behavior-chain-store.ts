@@ -591,7 +591,12 @@ export class BehaviorChainJournal {
   }
 
   capacitySnapshot() {
-    return this.db.transaction(() => ({ modelInvocations: this.liveModelInvocationCount(), reservations: this.reservedResources() }))()
+    return this.db.transaction(() => {
+      const retained = cachedStatement(this.db, `SELECT count(*) AS count FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+        WHERE c.resource_pending = 1 AND json_extract(i.value, '$.model') IS NOT NULL
+          AND json_extract(i.value, '$.state') = 'uncertain' AND behavior_native_resources_pending(i.value) = 1`).get() as { count: number }
+      return { modelInvocations: this.liveModelInvocationCount(), retainedModelInvocations: retained.count, reservations: this.reservedResources() }
+    })()
   }
 
   /** Resource allowances held by live native invocations, over the same
