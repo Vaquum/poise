@@ -119,6 +119,14 @@ class LogsChangedCase(TestCase):
             self.assertEqual(failed.returncode, 2, args)
             self.assertIn("usage:", failed.stderr)
 
+    def test_changed_after_as_a_search_or_prompt_value_reads_logs(self):
+        self.insert("a" * 32, 1761000100.0)
+        searched = self.cli("--logs", "--limit", "10", "--search", "--changed-after")
+        self.assertEqual((searched.returncode, searched.stderr), (0, ""), searched.stderr)
+        self.assertIn("rows", json.loads(searched.stdout))
+        session = self.cli("--logs", "--after", "0", "--session", "s", "--behavior", "pr_review", "--prompt", "--changed-after")
+        self.assertEqual((session.returncode, session.stderr), (0, ""), session.stderr)
+
     def cli(self, *args: str) -> subprocess.CompletedProcess:
         env = {
             "AGENT_INTERFACE_DATA_DIR": str(self.data),

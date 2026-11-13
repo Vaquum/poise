@@ -3163,10 +3163,9 @@ def _main():
                 usage(error=str(error))
             print(json.dumps(selected, separators=(",", ":")))
             return
-        if "--changed-after" in sys.argv[2:]:
-            rest = [arg for arg in sys.argv[2:] if arg != "--without-progress"]
-            if len(rest) != 4 or rest[0] != "--changed-after" or rest[2] != "--limit" \
-                    or len(sys.argv[2:]) - len(rest) > 1:
+        rest = [arg for arg in sys.argv[2:] if arg != "--without-progress"]
+        if rest[:1] == ["--changed-after"]:
+            if len(rest) != 4 or rest[2] != "--limit" or len(sys.argv[2:]) - len(rest) > 1:
                 usage(error="changed logs take --changed-after SEQ --limit N, and --without-progress")
             try:
                 payload = logs_changed(int(rest[1]), int(rest[3]), "--without-progress" in sys.argv[2:])
