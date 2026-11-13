@@ -101,7 +101,7 @@ import { classifyBehaviorDiagnostic, diagnosticClassification, isRepoAccessDenie
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { DATASTORE_MAX_AGE_SECONDS, datastoreFreshnessByOrganization, initialDatastoreFreshness, openStaleMirrors, recordStaleMirrorBlock, runDatastoreHealth, staleDatastoreFailure, staleMirrorMessage, type DatastoreFreshness, type StaleDatastoreError } from './datastore-health'
 import { resolveReviewCheckout } from './review-checkout'
-import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDetached } from './process'
+import { claudeSubscriptionEnvironment, isAbortError, processFailureEvidence, runFile, runningCallerLaunches, spawnDetached } from './process'
 import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type CheckSlotStats } from './check-semaphore'
 import { ProcessLockError, withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
@@ -2979,6 +2979,7 @@ async function currentHeadSha(
   repo: string,
   number: number,
   actor: string,
+  reportFailure = true,
 ): Promise<string> {
   const [owner, name] = repo.split('/', 2)
   if (!owner || !name || !Number.isSafeInteger(number) || number < 1) {
@@ -2989,7 +2990,7 @@ async function currentHeadSha(
   const { stdout } = await runFile(
     GH_INTERFACE,
     ['--head-sha', `#${number}`, '--token-user', actor],
-    { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
+    { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure },
   )
   const data = objectValue(
     parseJson(stdout, 'github-interface --head-sha'),
@@ -4486,7 +4487,7 @@ async function readChangesAddressedBatch(
     '--requested-changes-addressed', '--requests-json',
     JSON.stringify(prs.map((pr) => ({ repository: pr.repo, number: pr.number }))),
     '--username', reviewer, '--token-user', reviewer,
-  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false })
   const packet = objectValue(
     parseJson(stdout, 'github-interface --requested-changes-addressed batch'),
     'github-interface --requested-changes-addressed batch',
@@ -4518,13 +4519,14 @@ async function readChangesAddressedBatch(
 async function readReviewActivityBatch(
   requests: { pr: DatastorePr, since: string }[],
   reviewer: string,
+  reportFailure = true,
 ): Promise<BatchRead<ReviewActivityResult>[]> {
   const { stdout } = await runFile(GH_INTERFACE, [
     '--review-activity-since', '--requests-json',
     JSON.stringify(requests.map(({ pr, since }) => ({ repository: pr.repo, number: pr.number,
       since: reviewer.toLowerCase() === (getMeta('me') || '').toLowerCase() ? '1970-01-01T00:00:00Z' : since }))),
     '--username', reviewer, '--token-user', reviewer,
-  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(), reportFailure })
   const packet = objectValue(
     parseJson(stdout, 'github-interface --review-activity-since batch'),
     'github-interface --review-activity-since batch',
@@ -4586,7 +4588,7 @@ async function fireApprove(
   admittedReviewer?: string,
   replacesFailedCallId?: string,
 ): Promise<boolean> {
-  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author) }, async () => {
+  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author), phase: 'launch', expectedHead }, async () => {
   if (!isRunnable('approve-prs')) return false
   const accounts = prAccounts()
   const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
@@ -4611,7 +4613,8 @@ async function fireApprove(
   // does not discard it. Only shutdown or disable discards prepared work.
   return underLifecycleSignal(async () => {
   try {
-  const currentHead = await currentHeadSha(pr.repo, pr.number, actor)
+  const currentHead = await withNoticeDiagnosticIdentity({ ...diagnosticIdentity()!, phase: 'head-check' },
+    () => currentHeadSha(pr.repo, pr.number, actor, false))
   // The head-SHA lookup above is a subprocess with a 30s timeout, so the user
   // has a real window to turn the behaviour off while it is out. Nothing
   // re-read the flag between it returning and the spawn below, so a toggle-off
@@ -4738,9 +4741,15 @@ async function fireApprove(
     // The sweep deadline may expire while a launch is in flight; tickApprovePrs
     // reads that as an abort and would drop a genuine failure silently, so log
     // and record it here, as review-new-prs phase 3 does.
-    if (behaviorAborted()) return false
-    if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
-    recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+    let retry: BehaviorFailureState | null = null
+    try {
+      if (behaviorAborted()) return false
+      recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+      retry = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+    } finally {
+      if (!(err instanceof BehaviorLogFeedError) && !isAbortError(err)) diagnosticFailure(
+        processFailureEvidence(err)?.operation ?? 'application.behaviors', err, { retry })
+    }
     return false
   }
   })
@@ -4923,11 +4932,19 @@ async function tickApprovePrs(): Promise<void> {
         progress.changeChecksRead += read
         progress.checksPending -= read
       } catch (err) {
-        if (behaviorAborted()) return
-        console.error('[behaviors] approve-prs batch check failed:', err)
-        for (const pr of batch) {
-          // One error for the whole batch: unattributable to any repository.
-          recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+        let retry: Array<{ target: string, state: BehaviorFailureState | null }> | null = null
+        try {
+          if (behaviorAborted()) return
+          for (const pr of batch) {
+            // One error for the whole batch: unattributable to any repository.
+            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+          }
+          retry = batch.map((pr) => ({ target: `${pr.repo}#${pr.number}`,
+            state: getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`) }))
+        } finally {
+          if (!isAbortError(err)) diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err, {
+            account: reviewer, phase: 'changes-addressed', targets: batch.map((pr) => ({ target: `${pr.repo}#${pr.number}` })), retry,
+          })
         }
         continue
       }
@@ -5012,16 +5029,25 @@ async function tickApprovePrs(): Promise<void> {
         let activityRecords: BatchRead<ReviewActivityResult>[]
         try {
           if (context) context.phase = 'review-activity'
-          activityRecords = await readReviewActivityBatch(activityBatch, reviewer)
+          activityRecords = await readReviewActivityBatch(activityBatch, reviewer, false)
           const activityRead = activityRecords.filter((record) => record.error === null).length
           progress.activityChecksRead += activityRead
           progress.checksPending -= activityRead
         } catch (err) {
-          if (behaviorAborted()) return
-          console.error('[behaviors] approve-prs batch activity check failed:', err)
-          for (const { pr } of activityBatch) {
-            // One error for the whole batch: unattributable to any repository.
-            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+          let retry: Array<{ target: string, state: BehaviorFailureState | null }> | null = null
+          try {
+            if (behaviorAborted()) return
+            for (const { pr } of activityBatch) {
+              // One error for the whole batch: unattributable to any repository.
+              recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+            }
+            retry = activityBatch.map(({ pr }) => ({ target: `${pr.repo}#${pr.number}`,
+              state: getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`) }))
+          } finally {
+            if (!isAbortError(err)) diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err, {
+              account: reviewer, phase: 'review-activity',
+              targets: activityBatch.map(({ pr, check }) => ({ target: `${pr.repo}#${pr.number}`, expectedHead: check.headSha })), retry,
+            })
           }
           continue
         }
