@@ -207,6 +207,15 @@ chains keep their original ownership, but cannot
 consume the normal-work page. Native model/resource receipts are still read
 while an original model lacks resource-release proof, including after a merge;
 only unnecessary GitHub observation waits.
+Before new model work takes a free slot, the same sweep offers it to older
+capacity waiters across all chain pages. Both the shared semaphore and durable
+invocation-capacity refusals count. Journal order dates the uninterrupted eligible
+behavior/basis/reviewer-slot episode; unchanged checks and restart retain its
+place, while changed work, other waits and Hold/Resume reset it. Each candidate
+passes fresh observation and the existing permission, provider, resource and
+atomic admission gates. An older candidate that cannot run leaves the slot for
+later eligible work. The reconciliation cursors, interactive reserve and
+publication/merge gates remain unchanged; no worker or polling loop is added.
 Known closed PRs and closed seeds use the same native-only resource wait for
 their blocked model behaviors. A closed seed alone does not defer PR review or
 approval of an open PR. Public recheck times describe GitHub observation;
