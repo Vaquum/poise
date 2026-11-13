@@ -8980,21 +8980,48 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
 export function getBehaviorDiagnosticIncidents(snapshot: AgentLogSnapshot | null) {
   const scoped = () => {
     const failed = BEHAVIOR_KEYS.flatMap((behavior) => failedBehaviorLaunches(behavior))
-    return behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot,
-      [...BEHAVIOR_KEYS.flatMap((behavior) => listBehaviorLaunchClaims(behavior)), ...failed])
-    // A held row shows when its automatic retry runs: the failure clock for
-    // this exact attempt, never a newer attempt's clock on an older row.
+    const launches = [...BEHAVIOR_KEYS.flatMap((behavior) => listBehaviorLaunchClaims(behavior)), ...failed]
+    return behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot, launches)
+    // A failure clock identifies an attempt, but does not authorize its retry.
     .map((incident): typeof incident & { nextRetryAt?: string } => {
       const stopped = incident.error === REVIEW_BUDGET_STOPPED
       const launch = failed.find((claim) => claim.key === incident.behavior && claim.target === incident.target
         && claim.launchCallId === incident.callId && claim.launchCorrelationId === incident.correlationId
         && !claim.launchQuarantine)
       const refusal = launch && getMeta(`${META_PREFIX}review_recovery:${launch.key}:${launch.target}:${launch.launchCallId}:${launch.launchCorrelationId}`)
-      const current = refusal ? { ...incident, error: `${incident.error} ${refusal}` } : incident
+      const unresolved = snapshot?.entries.some((call) => call.id === incident.callId && call.action === null && call.outcome === null)
+        || snapshot?.quarantined.some((call) => call.id === incident.callId)
+      const current = refusal ? { ...incident, error: `${incident.error} ${refusal}` }
+        : launch && unresolved && !stopped && (incident.behavior === 'review-new-prs' || incident.behavior === 'approve-prs')
+          ? { ...incident, error: `${incident.error} Publication disposition unverified for Call ${incident.callId}. Inspect the original Call and reconcile publication before retrying.` } : incident
       if (stopped || !incident.callId
         || !(BEHAVIOR_KEYS as readonly string[]).includes(incident.behavior)) return current
       const failure = readBehaviorFailure(incident.behavior as BehaviorKey, incident.target)
       if (failure?.callId !== incident.callId) return current
+      if (incident.behavior === 'review-new-prs' || incident.behavior === 'approve-prs') {
+        const call = snapshot?.entries.find((row) => row.id === incident.callId)
+        if (!snapshot || !call || !unambiguousAgentCall(snapshot, call)
+          || call.behavior !== upstreamBehavior(incident.behavior)
+          || !incident.repo || incident.pr === null || call.repo !== incident.repo || String(call.pr_id) !== String(incident.pr)
+          || !incident.actor || call.actor?.toLowerCase() !== incident.actor.toLowerCase()
+          || incident.source !== `poise:${incident.behavior}` || call.source !== incident.source
+          || !incident.correlationId || call.correlation_id !== incident.correlationId
+          || !call.expected_head || !SHA_PATTERN.test(call.expected_head) || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase())
+          || call.action !== 'not_started' || call.outcome !== 'preflight_failed'
+          || !postedNothing(call) || call.review_comments != null || refusal
+          || launches.some((claim) => (claim.launchCallId === call.id || claim.launchCorrelationId === call.correlation_id)
+            && (claim.key !== incident.behavior || claim.target !== incident.target
+              || claim.launchQuarantine || claim.launchExpectedHead !== call.expected_head
+              || claim.launchActor.toLowerCase() !== call.actor?.toLowerCase() || claim.launchRepo !== call.repo
+              || String(claim.launchPr) !== String(call.pr_id) || claim.launchBehavior !== call.behavior
+              || claim.launchSource !== call.source || claim.launchCorrelationId !== call.correlation_id
+              || claim.launchCallId !== call.id || !Number.isFinite(Date.parse(claim.launchRequestedAt))
+              || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)))
+          || call.error_code === 'invalid_agent_result' || call.error_code === 'review_packet_too_large'
+          || boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call)
+          || prReviewRetryState(snapshot, incident.behavior, incident.repo, incident.pr, call.expected_head,
+            incident.actor, call.model, incident.target).stopped) return current
+      }
       return { ...current, nextRetryAt: new Date(failure.nextRetryAtMs).toISOString() }
     })
   }

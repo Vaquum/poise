@@ -137,6 +137,12 @@ review slot, reason and retry time. Their revision is unverified. An uncleared
 retry reads as due at and after its timestamp; clearing the scheduler failure,
 including through a successful no-op, removes the detail without changing blocker precedence.
 
+Legacy review incidents show an automatic retry time only for an exact, validated
+no-action Call eligible under the scheduler's existing failure and timeout-stop
+rules. A stored failure timer alone grants no retry. Unresolved publication holds
+retain the original Call and recovery refusal, or the next action to inspect that
+Call and reconcile publication, without changing stored evidence or timestamps.
+
 For legacy PRs, a live review on the verified current head can move past-revision
 review failures into `blocker.details`, retaining their head, cause and time.
 Attribution uses full-SHA targets, matching launch evidence, or already-cached
