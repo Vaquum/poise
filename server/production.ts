@@ -43,10 +43,6 @@ startLogging({ captureFatal: true })
 const { recordRuntimeDiagnostic } = await import('./runtime-diagnostic')
 const { attachChatSockets, createPoiseMiddleware, stopDailyModelRefresh, stopPoiseRuntime } = await import('./cache-plugin')
 const { closeDatabase } = await import('./db')
-// After the dotenv above, like every module that opens the database.
-const { warmUp } = await import('./warm-up')
-const { handleGhBody } = await import('./gh')
-const { readAnalyticsHealth } = await import('./analytics-health')
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 5555
@@ -579,8 +575,12 @@ export async function startProductionServer(options: ProductionServerOptions = {
   }
   console.log(`[poise] listening on http://${host}:${port}`)
   // The first page after a deploy finds the reads it needs already made.
+  // Its modules load only when it runs, long after the dotenv above, like
+  // every module that opens the database.
   const warming = setTimeout(() => {
-    void warmUp({ read: handleGhBody, health: () => readAnalyticsHealth() })
+    void Promise.all([import('./warm-up'), import('./gh'), import('./analytics-health')])
+      .then(([{ warmUp }, { handleGhBody }, { readAnalyticsHealth }]) => warmUp({ read: handleGhBody, health: () => readAnalyticsHealth() }))
+      .catch(() => undefined)
   }, WARM_UP_DELAY_MS)
   warming.unref()
   server.once('close', () => clearTimeout(warming))
