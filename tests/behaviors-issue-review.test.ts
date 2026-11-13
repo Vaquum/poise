@@ -4,11 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AgentLogSnapshot } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { CATALOG_STDOUT, PRE_ISSUE_REVIEW_CATALOG } from './model-catalog-fixture'
 
 const mocks = vi.hoisted(() => ({
-  captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
+  captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn<(snapshot: AgentLogSnapshot) => void>(),
   runFile: vi.fn(),
   spawnDetached: vi.fn(),
   authStatus: 'authenticated',
@@ -287,6 +288,9 @@ with api.db() as conn:
     expect(reads[1]!.bytes).toBeGreaterThan(96 * 1024 * 1024)
     expect(database.listBehaviorLaunchClaims(KEY).map(claim => claim.launchCallId).sort()).toEqual(running.map(row => row.id).sort())
     console.info('issue-review isolated history comparison', { rows: 6276, activeClaims: 3, reads, beforeMs, afterMs })
+    // Spies otherwise retain both the 100 MiB CLI responses and decoded snapshots across recovery.
+    mocks.runFile.mockClear()
+    mocks.observeSnapshot.mockClear()
     unavailable = true
     await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
@@ -306,6 +310,17 @@ api.finish(sys.argv[1], 'completed', action='commented', outcome='commented')
     expect(database.hasSeen(KEY, `${childRepo}#600`)).toBe(true)
     expect(database.listBehaviorLaunchClaims(KEY).some(claim => claim.claimId === originalClaims[0])).toBe(false)
     expect(database.listBehaviorLaunchClaims(KEY).filter(claim => originalClaims.includes(claim.claimId))).toHaveLength(2)
+    let retainedBytes = 0
+    for (const [snapshot] of mocks.observeSnapshot.mock.calls) {
+      for (const entry of snapshot.entries) retainedBytes += Buffer.byteLength(entry.prompt)
+    }
+    for (const result of mocks.runFile.mock.settledResults) {
+      const value: unknown = result.value
+      if (value && typeof value === 'object' && 'stdout' in value && typeof value.stdout === 'string') {
+        retainedBytes += Buffer.byteLength(value.stdout)
+      }
+    }
+    expect(retainedBytes).toBeLessThan(3 * 96 * 1024 * 1024)
   }, 60_000)
 
   it('keeps configured applicable siblings in admission provenance during temporary sign-out', async () => {
