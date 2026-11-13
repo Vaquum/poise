@@ -41,6 +41,7 @@ import { tryParseStructuredReply } from '../../src/edit-proposals'
 import type { AutoMergeAck, SafeModeAck } from './protocol'
 import { homedir } from 'node:os'
 import { lstat, mkdir, readdir, realpath, rm, rmdir, writeFile } from 'node:fs/promises'
+import type { Dirent } from 'node:fs'
 import { basename, dirname, join, relative, sep } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
 import { db, getMeta, setMeta } from '../db'
@@ -4741,31 +4742,26 @@ export class ChatRuntime extends EventEmitter {
       const dir = stack.pop()
       if (dir === undefined) break
       if (stop(dir)) break
-      let names: string[]
+      let listed: Dirent[]
       try {
-        names = await readdir(dir)
+        listed = await readdir(dir, { withFileTypes: true })
       } catch (error) {
         const { code } = error as NodeJS.ErrnoException
         if (code === 'ENOENT' || code === 'ENOTDIR') continue
         noteGap(dir, `readdir:${code ?? 'unknown'}`)
         continue
       }
-      entries += names.length
+      entries += listed.length
       if (stop(dir)) break
-      for (const name of names) {
+      for (const entry of listed) {
+        const name = entry.name
         if (name === '.git' || name === 'node_modules') continue
         if ((probes++ & 1023) === 0 && stop(dir)) break
+        // The listing gives each entry's type as lstat would, a symbolic
+        // link unfollowed, so only directories cost a probe: a workspace's
+        // files are most of its entries.
+        if (!entry.isDirectory()) continue
         const child = join(dir, name)
-        let info
-        try {
-          info = await lstat(child)
-        } catch (error) {
-          const { code } = error as NodeJS.ErrnoException
-          if (code === 'ENOENT' || code === 'ENOTDIR') continue
-          noteGap(child, `lstat:${code ?? 'unknown'}`)
-          continue
-        }
-        if (!info.isDirectory() || info.isSymbolicLink()) continue
         try {
           const gitInfo = await lstat(join(child, '.git'))
           if (gitInfo.isDirectory() || gitInfo.isFile()) found.push(child)
