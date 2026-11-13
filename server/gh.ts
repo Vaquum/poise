@@ -22,6 +22,7 @@ import type { ReviewSummary } from '../src/analytics-work-review'
 import type { OpenPrClosingList } from './chat/control'
 import { readDatastoreContent, readDatastoreView } from './datastore-reader'
 import { getMeta } from './db'
+import { rememberRead } from './warm-up'
 import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { MAX_PROCESS_ARG_BYTES, runFile } from './process'
@@ -940,6 +941,8 @@ const listReads = new Map<string, Promise<{ status: number, body: unknown }>>()
 
 export async function handleGhBody(body: any): Promise<{ status: number, body: unknown }> {
   const op = body?.operation
+  // The pages' reads, made again after the next start (server/warm-up.ts).
+  if ((op === 'list' && !body?.q) || op === 'issue_intake') rememberRead(body)
   const me = getMeta('me') || ''
   if (op !== 'list') return handleGhOperation(body, op, me)
   // Everything the read depends on keys it: an account or an organization that

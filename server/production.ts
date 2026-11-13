@@ -5,6 +5,9 @@ import type { Duplex } from 'node:stream'
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { HttpError, endJson, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
+import { readAnalyticsHealth } from './analytics-health'
+import { handleGhBody } from './gh'
+import { warmUp } from './warm-up'
 import { assertCallerRelease } from './caller-release'
 import { refuseInspectorActivation, registerProductionShutdownSignals } from './production-signals'
 import { abandonProductionCpuCapture, installProductionCpuCapture } from './production-cpu-profile'
@@ -523,6 +526,9 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   return server
 }
 
+/** Startup's own work comes first; the warm-up follows in the background. */
+const WARM_UP_DELAY_MS = 10_000
+
 export async function startProductionServer(options: ProductionServerOptions = {}): Promise<Server> {
   // Every launcher starts the server here; /api/health/stalls reads what it observes.
   installStallObserver()
@@ -571,6 +577,12 @@ export async function startProductionServer(options: ProductionServerOptions = {
     throw error
   }
   console.log(`[poise] listening on http://${host}:${port}`)
+  // The first page after a deploy finds the reads it needs already made.
+  const warming = setTimeout(() => {
+    void warmUp({ read: handleGhBody, health: () => readAnalyticsHealth() })
+  }, WARM_UP_DELAY_MS)
+  warming.unref()
+  server.once('close', () => clearTimeout(warming))
   // Production only: the installer names the launchd jobs to keep alive.
   const stopWatchdog = startLaunchdWatchdog()
   if (stopWatchdog) server.once('close', stopWatchdog)
