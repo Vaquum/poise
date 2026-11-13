@@ -26,7 +26,7 @@ assert len(addresses) == 1
 os.environ['POISE_NATIVE_CONTROL'] = addresses.pop()
 os.environ['AGENT_INTERFACE_DATA_DIR'] = json.loads(os.environ['POISE_NATIVE_CONTROL'])['store']['path']
 import agent_interface as api
-from agent_interface import resource_ownership
+from agent_interface import native_cleanup, resource_ownership
 
 mode = sys.argv[-1]
 marker = Path.home() / f'replacement-{mode}.json'
@@ -54,6 +54,14 @@ if sys.argv[1:2] == ['worker']:
             assert os.read(0, 1) == b'X'
             api.finish(call, 'failed', error='Explicit component body completed without any external action',
                        outcome='preflight_failed', action='not_started', error_code='component_no_effect')
+        elif mode == 'retained':
+            assert os.read(0, 1) == b'X'
+            with api.db() as database:
+                database.execute('begin immediate')
+                receipt = resource_ownership.read(database, call)
+                receipt['roots'].append({'path': str(root) + '-preparation', 'state': 'registered'})
+                resource_ownership._write(database, call, receipt)
+            os._exit(91)
         else:
             while True:
                 time.sleep(0.1)
@@ -67,7 +75,26 @@ elif sys.argv[1] == 'before':
     ready = json.loads(worker.stdout.readline())
     answer = health()
     assert answer['unsettledNativeCalls'] >= 1 and not answer['idle'], answer
-    if mode == 'cooperative':
+    if mode == 'retained':
+        worker.stdin.write('X')
+        worker.stdin.flush()
+        worker.communicate(timeout=15)
+        deadline = time.monotonic() + 20
+        while True:
+            native_cleanup.recover(api.DB)
+            answer = health()
+            hold = answer.get('nativeCleanupHold') or {}
+            if hold.get('callId') == ready['call'] and hold.get('retainedCalls') == answer['unsettledNativeCalls'] == 1 \
+                    and answer['runningCallerCalls'] == 0 and answer['backgroundWork'] == 1:
+                break
+            assert time.monotonic() < deadline, answer
+            time.sleep(0.25)
+        row = api.logs_selected({'latest': [], 'ids': [ready['call']]})[0]
+        assert row['status'] == 'failed' and row['error_code'] == 'interrupted', row
+        assert row['resource_ownership']['namespace']['state'] == 'settled' and not row['resources_settled_at'], row
+        assert not Path(ready['root']).exists()
+        ready['receipt'] = row['resource_ownership']
+    elif mode == 'cooperative':
         worker.stdin.write('X')
         worker.stdin.flush()
         output, errors = worker.communicate(timeout=15)
@@ -102,11 +129,18 @@ else:
         assert rows == original['receipt'], (rows, original['receipt'])
         assert answer['unsettledNativeCalls'] == 0 and answer['idle'], answer
         assert not Path(original['root']).exists()
+    elif mode == 'retained':
+        assert not row['resources_settled_at'] and row['resource_ownership'] == original['receipt'], row
+        assert not Path(original['root']).exists()
+        assert answer['unsettledNativeCalls'] == 1 and not answer['idle'], answer
+        assert answer['nativeCleanupHold']['callId'] == original['call'], answer
+        assert answer['nativeCleanupHold']['retainedCalls'] == 1, answer
     else:
         assert not row['resources_settled_at'], row
         assert Path(original['root']).is_dir()
         assert (Path(original['root']) / 'owned-output').stat().st_blocks * 512 >= 8 * 1024 * 1024
-        assert answer['unsettledNativeCalls'] >= 1 and not answer['idle'], answer
+        assert answer['unsettledNativeCalls'] == 2 and not answer['idle'], answer
+        assert (answer.get('nativeCleanupHold') or {}).get('retainedCalls', 0) < answer['unsettledNativeCalls'], answer
         assert row['status'] == 'failed' and row['error_code'] == 'interrupted', row
     with api.db() as database:
         assert database.execute('select count(*) from calls where correlation_id=?', (f'replacement-{mode}',)).fetchone()[0] == 1

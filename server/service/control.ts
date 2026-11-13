@@ -179,7 +179,7 @@ export class ServiceControl {
       activeChatTurns,
       runningCallerCalls: calls.count,
       unsettledNativeCalls: calls.known ? calls.pendingResources : null,
-      ...(cleanupHold && { nativeCleanupHold: { callId: cleanupHold.callId,
+      ...(cleanupHold && { nativeCleanupHold: { ...cleanupHold,
         reason: cleanupHold.reason === null ? null : redact(cleanupHold.reason, environmentSecrets()).slice(0, 2000) } }),
       backgroundWork,
       // Never idle while Caller's records cannot be read: calls an earlier server started may still run.
@@ -454,8 +454,9 @@ export class ServiceControl {
     this.runtime.startDrain('service')
     this.drainOn = true
     this.renewLapse()
-    if (first) this.armTurnDeadline()
-    return this.health()
+    const health = this.health()
+    if (first && health.nativeCleanupHold?.retainedCalls === undefined) this.armTurnDeadline()
+    return health
   }
 
   resume(): ServiceHealth {
@@ -507,6 +508,7 @@ export class ServiceControl {
     this.turnDeadline = this.timer.setTimeout(() => {
       this.turnDeadline = null
       if (!this.drainOn) return
+      if (runningCallerCalls().cleanupHold?.retainedCalls !== undefined) return
       this.log('[service] the drain reached the Chat-turn deadline; turns still running are stopped for the update')
       void this.runtime.stopTurnsForDrain(DRAIN_TURN_STOPPED)
     }, DRAIN_TURN_DEADLINE_MS)

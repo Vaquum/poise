@@ -60,7 +60,7 @@ export class CallerReceiptStoreError extends Error {
 
 let failure: CallerReceiptStoreError | null = null
 
-export interface NativeCleanupHold { callId: string, reason: string | null }
+export interface NativeCleanupHold { callId: string, reason: string | null, retainedCalls?: number }
 interface CallerActivity { live: number, pendingResources: number | null, cleanupHold?: NativeCleanupHold, cause?: unknown }
 type ResourceRead = 'skip' | 'count' | 'health'
 const pendingNative = "source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)"
@@ -123,18 +123,32 @@ function readCallerActivity(path: string, behaviorOnly: boolean, resources: Reso
     try {
       const { count: pendingResources } = db.prepare(`select count(*) as count from calls where ${pendingNative}`).get() as { count: number }
       if (resources !== 'health' || pendingResources === 0) return { live, pendingResources }
-      // The failure counter survives a retry taking the private claim. Report
-      // one terminal hold from the same snapshot as the replacement gate.
+      // Only the original namespace settlement can turn a cleanup failure
+      // into disk work that may be retained across container replacement.
       const hold = db.prepare(`
-        select id as callId, case when json_type(resource_cleanup, '$.last_error') = 'text'
-          then substr(json_extract(resource_cleanup, '$.last_error'), 1, 2000) end as reason
-        from calls where ${pendingNative} and status <> 'running'
-          and case when json_valid(resource_cleanup) then json_type(resource_cleanup, '$.failures') = 'integer'
-            and json_extract(resource_cleanup, '$.failures') > 0 end
-        order by id limit 1
-      `).get() as NativeCleanupHold | undefined
+        with holds as (
+          select id as callId, case when json_type(resource_cleanup, '$.last_error') = 'text'
+            then substr(json_extract(resource_cleanup, '$.last_error'), 1, 2000) end as reason,
+            case when status in ('completed', 'failed') and json_valid(resource_ownership) then
+              json_extract(resource_ownership, '$.version') = 2
+              and json_extract(resource_ownership, '$.namespace.state') = 'settled'
+              and json_type(resource_ownership, '$.process_pending') = 'false'
+              and json_extract(resource_ownership, '$.namespace.callId') = id
+              and json_extract(resource_ownership, '$.namespace.correlation') = correlation_id
+              and json_type(resource_ownership, '$.namespace.settled_at') in ('integer', 'real')
+              and json_extract(resource_ownership, '$.namespace.settled_at') > 0
+            end as processesSettled
+          from calls where ${pendingNative} and status <> 'running'
+            and case when json_valid(resource_cleanup) then json_type(resource_cleanup, '$.failures') = 'integer'
+              and json_extract(resource_cleanup, '$.failures') > 0 end
+        )
+        select callId, reason, case when min(coalesce(processesSettled, 0)) over () = 1
+          then count(*) over () end as retainedCalls
+        from holds order by coalesce(processesSettled, 0), callId limit 1
+      `).get() as { callId: string, reason: string | null, retainedCalls: number | null } | undefined
       if (!hold || !/^[a-f0-9]{32}$/.test(hold.callId)) return { live, pendingResources }
-      return { live, pendingResources, cleanupHold: hold }
+      const { callId, reason, retainedCalls } = hold
+      return { live, pendingResources, cleanupHold: { callId, reason, ...(retainedCalls !== null && { retainedCalls }) } }
     } catch (cause) { return { live, pendingResources: null, cause } }
   } finally {
     db?.close()

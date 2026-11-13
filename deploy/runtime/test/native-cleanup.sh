@@ -71,9 +71,9 @@ if [ "$runtime" = runsc ]; then
     headroom=$(node "$here/native-headroom.mjs" "$container")
     docker exec -e "POISE_COMPONENT_HEADROOM=$headroom" "$container" /opt/caller/venv/bin/python /contract/limits.py enforced "$resource_case"
   done
-  for replacement in cooperative abrupt; do
+  for replacement in cooperative retained abrupt; do
     docker exec "$container" /opt/caller/venv/bin/python /contract/replacement.py before "$replacement"
-    if [ "$replacement" = cooperative ]; then docker stop "$container" >/dev/null; fi
+    if [ "$replacement" != abrupt ]; then docker stop "$container" >/dev/null; fi
     docker rm --force "$container" >/dev/null
     start_workspace
     docker exec "$container" /opt/caller/venv/bin/python /contract/replacement.py after "$replacement"
