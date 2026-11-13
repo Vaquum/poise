@@ -13,13 +13,14 @@ const OK = ['ok', 'verified v2']
 
 /** The last read, kept across page loads: a reload paints it at once, then
  *  reads again. It stands only for the GitHub user, the organization chosen
- *  and the set of ready organizations it was read under. */
+ *  and the organizations configured, each with its status, it was read under:
+ *  All orgs counts every configured organization, ready or not. */
 interface LastHealth { key: string, data: AnalyticsHealth, at: number }
 const LAST_HEALTH_KEY = 'poise-overview-health'
 function healthKey(): string {
   const me = getSettings().me ?? ''
-  const ready = getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login.toLowerCase()).sort().join(',')
-  return me ? `${me}|${getSelectedOrganization()}|${ready}` : ''
+  const configured = getOrganizations().map((org) => `${org.login.toLowerCase()}:${org.status}`).sort().join(',')
+  return me ? `${me}|${getSelectedOrganization()}|${configured}` : ''
 }
 const readable = (data: AnalyticsHealth | null | undefined): data is AnalyticsHealth =>
   !!data?.rate && !!data.blocked && !!data.recovery && !!data.lastError && Array.isArray(data.coverage)
