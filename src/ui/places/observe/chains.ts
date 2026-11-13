@@ -84,6 +84,7 @@ export interface JournalEvent {
   reason: string | null
   outcome: string | null
   callId: string | null
+  reviewComplete?: boolean
   diagnostic: { operation?: string, phase?: string, stderr?: string | null, context?: Record<string, unknown> } | null
 }
 
@@ -168,7 +169,8 @@ export function readJournalPage(value: unknown): { chain: ChainRow | null, event
     if (!object(e) || !Number.isSafeInteger(e.sequence) || !Number.isFinite(e.at) || typeof e.type !== 'string') return incomplete('a journal event')
     const evidence = object(e.evidence) && object(e.evidence.diagnostic) ? e.evidence.diagnostic as JournalEvent['diagnostic'] : null
     return { sequence: Number(e.sequence), at: Number(e.at), type: e.type, invocationId: text(e.invocationId), reason: text(e.reason),
-      outcome: text(e.outcome), callId: text(e.callId), diagnostic: evidence }
+      outcome: text(e.outcome), callId: text(e.callId), diagnostic: evidence,
+      ...(object(e.evidence) && typeof e.evidence.review_complete === 'boolean' ? { reviewComplete: e.evidence.review_complete } : {}) }
   })
   return { chain: object(value.chain) ? readChain(value.chain) : null, events, next: value.next === null ? null : Number(value.next) }
 }
@@ -290,7 +292,7 @@ export function eventWords(event: JournalEvent, invocations: ReadonlyMap<string,
     case 'chain.held': return { kind: 'hold', text: event.reason === 'New invocations held by the person' ? 'Held by you: no new invocations' : `Held: ${reasonWords(event.reason ?? 'no reason recorded')}`, call: null }
     case 'chain.waiting': return { kind: 'event', text: `Waiting: ${reasonWords(event.reason ?? 'no reason recorded')}`, call: null }
     case 'chain.resumed': return { kind: 'event', text: 'Resumed', call: null }
-    case 'chain.merged': return { kind: 'event', text: 'Merged', call }
+    case 'chain.merged': return { kind: 'event', text: event.reviewComplete === true ? 'Original review evidence complete' : 'Merged', call }
     case 'chain.superseded': return { kind: 'event', text: 'Superseded by a merge that covered it', call }
     case 'invocation.admitted': return { kind: 'run', text: 'A step was admitted', call: null }
     case 'invocation.started': return { kind: 'run', text: `${step} started${by ? ` · ${by}` : ''}`, call }
