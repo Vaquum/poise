@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   audit:
+    if: github.repository == 'autonomio/poise'
     name: Audit main
     runs-on: ubuntu-latest
     timeout-minutes: 10

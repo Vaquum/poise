@@ -56,6 +56,7 @@ describe('scheduled npm audit', () => {
     expect(workflow?.on?.schedule).toBeDefined()
     expect(workflow?.on?.workflow_dispatch).toBeDefined()
     expect(workflow?.permissions?.issues).toBe('write')
+    expect(workflow.jobs.audit.if).toBe("github.repository == 'autonomio/poise'")
 
     const text = readFileSync('.github/workflows/npm-audit.yml', 'utf8')
     expect(text).toContain('npm audit --audit-level=high')
