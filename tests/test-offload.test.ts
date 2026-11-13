@@ -465,6 +465,7 @@ describe('a suite on a test box', () => {
   let listLagMs: number
   let runBoxes: boolean
   let runJobs: boolean
+  let refuseTreeUploads: boolean
   let warnings: Record<string, unknown>[]
   let events: Record<string, unknown>[]
   let runners: { child: ChildProcess; done: Promise<unknown> }[]
@@ -539,6 +540,10 @@ describe('a suite on a test box', () => {
         mkdirSync(dirname(file), { recursive: true })
         const chunks: Buffer[] = []
         for await (const chunk of req) chunks.push(chunk as Buffer)
+        if (refuseTreeUploads && url.searchParams.get('path')?.startsWith('/tmp/poise-tree/')) {
+          res.writeHead(503).end('upload refused')
+          return
+        }
         writeFileSync(file, Buffer.concat(chunks))
         res.writeHead(200).end()
         return
@@ -654,6 +659,7 @@ describe('a suite on a test box', () => {
     runners = []
     runBoxes = true
     runJobs = true
+    refuseTreeUploads = false
     render = startRender()
     relayServer = undefined as unknown as Server
   })
@@ -1108,6 +1114,7 @@ describe('a suite on a test box', () => {
       expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([expect.objectContaining({ exit: 0 })])
       expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: originalId, error: 'the gateway restarted' }))
       expect(terminated).toContain(interrupted.id)
+      expect(warnings.filter(({ event, method, path }) => event === 'test_relay.request.failed' && method === 'GET' && path === `${TEST_RELAY_PATH}/runs/probe/output`)).toEqual([])
 
       // Model publication/remote observations only after the real runner's fresh complete result.
       append({ type: 'invocation.settled', invocationId: 'implementation', callId: 'implementation', outcome: 'published',
@@ -1473,6 +1480,22 @@ ${stderr}`
     expect(code).toBe(125)
     expect(stderr).toContain('no test result')
     expect(stderr).toContain('says nothing about your code')
+    const admission = /, run ([a-f0-9]{32})/.exec(stderr)
+    expect(admission).not.toBeNull()
+    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![1],
+      error: expect.stringContaining('the stream from the box ended before the command did') }))
+  })
+
+  it('warns when the checkout upload fails', async () => {
+    refuseTreeUploads = true
+    await startAll()
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done
+    expect(code).toBe(125)
+    expect(stderr).toContain('no test result: sending the checkout to the box failed:')
+    const admission = /, run ([a-f0-9]{32})/.exec(stderr)
+    expect(admission).not.toBeNull()
+    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![1],
+      error: expect.stringContaining('with HTTP 503: upload refused') }))
   })
 
   it('keeps a healthy run whose box took long to get, however far Render\'s list lags', async () => {
@@ -1578,7 +1601,7 @@ ${stderr}`
       config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', baseService: null, jobPlan: 'plan-crn-005', limitSeconds: 3600, maxRuns },
       privateKey,
       origin: () => relayOrigin,
-      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: (event: string, fields: Record<string, unknown>) => { warnings.push({ event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
@@ -1603,6 +1626,37 @@ ${stderr}`
     setupExit = 0
     expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
     expect(snapshots.size).toBe(1)
+  })
+
+  it('answers only the authenticated recovery probe without a failure warning or admitting a run', async () => {
+    await startAll()
+    const probe = '/runs/probe/output'
+    const reply = await fetch(`${relayUrl}${probe}`, { headers: { authorization: `Bearer ${KEY}` } })
+    expect(reply.status).toBe(410)
+    expect(reply.headers.get('content-type')).toBe('text/plain; charset=utf-8')
+    expect(await reply.text()).toBe('this run is over')
+    expect(relay.runs.size).toBe(0)
+    expect(warnings.filter(({ event, path }) => event === 'test_relay.request.failed' && path === `${TEST_RELAY_PATH}${probe}`)).toEqual([])
+
+    const forged = workspaceKey(generateKeyPairSync('ed25519').privateKey, 'alice')
+    for (const [method, path, key, status] of [
+      ['GET', probe, '', 401],
+      ['GET', probe, forged, 401],
+      ['GET', `/runs/${'0'.repeat(32)}/output`, KEY, 410],
+      ['GET', `${probe}/extra`, KEY, 410],
+      ['GET', `${probe}/`, KEY, 410],
+      ['HEAD', probe, KEY, 410],
+      ['POST', probe, KEY, 410],
+      ['GET', '/runs/probe/spec', KEY, 410],
+    ] as const) {
+      const from = warnings.length
+      const response = await fetch(`${relayUrl}${path}`, { method, headers: key ? { authorization: `Bearer ${key}` } : {} })
+      expect(response.status).toBe(status)
+      await response.text()
+      expect(warnings.slice(from)).toContainEqual({ event: 'test_relay.request.failed', method, path: `${TEST_RELAY_PATH}${path}`, status,
+        error: status === 401 ? 'this key is not a workspace\'s' : 'this run is over' })
+    }
+    expect(relay.runs.size).toBe(0)
   })
 
   it('accepts only a workspace\'s key, and each workspace only its own run', async () => {
@@ -1636,8 +1690,11 @@ ${stderr}`
     const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
     const { id } = await created.json() as { id: string }
     for (const authorization of [`Bearer ${KEY}`, `Bearer ${'0'.repeat(64)}`, '']) {
-      expect((await fetch(`${relayUrl}/runs/${id}/spec`, { headers: { authorization } })).status).toBe(410)
-      expect((await fetch(`${relayUrl}/runs/${id}/docker`, { method: 'POST', headers: { authorization } })).status).toBe(410)
+      for (const [method, part] of [['GET', 'spec'], ['POST', 'docker']]) {
+        const path = `/runs/${id}/${part}`
+        expect((await fetch(`${relayUrl}${path}`, { method, headers: { authorization } })).status).toBe(410)
+        expect(warnings).toContainEqual({ event: 'test_relay.request.failed', method, path: `${TEST_RELAY_PATH}${path}`, status: 410, error: 'this run is over' })
+      }
     }
     expect(relay.runs.has(id)).toBe(true)
     expect((await fetch(`${relayUrl}/instance`)).status).toBe(200)
