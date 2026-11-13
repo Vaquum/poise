@@ -31,6 +31,7 @@ import { behaviorChainJournal } from './behavior-chain-journal'
 import { BehaviorResourceRecovery } from './behavior-chain-resource-recovery'
 import { readNativeInvocations } from './behavior-chain-native'
 import { db } from './db'
+import { trackReleaseBackground } from './release-background'
 
 /** Closed sessions keep their workspace this long before it may be removed. */
 export const WORKSPACE_CLOSED_GRACE_MS = 24 * 60 * 60_000
@@ -1021,11 +1022,12 @@ export function startStorageMaintenanceRuntime(): void {
   maintenanceTimer.unref?.()
   const pressure = () => {
     if (pressurePass) return
+    const finished = trackReleaseBackground()
     pressurePass = (async () => {
       try { await nativeCleanup() }
       catch (error) { console.error('[storage] native cleanup failed:', error) }
       return checkWorkspacePressure()
-    })().finally(() => { pressurePass = null })
+    })().finally(() => { pressurePass = null; finished() })
   }
   pressureTimer = setInterval(pressure, PRESSURE_CHECK_MS)
   pressureTimer.unref?.()

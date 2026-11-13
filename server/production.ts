@@ -432,8 +432,6 @@ export function createProductionShutdown(
       if (finished) return
       finished = true
       try {
-        const state = serverShutdowns.get(server)!
-        console.error(`[poise] shutdown timed out after ${PRODUCTION_SHUTDOWN_TIMEOUT_MS}ms; pending: ${[...state.pending].join(', ')}`, ...state.failures.map(({ error }) => error))
         closeDatabaseOnce()
       }
       catch (error) { serverShutdowns.get(server)!.failures.push({ phase: 'database_close', error }) }
