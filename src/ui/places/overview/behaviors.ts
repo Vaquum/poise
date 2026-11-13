@@ -70,8 +70,8 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
   let last = rememberedBehaviors(key)
   let metricsFresh = false
   let keptAt = 0
-  /** When the remembered estimates were read: a fresh read is always later. */
-  const keptAtStart = last?.at ?? 0
+  /** What was running, as last read, until a fresh read lands: a failed one keeps them, still remembered. */
+  let estimatesRemembered = !!last
   if (last) estimates = { data: last.estimates, error: '', at: last.at }
 
   /** Its switch, pause and last run: as read, or as last read while Behaviors reads afresh. */
@@ -149,7 +149,8 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
       metrics.data?.error ? metrics.data.error : '',
       readLine('What is running now', estimates),
     ].filter(Boolean)
-    const rows = BEHAVIORS.filter((meta) => find.matches(meta.label, getLastTriggered(meta.key)?.target))
+    // The search finds what each row shows: its last run as read, or as last read.
+    const rows = BEHAVIORS.filter((meta) => find.matches(meta.label, stateOf(meta.key).last?.target))
     box.innerHTML = `<div class="obeh" data-ref="ov.behaviors">
       <div class="obeh-h"><span class="t-gloss" data-ref="ov.behaviors.day">Runs, time and success for ${esc(day?.label ?? 'the chosen day')}, as the day above</span>
       <a class="lnk" href="${esc(placeHref('settings', { settings: 'behaviors', back: 'overview' }))}">Settings for each behavior</a></div>
@@ -189,6 +190,7 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
       const data = await json<{ estimates?: Estimate[] }>('/api/behavior-estimates')
       if (!Array.isArray(data.estimates)) throw new Error('the service answered with something this page cannot read')
       estimates = { data: data.estimates, error: '', at: Date.now() }
+      estimatesRemembered = false
     } catch (error) {
       estimates = { ...estimates, error: reason(error) }
     }
@@ -223,7 +225,7 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
     if (!last) return
     last = null
     if (!metricsFresh) metrics = { ...metrics, data: null }
-    if (estimates.at && !estimates.error && estimates.data && estimates.at <= keptAtStart) estimates = unread()
+    if (estimatesRemembered) { estimates = { ...unread(), error: estimates.error }; estimatesRemembered = false }
     paint()
   }, { signal })
 

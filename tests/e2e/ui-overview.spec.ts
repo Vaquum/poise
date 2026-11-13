@@ -68,6 +68,8 @@ interface Workspace {
   behaviorStates?: Record<string, unknown>
   /** What /api/github-quota answers. */
   quota?: unknown
+  /** /api/behavior-estimates fails. */
+  estimatesFail?: boolean
   /** /api/behaviors fails. */
   behaviorsFail?: boolean
   /** The organizations /api/settings names, all ready; acme alone unless set. */
@@ -101,6 +103,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     const path = url.pathname
     if (method === 'GET' && workspace.answersLate && ['/api/notices', '/api/chat/requests', '/api/chat/switchboard', '/api/editor/reviews', '/api/behavior-chains', '/api/behaviors',
       '/api/behavior-ledger/pr-status', '/api/answers/dismissals'].includes(path)) await workspace.answersLate
+    if (path === '/api/behavior-estimates' && workspace.estimatesFail) return json(route, { error: 'estimates are unavailable' }, 503)
     if (method === 'GET' && workspace.rightLate && ['/api/behaviors', '/api/behavior-metrics', '/api/behavior-estimates', '/api/github-quota'].includes(path)) await workspace.rightLate
     if (path === '/api/notices' && method === 'GET') return json(route, { enabled: true, notices: workspace.notices })
     if (path === '/api/notices/handled') return json(route, { handled: [] })
@@ -794,7 +797,7 @@ test('System health reads its five cards live, and a failed read keeps them, wit
 test('a reload paints Behaviors’ and the API quota’s last reads at once; a switch waits for the fresh read', async ({ page }) => {
   const quota = { accounts: [{ login: 'me', roles: ['user'], checkedAt: ago(1), error: null, buckets: [{ resource: 'core', label: 'REST', limit: 5000, used: 1200, remaining: 3800,
     resetAt: new Date(NOW + 30 * 60_000).toISOString(), perMinute: 4, riskPercent: 0, history: [] }] }] }
-  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, quota, behaviorStates: { 'review-new-prs': { enabled: true } },
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, quota, behaviorStates: { 'review-new-prs': { enabled: true, lastTriggered: { at: ago(10), target: 'acme/site#42' } } },
     metrics: { error: null, behaviors: { 'review-new-prs': { totalRuns: 12, durationMinutes: 30, successRate: 75 } } } }
   await open(page, workspace)
   const row = page.locator('[data-beh="review-new-prs"]')
@@ -817,6 +820,11 @@ test('a reload paints Behaviors’ and the API quota’s last reads at once; a s
   await expect(toggle).toHaveAttribute('aria-disabled', 'true')
   await expect(toggle).toHaveAttribute('data-why', /Reading what is current/)
   await toggle.dispatchEvent('click')
+  // The search finds what a row shows, its remembered last run included.
+  await page.getByRole('searchbox', { name: 'Filter this side' }).fill('site#42')
+  await expect(row).toBeVisible()
+  await expect(page.locator('[data-beh="approve-prs"]')).toHaveCount(0)
+  await page.getByRole('searchbox', { name: 'Filter this side' }).fill('')
   // The fresh reads replace them, and the switch works.
   release()
   await expect(row.locator('td.num').first()).toHaveText('13')
@@ -828,20 +836,24 @@ test('Behaviors’ last reads never stand once settings read afresh name other o
   const settings = { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC',
     manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }
   const kept = { key: 'me|acme:ready', at: NOW - 60_000, since: '1970-01-01T00:00:00.000Z', state: { 'review-new-prs': { on: true, paused: null, last: null } },
-    metrics: { error: null, behaviors: {} }, estimates: [] }
+    metrics: { error: null, behaviors: {} }, estimates: [{ id: 'r1', behavior: 'pr_review', startedAt: ago(2), estimate: null }] }
   await page.addInitScript(([last, behaviors]) => { localStorage.setItem('poise-last-settings', last); localStorage.setItem('poise-overview-behaviors', behaviors) }, [JSON.stringify(settings), JSON.stringify(kept)])
   let settingsRead!: () => void
-  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], orgs: ['acme', 'beta'], rightLate: new Promise<void>(() => {}),
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], orgs: ['acme', 'beta'], rightLate: new Promise<void>(() => {}), estimatesFail: true,
     settingsLate: new Promise<void>((resolve) => { settingsRead = resolve }) }
   await open(page, workspace)
   const toggle = page.locator('[data-beh="review-new-prs"] [data-act="beh-toggle"]')
   // Opened on the remembered settings, the switch shows its last state, taking no press.
   await expect(toggle).toHaveAttribute('aria-pressed', 'true')
   await expect(toggle).toHaveAttribute('data-why', /Reading what is current/)
-  // Read afresh, the settings name beta too: the last state no longer stands, though Behaviors has not been read.
+  // What was running, as last read, stands though its fresh read failed.
+  const lastRun = page.locator('[data-beh="review-new-prs"] td').nth(1)
+  await expect(lastRun).toContainText('Running')
+  // Read afresh, the settings name beta too: the last state and runs no longer stand, though Behaviors has not been read.
   settingsRead()
   await expect(toggle).toHaveAttribute('aria-pressed', 'false')
   await expect(toggle).toHaveAttribute('data-why', /could not be read/)
+  await expect(lastRun).not.toContainText('Running')
 })
 
 test('Behaviors gives every row its runs, time and success, or says why in words (#1382)', async ({ page }) => {
