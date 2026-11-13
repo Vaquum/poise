@@ -255,6 +255,9 @@ existing resume event records `ciRecovery`. The normal decision path then
 rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
+Work impact and attention describe this automatic CI recheck instead of asking
+for Resume; attention retains the scheduled `reconciliation.nextObservationAt`.
+Unsettled original receipts and resources still require reconciliation first.
 
 Merged `merge-pr` and `resolve-threads` uncertainty uses original journal
 receipts only. A missing original response schedules no GitHub read; retaining

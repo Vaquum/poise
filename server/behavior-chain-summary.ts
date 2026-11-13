@@ -271,7 +271,10 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
     progressAt: progress.at, retryAt,
     nextAction: contradicted ? 'Reconcile contradictory original resource-release evidence'
       : chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
-        : chain.held ? `Resolve the hold and explicitly resume: ${chain.held}`
+        : chain.held ? chain.ciHold
+            ? active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
+              : 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
+            : `Resolve the hold and explicitly resume: ${chain.held}`
           : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
             : active ? 'Await the original invocation outcome' : chain.mergeSha ? null
               : retryAt !== null ? 'Automatic retry eligible after backoff, subject to existing admission gates' : waiting,
@@ -465,7 +468,9 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         : chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : resourceContradicted ? `Hold: Invocation ${resourceContradicted.id} has contradictory resource-release evidence; ownership remains held`
-          : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'
+          : chain.held ? chain.ciHold
+            ? 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
+            : 'Resolve the durable hold, then explicitly resume the chain'
             : active ? 'Await the original invocation outcome'
               : state !== 'fresh' ? 'Await a fresh, complete chain observation'
                 : pull && pull.state !== 'open' ? 'Hold: pull request closed without a confirmed merge; a decision is required'
