@@ -5,9 +5,6 @@ import type { Duplex } from 'node:stream'
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { HttpError, endJson, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
-import { readAnalyticsHealth } from './analytics-health'
-import { handleGhBody } from './gh'
-import { warmUp } from './warm-up'
 import { assertCallerRelease } from './caller-release'
 import { refuseInspectorActivation, registerProductionShutdownSignals } from './production-signals'
 import { abandonProductionCpuCapture, installProductionCpuCapture } from './production-cpu-profile'
@@ -46,6 +43,10 @@ startLogging({ captureFatal: true })
 const { recordRuntimeDiagnostic } = await import('./runtime-diagnostic')
 const { attachChatSockets, createPoiseMiddleware, stopDailyModelRefresh, stopPoiseRuntime } = await import('./cache-plugin')
 const { closeDatabase } = await import('./db')
+// After the dotenv above, like every module that opens the database.
+const { warmUp } = await import('./warm-up')
+const { handleGhBody } = await import('./gh')
+const { readAnalyticsHealth } = await import('./analytics-health')
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 5555
