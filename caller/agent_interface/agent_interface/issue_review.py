@@ -30,7 +30,7 @@ from typing import Callable
 from . import progress, review_budget, resource_ownership
 from .atoms import AgentPreflightError, bounded_cause, provider_blocked
 from .model_catalog import Model
-from .process_diagnostic import diagnostic_envelope
+from .process_diagnostic import diagnostic_envelope, diagnostic_from_stderr
 from .provider_progress import ProviderStream, claude_error
 from .review_watch import _interrupted, _stop_process_group
 
@@ -107,7 +107,20 @@ def interface(*args: str, seconds: float = 120, cwd: Path | None = None) -> dict
         process.communicate()
         raise
     if process.returncode:
-        raise RuntimeError((stderr or stdout).strip() or f"github-interface {args[0]} exited {process.returncode}")
+        phase = progress.phase() or "github_interface"
+        diagnostic = diagnostic_from_stderr(stderr, phase) or diagnostic_envelope(
+            operation="github-interface", phase=phase, outcome="signal" if process.returncode < 0 else "exit",
+            exit_code=process.returncode if process.returncode >= 0 else None,
+            signal=-process.returncode if process.returncode < 0 else None,
+            message="No validated github-interface diagnostic; cause unavailable")
+        diagnostic["message"] = bounded_cause(
+            f"github-interface failed during {phase} (return code {process.returncode}): "
+            f"{diagnostic['operation']} {diagnostic.get('outcome')} "
+            f"(exit {diagnostic.get('exit_code')}, signal {diagnostic.get('signal')}): "
+            + (diagnostic.get("stderr") or diagnostic.get("message") or "cause unavailable"))
+        error = RuntimeError(diagnostic["message"])
+        error.diagnostic = diagnostic
+        raise error
     return json.loads(stdout)
 
 

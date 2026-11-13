@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from time import monotonic
 from typing import Callable
@@ -422,4 +423,13 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             return published
         finally:
             if lease.held:
-                lease.release()
+                active = sys.exception()
+                try:
+                    lease.release()
+                except Exception as cleanup:
+                    if active is not None and getattr(cleanup, "diagnostic", None) is None:
+                        diagnostic = getattr(active, "diagnostic", None)
+                        if diagnostic is not None:
+                            cleanup.diagnostic = diagnostic
+                            cleanup.args = (f"{cleanup} (original failure: {active})", *cleanup.args[1:])
+                    raise

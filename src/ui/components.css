@@ -13,6 +13,8 @@ button { background: none; border: 0; cursor: pointer; }
 ::selection { background: var(--c-agent-tint); color: var(--c-text); }
 :focus-visible { outline-width: var(--line-focus); outline-style: solid; outline-color: var(--c-focus); outline-offset: var(--line-focus); }
 :focus:not(:focus-visible) { outline: none; }
+/* Focus a place moves on purpose, such as the bell's, shows the keyboard's ring. */
+[data-focus-ring]:focus { outline-width: var(--line-focus); outline-style: solid; outline-color: var(--c-focus); }
 
 svg.i { width: var(--size-icon); height: var(--size-icon); fill: none; stroke: currentColor; stroke-width: var(--icon-stroke); stroke-linecap: round; stroke-linejoin: round; flex: none; }
 svg.i.sm { width: var(--size-icon-sm); height: var(--size-icon-sm); }

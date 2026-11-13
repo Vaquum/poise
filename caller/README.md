@@ -299,6 +299,15 @@ records filesystem bytes/inodes measured immediately after the process failure,
 with its own measurement time; unavailable readings are null with the measurement
 error. This is evidence at capture time, never a claim about earlier disk use.
 
+Atomic publication retains that same Git diagnostic in the original Call before
+managed-resource cleanup, including the inner Git exit or signal. Invalid,
+oversized or absent diagnostic envelopes retain only the github-interface
+process outcome and an explicitly unavailable cause; raw output is excluded.
+Caller logs and Logging expose the operation, publication phase and available
+cause. This evidence neither settles an unknown push nor authorizes a retry,
+including after a later merge; resource release and review obligations keep
+their existing gates. Discarded historical causes remain unavailable.
+
 Native namespace init forwards the executor's observed wait status before
 exiting. The original Call retains an executor signal separately from an
 explicit exit such as 137; the init's conventional 128+signal exit does not

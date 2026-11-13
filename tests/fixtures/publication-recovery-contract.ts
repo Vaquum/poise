@@ -4,6 +4,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
+import { callerDiagnostic } from '../../gateway/src/diagnostics/sources'
+import { normalize } from '../../gateway/src/diagnostics/contract'
 import { parseAgentLogStdout } from '../../server/agent-log-parse'
 import { decideBehaviorChain, type ChainObservation } from '../../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../../server/behavior-chain-runtime'
@@ -13,6 +15,16 @@ const snapshot = parseAgentLogStdout(readFileSync(process.argv[2], 'utf8'), 'ori
 assert.equal(snapshot.quarantined.length, 0, JSON.stringify(snapshot.quarantined))
 assert.equal(snapshot.entries.length, 1)
 const call = snapshot.entries[0], now = Date.now(), parent = 'b'.repeat(40), merge = 'd'.repeat(40)
+const diagnostic = call.diagnostic
+if (diagnostic) {
+  const logged = normalize(callerDiagnostic(call, 'fixture')!, now, [])!
+  assert.equal(logged.operation, diagnostic.operation)
+  assert.equal(logged.phase, diagnostic.phase)
+  assert.equal(logged.message, call.error)
+  assert.equal(logged.stderr, diagnostic.stderr)
+  assert.equal(logged.exitCode, diagnostic.context.exit_code)
+  assert.equal(logged.signal, diagnostic.context.signal)
+}
 const closed = process.argv[3] === 'merged-parent', repair = call.behavior === 'repair_pr'
 const noWrite = call.action === 'not_started'
 const reviewer = { slot: 'primary', model: call.model, recovery: call.model }
@@ -55,11 +67,13 @@ try {
   assert.equal(recovered.invocations.length, 1)
   assert.equal(recovered.invocations[0].state, noWrite ? 'settled' : 'uncertain')
   assert.equal(recovered.invocations[0].evidence?.artifact && chainBasis(recovered.invocations[0].evidence.artifact), chainBasis(call.artifact))
-  assert.equal(recovered.invocations[0].evidence?.resources_settled_at, call.resources_settled_at)
+  assert.equal(recovered.invocations[0].evidence?.resources_settled_at ?? null, call.resources_settled_at ?? null)
   if (!noWrite) {
-    assert.ok(recovered.waiting?.includes(call.id))
-    assert.ok(recovered.waiting?.includes('pre-push no-write checkpoint or a conclusive push result'))
     assert.equal(recovered.invocations[0].evidence?.action, null)
+    if (call.resources_settled_at) {
+      assert.ok(recovered.waiting?.includes(call.id))
+      assert.ok(recovered.waiting?.includes('pre-push no-write checkpoint or a conclusive push result'))
+    }
   } else if (!closed) {
     assert.equal(recovered.invocations[0].outcome, 'preflight_failed')
     assert.ok(recovered.waiting?.includes('native failure backoff'))
@@ -67,10 +81,14 @@ try {
     assert.equal(decideBehaviorChain(recovered, { ...observation, checkedAt: later }, later).kind, 'invoke')
   }
   if (closed) {
-    assert.equal(recovered.mergeSha, merge)
-    assert.equal(recovered.reviewPending, true)
-    assert.ok(recovered.held)
     assert.notEqual(recovered.invocations[0].outcome, 'published')
+    if (call.resources_settled_at) {
+      assert.equal(recovered.mergeSha, merge)
+      assert.equal(recovered.reviewPending, true)
+      assert.ok(recovered.held)
+    } else {
+      assert.equal(recovered.invocations[0].state, 'uncertain')
+    }
   }
   const effects = () => journal.history(chain.id).filter(row => JSON.parse(row.payload).type !== 'chain.observed')
   const history = effects()

@@ -4,7 +4,11 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from threading import Thread
+from time import monotonic
 from urllib.parse import urlparse
+
+from .process_diagnostic import StderrCapture, failure
 
 # One bare mirror per repository, outside ~/dev, so a fresh checkout is a
 # local clone instead of a full download.
@@ -114,12 +118,32 @@ def commit_work(head_repo: str, head_ref: str, message: str, token: str, path: P
 
 
 def _run(command: list[str], token: str, *secrets: str) -> str:
-    result = subprocess.run(command, capture_output=True, text=True)
-    output = (result.stderr or result.stdout) if result.returncode != 0 else (result.stdout or result.stderr)
+    started, capture = monotonic(), StderrCapture()
+    env = {**os.environ, **{f"GITHUB_INTERFACE_SECRET_{index}": secret
+                           for index, secret in enumerate((token, *secrets))}}
+    cwd = command[2] if command[1:2] == ["-C"] else os.getcwd()
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as error:
+        raise failure(cwd, env, command[1:], started, capture, error=error) from error
+    with process:
+        reader = Thread(target=capture.drain, args=(process.stderr,), daemon=True)
+        reader.start()
+        try:
+            stdout = process.stdout.read()
+            process.wait()
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            reader.join()
+        if process.returncode != 0:
+            raise failure(cwd, env, command[1:], started, capture, process=process)
+        output = stdout.decode() or capture.evidence(env)[0]
     for secret in (token, *secrets):
-        output = output.replace(secret, "***")
-    if result.returncode != 0:
-        raise RuntimeError(output.strip())
+        if secret:
+            output = output.replace(secret, "***")
     return output.strip()
 
 

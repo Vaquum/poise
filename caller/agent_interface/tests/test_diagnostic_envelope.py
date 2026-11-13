@@ -39,6 +39,23 @@ class DiagnosticEnvelopeCase(TestCase):
         assert_complete_envelope(value)
         self.assertEqual((value["stderr"], value["stderr_truncated"]), ("", False))
 
+    def test_invalid_envelopes_are_unavailable_instead_of_masking_process_failure(self):
+        value = process_diagnostic.diagnostic_envelope(operation="push", phase="git", outcome="exit", stderr="safe cause")
+        malformed = ["{", "[" * 2000, json.dumps({**value, "stderr": "x" * (128 * 1024)})]
+        malformed += [json.dumps({**value, **change}) for change in (
+            {"version": True}, {"outcome": []}, {"message": 7}, {"stderr_truncated": "false"}, {"filesystem": []},
+            {"filesystem": {"free_bytes": {"private": "content"}}}, {"exit_code": []},
+            {"signal": True}, {"elapsed_ms": float("nan")}, {"pid": 10 ** 1000},
+        )]
+        for raw in malformed:
+            with self.subTest(raw=raw[:80]):
+                self.assertIsNone(process_diagnostic.diagnostic_from_stderr("caller_diagnostic: " + raw, "publishing"))
+        parsed = process_diagnostic.diagnostic_from_stderr(
+            "unsafe raw output\ncaller_diagnostic: " + json.dumps({**value, "stdout": "private output"}), "publishing")
+        self.assertEqual(parsed["phase"], "publishing")
+        self.assertEqual(parsed["stderr"], "safe cause")
+        self.assertNotIn("stdout", parsed)
+
 
 class FinishFallbackCase(TestCase):
     def setUp(self):
