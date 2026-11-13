@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import { db, getMeta, setMeta } from './db'
+import { cachedStatement, prefixRange } from './statements'
 import { diagnostic } from './logging'
 import { conditionCorrelation } from './logging-context'
 import { organizationArgs, type Organization } from './organizations'
@@ -163,7 +164,7 @@ export function recordStaleMirrorBlock(error: StaleDatastoreError, behavior: str
 }
 
 export function openStaleMirrors(org: Organization | null): StaleMirrorEpisode[] {
-  const rows = db.prepare('SELECT value FROM meta WHERE substr(key, 1, ?) = ?').all(EPISODE_PREFIX.length, EPISODE_PREFIX) as Array<{ value: string }>
+  const rows = cachedStatement(db, 'SELECT value FROM meta WHERE key >= ? AND key < ?').all(...prefixRange(EPISODE_PREFIX)) as Array<{ value: string }>
   return rows.map(({ value }) => JSON.parse(value) as StaleMirrorEpisode).filter((episode) => !episode.recoveredAt
     && episode.account === (org?.login.toLowerCase() ?? 'legacy')
     && (!org?.datastorePath || episode.database === resolve(org.datastorePath)))

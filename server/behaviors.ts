@@ -93,7 +93,7 @@ import {
   type CompletedApprovalBasisLaunch,
   type DeadLetterReconcileResult,
 } from './db'
-import { cachedStatement } from './statements'
+import { cachedStatement, prefixRange } from './statements'
 import { HttpError } from './http'
 import { eventLoopDelayStats, type EventLoopDelayStats } from './event-loop-delay'
 import { behaviorErrorMessage, behaviorIncidentDiagnostics, REVIEW_BUDGET_STOPPED } from './behavior-diagnostics'
@@ -685,9 +685,9 @@ function clearRepoAccessHold(repo: string, actor = agentAccount()): void {
 
 function listRepoAccessHolds(): RepoAccessHold[] {
   const prefix = scopedMetaKey(REPO_ACCESS_HOLD_PREFIX)
-  const rows = db.prepare(
-    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
-  ).all(prefix.length, prefix) as Array<{ key: string }>
+  const rows = cachedStatement(db,
+    "SELECT key FROM meta WHERE key >= ? AND key < ? AND value <> ''",
+  ).all(...prefixRange(prefix)) as Array<{ key: string }>
   const holds: RepoAccessHold[] = []
   for (const row of rows) {
     const identity = row.key.slice(prefix.length)
@@ -758,9 +758,9 @@ function behaviorRetryDue(key: BehaviorKey, target: string): boolean {
 
 function behaviorFailureTargets(key: BehaviorKey): string[] {
   const prefix = `${scopedMetaKey(failureKey(key))}:`
-  const rows = db.prepare(
-    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
-  ).all(prefix.length, prefix) as Array<{ key: string }>
+  const rows = cachedStatement(db,
+    "SELECT key FROM meta WHERE key >= ? AND key < ? AND value <> ''",
+  ).all(...prefixRange(prefix)) as Array<{ key: string }>
   return rows.map((row) => row.key.slice(prefix.length))
 }
 
@@ -5370,9 +5370,9 @@ function retainResolveSupersededReceipt(checkTarget: string, attempt: ResolveRec
 
 async function retireClosedResolveRecoveries(open: ReadonlySet<string>): Promise<void> {
   const prefix = scopedMetaKey(RESOLVE_RECOVERY_PREFIX)
-  const rows = (db.prepare(
-    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
-  ).all(prefix.length, prefix) as Array<{ key: string }>).filter((row) => {
+  const rows = (cachedStatement(db,
+    "SELECT key FROM meta WHERE key >= ? AND key < ? AND value <> ''",
+  ).all(...prefixRange(prefix)) as Array<{ key: string }>).filter((row) => {
     const match = /^([^#]+)#([1-9][0-9]*):check$/.exec(row.key.slice(prefix.length))
     return match && !open.has(`${match[1]}#${match[2]}`)
   }).sort((a, b) => a.key.localeCompare(b.key))
@@ -6003,9 +6003,9 @@ export function getMergeQueueAdmission(target: string): MergeQueueAdmission | nu
 
 function retireClosedQueueAdmissions(open: ReadonlySet<string>): void {
   const prefix = scopedMetaKey(MERGE_QUEUE_ADMISSION_PREFIX)
-  const rows = db.prepare(
-    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
-  ).all(prefix.length, prefix) as Array<{ key: string }>
+  const rows = cachedStatement(db,
+    "SELECT key FROM meta WHERE key >= ? AND key < ? AND value <> ''",
+  ).all(...prefixRange(prefix)) as Array<{ key: string }>
   for (const row of rows) {
     const target = row.key.slice(prefix.length)
     const ref = target.match(/^[^#]+#\d+/)?.[0]

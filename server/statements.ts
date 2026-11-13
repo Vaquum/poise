@@ -17,3 +17,13 @@ export function cachedStatement(database: Database.Database, sql: string): Cache
   if (!statement) cache.set(sql, statement = database.prepare(sql))
   return statement
 }
+
+/** The keys that start with `prefix`, as the range a TEXT key's index answers:
+ *  `key >= low AND key < high`. A substr() or LIKE comparison reads every row,
+ *  value and all, instead. The prefix must end in an ASCII character, whose
+ *  successor is the next byte in UTF-8, so the range holds exactly those keys. */
+export function prefixRange(prefix: string): [low: string, high: string] {
+  const last = prefix.charCodeAt(prefix.length - 1)
+  if (!(last >= 0 && last < 0x7f)) throw new Error('a key prefix must end in an ASCII character')
+  return [prefix, prefix.slice(0, -1) + String.fromCharCode(last + 1)]
+}
