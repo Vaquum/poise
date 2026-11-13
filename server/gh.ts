@@ -355,12 +355,16 @@ let repoCacheGeneration = 0
 export function invalidateRepoListCache(): void {
   repoCacheGeneration += 1
   repoListCache.clear()
+  repoListFailures.clear()
   invalidateActionRunCache()
 }
 const REPO_LIST_TTL_MS = 5 * 60 * 1000
 
 /** Repository reads under way, by generation and identity: one read at a time each. */
 const repoListReads = new Map<string, Promise<string[]>>()
+/** Why the last read of a list failed, by identity, until one succeeds: a
+ *  picker shown the last list is shown this too. */
+const repoListFailures = new Map<string, string>()
 
 async function discoverOrgRepos(org: Organization, lastIsFine = false): Promise<string[]> {
   const me = getMeta('me') || ''
@@ -397,10 +401,18 @@ function readOrgRepos(org: Organization, me: string, key: string): Promise<strin
     if (generation === repoCacheGeneration) repoListCache.set(key, { repos: sorted, expiry: Date.now() + REPO_LIST_TTL_MS })
     return sorted
   })()
+  read.then(() => { if (generation === repoCacheGeneration) repoListFailures.delete(key) },
+    (error: unknown) => { if (generation === repoCacheGeneration) repoListFailures.set(key, error instanceof Error ? error.message : String(error)) })
   repoListReads.set(readKey, read)
   const settle = () => { if (repoListReads.get(readKey) === read) repoListReads.delete(readKey) }
   read.then(settle, settle)
   return read
+}
+
+function lastListFailure(org: Organization): string | null {
+  const key = `${(getMeta('me') || '').toLowerCase()}:${org.login.toLowerCase()}`
+  const cached = repoListCache.get(key)
+  return cached && cached.expiry <= Date.now() ? repoListFailures.get(key) ?? null : null
 }
 
 /** `lastIsFine`: a read-only picker may answer from a list past its time while it is read again. */
@@ -409,11 +421,19 @@ export async function listOrganizationsRepos(login?: string, lastIsFine = false)
   const results = await Promise.allSettled(orgs.map((org) => discoverOrgRepos(org, lastIsFine)))
   const repos: string[] = []
   const errors: OrganizationReadError[] = []
+  let unread = 0
   results.forEach((result, i) => {
-    if (result.status === 'fulfilled') repos.push(...result.value)
-    else errors.push({ org: orgs[i].login, error: result.reason instanceof Error ? result.reason.message : String(result.reason) })
+    if (result.status === 'fulfilled') {
+      repos.push(...result.value)
+      // A list past its time whose read again failed is shown with that failure.
+      const failure = lastIsFine ? lastListFailure(orgs[i]) : null
+      if (failure) errors.push({ org: orgs[i].login, error: `${failure}; showing the list read before` })
+    } else {
+      unread += 1
+      errors.push({ org: orgs[i].login, error: result.reason instanceof Error ? result.reason.message : String(result.reason) })
+    }
   })
-  if (orgs.length && errors.length === orgs.length) throw new HttpError(502, errors.map((entry) => `${entry.org}: ${entry.error}`).join('; '))
+  if (orgs.length && unread === orgs.length) throw new HttpError(502, errors.map((entry) => `${entry.org}: ${entry.error}`).join('; '))
   return { repos: [...new Set(repos)].sort((a, b) => a.localeCompare(b)), errors }
 }
 

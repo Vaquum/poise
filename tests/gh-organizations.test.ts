@@ -159,11 +159,20 @@ describe('the accounts GitHub is read as', () => {
       await vi.waitFor(() => expect(mocks.runFile).toHaveBeenCalledTimes(2))
       await vi.waitFor(async () => expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/one', 'alpha/two']))
       expect(mocks.runFile).toHaveBeenCalledTimes(2)
+      // A read again that fails leaves the last list, shown with why it is not newer, until one succeeds.
+      vi.setSystemTime(Date.parse('2026-11-13T05:12:00Z'))
+      mocks.runFile.mockImplementation(async () => { throw new Error('GitHub rate limit') })
+      expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/one', 'alpha/two'])
+      await vi.waitFor(async () => expect(await listOrganizationsRepos('alpha', true)).toEqual({
+        repos: ['alpha/one', 'alpha/two'], errors: [{ org: 'alpha', error: 'GitHub rate limit; showing the list read before' }] }))
+      mocks.runFile.mockImplementation(async () => ({ stdout: JSON.stringify({ repos: names.map((full_name) => ({ full_name })) }), stderr: '' }))
+      await vi.waitFor(async () => expect(await listOrganizationsRepos('alpha', true)).toEqual({ repos: ['alpha/one', 'alpha/two'], errors: [] }))
       // Validation never takes a list past its time: it waits for the fresh one.
       names = ['alpha/one', 'alpha/three', 'alpha/two']
-      vi.setSystemTime(Date.parse('2026-11-13T05:12:00Z'))
+      vi.setSystemTime(Date.parse('2026-11-13T05:24:00Z'))
+      const before = mocks.runFile.mock.calls.length
       expect(await listOrgRepos('alpha')).toEqual(['alpha/one', 'alpha/three', 'alpha/two'])
-      expect(mocks.runFile).toHaveBeenCalledTimes(3)
+      expect(mocks.runFile).toHaveBeenCalledTimes(before + 1)
     } finally {
       vi.useRealTimers()
     }
