@@ -97,6 +97,13 @@ describe('behavior run metrics', () => {
     for (const extra of [{ status: null }, { status: 'completed', startedAt: null }, { status: 'completed', id: log().id }]) {
       expect(readBehaviorMetrics([log()], window, null, [quarantine(extra)]).behaviors['review-new-prs']).toBeNull()
     }
+    // A readable record outside the range, or of another behavior, sharing its identity still makes it ambiguous.
+    const earlier = log({ id: 'd'.repeat(32), correlation_id: 'shared-call', started_at: '2026-10-10T10:00:00Z', completed_at: '2026-10-10T10:02:00Z' })
+    for (const extra of [{ id: 'D'.repeat(32).toLowerCase() }, { correlationId: 'shared-call' }]) {
+      expect(readBehaviorMetrics([log(), earlier], window, null, [quarantine({ status: 'completed', ...extra })]).behaviors['review-new-prs']).toBeNull()
+    }
+    const sibling = log({ id: 'b'.repeat(32), behavior: 'pr_approve', source: 'poise:approve-prs' })
+    expect(readBehaviorMetrics([log(), sibling], window, null, [quarantine({ status: 'completed', id: 'b'.repeat(32) })]).behaviors['review-new-prs']).toBeNull()
   })
 
   it.each([

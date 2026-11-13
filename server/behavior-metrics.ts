@@ -194,10 +194,10 @@ function behaviorSource(key: string): string {
 /** A damaged record Caller still places from its intact columns: this behavior,
  *  its own source, a status and a start, and no readable record with its
  *  identity. Anything less leaves the behavior's numbers unknown. */
-function placedRun(row: QuarantinedAgentLog, identities: ReadonlySet<string>, key: BehaviorKey, behavior: string): Run | null {
+function placedRun(row: QuarantinedAgentLog, readable: ReadonlySet<string>, key: BehaviorKey, behavior: string): Run | null {
   if (row.behavior !== behavior || !row.source || (row.source !== behaviorSource(key) && row.source !== 'poise:behavior-chain')) return null
   if (!row.status || !row.startedAt) return null
-  if (row.id && identities.has(`call:${row.id}`) || row.correlationId && identities.has(`correlation:${row.correlationId}`)) return null
+  if (row.id && readable.has(`call:${row.id.toLowerCase()}`) || row.correlationId && readable.has(`correlation:${row.correlationId}`)) return null
   return { behavior: key, startedAt: row.startedAt, completedAt: row.completedAt ?? null, status: row.status }
 }
 
@@ -212,6 +212,9 @@ export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, e
   quarantined: readonly QuarantinedAgentLog[] = []): BehaviorMetricsReport {
   const direct = readDirectMetrics(window)
   let unreadable = false
+  // Every readable record's identity, in any window and behavior: a damaged
+  // record sharing one is a contradictory duplicate and is never counted.
+  const readable = new Set(logs.flatMap((log) => [`call:${log.id.toLowerCase()}`, ...(log.correlation_id ? [`correlation:${log.correlation_id}`] : [])]))
   const behaviors = Object.fromEntries(BEHAVIOR_KEYS.map((key) => {
     if (key in AGENT_BEHAVIORS) {
       if (error) return [key, null]
@@ -222,7 +225,7 @@ export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, e
       const placed: Run[] = []
       for (const row of quarantined) {
         if (!quarantineMayAffect(row, identities, key, behavior, window)) continue
-        const run = placedRun(row, identities, key as BehaviorKey, behavior)
+        const run = placedRun(row, readable, key as BehaviorKey, behavior)
         if (!run) {
           unreadable = true
           return [key, null]
