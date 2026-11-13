@@ -471,7 +471,7 @@ export function runFile(
     const observe = (error: Error) => {
       const evidence = { command, executable: resolveCommand(command),
         operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review',
-          '--requested-changes-addressed', '--review-activity-since', '--head-sha'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
+          '--requested-changes-addressed', '--review-activity-since', '--head-sha', '--local-checkout-path', '--checkout-repo'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
         cwd: options.cwd ?? null, elapsedMs: Date.now() - startedAt, timeoutMs: timeout,
         stderrAllowed: !(command === 'gh' && args[0] === 'auth' && args[1] === 'token'),
         secrets: environmentSecrets(options.env ?? {}) }

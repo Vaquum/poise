@@ -2997,8 +2997,8 @@ function reconcileClosedTargetIncidents(): Promise<void> {
   return pass
 }
 
-async function localCheckoutPath(owner: string, repo: string, number: number, head: string, actor: string): Promise<string> {
-  return resolveReviewCheckout(owner, repo, number, actor, head, behaviorSignal())
+async function localCheckoutPath(owner: string, repo: string, number: number, head: string, actor: string, reportFailure = true): Promise<string> {
+  return resolveReviewCheckout(owner, repo, number, actor, head, behaviorSignal(), reportFailure)
 }
 
 async function currentHeadSha(
@@ -4850,7 +4850,8 @@ async function fireApprove(
     return false
   }
   attachCheckSlotToClaim(claimId, checkSlot)
-  const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
+  const pwd = await withNoticeDiagnosticIdentity({ ...diagnosticIdentity()!, phase: 'checkout' },
+    () => localCheckoutPath(owner, repo, pr.number, expectedHead, actor, false))
   const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor, accounts)
   // The final lookup runs first: the gates below catch anything that changed
   // while it was out, including role swaps during the lookup itself. A Random
