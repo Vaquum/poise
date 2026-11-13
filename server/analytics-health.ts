@@ -136,17 +136,25 @@ export function retryProven(chain: BehaviorChain, retry: ChainInvocation, observ
 }
 
 /** Confirmed closed seeds mirror journal.page(false): issue closed with no
- * existing pulls, settled ownership and no merged publication/PR. */
+ * remaining pulls, settled ownership and no merged publication/PR. Only the
+ * verified external closing reference is discounted; a test-merge SHA on the
+ * confirmed unmerged binding is not a merge. */
 function isConfirmedClosed(chain: BehaviorChain): boolean {
   const observation = chain.observation as ChainObservation | null
   if (!observation || observation.issue.open !== false) return false
-  if (!Array.isArray(observation.existingPulls) || observation.existingPulls.length !== 0) return false
+  const external = observation.externalMerge
+  const closing = typeof external?.merge_sha === 'string' && Number.isSafeInteger(external.pull_number) && external.pull_number > 0
+    ? `https://github.com/${chain.repository}/pull/${external.pull_number}`.toLowerCase() : null
+  if (!Array.isArray(observation.existingPulls)
+    || (closing === null ? observation.existingPulls.length !== 0
+      : observation.existingPulls.some(url => typeof url !== 'string' || url.toLowerCase() !== closing))) return false
   if (chain.invocations.some(invocation => invocation.state !== 'settled')) return false
   if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation }))) return false
   if (chain.reviewPending === true) return false
-  if (observation.publication.merged !== false || observation.publication.merge_sha != null) return false
+  if (observation.publication.merged !== false) return false
   const pull = observation.pull
   if (pull === null) return observation.publication.pull_number === null && observation.publication.state === null
+    && observation.publication.merge_sha == null
   return pull.state === 'closed' && observation.publication.state === 'closed'
     && pull.number === observation.publication.pull_number && pull.merged === false && pull.mergeSha == null
 }

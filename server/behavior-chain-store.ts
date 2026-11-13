@@ -471,13 +471,15 @@ export class BehaviorChainJournal {
         ${merged ? '' : `AND json_extract(state, '$.supersession') IS NULL AND NOT coalesce((
           json_type(state, '$.observation.issue.open') = 'false'
           AND json_type(state, '$.observation.existingPulls') = 'array'
-          AND json_array_length(state, '$.observation.existingPulls') = 0
+          AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.observation.existingPulls') p
+            WHERE json_extract(state, '$.observation.externalMerge.merge_sha') IS NULL
+              OR lower(p.value) IS NOT lower('https://github.com/' || json_extract(state, '$.repository') || '/pull/' || json_extract(state, '$.observation.externalMerge.pull_number')))
           AND resource_pending = 0 AND json_extract(state, '$.reviewPending') IS NOT 1
           AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i WHERE json_extract(i.value, '$.state') IS NOT 'settled')
           AND json_extract(state, '$.observation.publication.merged') IS 0
-          AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
           AND ((json_type(state, '$.observation.pull') = 'null'
             AND json_type(state, '$.observation.publication.pull_number') = 'null'
+            AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
             AND json_type(state, '$.observation.publication.state') = 'null')
           OR (json_extract(state, '$.observation.pull.state') = 'closed'
             AND json_extract(state, '$.observation.publication.state') = 'closed'

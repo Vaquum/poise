@@ -265,6 +265,19 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         || sha(state.merge_sha, 'merged pull') !== sha(external.merge_sha, 'external merge'))) {
         throw new Error('external merge differs from its closing PR evidence')
       }
+      if (!observation.issue.open && observation.publication.state === 'closed' && !observation.publication.merged
+        && state.state === 'closed' && state.merged === false && seed.external_merge) {
+        const closing = object(seed.external_merge, 'external merge')
+        const closingNumber = positive(closing.pull_number, 'external merge')
+        if (closingNumber === number) throw new Error('external merge conflicts with the unmerged bound PR')
+        const merged = await github(chain.repository, ['--pull-action-state', String(closingNumber), '--queue-evidence', ...reviewer])
+        if (merged.pull_number !== closingNumber || merged.state !== 'closed' || merged.merged !== true
+          || sha(merged.merge_sha, 'merged pull') !== sha(closing.merge_sha, 'external merge')) {
+          throw new Error('external merge differs from its closing PR evidence')
+        }
+        // Keep the closed binding as the target; the closing PR owns no native review obligation.
+        observation.externalMerge = { pull_number: closingNumber, merge_sha: sha(merged.merge_sha, 'external merge') }
+      }
       const head = sha(state.head_sha, 'pull state')
       const uncertainGrey = chain.invocations.find((invocation) => invocation.behavior === 'rerun-grey-ci' && invocation.state === 'uncertain')
       if (uncertainGrey) {
