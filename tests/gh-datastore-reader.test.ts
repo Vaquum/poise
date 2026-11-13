@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   runFile: vi.fn(),
   read: vi.fn(),
   content: vi.fn(),
+  closing: vi.fn(),
   org: { login: 'alpha', datastorePath: '/alpha.sqlite', status: 'ready', error: null as string | null },
 }))
 vi.mock('../server/db', () => ({ getMeta: () => null, setMeta: vi.fn(), db: { transaction: (fn: (...args: never[]) => unknown) => fn } }))
@@ -17,7 +18,8 @@ vi.mock('../server/organizations', () => ({
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
 vi.mock('../server/datastore-reader', () => ({ readDatastoreView: mocks.read, readDatastoreContent: mocks.content }))
-const { runCli } = await import('../server/gh')
+vi.mock('../server/chat/control', () => ({ readOpenPrClosingRefs: mocks.closing }))
+const { handleGhBody, runCli } = await import('../server/gh')
 
 const ARGS = ['view', 'pr', '--status', 'open', '--format', 'json']
 const row = (repo: string, number: number) => ({ repo, number, status: 'open', title: `${repo} ${number}` })
@@ -29,6 +31,7 @@ beforeEach(() => {
   mocks.read.mockReset()
   mocks.content.mockReset()
   mocks.content.mockReturnValue(null)
+  mocks.closing.mockReset()
   mocks.runFile.mockResolvedValue({ stdout: JSON.stringify(cli), stderr: '' })
 })
 afterEach(() => { vi.restoreAllMocks() })
@@ -184,6 +187,41 @@ describe('runCli with the in-process datastore reader', () => {
       expect(mocks.read).toHaveBeenCalledTimes(2)
     } finally {
       clock.mockRestore()
+  it('keeps the pages Board\'s intake reads of closing pull requests across syncs that change no item', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'poise-closing-pages-'))
+    const original = mocks.org.datastorePath
+    try {
+      const path = join(directory, 'alpha.sqlite')
+      writeFileSync(path, 'datastore')
+      mocks.org.datastorePath = path
+      const page = { prs: [{ repo: 'alpha/one', number: 2, url: 'https://github.com/alpha/one/pull/2', closing: [{ repo: 'alpha/one', number: 1 }], closesVia: 'closing-references', closingTruncated: false, headRef: null, headRepo: null }], truncated: false, more: false }
+      let mark = 'mark-1'
+      mocks.content.mockImplementation(() => Promise.resolve(mark))
+      mocks.read.mockImplementation(() => Promise.resolve([]))
+      mocks.closing.mockResolvedValue(page)
+      const intake = async () => (await handleGhBody({ operation: 'issue_intake' })).body as { prs: Record<string, unknown>, errors: unknown[] }
+      expect((await intake()).prs).toEqual({ 'alpha/one#1': [{ number: 2, url: 'https://github.com/alpha/one/pull/2' }] })
+      await intake()
+      expect(mocks.closing).toHaveBeenCalledTimes(1)
+      // A sync that changed no item.
+      writeFileSync(`${path}-wal`, 'frame')
+      expect((await intake()).errors).toEqual([])
+      expect(mocks.closing).toHaveBeenCalledTimes(1)
+      // An item changed.
+      mark = 'mark-2'
+      appendFileSync(`${path}-wal`, 'item frame')
+      await intake()
+      expect(mocks.closing).toHaveBeenCalledTimes(2)
+      // An unavailable page is an organization error, never kept.
+      mark = 'mark-3'
+      appendFileSync(`${path}-wal`, 'another item frame')
+      mocks.closing.mockResolvedValue(null)
+      expect((await intake()).errors).toEqual([{ org: 'alpha', error: 'open pull request references are incomplete' }])
+      mocks.closing.mockResolvedValue(page)
+      expect((await intake()).errors).toEqual([])
+      expect(mocks.closing).toHaveBeenCalledTimes(4)
+    } finally {
+      mocks.org.datastorePath = original
       rmSync(directory, { recursive: true, force: true })
     }
   })
