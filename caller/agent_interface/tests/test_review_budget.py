@@ -124,7 +124,7 @@ class TestReviewBudget(TestCase):
 
                 with patch.object(budget, 'monotonic', lambda: clock.now), \
                         patch.object(structured_review, 'monotonic', lambda: clock.now), \
-                        patch.object(structured_review, 'ReviewWatch', return_value=nullcontext()), \
+                        patch.object(structured_review, 'ReviewWatch', return_value=nullcontext(SimpleNamespace(check_closed=lambda: None))), \
                         patch.dict(structured_review.ASK, {'codex': ask}), \
                         patch.object(subprocess, 'run', side_effect=inspect) as command, \
                         budget.ReviewBudget(), self.assertRaises(budget.ReviewLimitError) as failure:
@@ -198,7 +198,7 @@ class TestRecovery(TestCase):
                 {'action': 'approved_pr', 'review_id': 93, 'head_sha': HEAD}))
 
         with patch.dict(structured_review.ASK, {'codex': Mock(side_effect=ask)}) as providers, \
-                patch.object(structured_review, 'ReviewWatch', return_value=nullcontext()), \
+                patch.object(structured_review, 'ReviewWatch', return_value=nullcontext(SimpleNamespace(check_closed=lambda: None))), \
                 patch.object(subprocess, 'run', side_effect=github) as self.verdict_github:
             self.verdict_ask = providers['codex']
             return self.execute([pr_approve.run, pr_approve.run], checks, model='gpt-6-astra-ultra')
@@ -800,7 +800,7 @@ class TestRecovery(TestCase):
         self.mod.run.side_effect = pr_approve.run if remapping or followup else pr_review.run
         with patch.object(budget, 'monotonic', lambda: clock.now), \
                 patch.object(structured_review, 'monotonic', lambda: clock.now), \
-                patch.object(structured_review, 'ReviewWatch', return_value=nullcontext(SimpleNamespace(run=provider))), \
+                patch.object(structured_review, 'ReviewWatch', return_value=nullcontext(SimpleNamespace(run=provider, check_closed=lambda: None))), \
                 patch.object(structured_review, 'codex_environment', return_value={}), \
                 (patch.dict(structured_review.PROVIDER_ANALYSIS_SECONDS, {'codex': 800})
                  if deadline and deadline.startswith('provider_analysis') else nullcontext()), \

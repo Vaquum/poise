@@ -2028,11 +2028,24 @@ def run_governed_behavior(
                 if prior:
                     response = f"{response}; prior: {prior}"
                 cancelled_receipt = review_receipt.get()
-                if cancelled_receipt is None:
+                unattempted_closure = False
+                if cancelled.closed_target is not None:
+                    with db() as conn:
+                        artifact = json.loads(conn.execute("select artifact from calls where id=?", (id_,)).fetchone()[0] or "{}")
+                    unattempted_closure = (cancelled_receipt is None and not cancelled.submission_attempted
+                                           and not review_receipt.failure() and artifact.get("phase") == "reviewing")
+                if unattempted_closure:
+                    result = _closed_target_result(
+                        facts=cancelled.closed_target,
+                        evidence="no submission attempted; original native receipt phase=reviewing; provider turn settled",
+                        attribution="target closed during provider analysis",
+                        prior_error=prior,
+                    )
+                elif cancelled_receipt is None and cancelled.closed_target is None:
                     result = {"action": None, "outcome": "superseded", "head_sha": cancelled.head_sha}
                 else:
-                    # The provider submitted before the cancellation landed:
-                    # verify the posted review instead of retracting it.
+                    # Idle/uncertain or sealed gates do not prove no write.
+                    # Reconcile the original publication, preserving its receipt.
                     progress.stage("verifying", "Verifying GitHub outcome after cancellation")
                     result = behavior_outcome(mod, behavior, pr, pwd, actor, expected_head, before,
                                               receipt=cancelled_receipt, call_id=id_, prior_error=response)

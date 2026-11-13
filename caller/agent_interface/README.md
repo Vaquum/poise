@@ -376,15 +376,22 @@ completion or supersession.
 An explicit provider refusal, exhausted Grok balance, or local Muse account latch
 is recorded as `review_provider_blocked`; transient provider outages remain retryable.
 
-While a model is analyzing a PR, Caller checks its live head approximately
-every 30 seconds through `github-interface --head-sha`. Only a valid response
-for the original repository and PR can cancel the run. Failed, timed-out, or
-malformed checks leave it running. A per-run submission lock lets an in-flight
-GitHub command finish and prevents cancelled workers from starting another one.
-Cancellation stops the provider process group and records `superseded` with the
-observed head, preserving the launch provenance. Poise then reconsiders the PR
-through its existing scheduler. Normal completion still uses the existing
-terminal head checks and authoritative review outcomes.
+While a model is analyzing a PR, Caller checks its live head and state approximately
+every 30 seconds through `github-interface --head-sha`, using its existing single
+PR read. Only a valid response for the original repository and PR can cancel the
+run. Failed, timed-out, or malformed checks leave it running. A per-run submission
+lock lets an in-flight GitHub command finish and prevents cancelled workers from
+starting another one. Head-change cancellation records `superseded` with the
+observed head, preserving the launch provenance for reconsideration.
+Verified closure on the same head also stops the provider process group. Closure
+returned as a provider turn completes preserves that turn's result but prevents
+another inspection turn, file group or structured submission. With no attempted
+submission and the original native receipt still in `reviewing`, the round settles
+through `review_target_closed` without a retry. Idle uncertain or sealed gates and
+native submission intent use the existing publication reconciliation; an original
+posted review keeps its own receipt and outcome. Native resource release remains
+independently required before capacity settles. Normal completion still uses the
+existing terminal head checks and authoritative review outcomes.
 
 Before provider invocation, verified head or base drift at either PR packet guard
 also settles as `superseded`. The packet CLI returns the original repository and

@@ -613,6 +613,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 # Each group was validated against the bounded provider schema.
                 # The aggregate's capacity is a publication constraint.
                 verdict = {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}
+            watch.check_closed()
             try:
                 review_receipt.retain_verdict(verdict, head)
             except OSError as error:

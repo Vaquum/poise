@@ -16,9 +16,9 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import agent_interface
-from agent_interface import atoms, pr_review, pr_approve, review_budget, review_stages, structured_review, review_repository
+from agent_interface import atoms, pr_review, pr_approve, review_budget, review_stages, review_watch, structured_review, review_repository
 from agent_interface.model_catalog import CATALOG, ModelCatalogError
-from agent_interface.review_watch import ReviewWatch
+from agent_interface.review_watch import ReviewSuperseded, ReviewWatch
 
 FINDING = {"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "[p1] O'Brien's input crashes."}
 MUSE_SESSION_ERROR = "muse: local session messaging disabled: session logging is required"
@@ -467,6 +467,54 @@ def staged_packet(paths):
 
 
 class TestStagedReview(TestCase):
+    def test_completion_race_retains_closure_before_another_group_turn_or_submission(self):
+        real_popen = subprocess.Popen
+        head = "a" * 40
+        for state in ("CLOSED", "MERGED"):
+            for behavior in ("pr_review", "pr_approve"):
+                for boundary in ("group", "inspection", "submission"):
+                    with self.subTest(state=state, behavior=behavior, boundary=boundary):
+                        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9 if boundary == "group" else 1)])
+                        verdict = {"assessment": ASSESSMENT, "action": "reviewed_clean" if behavior == "pr_review" else "approve", "comments": []}
+                        repository = None
+                        if boundary == "inspection":
+                            verdict = {**verdict, "action": "inspect", "requests": [
+                                {"operation": "read", "path": "src/f00.py", "query": "", "start_line": 1}]}
+                            repository = SimpleNamespace(inspect=lambda *args, **kwargs: {"text": "pinned file"})
+                        children, completed = [], []
+
+                        def launch(*args, **kwargs):
+                            child = real_popen(*args, **kwargs)
+                            children.append(child)
+                            return child
+
+                        def lookup(args, **kwargs):
+                            self.assertEqual(args[1], "--head-sha", "closed review tried to publish")
+                            children[0].wait(timeout=2)
+                            return SimpleNamespace(returncode=0, stdout=json.dumps({"action": "head_sha", "repository": "o/r",
+                                                   "pull_number": 12, "head_sha": head, "state": state}))
+
+                        def ask(root, model, system, text, schema, watch, timeout):
+                            done = watch.run([sys.executable, "-c", f"import time; time.sleep(.1); print({json.dumps(verdict)!r})"],
+                                             input="", cwd=str(root), timeout=3, env=os.environ.copy())
+                            completed.append(done)
+                            return done.stdout
+
+                        with patch.multiple(review_watch, POLL_SECONDS=.03), \
+                                patch.object(subprocess, "Popen", side_effect=launch), \
+                                patch.object(subprocess, "run", side_effect=lookup) as read, \
+                                patch.dict(structured_review.ASK, {"codex": ask}), self.assertRaises(ReviewSuperseded) as stopped:
+                            structured_review.run("/tmp", "system", f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone",
+                                                  CATALOG.resolve("gpt-6-astra-ultra"), behavior,
+                                                  "https://github.com/o/r/pull/12", "bit-mis", head, 60,
+                                                  packet=packet, repository=repository)
+                        self.assertEqual(len(children), 1)
+                        self.assertEqual(len(completed), 1)
+                        self.assertEqual(completed[0].returncode, 0)
+                        self.assertEqual(json.loads(completed[0].stdout), verdict)
+                        self.assertEqual(stopped.exception.closed_target["state"], state)
+                        read.assert_called_once()
+
     def test_stages_carry_a_bounded_cumulative_assessment_without_joining_full_responses(self):
         packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
         first = {key: value + "a" * 3000 for key, value in ASSESSMENT.items()}

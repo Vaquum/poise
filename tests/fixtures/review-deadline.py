@@ -87,7 +87,8 @@ with tempfile.TemporaryDirectory() as root:
             patch.object(api.subprocess, "run", side_effect=command), patch.object(pr_review, "run", side_effect=review), \
             patch.object(pr_approve, "run", side_effect=review), patch.object(api, "sleep"), \
             patch.dict(structured_review.ASK, {"codex": ask}), \
-            patch.object(structured_review, "ReviewWatch", return_value=nullcontext()), \
+            patch.object(structured_review, "ReviewWatch",
+                       return_value=nullcontext(SimpleNamespace(check_closed=lambda: None))), \
             patch.object(structured_review.resource_ownership, "temporary_directory", side_effect=tempfile.TemporaryDirectory), \
             patch.object(sys, "argv", ["agent-interface", *argv]), redirect_stdout(io.StringIO()):
         try:
