@@ -346,7 +346,7 @@ describe('completion-driven atomic behavior decisions', () => {
   })
 
   it('surfaces an unmergeable queue entry after 24 hours without resetting attention age on polls or restart', () => {
-    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    const { db, journal, chain } = setup(); const obs = observation(); pull(obs)
     let current = reviewed(journal, chain, obs)
     current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
       { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
@@ -367,9 +367,9 @@ describe('completion-driven atomic behavior decisions', () => {
         nextAction: 'Queue UNMERGEABLE needs attention; cause unknown. Await GitHub queue resolution or removal; GitHub retains ownership' })
     }
     const before = behaviorChainAttention(journal, obs.checkedAt)
-    journal.rebuild()
-    expect(behaviorChainAttention(journal, obs.checkedAt)).toEqual(before)
-    expect(journal.read(chain.id)!.held).toBeNull()
+    const recovered = new BehaviorChainJournal(db); recovered.rebuild()
+    expect(behaviorChainAttention(recovered, obs.checkedAt)).toEqual(before)
+    expect(recovered.read(chain.id)!.held).toBeNull()
   })
 
   it.each([{ shared: false, reason: 'failed_checks' }, { shared: true, reason: 'failed_checks' }, { shared: false, reason: 'merge_conflict' }])(
