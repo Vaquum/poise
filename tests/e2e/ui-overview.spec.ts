@@ -316,6 +316,35 @@ test('each Show level says how many entries it shows (#1380)', async ({ page }) 
   await expect(level('+ Faults')).toContainText('2')
 })
 
+test('the bell on Overview brings Answer here to its first entry with the focus ring; its count follows Show (#1433)', async ({ page }) => {
+  const notice = (id: string, kind: string, minutes: number) => ({ id, kind, title: `${kind} title`, body: '', since: ago(minutes), due: ago(minutes), silenceable: false, target: null })
+  await open(page, { notices: [notice('n1', 'storage_low', 5), notice('n2', 'ledger_queue_stalled', 6), notice('n3', 'chat_turn_finished', 7)], requests: [], decisions: [], revision: 1 })
+  const bell = page.getByRole('button', { name: /^Notifications/ })
+  await expect(bell).toHaveAccessibleName(/Brings Answer here to its first entry\.$/)
+  // Its count is what Show lists.
+  const level = (name: string) => answers(page).getByRole('radio', { name: new RegExp(`^${name.replace('+', '\\+')},`) })
+  await level('Only you').click()
+  await expect(bell.locator('[data-bell]')).toHaveText('1')
+  await level('+ Done').click()
+  await expect(bell.locator('[data-bell]')).toHaveText('3')
+  // Focus elsewhere, the list scrolled: a click brings the list to its top and focuses its first entry, ring and all.
+  await page.locator('.ova-list').evaluate((el) => { el.scrollTop = el.scrollHeight })
+  await page.getByRole('searchbox', { name: 'Filter this side' }).focus()
+  await bell.click()
+  const first = answers(page).locator('[data-notice]').first()
+  await expect(first).toBeFocused()
+  await expect(first).toHaveAttribute('data-notice', 'notice:n1')
+  expect(await first.evaluate((el) => getComputedStyle(el).outlineStyle)).toBe('solid')
+  expect(await page.locator('.ova-list').evaluate((el) => el.scrollTop)).toBe(0)
+  expect(new URL(page.url()).searchParams.get('view')).toBe('overview')
+})
+
+test('with nothing at the level, the bell focuses Answer here’s empty state (#1433)', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await page.getByRole('button', { name: /^Notifications/ }).click()
+  await expect(answers(page).locator('[data-key="empty"]')).toBeFocused()
+})
+
 test('a decision whose chat is gone says so, and Dismiss puts it away', async ({ page }) => {
   const decision = (id: number, exists: boolean) => ({ id, kind: 'decision', text: `Decision ${id}`, detail: null, createdAt: ago(4), source: { sessionId: `s${id}`, title: `Chat ${id}`, agent: 'claude', model: 'opus', exists }, sourceSeq: 2, options: [{ id: 'a', label: 'Open the fix', detail: null, recommended: true }], explanation: { state: 'none' } })
   const workspace: Workspace = { notices: [], requests: [], revision: 1, decisions: [decision(7, true), decision(8, false)] }

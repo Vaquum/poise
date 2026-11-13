@@ -160,6 +160,7 @@ export function showPlace(address: Address): void {
   bellBack = here
   // A place shown away from Overview has the bell read, though Overview never mounted to say it left.
   readBell?.()
+  paintBell?.()
 }
 
 // ---------- The route back ----------
@@ -194,6 +195,7 @@ function watchConnection(el: HTMLElement | null): void {
 // It counts what Overview's level shows, in its colour (places/overview/level.ts).
 let bellBack: Place = 'overview'
 let readBell: (() => void) | null = null
+let paintBell: (() => void) | null = null
 function watchBell(btn: HTMLElement | null): void {
   const badge = btn?.querySelector<HTMLElement>('[data-bell]')
   if (!btn || !badge) return
@@ -202,8 +204,10 @@ function watchBell(btn: HTMLElement | null): void {
     badge.textContent = String(count)
     badge.hidden = !count
     if (tone) badge.dataset.tone = tone; else delete badge.dataset.tone
-    btn.setAttribute('aria-label', `Notifications, ${count} open. Opens Answer here in Overview.`)
+    // It says what a click does here: on Overview it brings Answer here to its first entry.
+    btn.setAttribute('aria-label', `Notifications, ${count} open. ${bellBack === 'overview' ? 'Brings Answer here to its first entry.' : 'Opens Answer here in Overview.'}`)
   }
+  paintBell = paint
   // While the address is Overview, Overview reads these sources and hands over
   // its entries as it mounts; the bell reads them itself only on another place.
   const readAway = watchAway(() => !onOverview() && readAddress(location.search).address.place !== 'overview', paint)
@@ -212,7 +216,9 @@ function watchBell(btn: HTMLElement | null): void {
   readBell = readAway
   paint()
   btn.addEventListener('click', () => {
-    const href = `${placeHref('overview', { back: bellBack === 'overview' ? null : bellBack })}#answer`
+    // Overview is already open: going to its own address would do nothing you could see.
+    if (bellBack === 'overview') { document.dispatchEvent(new CustomEvent('poise:answer-here')); return }
+    const href = `${placeHref('overview', { back: bellBack })}#answer`
     document.dispatchEvent(new CustomEvent('poise:go', { detail: { href } }))
   })
 }

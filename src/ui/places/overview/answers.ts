@@ -270,7 +270,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       return `<section class="ng is-${group}" data-key="g:${group}" aria-label="${esc(name)}">${head}${folded ? '' : items.map((entry) => entryHTML(entry, goneIds.has(entry.id) ? goneWords(entry) : '')).join('')}</section>`
     }).join('')
     const off = feed.enabled || !noticeFeed.answered ? '' : `<p class="nempty" data-key="off">Notifications are off in <a class="lnk" href="${esc(placeHref('settings', { settings: 'general', back: 'overview' }))}">Settings, General</a>. Your chats’ requests, your documents’ review threads and Behaviors’ diagnostics still show here.</p>`
-    const empty = shown.length ? '' : `<p class="nempty" data-key="empty">Nothing ${level === 0 ? 'needs you' : 'is open at this level'}. ${level < 3 ? 'Show more with the control above, or rest.' : 'Rest.'}</p>`
+    const empty = shown.length ? '' : `<p class="nempty" data-key="empty" tabindex="-1">Nothing ${level === 0 ? 'needs you' : 'is open at this level'}. ${level < 3 ? 'Show more with the control above, or rest.' : 'Rest.'}</p>`
     const rows = handledRows()
     const handledHTML = `<section class="ng is-handled" data-key="g:handled"><h2 class="ng-h"><span class="t-micro">Handled today</span><span class="n">${rows.length}</span><button class="lnk" data-act="handled" aria-expanded="${handledOpen}" data-ref="ov.handled">${handledOpen ? 'Fold' : 'Show'}</button></h2>${handledOpen ? `<ul class="hl">${rows.map((row) => `<li><span class="sdot is-saved"></span><span class="hl-t">${esc(row.title)}</span><span class="hl-n">${esc(row.note)} · ${clockAt(row.at)}</span>${row.undo && holds.has(row.undo) ? `<button class="lnk" data-act="undo" data-undo="${esc(row.undo)}" data-ref="ov.undo">Undo</button>` : ''}</li>`).join('')}</ul>` : ''}</section>`
     return off + groups + empty + coverage() + handledHTML
@@ -813,7 +813,19 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   void readRequests()
   void readBoard()
   whileVisible(ctx, 60_000, () => { void readReviews(); void readHandled() })
-  if (location.hash === '#answer') requestAnimationFrame(() => (($('[data-notice]', list) as HTMLElement | null) ?? $('[data-ref="ov.answer"]', root))?.focus?.({ preventScroll: true }))
+  // The bell, here or from another place: Answer here at its top, focus on its
+  // first entry, or on its empty state, with the ring keyboard focus shows.
+  function bringToFirst(): void {
+    list.scrollTop = 0
+    root.scrollIntoView({ block: 'start' })
+    const target = ($('[data-notice]', list) ?? $('[data-key="empty"]', list) ?? $('[data-ref="ov.answer"]', root)) as HTMLElement | null
+    if (!target) return
+    target.dataset.focusRing = ''
+    target.addEventListener('blur', () => { delete target.dataset.focusRing }, { once: true })
+    target.focus({ preventScroll: true })
+  }
+  document.addEventListener('poise:answer-here', bringToFirst, { signal })
+  if (location.hash === '#answer') requestAnimationFrame(bringToFirst)
 
   return {
     setChains(next, rows) { chains = next; attention = rows; chainsRead = true; paint() },
