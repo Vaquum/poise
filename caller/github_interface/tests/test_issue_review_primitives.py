@@ -330,6 +330,58 @@ class TestCheckoutRepo(TestCase):
         self.assertEqual((path / "user-work").read_text(), "keep")
         self.assertEqual(sum("fetch" in call.args[0] for call in calls.call_args_list), 1)
 
+    def test_missing_tree_diagnostic_matches_bare_and_parenthesized_hashes(self) -> None:
+        base = {"operation": "reset", "outcome": "exit", "exit_code": 128, "signal": None, "errno": None, "stderr": ""}
+        for stderr in (
+            f"fatal: unable to read tree {'a' * 40}",
+            f"fatal: unable to read tree ({'b' * 40})",
+            f"fatal: unable to read tree {'c' * 64}",
+            f"fatal: unable to read tree ({'d' * 64})",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertTrue(local._is_missing_tree_reset(GitProcessError({**base, "stderr": stderr})))
+        for stderr, operation, outcome, exit_code in (
+            ("fatal: unable to read tree xyz", "reset", "exit", 128),
+            (f"fatal: unable to read tree {'a' * 40} extra", "reset", "exit", 128),
+            (f"fatal: unable to read tree ({'a' * 40}", "reset", "exit", 128),
+            ("fatal: unable to read tree", "reset", "exit", 128),
+            (f"fatal: unable to read tree {'a' * 40}", "fetch", "exit", 128),
+            (f"fatal: unable to read tree {'a' * 40}", "reset", "signal", 128),
+            (f"fatal: unable to read tree {'a' * 40}", "reset", "exit", 1),
+        ):
+            with self.subTest(stderr=stderr, operation=operation, outcome=outcome, exit_code=exit_code):
+                error = GitProcessError({**base, "operation": operation, "outcome": outcome,
+                                         "exit_code": exit_code, "stderr": stderr})
+                self.assertFalse(local._is_missing_tree_reset(error))
+        self.assertFalse(local._is_missing_tree_reset(RuntimeError("working-tree filter failed")))
+
+    def test_recovery_preserves_a_snapshot_replaced_during_cleanup(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        path, original_run, original_rmtree = self.root / "snapshot", local._run, shutil.rmtree
+        replaced = False
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            output = original_run(command, token, *secrets)
+            if "--no-checkout" in command:
+                self.remove_snapshot_tree(path)
+            return output
+
+        def rmtree(target, *args, **kwargs):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                # A concurrent replacement arriving between ownership
+                # verification and deletion.
+                path.mkdir(parents=True, exist_ok=True)
+                (path / "user-work").write_text("keep")
+            return original_rmtree(target, *args, **kwargs)
+
+        with patch.object(local, "_run", side_effect=run) as calls, patch.object(shutil, "rmtree", side_effect=rmtree), \
+                self.assertRaisesRegex(RuntimeError, "destination changed"):
+            checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+        self.assertEqual((path / "user-work").read_text(), "keep")
+        self.assertEqual(sum("fetch" in call.args[0] for call in calls.call_args_list), 1)
+
     def test_refuses_a_destination_created_while_waiting_for_the_lock(self) -> None:
         self.addCleanup(shutil.rmtree, self.root)
         path, original_flock = self.root / "snapshot", fcntl.flock

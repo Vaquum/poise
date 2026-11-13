@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from threading import Thread
@@ -15,6 +16,22 @@ from .process_diagnostic import GitProcessError, StderrCapture, failure
 # One bare mirror per repository, outside ~/dev, so a fresh checkout is a
 # local clone instead of a full download.
 MIRROR_ROOT = Path(os.getenv("GITHUB_INTERFACE_MIRROR_DIR") or Path.home() / ".cache" / "github-interface" / "mirrors")
+
+# `git reset` reports a missing object as `fatal: unable to read tree <sha>`;
+# newer Git parenthesizes the hash. Both name the same defect.
+_MISSING_TREE = re.compile(
+    r"(?m)^fatal: unable to read tree (?:\((?:[0-9a-f]{40}|[0-9a-f]{64})\)|(?:[0-9a-f]{40}|[0-9a-f]{64}))$"
+)
+
+
+def _is_missing_tree_reset(error: RuntimeError) -> bool:
+    return (
+        isinstance(error, GitProcessError)
+        and error.diagnostic["operation"] == "reset"
+        and error.diagnostic["outcome"] == "exit"
+        and error.diagnostic["exit_code"] == 128
+        and bool(_MISSING_TREE.search(error.diagnostic["stderr"]))
+    )
 
 
 def checkout_path(org: str, repo: str, root: Path | None = None) -> str:
@@ -89,12 +106,30 @@ def checkout_repo(
         _run(["git", "clone", "--quiet", "--no-checkout", "--branch", branch, str(mirror), str(path)], token)
 
     def discard(directory: Path, descriptor: int) -> bool:
+        # Move the pathname aside before verifying: a replacement arriving
+        # between a check and a pathname-based rmtree would otherwise be
+        # deleted. The sibling name is unique, so only the moved generation
+        # is ever removed.
+        sibling = directory.parent / f"{directory.name}.discard-{uuid.uuid4().hex}"
         try:
-            if not os.path.samestat(directory.lstat(), os.fstat(descriptor)):
-                return False
+            os.rename(directory, sibling)
         except FileNotFoundError:
             return True
-        shutil.rmtree(directory)
+        try:
+            owned = os.path.samestat(sibling.lstat(), os.fstat(descriptor))
+        except FileNotFoundError:
+            return True
+        if not owned:
+            try:
+                os.rename(sibling, directory)
+            except OSError:
+                pass
+            return False
+        shutil.rmtree(sibling)
+        # A replacement arriving while the owned generation was moved aside
+        # stays; retrying would otherwise fail on mkdir with a blunter error.
+        if os.path.lexists(directory):
+            return False
         return True
 
     with open(mirror.parent / f"{repo}.lock", "w") as lock:
@@ -121,13 +156,7 @@ def checkout_repo(
                     materializing = True
                     _run(["git", "-C", str(path), "reset", "--hard", "--quiet", "HEAD"], token)
                 except RuntimeError as error:
-                    if materializing and not (
-                        isinstance(error, GitProcessError)
-                        and error.diagnostic["operation"] == "reset"
-                        and error.diagnostic["outcome"] == "exit"
-                        and error.diagnostic["exit_code"] == 128
-                        and re.search(r"(?m)^fatal: unable to read tree (?:[0-9a-f]{40}|[0-9a-f]{64})$", error.diagnostic["stderr"])
-                    ):
+                    if materializing and not _is_missing_tree_reset(error):
                         raise
                     if not discard(path, snapshot_fd):
                         raise RuntimeError(f"checkout destination changed during recovery: {path}") from error
