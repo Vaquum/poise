@@ -13,6 +13,9 @@ export type DatastoreReadReply = { id: number, ok: true, rows: Record<string, un
 
 interface Connection { db: Database.Database, dev: number, ino: number, content?: { version: number, mark: string } }
 const connections = new Map<string, Connection>()
+/** How much of a datastore file reads map: the most this SQLite build maps
+ *  (SQLITE_MAX_MMAP_SIZE, just under 2 GiB); pages past it are read as before. */
+export const DATASTORE_MMAP_BYTES = 0x7fff0000
 
 function connection(path: string): Connection {
   const { dev, ino } = statSync(path)
@@ -22,9 +25,22 @@ function connection(path: string): Connection {
   // reading the unlinked one.
   connections.delete(path)
   open?.db.close()
-  const fresh = { db: new Database(path, { readonly: true, fileMustExist: true }), dev, ino }
+  const fresh = { db: openDatastore(path), dev, ino }
   connections.set(path, fresh)
   return fresh
+}
+
+/** A read-only connection to a datastore file that reads its pages through a
+ *  mapping of the file instead of a read call each. Every sync Caller commits
+ *  resets SQLite's own page cache, so without one a view read the datastore
+ *  page by page again, a system call per page (costly under gVisor); the
+ *  mapping stays across reads and syncs. A datastore never shrinks (Caller
+ *  keeps it in WAL with no vacuum), and a rebuilt one is a new file, reopened
+ *  by `connection`, so nothing mapped is ever cut away. */
+export function openDatastore(path: string): Database.Database {
+  const db = new Database(path, { readonly: true, fileMustExist: true })
+  db.pragma(`mmap_size = ${DATASTORE_MMAP_BYTES}`)
+  return db
 }
 
 /** The content mark, read once for each commit another connection makes;

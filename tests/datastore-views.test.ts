@@ -110,6 +110,15 @@ describe('datastore views read in-process', () => {
     expect(cli).toHaveBeenCalledTimes(4)
   })
 
+  it('reads a datastore through a mapping of its file', async () => {
+    const { openDatastore } = await import('../server/datastore-reader-worker')
+    const mapped = openDatastore(db)
+    try {
+      expect(mapped.pragma('mmap_size', { simple: true })).toBeGreaterThan(0)
+      expect(mapped.readonly).toBe(true)
+    } finally { mapped.close() }
+  })
+
   it('fails where Caller fails: incomplete label evidence', async () => {
     const unlabelled = join(directory, 'unlabelled.sqlite')
     const [answer] = caller(unlabelled, [LABEL_READ], true)
