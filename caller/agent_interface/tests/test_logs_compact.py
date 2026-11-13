@@ -69,3 +69,14 @@ class LogsCompactCase(TestCase):
         done = self.cli("--logs")
         parsed = json.loads(done.stdout)
         self.assertLess(len(done.stdout.encode()), len(json.dumps(parsed, indent=2).encode()))
+
+    def test_logs_without_progress_prints_the_same_rows_without_progress(self):
+        self.seed()
+        full = json.loads(self.cli("--logs").stdout)
+        done = self.cli("--logs", "--without-progress")
+        self.assertEqual((done.returncode, done.stderr), (0, ""), done.stderr)
+        parsed = json.loads(done.stdout)
+        self.assertTrue(any("progress" in row for row in full))
+        self.assertEqual(parsed, [{key: value for key, value in row.items() if key != "progress"} for row in full])
+        self.assertEqual(parsed, agent_interface.logs(without_progress=True))
+        self.assertLess(len(done.stdout.encode()), len(json.dumps(full, separators=(",", ":")).encode()))

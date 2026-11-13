@@ -376,7 +376,7 @@ describe('review worker exit diagnostics', () => {
         if (['unreadable retry history', 'missing retry history', 'changed retry evidence'].includes(scenario)) {
           const cli = mocks.runFile.getMockImplementation()!
           mocks.runFile.mockImplementation(async (command, args, ...rest) => {
-            if (command === 'agent-interface' && args.length === 1 && args[0] === '--logs') {
+            if (command === 'agent-interface' && args.join(' ') === '--logs --without-progress') {
               if (scenario === 'unreadable retry history') throw new Error('Caller retry history read failed')
               return { stdout: JSON.stringify(scenario === 'missing retry history' ? [] : [{ ...worker.timeout, review_id: 91 }]), stderr: '' }
             }

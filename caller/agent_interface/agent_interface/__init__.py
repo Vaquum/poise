@@ -834,12 +834,14 @@ def _decode_history_text(value: bytes) -> object:
         return _UNREADABLE_LOG_TEXT
 
 
-def logs(status: str | None = None):
+def logs(status: str | None = None, without_progress: bool = False):
     """Every retained call, oldest first; with status, only the running ones.
 
     The running-only read is indexed on (status, started_at), so retained
     history does not raise its cost. Full history quarantines unreadable rows.
-    Use logs_page for bounded history."""
+    Use logs_page for bounded history. Without progress, full history leaves
+    out each call's progress events, the largest field, which only a call's
+    own view shows (its page, its id or the running read)."""
     if status is not None and status != "running":
         raise ValueError("logs status filter must be running")
     reap_interrupted()
@@ -852,7 +854,11 @@ def logs(status: str | None = None):
         ).fetchall()
     if status:
         return [{**_log_row(row), "history_rowid": str(row["rowid"])} for row in rows]
-    return [_full_history_log_row(row) for row in rows]
+    history = [_full_history_log_row(row) for row in rows]
+    if without_progress:
+        for entry in history:
+            entry.pop("progress", None)
+    return history
 
 
 LOGS_PAGE_LIMIT_MAX = 1000
@@ -2803,6 +2809,7 @@ behaviors:
   --logs --id CALL_ID
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
+  --logs --without-progress
   --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
   --diagnostics [after-sequence] [limit-1..10]
   --stop CALL_ID
@@ -3052,6 +3059,9 @@ def _main():
             except ValueError as error:
                 usage(error=str(error))
             print(json.dumps(selected, separators=(",", ":")))
+            return
+        if sys.argv[2:] == ["--without-progress"]:
+            print(json.dumps(logs(without_progress=True), separators=(",", ":")))
             return
         if len(sys.argv) == 4 and sys.argv[2] == "--select":
             try:
