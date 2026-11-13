@@ -5,7 +5,7 @@
 import { $, $$, esc } from './dom'
 import { icon, hydrateIcons } from './icons'
 import { noticeFeed, READ_INTERVAL_MS } from '../notices'
-import { PLACE_NAMES, placeHref, type Address, type Place } from './address'
+import { PLACE_NAMES, placeHref, readAddress, type Address, type Place } from './address'
 import { styleSettingsHref } from './style-panel'
 import { awayGroups, watchAway } from './places/overview/away'
 import { bellTally, onBellChange, onOverview } from './places/overview/level'
@@ -158,6 +158,8 @@ export function showPlace(address: Address): void {
   })
   styleSettingsHref(placeHref('settings', { settings: 'style', back }))
   bellBack = here
+  // A place shown away from Overview has the bell read, though Overview never mounted to say it left.
+  readBell?.()
 }
 
 // ---------- The route back ----------
@@ -191,6 +193,7 @@ function watchConnection(el: HTMLElement | null): void {
 // ---------- The bell: what needs you, opening Overview's Answer here ----------
 // It counts what Overview's level shows, in its colour (places/overview/level.ts).
 let bellBack: Place = 'overview'
+let readBell: (() => void) | null = null
 function watchBell(btn: HTMLElement | null): void {
   const badge = btn?.querySelector<HTMLElement>('[data-bell]')
   if (!btn || !badge) return
@@ -201,9 +204,12 @@ function watchBell(btn: HTMLElement | null): void {
     if (tone) badge.dataset.tone = tone; else delete badge.dataset.tone
     btn.setAttribute('aria-label', `Notifications, ${count} open. Opens Answer here in Overview.`)
   }
-  const readAway = watchAway(() => !onOverview(), paint)
+  // While the address is Overview, Overview reads these sources and hands over
+  // its entries as it mounts; the bell reads them itself only on another place.
+  const readAway = watchAway(() => !onOverview() && readAddress(location.search).address.place !== 'overview', paint)
   noticeFeed.subscribe(paint)
   onBellChange(() => { readAway(); paint() })
+  readBell = readAway
   paint()
   btn.addEventListener('click', () => {
     const href = `${placeHref('overview', { back: bellBack === 'overview' ? null : bellBack })}#answer`
