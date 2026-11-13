@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { readDatastoreView, stopDatastoreReader } from '../server/datastore-reader'
-import { normalizeDatetime, parseViewArgs } from '../server/datastore-views'
+import { readDatastoreContent, readDatastoreView, stopDatastoreReader } from '../server/datastore-reader'
+import { datastoreContent, normalizeDatetime, parseViewArgs } from '../server/datastore-views'
 
 const ME = 'octocat'
 const AGENT = 'octo-agent'
@@ -104,6 +104,30 @@ describe('datastore views read in-process', () => {
     const rows = await readDatastoreView(db, read)!
     expect(rows.length).toBeGreaterThan(0)
     expect(rows.some((row) => row.number === 2)).toBe(false)
+  })
+
+  it('keeps one content mark across bookkeeping commits, and moves it when an item or its evidence changes', async () => {
+    const marked = join(directory, 'marked.sqlite')
+    caller(marked, [])
+    const writer = new Database(marked)
+    try {
+      const before = await readDatastoreContent(marked)!
+      expect(before).toBe(datastoreContent(writer))
+      writer.prepare("INSERT OR REPLACE INTO sync_state VALUES ('org', 'last_sync_at', ?, ?)").run('2026-11-13T08:00:00Z', '2026-11-13T08:00:00Z')
+      expect(await readDatastoreContent(marked)!).toBe(before)
+      writer.prepare("UPDATE items SET updated_at = '2026-11-13T08:00:01Z' WHERE item_id = (SELECT min(item_id) FROM items)").run()
+      const updated = await readDatastoreContent(marked)!
+      expect(updated).not.toBe(before)
+      writer.prepare("INSERT INTO associations VALUES (?, (SELECT min(item_id) FROM items), 'commenter', 'comment', 'c-new', 'body', NULL, NULL)").run(ME)
+      expect(await readDatastoreContent(marked)!).not.toBe(updated)
+    } finally {
+      writer.close()
+    }
+    // A file without the datastore's tables gives no mark: its views are read as before.
+    const bare = join(directory, 'bare.sqlite')
+    new Database(bare).exec('CREATE TABLE t (x)')
+    expect(await readDatastoreContent(bare)!).toBeNull()
+    expect(readDatastoreContent(join(directory, 'missing.sqlite'))).toBeNull()
   })
 
   it('leaves to the CLI what it does not mirror', () => {

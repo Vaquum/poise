@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   runFile: vi.fn(),
   read: vi.fn(),
+  content: vi.fn(),
   org: { login: 'alpha', datastorePath: '/alpha.sqlite', status: 'ready', error: null as string | null },
 }))
 vi.mock('../server/db', () => ({ getMeta: () => null, setMeta: vi.fn(), db: { transaction: (fn: (...args: never[]) => unknown) => fn } }))
@@ -15,7 +16,7 @@ vi.mock('../server/organizations', () => ({
   readyOrganizations: () => [mocks.org],
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
-vi.mock('../server/datastore-reader', () => ({ readDatastoreView: mocks.read }))
+vi.mock('../server/datastore-reader', () => ({ readDatastoreView: mocks.read, readDatastoreContent: mocks.content }))
 const { runCli } = await import('../server/gh')
 
 const ARGS = ['view', 'pr', '--status', 'open', '--format', 'json']
@@ -26,6 +27,8 @@ const cli = [row('alpha/one', 1), row('alpha/two', 2)]
 beforeEach(() => {
   mocks.runFile.mockReset()
   mocks.read.mockReset()
+  mocks.content.mockReset()
+  mocks.content.mockReturnValue(null)
   mocks.runFile.mockResolvedValue({ stdout: JSON.stringify(cli), stderr: '' })
 })
 afterEach(() => { vi.restoreAllMocks() })
@@ -104,6 +107,51 @@ describe('runCli with the in-process datastore reader', () => {
       await runCli(org as never, ['health', '--format', 'json'])
       await runCli(org as never, ['health', '--format', 'json'])
       expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('answers a view again across syncs that changed no item, until the content mark moves or five minutes pass', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'poise-view-content-'))
+    try {
+      const path = join(directory, 'alpha.sqlite')
+      writeFileSync(path, 'datastore')
+      const org = { ...mocks.org, datastorePath: path }
+      let mark = 'mark-1'
+      mocks.content.mockImplementation(() => Promise.resolve(mark))
+      mocks.read.mockImplementation(() => Promise.resolve([row('alpha/one', 1)]))
+      const other = [...ARGS, '--limit', '5']
+      await runCli(org as never, ARGS)
+      await runCli(org as never, other)
+      expect(mocks.read).toHaveBeenCalledTimes(2)
+      // Bookkeeping commits: the file changes, the content does not.
+      writeFileSync(`${path}-wal`, 'frame')
+      expect(await runCli(org as never, ARGS)).toEqual([row('alpha/one', 1)])
+      await runCli(org as never, other)
+      appendFileSync(`${path}-wal`, 'another frame')
+      await runCli(org as never, ARGS)
+      expect(mocks.read).toHaveBeenCalledTimes(2)
+      // One mark per file version, whatever the number of views.
+      expect(mocks.content).toHaveBeenCalledTimes(3)
+      // An item changed: read again.
+      mark = 'mark-2'
+      mocks.read.mockImplementation(() => Promise.resolve([row('alpha/one', 1), row('alpha/two', 2)]))
+      appendFileSync(`${path}-wal`, 'item frame')
+      expect(await runCli(org as never, ARGS)).toHaveLength(2)
+      expect(mocks.read).toHaveBeenCalledTimes(3)
+      // An unchanged mark vouches for five minutes, then the view is read again.
+      const now = Date.now()
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 5 * 60_000 + 1)
+      appendFileSync(`${path}-wal`, 'late frame')
+      await runCli(org as never, ARGS)
+      expect(mocks.read).toHaveBeenCalledTimes(4)
+      clock.mockRestore()
+      // No mark: every sync reads again, as before.
+      mocks.content.mockReturnValue(null)
+      appendFileSync(`${path}-wal`, 'unmarked frame')
+      await runCli(org as never, ARGS)
+      expect(mocks.read).toHaveBeenCalledTimes(5)
     } finally {
       rmSync(directory, { recursive: true, force: true })
     }

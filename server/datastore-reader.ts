@@ -12,7 +12,8 @@ import { parseViewArgs } from './datastore-views'
 
 const READ_TIMEOUT_MS = 30_000
 
-interface Pending { resolve: (rows: Record<string, unknown>[]) => void, reject: (error: Error) => void, timer: NodeJS.Timeout }
+interface Answer { rows: Record<string, unknown>[], content: string | null }
+interface Pending { resolve: (answer: Answer) => void, reject: (error: Error) => void, timer: NodeJS.Timeout }
 interface Reader { worker: Worker, pending: Map<number, Pending> }
 
 let reader: Promise<Reader> | null = null
@@ -59,7 +60,7 @@ function startReader(): Promise<Reader> {
       if (!call) return
       state.pending.delete(reply.id)
       clearTimeout(call.timer)
-      if (reply.ok) call.resolve(reply.rows)
+      if (reply.ok) call.resolve({ rows: reply.rows, content: reply.content })
       else call.reject(new Error(reply.message))
     })
     worker.on('error', retire)
@@ -69,7 +70,7 @@ function startReader(): Promise<Reader> {
   return started
 }
 
-async function read(path: string, request: Omit<DatastoreReadRequest, 'id' | 'path'>): Promise<Record<string, unknown>[]> {
+async function read(path: string, request: Omit<DatastoreReadRequest, 'id' | 'path'>): Promise<Answer> {
   const started = reader ??= startReader()
   let state: Reader
   try { state = await started }
@@ -95,7 +96,15 @@ async function read(path: string, request: Omit<DatastoreReadRequest, 'id' | 'pa
 export function readDatastoreView(path: string, args: readonly string[]): Promise<Record<string, unknown>[]> | null {
   const query = parseViewArgs(args)
   if (!query || !existsSync(path)) return null
-  return read(path, { query })
+  return read(path, { query }).then((answer) => answer.rows)
+}
+
+/** The datastore's content mark (server/datastore-views.ts): two equal marks
+ *  mean no item or evidence changed in between, so every view answers alike.
+ *  Null when the file is missing or gives no mark. */
+export function readDatastoreContent(path: string): Promise<string | null> | null {
+  if (!existsSync(path)) return null
+  return read(path, { query: null }).then((answer) => answer.content)
 }
 
 /** Test lifecycle: stop the thread; the next read starts another. */

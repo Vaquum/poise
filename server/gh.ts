@@ -19,7 +19,7 @@ import { mkdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ReviewSummary } from '../src/analytics-work-review'
-import { readDatastoreView } from './datastore-reader'
+import { readDatastoreContent, readDatastoreView } from './datastore-reader'
 import { getMeta } from './db'
 import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
@@ -264,23 +264,50 @@ export async function runCli(org: Organization, args: string[]): Promise<Datasto
 /** A view only reads the file, which changes only when Caller syncs it: while
  *  its version is the one a view was read at, that view answers alike. What is
  *  read is kept under the version seen before the read began, so a sync while
- *  it ran makes the next caller read again rather than trust it. */
+ *  it ran makes the next caller read again rather than trust it.
+ *
+ *  The file changes every few seconds while most of those commits change no
+ *  item: a view over items whose datastore still has the content mark it was
+ *  read under answers alike too, for CONTENT_KEPT_MS. The mark is taken
+ *  before the read, like the version. */
 async function readKept(org: Organization, args: string[], key: string): Promise<DatastoreRecord[]> {
-  const version = args[0] === 'view' && org.datastorePath ? await datastoreVersion(org.datastorePath) : null
+  const path = args[0] === 'view' ? org.datastorePath : undefined
+  const version = path ? await datastoreVersion(path) : null
   const kept = version ? viewReads.get(key) : undefined
   if (kept && kept.version === version) return kept.rows
+  const content = path && version && MARKED_VIEWS.has(args[1]) ? await datastoreContent(path, version) : null
+  if (kept && content !== null && kept.content === content && Date.now() - kept.readAt < CONTENT_KEPT_MS) {
+    kept.version = version!
+    return kept.rows
+  }
   const rows = await readDatastore(org, args)
   if (version) {
     viewReads.delete(key)
-    viewReads.set(key, { version, rows })
+    viewReads.set(key, { version, content, readAt: Date.now(), rows })
     if (viewReads.size > VIEW_READS_KEPT) viewReads.delete(viewReads.keys().next().value!)
   }
   return rows
 }
 
-/** View reads kept with the datastore file version they were read at, the oldest dropped first. */
-const viewReads = new Map<string, { version: string, rows: DatastoreRecord[] }>()
+/** View reads kept with the datastore file version and content mark they were read at, the oldest dropped first. */
+const viewReads = new Map<string, { version: string, content: string | null, readAt: number, rows: DatastoreRecord[] }>()
 const VIEW_READS_KEPT = 200
+/** The views over items and their evidence, all the content mark watches. */
+const MARKED_VIEWS = new Set(['pr', 'issue', 'user'])
+/** How long an unchanged content mark vouches for a view: a change the mark
+ *  cannot see (Caller filling a field it newly reads) shows within this. */
+const CONTENT_KEPT_MS = 5 * 60_000
+
+/** Each datastore's content mark, read once per file version for all its views; null when there is none. */
+const contents = new Map<string, { version: string, content: Promise<string | null> }>()
+function datastoreContent(path: string, version: string): Promise<string | null> {
+  const known = contents.get(path)
+  if (known?.version === version) return known.content
+  let content: Promise<string | null>
+  try { content = (readDatastoreContent(path) ?? Promise.resolve(null)).catch(() => null) } catch { content = Promise.resolve(null) }
+  contents.set(path, { version, content })
+  return content
+}
 
 /** The datastore file's version: its identity, size and time, and its write-ahead log's,
  *  which every committed sync changes. Null when it cannot be read: then nothing is kept. */
