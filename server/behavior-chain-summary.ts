@@ -151,7 +151,7 @@ const progressFolds = new WeakMap<BehaviorChainJournal, Map<string, ProgressFold
 function progressOf(fold: ProgressFold, id: string) {
   if (!fold.chain) throw new Error(`behavior chain admission history is unavailable: ${id}`)
   const { at, sequence, failureSequence, waitingSequence, waitingHead } = fold
-  return { at, sequence, failureSequence, waitingSequence, waitingHead, advances: [...fold.advances] }
+  return { at, sequence, failureSequence, waitingSequence, waitingHead, advances: fold.advances.map((point) => ({ ...point })) }
 }
 
 /** One chain's history after a sequence, a page at a time, each event parsed once. */

@@ -91,7 +91,9 @@ describe('progress clock', () => {
     expect(next).toEqual(replay())
     expect(next.advances.length).toBeGreaterThan(first.advances.length)
     // What a caller is handed is its own: changing it never changes the clock kept.
-    next.advances.length = 0
+    next.advances[0].at = 0
+    next.advances[0].sequence = 0
+    next.advances.length = 1
     expect(chainProgress(journal, chain.id, undefined, true)).toEqual(replay())
     // A failed invocation's view is still read from the start.
     expect(chainProgress(journal, chain.id, 'missing')).toEqual(chainProgressOf(journal.history(chain.id).map((row) => ({ sequence: row.sequence, at: row.at, event: JSON.parse(row.payload) as ChainEvent })), chain.id, 'missing'))
