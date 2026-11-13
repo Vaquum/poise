@@ -3,7 +3,7 @@ import Database from 'better-sqlite3'
 import { chmodSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { db, getMeta, setMeta } from './db'
+import { db, getMeta, setMeta, writeObservation } from './db'
 import { cachedStatement } from './statements'
 import { forgetSilence, openAlerts, resolveAlert, silencedKeys } from './alerts/store'
 import { ProcessLockError, withProcessLock } from './process-lock'
@@ -327,9 +327,11 @@ export async function removeOrganization(value: unknown): Promise<void> {
   }
 }
 
+// A sync's stage only reports its progress, which the next stage replaces, so
+// it commits as an observation, without waiting for the disk.
 function stage(login: string, value: string, generation?: number): void {
   if (generation !== undefined && !publishAdmitted(login, generation)) return
-  db.prepare('UPDATE organizations SET stage = ? WHERE login = ?').run(value, login)
+  writeObservation((connection) => cachedStatement(connection, 'UPDATE organizations SET stage = ? WHERE login = ?').run(value, login))
 }
 
 // The activation generation fences a login's job against a quick remove
