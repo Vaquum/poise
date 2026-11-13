@@ -434,7 +434,9 @@ unavailability is a collection Warning rather than an invented application cause
 
 Production shutdown retains one `process.shutdown` Error when cleanup rejects or
 reaches its ten-second deadline, including pending runtime/HTTP phases and known
-rejection causes. It commits through the same independent diagnostic store before
+rejection causes. `pendingPhases` also names unresolved runtime stops, such as
+`runtime_stop.agent_collaborator`, including the later ledger and Logging stops.
+It commits through the same independent diagnostic store before
 exit 1, including after runtime teardown has stopped Logging. Each supervisor
 spawn overrides `POISE_SHUTDOWN_DIAGNOSTIC_ID` with a fresh launch ID. Only a
 read-only lookup confirming that exact normalized event ID, owner, release and

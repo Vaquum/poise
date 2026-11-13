@@ -330,10 +330,15 @@ removing SQLite files before the abandoned worker exited.
 
 Retention targets 30 days from meaningful updates, bounded by 10,000 instances,
 30,000 changes, 32 MiB accounted metadata, a 64 MiB main database, at most
-32 attempts per root and 4 KiB per record. Terminal direct no-write firings are
-pruned first under pressure. Capacity can shorten history; uncertain-work
-removal records a gap. Root eviction removes its children. The rollback journal
-can add approximately 65 MiB; the independent health journal is at most 8 KiB.
+32 attempts per root and 4 KiB per record. Age pruning removes only settled
+terminal roots whose children are also settled and terminal. Under pressure,
+those roots are pruned ahead of unresolved work and its parents, with settled
+direct no-write firings first. The attempt cap preserves each slot's latest
+attempt and removes older settled terminal attempts before unresolved ones.
+These priorities also apply to existing records on reopen. Capacity can shorten
+history; unresolved-work removal records a gap. Root eviction removes its
+children. The rollback journal can add approximately 65 MiB; the independent
+health journal is at most 8 KiB.
 Consumers must respect health, removals and 410 resync responses rather than
 assuming a fixed retention period.
 

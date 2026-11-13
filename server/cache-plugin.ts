@@ -307,17 +307,27 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   if (!linkApi) linkApi = new LinkApi({ service })
 }
 
+const pendingStops = new Set<string>()
+
+export function pendingRuntimeStops(): string[] { return [...pendingStops] }
+
 export async function stopPoiseRuntime(): Promise<void> {
-  const authStops = [...activeClaudeAuthRuntimes].map(([auth, unwatch]) => {
+  const stop = async (name: string, operation: () => void | Promise<void>) => {
+    pendingStops.add(name)
+    try { await operation() }
+    catch (cause) { throw new Error(`Runtime stop failed: ${name}`, { cause }) }
+    finally { pendingStops.delete(name) }
+  }
+  const authStops = [...activeClaudeAuthRuntimes].map(([auth, unwatch], index) => stop(`claude_auth_${index}`, () => {
     unwatch()
     return auth.stop()
-  })
+  }))
   activeClaudeAuthRuntimes.clear()
-  const chatStop = chatRuntime?.stop() ?? Promise.resolve()
-  const controlStop = chatControl?.stop(chatStop) ?? Promise.resolve()
-  const switchboardStop = chatSwitchboard?.stop() ?? Promise.resolve()
-  const socketStop = chatSockets?.close() ?? Promise.resolve()
-  const terminalStop = terminalSockets?.close() ?? Promise.resolve()
+  const chatStop = stop('chat', () => chatRuntime?.stop())
+  const controlStop = stop('chat_control', () => chatControl?.stop(chatStop))
+  const switchboardStop = stop('switchboard', () => chatSwitchboard?.stop())
+  const socketStop = stop('chat_sockets', () => chatSockets?.close())
+  const terminalStop = stop('terminal_sockets', () => terminalSockets?.close())
   stopAccountsCheck?.()
   stopAccountsCheck = null
   selfUpdate?.reset()
@@ -335,10 +345,18 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopAgentCollaboratorRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopPublicationReviewsRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
-  await stopBehaviorLedger()
-  await stopLoggingApi()
-  await stopLogging()
+  await Promise.all([
+    stop('organizations', stopOrganizationsRuntime), stop('agent_collaborator', stopAgentCollaboratorRuntime),
+    stop('behaviors', stopBehaviorsRuntime), stop('notices', stopNoticesRuntime),
+    stop('publication_reviews', stopPublicationReviewsRuntime), stop('github_quota', stopGithubQuotaRuntime),
+    stop('ledger_health', stopLedgerHealthRuntime), stop('temporary_storage', stopTemporaryStorageRuntime),
+    stop('review_checkout_pruning', stopReviewCheckoutPruning), stop('storage_maintenance', stopStorageMaintenanceRuntime),
+    stop('content_finalizer', stopContentFinalizer), stop('jev', stopJev),
+    controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops,
+  ])
+  await stop('behavior_ledger', stopBehaviorLedger)
+  await stop('logging_api', stopLoggingApi)
+  await stop('logging', stopLogging)
 }
 
 /** Connected accounts, read now or from the last few seconds, with their

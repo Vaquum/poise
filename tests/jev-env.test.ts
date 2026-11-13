@@ -8,7 +8,7 @@ import { scrubbedChildEnvironment } from '../server/process'
 const marker = 'jev-fixture-server-only'
 vi.mock('vite', () => ({ defineConfig: (value: unknown) => value, loadEnv: () => ({ JEV_API_KEY: marker }) }))
 vi.mock('../scripts/build-identity.mjs', () => ({ buildSourceSha: () => 'fixture-build' }))
-vi.mock('../server/cache-plugin', () => ({ attachChatSockets: vi.fn(), createPoiseMiddleware: vi.fn(), stopPoiseRuntime: vi.fn() }))
+vi.mock('../server/cache-plugin', () => ({ attachChatSockets: vi.fn(), createPoiseMiddleware: vi.fn(), stopPoiseRuntime: vi.fn(), pendingRuntimeStops: () => [] }))
 let root = ''
 afterEach(async () => { vi.unstubAllEnvs(); if (root) await rm(root, { recursive: true, force: true }); root = '' })
 
