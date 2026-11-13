@@ -26,7 +26,7 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
   try {
     const params = new URL(url, 'http://localhost').searchParams
     const journal = behaviorChainJournal()
-    const summary = (chain: BehaviorChain) => behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) })
+    const summary = (chain: BehaviorChain) => behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) }, journal)
     const cutover = () => ({ ...journal.cutover(), support: nativeCleanupSupport(),
       blockers: journal.cutover().mode === 'draining' ? behaviorCutoverBlockers() : [] })
     if (req.method === 'GET') {
