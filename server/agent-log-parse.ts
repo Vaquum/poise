@@ -106,6 +106,8 @@ export interface QuarantinedAgentLog {
   status?: string | null
   source?: string | null
   startedAt?: string | null
+  /** When it ended, from the record's intact end column: metrics only, never proof of its result. */
+  completedAt?: string | null
   historyRowId?: string // Stable across feeds, unlike the page-local index.
   index: number
   error: string
@@ -150,6 +152,7 @@ function quarantineLogEntry(value: unknown, index: number, error: unknown): Quar
     status: text('status', LOG_STATUS, true),
     source: text('source', /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/),
     startedAt: typeof started === 'string' && Number.isFinite(Date.parse(started)) ? started : null,
+    completedAt: typeof row.completed_at === 'string' && Number.isFinite(Date.parse(row.completed_at)) ? row.completed_at : null,
     error: error instanceof Error ? error.message : String(error),
     id: text('id', LOG_CALL_ID, true),
     correlationId: text('correlation_id', LOG_CORRELATION_ID),

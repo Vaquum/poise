@@ -975,7 +975,30 @@ def _full_history_log_row(row: sqlite3.Row) -> dict:
         for key in ("id", "repo", "pr_id", "behavior", "correlation_id", "session_id", "source")
         if isinstance(row[key], str)
     }
-    return {**entry, **identity, "history_rowid": str(row["rowid"])}
+    return {**entry, **identity, **_intact_lifecycle(row), "history_rowid": str(row["rowid"])}
+
+
+def _intact_lifecycle(row: sqlite3.Row) -> dict:
+    """A damaged record's own status, start and end, where those columns read cleanly.
+
+    Damage usually hits the JSON columns, not these: run counts, durations and
+    success rates can still place the call in time. They never stand in for its
+    unreadable result."""
+    facts: dict = {}
+    status = row["status"]
+    if isinstance(status, str) and re.fullmatch(r"[a-z_]{1,32}", status):
+        facts["status"] = status
+    for column in ("started_at", "ended_at"):
+        value = row[column]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < 2**33:
+            continue
+        try:
+            stamps = ({"started_at": stamp(value), "started_at_precise": utc_stamp(value)} if column == "started_at"
+                      else {"completed_at": utc_stamp(value)})
+        except (OverflowError, OSError, ValueError):
+            continue
+        facts.update(stamps)
+    return facts
 
 
 def _resource_recovery_logs(correlations: list[str]) -> list[dict]:
