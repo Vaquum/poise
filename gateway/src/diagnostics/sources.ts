@@ -19,6 +19,8 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
   const context = object(diagnostic?.context) ?? diagnostic ?? {}
   const unavailable = text(row.evidence_unavailable)
   const error = text(row.error) ?? unavailable ?? ''
+  const detail = text(context.message)
+  const message = error || detail || 'Caller reported a process failure without a cause'
   if (/pull-request head or base changed (?:while building review packet|before checkout|during checkout)\b|pull-request head changed(?: [a-z ]+)?: expected [a-f0-9]{40}, got [a-f0-9]{40}/.test(error)) return null
   // Review verdicts alone are routine; recorded failure evidence takes precedence.
   if (!diagnostic && !error && !row.error_code && !priorWarning) return null
@@ -37,7 +39,7 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
     repository, pr, target: repository && pr ? `${repository}#${pr}` : repository,
     account: text(row.actor), reviewer: text(row.actor), behavior: text(row.behavior), callId: String(row.id),
     correlationId: text(row.correlation_id), container: text(context.container), release: text(context.release),
-    message: error || text(context.message) || 'Caller reported a process failure without a cause',
+    message, cause: detail?.trim() && detail !== message ? [detail] : [],
     stderr: text(diagnostic?.stderr), stack: text(context.stack), truncated: diagnostic?.stderr_truncated === true,
     exitCode: number(context.exit_code), signal: number(context.signal) ?? text(context.signal),
     timeoutMs: number(context.timeout_seconds) === null ? null : Number(context.timeout_seconds) * 1000,

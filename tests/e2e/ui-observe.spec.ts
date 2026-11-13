@@ -1,4 +1,6 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
+import { normalize, type LogEvent } from '../../gateway/src/diagnostics/contract'
+import { callerDiagnostic, workspaceEnvelope } from '../../gateway/src/diagnostics/sources'
 
 // Observe in the new interface (#556): Tasks with the chain's evidence,
 // Behaviors, GitHub and Logging, on main's endpoints. The isolated server has
@@ -41,7 +43,7 @@ const JOURNAL = [
   { sequence: 260, at: NOW - minutes(20), type: 'chain.waiting', reason: 'exact-head CI is still running' },
 ]
 
-interface Served { chainsFail?: boolean, posts?: unknown[] }
+interface Served { chainsFail?: boolean, posts?: unknown[], diagnostics?: ReturnType<typeof diagnostic>[] }
 async function serveChains(page: Page, served: Served = {}): Promise<void> {
   await page.route((url) => url.pathname === '/api/behavior-chains', async (route: Route) => {
     const url = new URL(route.request().url())
@@ -73,7 +75,7 @@ async function serveChains(page: Page, served: Served = {}): Promise<void> {
 }
 
 // ---------- Logging ----------
-function diagnostic(seed: string, over: Record<string, unknown> = {}) {
+function diagnostic(seed: string, over: Record<string, unknown> = {}): LogEvent & { occurrences: number } {
   return { version: 1, id: eventId(seed), incidentId: incidentId(seed), severity: 'error', visibility: 'workspace', source: 'poise', sourceLevel: 'error',
     component: 'behavior-chain', operation: 'repair', phase: null, target: 'acme/site#496', workspace: 'local', instance: null, container: null, release: null,
     account: null, repository: 'acme/site', pr: '496', behavior: null, reviewer: null, callId: null, requestId: null, correlationId: null,
@@ -85,7 +87,7 @@ const OTHER = diagnostic('b', { severity: 'warning', message: 'Quota forecast is
 const bounds = { retentionAfter: iso(NOW - minutes(60 * 24 * 14)), from: iso(NOW - minutes(60 * 24)), to: iso(NOW) }
 const policy = { retentionMs: 1_209_600_000, maxBytes: 1_000_000, maxEvents: 100_000 }
 
-async function serveLogging(page: Page, queries: URLSearchParams[] = []): Promise<void> {
+async function serveLogging(page: Page, queries: URLSearchParams[] = [], records = [LINKED, OTHER]): Promise<void> {
   await page.route((url) => url.pathname === '/api/workspace', (route) => route.fulfill({ json: { mode: 'local' } }))
   await page.route((url) => url.pathname.startsWith('/api/logging'), (route) => {
     const url = new URL(route.request().url())
@@ -94,11 +96,12 @@ async function serveLogging(page: Page, queries: URLSearchParams[] = []): Promis
     }
     if (url.pathname.startsWith('/api/logging/events/')) {
       const id = decodeURIComponent(url.pathname.split('/').pop()!)
-      return id === LINKED.id ? route.fulfill({ json: { version: 1, event: LINKED, bounds } }) : route.fulfill({ status: 404, json: { error: 'logging_event_unavailable', message: 'No permitted retained evidence.' } })
+      const event = records.find((record) => record.id === id)
+      return event ? route.fulfill({ json: { version: 1, event, bounds } }) : route.fulfill({ status: 404, json: { error: 'logging_event_unavailable', message: 'No permitted retained evidence.' } })
     }
     queries.push(url.searchParams)
     const incident = url.searchParams.get('incidentId')
-    const events = url.searchParams.has('after') ? [] : incident ? [LINKED, OTHER].filter((e) => e.incidentId === incident) : [LINKED, OTHER]
+    const events = url.searchParams.has('after') ? [] : incident ? records.filter((e) => e.incidentId === incident) : records
     return route.fulfill({ json: { version: 1, countKind: 'events', total: events.length, events, coverage: [], bounds, policy, watermark: 'w1', nextCursor: null } })
   })
 }
@@ -142,7 +145,7 @@ async function open(page: Page, address: string, served: Served = {}): Promise<v
   await page.route((url) => url.pathname === '/api/settings', (route) => route.fulfill({ json: { org: 'acme', me: 'me', agentAccount: 'bot', timezone: 'UTC',
     organizations: ['acme', 'umbrella'].map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })) } }))
   await serveChains(page, served)
-  await serveLogging(page)
+  await serveLogging(page, [], served.diagnostics)
   await serveRuns(page)
   await serveHistory(page)
   await page.goto(address)
@@ -229,6 +232,38 @@ test('Logging’s entry addresses open the exact diagnostic, an incident or say 
 
   await page.goto('/?view=logging&event=evt_nope')
   await expect(logging(page).locator('[data-ref="lg.linked"]')).toContainText('The diagnostic link is invalid.')
+})
+
+test('Logging keeps review deadline group and budget causes in the existing event detail', async ({ page }) => {
+  const cases = [
+    { phase: 'overall', message: 'Review reached its total time limit; needs attention',
+      cause: 'Incomplete analysis in file group 1 of 4: overall deadline; elapsed 1144.8s; remaining analysis 0.0s.' },
+    { phase: 'file_group', message: 'Review file-group time limit reached; incomplete analysis; reduce the review scope',
+      cause: 'Incomplete analysis in file group 2 of 4: file_group deadline; elapsed 60.0s; remaining analysis 78.4s.' },
+    { phase: null, message: 'Review reached its total time limit; needs attention', cause: null },
+  ]
+  const records = cases.map(({ phase, message, cause }, index) => ({
+    ...workspaceEnvelope(normalize(callerDiagnostic({ id: String(index + 1).repeat(32), status: 'failed', behavior: 'pr_review',
+      completed_at: iso(NOW - minutes(15)), repo: 'acme/site', pr_id: '496', error: message,
+      diagnostic: phase ? { version: 1, severity: 'error', operation: 'provider.review', phase, stderr: '',
+        context: { message: cause + '\nAuthorization: Bearer private-review-credential' } } : null,
+    }, 'local')!, NOW)!, 'local', NOW, []), occurrences: 1,
+  }))
+  await open(page, `/?view=observe&part=logging&event=${records[0].id}`, { diagnostics: records })
+  await expect(logging(page).locator('[data-ref="lg.row"]')).toHaveCount(3)
+  for (const [index, record] of records.entries()) {
+    const row = logging(page).locator(`tr[data-ev="${record.id}"]`)
+    await expect(row).toContainText(cases[index].message)
+    await expect(row.locator('[data-ref="lg.severity"]')).toHaveText('Error')
+    if (index) await row.getByRole('button', { name: 'Show the evidence' }).click()
+    const detail = logging(page).locator(`#lg-detail-${record.id}`)
+    await expect(detail).toBeVisible()
+    const cause = detail.locator('.lg-ev', { has: page.getByRole('heading', { name: 'Cause chain', exact: true }) }).locator('pre')
+    await expect(cause).toHaveText(cases[index].cause ? cases[index].cause + '\n[redacted header]' : 'Not recorded')
+    await expect(detail.locator('[data-ref="lg.facts"] div').filter({ has: page.locator('dt', { hasText: /^Phase$/ }) }).locator('dd'))
+      .toHaveText(cases[index].phase ?? 'Not recorded')
+    await expect(detail).not.toContainText('private-review-credential')
+  }
 })
 
 test('Logging’s Work impact shows on the row and in the detail, and opens its task at that step; Back returns with the interval and filters intact', async ({ page }) => {

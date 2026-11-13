@@ -39,6 +39,10 @@ prompts, content, responses, stdout, arguments, environment and conversation
 fields recursively. Strings and nested context are bounded; truncation is
 explicit. The source adapters select Caller metadata without reading prompt or
 response fields, and preserve its exact process evidence when available.
+For newly captured Caller completions, a nonempty diagnostic context message
+distinct from the summary is retained in the cause chain. Review deadlines keep
+their recorded phase, file-group position and remaining budget in the same
+event detail. Missing causes remain absent; stored events are not rewritten.
 
 ## Observe → Logging
 

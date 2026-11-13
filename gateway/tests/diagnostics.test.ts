@@ -94,6 +94,53 @@ describe('one diagnostic contract', () => {
     expect(normalize(input, NOW)).toMatchObject({ severity: 'warning', source: 'caller', operation: 'provider.cli_update' })
   })
 
+  it.each([
+    { phase: 'overall', nested: true, group: 1, elapsed: 1144.8, remaining: 0, timeout: 0,
+      error: 'Review reached its total time limit; needs attention' },
+    { phase: 'file_group', nested: false, group: 2, elapsed: 60, remaining: 78.4, timeout: 60,
+      error: 'Review file-group time limit reached; incomplete analysis; reduce the review scope' },
+  ])('retains the $phase review deadline cause through delivery and replay', ({ phase, nested, group, elapsed, remaining, timeout, error }) => {
+    const detail = `Incomplete analysis in file group ${group} of 4: ${phase} deadline; elapsed ${elapsed.toFixed(1)}s; remaining analysis ${remaining.toFixed(1)}s.`
+    const context = { message: detail + '\nAuthorization: Bearer private-review-credential', timeout_seconds: timeout }
+    const row = { id: 'c'.repeat(32), completed_at: new Date(NOW).toISOString(), status: 'failed', behavior: 'pr_review',
+      error, error_code: 'review_budget_exhausted', diagnostic: { version: 1, severity: 'error', operation: 'provider.review',
+        phase, stderr: '', ...(nested ? { context } : context) } }
+    const input = callerDiagnostic(row, 'alice')!
+    const original = normalize(input, NOW)!
+    const generic = normalize({ ...input, cause: [] }, NOW)!
+    expect(original.id).toBe(generic.id)
+    expect(original.incidentId).not.toBe(generic.incidentId)
+    const local = store(); local.append([original])
+    const delivery = local.delivery(alice)
+    expect(delivery.events).toHaveLength(1)
+    const central = store()
+    const delivered = workspaceEnvelope(JSON.parse(JSON.stringify(delivery.events[0])), 'alice', NOW, [])
+    expect(central.append([delivered])).toBe(1)
+    expect(central.append([workspaceEnvelope(delivery.events[0], 'alice', NOW + 1000, [])])).toBe(0)
+    const expected = { id: original.id, incidentId: original.incidentId, severity: 'error', phase, message: error,
+      cause: [detail + '\n[redacted header]'], stderr: '', timeoutMs: timeout * 1000, callId: row.id }
+    expect(central.query(alice, { source: 'caller', callId: row.id })).toMatchObject({ total: 1, events: [{ ...expected, occurrences: 1 }] })
+    expect(central.lookup(alice, original.id)).toMatchObject({ status: 'found', event: expected })
+    expect(JSON.stringify(central.lookup(alice, original.id))).not.toContain('private-review-credential')
+  })
+
+  it.each([null, {}, { message: '' }, { message: '   ' }, { message: 'Generic review deadline' }])(
+    'does not invent or duplicate a Caller cause for %j', (diagnostic) => {
+      const original = normalize(callerDiagnostic({ id: 'b'.repeat(32), status: 'failed', error: 'Generic review deadline',
+        diagnostic: diagnostic && { version: 1, severity: 'error', ...diagnostic } }, 'alice')!, NOW)!
+      const db = store(); db.append([workspaceEnvelope(original, 'alice', NOW, [])])
+      expect(db.lookup(alice, original.id)).toMatchObject({ status: 'found', event: { message: 'Generic review deadline', cause: [] } })
+    })
+
+  it('keeps a standalone Caller detail as the summary and bounds additional cause text', () => {
+    const row = { id: 'b'.repeat(32), diagnostic: { version: 1, severity: 'error', message: '障'.repeat(500) } }
+    expect(normalize(callerDiagnostic(row, 'alice')!, NOW)).toMatchObject({ message: row.diagnostic.message, cause: [] })
+    const record = normalize(callerDiagnostic({ ...row, error: 'Generic review deadline' }, 'alice')!, NOW)!
+    expect(record.cause).toHaveLength(1)
+    expect(Buffer.byteLength(record.cause[0])).toBeLessThanOrEqual(512)
+    expect(record.truncated).toBe(true)
+  })
+
   it('keeps a later Call failure separate from its earlier preparation warning', () => {
     const warning = { version: 1, severity: 'warning', operation: 'provider.cli_update', phase: 'launcher_verification',
       stderr: 'Retained launcher warning' }
