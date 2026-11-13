@@ -4330,12 +4330,13 @@ async function releaseFailedBehaviorIfNoAction(
       }
     }
   }
+  let observedHead: string | null = null
   if (prReviewRetryState(snapshot, behavior, repo, number, failed.launchExpectedHead,
     failed.launchActor, configuredModel ?? call.model, target).stopped
-    && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
+    && (observedHead = await currentHeadSha(repo, number, failed.launchActor)) === failed.launchExpectedHead) return false
   if (boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call)
     && (configuredModel == null || call.model === configuredModel)
-    && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
+    && (observedHead = await currentHeadSha(repo, number, failed.launchActor)) === failed.launchExpectedHead) return false
   const blockedPacket = call.action === 'not_started'
     && call.outcome === 'preflight_failed'
     && call.error_code === 'review_packet_too_large'
@@ -4352,12 +4353,24 @@ async function releaseFailedBehaviorIfNoAction(
   if (call.action !== null || call.outcome !== null) return false
   const startedAt = agentCallStartedAt(call)
   if (!Number.isFinite(Date.parse(startedAt))) return false
-  const activity = await checkReviewActivity(
-    repo,
-    number,
-    failed.launchActor,
-    startedAt,
-  )
+  const refusalKey = `${META_PREFIX}review_recovery:${behavior}:${target}:${call.id}:${failed.launchCorrelationId}`
+  const retainRefusal = (reason: string, head: string | null) => {
+    const current = getFailedBehaviorLaunch(behavior, target)
+    if (!current || current.launchQuarantine || current.launchCallId !== call.id
+      || current.launchCorrelationId !== failed.launchCorrelationId
+      || current.launchRequestedAt !== failed.launchRequestedAt
+      || current.launchExpectedHead !== failed.launchExpectedHead) return
+    // Diagnostic evidence only: keep the original failure, retry marker and clocks.
+    const message = reason ? `Legacy review retry held for Call ${call.id} (correlation ${failed.launchCorrelationId}); original head ${failed.launchExpectedHead}; observed head ${head ?? 'unavailable'}; reviewer ${failed.launchActor}. ${reason}` : ''
+    if (getMeta(refusalKey) !== message) setMeta(refusalKey, behaviorErrorMessage(message, 1_600))
+  }
+  let activity: ReviewActivityResult
+  try {
+    activity = await checkReviewActivity(repo, number, failed.launchActor, startedAt)
+  } catch (error) {
+    if (!behaviorAborted()) retainRefusal(`Publication evidence unavailable: ${behaviorErrorMessage(error)}`, observedHead)
+    throw error
+  }
   // Reviews the other reviewers of this pull request claim as their own
   // (Caller's receipts) are not this run's; only an unclaimed one could be
   // the dead run's own review, posted a moment before it died.
@@ -4368,8 +4381,20 @@ async function releaseFailedBehaviorIfNoAction(
     ? activity.reviewerReviewsSince
     : activity.reviewerReviewIdsSince.filter((id) => !claimed.has(id)).length
   if (unclaimed !== 0 || activity.reviewerPendingReviews !== 0) {
+    const reasons: string[] = []
+    if (activity.reviewerPendingReviews !== 0) reasons.push(`Pending publication: ${activity.reviewerPendingReviews} pending reviews`)
+    if (unclaimed !== 0) reasons.push(activity.reviewerReviewIdsSince === null
+      ? `Publication evidence incomplete: ${unclaimed} reviews since Call start, review identities unavailable`
+      : `Unclaimed publication: ${unclaimed} reviews not attributed to this Call`)
+    const reviews = activity.reviewerReviewsSinceItems?.filter((review) => !claimed.has(review.id))
+    if (reviews?.length) reasons.push(`Observed reviews: ${reviews.slice(-3).map((review) => `${review.id} ${review.state} on ${review.commit}`).join(', ')}${reviews.length > 3 ? ` (${reviews.length - 3} more omitted)` : ''}`)
+    else if (activity.reviewerReviewsSinceItems === null && activity.reviewerLatestState) {
+      reasons.push(`Latest review: ${activity.reviewerLatestState} on ${activity.reviewerLatestCommit ?? 'unavailable head'} (ID unavailable)`)
+    }
+    retainRefusal(`${reasons.join('. ')}. Observed reviews are not this Call's receipt.`, activity.headSha)
     return false
   }
+  retainRefusal('', activity.headSha)
   if (behavior === 'approve-prs' && activity.headSha !== failed.launchExpectedHead) {
     return false
   }
@@ -8780,17 +8805,26 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
 }
 
 export function getBehaviorDiagnosticIncidents(snapshot: AgentLogSnapshot | null) {
-  const scoped = () => behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot,
-    BEHAVIOR_KEYS.flatMap((behavior) => [...listBehaviorLaunchClaims(behavior), ...failedBehaviorLaunches(behavior)]))
+  const scoped = () => {
+    const failed = BEHAVIOR_KEYS.flatMap((behavior) => failedBehaviorLaunches(behavior))
+    return behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot,
+      [...BEHAVIOR_KEYS.flatMap((behavior) => listBehaviorLaunchClaims(behavior)), ...failed])
     // A held row shows when its automatic retry runs: the failure clock for
     // this exact attempt, never a newer attempt's clock on an older row.
     .map((incident): typeof incident & { nextRetryAt?: string } => {
-      if (incident.error === REVIEW_BUDGET_STOPPED || !incident.callId
-        || !(BEHAVIOR_KEYS as readonly string[]).includes(incident.behavior)) return incident
+      const stopped = incident.error === REVIEW_BUDGET_STOPPED
+      const launch = failed.find((claim) => claim.key === incident.behavior && claim.target === incident.target
+        && claim.launchCallId === incident.callId && claim.launchCorrelationId === incident.correlationId
+        && !claim.launchQuarantine)
+      const refusal = launch && getMeta(`${META_PREFIX}review_recovery:${launch.key}:${launch.target}:${launch.launchCallId}:${launch.launchCorrelationId}`)
+      const current = refusal ? { ...incident, error: `${incident.error} ${refusal}` } : incident
+      if (stopped || !incident.callId
+        || !(BEHAVIOR_KEYS as readonly string[]).includes(incident.behavior)) return current
       const failure = readBehaviorFailure(incident.behavior as BehaviorKey, incident.target)
-      if (failure?.callId !== incident.callId) return incident
-      return { ...incident, nextRetryAt: new Date(failure.nextRetryAtMs).toISOString() }
+      if (failure?.callId !== incident.callId) return current
+      return { ...current, nextRetryAt: new Date(failure.nextRetryAtMs).toISOString() }
     })
+  }
   if (behaviorOrganization.getStore() !== undefined) return scoped()
   const organizations = readyOrganizations()
   return organizations.length ? organizations.flatMap((org) => behaviorOrganization.run(org, scoped)) : scoped()

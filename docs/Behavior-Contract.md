@@ -523,6 +523,17 @@ and after restart. Other bounded, oversized-packet and invalid-result holds reta
 their existing rules; unrelated reviewers’ submitted receipts do not override
 an exact proof that this particular run never submitted.
 
+For legacy failed Calls with `action=null` and `outcome=null`, the existing
+publication probe retains its refusal on that exact held Call/correlation.
+Behaviors' held diagnostic and PR status `blocker.details` distinguish pending
+reviews, unclaimed reviews, incomplete identity inventory and unavailable reads,
+with the original/observed heads and at most three observed review IDs, states
+and commits where available. These observations never become the Call's receipt.
+The explanation survives ticks and restarts without another launch or changes to
+failure counts, backoff or the timeout-stop marker. Original Caller results and
+incident history remain intact; typed no-action and count-only zero-activity
+recovery retain their existing retry rules.
+
 ## Where the pull-request behaviors act
 
 `review-new-prs`, `approve-prs`, `resolve-unblocking`, `merge-prs`, `rerun-grey-ci` and `close-old-prs` each have a Skip
