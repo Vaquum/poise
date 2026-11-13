@@ -781,9 +781,10 @@ assertion may only resume, and anything else is refused with 403):
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
     `/api/debate`, `/api/models/refresh`). Refused work answers
     503 with code `draining`; work already running continues.
-  - One Chat turn holds a refusing drain at most 30 minutes: past that the
+  - One Chat turn holds an ordinary drain at most 30 minutes: past that the
     drain stops it through the person's Stop path, with a transcript notice
     naming the update, and the agent keeps its context for the next prompt.
+    A drain with retained native cleanup lets Chat turns finish.
     `idle` follows once the stopped turn settles and the other health counters
     clear. Past the gateway's own timeout, confirmed busy work can be cut
     only after native cleanup is positively clear. Older workspaces

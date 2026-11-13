@@ -1033,8 +1033,8 @@ autonomio/poise, and when the workspace was updated to it, as in
 An upgrade that changes the system itself, the files under `deploy/runtime/`,
 gets a new container instead. The gateway drains a running workspace first:
 the workspace refuses new Chat turns and agent launches, which then answer
-that Poise is installing an update, and lets running work finish. One Chat
-turn holds the drain at most 30 minutes: past that the workspace stops it
+that Poise is installing an update, and lets running work finish. In an ordinary
+drain, one Chat turn holds the drain at most 30 minutes: past that the workspace stops it
 with a notice in its transcript, naming the update, and the agent keeps its
 context for the next prompt. After a fresh admitted drain confirms the workspace
 is idle, the gateway recreates it on the new image with the same home volume.
@@ -1042,6 +1042,8 @@ A terminal cleanup failure can carry across replacement once Caller has
 recorded that the original process namespace is empty. The original Call,
 disk and reservation stay held. The gateway logs the retained cleanup with
 `workspace.upgrade.cleanup-retained` after all live work has finished.
+With retained cleanup, the workspace lets Chat turns finish and the gateway
+defers replacement if they are still active at its deadline.
 Past `POISE_DRAIN_TIMEOUT` seconds (90 minutes by default), cutting confirmed
 busy work requires a fresh admitted drain with zero unsettled native Calls,
 Caller processes and background operations, including launches before Call

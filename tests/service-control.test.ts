@@ -112,7 +112,7 @@ describe('service health', () => {
     }
   })
   it('retains pending native cleanup through drain until its durable release and claim retirement', async () => {
-    const { service } = serviceOf()
+    const { service, runtime, timer } = serviceOf()
     const records = join(root, 'native-cleanup-records')
     await mkdir(records, { recursive: true })
     const database = new Database(join(records, 'calls.sqlite3'))
@@ -143,6 +143,7 @@ describe('service health', () => {
       }
       const setOwnership = database.prepare('update calls set resource_ownership=? where id=?')
       const namespace = { state: 'settled', callId: heldId, correlation: 'review-1', settled_at: 1 }
+      const sessionId = session(runtime.instance, true)
       setOwnership.run(JSON.stringify({ version: 2, process_pending: true, namespace }), heldId)
       expect(service.health().nativeCleanupHold).toEqual(hold)
       setOwnership.run(JSON.stringify({ version: 2, process_pending: false, namespace }), heldId)
@@ -150,6 +151,13 @@ describe('service health', () => {
       const retainedHold = { ...hold, retainedCalls: 1 }
       expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, nativeCleanupHold: retainedHold, backgroundWork: 1, idle: false })
       expect(readHeld.get(heldId)).toEqual(unsettled)
+      timer.fireDelay(control.DRAIN_TURN_DEADLINE_MS)
+      expect(runtime.stopTurnsForDrain).not.toHaveBeenCalled()
+      service.resume()
+      for (let request = 0; request < 2; request++) {
+        expect(service.drain()).toMatchObject({ activeChatTurns: 1, draining: true, nativeCleanupHold: retainedHold })
+        expect([...timer.timers.values()].map(entry => entry.delayMs)).toEqual([(1800 + 300) * 1000])
+      }
 
       const otherId = 'b'.repeat(32)
       insert.run(otherId, 'failed', null, null, 'poise:behavior-chain', null, JSON.stringify(claim), null, 'review-2')
@@ -163,6 +171,7 @@ describe('service health', () => {
       database.prepare('update calls set resources_settled_at=1 where id=?').run(heldId)
       expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, nativeCleanupHold: retainedHold, backgroundWork: 1, idle: false })
       database.prepare('update calls set resource_cleanup=null where id=?').run(heldId)
+      storage.setOpenTurn(sessionId, null, null)
       expect(service.health()).toMatchObject({ unsettledNativeCalls: 0, backgroundWork: 0, idle: true, draining: true })
       expect(service.health().nativeCleanupHold).toBeUndefined()
     } finally {
