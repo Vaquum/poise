@@ -9,7 +9,8 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
-import { repairReportReviewScope, reportRepairExhaustion } from './behavior-chain-report'
+import { repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories } from './behavior-chain-report'
+import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
@@ -1842,9 +1843,9 @@ function sameCallEvidence(history: AgentLogSnapshot['entries'][number] | undefin
   return isDeepStrictEqual(recorded, read)
 }
 
-async function readBehaviorLogSnapshot(): Promise<AgentLogSnapshot> {
+async function readBehaviorLogSnapshot(fresh = false): Promise<AgentLogSnapshot> {
   try {
-    return await fetchAgentLogSnapshot({ signal: behaviorSignal() })
+    return await fetchAgentLogSnapshot({ signal: behaviorSignal(), fresh })
   } catch (cause) {
     throw new BehaviorLogFeedError(cause instanceof Error ? cause.message : String(cause), { cause })
   }
@@ -2485,6 +2486,7 @@ async function reconcileBehaviorLaunchClaims(
       }
     }
   }
+  await reportRetainedReviewTimeouts(behavior, snapshot)
 }
 
 // ── review-new-prs implementation ───────────────────────────────────────
@@ -4150,7 +4152,78 @@ function prReviewRetryState(
     return targetMatches && retry.expectedHead === head && retry.correlationId === call.correlation_id
       && typeof retry.at === 'string' && Number.isFinite(Date.parse(retry.at)) ? key : null
   }).find((key) => key !== null) ?? null
-  return { stopped, operatorRetryKey }
+  return { stopped, operatorRetryKey, timeouts, calls }
+}
+
+async function reportRetainedReviewTimeouts(behavior: 'review-new-prs' | 'approve-prs', snapshot: AgentLogSnapshot): Promise<void> {
+  // Most workspaces opt out. Do not add target reads to their legacy ticks.
+  const repositories = repairReportRepositories(db).split(',').map(value => value.trim().toLowerCase())
+  for (const claim of failedBehaviorLaunches(behavior)) {
+    if (!repositories.includes(claim.launchRepo.toLowerCase()) || claim.launchError !== REVIEW_BUDGET_STOPPED) continue
+    const { launchRepo: repo, launchPr: number, launchExpectedHead: head, launchActor: actor, target } = claim
+    const matching = (history: AgentLogSnapshot) => {
+      const current = getFailedBehaviorLaunch(behavior, target)
+      if (!current || !isDeepStrictEqual(current, claim) || current.launchQuarantine
+        || claim.launchBehavior !== upstreamBehavior(behavior) || claim.launchSource !== `poise:${behavior}`
+        || behavior === 'review-new-prs' && target !== reviewSlotTarget(`${repo}#${number}`, reviewSlotOfTarget(target))
+        || !SHA_PATTERN.test(head) || !Number.isFinite(Date.parse(claim.launchRequestedAt))
+        || hasActiveAgentLaunchForPr(repo, number) || replayReservationActive(repo, number, claim.launchBehavior)
+        || behaviorChainForPull(repo, number)?.invocations.some(invocation => invocation.state !== 'settled')
+        || history.quarantined.some(row => quarantinedLogMayMatch(row, { repo, prId: String(number) }))) return null
+      const original = history.entries.find(call => call.id === claim.launchCallId
+        && call.correlation_id === claim.launchCorrelationId)
+      if (!original || Date.parse(agentCallStartedAt(original)) < Date.parse(claim.launchRequestedAt)) return null
+      const retry = prReviewRetryState(history, behavior, repo, number, head, actor, original.model, target)
+      if (!retry.stopped || retry.operatorRetryKey || retry.timeouts.length < 2 || !retry.timeouts.includes(original)) return null
+      // Keep other verified timeout attempts in the report without counting
+      // another model or an inspection timeout toward the legacy retry stop.
+      const attempts = retry.calls.filter(call => budgetExhaustedProvenNoAction(call)
+        || call.error_code === 'review_inspection_timeout' && postedNothing(call) && call.review_comments == null)
+        .sort((a, b) => Date.parse(agentCallStartedAt(a)) - Date.parse(agentCallStartedAt(b)))
+      if (attempts.at(-1) !== original || attempts.some(call => {
+        const completed = Date.parse(call.completed_at ?? '')
+        return !Number.isFinite(completed) || completed < Date.parse(agentCallStartedAt(call)) || completed > Date.now()
+          || call.action !== 'not_started' || call.outcome !== 'preflight_failed'
+          || call.artifact?.phase !== 'reviewing'
+          || call.resource_ownership != null && !resourceReleaseProven({ ...call }, true)
+      }) || history.entries.some(call => call.repo === repo && String(call.pr_id) === String(number)
+        && (!terminalAgentStatus(call.status) || !attempts.includes(call)
+          && Date.parse(agentCallStartedAt(call)) >= Date.parse(agentCallStartedAt(original))))) return null
+      return attempts
+    }
+    const attempts = matching(snapshot)
+    if (!attempts) continue
+    const accounts = getSettings()
+    const verify = async () => {
+      await requireFreshDatastore()
+      const pr = await readPullRequest(repo, number)
+      if (!pr || pr.status !== 'open' || pr.draft || configuredReviewer(pr.author).toLowerCase() !== actor.toLowerCase()) return false
+      const activity = await checkReviewActivity(repo, number, actor, agentCallStartedAt(attempts[0]))
+      if (activity.state !== 'OPEN' || activity.draft || activity.headSha !== head || !activity.reviewContext
+        || activity.reviewerPendingReviews !== 0 || activity.reviewerReviewsSince !== 0
+        || activity.reviewerReviewIdsSince === null || attempts.some(call => {
+          const context = call.artifact?.review_context as Record<string, unknown> | undefined
+          return !context || context.repository !== repo || context.pull_number !== number || context.head_sha !== head
+            || context.context_sha !== activity.reviewContext || context.model !== call.model
+        })) return false
+      if (behavior === 'approve-prs' && target.includes('@req=')) {
+        const check = await checkChangesAddressed(repo, number, actor)
+        if (!check.hasChangeRequest || check.headSha !== head
+          || target !== `${repo}#${number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${head}`) return false
+      } else if (behavior === 'approve-prs' && target !== `${repo}#${number}@head=${head}`
+        && target !== `${repo}#${number}@head=${head}/context=${activity.reviewContext}`) {
+        return false
+      }
+      const fresh = matching(await readBehaviorLogSnapshot(true))
+      return !!fresh && isDeepStrictEqual(fresh, attempts)
+    }
+    const status = await reportLegacyReviewTimeout(db, behaviorChainJournal(), {
+      repository: repo, pull: number, author: accounts.me, reviewer: accounts.agentAccount, behavior, target, head,
+      slot: behavior === 'review-new-prs' ? reviewSlotOfTarget(target) : target,
+      heldAt: Date.parse(claim.seenAt), attempts,
+    }, verify, () => tickerStarted && !behaviorAborted() && isRunnable(behavior) && !releaseBackgroundPaused())
+    if (status) console.log(`[behaviors] ${status}`)
+  }
 }
 
 // An upgrade from a runtime that released its claims leaves only Caller

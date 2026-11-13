@@ -690,7 +690,7 @@ does not disturb native cleanup holds. Explicit empty durably overrides a legacy
 container environment after Poise restarts. Local mode keeps environment-based
 configuration. Unset or empty opts out.
 
-Repair and PR review reporting requires at least three settled original Caller
+Native repair and PR review reporting requires at least three settled original Caller
 receipts for the same phase, current head, review basis and slot after the last
 Resume, each with positive resource release, `action=not_started`, retained
 `outcome=preflight_failed` and no
@@ -720,6 +720,20 @@ review causes outside these two timeouts cannot qualify. Closed or merged target
 remain ineligible for a new review exhaustion report.
 Revoking repository scope during verification prevents publication and leaves the
 creation intent unconsumed, so re-enabling can still report once.
+
+Legacy review and approval ticks also report retained automatic retry stops in
+opted-in repositories, before checking model readiness and with v2 disabled.
+Their existing two same-head/model timeout policy is unchanged. Reporting requires
+the exact retained Call and correlation, behavior and target, two unambiguous
+no-submission timeout receipts with settled activity, and fresh datastore and
+native PR evidence. Each attempt's pinned review context must still match;
+closed or changed targets, published or pending reviews, live successors,
+explicit retries and cleared or ambiguous holds exclude creation. The report
+lists original Calls, retained timeout steps (unknown when unavailable), the
+retry-stop cause and explicit retry action. It uses the same durable publisher
+and reuses an existing PR review report across legacy/v2 ownership changes,
+including an unconfirmed creation intent. Reporting never changes the source
+hold or PR and does not enable v2 intake.
 
 Before a PR, `atomic_work_blocked` separately qualifies one settled original
 `implement-issue` receipt after the last Resume. The current durable automatic

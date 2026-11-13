@@ -38,6 +38,7 @@ vi.mock('../server/process', async (importOriginal) => {
   mocks.realRunFile = actual.runFile
   return {
     setProcessFailureObserver: actual.setProcessFailureObserver,
+    MAX_PROCESS_ARG_BYTES: actual.MAX_PROCESS_ARG_BYTES,
     processFailureEvidence: actual.processFailureEvidence,
     isAbortError: actual.isAbortError,
     CLAUDE_SUBSCRIPTION_CLI: '/poise/claude-subscription',
