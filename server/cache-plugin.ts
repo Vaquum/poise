@@ -1623,7 +1623,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (agentRespMatch && req.method === 'GET') {
           const callId = agentRespMatch[1]
           try {
-            const result = await fetchAgentResponse(callId)
+            const result = await fetchAgentResponse(callId, 'history')
             return json(res, 200, result)
           } catch (err: any) {
             const stderr = err?.stderr?.toString?.() || ''

@@ -79,7 +79,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
   let searchQuery = ''
   let pageIndex = 0
   let searchDebounce = 0
-  const expanded = new Map<string, { body: string | null, loading: boolean, error: string }>()
+  const expanded = new Map<string, { body: string | null, loading: boolean, error: string, unavailable: string, running: boolean }>()
   const expandedGroups = new Set<string>()
   let displayedGroups = new Map<string, RunGroup>()
   const reasoning = new Map<string, { chars: number, body: string, loading: boolean, error: string }>()
@@ -173,7 +173,6 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     { entry: group.entries[0], group },
     ...(expandedGroups.has(group.key) ? group.entries.slice(1).map((entry) => ({ entry, repeat: true })) : []),
   ])
-  const hasDetail = (e: LogEntry): boolean => !!e.response || !!e.error || !!e.progress
 
   function groupButton(group?: RunGroup): string {
     if (!group || group.entries.length < 2) return ''
@@ -223,7 +222,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     const e = row.entry
     const open = expanded.has(e.id)
     const model = modelName(e)
-    const detail = hasDetail(e) ? `<button type="button" class="ib chev${open ? ' is-open' : ''}" data-act="sw-detail" aria-expanded="${open}" aria-label="${open ? 'Hide' : 'Show'} detail" data-help="${open ? 'Hide detail' : e.progress ? 'View activity' : e.response ? 'View response' : 'View error'}" data-ref="bh.detail">${icon('chev', 'sm')}</button>` : ''
+    const detail = `<button type="button" class="ib chev${open ? ' is-open' : ''}" data-act="sw-detail" aria-expanded="${open}" aria-label="${open ? 'Hide' : 'Show'} detail" data-help="${open ? 'Hide detail' : e.progress ? 'View activity' : e.error ? 'View error' : 'View response'}" data-ref="bh.detail">${icon('chev', 'sm')}</button>`
     return `<td class="c-group">${row.repeat ? '' : groupButton(row.group)}</td>
       <td class="c-model" data-help="${esc(model)}" data-ref="bh.model">${model ? esc(model) : '<span class="dim">—</span>'}</td>
       <td class="c-behavior" data-help="${esc(e.behavior ?? '')}" data-ref="bh.behavior">${esc(behaviorName(e))}</td>
@@ -260,7 +259,8 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     const target = owner && name && e.pr_id ? `${owner}/${name}#${e.pr_id}` : ''
     const response = state?.loading ? '<section><h4 class="t-micro">Response</h4><p class="note"><span class="spin"></span> Reading the response…</p></section>'
       : state?.error ? `<section><h4 class="t-micro">Response</h4><p class="note is-warn">${esc(state.error)}</p></section>`
-        : state?.body ? `<section><h4 class="t-micro">Response</h4><pre class="sw-pre">${esc(state.body)}</pre></section>` : ''
+        : state?.unavailable ? `<section><h4 class="t-micro">Response</h4><p class="note">Unavailable: ${esc(state.unavailable)}</p></section>`
+          : state?.body !== null && state?.body !== undefined ? `<section><h4 class="t-micro">Response</h4><pre class="sw-pre">${esc(state.body)}</pre></section>` : ''
     return `<td colspan="${COLUMNS}"><div class="sw-detail-in">
       ${activityHTML(e)}${response}
       ${e.error ? `<section><h4 class="t-micro">Error</h4><pre class="sw-pre is-error">${esc(e.error)}</pre></section>` : ''}
@@ -640,28 +640,37 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     for (const entry of entries) {
       const state = expanded.get(entry.id)
       if (state && openReasoning.has(entry.id)) void loadReasoning(entry.id)
-      if (state && !state.loading && state.body === null && !state.error && entry.response) void loadResponse(entry.id)
+      if (state && !state.loading && state.body === null && !state.error
+        && (entry.response || (state.unavailable !== '' && state.running && !isRunning(entry)))) void loadResponse(entry.id)
     }
   }
   async function loadResponse(id: string): Promise<void> {
-    const entry = entries.find((e) => e.id === id)
-    if (!entry?.response) { expanded.set(id, { body: null, loading: false, error: '' }); render(); return }
-    expanded.set(id, { body: null, loading: true, error: '' })
+    const startedRunning = entries.some((entry) => entry.id === id && isRunning(entry))
+    expanded.set(id, { body: null, loading: true, error: '', unavailable: '', running: false })
     render()
-    let next: { body: string | null, loading: boolean, error: string }
+    let next: { body: string | null, loading: boolean, error: string, unavailable: string, running: boolean }
     try {
       const response = await fetch(`/api/agent-response/${encodeURIComponent(id)}`, { cache: 'no-store', signal: ctx.signal })
       if (!response.ok) throw new Error(await failureOf(response))
-      const data = await response.json() as { body?: unknown }
-      next = { body: typeof data.body === 'string' ? data.body : '', loading: false, error: '' }
+      const data = await response.json() as { body?: unknown, disposition?: unknown, reason?: unknown }
+      if (data.disposition === 'unavailable' && typeof data.reason === 'string' && data.reason) {
+        next = { body: null, loading: false, error: '', unavailable: data.reason, running: startedRunning }
+      } else {
+        if (data.disposition !== undefined || typeof data.body !== 'string') throw new Error('the answer is incomplete')
+        next = { body: data.body, loading: false, error: '', unavailable: '', running: false }
+      }
     } catch (error) {
       if (aborted(error)) return
-      next = { body: null, loading: false, error: `The response could not be read: ${message(error)}` }
+      next = { body: null, loading: false, error: `The response could not be read: ${message(error)}`, unavailable: '', running: false }
     }
     // The row may have been folded while the response was out.
     if (!expanded.has(id)) return
     expanded.set(id, next)
     render()
+    if (next.unavailable !== '' && next.running) {
+      const current = entries.find((e) => e.id === id)
+      if (current && !isRunning(current)) void loadResponse(id)
+    }
   }
   async function loadReasoning(id: string): Promise<void> {
     const entry = entries.find((e) => e.id === id)
@@ -874,7 +883,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     if (group && group.entries[0].id !== match.id) expandedGroups.add(group.key)
     const index = groupRows(groups).findIndex((row) => row.entry.id === match.id)
     pageIndex = Math.max(0, Math.floor(index / PAGE_SIZE))
-    if (hasDetail(match) && !expanded.has(match.id)) void loadResponse(match.id)
+    if (!expanded.has(match.id)) void loadResponse(match.id)
     render()
     const row = body.querySelector<HTMLTableRowElement>(`tr[data-run="${CSS.escape(match.id)}"]`)
     if (row) {

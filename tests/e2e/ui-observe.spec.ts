@@ -379,6 +379,85 @@ test('a run link opens that run unfolded in Behaviors, and a chain’s own GitHu
   await expect(running.getByRole('button', { name: 'Confirm stopping this run' })).toHaveText('Sure?')
 })
 
+for (const state of ['unavailable', 'missing-file', 'incomplete']) {
+  test(`a response-less run displays its response read as ${state}`, async ({ page }) => {
+    await open(page, '/?view=observe&part=behaviors')
+    const id = hex(32, 'd')
+    await page.route(`/api/agent-response/${id}`, route => state === 'missing-file'
+      ? route.fulfill({ status: 502, json: { error: 'promised response file is missing' } })
+      : route.fulfill({ json: state === 'unavailable'
+        ? { id, disposition: 'unavailable', reason: 'The Call is still running' } : {} }))
+    const behaviors = page.locator('[data-panel="behaviors"]')
+    await behaviors.locator(`tr[data-run="${id}"]`).getByRole('button', { name: 'Show detail' }).click()
+    const detail = behaviors.locator(`tr[data-detail-for="${id}"]`)
+    if (state === 'unavailable') {
+      await expect(detail).toContainText('Unavailable: The Call is still running')
+      await expect(detail.locator('.is-warn, .is-error')).toHaveCount(0)
+      await expect(detail.getByRole('heading', { name: 'Error', exact: true })).toHaveCount(0)
+    } else {
+      await expect(detail.locator('.is-warn')).toContainText(state === 'missing-file'
+        ? 'promised response file is missing' : 'the answer is incomplete')
+    }
+  })
+}
+
+test('a detail opened while running rereads its unavailable reason after the run ends without a response', async ({ page }) => {
+  await open(page, '/?view=observe&part=behaviors')
+  const id = hex(32, 'd')
+  let reads = 0
+  await page.route(`/api/agent-response/${id}`, route => route.fulfill({ json: ++reads === 1
+    ? { id, disposition: 'unavailable', reason: 'The Call is still running' }
+    : { id, disposition: 'unavailable', reason: 'The Call ended without a response' } }))
+  const behaviors = page.locator('[data-panel="behaviors"]')
+  await behaviors.locator(`tr[data-run="${id}"]`).getByRole('button', { name: 'Show detail' }).click()
+  const detail = behaviors.locator(`tr[data-detail-for="${id}"]`)
+  await expect(detail).toContainText('Unavailable: The Call is still running')
+  const finished = { ...RUNS[0], status: 'completed', completed_at: iso(NOW - minutes(1)), outcome: 'approved', time_elapsed: '3m 1s' }
+  await page.route((url) => url.pathname === '/api/agent-logs', route => {
+    const url = new URL(route.request().url())
+    const wanted = url.searchParams.get('id')
+    const logs = wanted ? [finished].filter((r) => r.id === wanted)
+      : url.searchParams.get('status') === 'running' ? [] : [finished, RUNS[1], RUNS[2]]
+    return route.fulfill({ json: { logs, quarantined: [], total: logs.length, nextCursor: null } })
+  })
+  await page.evaluate(() => dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(detail).toContainText('Unavailable: The Call ended without a response')
+  expect(reads).toBe(2)
+})
+
+test('a detail whose run ends while its response read is pending rereads without a second refresh', async ({ page }) => {
+  await open(page, '/?view=observe&part=behaviors')
+  const id = hex(32, 'd')
+  let reads = 0
+  let releaseFirst!: () => void
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+  await page.route(`/api/agent-response/${id}`, async (route) => {
+    reads += 1
+    if (reads === 1) await firstGate
+    return route.fulfill({ json: reads === 1
+      ? { id, disposition: 'unavailable', reason: 'The Call is still running' }
+      : { id, disposition: 'unavailable', reason: 'The Call ended without a response' } })
+  })
+  const behaviors = page.locator('[data-panel="behaviors"]')
+  const row = behaviors.locator(`tr[data-run="${id}"]`)
+  await row.getByRole('button', { name: 'Show detail' }).click()
+  await expect.poll(() => reads).toBe(1)
+  const finished = { ...RUNS[0], status: 'completed', completed_at: iso(NOW - minutes(1)), outcome: 'approved', time_elapsed: '3m 1s' }
+  await page.route((url) => url.pathname === '/api/agent-logs', (route) => {
+    const url = new URL(route.request().url())
+    const wanted = url.searchParams.get('id')
+    const logs = wanted ? [finished].filter((r) => r.id === wanted)
+      : url.searchParams.get('status') === 'running' ? [] : [finished, RUNS[1], RUNS[2]]
+    return route.fulfill({ json: { logs, quarantined: [], total: logs.length, nextCursor: null } })
+  })
+  await page.evaluate(() => dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(row.getByRole('button', { name: 'Stop this run' })).toHaveCount(0)
+  releaseFirst()
+  const detail = behaviors.locator(`tr[data-detail-for="${id}"]`)
+  await expect(detail).toContainText('Unavailable: The Call ended without a response')
+  expect(reads).toBe(2)
+})
+
 test('a GitHub link opens its row, widening the filters for that visit only', async ({ page }) => {
   await page.addInitScript(() => { localStorage.setItem('poise-observe-github', JSON.stringify({ types: ['action'], ci: 'failed', status: 'open', time: 'today' })) })
   await open(page, '/?view=observe&part=github&item=acme/site%23496')

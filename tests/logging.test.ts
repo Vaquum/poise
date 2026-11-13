@@ -6,7 +6,7 @@ import { diagnostic, diagnosticFailure, diagnosticPage, fatalDiagnostic, logging
 import { runFile } from '../server/process'
 import * as processes from '../server/process'
 import { credentialVariables } from './fixtures/cli-isolation'
-import { fetchAgentLogSnapshot, fetchRunningAgentLogSnapshot, resetAgentLogCache } from '../server/agent'
+import { fetchAgentLogSnapshot, fetchAgentResponse, fetchRunningAgentLogSnapshot, resetAgentLogCache } from '../server/agent'
 import { withNoticeDiagnosticIdentity } from '../server/logging-context'
 
 let directory = ''
@@ -21,6 +21,45 @@ function start(blocked = false) {
 }
 
 describe('independent application capture', () => {
+  it('keeps typed History absence out of Error and retains Call ID and purpose for required or broken reads', async () => {
+    start()
+    vi.stubEnv('CALLER_BIN_ROOT', directory)
+    const callId = 'a'.repeat(32)
+    const state = join(directory, 'response-state')
+    writeFileSync(state, 'absent')
+    writeFileSync(join(directory, 'agent-interface'), `#!${process.execPath}
+const { readFileSync } = require('node:fs')
+const mode = readFileSync(${JSON.stringify(state)}, 'utf8')
+if (mode === 'available') process.stdout.write('original response\\n')
+else if (mode === 'missing') { process.stderr.write('promised response file is missing'); process.exitCode = 1 }
+else {
+  process.stdout.write(JSON.stringify({ id: mode === 'wrong-call' ? 'b'.repeat(32) : process.argv[3],
+    disposition: 'unavailable', reason: 'The Call ended without a response' }))
+  process.exitCode = 3
+}
+`, { mode: 0o755 })
+    const events = () => {
+      loggingRuntime()!.flush()
+      return loggingRuntime()!.query(db => db.query({ workspace: 'alice', operator: false }, { source: 'poise' })).events
+    }
+    await expect(fetchAgentResponse(callId, 'history')).resolves.toEqual({ id: callId,
+      disposition: 'unavailable', reason: 'The Call ended without a response' })
+    expect(events()).toEqual([])
+    await expect(fetchAgentResponse(callId, 'content-finalization')).rejects.toMatchObject({ code: 3 })
+    expect(events()).toContainEqual(expect.objectContaining({ severity: 'error', callId,
+      context: expect.objectContaining({ readerPurpose: 'content-finalization' }) }))
+    for (const mode of ['wrong-call', 'missing']) {
+      writeFileSync(state, mode)
+      await expect(fetchAgentResponse(callId, 'history')).rejects.toThrow('Command failed')
+    }
+    const history = events().filter(event => event.context.readerPurpose === 'history')
+    expect(history).toHaveLength(2)
+    expect(history.every(event => event.severity === 'error' && event.callId === callId)).toBe(true)
+    expect(history.some(event => event.stderr === 'promised response file is missing')).toBe(true)
+    writeFileSync(state, 'available')
+    await expect(fetchAgentResponse(callId, 'history')).resolves.toEqual({ id: callId, body: 'original response\n' })
+  })
+
   it('retains one history episode across failed shared reads, with bounded first evidence and explicit recovery', async () => {
     start()
     resetAgentLogCache()

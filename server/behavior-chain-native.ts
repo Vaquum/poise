@@ -553,7 +553,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         throw new Error('native action response differs from its immutable request')
       }
       const { stdout } = await runFile('agent-interface', ['--read-response', call.id],
-        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 256 * 1024 })
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 256 * 1024,
+          callId: call.id, readerPurpose: 'native-action-receipt' })
       // Caller prints the retained bytes plus one newline. Hash those bytes,
       // not a JavaScript reserialization (Python's 1.0 is JavaScript's 1).
       if (!stdout.endsWith('\n') || createHash('sha256').update(stdout.slice(0, -1)).digest('hex') !== call.artifact.response_sha) {

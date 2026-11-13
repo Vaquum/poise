@@ -1703,6 +1703,14 @@ empty queue cannot authorize another enqueue. See
 Conversation-resolution summaries also expose the original Call's validated
 per-thread progress; partial progress retains the original action's uncertainty.
 
+History response details distinguish typed ordinary Caller absence from a
+promised response that is missing or unreadable. `/api/agent-response/CALL_ID`
+returns `{id, disposition: "unavailable", reason}` for ordinary absence, keeping
+it out of process Error; actual failures remain 502 and retain the exact Call ID
+and reader purpose. Required content and native-action reads still reject absent
+results, preserving receipt digests and publication/retry fences. The CLI's
+response-read contract is in [agent_interface](../caller/agent_interface/README.md#reading-a-response).
+
 Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
 code and existing v1 diagnostic into chain receipts and History. The unchanged
 no-publication shape and retry requirements are defined in
