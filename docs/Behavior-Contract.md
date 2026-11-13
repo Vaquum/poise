@@ -278,6 +278,13 @@ Load timeouts — an expired sweep deadline, a slow CLI, lock contention — ret
 on a short clock of a few minutes, not the hour-long backoff of hard failures.
 A failure carrying an explicit quota reset retries at the reset instead of that
 backoff: no sooner than a minute out, never later than an hour.
+PR review preparation and claimed-head revalidation retain the fixed GitHub
+primitive, phase, PR, reviewer slot, available expected head and original operation
+identity on failures. The handler records the existing per-slot `:check` retry
+before emitting one Error with the original child evidence and next retry time;
+separate attempts remain separate records. A timed-out probe launches no review.
+Its due retry reads the current head and launches each admitted reviewer slot
+once, while unrelated targets remain eligible.
 When the agent account cannot read a repository at all — GitHub 404 or
 NOT_FOUND for the repository — the first such failure records one held state
 for the repository instead of a per-target failure, and the pull-request
