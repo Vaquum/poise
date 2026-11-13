@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { servedRead, type ServedRead } from '../server/served-read'
+import { refreshServed, servedRead, type ServedRead } from '../server/served-read'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -87,5 +87,51 @@ describe('healthReadKey', () => {
     expect(healthReadKey('', two)).not.toBe(healthReadKey('', [two[0]]))
     expect(healthReadKey('', two)).not.toBe(healthReadKey('', [two[0], { login: 'beta', status: 'initializing' }]))
     expect(healthReadKey('alpha', [two[0]])).not.toBe(healthReadKey('', [two[0]]))
+  })
+})
+
+describe('reads kept fresh in the background', () => {
+  it('answers at once from a result younger than freshMs, without computing', async () => {
+    let now = 10_000
+    const state: ServedRead<string> = { running: null, last: { value: 'kept', at: 9_000 } }
+    const compute = vi.fn(async () => 'fresh')
+    expect(await servedRead(state, compute, { waitMs: 300, servedMs: 120_000, freshMs: 90_000, now: () => now })).toBe('kept')
+    expect(compute).not.toHaveBeenCalled()
+    // Past freshMs it reads as before: a fresh computation, waited for.
+    now = 100_000
+    expect(await servedRead(state, compute, { waitMs: 300, servedMs: 120_000, freshMs: 90_000, now: () => now })).toBe('fresh')
+    expect(compute).toHaveBeenCalledTimes(1)
+  })
+
+  it('refreshes in the background once at a time, and a failed refresh makes the next reader wait', async () => {
+    const state: ServedRead<string> = { running: null, last: { value: 'kept', at: Date.now() } }
+    const slow = deferred<string>()
+    const compute = vi.fn(() => slow.promise)
+    refreshServed(state, compute)
+    refreshServed(state, compute)
+    expect(compute).toHaveBeenCalledTimes(1)
+    slow.resolve('refreshed')
+    await slow.promise
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(state.last?.value).toBe('refreshed')
+    expect(state.running).toBeNull()
+
+    refreshServed(state, async () => { throw new Error('journal unreadable') })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(state.failed).toBe(true)
+    // A failure is never hidden behind a fresh-looking result.
+    await expect(servedRead(state, async () => { throw new Error('journal unreadable') }, { waitMs: 5, servedMs: 120_000, freshMs: 90_000 }))
+      .rejects.toThrow('journal unreadable')
+  })
+})
+
+describe('system health refresh time', () => {
+  it('falls 40 seconds past the minute, away from the minute itself', async () => {
+    const { untilHealthRefresh } = await import('../server/analytics-health')
+    const minute = Date.parse('2026-11-13T12:00:00.000Z')
+    expect(untilHealthRefresh(minute)).toBe(40_000)
+    expect(untilHealthRefresh(minute + 39_000)).toBe(1_000)
+    expect(untilHealthRefresh(minute + 40_000)).toBe(60_000)
+    expect(untilHealthRefresh(minute + 59_000)).toBe(41_000)
   })
 })
