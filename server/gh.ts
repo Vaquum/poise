@@ -275,22 +275,27 @@ async function readKept(org: Organization, args: string[], key: string): Promise
   const version = path ? await datastoreVersion(path) : null
   const kept = version ? viewReads.get(key) : undefined
   if (kept && kept.version === version) return kept.rows
+  // A version the mark vouched for stands only as long as the mark may: a
+  // change it cannot see shows within CONTENT_KEPT_MS, whether or not
+  // anything is written after it.
+  const vouching = kept !== undefined && Date.now() - kept.readAt < CONTENT_KEPT_MS
+  if (vouching && kept.vouched === version) return kept.rows
   const content = path && version && MARKED_VIEWS.has(args[1]) ? await datastoreContent(path, version) : null
-  if (kept && content !== null && kept.content === content && Date.now() - kept.readAt < CONTENT_KEPT_MS) {
-    kept.version = version!
+  if (vouching && content !== null && kept.content === content) {
+    kept.vouched = version
     return kept.rows
   }
   const rows = await readDatastore(org, args)
   if (version) {
     viewReads.delete(key)
-    viewReads.set(key, { version, content, readAt: Date.now(), rows })
+    viewReads.set(key, { version, content, vouched: null, readAt: Date.now(), rows })
     if (viewReads.size > VIEW_READS_KEPT) viewReads.delete(viewReads.keys().next().value!)
   }
   return rows
 }
 
 /** View reads kept with the datastore file version and content mark they were read at, the oldest dropped first. */
-const viewReads = new Map<string, { version: string, content: string | null, readAt: number, rows: DatastoreRecord[] }>()
+const viewReads = new Map<string, { version: string, content: string | null, vouched: string | null, readAt: number, rows: DatastoreRecord[] }>()
 const VIEW_READS_KEPT = 200
 /** The views over items and their evidence, all the content mark watches. */
 const MARKED_VIEWS = new Set(['pr', 'issue', 'user'])

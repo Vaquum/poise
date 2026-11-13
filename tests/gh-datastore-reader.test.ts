@@ -156,4 +156,35 @@ describe('runCli with the in-process datastore reader', () => {
       rmSync(directory, { recursive: true, force: true })
     }
   })
+
+  it('lets a version the content mark vouched for stand only within five minutes, though nothing is written after it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'poise-view-vouched-'))
+    let now = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const path = join(directory, 'alpha.sqlite')
+      writeFileSync(path, 'datastore')
+      const org = { ...mocks.org, datastorePath: path }
+      mocks.content.mockImplementation(() => Promise.resolve('mark'))
+      mocks.read.mockImplementation(() => Promise.resolve([row('alpha/one', 1)]))
+      await runCli(org as never, ARGS)
+      // A sync the mark vouches for, then nothing more is written.
+      writeFileSync(`${path}-wal`, 'frame')
+      now += 60_000
+      await runCli(org as never, ARGS)
+      now += 3 * 60_000
+      await runCli(org as never, ARGS)
+      expect(mocks.read).toHaveBeenCalledTimes(1)
+      // Past the window the view is read again, at the version it is now read at.
+      now += 60_001
+      await runCli(org as never, ARGS)
+      expect(mocks.read).toHaveBeenCalledTimes(2)
+      now += 10 * 60_000
+      await runCli(org as never, ARGS)
+      expect(mocks.read).toHaveBeenCalledTimes(2)
+    } finally {
+      clock.mockRestore()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
 })

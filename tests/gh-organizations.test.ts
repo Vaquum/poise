@@ -94,7 +94,8 @@ describe('organization data aggregation', () => {
   it('keeps same repository names and issue numbers distinct, and paginates the combined order', async () => {
     const result = await handleGhBody({ operation: 'list', record_type: 'pull_request', offset: 1, limit: 2 })
     expect((result.body as any).records.map((r: any) => `${r.repo}#${r.number}`)).toEqual(['alpha/same#1', 'beta/same#2'])
-    expect(mocks.runFile.mock.calls.map((call) => call[1].slice(0, 2))).toEqual([['--db', '/alpha.sqlite'], ['--db', '/beta.sqlite']])
+    // Organizations are read at once, so their calls may start in either order.
+    expect(mocks.runFile.mock.calls.map((call) => call[1].slice(0, 2)).sort()).toEqual([['--db', '/alpha.sqlite'], ['--db', '/beta.sqlite']])
     for (const call of mocks.runFile.mock.calls) expect(call[1]).toEqual(expect.arrayContaining(['--limit', '3']))
   })
 
