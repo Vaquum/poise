@@ -33,6 +33,7 @@ vi.mock('../server/production-cpu-profile', () => ({
 vi.mock('../server/cache-plugin', () => ({
   createPoiseMiddleware: mocks.createPoiseMiddleware,
   stopPoiseRuntime: mocks.stopPoiseRuntime,
+  pendingRuntimeStops: () => [],
   attachChatSockets: mocks.attachChatSockets,
   stopDailyModelRefresh: mocks.stopDailyModelRefresh,
 }))
@@ -287,6 +288,7 @@ describe('production shutdown', () => {
             export const attachChatSockets = () => {};
             export const stopDailyModelRefresh = () => {};
             export const stopPoiseRuntime = () => stopLogging();
+            export const pendingRuntimeStops = () => [];
           ` }))
       } }],
       })
