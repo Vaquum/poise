@@ -4,7 +4,7 @@ import type { NotificationItem } from '../src/notification-items'
 import { bellTally, DEFAULT_LEVEL, LEVEL_KEY, noticeGroup, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from '../src/ui/places/overview/level'
 import { chatOpening, diagnosticHref, itemOf, journalStep, targetOpening, timelineHref } from '../src/ui/places/overview/targets'
 import { chatState, countStates, issueState, pullState, taskPhase, taskState, type ChainLike } from '../src/ui/places/overview/states'
-import { decisionEntries, diagnosticGroup, foldWaiting, itemEntries, ordered, prGroup, prStatusesFrom, requestEntries, requestsFrom, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
+import { decisionEntries, diagnosticGroup, foldWaiting, itemEntries, keepEntries, ordered, prGroup, prStatusesFrom, requestEntries, requestsFrom, restoreEntries, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
 import { STALLED_MESSAGE } from '../src/behavior-diagnostics'
 import type { ChainAttentionRow } from '../src/notification-items'
 import type { PrStatus } from '../src/ui/places/board/model'
@@ -346,6 +346,26 @@ describe('Answer here’s entries', () => {
     // A put-away entry stays away until what it reports changes; notices keep their own dismissal.
     const put = new Map([[chain.id, chain.revision], [diagnostic.id, 'an older occurrence']])
     expect(undismissed([chain, diagnostic, permission], put).map((entry) => entry.id)).toEqual([diagnostic.id, permission.id])
+  })
+
+  it('keeps what a card shows, never what answering needs, and restores it remembered and unanswerable', () => {
+    const [entry] = requestEntries([request({ content: { title: 'Run gh pr create', description: 'x'.repeat(5000), input: { command: 'gh pr create' }, options: [{ id: 'allow', name: 'Allow once' }, { id: 'deny', name: 'Deny' }] } })], role)
+    const [kept] = keepEntries([entry])
+    expect(kept).toEqual({ id: 'request:r1', source: 'request', group: 'needs-you', kind: 'Permission', title: 'Run gh pr create', where: 'Muse', since: '2026-11-11T08:00:00Z',
+      detail: 'Asks before a step', options: ['Allow once', 'Deny'], primary: 0, open: { href: '?view=chat&chat=s1&back=overview', label: 'Open the chat' } })
+    // The description, the command and the request's ids stay behind.
+    expect(JSON.stringify(kept)).not.toMatch(/xxxx|"command"|sessionId|"request":/)
+    const [back] = restoreEntries(JSON.parse(JSON.stringify([kept])))
+    expect(back).toMatchObject({ id: 'request:r1', remembered: true, dismissable: false, silenceable: false, title: 'Run gh pr create', group: 'needs-you' })
+    expect(back.options.map((o) => [o.label, o.primary])).toEqual([['Allow once', true], ['Deny', false]])
+    expect(back.request).toBeUndefined()
+    // Anything kept in another shape is dropped, never guessed at; a link goes only within Poise or to https.
+    expect(restoreEntries([{ ...kept, group: 'ready' }, { ...kept, id: 3 }, null, 'x'])).toEqual([])
+    expect(restoreEntries('not a list')).toEqual([])
+    expect(restoreEntries([{ ...kept, open: { href: 'javascript:alert(1)', label: 'x' }, github: 'http://example.com' }])[0]).toMatchObject({ open: undefined, github: undefined })
+    // Long words are cut to what a card shows, and at most 200 entries are kept.
+    expect(keepEntries([{ ...entry, title: 'y'.repeat(1000) }])[0].title).toHaveLength(240)
+    expect(keepEntries(Array.from({ length: 250 }, () => entry))).toHaveLength(200)
   })
 
   it('lists the newest entry first within each group, and an entry without a time last', () => {

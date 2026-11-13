@@ -57,6 +57,14 @@ interface Workspace {
   chains?: unknown[]
   /** Each open pull request's blocker, as /api/behavior-ledger/pr-status answers. */
   prs?: unknown[]
+  /** Every read Answer here's entries come from waits for this first. */
+  answersLate?: Promise<void>
+  /** /api/behaviors fails. */
+  behaviorsFail?: boolean
+  /** The organizations /api/settings names, all ready; acme alone unless set. */
+  orgs?: string[]
+  /** /api/settings waits for this first. */
+  settingsLate?: Promise<void>
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -82,6 +90,8 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     const url = new URL(route.request().url())
     const method = route.request().method()
     const path = url.pathname
+    if (method === 'GET' && workspace.answersLate && ['/api/notices', '/api/chat/requests', '/api/chat/switchboard', '/api/editor/reviews', '/api/behavior-chains', '/api/behaviors',
+      '/api/behavior-ledger/pr-status', '/api/answers/dismissals'].includes(path)) await workspace.answersLate
     if (path === '/api/notices' && method === 'GET') return json(route, { enabled: true, notices: workspace.notices })
     if (path === '/api/notices/handled') return json(route, { handled: [] })
     if (path === '/api/chat/requests') { await workspace.requestsLate; return json(route, { revision: workspace.revision, complete: true, requests: workspace.requests }) }
@@ -117,8 +127,10 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       return json(route, { dismissals: workspace.dismissals })
     }
     if (path === '/api/answers/dismissals') return json(route, { dismissals: workspace.dismissals ?? [] })
+    if (path === '/api/behaviors' && workspace.behaviorsFail) return json(route, { error: 'behaviors are unavailable' }, 503)
     if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: workspace.agentLogsError ?? null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
-    if (path === '/api/settings' && method === 'GET') return json(route, { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
+    if (path === '/api/settings' && method === 'GET') await workspace.settingsLate
+    if (path === '/api/settings' && method === 'GET') return json(route, { org: '', organizations: (workspace.orgs ?? ['acme']).map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })), me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
     if (path === '/api/analytics') return json(route, { window: { since: url.searchParams.get('since'), until: url.searchParams.get('until') }, agentAccount: 'bot', ...day, ...(url.searchParams.get('dailyBounds') ? { daily: Array.from({ length: 7 }, () => day) } : {}), errors: [] })
     if (path === '/api/analytics/history') {
       const bounds = (url.searchParams.get('bounds') ?? '').split(',')
@@ -354,6 +366,90 @@ test('a pull request Poise is moving waits on nobody: it shows under Everything,
   // Alone in the list, what Poise handles is not folded.
   await expect(answers(page).locator('[data-key="g:auto"]')).toContainText('Handled automatically')
   await expect(entry(page, 'notice:pr').locator('.nc-d')).toHaveText('in merge queue since 12:12Z')
+})
+
+test('Answer here paints its last read at once, quiet and unanswerable, and each fresh read replaces it', async ({ page }) => {
+  let release!: () => void
+  const late = new Promise<void>((resolve) => { release = resolve })
+  const kept = [
+    { id: 'request:p1', source: 'request', group: 'needs-you', kind: 'Permission', title: 'Run gh pr create', where: 'Chat s1', since: ago(3), detail: 'Asks before a step',
+      options: ['Allow once', 'Deny'], primary: 0, open: { href: '?view=chat&chat=s1&back=overview', label: 'Open the chat' } },
+    { id: 'notice:disk', source: 'notice', group: 'needs-you', kind: 'Storage', title: 'Workspace disk is 95% full', where: '', since: ago(30) },
+  ]
+  await page.addInitScript((value) => { if (!sessionStorage.getItem('kept-once')) { sessionStorage.setItem('kept-once', '1'); localStorage.setItem('poise-overview-answers', value) } },
+    JSON.stringify({ key: 'me|acme:ready', at: NOW - 120_000, entries: kept }))
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [permission('p1', 's1', 'Run gh pr create')], answersLate: late }
+  const socket = await open(page, workspace)
+  // At once, before any read lands: the last read, quieter, nothing on it acting.
+  const card = entry(page, 'request:p1')
+  await expect(card).toHaveClass(/is-remembered/)
+  await expect(entry(page, 'notice:disk')).toHaveClass(/is-remembered/)
+  await expect(page.locator('[data-ncount]')).toHaveText('2')
+  await expect(page.locator('[data-held]')).toContainText('Last read')
+  const allow = card.getByRole('button', { name: 'Allow once' })
+  await expect(allow).toHaveAttribute('aria-disabled', 'true')
+  await allow.dispatchEvent('click')
+  await card.hover()
+  await expect(card.getByRole('button', { name: 'Dismiss' })).toHaveCount(0)
+  await expect(card.getByRole('link', { name: 'Open the chat' })).toHaveCount(1)
+  const box = await card.boundingBox()
+  // The reads land: the request is current and answers; the disk notice has cleared since.
+  release()
+  await expect(card).not.toHaveClass(/is-remembered/)
+  await expect(allow).not.toHaveAttribute('aria-disabled', 'true')
+  await expect(entry(page, 'notice:disk')).toHaveCount(0)
+  await expect(page.locator('[data-held]')).not.toContainText('Last read')
+  // The same card, where it was.
+  expect((await card.boundingBox())?.height).toBe(box?.height)
+  expect(socket.frames.filter((frame) => frame.command.type === 'permission.respond')).toEqual([])
+  // What is drawn now is kept for the next load, small: only what a card shows.
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers') ?? 'null')?.entries?.map((e: { id: string }) => e.id)), { timeout: 10_000 }).toEqual(['request:p1'])
+  const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers') ?? 'null'))
+  expect(stored.key).toBe('me|acme:ready')
+  expect(Object.keys(stored.entries[0]).sort()).toEqual(['detail', 'group', 'id', 'kind', 'open', 'options', 'primary', 'since', 'source', 'title', 'where'])
+})
+
+test('a failed read stands for nothing: its source’s last read stays, and the kept list is not overwritten', async ({ page }) => {
+  const kept = { key: 'me|acme:ready', at: NOW - 60_000, entries: [
+    { id: 'diagnostic:["held_result"]', source: 'diagnostic', group: 'fault', kind: 'Behaviors', title: 'The review outcome needs verification before retry.', where: 'acme/site#4', since: ago(30) }] }
+  await page.addInitScript((value) => localStorage.setItem('poise-overview-answers', value), JSON.stringify(kept))
+  await open(page, { notices: [], decisions: [], revision: 1, requests: [], behaviorsFail: true })
+  const card = page.locator('[data-notice="diagnostic:[\\"held_result\\"]"]')
+  await expect(card).toHaveClass(/is-remembered/)
+  // Every other source has read; Behaviors failed. Its last read stays, and nothing is written over it.
+  await page.waitForTimeout(3_500)
+  await expect(card).toHaveClass(/is-remembered/)
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers') ?? 'null')?.at)).toBe(kept.at)
+})
+
+test('settings read afresh for other organizations put the last read away at once', async ({ page }) => {
+  const settings = { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC',
+    manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }
+  await page.addInitScript(([last, answers]) => { localStorage.setItem('poise-last-settings', last); localStorage.setItem('poise-overview-answers', answers) },
+    [JSON.stringify(settings), JSON.stringify({ key: 'me|acme:ready', at: NOW - 60_000, entries: [{ id: 'request:old', source: 'request', group: 'needs-you', kind: 'Permission', title: 'From the old scope', where: 'Chat', since: ago(5) }] })])
+  let release!: () => void
+  let settingsRead!: () => void
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], orgs: ['acme', 'beta'], answersLate: new Promise<void>((resolve) => { release = resolve }),
+    settingsLate: new Promise<void>((resolve) => { settingsRead = resolve }) }
+  await open(page, workspace)
+  // The page opens on the settings it remembers, and paints their last read.
+  await expect(entry(page, 'request:old')).toHaveClass(/is-remembered/)
+  // Read afresh, the settings name beta too: acme's last read no longer stands, though nothing else has been read.
+  settingsRead()
+  await expect(entry(page, 'request:old')).toHaveCount(0)
+  release()
+  await expect(answers(page).locator('[data-key="empty"]')).toBeVisible()
+})
+
+test('another GitHub user’s or organizations’ last read never paints', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('poise-overview-answers', JSON.stringify({ key: 'someone-else|acme:ready', at: Date.now(), entries: [
+    { id: 'request:x', source: 'request', group: 'needs-you', kind: 'Permission', title: 'Not yours', where: 'Chat x', since: null }] })))
+  let release!: () => void
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], answersLate: new Promise<void>((resolve) => { release = resolve }) }
+  await open(page, workspace)
+  await expect(entry(page, 'request:x')).toHaveCount(0)
+  release()
+  await expect(answers(page).locator('[data-key="empty"]')).toBeVisible()
 })
 
 test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {

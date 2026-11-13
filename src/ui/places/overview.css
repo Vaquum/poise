@@ -45,6 +45,8 @@ svg.flip-x { transform: rotate(180deg); }
 
 .nc { display: flex; flex-direction: column; gap: var(--sp-1); outline-offset: calc(var(--line-focus) * -1); }
 .nc.is-answered { opacity: 0.72; }
+/* From the last read, until its source reads afresh: the same card, quieter, its answers waiting. */
+.nc.is-remembered { opacity: 0.72; }
 .nc.is-fresh { box-shadow: 0 0 0 var(--line-hair) var(--c-agent-tint); }
 /* Two lines of title and one of detail at rest, where More shows them whole. */
 .nc-t { font: inherit; }

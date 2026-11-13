@@ -7,7 +7,7 @@
 import type { DiagnosticEvidence } from '../../../../gateway/src/diagnostics/evidence-contract'
 import { getBehaviorDiagnostics, isBehaviorStateLoaded } from '../../../behaviors'
 import { chatClient, ChatCommandError } from '../../../chat-client'
-import { midnightInZone } from '../../../config'
+import { getOrganizations, getSettings, midnightInZone } from '../../../config'
 import { patchContent } from '../../../dom-patch'
 import { loggingAccess, loggingEvent, loggingWorkImpacts } from '../../../logging'
 import { LOCAL_NOTICE_KINDS, noticeFeed, type Notice, type NoticesState } from '../../../notices'
@@ -20,7 +20,7 @@ import { paintTerms } from '../../reference'
 import { lifeHTML, toast, type Stage } from '../../shell'
 import type { PrStatus } from '../board/model'
 import {
-  decisionEntries, foldWaiting, itemEntries, KEPT_DISMISSALS, openDecision, ordered, prStatusesFrom, requestEntries, requestsFrom, threadEntries, undismissed,
+  decisionEntries, foldWaiting, itemEntries, keepEntries, KEPT_DISMISSALS, openDecision, ordered, prStatusesFrom, requestEntries, requestsFrom, restoreEntries, threadEntries, undismissed,
   type DecisionItem, type Entry, type Publication, type RequestsRead, type Role, type ThreadReview,
 } from './entries'
 import { answersChanged, GROUPS, LEVELS, readLevel, saveLevel, setAnswerGroups, shownAt, tally, type Group } from './level'
@@ -29,6 +29,29 @@ import { ago, clockAt, json, readLine, reason, reportRead, ServiceError, slug, u
 
 /** How long Dismiss and Silence wait in the tab, which is their Undo. */
 export const HOLD_MS = 8000
+
+/** The last read, kept across page loads as Answer here drew it: a reload
+ *  paints it at once, calm and unanswerable, and each source's fresh read
+ *  replaces its own entries. It stands only for the GitHub user and the
+ *  organizations configured, each with its status, it was read under. */
+export const LAST_ANSWERS_KEY = 'poise-overview-answers'
+/** A kept read is written a moment after what is drawn settles, and again at most this often when nothing changed. */
+const KEEP_AFTER_MS = 2_000
+const KEEP_AGAIN_MS = 60_000
+function answersKey(): string {
+  const me = getSettings().me ?? ''
+  const configured = getOrganizations().map((org) => `${org.login.toLowerCase()}:${org.status}`).sort().join(',')
+  return me ? `${me}|${configured}` : ''
+}
+function rememberedAnswers(key: string): { at: number, entries: Entry[] } | null {
+  if (!key) return null
+  try {
+    const last = JSON.parse(localStorage.getItem(LAST_ANSWERS_KEY) ?? 'null') as { key?: unknown, at?: unknown, entries?: unknown } | null
+    return last?.key === key && typeof last.at === 'number' && Number.isFinite(last.at) ? { at: last.at, entries: restoreEntries(last.entries) } : null
+  } catch {
+    return null
+  }
+}
 const QUESTION_DRAFTS = 'poise-chat-question-drafts'
 
 interface Progress {
@@ -99,18 +122,47 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   let ringed: string | null = null
   let handledOpen = false
   let inFlight = 0
+  // The last read, painted at once until each source reads afresh (LAST_ANSWERS_KEY).
+  let readKey = answersKey()
+  const last = rememberedAnswers(readKey)
+  let remembered: Entry[] = last?.entries ?? []
+  const rememberedAt = last?.at ?? 0
+  let keptRead = { signature: '', at: 0 }
+  let keepTimer = 0
+  signal.addEventListener('abort', () => window.clearTimeout(keepTimer))
 
   // ---------- Entries ----------
   function compute(): Entry[] {
     const notices = feed.notices.filter((notice) => feed.enabled || (LOCAL_NOTICE_KINDS as readonly string[]).includes(notice.kind))
     const items = notificationItems(notices, getBehaviorDiagnostics(), Date.now(), attention)
     const reviewed = (reviews.data ?? []).flatMap((publication) => threadEntries(publication, threads.get(publication.slug)?.reviews ?? [], editorHref))
-    return ordered(undismissed(foldWaiting([
+    const read = ordered(undismissed(foldWaiting([
       ...itemEntries(items, options.role, chains, prs.data ?? new Map(), Date.now()),
       ...requestEntries(requests.data?.requests ?? [], options.role),
       ...decisionEntries(board.data ?? [], options.role),
       ...reviewed,
     ]), dismissals.data ?? new Map()))
+    if (!remembered.length) return read
+    // A source not yet read afresh in this page shows what it had last time; once every one has, the last read is gone.
+    const unreadSources = (Object.keys(readAfresh) as Entry['source'][]).filter((source) => !readAfresh[source]())
+    if (!unreadSources.length) { remembered = []; return read }
+    const ids = new Set(read.map((entry) => entry.id))
+    return ordered([...read, ...remembered.filter((entry) => unreadSources.includes(entry.source) && !ids.has(entry.id))])
+  }
+
+  /** Keeps what is drawn, once every source has read afresh in this page: a
+   *  moment after it settles, when it changed or a minute since, off the path of any paint. */
+  function keepSoon(): void {
+    if (remembered.length || !dismissals.data || !(Object.keys(readAfresh) as Entry['source'][]).every((source) => readAfresh[source]())) return
+    window.clearTimeout(keepTimer)
+    keepTimer = window.setTimeout(() => {
+      // A place left, or settings changed since it read, keeps nothing.
+      if (signal.aborted || !readKey || answersKey() !== readKey) return
+      const signature = JSON.stringify(keepEntries(openEntries()))
+      if (signature === keptRead.signature && Date.now() - keptRead.at < KEEP_AGAIN_MS) return
+      keptRead = { signature, at: Date.now() }
+      try { localStorage.setItem(LAST_ANSWERS_KEY, `{"key":${JSON.stringify(readKey)},"at":${keptRead.at},"entries":${signature}}`) } catch { /* the next page reads it anew */ }
+    }, KEEP_AFTER_MS)
   }
   const editorHref = (slugName: string) => placeHref('editor', { doc: slugName, back: 'overview' })
 
@@ -194,13 +246,15 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const p = progress.get(entry.id)
     const busy = !!p && (p.stage === 'Accepted' || p.stage === 'Queued' || p.stage === 'Executing')
     const closed = gone || unavailable(entry)
-    const blocked = closed || (p?.uncertain ? 'Not confirmed yet: wait for Poise to read whether it is still open.' : '')
+    // Painted from the last read: it shows its answers, which wait for its source to read afresh.
+    const stale = entry.remembered ? 'Reading what is current: it can be answered once read.' : ''
+    const blocked = closed || stale || (p?.uncertain ? 'Not confirmed yet: wait for Poise to read whether it is still open.' : '')
     const off = (why: string) => (why ? ` aria-disabled="true" data-why="${esc(why)}"` : '')
     const isOpenDetail = opened.has(entry.id)
     const answerable = !p?.settled && !busy
     // Only what acts is a button; its digit answers from the keyboard.
     const opts = answerable ? entry.options.map((o, i) => `<button class="btn ${o.primary ? 'btn-primary' : 'btn-line'}" data-act="answer" data-option="${esc(o.key)}" data-ref="ov.option" aria-keyshortcuts="${i + 1}"${off(blocked)}${o.detail ? ` title="${esc(o.detail)}"` : ''}>${esc(o.label)}</button>`).join('') : ''
-    const typed = !entry.options.length || replying.has(entry.id)
+    const typed = !entry.remembered && (!entry.options.length || replying.has(entry.id))
     // Your own words stay on screen while an answer is on its way, so typing
     // goes on; a failed send keeps what is there now.
     const sending = busy ? 'Sending your answer.' : ''
@@ -220,15 +274,17 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const more = entry.body || entry.code || entry.details.length || entry.why || entry.diagnostic
     // Everything else waits under the pointer, as on Board's cards.
     const ib = (inner: string, label: string, attrs: string) => `<${attrs.startsWith('href') ? 'a' : 'button'} class="ib" ${attrs} aria-label="${esc(label)}">${inner}</${attrs.startsWith('href') ? 'a' : 'button'}>`
+    // A remembered entry only opens where it lives: nothing on it acts until it is read afresh.
+    const acting = !entry.remembered
     const tools = p?.settled ? '' : [
-      ...(answerable ? entry.quiet ?? [] : []).map((q) => ib(icon(q.icon, 'sm'), q.label, `data-act="answer" data-option="${esc(q.key)}" data-ref="ov.option"${off(blocked)}`)),
+      ...(answerable && acting ? entry.quiet ?? [] : []).map((q) => ib(icon(q.icon, 'sm'), q.label, `data-act="answer" data-option="${esc(q.key)}" data-ref="ov.option"${off(blocked)}`)),
       entry.open ? ib(icon(openIcon(entry.open), 'sm'), entry.open.label, `href="${esc(entry.open.href)}"${entry.open.external ? ' target="_blank" rel="noopener"' : ''} data-act="open" data-ref="ov.open"`) : '',
       entry.github && !entry.open?.external ? ib(icon('external', 'sm'), 'Open on GitHub', `href="${esc(entry.github)}" target="_blank" rel="noopener" data-ref="ov.github"`) : '',
       entry.timeline ? ib(icon('chev', 'sm'), 'Open its timeline', `href="${esc(entry.timeline)}" data-act="open" data-ref="ov.timeline"`) : '',
       entry.diagnostic ? ib(icon('term', 'sm'), 'Open its diagnostic', `href="${esc(diagnosticLink(entry.diagnostic))}" data-act="open" data-ref="ov.diagnostic"`) : '',
-      more ? ib(icon('down', 'sm'), isOpenDetail ? 'Show less' : 'Show more', `data-act="more" data-ref="ov.more" aria-expanded="${isOpenDetail}"`) : '',
-      entry.silenceable && !busy ? ib(icon('mute', 'sm'), 'Silence reminders', 'data-act="silence" data-ref="ov.silence"') : '',
-      entry.dismissable && !busy ? ib(icon('cross', 'sm'), 'Dismiss', `data-act="dismiss" data-ref="ov.dismiss" data-words="${esc(entry.dismissWords)}"`) : '',
+      more && acting ? ib(icon('down', 'sm'), isOpenDetail ? 'Show less' : 'Show more', `data-act="more" data-ref="ov.more" aria-expanded="${isOpenDetail}"`) : '',
+      entry.silenceable && !busy && acting ? ib(icon('mute', 'sm'), 'Silence reminders', 'data-act="silence" data-ref="ov.silence"') : '',
+      entry.dismissable && !busy && acting ? ib(icon('cross', 'sm'), 'Dismiss', `data-act="dismiss" data-ref="ov.dismiss" data-words="${esc(entry.dismissWords)}"`) : '',
     ].join('')
     const ref = entry.notice?.kind === 'worker_idle' ? 'ov.idle' : 'ov.notice'
     const titleId = `nt-${slug(entry.id)}`
@@ -238,7 +294,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const edge = p?.settled || gone ? 'done' : EDGE[entry.group]
     // Its title and line are cut short only where More shows them whole, and never on a question you answer here.
     const clamped = !!more && !isOpenDetail && !(entry.options.length || entry.freeText || entry.questions)
-    return `<article class="card nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}${clamped ? ' is-clamped' : ''}" data-state="${edge}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="${titleId}">
+    return `<article class="card nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}${clamped ? ' is-clamped' : ''}${entry.remembered ? ' is-remembered' : ''}" data-state="${edge}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="${titleId}">
       <h3 class="nc-t">${title}</h3>
       ${entry.detail ? `<p class="nc-d">${esc(entry.detail)}</p>` : ''}
       ${closed && !p?.settled ? `<p class="nc-gone" data-ref="ov.gone">${esc(closed)}</p>` : ''}
@@ -279,6 +335,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const goneIds = new Set<string>()
     if (holding) {
       const byId = new Map(current.filter((entry) => shownAt(entry.group, level)).map((entry) => [entry.id, entry]))
+      // A remembered entry its source's first read no longer lists was loading, not a change: it leaves at once, even under the pointer.
+      holding = holding.filter((id) => byId.has(id) || !lastSeen.get(id)?.remembered)
       shown = holding.map((id) => byId.get(id) ?? lastSeen.get(id)).filter((entry): entry is Entry => !!entry)
       for (const entry of shown) if (!byId.has(entry.id) && !progress.get(entry.id)?.settled) goneIds.add(entry.id)
     } else {
@@ -313,6 +371,20 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   }
   const seeded = new Set<Entry['source']>()
   let chainsRead = false
+  /** Read afresh, successfully, in this page: only that replaces a source's last read, and only then is the list kept.
+   *  A failed read answers too (Behaviors' diagnostics carry its failure, a document's threads their error), but stands for nothing. */
+  const readAfresh: Record<Entry['source'], () => boolean> = {
+    notice: () => noticeFeed.answered, diagnostic: () => isBehaviorStateLoaded(), chain: () => chainsRead,
+    request: () => !!requests.data, decision: () => !!board.data, thread: () => !!reviews.data && [...threads.values()].every((read) => !read.error),
+  }
+  // Settings read afresh may name another GitHub user or other organizations than the page opened on:
+  // the last read no longer stands, and this page keeps nothing.
+  window.addEventListener('poise:settings-read', () => {
+    if (!readKey || answersKey() === readKey) return
+    readKey = ''
+    window.clearTimeout(keepTimer)
+    if (remembered.length) { remembered = []; paint() }
+  }, { signal })
 
   function paint(): void {
     current = compute()
@@ -349,13 +421,17 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     if (count) { count.textContent = String(t.count); if (t.tone) count.dataset.tone = t.tone; else delete count.dataset.tone }
     const heldEl = $('[data-held]', root)
     const waiting = holding ? current.filter((entry) => shownAt(entry.group, level) && isOpen(entry) && !holding!.includes(entry.id)).length : 0
+    // While any entry is from the last read, the heading's line says when that was, in the place the count of new ones takes.
+    const lastRead = current.some((entry) => entry.remembered) ? `<span data-ref="ov.remembered">Last read ${esc(clockAt(rememberedAt))}</span>` : ''
     if (heldEl) {
-      heldEl.classList.toggle('is-none', !waiting)
-      heldEl.setAttribute('aria-hidden', String(!waiting))
-      heldEl.innerHTML = waiting ? `${waiting} new · <button class="lnk" data-act="release">Show now</button>` : ''
+      const note = waiting ? `${waiting} new · <button class="lnk" data-act="release">Show now</button>` : lastRead
+      heldEl.classList.toggle('is-none', !note)
+      heldEl.setAttribute('aria-hidden', String(!note))
+      heldEl.innerHTML = note
     }
     answersChanged()
     options.onEntries(openEntries())
+    keepSoon()
   }
 
   // ---------- Holding still while you are in the list ----------
@@ -419,6 +495,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   }
 
   async function answer(entry: Entry, key: string | null, text: string | null = null): Promise<void> {
+    if (entry.remembered) return
     const p = progress.get(entry.id)
     if (p && p.stage !== 'Failed') return
     if (p?.uncertain) return
@@ -505,6 +582,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
 
   // ---------- Dismiss and Silence: held for eight seconds, with Undo ----------
   function holdSend(entry: Entry, kind: 'dismiss' | 'silence'): void {
+    if (entry.remembered) return
     const kept = kind === 'dismiss' && KEPT_DISMISSALS.includes(entry.source) ? { key: entry.id, revision: entry.revision, title: handledTitle(entry) } : undefined
     if (!(entry.notice || entry.decision || kept) || holds.has(entry.id)) return
     const timer = window.setTimeout(() => sendHeld(entry.id), HOLD_MS)
