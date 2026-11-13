@@ -99,6 +99,30 @@ export function readDatastoreView(path: string, args: readonly string[]): Promis
   return read(path, { query }).then((answer) => answer.rows)
 }
 
+// Reader failures already reported, so a persistent one is logged once.
+const viewFailures = new Set<string>()
+
+/** What `github-datastore view …` prints for an organization's datastore,
+ *  parsed: read on the reader's thread when it mirrors the arguments and the
+ *  file exists, as gh.ts and behaviors read theirs, and otherwise, or when the
+ *  reader fails (reported once per message), by `cli`, which runs the command
+ *  and returns its output. */
+export async function datastoreViewOrCli(path: string | undefined, args: readonly string[], cli: () => Promise<string>): Promise<unknown> {
+  const inProcess = path ? readDatastoreView(path, args) : null
+  if (inProcess) {
+    try {
+      return await inProcess
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!viewFailures.has(message)) {
+        viewFailures.add(message)
+        console.error(`[datastore-reader] the in-process read failed, so github-datastore answers it: ${message}`)
+      }
+    }
+  }
+  return JSON.parse(await cli())
+}
+
 /** The datastore's content mark (server/datastore-views.ts): two equal marks
  *  mean no item or evidence changed in between, so every view answers alike.
  *  Null when the file is missing or gives no mark. */

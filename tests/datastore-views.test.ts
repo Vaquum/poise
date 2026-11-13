@@ -3,8 +3,8 @@ import { mkdtempSync, renameSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import Database from 'better-sqlite3'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { readDatastoreContent, readDatastoreView, stopDatastoreReader } from '../server/datastore-reader'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { datastoreViewOrCli, readDatastoreContent, readDatastoreView, stopDatastoreReader } from '../server/datastore-reader'
 import { datastoreContent, normalizeDatetime, parseViewArgs } from '../server/datastore-views'
 
 const ME = 'octocat'
@@ -30,6 +30,15 @@ const READS: string[][] = [
   ['view', 'pr', '--created-since-datetime', '2026-11-03T00:00:00Z', '--format', 'json'],
   ['view', 'issue', '--created-at-datetime', '2026-11-02T03:00:00Z', '--format', 'json'],
   ['view', 'pr', '--status', 'closed', '--format', 'json'],
+  // Native chain discovery's two intake pages (server/behavior-chain-native.ts),
+  // the second from an empty cursor and from a stored one; worker capacity's
+  // backlog by repository (server/worker-capacity.ts); one issue for work
+  // reads (server/mcp-work.ts).
+  ['view', 'issue', '--status', 'open', '--format', 'json', '--limit', '100', '--label', 'poise-work'],
+  ['view', 'issue', '--status', 'open', '--format', 'json', '--limit', '100', '--label', 'poise-work', '--after-repo', '', '--after-number', '0'],
+  ['view', 'issue', '--status', 'open', '--format', 'json', '--limit', '100', '--after-repo', 'acme/plain', '--after-number', '3'],
+  ['view', 'issue', '--status', 'open', '--label', 'poise-work', '--repo', 'acme/plain', '--limit', '50', '--format', 'json'],
+  ['view', 'issue', '--repo', 'acme/plain', '--number', '4', '--limit', '1', '--format', 'json'],
 ]
 const LABEL_READ = READS[8]
 
@@ -80,6 +89,25 @@ describe('datastore views read in-process', () => {
       expect(parseViewArgs(argv)).not.toBeNull()
       expectSameRows(await readDatastoreView(db, argv)!, answers[index].rows!)
     }
+  })
+
+  it('answers a view in-process when it can, and from the CLI when it declines or fails', async () => {
+    const cli = vi.fn(async () => JSON.stringify([{ from: 'cli' }]))
+    const read = READS[READS.length - 1]
+    expectSameRows(await datastoreViewOrCli(db, read, cli) as Row[], answers[READS.length - 1].rows!)
+    expect(cli).not.toHaveBeenCalled()
+    // A label passed as one --label=value argument is declined: the CLI answers.
+    await expect(datastoreViewOrCli(db, ['view', 'issue', '--repo', 'acme/plain', '--label=poise-work', '--format', 'json'], cli)).resolves.toEqual([{ from: 'cli' }])
+    // No datastore of its own, and a reader failure, are the CLI's too; a failure is reported once.
+    await expect(datastoreViewOrCli(undefined, read, cli)).resolves.toEqual([{ from: 'cli' }])
+    const broken = join(directory, 'not-a-datastore.sqlite')
+    new Database(broken).close()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await expect(datastoreViewOrCli(broken, read, cli)).resolves.toEqual([{ from: 'cli' }])
+    await expect(datastoreViewOrCli(broken, read, cli)).resolves.toEqual([{ from: 'cli' }])
+    expect(error.mock.calls.filter(([message]) => String(message).includes('in-process read failed'))).toHaveLength(1)
+    error.mockRestore()
+    expect(cli).toHaveBeenCalledTimes(4)
   })
 
   it('fails where Caller fails: incomplete label evidence', async () => {

@@ -16,6 +16,7 @@
 // condition holds, so the steady state costs no API calls.
 import { db, getMeta, setMeta } from './db'
 import { organizationArgs, readyOrganizations } from './organizations'
+import { datastoreViewOrCli } from './datastore-reader'
 import { runFile } from './process'
 import { getManagerSettings } from './settings'
 import { behaviorChainOwner } from './behavior-chain-journal'
@@ -151,11 +152,10 @@ async function readLabelledBacklog(
   for (const { org, repo } of queries) {
     let rows: unknown
     try {
-      const { stdout } = await runFile('github-datastore',
-        organizationArgs(org, ['view', 'issue', '--status', 'open', '--label', WORK_LABEL,
-          ...(repo ? ['--repo', repo] : []), '--limit', String(BACKLOG_LIMIT), '--format', 'json']),
-        { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
-      rows = JSON.parse(stdout)
+      const args = ['view', 'issue', '--status', 'open', '--label', WORK_LABEL,
+        ...(repo ? ['--repo', repo] : []), '--limit', String(BACKLOG_LIMIT), '--format', 'json']
+      rows = await datastoreViewOrCli(org.datastorePath, args, async () =>
+        (await runFile('github-datastore', organizationArgs(org, args), { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })).stdout)
     } catch {
       return null
     }

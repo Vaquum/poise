@@ -10,6 +10,7 @@ import { runDatastoreHealth, staleDatastoreFailure, validatedHealth } from './da
 import { requireConfiguredRepository, type DatastoreRecord } from './gh'
 import { HttpError } from './http'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
+import { datastoreViewOrCli } from './datastore-reader'
 import { runFile } from './process'
 import type { ServiceConfig } from './service/config'
 
@@ -184,9 +185,9 @@ export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig
   let source = await mirrorCoverage(org)
   let rows: WorkIssue[] = []
   try {
-    const { stdout } = await runFile('github-datastore', organizationArgs(org, ['view', 'issue', '--repo', args.repository,
-      ...filters, '--limit', String(args.issue ? 1 : limit + 1), '--format', 'json']), { timeoutMs: 10_000, maxOutputBytes: 512 * 1024 })
-    const value: unknown = JSON.parse(stdout)
+    const view = ['view', 'issue', '--repo', args.repository, ...filters, '--limit', String(args.issue ? 1 : limit + 1), '--format', 'json']
+    const value = await datastoreViewOrCli(org.datastorePath, view, async () =>
+      (await runFile('github-datastore', organizationArgs(org, view), { timeoutMs: 10_000, maxOutputBytes: 512 * 1024 })).stdout)
     if (!Array.isArray(value)) throw new Error('datastore returned an invalid work page')
     rows = value as WorkIssue[]
     if (rows.length > (args.issue ? 1 : limit + 1) || rows.some(row => row.repo.toLowerCase() !== args.repository.toLowerCase()

@@ -9,6 +9,7 @@ import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocatio
 import { chainCiDependency, chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
+import { datastoreViewOrCli } from './datastore-reader'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
@@ -123,8 +124,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // The latest page catches newly labelled old issues immediately; the
       // stable repository/number page drains older intake without truncation.
       const pages = await Promise.all([base, [...base, '--after-repo', discoveryCursor.repo, '--after-number', String(discoveryCursor.number)]].map(async (args) => {
-        const { stdout } = await runFile('github-datastore', organizationArgs(org, args), { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
-        const rows: unknown = JSON.parse(stdout)
+        const rows = await datastoreViewOrCli(org.datastorePath, args, async () =>
+          (await runFile('github-datastore', organizationArgs(org, args), { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })).stdout)
         if (!Array.isArray(rows) || rows.length > 100) throw new Error('datastore issue intake returned an invalid page')
         return rows.map((raw) => {
           const row = object(raw, 'issue intake')
