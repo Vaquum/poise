@@ -3,10 +3,13 @@
 // only (muse-credential.ts). Only the account name a status command prints
 // leaves this module, never a token or key.
 
-import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, isExpectedFailure, type RunFileOptions, type RunFileResult } from '../process'
+import { lstat } from 'node:fs/promises'
+import { delimiter, resolve } from 'node:path'
+import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, isExpectedFailure, scrubbedChildEnvironment, type RunFileOptions, type RunFileResult } from '../process'
 import { claudeSubscriptionReady, sanitizeSubscriptionType } from '../claude-auth'
 import { diagnosticFailure } from '../logging'
 import { ACCOUNT_CLIS, GH_STORED_ACCOUNTS_ENV, type AccountCli } from './clis'
+import { accountLoginsStrict } from './logins'
 import { readMuseCredential } from './muse-credential'
 import { ACCOUNT_IDS, type AccountId, type ConnectedAccount, type GhAccount } from './types'
 
@@ -217,5 +220,49 @@ export function probeAccounts(run: RunCommand): Promise<ConnectedAccount[]> {
 }
 
 export function probeAccount(id: AccountId, run: RunCommand): Promise<ConnectedAccount> {
-  return probe(ACCOUNT_CLIS[id], run)
+  if (id !== 'codex') return probe(ACCOUNT_CLIS[id], run)
+  const command = process.env.CODEX_CLI || 'codex'
+  return probe({ ...ACCOUNT_CLIS.codex, command }, async (_command, args, probeOptions) => {
+    const version = args[0] === '--version'
+    const operation = version ? 'codex.version' : 'codex.login.status'
+    const context = { executable: command, purpose: version ? 'Connected accounts version probe' : 'Connected accounts login-status probe',
+      timeoutMs: probeOptions?.timeoutMs }
+    try {
+      // A custom launcher needs Codex's credential location and proxy route too.
+      const result = await run(command, args, { ...probeOptions,
+        env: { ...scrubbedChildEnvironment('codex'), ...probeOptions?.env }, reportFailure: false })
+      if (!version && !parseCodexStatus(`${result.stderr}\n${result.stdout}`)) {
+        diagnosticFailure(operation, new Error('`codex login status` gave no answer Poise can read.'), context)
+      }
+      return result
+    } catch (error) {
+      let absent = false
+      let configurationError: string | undefined
+      if (version && isRecord(error) && error.code === 'ENOENT' && !process.env.CODEX_CLI) {
+        try {
+          absent = !accountLoginsStrict().codex && await codexAbsent()
+        } catch (cause) {
+          configurationError = cause instanceof Error ? cause.message : String(cause)
+        }
+      }
+      const signedOut = !version && exitedNonZero(error) && error.code === 1
+        && parseCodexStatus(`${text(error.stderr)}\n${text(error.stdout)}`)?.signedIn === false
+      if (!absent && !signedOut) diagnosticFailure(operation, error, { ...context, configurationError })
+      throw error
+    }
+  })
+}
+
+/** ENOENT can also mean an existing script's interpreter is missing. Only
+ *  absent directory entries prove that an unused PATH command is optional. */
+async function codexAbsent(): Promise<boolean> {
+  for (const directory of (process.env.PATH ?? '').split(delimiter)) {
+    const names = process.platform === 'win32' ? ['codex', 'codex.exe', 'codex.cmd', 'codex.bat', 'codex.com'] : ['codex']
+    for (const name of names) {
+      try { await lstat(resolve(directory, name)); return false } catch (error) {
+        if (!isRecord(error) || error.code !== 'ENOENT') throw error
+      }
+    }
+  }
+  return true
 }
