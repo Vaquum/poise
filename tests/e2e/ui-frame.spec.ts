@@ -20,6 +20,10 @@ async function open(page: Page, address = '/', workspace: Workspace = {}): Promi
 const nav = (page: Page) => page.getByRole('navigation', { name: 'Poise' })
 const query = (page: Page) => new URL(page.url()).searchParams
 
+test('the retired classic page is no longer served', async ({ request }) => {
+  expect((await request.get('/classic.html')).status()).toBe(404)
+})
+
 test('the frame opens Overview, and each move between places is a history entry under the same top bar', async ({ page }) => {
   await open(page)
   await expect(page).toHaveTitle('Poise — Overview')

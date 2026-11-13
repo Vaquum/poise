@@ -78,7 +78,7 @@ What it does, in one line.      Default · or · Changed · Reset to 1 min
 Since then on `main`: the cap on concurrent turns is shared by chat turns and behavior runs, and background work always leaves one for the turns you send (#576). An idle timeout of 0 never expires. Storage reports failed, partial and stale readings, with their age and Retry (#631).
 
 **Redesigned:** one row per setting, saving itself. Following gets Stop following, and keeps `main`'s states: northwind reads Sync failed, Waiting on GitHub's 502, with Retry, the same failing sync as Overview's notice. The release line moves under This install, in the same words.
-- **Theme** is gone. The new interface is dark; classic keeps Light and Dark at `/classic.html` until it is removed (#556). Setup no longer asks for a theme.
+- **Theme** is gone. The new interface is dark; the classic interface has since been removed (#1175). Setup no longer asks for a theme.
 - **Running at once.** The new name for Concurrent local turns, 1 to 64 as on `main`. Chats and behavior runs share it. From 2, one is always left for your own turns; from 3, workers' turns leave one for behavior runs, so the reviews that finish a worker's pull request can start. Past the limit, a turn or run shows Waiting, saying for what. This workspace runs 10.
 - **Idle timeout.** 0 reads Never.
 - **Update wait.** Beside Running at once. A chat it holds shows Waiting · *for the Poise update*.

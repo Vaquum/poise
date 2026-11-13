@@ -36,9 +36,8 @@ Agents, PR checks and merge-queue candidates run the same set, which
   not edit it.
 - Any test the change edits, and any test that directly imports a changed file.
   One step only: following imports further selects most of the suite.
-- The core browser journeys (`smoke`, `service-mode`, `independent-startup`,
-  and `ui-frame` for the new interface), any spec the change edits, and the
-  browser suites mapped to a changed frontend area. Each place of the new
+- The core browser journeys (`service-mode` and `ui-frame`), any spec the change
+  edits, and the browser suites mapped to a changed frontend area. Each place of the new
   interface (`src/ui/places/`, and setup) maps to its own `ui-` specs. A path
   outside those areas adds no browser suite.
 

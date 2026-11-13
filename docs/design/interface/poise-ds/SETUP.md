@@ -11,7 +11,7 @@ Sources, in ~/dev/poise as of 21 Oct:
 
 A new workspace opens a dialog over the dimmed app. It takes you through what Poise needs, in the order it needs it. Each step checks that its connection works before the next one opens.
 - F1 It opens on a new workspace, and resumes at the step you left.
-- F2 Theme: light or dark, applied at once. Removed on 3 November: the new interface is dark, so setup starts at GitHub. Classic keeps Light and Dark at `/classic.html` until it is removed.
+- F2 Theme: light or dark, applied at once. Removed on 3 November: the new interface is dark, so setup starts at GitHub. The classic interface has since been removed (#1175).
 - F3 Your GitHub account, by GitHub's device sign-in: a one-time code, then approval at GitHub, then the connection is checked.
 - F4 The agent account, which can wait. It cannot be your own account. Since #748, Poise invites it to every repository in your organizations and accepts each invitation for it; the step says so.
 - F5 Organizations, each activating in steps until it is Ready. They keep activating if you go on.

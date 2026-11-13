@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { join, posix } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-const smoke = ['smoke', 'service-mode', 'independent-startup', 'ui-frame']
+const smoke = ['service-mode', 'ui-frame']
 const areas = [
   // The new interface's places (#556), each with its own specs.
   [/^src\/ui\/places\/(?:chat|manager)(?:\.ts$|\/)/, /^ui-chat/],
@@ -12,14 +12,13 @@ const areas = [
   [/^src\/ui\/places\/overview(?:\.(?:ts|css)$|\/)/, /^ui-overview$/],
   [/^src\/ui\/places\/observe(?:\.(?:ts|css)$|\/)/, /^ui-observe$/],
   [/^src\/ui\/(?:places\/settings|setup)(?:\.ts$|\/)/, /^ui-settings$/],
-  [/^src\/(?:views\/chat[^/]*|chat-[^/]+)\.(?:ts|css)$/, /^(?:chat|current-chat)/],
-  [/^src\/(?:views\/(?:admin-settings|connected-accounts)|settings-[^/]+)\.(?:ts|css)$/, /^(?:navigation-settings|settings-save|storage-settings|service-settings|connected-accounts)$/],
-  [/^src\/(?:views\/analytics-view|analytics-[^/]+)\.(?:ts|css)$/, /^(?:analytics|behavior-metrics)$/],
-  [/^src\/views\/swarm-view\.ts$/, /^(?:swarm-|repo-skips|multi-org|grey-ci-behavior)/],
-  [/^src\/(?:views\/editor[^/]*|editor-[^/]+)\.(?:ts|css)$/, /^(?:editor-|publishing|google-publishing|article-reviews)/],
-  [/^src\/(?:views\/snippets-view|snippet[^/]*)\.(?:ts|css)$/, /^(?:snippets-import|navigation-settings)$/],
-  [/^src\/(?:views\/notification-rail|notification-[^/]+)\.(?:ts|css)$/, /^notices$/],
-  [/^src\/(?:motion[^/]*|views\/motion[^/]*)\.(?:ts|css)$/, /^(?:motion|menu-ux|loading-stability|view-feedback)/],
+  [/^src\/(?:views\/chat[^/]*|chat-[^/]+)\.(?:ts|css)$/, /^ui-chat/],
+  [/^src\/(?:views\/(?:admin-settings|connected-accounts)|settings-[^/]+)\.(?:ts|css)$/, /^ui-settings$/],
+  [/^src\/analytics-[^/]+\.(?:ts|css)$/, /^ui-overview$/],
+  [/^src\/(?:views\/editor[^/]*|editor-[^/]+)\.(?:ts|css)$/, /^ui-(?:editor-|article-reviews$)/],
+  [/^src\/(?:views\/snippets-view|snippet[^/]*)\.(?:ts|css)$/, /^ui-settings$/],
+  [/^src\/(?:views\/notification-rail|notification-[^/]+)\.(?:ts|css)$/, /^ui-overview$/],
+  [/^src\/(?:motion[^/]*|views\/motion[^/]*)\.(?:ts|css)$/, /^ui-frame$/],
 ]
 // A change to one of these can change what every test proves, so only the full suite can vouch for it.
 const sharedSetup = /^(?:package(?:-lock)?\.json$|\.node-version$|(?:vitest|playwright|vite)\.config\.ts$|tsconfig[^/]*\.json$|\.github\/workflows\/|tests\/essential\.txt$|tests\/e2e\/fixtures\/|tests\/[^/]+-isolation\.ts$)/
