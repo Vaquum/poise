@@ -82,6 +82,13 @@ runner. Tests use isolated tmpfs and home-volume state, no network, no provider 
 GitHub actions. They are component proof; the frozen real-provider campaign
 remains separate.
 
+The `cleaner-loss` fixture records a live-owner retry and the resulting skipped
+recovery pass. It reserves only its selected Call while interrupting real cleanup
+after the original root's unlink, including a nested directory with the same name.
+Before allowing service maintenance to recover that Call, it checks the original
+controller's positive unlink proof and the still-pending durable root and release
+acknowledgements.
+
 ## Provider CLIs
 
 `install-clis.sh` installs each CLI missing from `~/.local/bin` with its
