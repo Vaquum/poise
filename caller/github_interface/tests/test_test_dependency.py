@@ -135,3 +135,22 @@ class TestDependency(IsolatedAsyncioTestCase):
         self.assertEqual(len(proof["failures"]), 1)
         self.delivered = True
         self.assertTrue((await self.inspect(proof))["recovered"])
+
+    async def test_recovered_report_missing_one_duplicate_case_does_not_authorize_recovery(self):
+        first = {"fullName": "rejects malformed preparation envelopes", "status": "failed",
+                 "failureMessages": ["AssertionError: first parameter"]}
+        second = {"fullName": "rejects malformed preparation envelopes", "status": "failed",
+                  "failureMessages": ["AssertionError: second parameter"]}
+        for ident in (1, 2):
+            self.tests[ident] = [copy.deepcopy(first), copy.deepcopy(second)]
+        self.tests[3] = [{"fullName": "rejects malformed preparation envelopes",
+                          "status": "passed", "failureMessages": []}]
+        proof = await self.inspect()
+        self.assertTrue(proof["verified"], proof)
+        self.assertEqual(len(proof["failures"]), 2)
+        self.delivered = True
+        recovered = await self.inspect(proof)
+        self.assertFalse(recovered["recovered"], recovered)
+        self.assertIn("every original failing assertion", recovered["reason"])
+        self.tests[3].append(copy.deepcopy(self.tests[3][0]))
+        self.assertTrue((await self.inspect(proof))["recovered"])

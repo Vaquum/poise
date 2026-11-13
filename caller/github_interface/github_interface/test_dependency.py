@@ -87,9 +87,17 @@ async def inspect(client, target: str, value: dict, current_base: str) -> dict:
         latest = max(runs, key=lambda run: run["id"])
         recovered = await _run(client, target, latest["id"], current_base, "success")
         passed = await full_suite_repair.test_results(client, target, recovered, causes=True)
+        # Parameterized cases can share one fixed title; the recovered report
+        # must pass at least as many cases per title as originally failed, so
+        # removing a case cannot stand in for fixing it.
+        required = {}
+        for failure in failures:
+            key = (failure["file"], failure["test"])
+            required[key] = required.get(key, 0) + 1
         if any(entries["status"] == "failed" for results in passed.values() for entries in results) \
-                or any(not passed.get((failure["file"], failure["test"]))
-                       or any(entry["status"] != "passed" for entry in passed[(failure["file"], failure["test"])]) for failure in failures):
+                or any(len(passed.get(key, [])) < count
+                       or any(entry["status"] != "passed" for entry in passed.get(key, []))
+                       for key, count in required.items()):
             raise ValueError("recovered base did not pass every original failing assertion")
         result.update(recovered=True, recovery={"merge": merge, "base": current_base,
                       "run": {key: entry for key, entry in recovered.items() if key != "unit_conclusions"}})
