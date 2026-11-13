@@ -142,6 +142,9 @@ API summaries include nullable `reviewPending` and `reviewStatus` (`pending`,
 stay not-recorded; they acquire neither fabricated proof nor a new obligation.
 These fields are projections, never normalized into historical reducer state.
 A confirmed merge remains visible alongside any hold or uncertain invocation.
+List and detail summaries omit the superseded native merge queue wait only when
+the canonical merge SHA is recorded. Other waits and pending original evidence
+remain visible; the original queue wait stays in journal history.
 Merged chains offer History and original receipt reconciliation, including
 while an invocation is unsettled. They have no Hold/Resume admission controls;
 the headless API refuses those operations with 409 after a confirmed merge.
