@@ -21,7 +21,7 @@ import { join } from 'node:path'
 import type { ReviewSummary } from '../src/analytics-work-review'
 import type { OpenPrClosingList } from './chat/control'
 import { readDatastoreContent, readDatastoreView } from './datastore-reader'
-import { getMeta } from './db'
+import { getMeta, setMeta } from './db'
 import { rememberRead } from './warm-up'
 import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
@@ -424,6 +424,8 @@ export function invalidateRepoListCache(): void {
   repoCacheGeneration += 1
   repoListCache.clear()
   repoListFailures.clear()
+  repoListsKept.clear()
+  repoListsInvalidatedAt = Date.now()
   invalidateActionRunCache()
 }
 const REPO_LIST_TTL_MS = 5 * 60 * 1000
@@ -434,11 +436,30 @@ const repoListReads = new Map<string, Promise<string[]>>()
  *  picker shown the last list is shown this too. */
 const repoListFailures = new Map<string, string>()
 
+/** Each list as last read, kept in meta: after a restart a picker shows it at
+ *  once and reads it again behind, rather than waiting on GitHub for seconds.
+ *  A list kept before the organizations last changed in this process is not used. */
+const keptRepoListKey = (key: string): string => `repo_list:${key}`
+const repoListsKept = new Map<string, string>()
+let repoListsInvalidatedAt = 0
+
+function keptRepoList(org: Organization, key: string): { repos: string[], expiry: number } | undefined {
+  let kept: { repos?: unknown, at?: unknown } | null
+  try { kept = JSON.parse(getMeta(keptRepoListKey(key)) || 'null') } catch { return undefined }
+  if (!kept || typeof kept.at !== 'number' || kept.at <= repoListsInvalidatedAt || !Array.isArray(kept.repos)) return undefined
+  const repos = kept.repos
+  if (!repos.every((repo): repo is string => typeof repo === 'string' && repoBelongsTo(repo, org.login))) return undefined
+  const entry = { repos, expiry: 0 }
+  repoListCache.set(key, entry)
+  repoListsKept.set(key, JSON.stringify(repos))
+  return entry
+}
+
 async function discoverOrgRepos(org: Organization, lastIsFine = false): Promise<string[]> {
   const me = getMeta('me') || ''
   if (!me) throw new Error('Set your GitHub account in Settings → General to list repositories')
   const key = `${me.toLowerCase()}:${org.login.toLowerCase()}`
-  const cached = repoListCache.get(key)
+  const cached = repoListCache.get(key) ?? (lastIsFine ? keptRepoList(org, key) : undefined)
   if (cached && cached.expiry > Date.now()) return cached.repos
   // A picker shows the last list at once and reads it again behind;
   // validation waits for a fresh one.
@@ -466,7 +487,15 @@ function readOrgRepos(org: Organization, me: string, key: string): Promise<strin
       throw new Error(`repository discovery returned repositories outside ${org.login}`)
     }
     const sorted = [...new Set(repos)].sort((a, b) => a.localeCompare(b))
-    if (generation === repoCacheGeneration) repoListCache.set(key, { repos: sorted, expiry: Date.now() + REPO_LIST_TTL_MS })
+    if (generation === repoCacheGeneration) {
+      repoListCache.set(key, { repos: sorted, expiry: Date.now() + REPO_LIST_TTL_MS })
+      // Written when it changed, not on every read: each commit waits for the disk.
+      const text = JSON.stringify(sorted)
+      if (repoListsKept.get(key) !== text) {
+        setMeta(keptRepoListKey(key), JSON.stringify({ repos: sorted, at: Date.now() }))
+        repoListsKept.set(key, text)
+      }
+    }
     return sorted
   })()
   read.then(() => { if (generation === repoCacheGeneration) repoListFailures.delete(key) },

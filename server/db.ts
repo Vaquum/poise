@@ -485,7 +485,7 @@ if (secureDeleteRebuilt !== 'complete') {
 // cheap and makes schema initialization safe to repeat.
 
 export function getMeta(key: string): string | null {
-  const row = cachedStatement(db, 'SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
+  const row = cachedStatement(observing ?? db, 'SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
   return row ? row.value : null
 }
 
@@ -520,8 +520,31 @@ function cursorConnection(): Database.Database {
 // A managed organization's behaviors scope their keys as `org:<login>:<key>`.
 const isRotationCursor = (key: string): boolean => ROTATION_CURSORS.has(key.replace(/^org:[^:]+:/, ''))
 
+// The connection of the observation being written now (see `writeObservation`), if any.
+let observing: Database.Database | null = null
+
+/** Runs `write` as one transaction on the cursor connection, for state that
+ *  only records what Poise last observed (a datastore's freshness, GitHub
+ *  quota samples): a power cut may lose its last commit, and the next
+ *  observation records it again, so it need not wait for the disk on the
+ *  server's thread. getMeta and setMeta inside it use that connection, and
+ *  `write` must touch nothing else. Inside a transaction on the main
+ *  connection it is simply part of that transaction. */
+/** Whether an observation's transaction is open now. */
+export const observationOpen = (): boolean => observing !== null
+
+export function writeObservation<T>(write: () => T): T {
+  if (observing || db.inTransaction) return write()
+  const connection = cursorConnection()
+  if (connection === db) return db.transaction(write).immediate()
+  return connection.transaction(() => {
+    observing = connection
+    try { return write() } finally { observing = null }
+  }).immediate()
+}
+
 export function setMeta(key: string, value: string): void {
-  const connection = isRotationCursor(key) && !db.inTransaction ? cursorConnection() : db
+  const connection = observing ?? (isRotationCursor(key) && !db.inTransaction ? cursorConnection() : db)
   connection.prepare('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
 }
 

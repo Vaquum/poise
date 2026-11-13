@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
-import { db, getMeta, setMeta } from './db'
+import { db, getMeta, setMeta, writeObservation } from './db'
 import { cachedStatement, prefixRange } from './statements'
 import { diagnostic } from './logging'
 import { conditionCorrelation } from './logging-context'
@@ -94,7 +94,8 @@ function reportEpisode(episode: StaleMirrorEpisode, phase: 'opened' | 'recovered
 function observeHealth(org: Organization | null, health: Health, blockedBy: readonly string[]): StaleMirrorEpisode | null {
   const account = org?.login.toLowerCase() ?? 'legacy'
   const key = episodeKey(account, health.database)
-  const transition = db.transaction(() => {
+  // An observation: the next probe records it again if a power cut loses it.
+  const transition = writeObservation(() => {
     const previous = readEpisode(key)
     if (previous) {
       const incomingSync = Date.parse(health.evidence.lastSuccessAt)
@@ -126,7 +127,7 @@ function observeHealth(org: Organization | null, health: Health, blockedBy: read
     } : { ...previous, latest: health.evidence, behaviors: [...new Set([...previous.behaviors, ...blockedBy])] }
     setMeta(key, JSON.stringify(episode))
     return { episode, phase: opened ? 'opened' as const : null }
-  }).immediate()
+  })
   if (transition && 'ignored' in transition) return transition.episode.recoveredAt ? null : transition.episode
   datastoreFreshnessByOrganization.set(`${account}:review-new-prs`, {
     status: health.status === 'healthy' ? 'healthy' : 'unavailable', checkedAt: health.evidence.checkedAt,
