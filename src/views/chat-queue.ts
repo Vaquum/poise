@@ -43,11 +43,11 @@ export function createQueuePanel(handlers: QueueHandlers) {
     const present = agents.some(agent => agent.models.some(model => model.identity === item.model))
     const fallback = present ? '' : `<option value="${escapeHtml(item.model)}" selected>${escapeHtml(`${AGENT_LABELS[item.agent]} · ${consoleModelLabel(item.model, item.effort)}`)}</option>`
     const state = pending ? 'Saving…' : item.state === 'running' ? 'Running' : item.state === 'failed' ? 'Not completed' : ''
-    return `<span class="chat-queue-number">${index + 1}</span><div class="chat-queue-content"><div class="chat-queue-text" title="${escapeHtml(item.prompt.text)}">${escapeHtml(item.prompt.text || 'Attachment task')}</div>
+    return `<span class="chat-queue-number">${index + 1}</span><div class="chat-queue-content"><div class="chat-queue-text" data-help="${escapeHtml(item.prompt.text)}">${escapeHtml(item.prompt.text || 'Attachment task')}</div>
       ${item.prompt.attachments.length ? `<div class="chat-queue-files">${escapeHtml(item.prompt.attachments.map(file => file.name).join(', '))}</div>` : ''}
       <div class="chat-queue-meta"><select class="chat-queue-agent" aria-label="Agent and model for queued message ${index + 1}"${pending || item.state !== 'waiting' ? ' disabled' : ''}>${fallback}${options}</select><span class="chat-queue-state">${state}</span></div>
       ${item.error ? `<div class="chat-queue-error" role="status">${escapeHtml(item.error)}</div>` : ''}</div>
-      <button type="button" class="chat-icon-btn chat-queue-remove" aria-label="Remove queued message ${index + 1}" title="Remove from queue"${pending || item.state === 'running' ? ' disabled' : ''}>×</button>`
+      <button type="button" class="chat-icon-btn chat-queue-remove" aria-label="Remove queued message ${index + 1}" data-help="Remove from queue"${pending || item.state === 'running' ? ' disabled' : ''}>×</button>`
   }
   return {
     el,

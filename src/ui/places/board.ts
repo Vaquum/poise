@@ -274,13 +274,13 @@ export const mount: MountPlace = (ctx) => {
     if (!intake || it.lane !== 'issue' || it.chain || isSettled(it)) return ''
     const prs = it.closing ?? []
     return prs.length
-      ? prs.map((p) => `<a class="intake" href="${esc(p.url)}" target="_blank" rel="noopener" data-ref="card.intake" title="An open pull request that closes this issue. The chain does not take an issue that has one.">PR #${p.number}</a>`).join('')
-      : '<span class="intake dim" data-ref="card.intake" title="No open pull request closes this issue.">no open PR</span>'
+      ? prs.map((p) => `<a class="intake" href="${esc(p.url)}" target="_blank" rel="noopener" data-ref="card.intake" data-help="An open pull request that closes this issue. The chain does not take an issue that has one.">PR #${p.number}</a>`).join('')
+      : '<span class="intake dim" data-ref="card.intake" data-help="No open pull request closes this issue.">no open PR</span>'
   }
   const ASSIGN_WHAT = 'Adds the chain’s label on GitHub, as you. The chain takes the issue at its next check.'
   const assignable = (it: Item) => canAssign({ ...it, who: who(it) }, !!intake, everyIssueEnters()) && !assigned.has(it.id.toLowerCase())
   const assignHTML = (it: Item, cls = 'ib') => (assignable(it)
-    ? `<button class="${cls}" data-act="assign" data-id="${esc(it.id)}" data-ref="card.assign" aria-label="Assign to Poise" title="${chainOff() ? 'Adds the chain’s label on GitHub, as you. The chain is off, so it takes the issue once it is on.' : ASSIGN_WHAT}">${cls === 'ib' ? icon('handoff', 'sm') : 'Assign to Poise'}</button>` : '')
+    ? `<button class="${cls}" data-act="assign" data-id="${esc(it.id)}" data-ref="card.assign" aria-label="Assign to Poise" data-help="${chainOff() ? 'Adds the chain’s label on GitHub, as you. The chain is off, so it takes the issue once it is on.' : ASSIGN_WHAT}">${cls === 'ib' ? icon('handoff', 'sm') : 'Assign to Poise'}</button>` : '')
   const railFor = (it: Item): string => {
     if (it.chain) return railHTML(it.chain)
     const p = phaseOf(it)
@@ -332,7 +332,7 @@ export const mount: MountPlace = (ctx) => {
     const body = labels.repo === w.repo && labels.error
       ? `<p class="t-gloss">Could not load ${esc(w.repo)}’s labels: ${esc(labels.error)}. The issue still opens without them.</p>`
       : !list ? '<p class="t-gloss">Reading the labels…</p>'
-        : shownLabels.length ? shownLabels.map((l) => `<label class="label-row" title="${esc(l.description || '')}"><input type="checkbox" value="${esc(l.name)}" data-label${w.labels.includes(l.name) ? ' checked' : ''}><span class="t-mono">${esc(l.name)}</span><span class="t-gloss">${esc(l.description || '')}</span></label>`).join('')
+        : shownLabels.length ? shownLabels.map((l) => `<label class="label-row" data-help="${esc(l.description || '')}"><input type="checkbox" value="${esc(l.name)}" data-label${w.labels.includes(l.name) ? ' checked' : ''}><span class="t-mono">${esc(l.name)}</span><span class="t-gloss">${esc(l.description || '')}</span></label>`).join('')
           : `<p class="t-gloss">${list.length ? 'No labels match.' : 'This repository has no labels.'}</p>`
     const notes = [w.labels.length ? `${w.labels.length} selected` : '', intake?.label && w.labels.includes(intake.label) ? `${intake.label}: it enters the chain` : ''].filter(Boolean).join(' · ')
     return `<div class="labels-pop" role="dialog" aria-label="Issue labels" data-ref="composer.labels"><input class="search" type="search" placeholder="Filter labels…" aria-label="Filter labels" data-labels-filter value="${esc(w.lq)}"><div class="labels-list" role="group" aria-label="Labels">${body}</div><div class="labels-foot">${esc(notes)}</div></div>`

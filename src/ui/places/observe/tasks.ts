@@ -27,7 +27,7 @@ export function railHTML(chain: ChainRow): string {
   const { index, word } = phaseOf(chain)
   const { state } = taskState(chain)
   return `<span class="rail" data-ref="task.rail" role="img" aria-label="${esc(`Phase: ${word}`)}">${PHASES.map((phase, i) =>
-    `<i class="${i < index ? 'p' : i === index ? 'c' : ''}"${i === index ? ` data-state="${state}"` : ''} title="${esc(phase)}"></i>`).join('')}</span><span class="rail-w">${esc(word)}</span>`
+    `<i class="${i < index ? 'p' : i === index ? 'c' : ''}"${i === index ? ` data-state="${state}"` : ''} data-help="${esc(phase)}"></i>`).join('')}</span><span class="rail-w">${esc(word)}</span>`
 }
 
 const identity = (repository: string, issue: number, pull: number | null): string => `${repository}#${issue}${pull ? ` → #${pull}` : ''}`
@@ -284,8 +284,8 @@ export function createTasks(ctx: PartContext): ObservePart {
     const held = !!chain.held
     const ref = held ? 'task.resume' : 'task.hold'
     const word = held ? 'Resume' : 'Hold new invocations'
-    if (failure) return `<button type="button" class="btn-ghost" aria-disabled="true" title="Tasks could not be read, so nothing can be held or resumed until they are." data-ref="${ref}">${word}</button>`
-    if (!meta?.cutover) return `<button type="button" class="btn-ghost" aria-disabled="true" title="Who owns new work has not been read yet; its controls wait for that read." data-ref="${ref}">${word}</button>`
+    if (failure) return `<button type="button" class="btn-ghost" aria-disabled="true" data-help="Tasks could not be read, so nothing can be held or resumed until they are." data-ref="${ref}">${word}</button>`
+    if (!meta?.cutover) return `<button type="button" class="btn-ghost" aria-disabled="true" data-help="Who owns new work has not been read yet; its controls wait for that read." data-ref="${ref}">${word}</button>`
     if (acting === chain.id) return `<button type="button" class="btn-ghost" aria-disabled="true" data-ref="${ref}"><span class="spin"></span>${held ? 'Resuming…' : 'Holding…'}</button>`
     return `<button type="button" class="btn-ghost${held ? ' is-primary' : ''}" data-act="${held ? 'tk-resume' : 'tk-hold'}" data-id="${esc(chain.id)}" data-ref="${ref}">${word}</button>`
   }
@@ -337,7 +337,7 @@ export function createTasks(ctx: PartContext): ObservePart {
       const failureText = failureWords(event)
       const isFrom = event.sequence === from
       const observed = event.type === 'chain.observed'
-      return `<li data-kind="${kind}"${isFrom ? ' class="is-from" data-ref="tk.from"' : observed ? ' data-ref="tk.observed"' : ''}><span class="t-mono" title="${esc(exactTime(event.at))}">${esc(clockTime(event.at))}</span><span><b>${KIND_WORDS[kind]}</b> ${esc(text)}${folded > 1 ? ` <span class="t-gloss">×${folded} since ${esc(clockTime(oldest ?? event.at))}</span>` : ''}${call ? ` · <a class="lnk" href="${esc(partHref('behaviors', { call }, back))}" data-ref="tk.run">run ${esc(call.slice(0, 8))}</a>` : ''}${failureText ? `<span class="t-gloss"> · ${esc(failureText)}</span>` : ''}</span></li>`
+      return `<li data-kind="${kind}"${isFrom ? ' class="is-from" data-ref="tk.from"' : observed ? ' data-ref="tk.observed"' : ''}><span class="t-mono" data-help="${esc(exactTime(event.at))}">${esc(clockTime(event.at))}</span><span><b>${KIND_WORDS[kind]}</b> ${esc(text)}${folded > 1 ? ` <span class="t-gloss">×${folded} since ${esc(clockTime(oldest ?? event.at))}</span>` : ''}${call ? ` · <a class="lnk" href="${esc(partHref('behaviors', { call }, back))}" data-ref="tk.run">run ${esc(call.slice(0, 8))}</a>` : ''}${failureText ? `<span class="t-gloss"> · ${esc(failureText)}</span>` : ''}</span></li>`
     }).join('')
     const status = windowReading ? '<span class="spin"></span> Reading the journal…' : windowError ? `<span class="note is-warn">${esc(windowError)}</span> <button type="button" class="lnk" data-act="tk-journal">Read it again</button>` : ''
     patchContent(box, `<p class="t-micro tk-tl-h">Timeline · newest first <span class="t-gloss">· ${journalReadAt ? `read ${esc(clockTime(journalReadAt))} · ` : ''}held still while you read it</span></p>

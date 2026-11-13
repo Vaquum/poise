@@ -831,7 +831,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
   function contextExtras(p: Partial<Pick<PromptInput, 'attachments' | 'mentions'>>): string {
     const extras: string[] = []
-    for (const a of p.attachments || []) extras.push(`<span class="chat-turn-extra" title="${escapeHtml(a.path)}">${escapeHtml(a.name)}</span>`)
+    for (const a of p.attachments || []) extras.push(`<span class="chat-turn-extra" data-help="${escapeHtml(a.path)}">${escapeHtml(a.name)}</span>`)
     for (const m of p.mentions || []) extras.push(`<span class="chat-turn-extra chat-turn-mention">@${escapeHtml(m.path)}</span>`)
     return extras.length ? `<div class="chat-turn-extras">${extras.join('')}</div>` : ''
   }
@@ -843,9 +843,9 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     const label = escapeHtml(actorName(actor))
     const tip = escapeHtml(actorTitleAttr(actor))
     if ((ctx.chats || []).some((c) => c.id === actor.sessionId)) {
-      return `<button type="button" class="chat-actor-btn" data-chat-session="${escapeHtml(actor.sessionId)}" title="${tip}">${label}</button>`
+      return `<button type="button" class="chat-actor-btn" data-chat-session="${escapeHtml(actor.sessionId)}" data-help="${tip}">${label}</button>`
     }
-    return `<span title="${tip}">${label} (deleted)</span>`
+    return `<span data-help="${tip}">${label} (deleted)</span>`
   }
 
   function userPill(turn: TurnModel, ctx: RenderContext): string {
@@ -867,7 +867,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
   }
 
   function copyButton(key: string): string {
-    return `<button type="button" class="chat-copy-btn" data-copy="${escapeHtml(key)}" aria-label="Copy message">${ICON_COPY}${ICON_COPIED}</button>`
+    return `<button type="button" class="chat-copy-btn" data-copy="${escapeHtml(key)}" aria-label="Copy message" data-tooltip>${ICON_COPY}${ICON_COPIED}</button>`
   }
 
   // A finished turn's last message has its copy button in the turn's meta row.
@@ -964,7 +964,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     if (revertable) {
       let action: string
       const r = d.revert
-      if (!r) action = `<button type="button" class="chat-edit-card-btn chat-revert-btn" data-revert="${escapeHtml(d.diffId)}"${d.previewOnly ? ' disabled title="Load the complete diff before reverting"' : ''}>Revert</button>`
+      if (!r) action = `<button type="button" class="chat-edit-card-btn chat-revert-btn" data-revert="${escapeHtml(d.diffId)}"${d.previewOnly ? ' disabled data-help="Load the complete diff before reverting"' : ''}>Revert</button>`
       else if (r.state === 'reverting') action = '<span class="chat-edit-card-badge chat-edit-card-badge-declined">Reverting…</span>'
       else if (r.state === 'reverted') action = '<span class="chat-edit-card-badge chat-edit-card-badge-applied">Reverted</span>'
       else action = `<span class="chat-edit-card-badge chat-edit-card-badge-conflict">${escapeHtml(r.error)}</span>`

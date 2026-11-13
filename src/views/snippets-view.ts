@@ -100,7 +100,7 @@ function skillBadge(trigger: string): string {
   const name = skills.switches.find(skill => skill.snippetTrigger === trigger)?.name
   if (!name) return ''
   const title = builtinTitle(name)
-  const builtin = title ? `<span class="snip-builtin" title="${title}">built in</span>` : ''
+  const builtin = title ? `<span class="snip-builtin" data-help="${title}">built in</span>` : ''
   return `<span class="snip-skill-name" aria-label="Chat skill /${escapeHtml(name)}">/${escapeHtml(name)}</span>${builtin}`
 }
 function libraryChanged(catalogue: ChatSwitches): void {
@@ -123,7 +123,7 @@ function renderRow(s: Snippet): HTMLTableRowElement {
   tr.innerHTML = `
     <td class="title-cell"><span class="snip-trigger">${escapeHtml(s.trigger)}</span>${skillBadge(s.trigger)}</td>
     <td><span class="snip-preview">${escapeHtml(previewLine(s.replace))}</span></td>
-    <td class="action-cell"><button type="button" class="expand-btn" title="Edit" aria-label="Edit snippet">${CHEV_SVG}</button></td>
+    <td class="action-cell"><button type="button" class="expand-btn" data-help="Edit" aria-label="Edit snippet">${CHEV_SVG}</button></td>
   `
   return tr
 }
@@ -431,7 +431,7 @@ function openAdd() {
   main.innerHTML = `
     <td class="title-cell"><span class="snip-draft-label">New snippet</span></td>
     <td><span class="snip-preview"></span></td>
-    <td class="action-cell"><button type="button" class="expand-btn open" title="Edit" aria-label="Edit snippet">${CHEV_SVG}</button></td>
+    <td class="action-cell"><button type="button" class="expand-btn open" data-help="Edit" aria-label="Edit snippet">${CHEV_SVG}</button></td>
   `
   tbodyEl.insertBefore(main, tbodyEl.firstChild)
   const editRow = buildEditRow(null, true)
