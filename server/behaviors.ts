@@ -4932,15 +4932,18 @@ async function tickApprovePrs(): Promise<void> {
         progress.changeChecksRead += read
         progress.checksPending -= read
       } catch (err) {
-        let retry: Array<{ target: string, state: BehaviorFailureState | null }> | null = null
+        let retry: Array<{ target: string, consecutiveFailures: number | null, nextRetryAt: string | null }> | null = null
         try {
           if (behaviorAborted()) return
           for (const pr of batch) {
             // One error for the whole batch: unattributable to any repository.
             recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
           }
-          retry = batch.map((pr) => ({ target: `${pr.repo}#${pr.number}`,
-            state: getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`) }))
+          retry = batch.map((pr) => {
+            const state = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+            return { target: `${pr.repo}#${pr.number}`,
+              consecutiveFailures: state?.consecutiveFailures ?? null, nextRetryAt: state?.nextRetryAt ?? null }
+          })
         } finally {
           if (!isAbortError(err)) diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err, {
             account: reviewer, phase: 'changes-addressed', targets: batch.map((pr) => ({ target: `${pr.repo}#${pr.number}` })), retry,
@@ -5034,15 +5037,18 @@ async function tickApprovePrs(): Promise<void> {
           progress.activityChecksRead += activityRead
           progress.checksPending -= activityRead
         } catch (err) {
-          let retry: Array<{ target: string, state: BehaviorFailureState | null }> | null = null
+          let retry: Array<{ target: string, consecutiveFailures: number | null, nextRetryAt: string | null }> | null = null
           try {
             if (behaviorAborted()) return
             for (const { pr } of activityBatch) {
               // One error for the whole batch: unattributable to any repository.
               recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
             }
-            retry = activityBatch.map(({ pr }) => ({ target: `${pr.repo}#${pr.number}`,
-              state: getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`) }))
+            retry = activityBatch.map(({ pr }) => {
+              const state = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+              return { target: `${pr.repo}#${pr.number}`,
+                consecutiveFailures: state?.consecutiveFailures ?? null, nextRetryAt: state?.nextRetryAt ?? null }
+            })
           } finally {
             if (!isAbortError(err)) diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err, {
               account: reviewer, phase: 'review-activity',

@@ -87,7 +87,7 @@ it.each(APPROVAL_CHECKS)('retains one attributed approval timeout and retries no
   } else {
     expect(recorded[0]).toMatchObject({ repository: null, target: null, context: {
       targets: [{ target: TARGET, ...(primitive === 'review-activity-since' ? { expectedHead: HEAD_SHA } : {}) }],
-      retry: [{ target: TARGET, state: expect.objectContaining({ nextRetryAt: retry.nextRetryAt, consecutiveFailures: 1 }) }],
+      retry: [{ target: TARGET, nextRetryAt: retry.nextRetryAt, consecutiveFailures: 1 }],
     } })
   }
   for (const secret of ['private-output', 'private-credential', '--requests-json', '--token-user']) {
@@ -126,6 +126,32 @@ it('keeps distinct failed approval batches under the same sweep correlation and 
   expect(new Set(recorded.map((event) => event.id)).size).toBe(4)
   expect(new Set(recorded.map((event) => event.correlationId)).size).toBe(2)
   expect(recorded.every((event) => event.operation === 'github-interface.requested-changes-addressed' && event.severity === 'error')).toBe(true)
+})
+
+it.each(['requested-changes-addressed', 'review-activity-since'])('keeps a full batch diagnostic under the context cap (%s)', async (primitive) => {
+  const { behaviors } = await start(primitive, failureScript('E'.repeat(300)))
+  const repo = `Vaquum/${'r'.repeat(130)}`
+  fixture.listedPrs = Array.from({ length: 10 }, (_, index) => ({ ...pr, repo, number: 17 + index,
+    url: `https://github.com/${repo}/pull/${17 + index}` }))
+  await behaviors.runEnabledBehaviorsOnce()
+  const recorded = events()
+  expect(recorded).toHaveLength(1)
+  const event = recorded[0]!
+  expect(event.operation).toBe(`github-interface.${primitive}`)
+  expect(event.context.targets).toHaveLength(10)
+  expect(event.context.retry).toHaveLength(10)
+  expect(event.context).toMatchObject({ elapsedMs: expect.any(Number) })
+  expect(event.context.truncated).not.toBe(true)
+  expect(Buffer.byteLength(JSON.stringify(event.context))).toBeLessThanOrEqual(8192)
+  for (const entry of event.context.retry as Array<Record<string, unknown>>) {
+    expect(Object.keys(entry).sort()).toEqual(['consecutiveFailures', 'nextRetryAt', 'target'])
+    expect(entry).toMatchObject({ consecutiveFailures: 1, nextRetryAt: expect.any(String) })
+  }
+  if (primitive === 'review-activity-since') {
+    for (const target of event.context.targets as Array<Record<string, unknown>>) {
+      expect(target).toMatchObject({ expectedHead: HEAD_SHA })
+    }
+  }
 })
 
 it.each(['requested-changes-addressed', 'head-sha'])('keeps the original approval process failure when retry bookkeeping throws (%s)', async (primitive) => {
