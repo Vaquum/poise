@@ -903,7 +903,10 @@ at each admission, so observed failures can name the attempt that produced them.
 An explicit gateway-restart failure is the one exception: the active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated
-run handshake and retries the whole suite once. Both attempts use one captured
+run handshake and retries the whole suite once. The authenticated
+`GET /api/link/test-relay/runs/probe/output` handshake returns 410 with
+`this run is over` without a request-failure warning. Other relay failures
+retain their warnings. Both attempts use one captured
 checkout archive, command, cwd and environment, including uncommitted edits.
 Capture, provisioning, upload, waiting and the complete rerun share a nine-minute
 command budget, capped by a shorter inherited `BASH_DEFAULT_TIMEOUT_MS`.

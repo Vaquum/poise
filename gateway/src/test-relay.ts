@@ -577,6 +577,11 @@ export class TestRelay {
     const handle = this.presentedHandle(req)
     if (handle === null) throw new RelayError(401, 'this key is not a workspace\'s')
 
+    if (req.method === 'GET' && url.pathname === `${TEST_RELAY_PATH}/runs/probe/output`) {
+      res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
+      return
+    }
+
     if (req.method === 'POST' && !id) {
       const run = await this.createRun(handle, await readLimited(req, MAX_SPEC_BYTES))
       res.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify({ id: run.id, dependencyCache: true }))
