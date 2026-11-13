@@ -6,16 +6,21 @@ import type { DatastoreReadReply, DatastoreReadRequest } from './datastore-reade
 import { parseViewArgs } from './datastore-views'
 
 // GitHub lists read the datastore's `pr`, `issue` and `user` views through
-// one long-lived worker thread instead of a Caller process per organization
+// long-lived worker threads instead of a Caller process per organization
 // and scope: under load, starting those processes was the reads' cost
-// (server/datastore-views.ts mirrors what the CLI answers).
+// (server/datastore-views.ts mirrors what the CLI answers). A few threads
+// read at once, so one page's reads never wait in line behind another's.
 
 const READ_TIMEOUT_MS = 30_000
 
 interface Pending { resolve: (rows: Record<string, unknown>[]) => void, reject: (error: Error) => void, timer: NodeJS.Timeout }
 interface Reader { worker: Worker, pending: Map<number, Pending> }
 
-let reader: Promise<Reader> | null = null
+/** Threads that may read at once; a second starts only when reads overlap. */
+const READERS = 3
+const readers: Array<Promise<Reader> | null> = Array.from({ length: READERS }, () => null)
+/** Reads each thread has in hand, so a read goes to the least busy one. */
+const load: number[] = Array.from({ length: READERS }, () => 0)
 let nextId = 0
 
 async function workerAsset(): Promise<URL> {
@@ -39,7 +44,7 @@ async function workerAsset(): Promise<URL> {
   }
 }
 
-function startReader(): Promise<Reader> {
+function startReader(slot: number): Promise<Reader> {
   const started: Promise<Reader> = (async () => {
     const worker = new Worker(await workerAsset())
     worker.unref()
@@ -47,7 +52,7 @@ function startReader(): Promise<Reader> {
     // A stopped thread fails its waiting reads (each takes the CLI) and the
     // next read starts another.
     const retire = (error: Error) => {
-      if (reader === started) reader = null
+      if (readers[slot] === started) readers[slot] = null
       for (const [id, call] of state.pending) {
         state.pending.delete(id)
         clearTimeout(call.timer)
@@ -70,11 +75,22 @@ function startReader(): Promise<Reader> {
 }
 
 async function read(path: string, request: Omit<DatastoreReadRequest, 'id' | 'path'>): Promise<Record<string, unknown>[]> {
-  const started = reader ??= startReader()
+  let slot = 0
+  for (let index = 1; index < READERS; index++) if (load[index] < load[slot]) slot = index
+  load[slot] += 1
+  try {
+    return await readOn(slot, path, request)
+  } finally {
+    load[slot] -= 1
+  }
+}
+
+async function readOn(slot: number, path: string, request: Omit<DatastoreReadRequest, 'id' | 'path'>): Promise<Record<string, unknown>[]> {
+  const started = readers[slot] ??= startReader(slot)
   let state: Reader
   try { state = await started }
   catch (error) {
-    if (reader === started) reader = null
+    if (readers[slot] === started) readers[slot] = null
     throw error
   }
   const id = ++nextId
@@ -98,9 +114,11 @@ export function readDatastoreView(path: string, args: readonly string[]): Promis
   return read(path, { query })
 }
 
-/** Test lifecycle: stop the thread; the next read starts another. */
+/** Test lifecycle: stop the threads; the next read starts another. */
 export async function stopDatastoreReader(): Promise<void> {
-  const current = reader
-  reader = null
-  if (current) await (await current).worker.terminate()
+  const current = readers.splice(0, READERS, ...Array.from({ length: READERS }, () => null))
+  await Promise.all(current.map(async (started) => { if (started) await (await started).worker.terminate() }))
 }
+
+/** Test seam: the threads started and not stopped. */
+export const datastoreReaderThreads = (): number => readers.filter(Boolean).length
