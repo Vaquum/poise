@@ -1173,12 +1173,38 @@ def _receipts(raw: str | None) -> list | None:
 
 
 def read_response(short: str):
-    with db() as conn:
-        rows = conn.execute("select response_path from calls where response_path is not null and id like ?", (short + "%",)).fetchall()
-    if len(rows) != 1:
-        raise SystemExit(f"response hash matched {len(rows)} rows")
-    path = Path(rows[0]["response_path"])
-    print(caller_store.response(path if path.is_absolute() else DATA_DIR.parent / path, RESPONSES).read_text())
+    try:
+        if not re.fullmatch(r"[0-9a-fA-F]{1,32}", short):
+            raise ValueError("invalid Call ID")
+        with db() as conn:
+            rows = conn.execute("select id,response_path,status,behavior,artifact,diagnostic from calls where id like ?",
+                                (short + "%",)).fetchall()
+        if len(rows) > 1:
+            raise ValueError(f"Call ID matched {len(rows)} rows")
+        reason = "The Call is unknown"
+        if rows:
+            row = rows[0]
+            short = row["id"]
+            if row["response_path"] is not None:
+                path = Path(row["response_path"])
+                print(caller_store.response(path if path.is_absolute() else DATA_DIR.parent / path, RESPONSES).read_text())
+                return
+            diagnostic = json.loads(row["diagnostic"]) if row["diagnostic"] is not None else {}
+            artifact = json.loads(row["artifact"]) if row["artifact"] is not None else {}
+            if not isinstance(diagnostic, dict) or not isinstance(artifact, dict):
+                raise ValueError("invalid response evidence")
+            if diagnostic.get("phase") == "response_persist" and diagnostic.get("outcome") == "persist_failed":
+                raise ValueError("response persistence failed")
+            if artifact.get("response_sha") is not None or (row["status"] == "completed"
+                    and row["behavior"] in {"native_action", "native_publication"}):
+                raise ValueError("required response receipt is missing")
+            if row["status"] not in {"running", "completed", "failed", "cancelled"}:
+                raise ValueError("invalid Call status")
+            reason = "The Call is still running" if row["status"] == "running" else "The Call ended without a response"
+        print(json.dumps({"id": short.lower(), "disposition": "unavailable", "reason": reason}))
+        raise SystemExit(3)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+        raise SystemExit(f"Response read failed for Call {short}: {error}") from error
 
 
 def run_pr_review(

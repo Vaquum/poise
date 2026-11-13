@@ -23,6 +23,22 @@ starts. A named guide that is missing or empty fails the call. With neither,
 it writes without a voice guide, says so on stderr, and prints
 `"voice_guide": null` with its result.
 
+# Reading a response
+
+`agent-interface --read-response CALL_ID` looks up the Call before its response
+path. Success prints the original response plus one trailing newline. Ordinary
+absence exits 3 with JSON `{id, disposition: "unavailable", reason}` on stdout:
+the Call is unknown, still running, or ended without a response. A recorded
+`response_persist` / `persist_failed`, a missing required native receipt, invalid
+row evidence, or a promised file that is missing or unreadable remains an error.
+A null response path alone does not establish ordinary absence.
+
+Poise's History reader displays typed absence as unavailable with its reason,
+without retaining a process Error. Required content and native-action readers
+still reject absence; it grants no publication or retry authority. Failed reads
+retain the exact Call ID and reader purpose. Native receipt digest verification
+continues to use the original response bytes before the CLI's trailing newline.
+
 # Stopping a run
 
 Every local call records its supervisor PID and available kernel start/epoch

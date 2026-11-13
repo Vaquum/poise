@@ -98,6 +98,13 @@ print(hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, sep
   mocks.runFile.mockResolvedValueOnce({ stdout: `${JSON.stringify(JSON.parse(retained))}\n` })
   await expect(actionOperations().readActionResult(invocation, call))
     .rejects.toThrow('retained digest')
+  const unavailable = Object.assign(new Error('required receipt is unavailable'), { code: 3,
+    stdout: JSON.stringify({ id: call.id, disposition: 'unavailable', reason: 'The Call is unknown' }), stderr: '' })
+  mocks.runFile.mockRejectedValueOnce(unavailable)
+  await expect(actionOperations().readActionResult(invocation, call)).rejects.toBe(unavailable)
+  expect(mocks.runFile).toHaveBeenLastCalledWith('agent-interface', ['--read-response', call.id],
+    expect.objectContaining({ callId: call.id, readerPurpose: 'native-action-receipt' }))
+  expect(mocks.runFile.mock.lastCall?.[2].expected).toBeUndefined()
 })
 
 function actionOperations(overrides: Partial<NativeChainHooks> = {}) {

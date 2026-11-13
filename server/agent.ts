@@ -25,7 +25,7 @@ import { getHeadSha, getPrAuthor } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
 import { needsClaude, randomDrawStillValid, reviewChoice } from './review-model'
-import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
+import { claudeSubscriptionEnvironment, isExpectedFailure, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic, diagnosticFailure } from './logging'
 import { getModelSettings, requireAgentAccount } from './settings'
@@ -584,16 +584,35 @@ function warnAgentLogCap(stdout: string, rows: number): void {
 
 // Fetch one response body by the full 32-hex call id. agent-interface also
 // accepts prefixes, but those become ambiguous as the log grows.
-export async function fetchAgentResponse(callId: string): Promise<{ id: string, body: string }> {
+export type AgentResponse = { id: string, body: string }
+  | { id: string, disposition: 'unavailable', reason: string }
+
+export async function fetchAgentResponse(callId: string, readerPurpose: string): Promise<AgentResponse> {
   if (!/^[0-9a-fA-F]{32}$/.test(callId)) {
     throw new Error('invalid agent call id')
   }
-  const { stdout } = await runFile(CLI, ['--read-response', callId], {
-    cwd: agentCwd(),
-    timeoutMs: 30_000,
-    maxOutputBytes: 32 * 1024 * 1024,
-  })
-  return { id: callId, body: stdout }
+  const unavailable = (stdout: string): Extract<AgentResponse, { disposition: string }> | null => {
+    try {
+      const value = JSON.parse(stdout) as { id?: unknown, disposition?: unknown, reason?: unknown }
+      return value?.id === callId.toLowerCase() && value.disposition === 'unavailable'
+        && typeof value.reason === 'string' && value.reason.length > 0
+        ? { id: callId, disposition: 'unavailable', reason: value.reason } : null
+    } catch { return null }
+  }
+  try {
+    const { stdout } = await runFile(CLI, ['--read-response', callId], {
+      cwd: agentCwd(), timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024,
+      callId, readerPurpose,
+      expected: readerPurpose === 'history' ? { codes: [3], stderr: /^$/, stdout: value => unavailable(value) !== null } : undefined,
+    })
+    return { id: callId, body: stdout }
+  } catch (error) {
+    if (isExpectedFailure(error)) {
+      const result = unavailable((error as { stdout: string }).stdout)
+      if (result) return result
+    }
+    throw error
+  }
 }
 
 export async function fetchAgentReasoning(callId: string): Promise<{ id: string, body: string }> {

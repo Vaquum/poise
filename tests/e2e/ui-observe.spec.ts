@@ -279,6 +279,28 @@ test('a run link opens that run unfolded in Behaviors, and a chain’s own GitHu
   await expect(running.getByRole('button', { name: 'Confirm stopping this run' })).toHaveText('Sure?')
 })
 
+for (const state of ['unavailable', 'missing-file', 'incomplete']) {
+  test(`a response-less run displays its response read as ${state}`, async ({ page }) => {
+    await open(page, '/?view=observe&part=behaviors')
+    const id = hex(32, 'd')
+    await page.route(`/api/agent-response/${id}`, route => state === 'missing-file'
+      ? route.fulfill({ status: 502, json: { error: 'promised response file is missing' } })
+      : route.fulfill({ json: state === 'unavailable'
+        ? { id, disposition: 'unavailable', reason: 'The Call is still running' } : {} }))
+    const behaviors = page.locator('[data-panel="behaviors"]')
+    await behaviors.locator(`tr[data-run="${id}"]`).getByRole('button', { name: 'Show detail' }).click()
+    const detail = behaviors.locator(`tr[data-detail-for="${id}"]`)
+    if (state === 'unavailable') {
+      await expect(detail).toContainText('Unavailable: The Call is still running')
+      await expect(detail.locator('.is-warn, .is-error')).toHaveCount(0)
+      await expect(detail.getByRole('heading', { name: 'Error', exact: true })).toHaveCount(0)
+    } else {
+      await expect(detail.locator('.is-warn')).toContainText(state === 'missing-file'
+        ? 'promised response file is missing' : 'the answer is incomplete')
+    }
+  })
+}
+
 test('a GitHub link opens its row, widening the filters for that visit only', async ({ page }) => {
   await page.addInitScript(() => { localStorage.setItem('poise-observe-github', JSON.stringify({ types: ['action'], ci: 'failed', status: 'open', time: 'today' })) })
   await open(page, '/?view=observe&part=github&item=acme/site%23496')
