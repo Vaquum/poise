@@ -512,8 +512,11 @@ function cursorConnection(): Database.Database {
   return cursorDb
 }
 
+// A managed organization's behaviors scope their keys as `org:<login>:<key>`.
+const isRotationCursor = (key: string): boolean => ROTATION_CURSORS.has(key.replace(/^org:[^:]+:/, ''))
+
 export function setMeta(key: string, value: string): void {
-  const connection = ROTATION_CURSORS.has(key) && !db.inTransaction ? cursorConnection() : db
+  const connection = isRotationCursor(key) && !db.inTransaction ? cursorConnection() : db
   connection.prepare('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
 }
 

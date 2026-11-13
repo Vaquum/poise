@@ -32,8 +32,13 @@ describe('rotation cursors', () => {
     // Not on the main connection, which waits for the disk on every commit.
     const main = vi.spyOn(module.db, 'prepare')
     module.setMeta('behavior_merge_prs_cursor', 'alpha/one#1')
+    // A managed organization's behaviors scope the same cursor by its login.
+    module.setMeta('org:alpha:behavior_merge_prs_cursor', 'alpha/two#1')
     expect(main).not.toHaveBeenCalled()
+    module.setMeta('org:alpha:behavior_merge_prs_skip_repos', '[]')
+    expect(main).toHaveBeenCalledTimes(1)
     main.mockRestore()
+    expect(module.getMeta('org:alpha:behavior_merge_prs_cursor')).toBe('alpha/two#1')
     expect(module.getMeta('behavior_merge_prs_cursor')).toBe('alpha/one#1')
     module.setMeta('behavior_merge_prs_cursor', 'alpha/one#2')
     expect(module.db.prepare("SELECT value FROM meta WHERE key = 'behavior_merge_prs_cursor'").get()).toEqual({ value: 'alpha/one#2' })
