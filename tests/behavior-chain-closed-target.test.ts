@@ -174,6 +174,41 @@ it('keeps a running original and uncertain resource ownership until native settl
   expect(forbidden).not.toHaveBeenCalled()
 })
 
+it.each((['review-pr', 'approve-pr'] as const).flatMap(behavior =>
+  (['merged', 'closed'] as const).map(state => ({ behavior, state }))))(
+  'settles same-head $state during $behavior only after original native resource release, without replay', async ({ behavior, state }) => {
+    const { db, journal, chain, calls, operations, forbidden, fenceClosedTarget } = setup(behavior, true)
+    operations.observe = vi.fn(async () => observed(state))
+    const call = completedReviewCall(chain.repository, 17, HEAD, chain.reviewer)
+    Object.assign(call, { source: 'poise:behavior-chain', correlation_id: 'original',
+      behavior: behavior === 'review-pr' ? 'pr_review' : 'pr_approve', status: 'running',
+      completed_at: null, resources_settled_at: null, review_id: null, action: null, outcome: null, artifact: { phase: 'reviewing' },
+      resource_ownership: { version: 1, roots: [], errors: [] } })
+    calls.push(call)
+    const runtime = new BehaviorChainRuntime(journal, operations)
+    await runtime.run()
+    Object.assign(call, { status: 'superseded', outcome: 'superseded', error_code: 'review_target_closed',
+      head_sha: HEAD, error: `target ${state.toUpperCase()}; no submission attempted`, completed_at: new Date().toISOString() })
+    await runtime.run()
+    expect(journal.read(chain.id)?.invocations[0]).toMatchObject({ state: 'uncertain', callId: null, evidence: { callId: call.id } })
+    expect(journal.liveModelInvocationCount()).toBe(1)
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 8, diskBytes: 16, unaccounted: 0 })
+    expect(operations.observe).not.toHaveBeenCalled()
+
+    call.resources_settled_at = new Date().toISOString()
+    await runtime.run()
+    expect(journal.read(chain.id)?.invocations[0]).toMatchObject({ state: 'settled', callId: call.id, outcome: 'superseded',
+      evidence: { error_code: 'review_target_closed', head_sha: HEAD, review_id: null, artifact: { phase: 'reviewing' } } })
+    expect(journal.liveModelInvocationCount()).toBe(0)
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+    const reopened = new BehaviorChainJournal(db)
+    reopened.rebuild()
+    await new BehaviorChainRuntime(reopened, operations).run()
+    expect(reopened.read(chain.id)?.invocations).toHaveLength(1)
+    expect(forbidden).not.toHaveBeenCalled()
+    expect(fenceClosedTarget).not.toHaveBeenCalled()
+  })
+
 it.each([false, true])('journals the recovery hold before a partial restore is readable, with a competing exit: %s', async competingExit => {
   const { db, journal, chain, operations, forbidden, fenceClosedTarget } = setup('repair-pr', true)
   record(journal, chain, { type: 'chain.held', reason: 'person hold' })

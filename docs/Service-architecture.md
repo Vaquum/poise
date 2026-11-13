@@ -1540,7 +1540,12 @@ Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
 started originals without a Call remain uncertain without a retry or synthetic
 no-effect receipt, since partial recovery can lose the original unique correlation.
-Unreadable snapshots retain that hold in the existing journal. Existing Calls and uncertain
+Unreadable snapshots retain that hold in the existing journal.
+The existing in-flight review/approval poll also observes same-head closure.
+It waits for active submission and retains completed-turn results while preventing
+further analysis. Unattempted rounds use `review_target_closed`; attempted writes
+retain the original publication fence and receipt.
+Existing Calls and uncertain
 resources are never released by closure alone. Merged-chain Hold/Resume writes
 return 409 and the GUI retains History and read-only reconciliation. No new
 endpoint, signal or journal event type is added; the Caller contract is in

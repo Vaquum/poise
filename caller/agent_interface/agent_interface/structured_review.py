@@ -598,6 +598,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 verdict = validate_verdict(json.dumps(
                     {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}), behavior)
                 raw = json.dumps(verdict)
+            watch.check_closed()
             _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
     except review_stages.StageError as error:
         cause = bounded_cause(str(error) or "invalid review packet stages")

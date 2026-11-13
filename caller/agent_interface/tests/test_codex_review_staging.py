@@ -46,7 +46,7 @@ class TestCodexReviewStaging(TestCase):
             return SimpleNamespace(returncode=1 if failure == "provider_failure" and not stage else 0,
                                    stdout="\n".join(json.dumps(event) for event in events), stderr="failed")
 
-        watch = SimpleNamespace(run=turn)
+        watch = SimpleNamespace(run=turn, check_closed=lambda: None)
         receipt = json.dumps({"action": "approved_pr", "review_id": 91, "head_sha": "a" * 40})
         with patch.object(structured_review, "CODEX_MAX_INPUT_CHARS", LIMIT), \
                 patch.object(structured_review, "monotonic", lambda: clock.now), \
