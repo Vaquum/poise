@@ -89,6 +89,7 @@ import {
   renewPrOperationOwned,
   setBehaviorLaunchErrorOwned,
   setMeta as databaseSetMeta,
+  writeObservation,
   type BehaviorAgentLaunch,
   type BehaviorLaunchClaim,
   type CompletedApprovalBasisLaunch,
@@ -6817,7 +6818,10 @@ async function tickRerunGreyCi(): Promise<void> {
   // The scan completed: per-target failures above are recorded individually,
   // and this stamp proves the behavior itself is alive. A stale stamp with no
   // failures is a silent stop, not a quiet queue.
-  setMeta('behavior_rerun_grey_ci_last_success', new Date().toISOString())
+  // What the page shows as the last scan, written by every tick: a commit lost
+  // to a power cut only shows the tick before, so it never waits for the disk
+  // on the server's thread (up to 0.8 s on production).
+  writeObservation(() => setMeta('behavior_rerun_grey_ci_last_success', new Date().toISOString()))
 }
 
 // ── Close old pull requests ────────────────────────────────────────────
