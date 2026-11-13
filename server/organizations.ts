@@ -133,10 +133,18 @@ function observeRateLimit(error: unknown, me: string): GitHubRateLimitError | nu
   return new GitHubRateLimitError(me, cooldownUntil(me) || resetAt)
 }
 
-function fromRow(row: OrganizationRow): Organization {
+// What every account's status depends on, the configured user and its
+// rate-limit cooldown, read once for a listing instead of once per account.
+function accountContext(): { me: string | undefined, cooldown: () => number } {
   const me = getMeta('me')?.trim()
+  let cooldown: number | undefined
+  return { me, cooldown: () => cooldown ??= cooldownUntil(me) }
+}
+
+function fromRow(row: OrganizationRow, context = accountContext()): Organization {
+  const me = context.me
   const pendingUser = row.status === 'ready' && row.managed && row.indexed_user !== me
-  const resetAt = row.managed && row.status !== 'error' ? cooldownUntil(me) : 0
+  const resetAt = row.managed && row.status !== 'error' ? context.cooldown() : 0
   const retryAt = Math.max(resetAt, row.sync_failures ? row.next_sync_at : 0)
   return {
     login: row.login,
@@ -171,10 +179,21 @@ function rowFor(login: string): OrganizationRow | undefined {
 
 export function getOrganizations(): Organization[] {
   const rows = cachedStatement(db, 'SELECT * FROM organizations ORDER BY rowid').all() as OrganizationRow[]
-  const result = rows.map(fromRow)
+  const context = accountContext()
+  const result = rows.map((row) => fromRow(row, context))
   const legacy = legacyOrganization()
   if (legacy && !result.some((org) => org.login.toLowerCase() === legacy.login.toLowerCase())) result.unshift(legacy)
   return result
+}
+
+/** The accounts as getOrganizations lists them, by login and whether each is
+ *  managed, without their status: what reading a preference needs. */
+export function organizationAccounts(): Array<{ login: string, managed: boolean }> {
+  const accounts = (cachedStatement(db, 'SELECT login, managed FROM organizations ORDER BY rowid').all() as Array<{ login: string, managed: number }>)
+    .map((row) => ({ login: row.login, managed: !!row.managed }))
+  const legacy = getMeta('org')?.trim()
+  if (legacy && !accounts.some((account) => account.login.toLowerCase() === legacy.toLowerCase())) accounts.unshift({ login: legacy, managed: false })
+  return accounts
 }
 
 export function readyOrganizations(): Organization[] {

@@ -107,7 +107,7 @@ import { ProcessLockError, withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, requireAgentAccount, BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
-import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
+import { getOrganizations, organizationAccounts, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { readDatastoreView } from './datastore-reader'
 import { behaviorHeld, providerSignInRejected, providerSignInVerified } from './alerts/producers'
 import { retireClearedBehaviorAlerts } from './alerts/notices'
@@ -169,7 +169,7 @@ function scopedMetaKey(key: string): string {
 function globalPreference(key: string): string | null {
   const existing = databaseGetMeta(key)
   if (existing !== null) return existing
-  const organizations = getOrganizations()
+  const organizations = organizationAccounts()
   // Legacy preferences, including unset defaults, remain authoritative. A
   // managed-only installation adopts its old preferences once, independently
   // of which account happens to make the first settings request.
