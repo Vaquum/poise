@@ -1290,6 +1290,16 @@ whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
 its own, keeping its volume and respecting the native settlement barrier.
 The reporting allowlist is reconciled separately through trusted service
 configuration without replacing a compatible running container.
+Replacement pins stop and removal to the inspected container ID. If stopping
+fails, the gateway inspects that ID and the current workspace name separately.
+It continues only for the same owned container with an explicit stopped state;
+an absent, unreadable or malformed target cannot authorize removal. An already
+serving successor is left alone and observed only after the old container is
+confirmed stopped or absent and its own ownership, image, settings and health
+(including the intended release) match. Otherwise the upgrade retains an Error
+with the stop cause and safe old/current identity and inspection evidence.
+Abandoning replacement releases a drain only while the original container still
+owns the workspace name.
 The operator scripts retain an exact-release rollout receipt beyond their
 bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
 receipt through the existing workspace health/image proof without initiating

@@ -44,6 +44,8 @@ export interface FakeDocker {
   networks: Set<string>
   containers: Map<string, FakeContainer>
   calls: DockerCall[]
+  /** Overrides a Docker response at the HTTP boundary, after recording the request. */
+  onCall?: (call: DockerCall) => { status: number; body?: unknown } | undefined
   /** Called whenever a container starts or restarts. */
   onStart: (name: string) => void
   addContainer(container: Omit<FakeContainer, 'id'>): FakeContainer
@@ -115,7 +117,10 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
       const body = text ? JSON.parse(text) as Record<string, unknown> : undefined
       const url = new URL(req.url ?? '/', 'http://docker')
       const method = req.method ?? ''
-      calls.push({ method, path: `${url.pathname}${url.search}`, body })
+      const call = { method, path: `${url.pathname}${url.search}`, body }
+      calls.push(call)
+      const response = fake.onCall?.(call)
+      if (response) return send(res, response.status, response.body)
       const path = url.pathname
       let match: RegExpExecArray | null
 
