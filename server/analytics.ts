@@ -265,8 +265,12 @@ async function readScoped(window: AnalyticsWindow, orgLogin?: string, signal?: A
   const scopes = { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) }
   const key = JSON.stringify([window.since ?? null, window.until ?? null, me, scopes,
     organizations.map((org) => [org.login, org.datastorePath, org.error ?? null])])
+  // An account whose read failed is read again next time: its failure (a
+  // busy datastore) may pass without any file changing. A sync failure is the
+  // account's own state, part of the key.
   return readKeptAcross(organizations.map((org) => analyticsDatastorePath(org)), key, recordReads,
-    () => readAnalyticsInWorker({ organizations, me, window, scopes }, signal))
+    () => readAnalyticsInWorker({ organizations, me, window, scopes }, signal),
+    { keep: (records) => records.errors.every((error) => error.stale) })
 }
 
 export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string, dailyBounds?: string[], signal?: AbortSignal): Promise<AnalyticsReport> {

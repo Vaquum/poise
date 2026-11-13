@@ -637,6 +637,18 @@ describe('reading what Current shows', () => {
     } finally { reads.mockRestore() }
   })
 
+  it('keeps no records read while an account failed, so its recovery shows on the next read', async () => {
+    data()
+    const reader = await import('../server/analytics-reader')
+    const reads = vi.spyOn(reader, 'readAnalyticsInWorker')
+      .mockResolvedValueOnce({ issues: [], prs: [], errors: [{ org: 'alpha', error: 'database is locked' }] })
+    try {
+      expect((await readAnalytics(WEEK)).errors).toEqual([{ org: 'alpha', error: 'database is locked' }])
+      expect((await readAnalytics(WEEK)).errors).toEqual([])
+      expect(reads).toHaveBeenCalledTimes(2)
+    } finally { reads.mockRestore() }
+  })
+
   it('reads a change the content mark cannot see once the mark stops vouching', async () => {
     const id = seed(pr(1, '2026-10-06T00:00:00Z', '2026-10-08T00:00:00Z'), 'pr', true)
     const before = (await readAnalytics(WEEK)).pullRequests.workReview
