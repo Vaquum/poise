@@ -109,9 +109,9 @@
   --c-other-tint: color-mix(in srgb, var(--c-other) var(--ctl-tint), transparent);
   --c-other-on: color-mix(in srgb, var(--c-other) 55%, var(--p-white));
   --c-row-hover: color-mix(in srgb, var(--c-surface) 55%, transparent);
-  /* A QR code scans as dark modules on light paper, whatever the theme. */
-  --c-qr-paper: var(--p-n7);
-  --c-qr-ink: var(--p-n0);
+  /* A QR code scans as dark modules on light paper. White and black, which no palette in Style changes. */
+  --c-qr-paper: var(--p-white);
+  --c-qr-ink: var(--p-black);
   --c-row-selected: var(--c-canvas);
 
   /* States: one vocabulary, one colour each (the words live in refdefs.js) */

@@ -156,32 +156,56 @@ export function phoneSection(account: GatewayAccount): PhoneSection {
     paint(phonesEl, phonesHtml())
   }
 
-  const refresh = async (): Promise<void> => {
-    const current = ++generation
-    try {
-      const next = await fetchPhones()
-      if (current !== generation || disposed) return
-      codes = next.codes
-      phones = next.phones
-      readError = null
-    } catch (error) {
-      if (current !== generation || disposed) return
-      readError = (error as Error).message
+  // One read at a time, however slow, so a slow gateway still delivers every reading. A decision or a
+  // sign-out made meanwhile (`generation`) discards the read it overlapped and asks for another.
+  let reading = false
+  let readAgain = false
+  const refresh = async (after = false): Promise<void> => {
+    if (reading) {
+      if (after) readAgain = true
+      return
     }
-    render()
+    reading = true
+    try {
+      do {
+        readAgain = false
+        const current = generation
+        try {
+          const next = await fetchPhones()
+          if (disposed) return
+          if (current !== generation) {
+            readAgain = true
+            continue
+          }
+          codes = next.codes
+          phones = next.phones
+          readError = null
+        } catch (error) {
+          if (disposed) return
+          if (current === generation) readError = (error as Error).message
+        }
+        render()
+      } while (readAgain && !disposed)
+    } finally {
+      reading = false
+    }
   }
 
+  // Each choice the person makes here (show, hide, decide) starts a new round; a code minted for an older
+  // round, such as a renewal that lands after Hide, is not shown.
+  let round = 0
   let renewing = false
   async function startCode(count: number): Promise<void> {
+    const mine = round
     if (count === 1) show = { kind: 'starting' }
     renewing = true
     render()
     try {
       const { code, url } = await startPhoneCode()
-      if (disposed) return
+      if (disposed || mine !== round) return
       show = { kind: 'code', code, svg: qrSvg(qrCode(url), 'QR code that signs your phone in to Poise'), until: Date.now() + (code.expiresAt - code.createdAt), count }
     } catch (error) {
-      if (disposed) return
+      if (disposed || mine !== round) return
       // A code on screen keeps working until it expires; only a first code that failed says so at once.
       if (show.kind === 'code') show = { ...show, count: MAX_CODES }
       else show = { kind: 'failed', message: (error as Error).message }
@@ -203,6 +227,7 @@ export function phoneSection(account: GatewayAccount): PhoneSection {
       codes = codes.map((candidate) => (candidate.id === id ? next : candidate))
       // The decision ends this round; a new code is shown only when asked for.
       show = { kind: 'idle' }
+      round++
       generation++
     } catch (error) {
       decideError = { id, message: (error as Error).message }
@@ -210,7 +235,7 @@ export function phoneSection(account: GatewayAccount): PhoneSection {
       deciding = null
     }
     render()
-    void refresh()
+    void refresh(true)
   }
 
   async function signOut(id: string): Promise<void> {
@@ -244,9 +269,11 @@ export function phoneSection(account: GatewayAccount): PhoneSection {
     switch (target.dataset.act) {
       case 'show':
         decided.clear()
+        round++
         void startCode(1)
         break
       case 'hide':
+        round++
         show = { kind: 'idle' }
         render()
         break

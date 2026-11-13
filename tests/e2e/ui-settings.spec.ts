@@ -34,6 +34,10 @@ interface PhoneWorld {
   lifetimeMs: number
   /** Every decision and sign-out as sent, address and body. */
   calls: Array<{ path: string, body: Record<string, unknown> }>
+  /** How long each read of the codes and phones takes. */
+  readDelayMs?: number
+  /** While set, new codes wait here until released. */
+  heldStarts?: Array<() => void>
 }
 
 function phoneWorld(lifetimeMs = 120_000, refuse: number[] = []): PhoneWorld {
@@ -124,7 +128,10 @@ async function settings(page: Page, world: Partial<World> = {}, address = '/?vie
       if (g === 'devices') return route.fulfill({ json: { devices: [] as PairedDevice[] } })
       if (g === 'admin') return route.fulfill({ json: ADMIN })
       if (g === 'phone' || g.startsWith('phone/')) {
-        const answer = phoneApi(w.phone ??= phoneWorld(), g, url.search, body)
+        const phone = w.phone ??= phoneWorld()
+        if (g === 'phone' && phone.readDelayMs) await new Promise((resolve) => setTimeout(resolve, phone.readDelayMs))
+        if (g === 'phone/start' && phone.heldStarts) await new Promise<void>((release) => phone.heldStarts!.push(release))
+        const answer = phoneApi(phone, g, url.search, body)
         return route.fulfill({ status: answer.status ?? 200, json: answer.json })
       }
       return route.fulfill({ status: 404, json: { error: 'not_found', message: 'There is nothing at this address.' } })
@@ -358,9 +365,12 @@ test('behind the gateway, a phone that opens the code is approved here, signed i
   await phone.getByRole('button', { name: 'Show the code' }).click()
   await expect(phone.getByRole('img', { name: 'QR code that signs your phone in to Poise' })).toBeVisible()
   await expect(phone).toContainText('Scan this with your phone’s camera.')
-  // The QR is drawn as dark paths on light paper, from tokens.
-  const colours = await phone.locator('.ph-qr').evaluate((el) => [getComputedStyle(el).backgroundColor, getComputedStyle(el).color])
-  expect(colours).toEqual(['rgb(247, 248, 249)', 'rgb(22, 26, 32)'])
+  // The QR is black on white, from tokens, and a light palette chosen in Style does not invert it.
+  const colours = () => phone.locator('.ph-qr').evaluate((el) => [getComputedStyle(el).backgroundColor, getComputedStyle(el).color])
+  expect(await colours()).toEqual(['rgb(255, 255, 255)', 'rgb(0, 0, 0)'])
+  await page.evaluate(() => { document.documentElement.style.setProperty('--p-n0', '#f7f8f9'); document.documentElement.style.setProperty('--p-n7', '#161a20') })
+  expect(await colours()).toEqual(['rgb(255, 255, 255)', 'rgb(0, 0, 0)'])
+  await page.evaluate(() => { document.documentElement.style.removeProperty('--p-n0'); document.documentElement.style.removeProperty('--p-n7') })
 
   // The phone opens the code: Settings shows it, with its device and browser, for a decision.
   const grant = 'a'.repeat(64)
@@ -410,6 +420,36 @@ test('behind the gateway, a shown code is replaced before it expires, and a code
   await phone.getByRole('button', { name: 'Show a new code' }).click()
   await expect(phone.locator('.ph-qr svg')).toBeVisible()
   expect(w.phone!.starts).toBe(4)
+})
+
+test('behind the gateway, reads slower than the polling still show a phone that opened the code', async ({ page }) => {
+  const w = await settings(page, { mode: 'service', phone: { ...phoneWorld(), readDelayMs: 2_500 } }, '/?settings=accounts')
+  const phone = row(page, 'phone')
+  await phone.getByRole('button', { name: 'Show the code' }).click()
+  await expect(phone.locator('.ph-qr svg')).toBeVisible()
+  w.phone!.codes[0] = { ...w.phone!.codes[0], state: 'scanned', device: 'Android phone · Chrome', grant: 'b'.repeat(64), scannedAt: Date.now() }
+  await expect(phone).toContainText('Android phone · Chrome wants to sign in as octocat.', { timeout: 15_000 })
+})
+
+test('behind the gateway, Hide wins over a replacement code still on its way', async ({ page }) => {
+  await page.clock.install()
+  const w = await settings(page, { mode: 'service', phone: phoneWorld() }, '/?settings=accounts')
+  const phone = row(page, 'phone')
+  await phone.getByRole('button', { name: 'Show the code' }).click()
+  await expect(phone.locator('.ph-qr svg')).toBeVisible()
+  w.phone!.heldStarts = []
+  await page.clock.fastForward(100_500)
+  await expect.poll(() => w.phone!.heldStarts!.length).toBe(1)
+  await phone.getByRole('button', { name: 'Hide the code' }).click()
+  await expect(phone.getByRole('button', { name: 'Show the code' })).toBeVisible()
+  w.phone!.heldStarts!.shift()!()
+  await expect.poll(() => w.phone!.codes.length).toBe(2)
+  await page.clock.fastForward(3_000)
+  await expect(phone.locator('.ph-qr')).toHaveCount(0)
+  await expect(phone.getByRole('button', { name: 'Show the code' })).toBeVisible()
+  // Hidden, it asks for no more codes.
+  await page.clock.fastForward(120_000)
+  expect(w.phone!.starts).toBe(2)
 })
 
 for (const width of [375, 768, 1000]) {
