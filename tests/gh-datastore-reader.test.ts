@@ -187,6 +187,10 @@ describe('runCli with the in-process datastore reader', () => {
       expect(mocks.read).toHaveBeenCalledTimes(2)
     } finally {
       clock.mockRestore()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it('keeps the pages Board\'s intake reads of closing pull requests across syncs that change no item', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'poise-closing-pages-'))
     const original = mocks.org.datastorePath
