@@ -72,18 +72,65 @@ it('counts one incident per seed over completed lifetimes, including pre-window 
   expect((await f.read()).rate).toEqual(initial.rate)
 })
 
-it('withholds zero-denominator, unknown merge-time and incomplete lifetime rates while retaining known counts', async () => {
+it('withholds only a zero-denominator or unknown merge-time rate, in words, while retaining known counts', async () => {
   const f = setup()
-  expect((await f.read()).rate).toMatchObject({ completed: 0, perItem: null })
+  expect((await f.read()).rate).toMatchObject({ completed: 0, perItem: null, withheld: 'no v2 work merged in the last 24 hours' })
   f.merge(f.fail(f.seed(1), 'old error', NOW - 30 * HOUR), NOW - HOUR)
+  // A gap in the observational ledger during the item's life hides no work error: they come from the journal (#1381).
   f.input.history.gaps = [{ since: new Date(NOW - 40 * HOUR).toISOString(), until: new Date(NOW - 35 * HOUR).toISOString(), reason: 'unavailable' }]
   expect(healthIntervals(f.input.history, NOW - 24 * HOUR, NOW).every(part => part.state === 'covered')).toBe(true)
   const report = await f.read()
-  expect(report.rate).toMatchObject({ completed: 1, errors: 1, perItem: null })
-  expect(report.limits.join(' ')).toContain('incomplete lifetime evidence')
+  expect(report.rate).toMatchObject({ completed: 1, errors: 1, perItem: 1, unsettled: 0, withheld: null })
+  expect(report.limits.join(' ')).not.toContain('incomplete lifetime evidence')
   expect(report.coverage.find(source => source.name === 'Caller receipts')!.intervals!.some(part => part.state === 'gap')).toBe(true)
   f.append(f.seed(2), { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: 'acme/repo', pull_number: 102, merged: true, merge_sha: MERGE } }, NOW)
-  expect((await f.read()).limits.join(' ')).toContain('original GitHub merge time unavailable')
+  const unknown = await f.read()
+  expect(unknown.limits.join(' ')).toContain('original GitHub merge time unavailable')
+  expect(unknown.rate).toMatchObject({ completed: 1, errors: 1, perItem: null, withheld: expect.stringContaining('merge time for acme/repo#2 is unknown') })
+})
+
+it('verifies a merge from GitHub\'s merge facts in any observation: a lagging publication or an existing pull request (#1381)', async () => {
+  const f = setup()
+  // The first merged read still has Poise's publication open on its head; the next agrees.
+  const agreeing = structuredClone(f.observe(f.seed(8), NOW - 2 * HOUR, NOW - 2 * HOUR).observation) as ChainObservation
+  Object.assign(agreeing.publication, { pull_number: 101 }); agreeing.pull!.number = 101
+  const behind = structuredClone(agreeing)
+  Object.assign(behind.publication, { merged: false, merge_sha: HEAD, state: 'open' })
+  let lagging = f.append(f.seed(1), { type: 'chain.observed', observation: behind }, NOW - 2 * HOUR)
+  lagging = f.append(lagging, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: 'acme/repo', pull_number: 101, merged: true, merge_sha: MERGE, review_complete: true } }, NOW - 2 * HOUR)
+  lagging = f.append(lagging, { type: 'chain.observed', observation: { ...agreeing, checkedAt: NOW - 2 * HOUR + 1 } }, NOW - 2 * HOUR + 1)
+  // An existing pull request closed the seed: the chain has no publication of its own.
+  let existing = f.seed(2)
+  const outside = structuredClone(f.observe(f.seed(9), NOW - HOUR, NOW - HOUR).observation) as ChainObservation
+  Object.assign(outside.publication, { pull_number: null, head_sha: null, state: null, merged: false, merge_sha: null })
+  existing = f.append(existing, { type: 'chain.observed', observation: outside }, NOW - HOUR)
+  existing = f.append(existing, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: 'acme/repo', pull_number: 109, merged: true, merge_sha: MERGE, review_complete: false } }, NOW - HOUR)
+  const report = await f.read()
+  expect(report.rate).toMatchObject({ completed: 2, errors: 0, perItem: 0, withheld: null })
+  expect(report.rate.items.map(item => item.work).sort()).toEqual(['acme/repo#1', 'acme/repo#2'])
+  // A merged pull request that is not the chain's own publication proves nothing.
+  let other = f.seed(3)
+  const foreign = structuredClone(outside)
+  Object.assign(foreign.publication, { pull_number: 555 })
+  other = f.append(other, { type: 'chain.observed', observation: foreign }, NOW - HOUR)
+  f.append(other, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: 'acme/repo', pull_number: 109, merged: true, merge_sha: MERGE, review_complete: false } }, NOW - HOUR)
+  expect((await f.read()).rate).toMatchObject({ perItem: null, withheld: expect.stringContaining('acme/repo#3') })
+})
+
+it('shows a lower bound while a counted item still has a run being reconciled (#1381)', async () => {
+  const f = setup()
+  const template = f.fail(f.seed(1), 'template', NOW - 5 * HOUR).invocations[0]
+  f.merge(f.seed(2), NOW - HOUR)
+  let chain = f.seed(3)
+  const id = chainBasis('still-reconciling').slice(0, 32)
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { ...template, id, admittedAt: NOW - 3 * HOUR } }, NOW - 3 * HOUR)
+  chain = f.append(chain, { type: 'invocation.started', invocationId: id }, NOW - 3 * HOUR)
+  chain = f.append(chain, { type: 'invocation.uncertain', invocationId: id, reason: 'Original outcome requires read-only reconciliation' }, NOW - 2 * HOUR)
+  chain = f.observe(chain, NOW - HOUR, NOW - HOUR)
+  f.append(chain, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: chain.repository, pull_number: 103, merged: true, merge_sha: MERGE, review_complete: false } }, NOW - HOUR)
+  const report = await f.read()
+  expect(report.rate).toMatchObject({ completed: 2, errors: 0, perItem: 0, unsettled: 1, withheld: null })
+  expect(report.limits.join(' ')).toContain('acme/repo#3: a run admitted before its merge is still unsettled')
 })
 
 it('uses execution evidence rather than Logging severity, excluding successful preparation and ordinary feedback or no-effect outcomes', () => {

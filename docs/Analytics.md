@@ -18,14 +18,22 @@ existing chain journal evidence.
 
 - **Errors per completed work item** divides distinct work-error incidents over
   each completed item's lifetime by distinct seeds merged in the trailing 24
-  hours. The cohort uses original verified GitHub `mergedAt`, never observation
-  or later review-reconciliation time. Error-free completions count too.
+  hours. The cohort uses GitHub's own `mergedAt` for the chain's merge commit,
+  from any observation of the merged pull request: the chain's own publication,
+  or the existing pull request that closed the seed. Poise's copy of its
+  publication may lag a read behind; observation and later review-reconciliation
+  times are never used. Error-free completions count too.
   Execution failures include authentication and transport warnings; successful
   preparation warnings, ordinary review/CI feedback, stopped, superseded and
   closed-target no-effect outcomes do not count. Repeated incident observations
-  count once per item. Both known counts remain visible, but the rate is
-  unavailable for an empty or incomplete cohort, including missing lifetime
-  coverage before the trailing window.
+  count once per item. Errors come from the chain journal, which keeps every
+  settled run, so gaps in the observational ledger's coverage do not withhold
+  the rate. While a counted item still has a run admitted before its merge that
+  has not settled, the rate is shown as a lower bound (**at least**) with how
+  many items are still being reconciled. Both counts always show; the rate
+  itself says **None completed** when nothing merged in the window, and
+  **Unknown**, with the reason in words, when an account's GitHub evidence is
+  not ok or a merged chain's GitHub merge time is unknown.
 - **Work blocked** counts held, uncertain or overdue seeds, including those
   without a PR, with oldest verified progress age and the largest stage.
   Known healthy waits, including draft and queue waits older than 24 hours,

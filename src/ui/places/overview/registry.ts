@@ -92,7 +92,11 @@ export const OVERVIEW: Registry = {
 
   /* ---------- System health ---------- */
   'ov.health': { name: 'System health', kind: 'Display', what: 'Five live cards over the last 24 hours of v2 chain work: errors per completed item, work blocked, recovered by itself, time since the last work error, and evidence coverage. Each opens the evidence behind its value.', source: 'PRD autonomio/poise#1101: the chain journal, Caller receipts, GitHub and Logging’s coverage.' },
-  'ov.h.errors': { name: 'Errors per completed work item', kind: 'Display', what: 'For work completed in the last 24 hours, its distinct work errors over its whole life, per item, with both counts.', does: 'Opens Logging.' },
+  'ov.h.errors': {
+    name: 'Errors per completed work item', kind: 'Display', what: 'For work completed in the last 24 hours, its distinct work errors over its whole life, per item, with both counts.', does: 'Opens Logging.',
+    values: [['at least', 'A counted item still has a run being reconciled, which may add an error.'], ['None completed', 'No v2 work merged in the last 24 hours, so there is no rate.'], ['Unknown', 'Which work completed is not known; the line under it says why.']],
+    source: 'The chain journal, which keeps every settled run, and GitHub’s own merge time for each merged pull request.',
+  },
   'ov.h.blocked': { name: 'Work blocked', kind: 'Display', what: 'Work held, not confirmed or overdue now, with the oldest time since verified progress and the stages it sits at.', does: 'Opens Observe → Tasks.' },
   'ov.h.recovery': { name: 'Recovered by itself', kind: 'Display', what: 'Work that recovered by itself after a failed run in the last 24 hours, with how many needed outside help.', does: 'Opens Observe → Tasks.' },
   'ov.h.lasterror': { name: 'Since the last work error', kind: 'Display', what: 'How long since the latest verified work error, and when.', does: 'Opens that diagnostic in Logging.' },
