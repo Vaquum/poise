@@ -614,7 +614,9 @@ export function chainWaitsForResourceRelease(chain: BehaviorChain): boolean {
 export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at: number | null }) {
   const publication = chain.observation?.publication as { pull_number?: number | null } | undefined
   return { id: chain.id, repository: chain.repository, issue: chain.issue, branch: chain.branch, author: chain.author, reviewer: chain.reviewer,
-    sequence: chain.sequence, held: chain.held, waiting: chain.waiting, mergeSha: chain.mergeSha,
+    sequence: chain.sequence, held: chain.held,
+    waiting: chain.mergeSha && chain.waiting?.startsWith('native merge queue owns entry ') ? null : chain.waiting,
+    mergeSha: chain.mergeSha,
     supersession: chain.supersession ?? null,
     reviewPending: chain.reviewPending ?? null,
     reviewStatus: chain.reviewPending === true ? 'pending' : chain.reviewPending === false ? 'complete' : 'not-recorded',
