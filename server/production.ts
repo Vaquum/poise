@@ -523,6 +523,9 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   return server
 }
 
+/** Startup's own work comes first; the warm-up follows in the background. */
+const WARM_UP_DELAY_MS = 10_000
+
 export async function startProductionServer(options: ProductionServerOptions = {}): Promise<Server> {
   // Every launcher starts the server here; /api/health/stalls reads what it observes.
   installStallObserver()
@@ -571,6 +574,16 @@ export async function startProductionServer(options: ProductionServerOptions = {
     throw error
   }
   console.log(`[poise] listening on http://${host}:${port}`)
+  // The first page after a deploy finds the reads it needs already made.
+  // Its modules load only when it runs, long after the dotenv above, like
+  // every module that opens the database.
+  const warming = setTimeout(() => {
+    void Promise.all([import('./warm-up'), import('./gh'), import('./analytics-health')])
+      .then(([{ warmUp }, { handleGhBody }, { readAnalyticsHealth }]) => warmUp({ read: handleGhBody, health: () => readAnalyticsHealth() }))
+      .catch(() => undefined)
+  }, WARM_UP_DELAY_MS)
+  warming.unref()
+  server.once('close', () => clearTimeout(warming))
   // Production only: the installer names the launchd jobs to keep alive.
   const stopWatchdog = startLaunchdWatchdog()
   if (stopWatchdog) server.once('close', stopWatchdog)
