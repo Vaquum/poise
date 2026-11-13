@@ -72,6 +72,105 @@ function captureDiagnostics() {
   }
 }
 
+it.each(['recovery', 'restart before admission', 'identical operator hold', 'missing original proof', 'unreleased resources',
+  'unknown publication', 'changed source', 'ineligible source', 'pushed branch', 'bound PR', 'competing work',
+  'unrelated passing run', 'source changes during preparation', 'missing review'])(
+  'recovers one pre-PR implementation on attempt three through normal admission: %s', async mode => {
+    const { db, journal } = setup()
+    let chain = seed(journal)
+    const obs = observation(false)
+    const basis = chainBasis(['issue', obs.issue.revision])
+    obs.issueReviewers = [reviewer]; obs.issue.commentIds = [11]
+    chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-review', behavior: 'review-issue',
+      actor: chain.reviewer, model: reviewer.model, slot: reviewer.slot, basis, admittedAt: NOW - 500_000,
+      request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+    chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'original-review', callId: 'b'.repeat(32), outcome: 'commented',
+      evidence: { status: 'completed', action: 'commented', issue_revision: obs.issue.revision,
+        receipts: [{ issue: chain.id, author: chain.reviewer, comment_id: 11 }], resources_settled_at: new Date(NOW - 400_000).toISOString() } })
+    const reviewed = structuredClone(chain.invocations[0])
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: `implementation-${attempt}`, behavior: 'implement-issue',
+        actor: chain.author, model: reviewer.model, slot: reviewer.slot, basis, admittedAt: NOW - (4 - attempt) * 100_000,
+        request: { command: 'agent-interface', cwd: '/fixture', argv: ['--expected-issue-revision', obs.issue.revision] } } })
+      if (attempt < 3) chain = record(journal, chain, { type: 'invocation.settled', invocationId: `implementation-${attempt}`,
+        callId: String(attempt).repeat(32), outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started',
+          completedAt: NOW - (4 - attempt) * 100_000, resources_settled_at: new Date(NOW - 50_000).toISOString() } })
+    }
+    const proof = { verified: true, base: 'a'.repeat(40), run: 1, runAttempt: 1, baselineRun: 2, baselineAttempt: 1,
+      remediation: 'https://github.com/acme/repo/issues/1530', failures: [{ file: 'tests/test-relay.test.ts', test: 'warning array', cause: 'expected []' }] }
+    const original: LogEntry = { ...completedReviewCall(chain.repository, 7, 'a'.repeat(40), chain.author), id: 'a'.repeat(32),
+      behavior: 'implement_issue', source: 'poise:behavior-chain', correlation_id: 'implementation-3', status: 'failed',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, review_id: null,
+      error_code: 'atomic_work_blocked', error: 'Original test failed on the implementation base',
+      completed_at: new Date(NOW - 3000).toISOString(), resources_settled_at: mode === 'unreleased resources' ? null : new Date(NOW - 2000).toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] },
+      artifact: { phase: mode === 'unknown publication' ? 'publishing' : 'executing',
+        prepared: { repository: chain.repository, issue_number: 7, actor: chain.author, branch: chain.branch,
+          checkout_head: proof.base, head_sha: null, pull_number: null },
+        ...(mode === 'missing original proof' ? {} : { test_dependency: proof }) } }
+    const calls = [original]
+    obs.testDependency = { invocationId: 'implementation-3', verified: true, recovered: false }
+    const observe = vi.fn(async () => ({ ...structuredClone(obs), checkedAt: Date.now() }))
+    const launch = vi.fn(async () => true)
+    let admitted = mode !== 'restart before admission'
+    const native = operations({ enabled: () => true, available: () => true, permitted: () => admitted, observe, launch,
+      readInvocations: async () => parseAgentLogStdout(JSON.stringify(calls), 'pre-PR test recovery'),
+      request: async () => {
+        if (mode === 'source changes during preparation') obs.existingPulls = ['https://github.com/acme/repo/pull/99']
+        return { command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] }
+      } })
+    let runtime = new BehaviorChainRuntime(journal, native)
+    await runtime.run()
+    chain = journal.read(chain.id)!
+    expect(chain.held).toBe(original.error)
+    const failed = structuredClone(chain.invocations.at(-1))
+    expect(launch).not.toHaveBeenCalled()
+    if (mode === 'identical operator hold') chain = record(journal, chain, { type: 'chain.held', reason: original.error })
+    obs.testDependency = { ...obs.testDependency, recovered: mode !== 'unrelated passing run',
+      recovery: { merge: 'b'.repeat(40), base: 'c'.repeat(40), run: { id: 3 } } }
+    obs.prerequisites!.base = 'c'.repeat(40)
+    if (mode === 'changed source') obs.issue.revision = 'changed'
+    if (mode === 'ineligible source') obs.issue.eligible = false
+    if (mode === 'pushed branch') obs.publication.head_sha = 'd'.repeat(40)
+    if (mode === 'bound PR') obs.publication.pull_number = 17
+    if (mode === 'competing work') obs.existingPulls = ['https://github.com/acme/repo/pull/99']
+    if (mode === 'missing review') obs.issue.commentIds = []
+    vi.setSystemTime(NOW + 120_000)
+    await runtime.run()
+    if (mode === 'restart before admission') {
+      expect(journal.read(chain.id)).toMatchObject({ held: null, testRecovery: { hold: { invocationId: 'implementation-3' } } })
+      expect(launch).not.toHaveBeenCalled()
+      journal.rebuild()
+      runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
+      admitted = true
+      await runtime.run()
+    }
+    chain = journal.read(chain.id)!
+    expect(chain.invocations[0]).toEqual(reviewed)
+    expect(chain.invocations[3]).toEqual(failed)
+    if (!['recovery', 'restart before admission'].includes(mode)) {
+      expect(launch).not.toHaveBeenCalled()
+      expect(chain.invocations).toHaveLength(4)
+      return
+    }
+    expect(launch).toHaveBeenCalledTimes(1)
+    const replacement = chain.invocations.at(-1)!
+    expect(chain).toMatchObject({ held: null, resumedAfterSequence: 0, testRecovery: { merge: 'b'.repeat(40), admission: replacement.id } })
+    expect(replacement).toMatchObject({ behavior: 'implement-issue', state: 'started', basis })
+    calls.push({ ...original, id: 'c'.repeat(32), correlation_id: replacement.id, artifact: { phase: 'executing' } })
+    vi.setSystemTime(Date.now() + 120_000)
+    await runtime.run()
+    journal.rebuild()
+    runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
+    // Neither another main commit nor a duplicate passing validation restores
+    // the allowance after the replacement has failed.
+    obs.testDependency.recovery!.base = 'e'.repeat(40)
+    obs.prerequisites!.base = 'e'.repeat(40)
+    for (let tick = 0; tick < 3; tick++) { vi.setSystemTime(Date.now() + 120_000); await runtime.run() }
+    expect(journal.read(chain.id)?.invocations).toHaveLength(5)
+    expect(launch).toHaveBeenCalledTimes(1)
+  })
+
 it.each(['receipt-read', 'observation', 'request-preparation'] as const)(
   'recovers a competing write during %s and advances another chain without a stale effect', async phase => {
     const { journal } = setup()

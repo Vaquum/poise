@@ -25,6 +25,8 @@ export interface ChainObservation extends Record<string, unknown> {
   workPublication?: { callId: string, repliesComplete: boolean, resumable?: boolean, planSha?: string }
   greyRecovery?: { invocationId: string, receipt: Record<string, unknown> }
   ciDependency?: { invocationId: string, base: string, recovered: boolean }
+  testDependency?: { invocationId: string, verified: boolean, recovered: boolean, reason?: string,
+    recovery?: { merge: string, base: string, run: Record<string, unknown> } }
   prerequisites?: { wait: string | null, base: string | null, evidence: Record<string, unknown>[] }
   ciBaseUpdate?: { from: string, head: string, base: string, tree: string }
   fullSuite?: Record<string, unknown>
@@ -55,6 +57,27 @@ function settled(chain: BehaviorChain, behavior: ChainBehavior, basis: string, s
 
 function succeeded(invocation: ChainInvocation): boolean {
   return invocation.evidence?.status === 'completed'
+}
+
+/** This proof comes from Caller's bounded artifact verification, never prose. */
+export function implementationTestDependency(invocation: ChainInvocation) {
+  const evidence = invocation.evidence
+  const artifact = evidence?.artifact as Record<string, unknown> | undefined
+  const prepared = artifact?.prepared as Record<string, unknown> | undefined
+  const proof = artifact?.test_dependency as { verified: boolean, base: string, run: number, runAttempt: number,
+    baselineRun: number, baselineAttempt: number, remediation: string, failures: Array<{ file: string, test: string, cause: string }> } | undefined
+  if (invocation.behavior !== 'implement-issue' || evidence?.status !== 'failed' || evidence.action !== 'not_started'
+    || evidence.outcome !== 'preflight_failed' || evidence.error_code !== 'atomic_work_blocked' || artifact?.phase !== 'executing'
+    || [artifact.plan_sha, artifact.publication_head, artifact.replies_started, artifact.publication, artifact.result,
+      artifact.receipts, evidence.receipts, evidence.review_id, evidence.head_sha, evidence.publicationPlan,
+      evidence.publicationResume, evidence.publicationReceipt, evidence.nativeActionReceipt].some(value => value != null)
+    || !proof || proof.verified !== true || !/^[a-f0-9]{40}$/.test(proof.base) || prepared?.checkout_head !== proof.base
+    || ![proof.run, proof.runAttempt, proof.baselineRun, proof.baselineAttempt].every(id => Number.isSafeInteger(id) && id > 0)
+    || proof.run === proof.baselineRun || typeof proof.remediation !== 'string'
+    || !Array.isArray(proof.failures) || !proof.failures.length || proof.failures.some(failure =>
+      !failure || typeof failure.file !== 'string' || !failure.file || typeof failure.test !== 'string' || !failure.test
+      || typeof failure.cause !== 'string' || !failure.cause.trim())) return null
+  return proof
 }
 
 export function chainCiDependency(chain: BehaviorChain, removal?: string | null) {
@@ -100,6 +123,12 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
   const history = settled(chain, behavior, basis, reviewer?.slot ?? null)
   const successful = [...history].reverse().find(succeeded)
   if (successful) return { kind: 'wait', reason: `${behavior} finished; waiting for its verified artifact or changed input` }
+  if (behavior === 'implement-issue' && chain.testRecovery) {
+    const original = chain.invocations.find(item => item.id === chain.testRecovery!.hold.invocationId)
+    if (chain.testRecovery.admission) return { kind: 'hold', reason: 'the single implementation after verified test recovery was admitted; another attempt requires Resume' }
+    if (!original || original.basis !== basis || original.slot !== reviewer?.slot || original.actor !== actor) return { kind: 'hold', reason: 'verified test recovery no longer matches the original implementation source' }
+    return { kind: 'invoke', behavior, basis, actor, reviewer, reason }
+  }
   const attempts = history.filter((invocation) => invocation.evidence?.status !== 'deferred' && invocation.admissionSequence > chain.resumedAfterSequence)
   if (attempts.length) {
     const last = attempts.at(-1)!

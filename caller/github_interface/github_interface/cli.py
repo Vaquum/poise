@@ -393,6 +393,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--chain-seed":
         parser = argparse.ArgumentParser(prog="github-interface --chain-seed ISSUE")
         parser.add_argument("--branch", required=True)
+        parser.add_argument("--test-dependency-json", help="Verify retained pre-publication exact-base test evidence")
         _add_repository(parser)
         return parser
 

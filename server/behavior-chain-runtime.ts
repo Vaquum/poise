@@ -3,7 +3,7 @@ import { DATASTORE_MAX_AGE_SECONDS, staleDatastoreFailure } from './datastore-he
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, implementationTestDependency, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -110,6 +110,37 @@ function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: n
     && (pull.head === hold.head || observation.ciBaseUpdate?.from === hold.head && observation.ciBaseUpdate.head === pull.head
       && observation.publication.pull_number === pull.number && observation.publication.head_sha === pull.head)
     && pull.checksState === 'SUCCESS' && !pull.pending && pull.failing.length === 0
+}
+
+function recoveredImplementation(chain: BehaviorChain, observation: ChainObservation, now: number): BehaviorChain['testRecovery'] | null {
+  const hold = chain.testHold ?? chain.testRecovery?.hold
+  const original = chain.invocations.find(invocation => invocation.id === hold?.invocationId), evidence = original?.evidence
+  const prepared = (evidence?.artifact as { prepared?: Record<string, unknown> } | undefined)?.prepared
+  const proof = original && implementationTestDependency(original)
+  const recovery = observation.testDependency
+  const publication = observation.publication
+  if (!hold || chain.mergeSha || chain.supersession || chain.testRecovery?.admission
+    || chain.invocations.some(invocation => invocation.state !== 'settled')
+    || !original || original.id !== hold.invocationId || original.callId !== hold.callId || !proof
+    || prepared?.repository !== chain.repository || prepared.issue_number !== chain.issue || prepared.branch !== chain.branch
+    || prepared.actor !== chain.author || prepared.pull_number !== null || prepared.head_sha !== null
+    || chain.held !== null && (!chain.testHold || chain.held !== evidence?.error)
+    || original.actor !== chain.author || original.slot !== observation.implementer.slot
+    || original.basis !== chainBasis(['issue', observation.issue.revision])
+    || !original.request.argv.includes('--expected-issue-revision')
+    || original.request.argv[original.request.argv.indexOf('--expected-issue-revision') + 1] !== observation.issue.revision
+    || !observation.issue.open || !observation.issue.eligible || observation.pull !== null || observation.existingPulls.length
+    || publication.pull_number !== null || publication.head_sha !== null || publication.head_invocation !== null
+    || publication.state !== null || publication.merged !== false || publication.merge_sha !== null
+    || !evidence || !resourceReleaseProven(evidence, true) || typeof evidence.completedAt !== 'number'
+    || !Number.isFinite(evidence.completedAt) || observation.checkedAt < evidence.completedAt
+    || observation.checkedAt < Date.parse(String(evidence.resources_settled_at))
+    || !Number.isFinite(observation.checkedAt) || observation.checkedAt > now || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS
+    || recovery?.invocationId !== original.id || recovery.verified !== true || recovery.recovered !== true
+    || !recovery.recovery || !/^[a-f0-9]{40}$/.test(recovery.recovery.merge) || !/^[a-f0-9]{40}$/.test(recovery.recovery.base)
+    || observation.prerequisites?.base !== recovery.recovery.base
+    || chain.testRecovery && chain.testRecovery.merge !== recovery.recovery.merge) return null
+  return { hold, merge: recovery.recovery.merge, base: recovery.recovery.base }
 }
 
 class ClosedTargetFenceError extends Error {}
@@ -373,6 +404,15 @@ export class BehaviorChainRuntime {
               if (ciRecovered(chain, observation, Date.now())) {
                 chain = this.append(chain, { type: 'chain.resumed', ciRecovery: chain.ciHold })
               }
+              const testRecovery = recoveredImplementation(chain, observation, Date.now())
+              if (chain.testHold && !chain.testRecovery && testRecovery) {
+                chain = this.append(chain, { type: 'chain.resumed', testRecovery })
+              }
+              if (chain.testRecovery && !chain.testRecovery.admission && !testRecovery) {
+                const reason = `Original implementation test recovery awaits current source/publication evidence: ${observation.testDependency?.reason || 'recovery is not verified'}`
+                if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                continue
+              }
               const mergeEvidence = observation.pull?.merged ? {
                 before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
                 firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
@@ -479,6 +519,12 @@ export class BehaviorChainRuntime {
                 // Preparation can await provider/auth/configuration. Recheck admission
                 // at the last boundary, before committing authority for an effect.
                 if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
+                if (decision.behavior === 'implement-issue' && chain.testRecovery && !chain.testRecovery.admission) {
+                  const fresh = await this.operations.observe(chain)
+                  chain = this.append(chain, { type: 'chain.observed', observation: fresh })
+                  if (!recoveredImplementation(chain, fresh, Date.now()) || fresh.prerequisites?.wait !== null) continue
+                  if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
+                }
                 phase = 'invocation-admission'
                 const admitted = this.journal.admitInvocation(chain, randomUUID(), { id, behavior: decision.behavior, basis: decision.basis,
                   actor: decision.actor, model: request.command === 'agent-interface' ? request.argv[request.argv.indexOf('--model') + 1] : null, slot: decision.reviewer?.slot ?? null,
@@ -602,8 +648,10 @@ export class BehaviorChainRuntime {
     const resourceStopped = ['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable', 'resource_receipt_unavailable'].includes(call.error_code || '')
     const workBlocked = call.error_code === 'atomic_work_blocked'
     const ciHold = workBlocked ? ciOnlyHold(invocation, call) : undefined
+    const testHold = !chain.testRecovery && workBlocked && implementationTestDependency({ ...invocation, evidence: receipt(call) })
+      ? { invocationId: invocation.id, callId: call.id } : undefined
     if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: call.error,
-      ...(ciHold ? { ciHold } : {}) })
+      ...(ciHold ? { ciHold } : {}), ...(testHold ? { testHold } : {}) })
     if (stopped && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: `behavior invocation ${invocation.id} was stopped by the person` })
     if (!nativeResourcesReleased(call)) {
       const evidence = { ...receipt(call), callId: call.id, ...(invocation.model === null ? { nativeCallId: call.id } : {}) }
