@@ -108,6 +108,7 @@ import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, requireAgentAccount, BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
+import { readDatastoreView } from './datastore-reader'
 import { behaviorHeld, providerSignInRejected, providerSignInVerified } from './alerts/producers'
 import { retireClearedBehaviorAlerts } from './alerts/notices'
 import { consumeProviderRecovery, providerRecoveryAvailable, providerSignInFailure, recordProviderRecovery } from './accounts/logins'
@@ -2570,6 +2571,36 @@ function parseJson(value: string, operation: string): unknown {
   }
 }
 
+// A datastore view as `github-datastore view …` prints it. Views the
+// in-process reader mirrors exactly (server/datastore-views.ts) are read on
+// its thread, as gh.ts reads the Board's, instead of starting a Python
+// process for each: every tick reads the open pull requests and each
+// incident's target, for every organization. Any other view, and any reader
+// failure, is the CLI's to answer, as before.
+const datastoreReaderFailures = new Set<string>()
+async function datastoreView(args: string[], maxOutputBytes: number): Promise<unknown> {
+  const signal = behaviorSignal()
+  const path = currentOrganization()?.datastorePath
+  signal?.throwIfAborted()
+  const inProcess = path ? readDatastoreView(path, args) : null
+  if (inProcess) {
+    try {
+      const rows = await inProcess
+      signal?.throwIfAborted()
+      return rows
+    } catch (error) {
+      if (signal?.aborted) throw error
+      const message = error instanceof Error ? error.message : String(error)
+      if (!datastoreReaderFailures.has(message)) {
+        datastoreReaderFailures.add(message)
+        console.error(`[behaviors] the in-process datastore read failed, so github-datastore answers it: ${message}`)
+      }
+    }
+  }
+  const { stdout } = await runFile(DATASTORE, datastoreArgs(args), { timeoutMs: 30_000, maxOutputBytes, signal })
+  return parseJson(stdout, `github-datastore ${args.slice(0, 2).join(' ')}`)
+}
+
 function objectValue(value: unknown, operation: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${operation} returned a non-object`)
@@ -2731,12 +2762,7 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
 // filtering the tick applies. Read-only callers (the per-PR status
 // projection) use this so a GET never mutates execution state.
 export async function fetchOpenPrRows(): Promise<DatastorePr[]> {
-  const { stdout } = await runFile(
-    DATASTORE,
-    datastoreArgs(['view', 'pr', '--status', 'open', '--format', 'json']),
-    { timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024, signal: behaviorSignal() },
-  )
-  const parsed = parseJson(stdout, 'github-datastore view pr')
+  const parsed = await datastoreView(['view', 'pr', '--status', 'open', '--format', 'json'], 32 * 1024 * 1024)
   if (!Array.isArray(parsed)) throw new Error('github-datastore view pr returned a non-array')
   const seen = new Set<string>()
   return parsed.map((row, index) => {
@@ -2839,12 +2865,7 @@ export async function forEachPool<T>(items: readonly T[], limit: number, task: (
 // One pull request as the datastore has it, whatever its state; null when it
 // has no such pull request.
 async function readPullRequest(repo: string, number: number): Promise<DatastorePr | null> {
-  const { stdout } = await runFile(
-    DATASTORE,
-    datastoreArgs(['view', 'pr', '--repo', repo, '--number', String(number), '--format', 'json']),
-    { timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
-  )
-  const parsed = parseJson(stdout, 'github-datastore view pr')
+  const parsed = await datastoreView(['view', 'pr', '--repo', repo, '--number', String(number), '--format', 'json'], 1 * 1024 * 1024)
   if (!Array.isArray(parsed)) throw new Error('github-datastore view pr returned a non-array')
   const rows = parsed.map(datastorePr)
   if (rows.length > 1 || rows.some((row) => row.repo !== repo || row.number !== number)) {
@@ -6728,12 +6749,7 @@ function datastoreIssue(row: unknown, index: number, repo: string): DatastoreIss
 }
 
 async function listOpenIssues(repo: string, since: string): Promise<DatastoreIssue[]> {
-  const { stdout } = await runFile(
-    DATASTORE,
-    datastoreArgs(['view', 'issue', '--repo', repo, '--status', 'open', '--created-since-datetime', since, '--limit', '500', '--format', 'json']),
-    { timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024, signal: behaviorSignal() },
-  )
-  const parsed = parseJson(stdout, 'github-datastore view issue')
+  const parsed = await datastoreView(['view', 'issue', '--repo', repo, '--status', 'open', '--created-since-datetime', since, '--limit', '500', '--format', 'json'], 32 * 1024 * 1024)
   if (!Array.isArray(parsed)) throw new Error('github-datastore view issue returned a non-array')
   return parsed.map((row, index) => {
     const issue = datastoreIssue(row, index, repo)
@@ -6745,12 +6761,7 @@ async function listOpenIssues(repo: string, since: string): Promise<DatastoreIss
 // One issue as the datastore has it, whatever its state; null when it has no
 // such issue.
 async function readIssue(repo: string, number: number): Promise<DatastoreIssue | null> {
-  const { stdout } = await runFile(
-    DATASTORE,
-    datastoreArgs(['view', 'issue', '--repo', repo, '--number', String(number), '--format', 'json']),
-    { timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
-  )
-  const parsed = parseJson(stdout, 'github-datastore view issue')
+  const parsed = await datastoreView(['view', 'issue', '--repo', repo, '--number', String(number), '--format', 'json'], 1 * 1024 * 1024)
   if (!Array.isArray(parsed)) throw new Error('github-datastore view issue returned a non-array')
   const rows = parsed.map((row, index) => datastoreIssue(row, index, repo))
   if (rows.length > 1 || rows.some((row) => row.number !== number)) {
