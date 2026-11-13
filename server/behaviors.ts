@@ -3169,6 +3169,14 @@ function settleClaimAfterExit(
             candidate[field] = typeof value === 'string' ? truncateCodePoints(value, 512) : value
           }
           candidate.error = error
+          const artifact = row.artifact as Record<string, unknown> | null | undefined
+          candidate.resource_error = artifact == null ? null
+            : typeof artifact === 'object' && !Array.isArray(artifact) && typeof artifact.resource_error === 'string'
+              ? truncateCodePoints(artifact.resource_error, 512) : null
+          const ownership = row.resource_ownership as { errors?: unknown } | null | undefined
+          candidate.ownership_error = ownership == null ? null
+            : typeof ownership === 'object' && !Array.isArray(ownership) && Array.isArray(ownership.errors)
+              ? (ownership.errors.length > 0 ? 'ownership_failed' : null) : 'invalid_ownership'
           candidate.started_at_precise = row.started_at_precise
           candidate.completed_at = row.completed_at
           candidate.diagnostic = entryDiagnostic

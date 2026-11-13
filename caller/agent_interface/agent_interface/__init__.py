@@ -953,6 +953,15 @@ LOGS_SEARCH_SQL = """lower(
     || ' ' || coalesce(repo,'') || '#' || coalesce(pr_id,'')
     || ' ' || '#' || coalesce(pr_id,'')
     || ' ' || coalesce(session_id,'') || ' ' || coalesce(outcome,'') || ' ' || coalesce(error,'')
+    || ' ' || case when behavior='issue_review' and status='failed' and error_code='issue_revision_changed'
+      and action='not_started' and outcome='preflight_failed'
+      and receipts is null and head_sha is null and review_id is null and review_comments is null
+      and (artifact is null or (json_valid(artifact)
+        and json_extract(artifact,'$.phase')='reviewing'
+        and json_extract(artifact,'$.resource_error') is null))
+      and (resource_ownership is null or (json_valid(resource_ownership)
+        and json_array_length(resource_ownership,'$.errors')=0))
+      then 'superseded issue changed' else '' end
 ) like '%' || ? || '%' escape '\\'"""
 
 
@@ -1146,13 +1155,21 @@ def diagnostics(after: int = 0, limit: int = 3) -> dict:
               and (coalesce(c.error,'') != '' or c.error_code is not null or c.diagnostic is not null))""").fetchone()[0]
         columns = ",".join(f"substr(c.{field},1,512) as {field}" for field in fields)
         rows = conn.execute(f"""select d.seq,{columns},c.started_at,c.ended_at,
-            substr(c.error,1,8192) as error,substr(c.diagnostic,1,65536) as diagnostic
+            substr(c.error,1,8192) as error,substr(c.diagnostic,1,65536) as diagnostic,
+            case when c.artifact is null then null when json_valid(c.artifact)
+            then substr(json_extract(c.artifact,'$.resource_error'),1,512) else 'invalid_artifact' end as resource_error,
+            case when c.resource_ownership is null then null when json_valid(c.resource_ownership)
+            then case when json_array_length(c.resource_ownership,'$.errors') is null then 'invalid_ownership'
+            when json_array_length(c.resource_ownership,'$.errors') > 0 then 'ownership_failed' else null end
+            else 'invalid_ownership' end as ownership_error
             from diagnostic_calls d join calls c on c.id=d.call_id
             where d.seq>? order by d.seq limit ?""", (after, limit + 1)).fetchall()
     events = []
     for row in rows[:limit]:
         entry = {field: row[field] for field in fields}
-        entry.update(seq=row["seq"], error=row["error"], started_at_precise=utc_stamp(row["started_at"]),
+        entry.update(seq=row["seq"], error=row["error"], resource_error=row["resource_error"],
+                     ownership_error=row["ownership_error"],
+                     started_at_precise=utc_stamp(row["started_at"]),
                      completed_at=utc_stamp(row["ended_at"]) if row["ended_at"] else None)
         try:
             raw = row["diagnostic"]
@@ -1229,11 +1246,13 @@ def run_pr_review(
 def record_cleanup_failure(call_id: str) -> None:
     """A run directory that survived deletion keeps its resources unsettled:
     the failure is durable and visible. A legacy sweep cannot retry deletion
-    without original ownership and process-termination proof."""
+    without original ownership and process-termination proof. The diagnostic
+    entry is requeued so a poll that already passed still sees the failure."""
     try:
         with db() as conn:
             conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.resource_error','cleanup_failed') where id=?",
                          (call_id,))
+            conn.execute("delete from diagnostic_calls where call_id=?", (call_id,))
     except Exception as error:
         print(f"call {call_id} cleanup failed and its record could not be updated: {error}", file=sys.stderr)
 

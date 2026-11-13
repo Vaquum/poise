@@ -201,6 +201,86 @@ describe('review worker exit diagnostics', () => {
     } finally { await worker.logging.stopLogging() }
   })
 
+  it('keeps one Caller timeout when the envelope turns on the new resource fields', async () => {
+    const worker = await reviewWorker()
+    try {
+      const truncate = (value: string, limit: number): string => {
+        if (value.length <= limit) return value
+        const chars = Array.from(value)
+        return chars.length > limit ? chars.slice(0, limit).join('') : value
+      }
+      const jsonLength = (value: unknown): number => {
+        const js = JSON.stringify(value) ?? 'null'
+        let separators = 0, extra = 0, inString = false, escaped = false
+        for (const char of js) {
+          if (inString) {
+            if (escaped) { escaped = false; continue }
+            if (char === '\\') { escaped = true; continue }
+            if (char === '"') { inString = false; continue }
+            const code = char.codePointAt(0)!
+            if (code > 127) extra += (code > 0xffff ? 12 : 6) - Buffer.byteLength(char)
+            continue
+          }
+          if (char === '"') { inString = true; continue }
+          if (char === ':' || char === ',') separators += 1
+        }
+        return Buffer.byteLength(js) + separators + extra
+      }
+      const fullError = `Review reached its total time limit; needs attention ${'x'.repeat(9000)}`
+      const truncatedError = truncate(fullError, 8192)
+      const fields = ['id', 'model', 'status', 'pr_id', 'repo', 'actor', 'behavior', 'outcome',
+        'head_sha', 'expected_head', 'source', 'correlation_id', 'action', 'error_code'] as const
+      const candidateSize = (operationLength: number, withNew: boolean): number => {
+        const diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'o'.repeat(operationLength),
+          phase: 'reviewing', outcome: 'timeout', timeout_seconds: 1413, provider_started: true }
+        const candidate: Record<string, unknown> = { seq: 0 }
+        for (const field of fields) {
+          const value = (worker.timeout as Record<string, unknown>)[field]
+          candidate[field] = typeof value === 'string' ? truncate(value, 512) : value
+        }
+        candidate.error = truncatedError
+        if (withNew) candidate.resource_error = null
+        if (withNew) candidate.ownership_error = null
+        candidate.started_at_precise = worker.timeout.started_at_precise
+        candidate.completed_at = worker.timeout.completed_at
+        candidate.diagnostic = diagnostic
+        return jsonLength(candidate)
+      }
+      const baseOld = candidateSize(0, false)
+      const padding = 64 * 1024 - baseOld - 10
+      expect(padding).toBeGreaterThan(0)
+      const diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'o'.repeat(padding),
+        phase: 'reviewing', outcome: 'timeout', timeout_seconds: 1413, provider_started: true }
+      expect(jsonLength(diagnostic)).toBeLessThanOrEqual(65536)
+      expect(candidateSize(padding, false)).toBeLessThanOrEqual(64 * 1024)
+      expect(candidateSize(padding, true)).toBeGreaterThan(64 * 1024)
+      worker.timeout.error = fullError
+      worker.timeout.diagnostic = diagnostic
+      fixture.agentLogs = [worker.timeout]
+      await worker.exit({ code: 1, signal: null })
+
+      const errors = worker.events().filter((event) => event.severity === 'error')
+      expect(errors).toHaveLength(1)
+      const envelopeError = truncate(truncatedError, 2048)
+      expect(errors[0]).toMatchObject({ source: 'caller', callId: worker.timeout.id,
+        correlationId: worker.claim.launchCorrelationId, message: envelopeError })
+      const incidentId = (errors[0] as { incidentId: string }).incidentId
+
+      worker.collector.events = [{ ...worker.timeout, error: envelopeError, diagnostic: null,
+        evidence_unavailable: 'Stored process diagnostic exceeds the bounded metadata envelope' }]
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await worker.logging.stopLogging()
+      writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
+      worker.logging.startLogging()
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
+      const replayed = worker.events().filter((event) => event.severity === 'error')
+      expect(replayed).toHaveLength(1)
+      expect((replayed[0] as { incidentId: string }).incidentId).toBe(incidentId)
+      expect(worker.logging.loggingRuntime()!.health().rejected).toBe(0)
+    } finally { await worker.logging.stopLogging() }
+  })
+
   it.each([
     'missing result', 'unreadable logs', 'malformed diagnostic', 'unavailable evidence', 'foreign invocation',
     'different head', 'different reviewer', 'different source', 'older result', 'unfinished result',
