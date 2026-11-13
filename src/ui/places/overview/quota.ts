@@ -38,9 +38,11 @@ function rememberedQuota(key: string): { at: number, data: GithubQuotaReport } |
 }
 
 export function mountQuota(ctx: PartContext, box: HTMLElement, find: RightFilter): void {
-  const key = quotaKey()
+  let key = quotaKey()
   const last = rememberedQuota(key)
   let quota: Read<GithubQuotaReport> = last ? { data: last.data, error: '', at: last.at } : unread()
+  /** Painted from the last read until a fresh one lands. */
+  let remembered = !!last
   let keptAt = 0
   const n = (value: number) => value.toLocaleString('en-US')
 
@@ -76,6 +78,7 @@ export function mountQuota(ctx: PartContext, box: HTMLElement, find: RightFilter
       const data = await json<GithubQuotaReport>('/api/github-quota')
       if (!Array.isArray(data?.accounts)) throw new Error('the service answered with something this page cannot read')
       quota = { data, error: '', at: Date.now() }
+      remembered = false
       // A place left, or settings changed while it read, keeps nothing.
       if (key && !ctx.signal.aborted && key === quotaKey() && quota.at - keptAt >= KEEP_EVERY_MS) {
         keptAt = quota.at
@@ -90,6 +93,13 @@ export function mountQuota(ctx: PartContext, box: HTMLElement, find: RightFilter
     }
     paint()
   }
+
+  // Settings read afresh for another GitHub user or automation account: the last read no longer stands, and this page keeps nothing.
+  window.addEventListener('poise:settings-read', () => {
+    if (!key || quotaKey() === key) return
+    key = ''
+    if (remembered) { remembered = false; quota = unread(); paint() }
+  }, { signal: ctx.signal })
 
   paint()
   whileVisible(ctx, GITHUB_QUOTA_REFRESH_MS, () => { void read() })

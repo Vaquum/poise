@@ -818,6 +818,26 @@ test('a reload paints Behaviors’ and the API quota’s last reads at once; a s
   expect(posts).toEqual([])
 })
 
+test('Behaviors’ last reads never stand once settings read afresh name other organizations', async ({ page }) => {
+  const settings = { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC',
+    manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }
+  const kept = { key: 'me|acme:ready', at: NOW - 60_000, since: '1970-01-01T00:00:00.000Z', state: { 'review-new-prs': { on: true, paused: null, last: null } },
+    metrics: { error: null, behaviors: {} }, estimates: [] }
+  await page.addInitScript(([last, behaviors]) => { localStorage.setItem('poise-last-settings', last); localStorage.setItem('poise-overview-behaviors', behaviors) }, [JSON.stringify(settings), JSON.stringify(kept)])
+  let settingsRead!: () => void
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], orgs: ['acme', 'beta'], rightLate: new Promise<void>(() => {}),
+    settingsLate: new Promise<void>((resolve) => { settingsRead = resolve }) }
+  await open(page, workspace)
+  const toggle = page.locator('[data-beh="review-new-prs"] [data-act="beh-toggle"]')
+  // Opened on the remembered settings, the switch shows its last state, taking no press.
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+  await expect(toggle).toHaveAttribute('data-why', /Reading what is current/)
+  // Read afresh, the settings name beta too: the last state no longer stands, though Behaviors has not been read.
+  settingsRead()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false')
+  await expect(toggle).toHaveAttribute('data-why', /could not be read/)
+})
+
 test('Behaviors gives every row its runs, time and success, or says why in words (#1382)', async ({ page }) => {
   const metrics = { error: 'Some worker logs are unreadable; affected behavior metrics are unavailable.', behaviors: {
     'review-new-prs': { totalRuns: 12, durationMinutes: 30, successRate: 75 },

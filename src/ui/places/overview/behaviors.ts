@@ -65,10 +65,12 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
   const rowErrors = new Map<BehaviorKey, string>()
   const saving = new Set<BehaviorKey>()
   let generation = 0
-  const key = behaviorsKey()
-  const last = rememberedBehaviors(key)
+  let key = behaviorsKey()
+  let last = rememberedBehaviors(key)
   let metricsFresh = false
   let keptAt = 0
+  /** When the remembered estimates were read: a fresh read is always later. */
+  const keptAtStart = last?.at ?? 0
   if (last) estimates = { data: last.estimates, error: '', at: last.at }
 
   /** Its switch, pause and last run: as read, or as last read while Behaviors reads afresh. */
@@ -201,6 +203,18 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
     }, (error: unknown) => {
       rowErrors.set(key, `Not saved: ${reason(error)}`)
     }).finally(() => { saving.delete(key); paint(); $(`[data-beh="${key}"] [data-act="beh-toggle"]`, box)?.focus() })
+  }, { signal })
+
+  // Settings read afresh may name another GitHub user or other organizations than the page opened on:
+  // the last reads no longer stand, and this page keeps nothing.
+  window.addEventListener('poise:settings-read', () => {
+    if (!key || behaviorsKey() === key) return
+    key = ''
+    if (!last) return
+    last = null
+    if (!metricsFresh) metrics = { ...metrics, data: null }
+    if (estimates.at && !estimates.error && estimates.data && estimates.at <= keptAtStart) estimates = unread()
+    paint()
   }, { signal })
 
   paint()
