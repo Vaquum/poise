@@ -146,7 +146,7 @@ describe('cutover launch boundary', () => {
     mocks.runFile.mockImplementation((command: string, args: string[], options?: { cwd?: string }) =>
       command === 'github-datastore' && args[1] === 'pr-closing'
         ? Promise.resolve({ stdout: JSON.stringify({ prs: [{ repo: chain.repository, number: 18, closes_via: 'closing-references', closing_truncated: false,
-          closing: [{ repo: chain.repository, number: closingIssue }] }] }), stderr: '' }) : run(command, args, options))
+          closing: [{ repo: chain.repository, number: closingIssue }] }], truncated: false, more: false }), stderr: '' }) : run(command, args, options))
     await expect(captured.reviewScope!(chain, { number: 18 })).resolves.toBe('')
     await expect(captured.reviewScope!(remediation, { number: 18 })).resolves.toBe(REMEDIATION_SCOPE)
     closingIssue = 88
