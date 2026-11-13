@@ -876,6 +876,13 @@ not use the gateway's discarded OAuth token.
     gh's accounts and says when either is not signed in to gh.
   - Each command has 10 seconds. Answers are kept for 15 seconds and dropped
     whenever a terminal exits.
+    Codex's version and login-status probes use the same `CODEX_CLI` override
+    when set, otherwise `codex` on PATH, without running CLI maintenance.
+    Only confirmed launcher absence with no configured override and no durable
+    sign-in record stays account status without a Logging Error. Unreadable
+    configuration, broken launchers and unexpected probe failures retain an
+    Error naming the probe purpose and executable; a normal signed-out answer
+    remains account status.
   - Every read records sign-in alerts (`sign_in_needed`): one for an
     installed, configured CLI that says it is not signed in, and one each for
     the person's own account and the GitHub automation account while gh does
