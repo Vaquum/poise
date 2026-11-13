@@ -121,9 +121,15 @@ const AGENT_LOG_SNAPSHOT_TTL_MS = 5_000
  *  every open view polls the running lane. */
 export const RUNNING_SNAPSHOT_SERVED_MS = 30_000
 
+// History leaves out each call's progress events, the largest field: no
+// reader of the whole history uses them (a call's own view reads them by its
+// page, its id or the running read). A Caller from before the flag answers
+// with its usage, and history is read whole, as before.
 const historyAgentLogLane: AgentLogLane = {
-  args: ['--logs'], source: 'agent-interface --logs', running: null, queued: null, cached: null,
+  args: ['--logs', '--without-progress'], source: 'agent-interface --logs', running: null, queued: null, cached: null,
 }
+const FULL_HISTORY_ARGS: readonly string[] = ['--logs']
+let historyArgs: readonly string[] = historyAgentLogLane.args
 
 let historyReadFailure: { id: string, firstFailureAt: string, failedReads: number } | null = null
 
@@ -137,6 +143,7 @@ const selectedAgentLogLanes = new Map<string, AgentLogLane>()
 // Production never calls it; in-flight reads are untouched.
 export function resetAgentLogCache(): void {
   historyAgentLogLane.cached = null
+  historyArgs = historyAgentLogLane.args
   runningAgentLogLane.cached = null
   for (const [key, lane] of selectedAgentLogLanes) {
     lane.cached = null
@@ -309,7 +316,13 @@ async function readHistoryAgentLogSnapshot(signal: AbortSignal): Promise<AgentLo
   let stdout: string
   let snapshot: AgentLogSnapshot
   try {
-    ({ stdout } = await spawnAgentLogRead(historyAgentLogLane.args, signal))
+    try {
+      ({ stdout } = await spawnAgentLogRead(historyArgs, signal))
+    } catch (error) {
+      if (historyArgs === FULL_HISTORY_ARGS || !callerUsageError(error)) throw error
+      historyArgs = FULL_HISTORY_ARGS
+      ;({ stdout } = await spawnAgentLogRead(historyArgs, signal))
+    }
     snapshot = await decodeAgentLogSnapshot(stdout, historyAgentLogLane.source, signal)
   } catch (error) {
     if (!signal.aborted) {
@@ -365,16 +378,21 @@ function spawnAgentLogRead(args: readonly string[], signal: AbortSignal | undefi
     timeoutMs: 30_000,
     maxOutputBytes: AGENT_LOG_READ_CAP_BYTES,
     signal,
-    reportFailure: args !== historyAgentLogLane.args,
+    reportFailure: args !== historyAgentLogLane.args && args !== FULL_HISTORY_ARGS,
   }))
 }
 
 // An older Caller answers the new flags with its usage text. Name the fix;
 // anything else is a real failure and passes through untouched.
+/** Caller answered with its usage text: it does not know these flags. */
+function callerUsageError(error: unknown): boolean {
+  const stderr = (error as { stderr?: unknown } | null)?.stderr
+  return typeof stderr === 'string' && stderr.includes('usage:')
+}
+
 function callerUpdateError(args: readonly string[], error: unknown): Error | null {
   if (args.length < 2) return null
-  const stderr = (error as { stderr?: unknown } | null)?.stderr
-  if (typeof stderr !== 'string' || !stderr.includes('usage:')) return null
+  if (!callerUsageError(error)) return null
   const feature = args.includes('--status') ? 'running-only'
     : args.includes('--limit') ? 'paged' : 'selected'
   return new Error(`Update Caller: ${feature} log reads are unavailable`, { cause: error })

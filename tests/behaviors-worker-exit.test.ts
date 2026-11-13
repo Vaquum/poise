@@ -255,7 +255,10 @@ describe('review worker exit diagnostics', () => {
       const call = worker.timeout
       Object.assign(call, { error_code: null, error: 'error: GitHub 503: Service Unavailable',
         action: 'not_started', outcome: 'preflight_failed', review_policy: 'bounded-v1',
-        diagnostic: severity ? { version: 1, source: 'caller', severity, operation: 'github-interface', phase: 'preflight' } : null })
+        diagnostic: severity ? { version: 1, source: 'caller', severity, operation: 'github-interface', phase: 'preflight' } : null,
+        // The call's own read carries its progress; the whole history does not.
+        progress: { version: 1, phase: 'preflight', phase_started_at: '2026-11-10T17:00:00.000Z', heartbeat_at: '2026-11-10T17:00:01.000Z',
+          last_provider_event_at: null, deadline_at: null, warning: null, events: [] } })
       // The launch cached empty history. One earlier timeout leaves retry
       // budget, but is outside the selected invocation's completion read.
       fixture.agentLogs = [agentLog({ ...call, id: 'e'.repeat(32), correlation_id: 'prior-timeout', diagnostic: null,
@@ -376,7 +379,7 @@ describe('review worker exit diagnostics', () => {
         if (['unreadable retry history', 'missing retry history', 'changed retry evidence'].includes(scenario)) {
           const cli = mocks.runFile.getMockImplementation()!
           mocks.runFile.mockImplementation(async (command, args, ...rest) => {
-            if (command === 'agent-interface' && args.length === 1 && args[0] === '--logs') {
+            if (command === 'agent-interface' && args.join(' ') === '--logs --without-progress') {
               if (scenario === 'unreadable retry history') throw new Error('Caller retry history read failed')
               return { stdout: JSON.stringify(scenario === 'missing retry history' ? [] : [{ ...worker.timeout, review_id: 91 }]), stderr: '' }
             }

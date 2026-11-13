@@ -371,7 +371,10 @@ function arrangeCli(
           body: 'An ordinary unmarked seed', state: 'open', labels: [{ name: 'poise' }] } }), stderr: '' }
     }
     if (command === 'agent-interface' && args[0] === '--logs') {
-      return { stdout: JSON.stringify(agentLogs), stderr: '' }
+      // As Caller answers it: the whole history leaves out progress events.
+      const rows = args.includes('--without-progress')
+        ? agentLogs.map(({ progress: _progress, ...row }) => row) : agentLogs
+      return { stdout: JSON.stringify(rows), stderr: '' }
     }
     throw new Error(`unexpected CLI call: ${command} ${args.join(' ')}`)
   })

@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -104,6 +104,26 @@ describe('production server', () => {
 
     const asset = await fetch(`${baseUrl}/assets/app.js`)
     expect(asset.headers.get('cache-control')).toBe('public, max-age=31536000, immutable')
+  })
+
+  it('answers a page route from the current index.html, and as not modified while it is unchanged', async () => {
+    const index = join(staticDir, 'index.html')
+    const first = await fetch(`${baseUrl}/chat`, { headers: { Accept: 'text/html' } })
+    expect(first.status).toBe(200)
+    expect(await first.text()).toContain('Poise test')
+    expect(first.headers.get('cache-control')).toBe('no-cache')
+    expect(first.headers.get('content-type')).toContain('text/html')
+    const etag = first.headers.get('etag')!
+    expect((await fetch(`${baseUrl}/chat`, { headers: { Accept: 'text/html', 'If-None-Match': etag } })).status).toBe(304)
+    const original = await readFile(index, 'utf8')
+    try {
+      await writeFile(index, '<!doctype html><title>Poise next build</title>')
+      const next = await fetch(`${baseUrl}/chat`, { headers: { Accept: 'text/html' } })
+      expect(await next.text()).toContain('Poise next build')
+      expect(next.headers.get('etag')).not.toBe(etag)
+    } finally {
+      await writeFile(index, original)
+    }
   })
 
   it.runIf(process.platform !== 'win32')('does not serve symlinks that escape the static root', async () => {

@@ -83,6 +83,27 @@ def test_a_persistence_failure_with_an_earlier_diagnostic_remains_an_error(capsy
     assert capsys.readouterr().out == ""
 
 
+def test_a_write_failure_with_a_retained_response_keeps_it_readable_and_nests_the_earlier_diagnostic(monkeypatch, capsys):
+    call_id = api.track("fixture", "prompt")
+    retained_path = api.caller_store.response_name(api.RESPONSES / f"{call_id}.txt")
+    (api.RESPONSES / f"{call_id}.txt").write_text("retained")
+    with api.db() as conn:
+        conn.execute("update calls set response_path=? where id=?", (retained_path, call_id))
+    def fail(*args, **kwargs):
+        raise OSError("simulated storage failure")
+    monkeypatch.setattr(api.caller_store, "write_response_text", fail)
+    api.finish(call_id, "completed", response="final",
+               diagnostic={"operation": "provider.review", "phase": "submitting", "outcome": "exit"})
+    with api.db() as conn:
+        row = conn.execute("select response_path,diagnostic from calls where id=?", (call_id,)).fetchone()
+    assert row["response_path"] == retained_path
+    stored = json.loads(row["diagnostic"])
+    assert (stored["phase"], stored["outcome"]) == ("response_persist", "persist_failed")
+    assert stored["prior"]["phase"] == "submitting"
+    api.read_response(call_id)
+    assert capsys.readouterr().out == "retained\n"
+
+
 def test_a_fenced_superseded_call_without_a_response_is_ordinary_absence(capsys):
     fenced = api.fence_closed_behavior(model="original-model", actor="author", repository="example/repo",
                                        number=17, behavior="repair_pr", correlation_id="test-fence",

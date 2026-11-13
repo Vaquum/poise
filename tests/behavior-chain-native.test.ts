@@ -357,10 +357,12 @@ it('retires an already-held closed binding after a different PR closes the seed,
 }, 30_000)
 
 it.each([
-  { blockers: [], mergeable: true, expected: 'approve-pr' },
-  { blockers: ['merge_state_not_clean'], mergeable: true, expected: 'repair-pr' },
-  { blockers: ['not_mergeable'], mergeable: false, expected: 'repair-pr' },
-])('uses native readiness policy for behind branches and still repairs actual conflicts: $expected', async ({ blockers, mergeable, expected }) => {
+  { name: 'clean', blockers: [], mergeable: true, mergeState: 'clean', expected: 'review-pr' },
+  { name: 'behind with queue integration', blockers: [], mergeable: true, mergeState: 'behind', expected: 'review-pr' },
+  { name: 'behind requiring a base update', blockers: ['merge_state_not_clean'], mergeable: true, mergeState: 'behind', expected: 'review-pr' },
+  { name: 'conflicting', blockers: ['not_mergeable'], mergeable: false, mergeState: 'dirty', expected: 'repair-pr' },
+])('selects $expected for an unreviewed $name PR using exact-head native evidence', async ({ blockers, mergeable, mergeState, expected }) => {
+  let ciHead = HEAD
   mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
     const evidence: Record<string, unknown> = {
       '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
@@ -369,19 +371,31 @@ it.each([
       '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
       '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: false,
         unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0, green: false, blockers: [...blockers, 'reviewer_not_approved_current_head'] },
-      '--list-failing-ci': { head_sha: HEAD, pull_number: 21, failing: [], mergeable, mergeable_state: mergeable ? 'behind' : 'dirty' },
+      '--list-failing-ci': { head_sha: ciHead, pull_number: 21, failing: [], mergeable, mergeable_state: mergeState },
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
     return { stdout: JSON.stringify(evidence[argv[0]]) }
   })
   const operations = nativeChainOperations({ login: 'example' } as Organization, {
-    roster: async () => ({ issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
+    roster: async () => ({ issueReviewers: [], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer }),
     resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
     capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
     reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
   })
   const observation = await operations.observe(chain)
-  expect(decideBehaviorChain(chain, observation, Date.now())).toMatchObject({ kind: 'invoke', behavior: expected })
+  expect(observation.pull).toMatchObject({ reviewIds: [], reviewReceipts: [], failing: [], pending: false,
+    conflict: !mergeable, behind: mergeState === 'behind' && blockers.includes('merge_state_not_clean') })
+  const decision = decideBehaviorChain(chain, observation, Date.now())
+  expect(decision).toMatchObject({ kind: 'invoke', behavior: expected })
+  if (expected === 'repair-pr') {
+    if (decision.kind !== 'invoke') throw new Error('expected conflict repair')
+    const request = await operations.request(chain, observation, decision, 'conflict-repair')
+    expect(request).toMatchObject({ command: 'agent-interface', context: { head: HEAD, reviewRevision: 'reviews' } })
+    expect(request?.argv).toEqual(expect.arrayContaining(['--atomic-work', 'example/repo#7', '--actor', 'author',
+      '--pull-number', '21', '--expected-head', HEAD, '--merge-base']))
+    ciHead = 'c'.repeat(40)
+    await expect(operations.observe(chain)).rejects.toThrow('native PR observations changed head or are incomplete')
+  }
 })
 
 it('records a pull closed without merging, which carries no queue removal evidence, and holds', async () => {
