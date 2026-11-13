@@ -337,7 +337,6 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       cache.set(chain.id, { revision: chain.sequence, progress })
       const active = chain.invocations.find(invocation => invocation.state !== 'settled')
       const ageMs = Math.max(0, now - progress.at)
-      if (!chain.held && !chain.reviewPending && active?.state !== 'uncertain' && ageMs < CHAIN_ATTENTION_DELAY_MS) continue
       const observation = chain.observation as ChainObservation | null
       const pull = exactPull(observation)
       const state = !observation ? 'unavailable' : !Number.isFinite(observation.checkedAt) || observation.checkedAt > now
@@ -345,10 +344,11 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         ? 'incomplete' : now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS ? 'stale'
           : observation.pull && (!pull || !['SUCCESS', 'PENDING', 'EXPECTED', 'FAILURE', 'ERROR'].includes(pull.checksState ?? '')) ? 'incomplete' : 'fresh'
       const queueReviewConflict = state === 'fresh' && observation && pull?.state === 'open' && !pull.merged && !chain.mergeSha
-        && pull.queueEntry && (needsPrReview(chain, observation, pull) || prReviewMissingArtifact(chain, observation, pull)
+        && pull.queueEntry && (pull.changesRequested || needsPrReview(chain, observation, pull) || prReviewMissingArtifact(chain, observation, pull)
           || !chain.invocations.some(invocation => invocation.state === 'settled' && invocation.evidence?.status === 'completed'
             && ['reviewed_clean', 'approved'].includes(String(invocation.evidence.action))
             && chainReviewResponse(chain, invocation, observation, now)))
+      if (!queueReviewConflict && !chain.held && !chain.reviewPending && active?.state !== 'uncertain' && ageMs < CHAIN_ATTENTION_DELAY_MS) continue
       const gates = pull ? [
         `Head ${pull.head.slice(0, 12)}`,
         pull.failing?.length ? `CI failing: ${pull.failing.join(', ')}` : pull.pending ? 'Required CI pending'
@@ -501,7 +501,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         && chain.invocations.some(invocation => invocation.behavior === 'merge-pr' && invocation.state === 'settled'
           && invocation.evidence?.status === 'completed' && invocation.basis === mergeBasis && invocation.slot === null)
       let next = queueReviewConflict && pull
-        ? `PR ${chain.repository}#${pull.number} head ${pull.head}, queue entry ${pull.queueEntry}: remove it from the merge queue and disable auto-merge if enabled; reconcile the missing required retained Poise review evidence before resuming. Resuming alone cannot stop GitHub merging.`
+        ? `PR ${chain.repository}#${pull.number} head ${pull.head}, queue entry ${pull.queueEntry}: remove it from the merge queue and disable auto-merge if enabled; reconcile the required retained Poise review evidence before resuming. Resuming alone cannot stop GitHub merging.`
         : chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : resourceContradicted ? `Hold: Invocation ${resourceContradicted.id} has contradictory resource-release evidence; ownership remains held`
@@ -595,7 +595,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
           : !chain.held ? chain.waiting || (pull ? 'PR merge gates' : 'Issue admission')
           : last ? `${last.behavior}: ${last.outcome ?? last.state}` : 'Issue admission',
         progressAt: progress.at, ageMs,
-        blocker: preview([chain.held, active?.state === 'uncertain' ? active.outcome || 'Original receipt unverified' : null,
+        blocker: preview([queueReviewConflict ? 'Queue admission conflicts with required retained Poise review evidence' : null,
+          chain.held, active?.state === 'uncertain' ? active.outcome || 'Original receipt unverified' : null,
           chain.reviewPending ? 'Original pre-merge review evidence pending' : null, chain.waiting].filter(Boolean).join('; ')
           || 'No verified progress for at least 24 hours'),
         evidence: { state, checkedAt: observation?.checkedAt ?? null, gates: gates.map(preview) },

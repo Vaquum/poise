@@ -110,7 +110,8 @@ History exposes each `chain.merged` event's recorded `evidence.review_complete` 
 Notifications lists each delayed or held admitted issue's step,
 progress age, hold, exact-head CI/review gates and next known action, with issue,
 PR links and a Journal evidence action that opens the same journal in Observe → Tasks. Held, uncertain and pending-original-review work
-appears immediately; other active work appears after 24 hours without a verified
+appears immediately, as does a fresh queue/review conflict even while a review is
+running or awaiting capacity; other active work appears after 24 hours without a verified
 advance. Selection covers every active chain page, including unpublished issues
 and merged PRs with pending review evidence, sorted by oldest progress first.
 The clock starts at admission. Canonical history advances it on a newly verified
@@ -234,12 +235,17 @@ journal errors and unreadable native receipts still surface; concurrent exit
 evidence and original invocation correlations and uncertainty are preserved.
 
 Held open PRs are rechecked every two minutes through that same scheduler,
-including after a head change. Fresh queue evidence without the required retained
+including after a head change. Running PR reviews also refresh their open PR
+observation at that two-minute boundary without settling or replacing the original
+invocation. Fresh queue evidence without the required retained
 exact-head/context reviews surfaces a conflict in work diagnostics, naming the
 PR, head and queue entry. The next action directs removal from the queue and
 disabling auto-merge if enabled before reconciling the original review receipts;
 Resume alone cannot stop GitHub merging. Stale or incomplete observations do not
 emit this conflict. The hold and original receipts remain unchanged.
+The conflict stays actionable after a retained changes-requested verdict while
+the queue entry persists. It clears when qualifying review evidence is retained
+without current change requests, or a fresh observation finds the queue entry gone.
 
 Other successful quiescent observations schedule their next read at `checkedAt +
 min(24 hours, max(2 minutes, checkedAt - origin))`. Origin is the recorded actual
