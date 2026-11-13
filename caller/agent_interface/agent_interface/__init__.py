@@ -1637,7 +1637,7 @@ def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
     conn.execute("update calls set action='not_started', outcome='preflight_failed', head_sha=null "
                  "where id=? and source='poise:behavior-chain' and status='failed' and resources_settled_at is not null and "
                  "coalesce(error_code,'') not in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable') and "
-                 "json_valid(artifact) and (json_extract(artifact,'$.phase') in ('preparing','prepared','executing','reviewing') "
+                 "json_valid(artifact) and (json_extract(artifact,'$.phase') in ('preparing','prepared','executing','reviewing','preparing_publication') "
                  "or (action_plan is null and behavior in ('issue_review','implement_issue','repair_pr')))",
                  (call_id,))
 
