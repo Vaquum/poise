@@ -2145,6 +2145,23 @@ def _repeat_only_refusal(failure: BaseException) -> bool:
             and diagnostic.get("refusal") == "repeat_only")
 
 
+def _pre_post_no_action_proof(call_id: str, failure: review_budget.ReviewLimitError, receipt: dict | None,
+                              capped: bool) -> bool:
+    # Capped approvals can also file an issue outside this inventory.
+    if failure.code != "review_budget_exhausted" or receipt is not None or capped:
+        return False
+    with db() as conn:
+        original = conn.execute("select artifact,review_id,receipts,head_sha from calls where id=?",
+                                (call_id,)).fetchone()
+    # The durable pre-POST phase, not a diagnostic alone, proves
+    # that this invocation never attempted publication.
+    return (original is not None
+            and json.loads(original["artifact"] or "{}").get("phase") == "reviewing"
+            and all(original[key] is None for key in ("review_id", "receipts", "head_sha"))
+            and not review_receipt.failure() and not review_receipt.conflict()
+            and (failure.diagnostic or {}).get("submission") in {None, "none"})
+
+
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
                               capped=False, review_round=None, review_cap=None, review_scope=""):
     # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
@@ -2174,19 +2191,7 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         try:
             facts = review_facts(mod, pr, pwd, actor, head, 0)
             receipt = review_receipt.get()
-            deadline_no_action = False
-            # Capped approvals can also file an issue outside this inventory.
-            if failure.code == "review_budget_exhausted" and receipt is None and not capped:
-                with db() as conn:
-                    original = conn.execute("select artifact,review_id,receipts,head_sha from calls where id=?",
-                                            (call_id,)).fetchone()
-                # The durable pre-POST phase, not a diagnostic alone, proves
-                # that this invocation never attempted publication.
-                deadline_no_action = (original is not None
-                                      and json.loads(original["artifact"] or "{}").get("phase") == "reviewing"
-                                      and all(original[key] is None for key in ("review_id", "receipts", "head_sha"))
-                                      and not review_receipt.failure() and not review_receipt.conflict()
-                                      and (failure.diagnostic or {}).get("submission") in {None, "none"})
+            deadline_no_action = _pre_post_no_action_proof(call_id, failure, receipt, capped)
             proven = receipt is None and (deadline_no_action if failure.code == "review_budget_exhausted"
                                          else _proven_no_action(failure))
             # A re-verdict submits anew: even proven no-action needs the
@@ -2258,6 +2263,11 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         try:
             review_budget.timeout(seconds, reserve=review_budget.FINAL_CHECK_SECONDS)
         except review_budget.ReviewLimitError as exhausted:
+            # Quiet verification already authorized a retry; a budget
+            # exhaustion then defers it to backoff instead of recovery.
+            if _pre_post_no_action_proof(call_id, exhausted, receipt, capped):
+                message = f"{exhausted}; prior: {failure}" if verdict_failure else str(exhausted)
+                raise atoms.AgentPreflightError(message, exhausted.code, exhausted.diagnostic) from exhausted
             if verdict_failure:
                 raise review_budget.ReviewLimitError(
                     f"{exhausted}; prior: {failure}", exhausted.code, exhausted.diagnostic) from exhausted
