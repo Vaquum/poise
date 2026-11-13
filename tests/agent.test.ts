@@ -944,6 +944,16 @@ describe('stopping a run', () => {
     await expect(stopAgentJob('A'.repeat(32))).resolves.toEqual({ id: 'a'.repeat(32), stopped: true, status: 'failed', error_code: 'stopped' })
     expect(mocks.runFile).toHaveBeenCalledWith('agent-interface', ['--stop', 'a'.repeat(32)], expect.objectContaining({ timeoutMs: 30_000 }))
   })
+  it('drops the running views\' last snapshot once a run is stopped', async () => {
+    const { stopAgentJob } = await import('../server/agent')
+    mocks.runFile.mockResolvedValueOnce({ stdout: JSON.stringify([logRow({ status: 'running', completed_at: null })]), stderr: '' })
+    expect((await fetchRunningAgentLogSnapshot()).entries).toHaveLength(1)
+    mocks.runFile.mockResolvedValueOnce({ stdout: JSON.stringify({ id: 'a'.repeat(32), stopped: true, status: 'failed', error_code: 'stopped' }), stderr: '' })
+    await stopAgentJob('a'.repeat(32))
+    mocks.runFile.mockResolvedValueOnce({ stdout: '[]', stderr: '' })
+    expect((await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).entries).toEqual([])
+    expect(mocks.runFile).toHaveBeenCalledTimes(3)
+  })
   it('refuses a malformed id before running anything, and an old Caller after', async () => {
     const { stopAgentJob } = await import('../server/agent')
     await expect(stopAgentJob('../etc')).rejects.toThrow('invalid agent call id')
@@ -1332,6 +1342,31 @@ describe('selected agent-log reads', () => {
       expect(mocks.runFile).toHaveBeenCalledTimes(2)
       answer({ stdout: JSON.stringify([logRow({ id: 'b'.repeat(32) })]), stderr: '' })
       await vi.waitFor(async () => expect((await fetchSelectedAgentLogSnapshot(own, { lastObserved: true })).entries[0]!.id).toBe('b'.repeat(32)))
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('answers the running views at once from a running snapshot within their age, and reads an older one now', async () => {
+    const running = (overrides: Record<string, unknown> = {}) => logRow({ status: 'running', completed_at: null, ...overrides })
+    mocks.runFile.mockResolvedValueOnce({ stdout: JSON.stringify([running()]), stderr: '' })
+    const first = await fetchRunningAgentLogSnapshot()
+    let answer!: (value: { stdout: string, stderr: string }) => void
+    mocks.runFile.mockImplementation(() => new Promise(resolve => { answer = resolve }))
+    const start = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start + 6_000)
+    try {
+      // Past its five seconds, within the views' age: at once, read again behind.
+      expect(await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).toBe(first)
+      expect(mocks.runFile).toHaveBeenCalledTimes(2)
+      answer({ stdout: JSON.stringify([running({ id: 'b'.repeat(32) })]), stderr: '' })
+      await vi.waitFor(async () => expect((await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).entries[0]!.id).toBe('b'.repeat(32)))
+      // Older than the views' age: the reader waits for a read of now.
+      clock.mockReturnValue(start + 60_000)
+      const waiting = fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })
+      expect(mocks.runFile).toHaveBeenCalledTimes(3)
+      answer({ stdout: JSON.stringify([running({ id: 'c'.repeat(32) })]), stderr: '' })
+      expect((await waiting).entries[0]!.id).toBe('c'.repeat(32))
     } finally {
       clock.mockRestore()
     }

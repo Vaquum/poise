@@ -32,7 +32,7 @@ import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations
 import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { startAgentCollaboratorRuntime, stopAgentCollaboratorRuntime } from './agent-collaborator'
-import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
+import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob, RUNNING_SNAPSHOT_SERVED_MS } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
 import { readBehaviorEstimates } from './behavior-estimates'
 import { listCapabilities } from './capabilities'
@@ -905,7 +905,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // pages never queue it. Filtering stays here too, so the read
             // is exact even when Caller cannot pre-filter.
             if (status !== null) {
-              const snapshot = await fetchRunningAgentLogSnapshot()
+              const snapshot = await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: RUNNING_SNAPSHOT_SERVED_MS })
               const selected = snapshot.entries.filter((entry) => belongs(entry.repo))
               const quarantined = snapshot.quarantined.filter((row) => !row.repo || belongs(row.repo)
                 || selected.some((entry) => row.id === entry.id
@@ -940,7 +940,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (path === '/api/behavior-estimates' && req.method === 'GET') {
           try {
             // The whole history only shapes the estimates: its last snapshot answers at once.
-            const [running, history] = await Promise.all([fetchRunningAgentLogSnapshot(), fetchAgentLogSnapshot({ lastObserved: true })])
+            const [running, history] = await Promise.all([
+              fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: RUNNING_SNAPSHOT_SERVED_MS }),
+              fetchAgentLogSnapshot({ lastObserved: true }),
+            ])
             return json(res, 200, { estimates: readBehaviorEstimates(history.entries, running.entries) })
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })
