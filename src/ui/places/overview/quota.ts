@@ -1,6 +1,7 @@
 // GitHub API quota in Overview (O13): one card per account, REST and GraphQL,
 // live every 15 seconds whatever the day. Classic Analytics' read and words
 // (src/views/analytics-view.ts, src/github-quota.ts).
+import { getSettings } from '../../../config'
 import { GITHUB_QUOTA_REFRESH_MS, quotaHours, quotaRiskTone, type GithubQuotaReport } from '../../../github-quota'
 import { noticeFeed, type ReadFailure } from '../../../notices'
 import { placeHref } from '../../address'
@@ -12,8 +13,37 @@ import { clockAt, json, reason, readLine, unread, whileVisible, type Read, type 
 // Classic's yellow, orange and red, in the new interface's words.
 const TONE: Record<string, string> = { '': 'ok', yellow: 'low', orange: 'mid', red: 'high' }
 
+/** The last read, kept across page loads: a reload paints it at once, then
+ *  reads again. It stands only for the GitHub user and the automation account
+ *  it was read for, and keeps only what the cards draw: REST and GraphQL with
+ *  their hourly samples. Written at most once a minute. */
+const LAST_QUOTA_KEY = 'poise-overview-quota'
+const KEEP_EVERY_MS = 60_000
+function quotaKey(): string {
+  const settings = getSettings()
+  return settings.me ? `${settings.me}|${settings.agentAccount ?? ''}` : ''
+}
+const drawn = (data: GithubQuotaReport): GithubQuotaReport => ({
+  accounts: data.accounts.map((account) => ({ login: account.login, roles: account.roles, checkedAt: account.checkedAt, error: account.error,
+    buckets: account.buckets.filter((bucket) => bucket.resource === 'core' || bucket.resource === 'graphql').map((bucket) => ({ ...bucket, history: (bucket.history ?? []).slice(-24) })) })),
+})
+function rememberedQuota(key: string): { at: number, data: GithubQuotaReport } | null {
+  if (!key) return null
+  try {
+    const last = JSON.parse(localStorage.getItem(LAST_QUOTA_KEY) ?? 'null') as { key?: unknown, at?: unknown, data?: GithubQuotaReport } | null
+    return last?.key === key && typeof last.at === 'number' && Array.isArray(last.data?.accounts) ? { at: last.at, data: last.data! } : null
+  } catch {
+    return null
+  }
+}
+
 export function mountQuota(ctx: PartContext, box: HTMLElement, find: RightFilter): void {
-  let quota: Read<GithubQuotaReport> = unread()
+  let key = quotaKey()
+  const last = rememberedQuota(key)
+  let quota: Read<GithubQuotaReport> = last ? { data: last.data, error: '', at: last.at } : unread()
+  /** Painted from the last read until a fresh one lands. */
+  let remembered = !!last
+  let keptAt = 0
   const n = (value: number) => value.toLocaleString('en-US')
 
   function paint(): void {
@@ -48,6 +78,12 @@ export function mountQuota(ctx: PartContext, box: HTMLElement, find: RightFilter
       const data = await json<GithubQuotaReport>('/api/github-quota')
       if (!Array.isArray(data?.accounts)) throw new Error('the service answered with something this page cannot read')
       quota = { data, error: '', at: Date.now() }
+      remembered = false
+      // A place left, or settings changed while it read, keeps nothing.
+      if (key && !ctx.signal.aborted && key === quotaKey() && quota.at - keptAt >= KEEP_EVERY_MS) {
+        keptAt = quota.at
+        try { localStorage.setItem(LAST_QUOTA_KEY, JSON.stringify({ key, at: quota.at, data: drawn(data) })) } catch { /* the next page reads it anew */ }
+      }
       const failures: ReadFailure[] = data.accounts.flatMap((account) => account.error ? [{ key: `quota:${account.login.toLowerCase()}`, title: `GitHub quota for ${account.login} is unavailable`, body: account.error }] : [])
       noticeFeed.reportReadErrors('overview-quota', failures)
     } catch (error) {
@@ -57,6 +93,13 @@ export function mountQuota(ctx: PartContext, box: HTMLElement, find: RightFilter
     }
     paint()
   }
+
+  // Settings read afresh for another GitHub user or automation account: the last read no longer stands, and this page keeps nothing.
+  window.addEventListener('poise:settings-read', () => {
+    if (!key || quotaKey() === key) return
+    key = ''
+    if (remembered) { remembered = false; quota = unread(); paint() }
+  }, { signal: ctx.signal })
 
   paint()
   whileVisible(ctx, GITHUB_QUOTA_REFRESH_MS, () => { void read() })

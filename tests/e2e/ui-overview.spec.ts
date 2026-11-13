@@ -62,6 +62,14 @@ interface Workspace {
   prs?: unknown[]
   /** Every read Answer here's entries come from waits for this first. */
   answersLate?: Promise<void>
+  /** Behaviors' state, runs and estimates and the API quota wait for this first. */
+  rightLate?: Promise<void>
+  /** Each behavior's state, as /api/behaviors answers it beside its diagnostics. */
+  behaviorStates?: Record<string, unknown>
+  /** What /api/github-quota answers. */
+  quota?: unknown
+  /** /api/behavior-estimates fails. */
+  estimatesFail?: boolean
   /** /api/behaviors fails. */
   behaviorsFail?: boolean
   /** The organizations /api/settings names, all ready; acme alone unless set. */
@@ -95,6 +103,8 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     const path = url.pathname
     if (method === 'GET' && workspace.answersLate && ['/api/notices', '/api/chat/requests', '/api/chat/switchboard', '/api/editor/reviews', '/api/behavior-chains', '/api/behaviors',
       '/api/behavior-ledger/pr-status', '/api/answers/dismissals'].includes(path)) await workspace.answersLate
+    if (path === '/api/behavior-estimates' && workspace.estimatesFail) return json(route, { error: 'estimates are unavailable' }, 503)
+    if (method === 'GET' && workspace.rightLate && ['/api/behaviors', '/api/behavior-metrics', '/api/behavior-estimates', '/api/github-quota'].includes(path)) await workspace.rightLate
     if (path === '/api/notices' && method === 'GET') return json(route, { enabled: true, notices: workspace.notices })
     if (path === '/api/notices/handled') return json(route, { handled: [] })
     if (path === '/api/chat/requests') { await workspace.requestsLate; return json(route, { revision: workspace.revision, complete: true, requests: workspace.requests }) }
@@ -131,7 +141,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     }
     if (path === '/api/answers/dismissals') return json(route, { dismissals: workspace.dismissals ?? [] })
     if (path === '/api/behaviors' && workspace.behaviorsFail) return json(route, { error: 'behaviors are unavailable' }, 503)
-    if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: workspace.agentLogsError ?? null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
+    if (path === '/api/behaviors') return json(route, { ...workspace.behaviorStates, diagnostics: { status: 'ok', agentLogsError: workspace.agentLogsError ?? null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
     if (path === '/api/settings' && method === 'GET') await workspace.settingsLate
     if (path === '/api/settings' && method === 'GET') return json(route, { org: '', organizations: (workspace.orgs ?? ['acme']).map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })), me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
     if (path === '/api/analytics') return json(route, { window: { since: url.searchParams.get('since'), until: url.searchParams.get('until') }, agentAccount: 'bot', ...day, ...(url.searchParams.get('dailyBounds') ? { daily: Array.from({ length: 7 }, () => day) } : {}), errors: [] })
@@ -139,7 +149,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       const bounds = (url.searchParams.get('bounds') ?? '').split(',')
       return json(route, { periods: bounds.slice(1).map((until, i) => ({ since: bounds[i], until, ...day })), errors: [] })
     }
-    if (path === '/api/github-quota') return json(route, { accounts: [] })
+    if (path === '/api/github-quota') return json(route, workspace.quota ?? { accounts: [] })
     if (path === '/api/behavior-metrics') {
       (workspace.metricsAsked ??= []).push(url.searchParams)
       return workspace.metricsFail ? json(route, { error: 'metrics refresh unavailable' }, 503) : json(route, workspace.metrics ?? { behaviors: {}, error: null })
@@ -782,6 +792,68 @@ test('System health reads its five cards live, and a failed read keeps them, wit
     await expect(card('ov.h.errors').locator(':scope > .t-gloss')).toBeVisible()
     await expect(card('ov.h.errors')).toHaveAttribute('href', '?view=observe&part=logging&back=overview')
   }
+})
+
+test('a reload paints Behaviors’ and the API quota’s last reads at once; a switch waits for the fresh read', async ({ page }) => {
+  const quota = { accounts: [{ login: 'me', roles: ['user'], checkedAt: ago(1), error: null, buckets: [{ resource: 'core', label: 'REST', limit: 5000, used: 1200, remaining: 3800,
+    resetAt: new Date(NOW + 30 * 60_000).toISOString(), perMinute: 4, riskPercent: 0, history: [] }] }] }
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, quota, behaviorStates: { 'review-new-prs': { enabled: true, lastTriggered: { at: ago(10), target: 'acme/site#42' } } },
+    metrics: { error: null, behaviors: { 'review-new-prs': { totalRuns: 12, durationMinutes: 30, successRate: 75 } } } }
+  await open(page, workspace)
+  const row = page.locator('[data-beh="review-new-prs"]')
+  const toggle = row.locator('[data-act="beh-toggle"]')
+  await expect(row.locator('td.num').first()).toHaveText('12')
+  await expect(page.locator('[data-quota]')).toContainText('1,200 of 5,000 used')
+  // Read afresh, they are kept for the next load: only what the panels draw.
+  await expect.poll(() => page.evaluate(() => [localStorage.getItem('poise-overview-behaviors'), localStorage.getItem('poise-overview-quota')].map((value) => value ? JSON.parse(value).key : null)))
+    .toEqual(['me|acme:ready', 'me|bot'])
+  // The next load, with every read held back: the last reads paint at once, the switch as it was but taking no press.
+  let release!: () => void
+  workspace.rightLate = new Promise<void>((resolve) => { release = resolve })
+  workspace.metrics = { error: null, behaviors: { 'review-new-prs': { totalRuns: 13, durationMinutes: 31, successRate: 80 } } }
+  const posts: string[] = []
+  page.on('request', (request) => { if (request.method() === 'POST' && new URL(request.url()).pathname.startsWith('/api/behaviors')) posts.push(request.url()) })
+  await page.reload()
+  await expect(row.locator('td.num').first()).toHaveText('12')
+  await expect(page.locator('[data-quota]')).toContainText('1,200 of 5,000 used')
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+  await expect(toggle).toHaveAttribute('aria-disabled', 'true')
+  await expect(toggle).toHaveAttribute('data-why', /Reading what is current/)
+  await toggle.dispatchEvent('click')
+  // The search finds what a row shows, its remembered last run included.
+  await page.getByRole('searchbox', { name: 'Filter this side' }).fill('site#42')
+  await expect(row).toBeVisible()
+  await expect(page.locator('[data-beh="approve-prs"]')).toHaveCount(0)
+  await page.getByRole('searchbox', { name: 'Filter this side' }).fill('')
+  // The fresh reads replace them, and the switch works.
+  release()
+  await expect(row.locator('td.num').first()).toHaveText('13')
+  await expect(toggle).not.toHaveAttribute('aria-disabled', 'true')
+  expect(posts).toEqual([])
+})
+
+test('Behaviors’ last reads never stand once settings read afresh name other organizations', async ({ page }) => {
+  const settings = { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC',
+    manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }
+  const kept = { key: 'me|acme:ready', at: NOW - 60_000, since: '1970-01-01T00:00:00.000Z', state: { 'review-new-prs': { on: true, paused: null, last: null } },
+    metrics: { error: null, behaviors: {} }, estimates: [{ id: 'r1', behavior: 'pr_review', startedAt: ago(2), estimate: null }] }
+  await page.addInitScript(([last, behaviors]) => { localStorage.setItem('poise-last-settings', last); localStorage.setItem('poise-overview-behaviors', behaviors) }, [JSON.stringify(settings), JSON.stringify(kept)])
+  let settingsRead!: () => void
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], orgs: ['acme', 'beta'], rightLate: new Promise<void>(() => {}), estimatesFail: true,
+    settingsLate: new Promise<void>((resolve) => { settingsRead = resolve }) }
+  await open(page, workspace)
+  const toggle = page.locator('[data-beh="review-new-prs"] [data-act="beh-toggle"]')
+  // Opened on the remembered settings, the switch shows its last state, taking no press.
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+  await expect(toggle).toHaveAttribute('data-why', /Reading what is current/)
+  // What was running, as last read, stands though its fresh read failed.
+  const lastRun = page.locator('[data-beh="review-new-prs"] td').nth(1)
+  await expect(lastRun).toContainText('Running')
+  // Read afresh, the settings name beta too: the last state and runs no longer stand, though Behaviors has not been read.
+  settingsRead()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false')
+  await expect(toggle).toHaveAttribute('data-why', /could not be read/)
+  await expect(lastRun).not.toContainText('Running')
 })
 
 test('Behaviors gives every row its runs, time and success, or says why in words (#1382)', async ({ page }) => {

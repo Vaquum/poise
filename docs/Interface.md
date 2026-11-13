@@ -111,7 +111,11 @@ Last reads, painted at once on the next load while each part reads afresh:
 `poise-overview-answers` (Answer here's open entries as its cards show them,
 under the GitHub user and the configured organizations, written a moment after
 every source has read afresh), `poise-overview-health`, `poise-overview-motion`,
-`poise-overview-day` and `poise-board-last`.
+`poise-overview-day`, `poise-overview-behaviors` (each behavior's switch, pause
+and last run, the chosen day's runs, time and success, and what was running;
+a switch shows its last state but takes no press until Behaviors is read
+afresh), `poise-overview-quota` (REST and GraphQL per account, with their
+hourly samples) and `poise-board-last`. Each is written at most once a minute.
 
 ## Tests
 
