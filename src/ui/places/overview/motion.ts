@@ -180,7 +180,7 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
     // Another organization's last reads never stand for this one's.
     const org = getSelectedOrganization()
     const orgs = readyOrgs()
-    if (org !== itemsOrg || (!org && orgs !== itemsOrgs)) { [items, pulls, running] = [unread(), unread(), unread()]; itemsOrg = org }
+    if (org !== itemsOrg || (!org && orgs !== itemsOrgs)) { [items, pulls, running] = [unread(), unread(), unread()]; itemsOrg = org; paint() }
     itemsOrgs = orgs
     const mine = ++itemsRead
     const gh = (body: Record<string, unknown>) => json<Record<string, unknown>>('/api/gh', { method: 'POST', body: JSON.stringify({ ...body, ...organizationPayload() }) })
@@ -211,6 +211,8 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   signal.addEventListener('abort', off)
   paint()
   whileVisible(ctx, 60_000, () => { void readSessions(); void readItems() })
+  // Fresh settings naming other organizations, or another one chosen: what was read for the last ones goes at once.
+  window.addEventListener('poise:organization-filter-changed', () => { void readItems() }, { signal })
 
   return {
     setChains(next, error, at) { chains = error ? { ...chains, error } : { data: next, error: '', at }; paint(); if (!error) remember() },
