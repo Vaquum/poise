@@ -11,8 +11,8 @@ export function releaseBackgroundPaused(): boolean { return paused }
 export function releaseBackgroundBusy(): number { return operations }
 export function behaviorBackgroundBusy(): number { return behaviorOperations }
 
-/** A release switch is waiting for its quiet moment: timer turns hold back
- *  so they never keep it waiting. Set by the service controller. */
+/** A release switch is waiting for its quiet moment: recurring work yields
+ *  between safe units so it cannot keep it waiting. Set by the service controller. */
 export function markReleaseSwitch(pending: boolean): void { switchPending = pending }
 export function releaseSwitchPending(): boolean { return switchPending }
 

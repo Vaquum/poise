@@ -370,7 +370,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     } finally { observations.mockRestore(); messages.mockRestore() }
   })
 
-  it.each(['drain', 'switch'] as const)('counts yielded and suspended monitor work through service %s', async (mode) => {
+  it.each(['drain', 'withdrawal', 'refused restart'] as const)('yields an active multi-target monitor and resumes deferred work after %s', async (mode) => {
     const { ServiceControl } = await import('../server/service/control')
     const parent = await manager()
     const releasesDir = join(root, `releases-${randomUUID()}`)
@@ -383,32 +383,63 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       setTimeout(run: () => void, delay: number) { const handle = {}; scheduled.set(handle, { run, delay }); return handle },
       clearTimeout(handle: unknown) { scheduled.delete(handle) },
     }
-    const restart = vi.fn(() => false)
+    const targets = [1, 2, 3].map(number => `https://github.com/monitor/barrier/pull/${number}`)
+    const failed = { head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] }
+    const restart = vi.fn(() => {
+      // The admitted read's durable result and notice precede the quiet gate.
+      expect(store.observation(runtime.instance, `ci:${targets[0]}`)?.fingerprint).toBeTruthy()
+      expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+      return false
+    })
     const service = new ServiceControl(runtime, { drainTimeoutSeconds: 60, timer, log: () => {},
       releasesDir, release: { name: '0'.repeat(40), base: 'fixture-base' }, canRestart: () => true, restart, now: () => clock })
-    let complete: ((status: WorkTargetStatus) => void) | undefined
-    targetStatus.mockImplementationOnce(() => new Promise(resolve => { complete = resolve }))
-    store.bindWork(runtime.instance, parent.id, 'https://github.com/monitor/barrier/pull/1')
+    let complete: ((result: CiObservation) => void) | undefined
+    ci.mockResolvedValue(failed).mockImplementationOnce(() => new Promise(resolve => { complete = resolve }))
+    for (const target of targets) store.bindWork(runtime.instance, parent.id, target)
     const passes = vi.spyOn(store, 'bindings')
     try {
       await control.tick()
       expect(service.health()).toMatchObject({ idle: false, backgroundWork: 1 })
       await until(() => complete !== undefined)
-      await control.tick(); await control.tick()
       expect(service.health()).toMatchObject({ idle: false, backgroundWork: 1 })
       const poll = () => {
         const entry = [...scheduled].find(([, job]) => job.delay === 500)
         if (!entry) throw new Error('expected a release-switch poll')
         scheduled.delete(entry[0]); entry[1].run()
       }
+      const requestedAt = clock
       if (mode === 'drain') expect(service.drain()).toMatchObject({ idle: false, backgroundWork: 1 })
       else { service.switchRelease(release); poll(); expect(restart).not.toHaveBeenCalled() }
-      complete!('open')
+      // Recurring due ticks must not add another pass while this one yields.
+      for (let tick = 0; tick < 3; tick++) { clock += 60_000; await control.tick() }
+      expect(service.health()).toMatchObject({ idle: false, backgroundWork: 1 })
+      expect(restart).not.toHaveBeenCalled()
+      complete!(failed)
       await until(() => releaseBackgroundBusy() === 0)
       expect(service.health()).toMatchObject({ idle: true, backgroundWork: 0 })
       expect(passes).toHaveBeenCalledTimes(1)
-      if (mode === 'switch') { poll(); expect(restart).toHaveBeenCalledOnce() }
-    } finally { service.reset(); passes.mockRestore(); complete?.('open') }
+      expect(ci).toHaveBeenCalledOnce()
+      expect(store.observation(runtime.instance, `ci:${targets[1]}`)).toBeUndefined()
+      const original = store.observation(runtime.instance, `ci:${targets[0]}`)
+      const [notice] = store.inbox(runtime.instance, parent.id)
+      expect(notice).toBeDefined()
+      if (mode === 'drain') service.resume()
+      else if (mode === 'withdrawal') service.switchRelease('0'.repeat(40))
+      else {
+        clock += 500
+        poll()
+        expect(restart).toHaveBeenCalledOnce()
+        expect(clock - requestedAt).toBeLessThan(600_000)
+      }
+      await control.tick()
+      await until(() => store.observation(runtime.instance, `ci:${targets[2]}`) !== undefined)
+      await until(() => releaseBackgroundBusy() === 0)
+      expect(ci).toHaveBeenCalledTimes(targets.length)
+      expect(store.observation(runtime.instance, `ci:${targets[0]}`)).toEqual(original)
+      expect(store.inbox(runtime.instance, parent.id)).toHaveLength(targets.length)
+      expect(store.inbox(runtime.instance, parent.id)[0]).toMatchObject({ seq: notice.seq, body: notice.body })
+      expect(store.bindings(runtime.instance).map(binding => binding.target)).toEqual(targets)
+    } finally { service.reset(); passes.mockRestore(); complete?.(failed) }
   })
 
   it('lets a running manager create three parallel workers and receive their outcomes without sharing its lease', async () => {

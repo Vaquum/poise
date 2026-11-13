@@ -17,7 +17,7 @@ import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
 import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun, reapAbandonedDirectBehaviorRuns } from './behavior-metrics'
 import { CLI_UPDATE_TIMEOUT_MS } from '../scripts/provider-cli-updates.mjs'
-import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
+import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from './release-background'
 import { CallerReceiptStoreError } from './service/caller-calls'
 // Server-side behavior runtime. Lives with the Poise HTTP server
 // so the toggle keeps working when the browser tab is closed,
@@ -8169,7 +8169,7 @@ export async function runEnabledBehaviorsOnce(
     return behaviorOperationSignal.run(lifecycle, () => runEnabledBehaviorsOnce(options))
   }
   if (behaviorAborted()) return
-  if (releaseBackgroundPaused()) return
+  if (releaseBackgroundPaused() || releaseSwitchPending()) return
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
     if (behaviorAdmissionDraining()) {

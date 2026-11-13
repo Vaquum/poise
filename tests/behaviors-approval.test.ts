@@ -86,7 +86,7 @@ describe('approval eligibility and review activity', () => {
     expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--approve-pr')).toBe(false)
   })
 
-  it('starts a behavior launch normally with a release switch pending', async () => {
+  it('defers a behavior launch during a release switch and resumes after withdrawal', async () => {
     arrangeCli(true, false, { headSha: NEXT_HEAD_SHA }, {
       commits_after_request: 0,
       author_commits_after_request: 0,
@@ -94,13 +94,13 @@ describe('approval eligibility and review activity', () => {
     })
     mocks.spawnDetached.mockResolvedValue(undefined)
     const { database: db, behaviors: runtime } = await loadModules()
-    // A pending Poise update waits Chat turns only; the scheduler keeps launching.
+    // The pending update holds new sweeps until the switch is withdrawn.
     const { ServiceControl } = await import('../server/service/control')
     const releasesDir = join(fixture.tempRoot, 'releases')
     await mkdir(join(releasesDir, 'r2'), { recursive: true })
     await writeFile(join(releasesDir, 'r2', 'base'), 'b1\n')
     await writeFile(join(releasesDir, 'r2', 'installed'), '')
-    const chat = { instance: 'behavior-switch-test', setSwitchPending: () => {}, endDrain: () => {} } as unknown as ChatRuntime
+    const chat = { instance: 'behavior-switch-test', setSwitchPending: () => {}, endDrain: () => {}, releaseSwitchWait: async () => {} } as unknown as ChatRuntime
     const service = new ServiceControl(chat, {
       drainTimeoutSeconds: 60, timer: { setTimeout: () => 0, clearTimeout: () => {} },
       log: () => {}, releasesDir, release: { name: 'r1', base: 'b1' }, restart: () => true, canRestart: () => true,
@@ -111,6 +111,11 @@ describe('approval eligibility and review activity', () => {
       db.setMeta('me', 'poise-user')
       db.setMeta('behavior_approve_prs_enabled', '1')
 
+      await runtime.runEnabledBehaviorsOnce()
+
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+      expect(db.listBehaviorLaunchClaims('approve-prs')).toEqual([])
+      service.switchRelease('r1')
       await runtime.runEnabledBehaviorsOnce()
 
       expect(mocks.spawnDetached).toHaveBeenCalledOnce()
