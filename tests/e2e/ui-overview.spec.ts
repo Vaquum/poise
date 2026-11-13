@@ -316,6 +316,22 @@ test('each Show level says how many entries it shows (#1380)', async ({ page }) 
   await expect(level('+ Faults')).toContainText('2')
 })
 
+for (const width of [1440, 1000, 375]) {
+  test(`Show's levels fit Answer here's row at ${width} pixels, whatever their counts (#1439)`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 })
+    const notice = (id: number) => ({ id: `n${id}`, kind: 'storage_low', title: `Disk ${id}`, body: '', since: ago(id), due: ago(id), silenceable: false, target: null })
+    await open(page, { notices: Array.from({ length: 120 }, (_, i) => notice(i + 1)), requests: [], decisions: [], revision: 1 })
+    const seg = answers(page).locator('.olevel')
+    await expect(seg.getByRole('radio', { name: /^Everything,/ })).toHaveAccessibleName('Everything, 120 entries')
+    const fit = await seg.evaluate((el) => {
+      const row = el.closest<HTMLElement>('.ova-level')!.getBoundingClientRect()
+      const box = el.getBoundingClientRect()
+      return { inside: box.left >= row.left - 0.5 && box.right <= row.right + 0.5, buttons: [...el.querySelectorAll('button')].every((button) => button.scrollWidth <= button.clientWidth + 0.5) }
+    })
+    expect(fit).toEqual({ inside: true, buttons: true })
+  })
+}
+
 test('a decision whose chat is gone says so, and Dismiss puts it away', async ({ page }) => {
   const decision = (id: number, exists: boolean) => ({ id, kind: 'decision', text: `Decision ${id}`, detail: null, createdAt: ago(4), source: { sessionId: `s${id}`, title: `Chat ${id}`, agent: 'claude', model: 'opus', exists }, sourceSeq: 2, options: [{ id: 'a', label: 'Open the fix', detail: null, recommended: true }], explanation: { state: 'none' } })
   const workspace: Workspace = { notices: [], requests: [], revision: 1, decisions: [decision(7, true), decision(8, false)] }

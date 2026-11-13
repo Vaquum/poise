@@ -113,8 +113,12 @@ svg.flip-x { transform: rotate(180deg); }
 /* One set of filters for the right-hand side: the day, the search, the organization. */
 .ova-ctl > [data-dayctl], .ova-ctl > [data-orgctl] { display: contents; }
 .ova-ctl .search { width: calc(var(--sp-unit) * 44); }
-/* Each Show level says how many entries it shows; on a phone the levels go under their label. */
+/* Each Show level says how many entries it shows, its count under its name:
+   four equal columns that fit Answer here's row at any width and count. */
 .ova-level { flex-wrap: wrap; }
+.ova-level .olevel { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; height: auto; }
+.olevel.seg button { display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 0; padding: var(--sp-1); line-height: var(--lh-ui); }
+.olevel.seg button small { margin-left: 0; font-size: var(--fs-tiny); }
 
 /* Tiles: the day's number, its pace and its year */
 .ova-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-3); }
@@ -274,6 +278,5 @@ svg.flip-x { transform: rotate(180deg); }
   .ova-main { padding-inline: var(--sp-3); }
   .ova-ctl { margin-left: 0; }
   .ova-ctl .search { width: auto; flex: 1 1 calc(var(--sp-unit) * 32); min-width: 0; }
-  .olevel.seg button { padding-inline: var(--sp-2); }
   .ova-hint { display: none; }
 }
