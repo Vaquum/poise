@@ -342,12 +342,24 @@ export function listEvents(sessionId: string, afterSeq: number, limit: number = 
 }
 
 /** The seq after which a transcript's last `turns` turns begin, read from the
- *  turn-finish index; 0 when it has no more finished turns than that. */
-export function lastTurnsStart(sessionId: string, turns: number): number {
-  const row = db.prepare(`SELECT seq FROM chat_events INDEXED BY idx_chat_events_turn_finished
+ *  turn-finish index; 0 when it has no more finished turns than that. Given a
+ *  budget in characters, fewer of them when they are large: as many as fit,
+ *  and always the last one. */
+export function lastTurnsStart(sessionId: string, turns: number, budget = Infinity): number {
+  const finishes = db.prepare(`SELECT seq FROM chat_events INDEXED BY idx_chat_events_turn_finished
     WHERE session_id = ? AND json_extract(event, '$.type') = 'turn.finished'
-    ORDER BY seq DESC LIMIT 1 OFFSET ?`).get(sessionId, turns) as { seq: number } | undefined
-  return row?.seq ?? 0
+    ORDER BY seq DESC LIMIT ?`).pluck().all(sessionId, turns + 1) as number[]
+  const start = (count: number) => finishes[count] ?? 0
+  if (!Number.isFinite(budget)) return start(turns)
+  const sizes = db.prepare('SELECT seq, length(event) AS size FROM chat_events WHERE session_id = ? AND seq > ? ORDER BY seq DESC')
+    .all(sessionId, start(turns)) as Array<{ seq: number, size: number }>
+  let total = 0
+  let index = 0
+  for (let count = 1; count <= turns; count++) {
+    for (; index < sizes.length && sizes[index].seq > start(count); index++) total += sizes[index].size
+    if (count > 1 && total > budget) return start(count - 1)
+  }
+  return start(turns)
 }
 
 export function lastEvent(sessionId: string): ChatEnvelope | null {

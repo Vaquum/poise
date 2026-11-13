@@ -1791,10 +1791,11 @@ export class ChatRuntime extends EventEmitter {
     return storage.listEvents(id, afterSeq)
   }
 
-  /** Where the last `turns` turns of a transcript begin: a first open reads from there. */
-  turnsStart(id: string, turns: number): number {
+  /** Where the last `turns` turns of a transcript begin, fewer when they pass
+   *  `budget` characters: a first open reads from there. */
+  turnsStart(id: string, turns: number, budget = Infinity): number {
     this.get(id)
-    return storage.lastTurnsStart(id, turns)
+    return storage.lastTurnsStart(id, turns, budget)
   }
 
   ownsSession(id: string): boolean {
