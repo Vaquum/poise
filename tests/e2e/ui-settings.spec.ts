@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
-import type { AdminOverview, GatewayAccount, PairedDevice } from '../../src/gateway-client'
+import type { AdminOverview, GatewayAccount, PairedDevice, PhoneCode, SignedInPhone } from '../../src/gateway-client'
 import { BEHAVIORS } from '../../src/behaviors'
 
 // Settings in the new interface (#556 PR 4): one section at a time, each with
@@ -21,6 +21,46 @@ interface World {
   admin?: boolean
   /** First-run setup's state behind the gateway. */
   onboarding?: { status: 'pending' | 'done', step: string }
+  /** Signing in on a phone, as the gateway would answer it. */
+  phone?: PhoneWorld
+}
+
+interface PhoneWorld {
+  codes: PhoneCode[]
+  phones: SignedInPhone[]
+  starts: number
+  /** Which starts, counted from 1, the gateway refuses. */
+  refuse?: number[]
+  lifetimeMs: number
+  /** Every decision and sign-out as sent, address and body. */
+  calls: Array<{ path: string, body: Record<string, unknown> }>
+}
+
+function phoneWorld(lifetimeMs = 120_000, refuse: number[] = []): PhoneWorld {
+  return { codes: [], phones: [], starts: 0, refuse, lifetimeMs, calls: [] }
+}
+
+function phoneApi(phone: PhoneWorld, g: string, search: string, body: Record<string, unknown> | null): { status?: number, json: unknown } {
+  if (g === 'phone') return { json: { codes: phone.codes, phones: phone.phones } }
+  if (g === 'phone/start') {
+    phone.starts += 1
+    if (phone.refuse?.includes(phone.starts)) return { status: 429, json: { error: 'too_many_requests', message: 'Too many codes were shown. Try again in 15 minutes.' } }
+    const now = Date.now()
+    const code: PhoneCode = { id: `code-${phone.starts}`, state: 'waiting', device: null, grant: null, createdAt: now, expiresAt: now + phone.lifetimeMs, scannedAt: null, decidedAt: null, finishedAt: null }
+    phone.codes.unshift(code)
+    return { json: { code, url: `https://poise.example.test/auth/phone?t=${String(phone.starts).padStart(22, 'k')}` } }
+  }
+  phone.calls.push({ path: `${g}${search}`, body: body ?? {} })
+  if (g === 'phone/approve' || g === 'phone/deny') {
+    const index = phone.codes.findIndex((code) => code.id === body?.id)
+    phone.codes[index] = { ...phone.codes[index], state: g === 'phone/approve' ? 'approved' : 'denied', decidedAt: Date.now() }
+    return { json: { code: phone.codes[index] } }
+  }
+  if (g === 'phone/revoke') {
+    phone.phones = phone.phones.filter((candidate) => candidate.id !== body?.id)
+    return { json: { phones: phone.phones } }
+  }
+  return { status: 404, json: { error: 'not_found', message: 'There is nothing at this address.' } }
 }
 
 const START = {
@@ -83,6 +123,10 @@ async function settings(page: Page, world: Partial<World> = {}, address = '/?vie
       if (g === 'account') return route.fulfill({ json: gateway(!!w.admin) })
       if (g === 'devices') return route.fulfill({ json: { devices: [] as PairedDevice[] } })
       if (g === 'admin') return route.fulfill({ json: ADMIN })
+      if (g === 'phone' || g.startsWith('phone/')) {
+        const answer = phoneApi(w.phone ??= phoneWorld(), g, url.search, body)
+        return route.fulfill({ status: answer.status ?? 200, json: answer.json })
+      }
       return route.fulfill({ status: 404, json: { error: 'not_found', message: 'There is nothing at this address.' } })
     }
     if (path === '/api/settings' && request.method() === 'POST') {
@@ -304,6 +348,68 @@ test('behind the gateway, an admin finds Admin with its people and workspaces', 
   await settings(page, { mode: 'service', admin: true }, '/?settings=admin')
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Admin')
   await expect(page.locator('[data-body]')).toContainText('octocat')
+})
+
+test('behind the gateway, a phone that opens the code is approved here, signed in, and signed out again', async ({ page }) => {
+  const w = await settings(page, { mode: 'service', phone: phoneWorld() }, '/?settings=accounts')
+  const phone = row(page, 'phone')
+  await expect(phone).toContainText('Sign in on your phone')
+  await expect(phone).toContainText('No phone is signed in with a code.')
+  await phone.getByRole('button', { name: 'Show the code' }).click()
+  await expect(phone.getByRole('img', { name: 'QR code that signs your phone in to Poise' })).toBeVisible()
+  await expect(phone).toContainText('Scan this with your phone’s camera.')
+  // The QR is drawn as dark paths on light paper, from tokens.
+  const colours = await phone.locator('.ph-qr').evaluate((el) => [getComputedStyle(el).backgroundColor, getComputedStyle(el).color])
+  expect(colours).toEqual(['rgb(247, 248, 249)', 'rgb(22, 26, 32)'])
+
+  // The phone opens the code: Settings shows it, with its device and browser, for a decision.
+  const grant = 'a'.repeat(64)
+  w.phone!.codes[0] = { ...w.phone!.codes[0], state: 'scanned', device: 'iPhone · Safari', grant, scannedAt: Date.now() }
+  await expect(phone).toContainText('iPhone · Safari wants to sign in as octocat.')
+  await expect(phone.getByRole('img')).toHaveCount(0)
+  await phone.getByRole('button', { name: 'Approve' }).click()
+  await expect(phone).toContainText('is finishing its sign-in.')
+  expect(w.phone!.calls).toEqual([{ path: `phone/approve?grant=${grant}`, body: { id: 'code-1' } }])
+
+  // The phone finishes: both screens say so, and it is listed with Sign out.
+  w.phone!.codes[0] = { ...w.phone!.codes[0], state: 'signed_in', finishedAt: Date.now() }
+  w.phone!.phones = [{ id: 'phone-1', device: 'iPhone · Safari', grant, createdAt: Date.now() }]
+  await expect(phone).toContainText('iPhone · Safari is signed in as octocat.')
+  const listed = phone.locator('.ph-phones .frow')
+  await expect(listed).toHaveCount(1)
+  await expect(listed).toContainText('iPhone · Safari')
+
+  // Sign out asks Sure? first, then names the phone's grant for a login proxy in front.
+  await listed.getByRole('button', { name: 'Sign iPhone · Safari out' }).click()
+  await expect(listed.getByRole('button', { name: 'Confirm signing iPhone · Safari out' })).toHaveText('Sure?')
+  expect(w.phone!.calls).toHaveLength(1)
+  await listed.getByRole('button', { name: 'Confirm signing iPhone · Safari out' }).click()
+  await expect(phone).toContainText('No phone is signed in with a code.')
+  expect(w.phone!.calls[1]).toEqual({ path: `phone/revoke?grant=${grant}`, body: { id: 'phone-1' } })
+})
+
+test('behind the gateway, a shown code is replaced before it expires, and a code that could not be says it expired', async ({ page }) => {
+  await page.clock.install()
+  const w = await settings(page, { mode: 'service', phone: phoneWorld(120_000, [3]) }, '/?settings=accounts')
+  const phone = row(page, 'phone')
+  await phone.getByRole('button', { name: 'Show the code' }).click()
+  const qr = phone.locator('.ph-qr svg path')
+  await expect(qr).toHaveCount(1)
+  const first = await qr.getAttribute('d')
+  // Twenty seconds before it expires, the code is replaced.
+  await page.clock.fastForward(100_500)
+  await expect.poll(() => qr.getAttribute('d')).not.toBe(first)
+  expect(w.phone!.starts).toBe(2)
+  // The next replacement is refused: the code on screen stays until it expires, then says so.
+  await page.clock.fastForward(100_500)
+  await expect.poll(() => w.phone!.starts).toBe(3)
+  await expect(phone.locator('.ph-qr')).toBeVisible()
+  await page.clock.fastForward(20_000)
+  await expect(phone).toContainText('The code expired.')
+  await expect(phone.locator('.ph-qr')).toHaveCount(0)
+  await phone.getByRole('button', { name: 'Show a new code' }).click()
+  await expect(phone.locator('.ph-qr svg')).toBeVisible()
+  expect(w.phone!.starts).toBe(4)
 })
 
 for (const width of [375, 768, 1000]) {

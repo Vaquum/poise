@@ -109,6 +109,9 @@
   --c-other-tint: color-mix(in srgb, var(--c-other) var(--ctl-tint), transparent);
   --c-other-on: color-mix(in srgb, var(--c-other) 55%, var(--p-white));
   --c-row-hover: color-mix(in srgb, var(--c-surface) 55%, transparent);
+  /* A QR code scans as dark modules on light paper, whatever the theme. */
+  --c-qr-paper: var(--p-n7);
+  --c-qr-ink: var(--p-n0);
   --c-row-selected: var(--c-canvas);
 
   /* States: one vocabulary, one colour each (the words live in refdefs.js) */
@@ -223,6 +226,7 @@
   --w-tip: 300px;
   --w-ref: 580px;
   --w-read: calc(760px * var(--ctl-measure));
+  --size-qr: 246px; /* six pixels a module for the sign-in link's 41 */
 }
 
 /* Reduced motion is a control too: it sets motion to zero. */
