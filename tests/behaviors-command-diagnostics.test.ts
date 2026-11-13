@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { CheckSemaphore } from '../server/check-semaphore'
@@ -18,6 +18,8 @@ const APPROVAL_CHECKS = [
   ['requested-changes-addressed', 'changes-addressed'],
   ['review-activity-since', 'review-activity'],
   ['head-sha', 'head-check'],
+  ['local-checkout-path', 'checkout'],
+  ['checkout-repo', 'checkout'],
 ] as const
 
 async function start(primitive = RESOLVE, script = "setInterval(() => {}, 1000)", timeout = false) {
@@ -31,12 +33,27 @@ async function start(primitive = RESOLVE, script = "setInterval(() => {}, 1000)"
   database.setMeta(`behavior_${behavior.replaceAll('-', '_')}_enabled`, '1')
   fixture.agentLogs = [{ ...completedReviewCall(pr.repo, pr.number, HEAD_SHA, 'review-bot') }]
   vi.stubEnv('CALLER_BIN_ROOT', fixture.tempRoot)
-  writeFileSync(join(fixture.tempRoot, 'github-interface'), `#!${process.execPath}\n${script}\n`, { mode: 0o700 })
+  const missingCheckout = primitive === 'checkout-repo'
+    ? "if (process.argv[2] === '--local-checkout-path') { process.stderr.write('error: checkout not found under /fake/dev: ' + process.argv[3] + '/' + process.argv[4] + '\\n'); process.exit(1) }\n"
+    : ''
+  writeFileSync(join(fixture.tempRoot, 'github-interface'), `#!${process.execPath}\n${missingCheckout}${script}\n`, { mode: 0o700 })
   const original = mocks.runFile.getMockImplementation()!
   let failing = true
   mocks.runFile.mockImplementation((command: string, args: string[], options: RunFileOptions) => {
+    if (primitive === 'checkout-repo' && command === 'github-interface' && args[0] === '--local-checkout-path') {
+      return mocks.realRunFile!(command, args, options)
+    }
     if (failing && command === 'github-interface' && args[0] === `--${primitive}`) {
       return mocks.realRunFile!(command, args, timeout ? { ...options, timeoutMs: 500 } : options)
+    }
+    if (primitive === 'checkout-repo') {
+      if (command === 'github-interface' && args[0] === '--checkout-repo') {
+        mkdirSync(args[3]!, { recursive: true })
+        return Promise.resolve({ stdout: JSON.stringify({ action: 'checkout_repo', repository: pr.repo, path: args[3] }), stderr: '' })
+      }
+      if (command === 'git') return Promise.resolve({
+        stdout: args[0] === 'remote' ? `https://github.com/${pr.repo}.git` : args[0] === 'rev-parse' ? HEAD_SHA : '', stderr: '',
+      })
     }
     if (command === 'github-interface' && args[0] === '--merge-candidates') return Promise.resolve({
       stdout: JSON.stringify({ action: 'merge_candidates', actor: 'review-bot', graphql_cost: 1, records: [{
@@ -82,7 +99,7 @@ it.each(APPROVAL_CHECKS)('retains one attributed approval timeout and retries no
       executable: join(fixture.tempRoot, 'github-interface'), configuredCommand: 'github-interface' }),
   })])
   expect(Number(recorded[0]!.context.elapsedMs)).toBeGreaterThanOrEqual(500)
-  if (primitive === 'head-sha') {
+  if (phase === 'head-check' || phase === 'checkout') {
     expect(recorded[0]).toMatchObject({ repository: pr.repo, target: TARGET,
       context: { expectedHead: HEAD_SHA, retry } })
   } else {
@@ -91,11 +108,13 @@ it.each(APPROVAL_CHECKS)('retains one attributed approval timeout and retries no
       retry: [{ target: TARGET, nextRetryAt: retry.nextRetryAt, consecutiveFailures: 1 }],
     } })
   }
-  for (const secret of ['private-output', 'private-credential', '--requests-json', '--token-user']) {
+  for (const secret of ['private-output', 'private-credential', '--requests-json', '--token-user', '--path', 'checkout not found']) {
     expect(JSON.stringify(recorded)).not.toContain(secret)
   }
   expect(mocks.spawnDetached).not.toHaveBeenCalled()
   expect(database.listBehaviorLaunchClaims('approve-prs')).toEqual([])
+  expect(database.db.prepare("SELECT target FROM behavior_seen WHERE key = 'pr-operation'").all()).toEqual([])
+  expect(behaviors.getBehaviorCheckSlots().stats()).toMatchObject({ running: 0, behaviorRunning: 0 })
   const calls = mocks.runFile.mock.calls.filter(([, args]) => args[0] === `--${primitive}`).length
   await behaviors.runEnabledBehaviorsOnce()
   expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === `--${primitive}`)).toHaveLength(calls)
@@ -106,6 +125,12 @@ it.each(APPROVAL_CHECKS)('retains one attributed approval timeout and retries no
   await behaviors.runEnabledBehaviorsOnce()
   expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
   expect(mocks.spawnDetached.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+  if (primitive === 'checkout-repo') {
+    expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--checkout-repo')).toHaveLength(2)
+    expect(mocks.spawnDetached.mock.calls[0]![1]).toEqual(expect.arrayContaining([
+      '--pwd', join(fixture.tempRoot, 'review-checkouts', HEAD_SHA, pr.repo.toLowerCase()),
+    ]))
+  }
   expect(behaviors.getBehaviorFailureState('approve-prs', CHECK)).toBeNull()
   expect(events()).toHaveLength(1)
 })
@@ -155,7 +180,7 @@ it.each(['requested-changes-addressed', 'review-activity-since'])('keeps a full 
   }
 })
 
-it.each(['requested-changes-addressed', 'head-sha'])('keeps the original approval process failure when retry bookkeeping throws (%s)', async (primitive) => {
+it.each(['requested-changes-addressed', 'head-sha', 'local-checkout-path', 'checkout-repo'])('keeps the original approval process failure when retry bookkeeping throws (%s)', async (primitive) => {
   const { database, behaviors } = await start(primitive, failureScript('original read failure'))
   const setMeta = database.setMeta
   vi.spyOn(database, 'setMeta').mockImplementation((key, value) => {
@@ -181,18 +206,37 @@ it('retains an independent approval launch failure after a successful head check
   })])
 })
 
-it.each(['requested-changes-addressed', 'head-sha'])('keeps a failed approval read if shutdown interrupts its handler (%s)', async (primitive) => {
+it.each(['requested-changes-addressed', 'head-sha', 'local-checkout-path', 'checkout-repo'])('keeps a failed approval read if shutdown interrupts its handler (%s)', async (primitive) => {
   const { behaviors } = await start(primitive, failureScript('original read failure'))
   const original = mocks.runFile.getMockImplementation()!
   let stopping: Promise<void> | undefined
   mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
     try { return await original(command, args, options) }
-    catch (error) { stopping = behaviors.stopBehaviorsRuntime(); throw error }
+    catch (error) {
+      if (command === 'github-interface' && args[0] === `--${primitive}`) stopping = behaviors.stopBehaviorsRuntime()
+      throw error
+    }
   })
   await behaviors.runEnabledBehaviorsOnce()
   await stopping
   expect(events()).toEqual([expect.objectContaining({ operation: `github-interface.${primitive}`,
     severity: 'error', exitCode: 1, stderr: 'original read failure', context: expect.objectContaining({ retry: null }) })])
+})
+
+it.each(['local-checkout-path', 'checkout-repo'])('retains distinct failed checkout attempts (%s)', async (primitive) => {
+  const { database, behaviors } = await start(primitive, failureScript('checkout failed'))
+  await behaviors.runEnabledBehaviorsOnce()
+  const key = `behavior_approve_prs_failure:${CHECK}`
+  database.setMeta(key, JSON.stringify({ ...JSON.parse(database.getMeta(key)!), nextRetryAtMs: 1 }))
+  await behaviors.runEnabledBehaviorsOnce()
+  const recorded = events()
+  expect(recorded).toHaveLength(2)
+  expect(new Set(recorded.map((event) => event.id)).size).toBe(2)
+  expect(new Set(recorded.map((event) => event.correlationId)).size).toBe(2)
+  for (const event of recorded) expect(event).toMatchObject({
+    operation: `github-interface.${primitive}`, phase: 'checkout', severity: 'error', stderr: 'checkout failed',
+  })
+  expect(behaviors.getBehaviorFailureState('approve-prs', CHECK)).toMatchObject({ consecutiveFailures: 2 })
 })
 
 it('persists one Error per real timeout and distinguishes identical attempts in the same incident', async () => {
