@@ -33,6 +33,7 @@ export interface ChainObservation extends Record<string, unknown> {
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,
     queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null },
+    queueEntryDetails?: { id: string, state: string, base: string | null, head: string | null } | null,
     changesRequested: boolean, unresolved: number, unresolvedOutdated?: number, approved: boolean, ready: boolean,
     reviewIds: number[], reviewRevision: string,
     reviewContext?: string, mergedAt?: number | null,
@@ -267,7 +268,10 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     return propose(chain, 'implement-issue', issueBasis, chain.author, observation.implementer,
       'all required issue review invocations posted their comments', now)
   }
-  if (pull.queueEntry) return { kind: 'wait', reason: `native merge queue owns entry ${pull.queueEntry}` }
+  if (pull.queueEntry) {
+    const entry = pull.queueEntryDetails?.id === pull.queueEntry ? pull.queueEntryDetails : null
+    return { kind: 'wait', reason: `native merge queue owns entry ${pull.queueEntry}; queue ${entry?.state ?? 'disposition unknown'}${entry?.state === 'UNMERGEABLE' ? '; cause unknown' : ''}` }
+  }
   const dismissed = pull.reviewReceipts.find((review) => review.head === pull.head && review.state === 'DISMISSED'
     && chain.invocations.some((invocation) => invocation.behavior === 'approve-pr' && invocation.callId === review.invocation))
   if (dismissed) return { kind: 'hold', reason: `approval ${dismissed.id} was dismissed on the current head; a decision is required` }

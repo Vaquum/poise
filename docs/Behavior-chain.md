@@ -347,6 +347,18 @@ through the existing control after resolving the blocker.
 4. Existing native primitives handle grey CI, approved nonblocking conversation resolution, strict readiness, merge and merge-queue admission. Conversation resolution also covers outdated threads, because GitHub's merge rule counts them, but only when readiness is blocked solely by `merge_state_not_clean` or `required_reviews_not_approved`, the blockers an open conversation can explain. A PR that readiness reports green goes to merge with its outdated threads left alone. Their repository policy leaves a merely behind branch to native queue integration; an actual conflict still requires repair. Completion requires the actual GitHub merge SHA. Queue admission, a finished turn, approval or CLOSED alone cannot complete a chain.
 5. A removed queue entry requires its actual GitHub removal event. Failed integration checks or conflicts lead to fresh repair; manual or unknown removal holds for a decision. A `merged` removal alongside an earlier open-PR read waits for confirmed merge evidence; that event alone neither completes nor holds the chain. An unchanged-head repair requires a new independent approval before another native queue attempt. Only that attempt's actual integration result can establish acceptance. Deliberate dismissal of a current-head managed approval is also held.
 
+Live queue observations retain the entry ID, GitHub disposition and nullable
+integration base/head commits together through `pull_action_state --queue-evidence`.
+Exhausting its three head-matching reads fails rather than attaching another
+head's queue disposition. Work status keeps queue membership and original enqueue
+attribution while showing `UNMERGEABLE` as `blocked`, with cause unknown. This is
+a queue wait, including when PR mergeability is `UNKNOWN`; it does not diagnose a
+conflict against current main or authorize repair or dequeue. Delayed entries use
+the existing 24-hour history progress clock to request attention; unchanged polls
+do not reset it. Replaced integration evidence supersedes the prior observation.
+After a verified removal, the ordinary exact-head repair, CI, fresh review and
+independent approval gates govern readmission.
+
 The chain intentionally does not use the legacy approval-round escape that files remaining findings as a follow-up issue and approves. Unresolved blockers remain blockers.
 
 ## Authority and recovery

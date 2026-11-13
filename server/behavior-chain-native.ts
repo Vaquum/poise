@@ -340,6 +340,16 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         || (state.queue_entry_id !== null && (typeof state.queue_entry_id !== 'string' || !state.queue_entry_id))
         || (state.state === 'open' && !Array.isArray(state.queue_removals))) throw new Error('native PR observations changed head or are incomplete')
       const checks = ci.failing.map((item) => object(item, 'CI check'))
+      let queueEntryDetails: NonNullable<ChainObservation['pull']>['queueEntryDetails'] = null
+      if (state.queue_entry_id !== null) {
+        const entry = object(state.queue_entry, 'native queue entry')
+        if (entry.id !== state.queue_entry_id || !['QUEUED', 'AWAITING_CHECKS', 'LOCKED', 'MERGEABLE', 'UNMERGEABLE'].includes(String(entry.state))) {
+          throw new Error('native queue entry disposition is incomplete or mismatched')
+        }
+        queueEntryDetails = { id: String(entry.id), state: String(entry.state),
+          base: entry.base === null ? null : sha(entry.base, 'queue integration base'),
+          head: entry.head === null ? null : sha(entry.head, 'queue integration head') }
+      }
       const pending = checks.some((check) => ['queued', 'pending', 'in_progress', 'requested', 'waiting'].includes(String(check.state)) || (check.state === 'completed' && check.conclusion == null))
       const failures = checks.filter((check) => ['failure', 'error'].includes(String(check.state)) || (check.state === 'completed' && ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(check.conclusion))))
       if (checks.some((check) => typeof check.name !== 'string' || !['completed', 'queued', 'pending', 'in_progress', 'requested', 'waiting', 'failure', 'error', 'success'].includes(String(check.state)))) throw new Error('native CI observation contains an unknown state')
@@ -361,6 +371,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       }
       observation.pull = { number, head, headSince, state: String(state.state), draft: readiness.draft, merged: false, mergeSha: null,
         queueEntry: typeof state.queue_entry_id === 'string' ? state.queue_entry_id : null,
+        queueEntryDetails,
         queueRemoval: removal ? { id: String(removal.id), reason: typeof removal.reason === 'string' ? removal.reason : null,
           at: Date.parse(String(removal.createdAt)), actor: removal.actor ? String(object(removal.actor, 'queue actor').login) : null } : null,
         changesRequested: latest?.state === 'CHANGES_REQUESTED' && latest.commit_id === head,

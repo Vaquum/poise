@@ -282,7 +282,7 @@ it.each(['never-enqueued', 'old-head', 'earlier-removal'] as const)('does not le
   expect(row.blocker).toMatchObject({ id: 'ci_pending', line: 'v2 exact-head CI is running' })
 })
 
-it.each(['enqueued', 'in_queue'] as const)('distinguishes the original %s response from somebody else queueing the candidate', async (outcome) => {
+it.each(['enqueued', 'in_queue'] as const)('distinguishes the original %s response from somebody else queueing the candidate, including UNMERGEABLE', async (outcome) => {
   const { journal, chain, obs, status } = await setup()
   let current = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'queue-action', behavior: 'merge-pr',
     actor: chain.reviewer, model: null, slot: null, basis: 'queue', admittedAt: Date.now(),
@@ -303,6 +303,26 @@ it.each(['enqueued', 'in_queue'] as const)('distinguishes the original %s respon
     attribution: outcome === 'enqueued' ? 'accepted-response' : 'observed-no-action', queueEntryId: 'real-entry',
   })
   expect(JSON.stringify(summary)).not.toContain('nativeActionReceipt')
+  obs.pull!.queueEntryDetails = { id: 'real-entry', state: 'UNMERGEABLE', base: MERGE, head: null }
+  current = record(journal, current, { type: 'chain.observed', observation: obs })
+  const blocked = (await status.readPrStatus(50)).rows[0]
+  expect(blocked).toMatchObject({ queue: { state: 'queued', entryId: 'real-entry',
+    attribution: outcome === 'enqueued' ? 'accepted-response' : 'observed', disposition: 'UNMERGEABLE', integrationBase: MERGE, integrationHead: null },
+  blocker: { id: 'blocked', line: 'v2 queue UNMERGEABLE; cause unknown; GitHub retains ownership' } })
+  expect(journal.read(chain.id)!.held).toBeNull()
+  for (const disposition of ['QUEUED', 'AWAITING_CHECKS', 'LOCKED', 'MERGEABLE']) {
+    obs.pull!.queueEntryDetails.state = disposition
+    current = record(journal, current, { type: 'chain.observed', observation: obs })
+    expect((await status.readPrStatus(50)).rows[0]).toMatchObject({ queue: { state: 'queued', disposition }, blocker: { id: 'in_queue' } })
+  }
+  obs.pull!.queueEntryDetails.state = 'UNMERGEABLE'
+  // A replaced entry cannot inherit the earlier entry's disposition.
+  obs.pull!.queueEntry = 'replacement'
+  current = record(journal, current, { type: 'chain.observed', observation: obs })
+  expect((await status.readPrStatus(50)).rows[0]).toMatchObject({ queue: { state: 'queued', entryId: 'replacement', attribution: 'observed' },
+    blocker: { id: 'in_queue' } })
+  record(journal, current, { type: 'chain.observed', observation: obs })
+  expect((await status.readPrStatus(50, Date.now() + 120_001)).rows[0]).toMatchObject({ queue: { state: 'unknown' }, blocker: { id: 'unknown' } })
 })
 
 it('preserves the original enqueue attribution after a later no-action observation of the same entry', async () => {
