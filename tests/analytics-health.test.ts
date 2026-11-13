@@ -91,8 +91,8 @@ it('withholds only a zero-denominator or unknown merge-time rate, in words, whil
 
 it('never calls an unknown cohort empty: missing GitHub evidence or merge time withholds with its own reason', async () => {
   const f = setup()
-  f.input.dependencies.datastore[0].status = 'stale'
-  expect((await f.read()).rate).toMatchObject({ completed: 0, perItem: null, withheld: 'GitHub evidence for acme is stale, so merges may be missing' })
+  f.input.dependencies.datastore[0].status = 'unavailable'
+  expect((await f.read()).rate).toMatchObject({ completed: 0, perItem: null, withheld: 'GitHub evidence for acme is unavailable, so merges may be missing' })
   f.input.dependencies.datastore[0].status = 'ok'
   f.append(f.seed(2), { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: 'acme/repo', pull_number: 102, merged: true, merge_sha: MERGE } }, NOW)
   expect((await f.read()).rate).toMatchObject({ completed: 0, perItem: null, withheld: expect.stringContaining('merge time for acme/repo#2 is unknown') })
