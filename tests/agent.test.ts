@@ -307,7 +307,11 @@ describe('changed-call history reads', () => {
   function callerTable() {
     const calls: Array<{ rowid: number, seq: number, started: number, row: Record<string, unknown> }> = []
     let newest = 0
+    let clock = 0
     const ordered = () => [...calls].sort((a, b) => a.started - b.started || a.rowid - b.rowid)
+    // A running call's elapsed time reads from the clock, as Caller's does.
+    const view = (call: { row: Record<string, unknown> }) => call.row.status === 'running' ? { ...call.row, time_elapsed: `${clock}s` } : call.row
+    const item = (call: { rowid: number, seq: number, row: Record<string, unknown> }) => ({ rowid: call.rowid, seq: call.seq, row: view(call) })
     const table = {
       reads: [] as string[][],
       insert(row: Record<string, unknown>, started: number) { calls.push({ rowid: calls.length + 1, seq: ++newest, started, row }) },
@@ -317,7 +321,8 @@ describe('changed-call history reads', () => {
         call.seq = ++newest
       },
       replace() { calls.length = 0; newest = 0 },
-      whole: () => ordered().map((call) => call.row),
+      tick() { clock += 1 },
+      whole: () => ordered().map(view),
     }
     mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
       table.reads.push(args)
@@ -326,8 +331,8 @@ describe('changed-call history reads', () => {
         const limit = Number(args[args.indexOf('--limit') + 1])
         const changed = calls.filter((call) => call.seq > after).sort((a, b) => a.seq - b.seq)
         const page = changed.slice(0, limit)
-        return { stdout: JSON.stringify({ rows: page.map(({ rowid, seq, row }) => ({ rowid, seq, row })),
-          cursor: page.at(-1)?.seq ?? after, more: changed.length > limit, order: ordered().map((call) => call.rowid), newest }), stderr: '' }
+        return { stdout: JSON.stringify({ rows: page.map(item), cursor: page.at(-1)?.seq ?? after, more: changed.length > limit,
+          order: ordered().map((call) => call.rowid), newest, running: calls.filter((call) => call.row.status === 'running').map(item) }), stderr: '' }
       }
       return { stdout: JSON.stringify(table.whole()), stderr: '' }
     })
@@ -367,6 +372,21 @@ describe('changed-call history reads', () => {
     for (let n = 1; n <= 3; n++) table.insert(call(100 + n, { status: 'running', completed_at: null }), n)
     expect(await fetchAgentLogSnapshot({ fresh: true })).toEqual(parseAgentLogList(table.whole()))
     expect((await fetchAgentLogSnapshot({ fresh: true })).entries.map((entry) => entry.pr_id)).toEqual(['103', '102', '101'])
+  })
+
+  it('keeps running calls current, as a whole read would, when only the clock moved', async () => {
+    const table = callerTable()
+    table.insert(call(1), 1)
+    table.insert(call(2, { status: 'running', completed_at: null }), 2)
+    table.insert(call(3, { status: 'running', completed_at: null }), 3)
+    expect(await fetchAgentLogSnapshot({ fresh: true })).toEqual(parseAgentLogList(table.whole()))
+    table.tick()
+    const later = await fetchAgentLogSnapshot({ fresh: true })
+    expect(later).toEqual(parseAgentLogList(table.whole()))
+    expect(later.entries.filter((entry) => entry.status === 'running').map((entry) => entry.time_elapsed)).toEqual(['1s', '1s'])
+    table.update(2, { status: 'completed' })
+    table.tick()
+    expect(await fetchAgentLogSnapshot({ fresh: true })).toEqual(parseAgentLogList(table.whole()))
   })
 
   it('keeps its snapshot frozen, as every reader expects', async () => {

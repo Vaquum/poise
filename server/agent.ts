@@ -151,6 +151,9 @@ interface ChangedHistoryPage {
   more: boolean
   order: number[]
   newest: number
+  /** Every running call as the page read it: its row changes with the clock
+   *  alone (its elapsed time), so no change number marks it. */
+  running: Array<{ rowid: number, seq: number, row: unknown }>
 }
 let heldHistory: HeldHistory | null = null
 /** False once this Caller answered a changed read with the whole history or its usage. */
@@ -356,13 +359,14 @@ function parseChangedHistoryPage(stdout: string): ChangedHistoryPage | null {
   try { value = JSON.parse(stdout.trim()) } catch { return null }
   const page = value as Partial<ChangedHistoryPage> | null
   const count = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) >= 0
-  if (!page || typeof page !== 'object' || Array.isArray(page) || !Array.isArray(page.rows) || !count(page.cursor)
+  const calls = (items: unknown): boolean => Array.isArray(items)
+    && items.every((item) => item !== null && typeof item === 'object' && count(item.rowid) && item.rowid > 0 && count(item.seq))
+  if (!page || typeof page !== 'object' || Array.isArray(page) || !calls(page.rows) || !count(page.cursor)
     || typeof page.more !== 'boolean' || !Array.isArray(page.order) || !page.order.every((rowid) => count(rowid) && rowid > 0)
-    || !count(page.newest)
-    || !page.rows.every((item) => item !== null && typeof item === 'object' && count(item.rowid) && item.rowid > 0 && count(item.seq))) {
+    || !count(page.newest) || (page.running !== undefined && !calls(page.running))) {
     return null
   }
-  return page as ChangedHistoryPage
+  return { ...page, running: page.running ?? [] } as ChangedHistoryPage
 }
 
 /** The whole history from the held calls in Caller's order, parsed as one
@@ -424,6 +428,8 @@ async function readChangedHistory(signal: AbortSignal): Promise<{ snapshot: Agen
       for (const item of page.rows) {
         if (reading.calls.get(item.rowid)?.seq !== item.seq) reading.calls.set(item.rowid, { seq: item.seq, row: item.row, index: -1, parsed: null })
       }
+      // Running calls are taken as this page read them, changed or not.
+      for (const item of page.running) reading.calls.set(item.rowid, { seq: item.seq, row: item.row, index: -1, parsed: null })
       reading.cursor = page.cursor
       if (!page.more) {
         order = page.order

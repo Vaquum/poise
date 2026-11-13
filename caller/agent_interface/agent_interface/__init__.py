@@ -900,7 +900,9 @@ def logs_changed(after: int, limit: int, without_progress: bool = False) -> dict
     same snapshot as its rows: a reader that holds each call's latest row puts
     them in that order and has the whole history, without reading the
     unchanged calls again. A newest number below what the reader saw means
-    the database was replaced, and it reads from 0."""
+    the database was replaced, and it reads from 0. A running call's row
+    changes with the clock alone (its elapsed time), so every page also
+    carries every running call as it reads now."""
     if type(after) is not int or after < 0:
         raise ValueError("changed logs need a change number of 0 or more")
     if type(limit) is not int or not 1 <= limit <= LOGS_CHANGED_LIMIT_MAX:
@@ -914,16 +916,19 @@ def logs_changed(after: int, limit: int, without_progress: bool = False) -> dict
             " where change_seq > ? order by change_seq limit ?", (after, limit + 1)).fetchall()
         order = [row[0] for row in conn.execute("select rowid from calls order by started_at, rowid")]
         newest = conn.execute("select coalesce(max(change_seq), 0) from calls").fetchone()[0]
+        running = conn.execute(
+            f"select calls.rowid, calls.change_seq, {LOG_ROW_COLUMNS} from calls where status='running'").fetchall()
     more = len(rows) > limit
     rows = rows[:limit]
-    changed = []
-    for row in rows:
+
+    def item(row) -> dict:
         entry = _full_history_log_row(row)
         if without_progress:
             entry.pop("progress", None)
-        changed.append({"rowid": row["rowid"], "seq": row["change_seq"], "row": entry})
+        return {"rowid": row["rowid"], "seq": row["change_seq"], "row": entry}
+    changed = [item(row) for row in rows]
     return {"rows": changed, "cursor": changed[-1]["seq"] if changed else after, "more": more, "order": order,
-            "newest": newest}
+            "newest": newest, "running": [item(row) for row in running]}
 
 LOGS_LATEST_QUERY = f"""select {LOG_ROW_COLUMNS} from calls
     where behavior=? and source=? and {LOG_OWNER_SQL}=?

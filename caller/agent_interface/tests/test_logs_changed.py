@@ -45,7 +45,7 @@ class LogsChangedCase(TestCase):
         held, after = {}, 0
         while True:
             page = agent_interface.logs_changed(after, 2, without_progress)
-            for item in page["rows"]:
+            for item in page["rows"] + page["running"]:
                 held[item["rowid"]] = item["row"]
             after = page["cursor"]
             if not page["more"]:
@@ -78,6 +78,17 @@ class LogsChangedCase(TestCase):
         self.assertEqual(later["order"], [2, 1])
         self.assertEqual(later["newest"], max(item["seq"] for item in later["rows"]))
         self.assertEqual(self.merged(), self.whole())
+
+    def test_every_page_carries_the_running_calls_as_they_read_now(self):
+        self.insert("a" * 32, 1761000100.0, status="running")
+        self.insert("b" * 32, 1761000200.0)
+        cursor = agent_interface.logs_changed(0, 10)["cursor"]
+        later = agent_interface.logs_changed(cursor, 10)
+        self.assertEqual(later["rows"], [])
+        self.assertEqual([item["rowid"] for item in later["running"]], [1])
+        whole = {row["id"]: row for row in self.whole()}
+        self.assertEqual(later["running"][0]["row"]["status"], "running")
+        self.assertEqual(later["running"][0]["row"].keys(), whole["a" * 32].keys())
 
     def test_pages_hand_over_every_change_once(self):
         for n in range(5):
