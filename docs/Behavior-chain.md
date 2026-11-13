@@ -621,7 +621,8 @@ Reporting is off by default. An operator can set
 `POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
 list of explicit `owner/repo` names, up to 8192 bytes so the workspace can echo
 it in health for gateway reconciliation. Enabled v2 chains check both new and existing
-repair holds, automatic implementation holds before a PR, and uncertain merge
+repair holds, automatic implementation holds before a PR, uncertain implementation
+publication, and uncertain merge
 submissions during their ordinary bounded reconciliation, including open `poise`
 seeds whose only PR closed unmerged; no Resume or extra poller is needed.
 Reporting preserves the source hold, uncertainty and ownership and does not
@@ -690,6 +691,23 @@ the bounded, redacted blocker as **worker-reported** and available structured Ca
 diagnostic facts. Caller's blocked result does not independently verify the worker's
 health-check, test-relay or other runner explanation. Its next action is to inspect
 the original Call, remedy the blocker and explicitly Resume for a fresh implementation.
+
+`implementation_publication_uncertain` qualifies an original `implement-issue`
+invocation that remains uncertain after recovery, including an unheld source.
+Its failed terminal Call is retained in `evidence.callId` while `invocation.callId`
+is still null. The original receipt must retain the `publishing` phase, completion
+time and positive resource-release proof without a conclusive publication result.
+Fresh reconciliation must still verify the same open, eligible source with no
+attributable pushed branch, bound PR or competing linked work. Reporting keeps
+the source fenced and names the original invocation, Call, bounded cause and
+missing pre-push no-write checkpoint or conclusive push result. It authorizes
+neither replacement implementation nor a second push. Its existing intent uses
+cause + source chain + original invocation. Before creation, source-body links
+and comments by configured accounts can identify an existing report, including a
+closed markerless issue by either configured account. Its body must verify the
+same source, invocation, Call and uncertain publication with missing original
+push evidence; an ordinary reference or another failure cannot qualify. Adoption
+retains that issue in the intent across restart without another POST or marker edit.
 
 `merge_submission_uncertain` separately qualifies the original pending `merge-pr`
 invocation after recovery rereads the journal, even without an explicit chain hold.

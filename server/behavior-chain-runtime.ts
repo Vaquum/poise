@@ -20,7 +20,7 @@ export interface ChainRuntimeOperations {
   discover(): Promise<ChainSeed[]>
   ownsRepository(repository: string): boolean
   observe(chain: BehaviorChain): Promise<ChainObservation>
-  /** Also reports terminal uncertain merge submissions without a chain hold. */
+  /** Also reports terminal uncertain publications and merges without a chain hold. */
   reportHold?(chain: BehaviorChain): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
@@ -366,7 +366,9 @@ export class BehaviorChainRuntime {
                 phase = 'invocation-recovery'
                 try { await this.recover(chain, pendingInvocation, observation, chainSnapshot) }
                 catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError = preferObservationError(observationError, error) }
-                if (pendingInvocation.behavior === 'merge-pr' && this.operations.reportHold) await this.reportHold(this.current(chain))
+                const recovered = this.current(chain)
+                if (recovered.invocations.some(invocation => invocation.id === pendingInvocation.id && invocation.state === 'uncertain'
+                  && ['implement-issue', 'merge-pr'].includes(invocation.behavior)) && this.operations.reportHold) await this.reportHold(recovered)
                 continue
               }
               phase = 'decision'
@@ -528,7 +530,7 @@ export class BehaviorChainRuntime {
     try { reason = await this.operations.reportHold!(chain) }
     catch (error) { reason = `Work-failure reporting pending: ${error instanceof Error ? error.message : String(error)}` }
     const current = this.current(chain)
-    if (reason && (current.held || current.invocations.some(invocation => invocation.behavior === 'merge-pr' && invocation.state === 'uncertain'))
+    if (reason && (current.held || current.invocations.some(invocation => ['implement-issue', 'merge-pr'].includes(invocation.behavior) && invocation.state === 'uncertain'))
       && current.resumedAfterSequence === chain.resumedAfterSequence && current.waiting !== reason) {
       this.append(current, { type: 'chain.waiting', reason })
     }
