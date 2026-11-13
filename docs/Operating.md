@@ -522,12 +522,12 @@ The wake sends only `ref: main`, never a candidate SHA. The fork still requires
 `POISE_UPSTREAM_SYNC=true`; forks cannot dispatch the production wake themselves.
 
 Sync retains its five-minute schedule to reconcile missed or failed wakes.
-A failed Deploy completion also wakes Sync.
+A successful Deploy wakes Sync for the next upstream changes once its apply
+step succeeds. A failed Deploy wakes Sync to reconcile the failure.
 Duplicate or stale wakes enter the same serialized Sync, which reads current
 main: they introduce no additional deployment or rollback. This does not prevent
 an operator from reapplying settings through Deploy on the same green tip.
-Promptness applies to requesting Sync; a retained candidate can still wait for
-later reconciliation. With `POISE_DEPLOY_HOST` set, Sync
+With `POISE_DEPLOY_HOST` set, Sync
 retains the fork's current main through both required push workflows (CI and
 Caller) and its gated, serialized Deploy attempt. Green CI alone does not
 release the candidate, nor does a successful Deploy that skipped its apply

@@ -36,6 +36,9 @@ export class DiagnosticConflictError extends Error {
 export class DiagnosticStore {
   private readonly db: Database.Database
   private readonly indexes = new Set<string>()
+  /** Tombstones added since the cap was last held: the cap is read again once a
+   *  64th of it has built up, and on the first prune of this store. */
+  private tombstonesSinceCap = Number.POSITIVE_INFINITY
   constructor(readonly path: string, readonly policy: LogPolicy = DEFAULT_LOG_POLICY, readonly now = Date.now, readonly readOnly = false) {
     if (!Object.values(policy).every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error('Logging retention and storage limits must be positive integers')
     if (!readOnly && path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -111,7 +114,7 @@ export class DiagnosticStore {
 
   append(events: readonly LogEvent[]): number {
     if (events.length > 100) throw new Error('Logging ingestion batch exceeds 100 events')
-    return this.db.transaction(() => {
+    return this.capChecked(() => this.db.transaction(() => {
       let inserted = 0
       this.prune()
       for (const event of events) {
@@ -124,8 +127,8 @@ export class DiagnosticStore {
           || !new RegExp(`^inc_${prefix}_[a-f0-9]{64}$`).test(event.incidentId)) throw new DiagnosticEventError(event.id, 'Logging event identity is outside its authorized scope', event)
         if (this.db.prepare('SELECT 1 FROM log_expired WHERE id=?').get(event.id)) continue
         if (Date.parse(event.ingestedAt) < this.now() - this.policy.retentionMs) {
-          this.db.prepare('INSERT OR IGNORE INTO log_expired VALUES (?,?,?,?)').run(event.id, event.workspace, event.visibility,
-            new Date(Date.parse(event.ingestedAt) + this.policy.retentionMs).toISOString())
+          this.tombstonesSinceCap += this.db.prepare('INSERT OR IGNORE INTO log_expired VALUES (?,?,?,?)').run(event.id, event.workspace, event.visibility,
+            new Date(Date.parse(event.ingestedAt) + this.policy.retentionMs).toISOString()).changes
           continue
         }
         const existing = this.db.prepare('SELECT payload FROM log_events WHERE id=?').get(event.id) as { payload: string } | undefined
@@ -147,26 +150,47 @@ export class DiagnosticStore {
       }
       this.prune()
       return inserted
-    })()
+    })())
+  }
+
+  /** A write that rolls back also undoes a tombstone cap held inside it, so the
+   *  next prune holds the cap again. */
+  private capChecked<T>(write: () => T): T {
+    try {
+      return write()
+    } catch (error) {
+      this.tombstonesSinceCap = Number.POSITIVE_INFINITY
+      throw error
+    }
   }
 
   prune(reserve = 0): void {
     if (reserve > this.policy.maxBytes) throw new Error('Logging event exceeds the configured storage budget')
     const cutoff = new Date(this.now() - this.policy.retentionMs).toISOString()
-    this.db.transaction(() => {
+    this.capChecked(() => this.db.transaction(() => {
       this.db.prepare('DELETE FROM log_expired WHERE expired_at < ?').run(cutoff)
       // Release payload/index pages before allocating their smaller tombstones.
       const expired = this.db.prepare("DELETE FROM log_events WHERE ingested_at < ? RETURNING id,workspace,visibility,strftime('%Y-%m-%dT%H:%M:%fZ',ingested_at,?) AS expired_at")
         .all(cutoff, `+${this.policy.retentionMs / 1000} seconds`) as ExpiredRow[]
       this.evict(reserve, expired.length * 1024)
       this.rememberExpired(expired)
-      this.db.prepare('DELETE FROM log_expired WHERE id IN (SELECT id FROM log_expired ORDER BY expired_at DESC,id DESC LIMIT -1 OFFSET ?)').run(Math.max(1, Math.min(this.policy.maxEvents * 2, Math.floor(this.policy.maxBytes / 1024))))
-    })()
+      // Keep the newest tombstones up to the cap. Walking past the cap's worth of
+      // index entries on every prune, twice an append, cost up to 0.86 s a call in
+      // production. The cap is read again only once new tombstones have built up
+      // (a 64th of it, at least one), and then a count and only the excess,
+      // oldest first.
+      const cap = Math.max(1, Math.min(this.policy.maxEvents * 2, Math.floor(this.policy.maxBytes / 1024)))
+      if (this.tombstonesSinceCap >= Math.max(1, Math.floor(cap / 64))) {
+        this.tombstonesSinceCap = 0
+        const { count } = this.db.prepare('SELECT COUNT(*) AS count FROM log_expired').get() as { count: number }
+        if (count > cap) this.db.prepare('DELETE FROM log_expired WHERE id IN (SELECT id FROM log_expired ORDER BY expired_at ASC,id ASC LIMIT ?)').run(count - cap)
+      }
+    })())
   }
 
   private rememberExpired(rows: readonly ExpiredRow[]): void {
     const insert = this.db.prepare('INSERT OR IGNORE INTO log_expired VALUES (?,?,?,?)')
-    for (const row of rows) insert.run(row.id, row.workspace, row.visibility, row.expired_at)
+    for (const row of rows) this.tombstonesSinceCap += insert.run(row.id, row.workspace, row.visibility, row.expired_at).changes
   }
 
   private evict(reserve: number, pendingExpiryBytes = 0): void {

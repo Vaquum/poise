@@ -49,6 +49,26 @@ let pendingSettings: { revision: number, promise: Promise<AppSettings> } | null 
 let loadOk = false
 export function settingsLoadOk(): boolean { return loadOk }
 
+// The last settings this browser read for this workspace. A page opens its
+// place on them at once instead of waiting for the server, and reads them
+// again behind it. They name accounts, organizations and a time zone, never
+// a credential.
+const LAST_SETTINGS_KEY = 'poise-last-settings'
+let remembered: AppSettings | null | undefined
+let rememberedCheck = false
+function rememberedSettings(): AppSettings | null {
+  if (remembered === undefined) {
+    try {
+      const raw = localStorage.getItem(LAST_SETTINGS_KEY)
+      remembered = raw ? JSON.parse(raw) as AppSettings : null
+    } catch {
+      remembered = null
+    }
+  }
+  return remembered
+}
+const daysAndScope = (s: AppSettings): string => JSON.stringify([s.me, s.timezone, (s.organizations ?? []).map((org) => [org.login, org.status])])
+
 export function loadSettings(options: { fresh?: boolean } = {}): Promise<AppSettings> {
   // Post-write reads supersede any snapshot captured before that write.
   if (options.fresh) savedRevision++
@@ -71,6 +91,7 @@ async function readSettings(revision: number): Promise<AppSettings> {
       if (revision === savedRevision) {
         current = settings
         loadOk = true
+        try { localStorage.setItem(LAST_SETTINGS_KEY, JSON.stringify(settings)) } catch { /* the next page waits for the server */ }
       }
     } else if (revision === savedRevision) {
       loadOk = false
@@ -79,6 +100,7 @@ async function readSettings(revision: number): Promise<AppSettings> {
     if (revision === savedRevision) loadOk = false
   }
   loaded = true
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('poise:settings-read'))
   return current
 }
 
@@ -90,10 +112,24 @@ export function settingsLoaded(): boolean {
   return loaded
 }
 
-/** Settings for a place that is opening: the page's first read is awaited;
- *  after it, the last answer stands while a fresh one is read behind it. */
+/** Settings for a place that is opening: the last answer stands while a
+ *  fresh one is read behind it. The page's first read is awaited only when
+ *  this browser has never read them; otherwise the place opens on the ones it
+ *  remembers, and if the fresh ones change its days, organizations or GitHub
+ *  user, it is told as for a change of organization. */
 export function placeSettings(): Promise<AppSettings> {
-  if (!loaded) return loadSettings()
+  if (!loaded) {
+    const last = rememberedSettings()
+    if (!last) return loadSettings()
+    if (!rememberedCheck) {
+      rememberedCheck = true
+      current = last
+      void loadSettings().then((fresh) => {
+        if (loadOk && daysAndScope(fresh) !== daysAndScope(last)) window.dispatchEvent(new CustomEvent('poise:organization-filter-changed'))
+      })
+    }
+    return Promise.resolve(current)
+  }
   void loadSettings()
   return Promise.resolve(current)
 }

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { db, getMeta, setMeta } from '../db'
+import { cachedStatement } from '../statements'
 import { behaviorChainOwner, type ChainPullIdentity } from '../behavior-chain-journal'
 import { HttpError } from '../http'
 import type { WakeMinutes } from '../../src/chat-manager-settings-types'
@@ -257,7 +258,7 @@ export function settleOrphanedMessages(instance: string): void {
  *  pending on the cut turn. Page by 100 recipients, retaining both
  *  candidates at the boundary. The tick picks at most one row per recipient. */
 export function pending(instance: string, afterRecipient = '', now = Date.now()): InternalMessage[] {
-  const page = db.prepare(`WITH candidates AS (
+  const page = cachedStatement(db, `WITH candidates AS (
       SELECT ${INBOX_COLUMNS} FROM chat_control_inbox
       WHERE instance = ? AND state = 'pending' AND timer_id IS NULL
         AND seq IN (SELECT MIN(seq) FROM chat_control_inbox WHERE instance = ? AND state = 'pending' AND timer_id IS NULL GROUP BY recipient)

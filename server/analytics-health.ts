@@ -136,19 +136,172 @@ export function retryProven(chain: BehaviorChain, retry: ChainInvocation, observ
 }
 
 /** Confirmed closed seeds mirror journal.page(false): issue closed with no
- * existing pulls, settled ownership and no merged publication/PR. */
+ * remaining pulls, settled ownership and no merged publication/PR. Only the
+ * verified external closing reference is discounted; a test-merge SHA on the
+ * confirmed unmerged binding is not a merge. */
 function isConfirmedClosed(chain: BehaviorChain): boolean {
   const observation = chain.observation as ChainObservation | null
   if (!observation || observation.issue.open !== false) return false
-  if (!Array.isArray(observation.existingPulls) || observation.existingPulls.length !== 0) return false
+  const external = observation.externalMerge
+  const closing = typeof external?.merge_sha === 'string' && Number.isSafeInteger(external.pull_number) && external.pull_number > 0
+    ? `https://github.com/${chain.repository}/pull/${external.pull_number}`.toLowerCase() : null
+  if (!Array.isArray(observation.existingPulls)
+    || (closing === null ? observation.existingPulls.length !== 0
+      : observation.existingPulls.some(url => typeof url !== 'string' || url.toLowerCase() !== closing))) return false
   if (chain.invocations.some(invocation => invocation.state !== 'settled')) return false
   if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation }))) return false
   if (chain.reviewPending === true) return false
-  if (observation.publication.merged !== false || observation.publication.merge_sha != null) return false
+  if (observation.publication.merged !== false) return false
   const pull = observation.pull
   if (pull === null) return observation.publication.pull_number === null && observation.publication.state === null
+    && observation.publication.merge_sha == null
   return pull.state === 'closed' && observation.publication.state === 'closed'
     && pull.number === observation.publication.pull_number && pull.merged === false && pull.mergeSha == null
+}
+
+/** One error's recovery as the journal proves it; the clock decides only whether it counts. */
+type RecoveryFact = { unknown: true, errorAt: number, advancedAt: number | null }
+  | { unknown: false, origin: 'automatic' | 'operator', at: number | null | undefined, outcome: WorkRecovery }
+
+/** What one revision of a chain's journal says apart from the clock. Its
+ * errors leave out those later than the clock it was read at, so it stands
+ * for a clock in [from, until): the latest error counted to the earliest left out. */
+interface ChainFacts {
+  revision: number, from: number, until: number
+  admittedAt: number, progress: { at: number, sequence: number }
+  errors: WorkError[]
+  /** A merge verified but for the clock: its GitHub time, its lifetime's incidents and whether that evidence is incomplete. */
+  merge: { at: number, incidents: number, incomplete: boolean } | null
+  recoveries: RecoveryFact[]
+}
+
+/** Replaying each chain's journal was the whole cost of a read, and history is
+ * immutable: a chain's facts stand until its next event. */
+const factsByJournal = new WeakMap<BehaviorChainJournal, Map<string, ChainFacts>>()
+
+function chainFacts(journal: BehaviorChainJournal, chain: BehaviorChain, now: number): ChainFacts {
+  const rows = historyRows(journal, chain.id)
+  const admittedAt = rows[0]?.at
+  const progress = chainProgress(journal, chain.id, undefined, true)
+  let from = -Infinity, until = Infinity
+  // Reconciliation can replace the current outcome with a verified success.
+  // Original failure receipts remain in the immutable journal, including
+  // failed Calls whose resource/publication outcome is still uncertain.
+  const errors: WorkError[] = []
+  // Each error recovers against the failure row that produced it: one
+  // invocation can fail an original Call and later a publication Call, and
+  // the first failure row is the wrong window for the later incident.
+  const failureByError = new Map<WorkError, typeof rows[number]>()
+  const seenErrors = new Set<string>()
+  for (const row of rows) {
+    const event = row.event
+    if (event.type !== 'invocation.settled' && event.type !== 'invocation.reconciled') continue
+    const invocation = chain.invocations.find(item => item.id === event.invocationId)!
+    const error = workError(chain, { ...invocation, evidence: event.evidence,
+      callId: event.type === 'invocation.settled' ? event.callId : null })
+    if (error && error.at > now) until = Math.min(until, error.at)
+    if (!error || error.at > now || seenErrors.has(`${error.callId}:${error.incident}`)) continue
+    seenErrors.add(`${error.callId}:${error.incident}`)
+    errors.push(error)
+    failureByError.set(error, row)
+    from = Math.max(from, error.at)
+  }
+  const merged = rows.find(row => row.event.type === 'chain.observed' && row.event.observation.pull
+    && (row.event.observation as ChainObservation).pull?.merged)
+  const observation = (merged?.event as Extract<ChainEvent, { type: 'chain.observed' }> | undefined)?.observation as ChainObservation | undefined
+  const pull = observation?.pull
+  const mergedAt = pull?.mergedAt
+  const known = !!chain.mergeSha && pull?.mergeSha === chain.mergeSha
+    && observation?.publication.pull_number === pull?.number && observation?.publication.merged === true
+    && observation.publication.merge_sha === chain.mergeSha && typeof mergedAt === 'number' && Number.isFinite(mergedAt)
+  const merge = known ? {
+    at: mergedAt!,
+    // Delayed reconciliation can stamp a pre-merge failure after merging;
+    // the admitted attempt still proves the incident belongs to the lifetime.
+    incidents: new Set(errors.filter(error => {
+      if (error.at <= mergedAt!) return true
+      const failed = chain.invocations.find(invocation => invocation.id === error.invocation)!
+      return failed.admittedAt <= mergedAt!
+    }).map(error => error.incident)).size,
+    incomplete: chain.invocations.some(invocation => invocation.admittedAt <= mergedAt!
+      && (!invocation.evidence || invocation.evidence.status === 'failed' && (!invocation.callId || !Number.isFinite(invocation.evidence.completedAt))
+        || invocation.state === 'uncertain')),
+  } : null
+  const recoveries: RecoveryFact[] = []
+  for (const error of errors) {
+    const failed = chain.invocations.find(invocation => invocation.id === error.invocation)!
+    const failure = failureByError.get(error)
+    if (!failure) continue
+    const later = chain.invocations.find(invocation => invocation.admissionSequence > failure.sequence
+      && invocation.behavior === failed.behavior && invocation.basis === failed.basis && invocation.slot === failed.slot
+      && invocation.evidence?.status === 'completed')
+    // recover() settles verified native publication success on the
+    // original invocation instead of admitting a later retry: the retry
+    // may share the failure's admission or predate its settlement.
+    const fallback = !later ? chain.invocations.find(invocation => invocation.behavior === failed.behavior
+      && invocation.basis === failed.basis && invocation.slot === failed.slot && invocation.evidence?.status === 'completed'
+      && rows.some(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
+        && row.event.invocationId === invocation.id && row.sequence > failure.sequence
+        && (row.event.evidence as Record<string, unknown>).status === 'completed') ) : undefined
+    const retry = later ?? fallback
+    const success = retry && rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
+      && row.event.invocationId === retry.id && row.sequence > failure.sequence && row.event.evidence.status === 'completed')
+    // Same-invocation publication retries launch via a recorded
+    // publicationResume before their success settles. An operator
+    // Hold/Resume while that automatic retry runs must not relabel it.
+    // A cleared launch (CallerReceiptStoreError) may precede the launch
+    // that actually succeeds; use the latest launch before success so an
+    // operator Resume between them is not excluded.
+    const launch = retry && retry.admissionSequence <= failure.sequence ? rows.filter(row => row.sequence > failure.sequence
+      && (!success || row.sequence < success.sequence) && row.event.type === 'invocation.reconciled' && row.event.invocationId === retry.id
+      && typeof (row.event.evidence as Record<string, unknown> | null)?.publicationResume === 'object'
+      && (row.event.evidence as Record<string, unknown> | null)?.publicationResume !== null
+      && typeof (((row.event.evidence as Record<string, unknown>).publicationResume as Record<string, unknown>).correlation) === 'string').at(-1) : undefined
+    const resumed = rows.filter(row => row.sequence > failure.sequence && row.event.type === 'chain.resumed'
+      && (!retry || (retry.admissionSequence > failure.sequence ? row.sequence < retry.admissionSequence
+        : launch ? row.sequence < launch.sequence : !success || row.sequence < success.sequence)))
+    const operator = resumed.filter(row => row.event.type === 'chain.resumed' && row.event.recovery?.origin === 'operator').at(-1)
+    // A runtime CI recovery carries its own ciRecovery evidence and is not
+    // an ambiguous operator resume.
+    const ambiguous = resumed.some(row => row.event.type === 'chain.resumed' && !row.event.ciRecovery
+      && (!row.event.recovery || row.event.recovery.origin === 'unknown'))
+    const action = operator ?? resumed.at(-1)
+    const origin = operator ? 'operator' : ambiguous ? 'unknown' : 'automatic'
+    // Same-invocation continuations preserve the failed Call's
+    // completedAt through recover(), so the stale stamp would accept a
+    // head advance observed before publicationResume. Require progress
+    // after the launch that actually succeeds; a verified published head
+    // journaled after that launch but before its success settlement still
+    // counts. Without a launch (e.g. publish-issue settled from the
+    // observation), require progress after the failure instead of the
+    // later success settlement. Later-admission retries keep the
+    // preceding-observation proof (e.g. grey CI success observed before
+    // its settlement).
+    const sameInvocation = !!retry && !!success && retry.admissionSequence <= failure.sequence
+    const bound = sameInvocation ? (launch ?? failure) : undefined
+    const retryAt = bound ? bound.at : Number(retry?.evidence?.completedAt)
+    const advanced = retry && success && progress.advances.find(point => {
+      if (point.sequence < failure.sequence || point.at < retryAt || point.at < error.at) return false
+      if (sameInvocation && bound && point.sequence < bound.sequence) return false
+      const observed = rows.filter(row => row.sequence <= point.sequence && row.event.type === 'chain.observed').at(-1)
+      return observed?.event.type === 'chain.observed' && retryProven(chain, retry, observed.event.observation as ChainObservation, point.at)
+    })
+    const recovery = operator?.event.type === 'chain.resumed' ? operator.event.recovery : null
+    const interventionAt = recovery?.intervention?.at ?? (operator && advanced ? operator.at : null)
+    const verifiedHelp = !!recovery?.intervention && recovery.intervention.at > error.at
+      && recovery.intervention.verifiedAt >= recovery.intervention.at
+    const outcomeAt = origin === 'operator' ? interventionAt : advanced?.at
+    if (origin === 'unknown' || !advanced || recovery?.intervention && !verifiedHelp) {
+      recoveries.push({ unknown: true, errorAt: error.at, advancedAt: advanced ? advanced.at : null })
+      continue
+    }
+    recoveries.push({ unknown: false, origin, at: outcomeAt, outcome: { work: chain.id, journal: journalHref(chain.id, failure.sequence), summary: error.summary,
+      failedCall: error.callId, origin,
+      actionSequence: action?.sequence ?? (retry!.admissionSequence > failure.sequence || !success ? retry!.admissionSequence : success.sequence),
+      actionAt: action?.at ?? (retry!.admissionSequence > failure.sequence || !success ? retry!.admittedAt : success.at), progressAt: advanced.at,
+      interventionAt: origin === 'operator' ? interventionAt : null } })
+  }
+  return { revision: chain.sequence, from, until, admittedAt, progress: { at: progress.at, sequence: progress.sequence }, errors, merge, recoveries }
 }
 
 /** Only canonical v2 ownership enters this population. Nothing here observes
@@ -175,62 +328,31 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
   }
   if (!organizations.length) { complete = false; addLimit('No configured GitHub account is available') }
   const accountsComplete = complete
+  let memo = factsByJournal.get(journal)
+  if (!memo) { memo = new Map(); factsByJournal.set(journal, memo) }
   let after = ''
   for (;;) {
     const page = journal.page(after, 100, null)
     for (const chain of page) {
       input.signal?.throwIfAborted()
       if (!organizations.some(org => chain.repository.split('/')[0].toLowerCase() === org.login.toLowerCase())) continue
-      const rows = historyRows(journal, chain.id)
-      const admittedAt = rows[0]?.at
-      const progress = chainProgress(journal, chain.id, undefined, true)
-      // Reconciliation can replace the current outcome with a verified success.
-      // Original failure receipts remain in the immutable journal, including
-      // failed Calls whose resource/publication outcome is still uncertain.
-      const errors: WorkError[] = []
-      // Each error recovers against the failure row that produced it: one
-      // invocation can fail an original Call and later a publication Call, and
-      // the first failure row is the wrong window for the later incident.
-      const failureByError = new Map<WorkError, typeof rows[number]>()
-      const seenErrors = new Set<string>()
-      for (const row of rows) {
-        const event = row.event
-        if (event.type !== 'invocation.settled' && event.type !== 'invocation.reconciled') continue
-        const invocation = chain.invocations.find(item => item.id === event.invocationId)!
-        const error = workError(chain, { ...invocation, evidence: event.evidence,
-          callId: event.type === 'invocation.settled' ? event.callId : null })
-        if (!error || error.at > now || seenErrors.has(`${error.callId}:${error.incident}`)) continue
-        seenErrors.add(`${error.callId}:${error.incident}`)
-        errors.push(error)
-        failureByError.set(error, row)
+      let facts = memo.get(chain.id)
+      if (!facts || facts.revision !== chain.sequence || now < facts.from || now >= facts.until) {
+        facts = chainFacts(journal, chain, now)
+        memo.set(chain.id, facts)
       }
+      const { admittedAt, progress, errors, merge } = facts
       for (const error of errors) if (!result.lastError.error || error.at > result.lastError.error.at) result.lastError.error = error
-      const merged = rows.find(row => row.event.type === 'chain.observed' && row.event.observation.pull
-        && (row.event.observation as ChainObservation).pull?.merged)
-      const observation = (merged?.event as Extract<ChainEvent, { type: 'chain.observed' }> | undefined)?.observation as ChainObservation | undefined
-      const pull = observation?.pull
-      const mergedAt = pull?.mergedAt
-      const verifiedMerge = !!chain.mergeSha && pull?.mergeSha === chain.mergeSha
-        && observation?.publication.pull_number === pull?.number && observation?.publication.merged === true
-        && observation.publication.merge_sha === chain.mergeSha && typeof mergedAt === 'number' && Number.isFinite(mergedAt) && mergedAt <= now
+      const verifiedMerge = !!merge && merge.at <= now
       if (chain.mergeSha && !verifiedMerge) { complete = false; addLimit(`${chain.id}: original GitHub merge time unavailable`) }
-      if (verifiedMerge && mergedAt! >= since) {
+      if (verifiedMerge && merge.at >= since) {
         result.rate.completed++
-        // Delayed reconciliation can stamp a pre-merge failure after merging;
-        // the admitted attempt still proves the incident belongs to the lifetime.
-        const incidents = new Set(errors.filter(error => {
-          if (error.at <= mergedAt!) return true
-          const failed = chain.invocations.find(invocation => invocation.id === error.invocation)!
-          return failed.admittedAt <= mergedAt!
-        }).map(error => error.incident))
-        result.rate.errors += incidents.size
-        result.rate.items.push({ work: chain.id, journal: journalHref(chain.id), summary: `${incidents.size} errors; merged ${new Date(mergedAt!).toISOString()}` })
+        result.rate.errors += merge.incidents
+        result.rate.items.push({ work: chain.id, journal: journalHref(chain.id), summary: `${merge.incidents} errors; merged ${new Date(merge.at).toISOString()}` })
         lifetimeStart = Math.min(lifetimeStart, admittedAt)
-        if (!covered(admittedAt, mergedAt!) || chain.invocations.some(invocation => invocation.admittedAt <= mergedAt!
-          && (!invocation.evidence || invocation.evidence.status === 'failed' && (!invocation.callId || !Number.isFinite(invocation.evidence.completedAt))
-            || invocation.state === 'uncertain'))) {
+        if (!covered(admittedAt, merge.at) || merge.incomplete) {
           complete = false
-          addLimit(`${chain.id}: incomplete lifetime evidence ${new Date(admittedAt).toISOString()} – ${new Date(mergedAt!).toISOString()}`)
+          addLimit(`${chain.id}: incomplete lifetime evidence ${new Date(admittedAt).toISOString()} – ${new Date(merge.at).toISOString()}`)
         }
       }
       if (!chain.supersession && !isConfirmedClosed(chain) && (!chain.mergeSha || chain.reviewPending)) {
@@ -261,79 +383,13 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
       }
       const outcomes = new Map<'automatic' | 'operator', WorkRecovery>()
       let unknownRecovery = false
-      for (const error of errors) {
-        const failed = chain.invocations.find(invocation => invocation.id === error.invocation)!
-        const failure = failureByError.get(error)
-        if (!failure) continue
-        const later = chain.invocations.find(invocation => invocation.admissionSequence > failure.sequence
-          && invocation.behavior === failed.behavior && invocation.basis === failed.basis && invocation.slot === failed.slot
-          && invocation.evidence?.status === 'completed')
-        // recover() settles verified native publication success on the
-        // original invocation instead of admitting a later retry: the retry
-        // may share the failure's admission or predate its settlement.
-        const fallback = !later ? chain.invocations.find(invocation => invocation.behavior === failed.behavior
-          && invocation.basis === failed.basis && invocation.slot === failed.slot && invocation.evidence?.status === 'completed'
-          && rows.some(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
-            && row.event.invocationId === invocation.id && row.sequence > failure.sequence
-            && (row.event.evidence as Record<string, unknown>).status === 'completed') ) : undefined
-        const retry = later ?? fallback
-        const success = retry && rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
-          && row.event.invocationId === retry.id && row.sequence > failure.sequence && row.event.evidence.status === 'completed')
-        // Same-invocation publication retries launch via a recorded
-        // publicationResume before their success settles. An operator
-        // Hold/Resume while that automatic retry runs must not relabel it.
-        // A cleared launch (CallerReceiptStoreError) may precede the launch
-        // that actually succeeds; use the latest launch before success so an
-        // operator Resume between them is not excluded.
-        const launch = retry && retry.admissionSequence <= failure.sequence ? rows.filter(row => row.sequence > failure.sequence
-          && (!success || row.sequence < success.sequence) && row.event.type === 'invocation.reconciled' && row.event.invocationId === retry.id
-          && typeof (row.event.evidence as Record<string, unknown> | null)?.publicationResume === 'object'
-          && (row.event.evidence as Record<string, unknown> | null)?.publicationResume !== null
-          && typeof (((row.event.evidence as Record<string, unknown>).publicationResume as Record<string, unknown>).correlation) === 'string').at(-1) : undefined
-        const resumed = rows.filter(row => row.sequence > failure.sequence && row.event.type === 'chain.resumed'
-          && (!retry || (retry.admissionSequence > failure.sequence ? row.sequence < retry.admissionSequence
-            : launch ? row.sequence < launch.sequence : !success || row.sequence < success.sequence)))
-        const operator = resumed.filter(row => row.event.type === 'chain.resumed' && row.event.recovery?.origin === 'operator').at(-1)
-        // A runtime CI recovery carries its own ciRecovery evidence and is not
-        // an ambiguous operator resume.
-        const ambiguous = resumed.some(row => row.event.type === 'chain.resumed' && !row.event.ciRecovery
-          && (!row.event.recovery || row.event.recovery.origin === 'unknown'))
-        const action = operator ?? resumed.at(-1)
-        const origin = operator ? 'operator' : ambiguous ? 'unknown' : 'automatic'
-        // Same-invocation continuations preserve the failed Call's
-        // completedAt through recover(), so the stale stamp would accept a
-        // head advance observed before publicationResume. Require progress
-        // after the launch that actually succeeds; a verified published head
-        // journaled after that launch but before its success settlement still
-        // counts. Without a launch (e.g. publish-issue settled from the
-        // observation), require progress after the failure instead of the
-        // later success settlement. Later-admission retries keep the
-        // preceding-observation proof (e.g. grey CI success observed before
-        // its settlement).
-        const sameInvocation = !!retry && !!success && retry.admissionSequence <= failure.sequence
-        const bound = sameInvocation ? (launch ?? failure) : undefined
-        const retryAt = bound ? bound.at : Number(retry?.evidence?.completedAt)
-        const advanced = retry && success && progress.advances.find(point => {
-          if (point.sequence < failure.sequence || point.at < retryAt || point.at < error.at) return false
-          if (sameInvocation && bound && point.sequence < bound.sequence) return false
-          const observed = rows.filter(row => row.sequence <= point.sequence && row.event.type === 'chain.observed').at(-1)
-          return observed?.event.type === 'chain.observed' && retryProven(chain, retry, observed.event.observation as ChainObservation, point.at)
-        })
-        const recovery = operator?.event.type === 'chain.resumed' ? operator.event.recovery : null
-        const interventionAt = recovery?.intervention?.at ?? (operator && advanced ? operator.at : null)
-        const verifiedHelp = !!recovery?.intervention && recovery.intervention.at > error.at
-          && recovery.intervention.verifiedAt >= recovery.intervention.at
-        const outcomeAt = origin === 'operator' ? interventionAt : advanced?.at
-        if (origin === 'unknown' || !advanced || recovery?.intervention && !verifiedHelp) {
-          if (error.at >= since || advanced && advanced.at >= since) unknownRecovery = true
+      for (const recovery of facts.recoveries) {
+        if (recovery.unknown) {
+          if (recovery.errorAt >= since || recovery.advancedAt !== null && recovery.advancedAt >= since) unknownRecovery = true
           continue
         }
-        if (outcomeAt === null || outcomeAt === undefined || outcomeAt < since || outcomeAt > now || outcomes.has(origin)) continue
-        outcomes.set(origin, { work: chain.id, journal: journalHref(chain.id, failure.sequence), summary: error.summary,
-          failedCall: error.callId, origin,
-          actionSequence: action?.sequence ?? (retry!.admissionSequence > failure.sequence || !success ? retry!.admissionSequence : success.sequence),
-          actionAt: action?.at ?? (retry!.admissionSequence > failure.sequence || !success ? retry!.admittedAt : success.at), progressAt: advanced.at,
-          interventionAt: origin === 'operator' ? interventionAt : null })
+        if (recovery.at === null || recovery.at === undefined || recovery.at < since || recovery.at > now || outcomes.has(recovery.origin)) continue
+        outcomes.set(recovery.origin, recovery.outcome)
       }
       if (unknownRecovery) result.recovery.unknown++
       for (const [origin, outcome] of outcomes) result.recovery[origin === 'automatic' ? 'automatic' : 'intervention'].push(outcome)

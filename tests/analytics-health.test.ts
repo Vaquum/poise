@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { projectAnalyticsHealth, healthIntervals, workError, retryProven } from '../server/analytics-health'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { nativeActionReceipt } from '../server/behavior-chain-action'
@@ -53,7 +53,7 @@ function setup() {
     githubQuota: [], collectors: { status: 'ok', reason: null, since: null, queued: 0, queuedBytes: 0, dropped: 0, lastSuccessfulWriteAt: null, error: null } }
   const input: Parameters<typeof projectAnalyticsHealth>[1] = { now: NOW, scope: '', history, dependencies, organizations: [{ login: 'acme', managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: null, retryAt: null }] }
   const read = () => projectAnalyticsHealth(journal, input)
-  return { journal, seed, append, observe, fail, succeed, finish, merge, read, input }
+  return { db, journal, seed, append, observe, fail, succeed, finish, merge, read, input }
 }
 
 it('counts one incident per seed over completed lifetimes, including pre-window errors, with error-free items in the denominator', async () => {
@@ -334,6 +334,43 @@ it('excludes confirmed closed seeds without a PR from blocked work', async () =>
   const report = await f.read()
   expect(report.blocked.count).toBe(0)
   expect(report.blocked.items).toEqual([])
+})
+
+it('excludes a held binding retired by a different merged closing PR', async () => {
+  const f = setup()
+  const reviewer = { model: 'fixture', slot: 'primary', recovery: 'fixture' }
+  const closing = 'https://github.com/acme/repo/pull/1260'
+  const TEST_MERGE = '307c8a031acceae31843add8e66d97ce93ef5e13'
+  const makeClosed = (existingPulls: string[], externalMerge?: ChainObservation['externalMerge']): ChainObservation => ({
+    checkedAt: NOW, existingPulls, issue: { open: false, eligible: true, revision: 'issue', commentIds: [] },
+    issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer,
+    prerequisites: { wait: null, base: HEAD, evidence: [] },
+    publication: { pull_number: 1259, head_sha: HEAD, head_invocation: null, state: 'closed', merged: false, merge_sha: TEST_MERGE },
+    pull: { number: 1259, head: HEAD, headSince: NOW - HOUR, state: 'closed', draft: false, merged: false, mergeSha: null,
+      mergedAt: null, queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'review', greyRuns: [], pending: false, failing: [], conflict: false, behind: false, checksState: null },
+    ...(externalMerge === undefined ? {} : { externalMerge }),
+  })
+  const settle = (issue: number, observation: ChainObservation) => {
+    let chain = f.seed(issue)
+    chain = f.append(chain, { type: 'invocation.admitted', invocation: { id: chainBasis(`${chain.id}:closed`).slice(0, 32),
+      behavior: 'review-issue', actor: 'reviewer', slot: 'primary', basis: 'issue', model: 'fixture',
+      admittedAt: NOW - 48 * HOUR, request: { command: 'agent-interface', argv: [], cwd: '/fixture' } } }, NOW - 48 * HOUR)
+    chain = f.append(chain, { type: 'invocation.started', invocationId: chain.invocations[0].id }, NOW - 48 * HOUR + 1)
+    chain = f.append(chain, { type: 'invocation.settled', invocationId: chain.invocations[0].id, callId: chain.invocations[0].id,
+      outcome: 'commented', evidence: { status: 'completed', action: 'commented', outcome: 'commented', completedAt: NOW - 47 * HOUR } }, NOW - 47 * HOUR)
+    chain = f.append(chain, { type: 'chain.observed', observation }, NOW - HOUR)
+    return f.append(chain, { type: 'chain.held', reason: `seed issue already belongs to existing work: ${closing}` }, NOW - HOUR + 1)
+  }
+  const retired = settle(1, makeClosed([closing], { pull_number: 1260, merge_sha: MERGE }))
+  const missing = settle(2, makeClosed([closing]))
+  const extra = settle(3, makeClosed([closing, 'https://github.com/acme/repo/pull/1261'], { pull_number: 1260, merge_sha: MERGE }))
+  const incomplete = settle(4, makeClosed([closing], { pull_number: 1260 } as unknown as ChainObservation['externalMerge']))
+  expect(f.journal.page('', 100, false).map(chain => chain.id)).toEqual([missing.id, extra.id, incomplete.id].sort())
+  const report = await f.read()
+  expect(report.blocked.count).toBe(3)
+  expect(report.blocked.items.map(item => item.work).sort()).toEqual([missing.id, extra.id, incomplete.id].sort())
+  expect(report.blocked.items.map(item => item.work)).not.toContain(retired.id)
 })
 
 it('counts a pre-merge failure reconciled after merging via its admitted attempt', async () => {
@@ -702,4 +739,32 @@ it('anchors each recovery to its own failure when one invocation fails twice', a
   expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
   expect(report.recovery.intervention).toEqual([])
   expect(report.recovery.unknown).toBe(0)
+})
+
+it('replays only the chains whose journal changed, and reads as a fresh journal does wherever the clock moves', async () => {
+  const f = setup()
+  let recovered = f.observe(f.seed(1), NOW - 7 * HOUR)
+  recovered = f.fail(recovered, 'failure', NOW - 6 * HOUR)
+  recovered = f.succeed(recovered, 'retry', NOW - 5 * HOUR)
+  f.merge(f.observe(recovered, NOW - 5 * HOUR + 1000, null, [17]), NOW - 4 * HOUR)
+  f.merge(f.seed(2), NOW - 2 * HOUR)
+  f.fail(f.seed(3), 'active', NOW - HOUR)
+  const first = await f.read()
+  expect(first.rate).toMatchObject({ completed: 2, errors: 1 })
+  expect(first.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
+  expect(first.lastError.error).toMatchObject({ work: 'acme/repo#3', at: NOW - HOUR })
+  const replayed = vi.spyOn(f.journal, 'history')
+  expect(await f.read()).toEqual(first)
+  expect(replayed).not.toHaveBeenCalled()
+  f.observe(f.journal.read('acme/repo#3')!, NOW)
+  await f.read()
+  expect(new Set(replayed.mock.calls.map(([id]) => id))).toEqual(new Set(['acme/repo#3']))
+  // The window moves by the clock alone: a merge and a recovery leave it,
+  // and a clock before an error replays only the chain that error is in.
+  for (const [now, replays] of [[NOW + 5 * HOUR, []], [NOW + 30 * HOUR, []], [NOW - 2 * HOUR, ['acme/repo#3']]] as const) {
+    replayed.mockClear()
+    const read = await projectAnalyticsHealth(f.journal, { ...f.input, now })
+    expect(new Set(replayed.mock.calls.map(([id]) => id))).toEqual(new Set(replays))
+    expect(read).toEqual(await projectAnalyticsHealth(new BehaviorChainJournal(f.db), { ...f.input, now }))
+  }
 })

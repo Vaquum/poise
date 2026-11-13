@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { db, getMeta, setMeta } from './db'
+import { cachedStatement } from './statements'
 import { forgetSilence, openAlerts, resolveAlert, silencedKeys } from './alerts/store'
 import { ProcessLockError, withProcessLock } from './process-lock'
 import { runFile } from './process'
@@ -169,7 +170,7 @@ function rowFor(login: string): OrganizationRow | undefined {
 }
 
 export function getOrganizations(): Organization[] {
-  const rows = db.prepare('SELECT * FROM organizations ORDER BY rowid').all() as OrganizationRow[]
+  const rows = cachedStatement(db, 'SELECT * FROM organizations ORDER BY rowid').all() as OrganizationRow[]
   const result = rows.map(fromRow)
   const legacy = legacyOrganization()
   if (legacy && !result.some((org) => org.login.toLowerCase() === legacy.login.toLowerCase())) result.unshift(legacy)

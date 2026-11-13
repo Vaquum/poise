@@ -283,6 +283,72 @@ it('discovers a verified external merge for a closed held seed without binding o
   } finally { db.close(); vi.useRealTimers() }
 }, 30_000)
 
+it('retires an already-held closed binding after a different PR closes the seed, preserving its original receipts', async () => {
+  const db = new Database(':memory:')
+  const journal = new BehaviorChainJournal(db)
+  const target = { ...chain, id: 'example/repo#1251', issue: 1251, branch: 'poise/issue-1251' }
+  let current = journal.append(target.id, 'seed', 0, { type: 'chain.admitted', repository: target.repository,
+    issue: target.issue, branch: target.branch, author: target.author, reviewer: target.reviewer })
+  for (const [index, behavior] of (['review-issue', 'implement-issue'] as const).entries()) {
+    current = journal.append(current.id, `admit-${index}`, current.sequence, { type: 'invocation.admitted', invocation: {
+      id: `original-${index}`, behavior, basis: 'original', actor: index ? 'author' : 'reviewer', model: 'fixture', slot: 'primary',
+      admittedAt: Date.now() - 1000, request: { command: 'agent-interface', argv: ['--fixture'], cwd: '/fixture', nativeResources: 2 } } })
+    current = journal.append(current.id, `settle-${index}`, current.sequence, { type: 'invocation.settled', invocationId: `original-${index}`,
+      callId: String(index + 1).repeat(32), outcome: 'completed', evidence: { status: 'completed', resources_settled_at: new Date().toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] } } })
+  }
+  const closing = 'https://github.com/example/repo/pull/1260'
+  current = journal.append(current.id, 'competing', current.sequence, { type: 'chain.observed', observation: {
+    checkedAt: 0, issue: { open: true }, existingPulls: [closing],
+    publication: { pull_number: 1259, head_sha: HEAD, head_invocation: null, state: 'closed', merged: false,
+      merge_sha: '307c8a031acceae31843add8e66d97ce93ef5e13' },
+    pull: { number: 1259, head: HEAD, headSince: Date.now() - 1000, reviewRevision: 'original', state: 'closed', merged: false, mergeSha: null } } })
+  current = journal.append(current.id, 'held', current.sequence, { type: 'chain.held', reason: `seed issue already belongs to existing work: ${closing}` })
+  const original = current
+  const history = journal.history(current.id)
+  let mode = 'verified'
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    expect(command).toBe('github-interface')
+    if (argv[0] === '--pr-readiness') return { stdout: JSON.stringify({ head_sha: HEAD, draft: false,
+      reviewer_approved_current_head: false, unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0,
+      green: false, blockers: ['pull_not_open'] }) }
+    if (argv[0] === '--list-failing-ci') return { stdout: JSON.stringify({ head_sha: HEAD, pull_number: 1259, failing: [] }) }
+    return { stdout: execFileSync('python3', ['tests/fixtures/closed-seed-merge.py'], {
+      input: JSON.stringify({ argv, mode, bound: true }), encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, PYTHONPATH: [resolve('caller/github_interface'), process.env.PYTHONPATH].filter(Boolean).join(':') },
+    }) }
+  })
+  const effect = vi.fn(async () => { throw new Error('closed binding must not start work or publication') })
+  const operations: ChainRuntimeOperations = { ...actionOperations(), discover: async () => [],
+    readInvocations: async () => ({ entries: [], quarantined: [] }), request: effect, launch: effect,
+    perform: effect, resumePublication: effect, fenceClosedTarget: effect }
+  try {
+    mode = 'contradictory'
+    await expect(new BehaviorChainRuntime(journal, operations).run()).rejects.toThrow('external merge differs from its closing PR evidence')
+    expect(journal.read(current.id)).toEqual(original)
+    expect(journal.page('', 100, false)).toEqual([original])
+    mode = 'verified'
+    await new BehaviorChainRuntime(journal, operations).run()
+    current = journal.read(current.id)!
+    expect(current).toMatchObject({ held: original.held, mergeSha: null, invocations: original.invocations,
+      observation: { existingPulls: [closing], publication: { pull_number: 1259, state: 'closed', merged: false,
+        merge_sha: '307c8a031acceae31843add8e66d97ce93ef5e13' },
+      pull: { number: 1259, state: 'closed', merged: false, mergeSha: null },
+      externalMerge: { pull_number: 1260, merge_sha: 'd'.repeat(40) } } })
+    expect(current).not.toHaveProperty('reviewPending')
+    expect(journal.page('', 100, false)).toEqual([])
+    expect(journal.history(current.id)).toEqual([...history, expect.objectContaining({
+      payload: JSON.stringify({ type: 'chain.observed', observation: current.observation }) }), expect.objectContaining({
+      payload: JSON.stringify({ type: 'chain.waiting', reason: original.held }) })])
+    journal.rebuild()
+    expect(journal.read(current.id)).toEqual(current)
+    expect(journal.forPull(target.repository, 1259)).toEqual(current)
+    expect(journal.forPull(target.repository, 1260)).toBeNull()
+    expect(journal.page('', 100, false)).toEqual([])
+    expect(effect).not.toHaveBeenCalled()
+  } finally { db.close() }
+}, 30_000)
+
 it.each([
   { blockers: [], mergeable: true, expected: 'approve-pr' },
   { blockers: ['merge_state_not_clean'], mergeable: true, expected: 'repair-pr' },

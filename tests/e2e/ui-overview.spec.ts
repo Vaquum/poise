@@ -365,6 +365,56 @@ test('In motion says what was never read, rather than zero or clear', async ({ p
   await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
 })
 
+test('a reload opens Overview on the settings this browser remembers, without waiting for the server’s', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+  // The server's settings answer is held; the reload opens the place anyway.
+  let answer: () => void = () => {}
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    await new Promise<void>((resolve) => { answer = resolve })
+    return route.fallback()
+  })
+  await page.reload()
+  await expect(page.getByRole('complementary', { name: 'Answer here' })).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('.ova-main')).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+  answer()
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+})
+
+const SETTINGS = { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }
+
+test('a failed fresh read of Settings shows on the Manager’s card, never the remembered controls', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-act="mgr-paused"]')).toBeVisible()
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, { error: 'settings store unavailable' }, 503))
+  await page.reload()
+  await expect(page.locator('[data-mgrbox]')).toContainText('Settings could not be read')
+  await expect(page.locator('[data-act="mgr-paused"]')).toHaveCount(0)
+})
+
+test('a focused Manager control shows the fresh settings when they land, so it acts on what it shows', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const pause = page.locator('[data-act="mgr-paused"]')
+  await expect(pause).toHaveAttribute('aria-pressed', 'false')
+  // New work was paused elsewhere; the reload opens on the remembered controls while the fresh ones are held.
+  let hold = true
+  const held: Array<() => void> = []
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    if (hold) await new Promise<void>((resolve) => held.push(resolve))
+    return json(route, { ...SETTINGS, manager: { ...SETTINGS.manager, paused: true, version: 2 } })
+  })
+  await page.reload()
+  await expect(pause).toHaveAttribute('aria-pressed', 'false')
+  await pause.focus()
+  hold = false
+  held.forEach((resolve) => resolve())
+  await expect(pause).toHaveAttribute('aria-pressed', 'true')
+  await expect(pause).toBeFocused()
+})
+
 test('a reload paints In motion’s last reads at once, while it reads them again', async ({ page }) => {
   await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
   const people = page.locator('[data-counts="people"] b').first()

@@ -61,6 +61,22 @@ tip=$(jq -r '.sha // empty' <<<"$response" 2>/dev/null) \
   || fail "cannot read the tip of $REPO's main: unexpected answer"
 [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || fail "cannot read the tip of $REPO's main: unexpected answer"
 
+# Caller can wake an early Deploy that exits successfully without applying
+# anything. Only an actual apply may use this event to release a held merge.
+if [ -n "${SUCCESSFUL_DEPLOY_RUN_ID:-}" ]; then
+  [[ "$SUCCESSFUL_DEPLOY_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail 'invalid completed Deploy run ID'
+  if ! jobs=$(gh api "repos/$REPO/actions/runs/$SUCCESSFUL_DEPLOY_RUN_ID/jobs?per_page=100" 2>&1); then
+    fail "cannot read completed Deploy $SUCCESSFUL_DEPLOY_RUN_ID: $jobs"
+  fi
+  applied=$(jq -er --arg step "Deploy $tip" '
+    [.jobs[].steps[]? | select(.name == $step and .conclusion == "success")] | length' <<<"$jobs") \
+    || fail "cannot read completed Deploy $SUCCESSFUL_DEPLOY_RUN_ID steps: unexpected answer"
+  if (( applied == 0 )); then
+    finish 'waiting for Deploy' false "Completed Deploy $SUCCESSFUL_DEPLOY_RUN_ID did not apply $tip."
+    exit 0
+  fi
+fi
+
 blocked=()
 waiting=()
 started=$(date +%s)

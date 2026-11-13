@@ -5,7 +5,7 @@ import { diagnostic, diagnosticFailure } from './logging'
 import { GH_STORED_ACCOUNTS_ENV } from './accounts/clis'
 import { quotaRiskKey as riskKey } from './quota-risk'
 import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails } from './alerts/store'
-import { getMeta, setMeta } from './db'
+import { db, getMeta, setMeta } from './db'
 import { runFile } from './process'
 import { getNotificationSettings, getSettings, knownTimeZone } from './settings'
 import { zonedTime } from '../src/clock'
@@ -71,7 +71,8 @@ export function quotaBuckets(value: unknown, login: string, now: number): Github
     return [{ resource, label, limit, used, remaining, resetAt: new Date(reset * 1000).toISOString(), perMinute, ...(observations ? { history: observations } : {}),
       riskPercent: limit === 0 || minutesLeft === 0 ? null : remaining === 0 ? 100 : perMinute === null ? null : exhaustionRisk(remaining, perMinute * minutesLeft) }]
   })
-  for (const [key, value] of histories) setMeta(key, value)
+  // One commit for the read's histories: each write commits, and fsyncs, alone otherwise.
+  db.transaction(() => { for (const [key, value] of histories) setMeta(key, value) })()
   return buckets
 }
 
@@ -150,6 +151,18 @@ const conditionKey = (login: string, bucket: GithubQuotaBucket) => `${PREFIX}${l
 /** Observe actual snapshots even with popups off; cached reads cannot extend a risk interval. */
 export function observeQuotaConditions(accounts: GithubQuotaAccount[], now = Date.now()): ReadonlySet<string> {
   const sustained = new Set<string>()
+  // The windows are written together in one commit, each fsyncs alone otherwise;
+  // those observed before an invalid retained one still are, as before.
+  const windows: Array<[string, string]> = []
+  try {
+    observe(accounts, now, sustained, windows)
+  } finally {
+    if (windows.length) db.transaction(() => { for (const [key, value] of windows) setMeta(key, value) })()
+  }
+  return sustained
+}
+
+function observe(accounts: GithubQuotaAccount[], now: number, sustained: Set<string>, windows: Array<[string, string]>): void {
   for (const account of accounts) {
     if (account.error || !account.checkedAt) continue
     const at = Date.parse(account.checkedAt)
@@ -171,7 +184,7 @@ export function observeQuotaConditions(accounts: GithubQuotaAccount[], now = Dat
         ? { ...previous } : { resetAt: bucket.resetAt, since: null, lastAt: at, warned: false }
       state.exhaustedSince = bucket.remaining === 0 && Date.parse(bucket.resetAt) > now ? state.exhaustedSince ?? at : null
       // Positive capacity is authoritative even before a forecast can be computed.
-      if (bucket.riskPercent === null) { setMeta(key, JSON.stringify(state)); continue }
+      if (bucket.riskPercent === null) { windows.push([key, JSON.stringify(state)]); continue }
       if (!eligible) { state.since = null; state.warned = false }
       else if (state.since === null) state.since = at
       state.lastAt = Math.max(state.lastAt, at)
@@ -183,10 +196,9 @@ export function observeQuotaConditions(accounts: GithubQuotaAccount[], now = Dat
             used: bucket.used, remaining: bucket.remaining, limit: bucket.limit, perMinute: bucket.perMinute, resetAt: bucket.resetAt,
             measuredAt: account.checkedAt, riskSince: new Date(state.since).toISOString(), sustainMs: state.lastAt - state.since } }) !== null
       }
-      setMeta(key, JSON.stringify(state))
+      windows.push([key, JSON.stringify(state)])
     }
   }
-  return sustained
 }
 
 // The notice is read on the desktop too, so its reset time names its zone:

@@ -262,6 +262,8 @@ describe('how CI and the commands reach the choice', () => {
     expect(gate.run).toBe('deploy/actions/sync-gate.sh')
     expect(gate.env.GH_TOKEN).toBe('${{ github.token }}')
     expect(gate.env.REPO).toBe('${{ github.repository }}')
+    expect(gate.env.SUCCESSFUL_DEPLOY_RUN_ID).toBe("${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.id || '' }}")
+    expect(sync.jobs.sync.if).toMatch(/^vars\.POISE_UPSTREAM_SYNC == 'true' \|\|/)
     expect(steps.indexOf(gate)).toBeLessThan(steps.indexOf(merge))
     expect(merge.if).toBe("vars.POISE_UPSTREAM_SYNC == 'true' && (vars.POISE_DEPLOY_HOST == '' || steps.gate.outputs.proceed == 'true')")
     expect(sync.concurrency).toEqual({ group: 'sync-upstream', 'cancel-in-progress': false })

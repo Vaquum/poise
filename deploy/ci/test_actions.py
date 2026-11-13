@@ -521,12 +521,12 @@ cat "$GH_FIXTURES/$file"
                  for name in ('Set up job', 'Audit dependencies', 'Complete job')]
         self.fixture('jobs.json', {'total_count': 1, 'jobs': [{'steps': steps}]})
 
-    def gate(self, trigger='workflow_run', fail='', script='gate.sh'):
+    def gate(self, trigger='workflow_run', fail='', script='gate.sh', **variables):
         env = clean_env(
             PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
             GH_FIXTURES=self.fixtures, GH_CALLS=self.calls, GH_FAIL=fail,
             GITHUB_OUTPUT=self.output, GITHUB_STEP_SUMMARY=self.summary,
-            REPO=self.REPO, TRIGGER=trigger,
+            REPO=self.REPO, TRIGGER=trigger, **variables,
         )
         if os.path.exists(self.output):
             os.unlink(self.output)
@@ -659,8 +659,8 @@ cat "$GH_FIXTURES/$file"
         self.assertEqual(result.returncode, 1)
         self.assertIn('no deploy trigger', result.stderr)
 
-    def sync(self, fail=''):
-        result, outputs = self.gate(fail=fail, script='sync-gate.sh')
+    def sync(self, fail='', **variables):
+        result, outputs = self.gate(fail=fail, script='sync-gate.sh', **variables)
         if result.returncode == 0 and outputs['proceed'] == 'true':
             with open(WORKFLOWS[1]) as file:
                 body = file.read().split('        run: |\n', 1)[1]
@@ -738,6 +738,27 @@ cat "$GH_FIXTURES/$file"
              'started_at': run['created_at'], 'conclusion': 'success'},
             {'name': f'Deploy {apply_sha or self.TIP}', 'conclusion': apply},
         ]}]})
+
+    def test_successful_deploy_wake_releases_a_held_merge_after_exact_apply(self):
+        self.green()
+        newest = 'c' * 40
+        self.fixture('upstream.json', {'sha': newest})
+        for apply, sha in [('skipped', self.TIP), ('success', 'a' * 40)]:
+            self.deploy_run(apply=apply, apply_sha=sha)
+            result, outputs = self.sync(SUCCESSFUL_DEPLOY_RUN_ID='301')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(outputs, {'proceed': 'false', 'sha': self.TIP})
+        with open(self.calls) as file:
+            calls = file.read()
+        self.assertNotIn('/merge-upstream', calls)
+        self.assertNotIn('workflow run', calls)
+
+        self.deploy_run(apply='success', head_sha='a' * 40)
+        result, outputs = self.sync(SUCCESSFUL_DEPLOY_RUN_ID='301')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'true', 'sha': self.TIP})
+        with open(os.path.join(self.fixtures, 'tip.json')) as file:
+            self.assertEqual(json.load(file)['sha'], newest)
 
     def test_sync_recovers_a_missed_completion_wake_without_an_upstream_merge(self):
         self.green()

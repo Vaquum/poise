@@ -181,6 +181,8 @@ describe('edit decisions', () => {
   it('opens a transcript on its last turns when asked, saying where they begin', async () => {
     const { session } = await runtime.createForSubject({ agent: 'grok', model: 'grok-4.6-xhigh', subject: docSubject() })
     for (let i = 0; i < 3; i++) await runReplyTurn(session.id, REPLY)
+    // The runtime publishes idle after recording the terminal turn event.
+    await until(() => storage.getSession(session.id)?.status === 'idle', 'the final idle status')
     const read = async (query: string) => await (await fetch(`${origin}/api/chat/sessions/${session.id}?${query}`)).json() as { events: ChatEnvelope[], from: number }
     const all = await read('after=0')
     expect(all.from).toBe(0)
@@ -188,7 +190,11 @@ describe('edit decisions', () => {
     expect(finishes).toHaveLength(3)
     const last = await read('after=0&turns=1')
     expect(last.from).toBe(finishes[1])
-    expect(last.events.map(({ seq }) => seq)).toEqual(all.events.filter(({ seq }) => seq > finishes[1]).map(({ seq }) => seq))
+    // The last turn's events, from right after the turn before it and with no gap.
+    // A turn's trailing events may still land between the two reads, so the
+    // first read is not the measure of where they end.
+    expect(last.events.map(({ seq }) => seq)).toEqual(last.events.map((_, index) => finishes[1]! + 1 + index))
+    expect(last.events.at(-1)!.seq).toBeGreaterThanOrEqual(finishes[2]!)
     expect(last.events.filter(({ event }) => event.type === 'turn.started')).toHaveLength(1)
     // A later page reads after its cursor, whatever else it asks.
     expect((await read(`after=${finishes[0]}&turns=1`)).from).toBe(finishes[0])

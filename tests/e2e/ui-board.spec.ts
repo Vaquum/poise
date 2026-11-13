@@ -5,7 +5,11 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 // status ledger, the chains and the running jobs are stood in for here; your
 // cards are the test server's own.
 
-const NOW = Date.now()
+// Midday of a fixed day in the browser's own zone, pinned to UTC (Settings name
+// none, so Board's Today follows the browser), with each page's clock set to it:
+// "today" never crosses midnight while a test runs, on any runner.
+test.use({ timezoneId: 'UTC' })
+const NOW = Date.parse('2026-10-15T12:00:00Z')
 const iso = (minutesAgo: number) => new Date(NOW - minutesAgo * 60_000).toISOString()
 
 interface Record { kind: 'pr' | 'issue', repo: string, number: number, state: 'open' | 'closed' | 'merged', title: string, url: string, created_at: string, updated_at: string, merged_at: string | null }
@@ -72,6 +76,7 @@ const card = (page: Page, text: string) => page.locator('.card', { hasText: text
 const view = (page: Page, name: 'Lanes' | 'List') => page.getByRole('group', { name: 'View' }).getByRole('button', { name })
 
 test.beforeEach(async ({ page }) => {
+  await page.clock.install({ time: NOW })
   await page.addInitScript(() => { if (!sessionStorage.getItem('board-spec')) { localStorage.clear(); sessionStorage.setItem('board-spec', '1') } })
 })
 
@@ -90,7 +95,14 @@ test('List stays as you left it across a reload, and a link’s view is not reme
 })
 
 test('Today means changed today on Updated, and opened today on Opened', async ({ page }) => {
-  await board(page, { records: RECORDS })
+  // Fresh today stamps: RECORDS' 20–60m offsets are yesterday once the run crosses midnight.
+  const now = new Date().toISOString()
+  await board(page, { records: [
+    record('issue', 41, 'Old issue changed today', { created_at: iso(10 * 1440), updated_at: now }),
+    record('issue', 42, 'Opened today', { created_at: now, updated_at: now }),
+    record('issue', 43, 'Owned by Poise', { created_at: iso(5 * 1440), updated_at: iso(3 * 1440) }),
+    record('pr', 44, 'A pull request', { created_at: iso(2 * 1440), updated_at: iso(2 * 1440) }),
+  ] })
   await page.getByRole('group', { name: 'When' }).getByRole('button', { name: 'Today' }).click()
   await expect(card(page, 'Old issue changed today')).toBeVisible()
   await expect(card(page, 'Opened today')).toBeVisible()
@@ -113,22 +125,88 @@ test('Who shows Poise’s own work or everything else, and each open issue its c
   await expect(card(page, 'Owned by Poise')).toHaveCount(0)
 })
 
-test('Assign to Poise asks Sure?, adds the label, and shows Poise at once', async ({ page }) => {
+for (const layout of ['Lanes', 'List'] as const) {
+  test(`${layout}: Assign is the first action icon, restores after expiry, and adds the label after Sure?`, async ({ page }) => {
+    const world: World = { records: RECORDS }
+    await board(page, world)
+    await view(page, layout).click()
+    // Fake the clock before focusing: focus schedules the reference tooltip,
+    // and a real timer would show it over the action row mid-test.
+    await page.clock.install()
+    const issue = card(page, 'Opened today')
+    const assign = issue.getByRole('button', { name: 'Assign to Poise', exact: true })
+    // Focus reveals the action row without resting on the card, which would
+    // raise its tooltip over the row and pin itself open over the icon.
+    await issue.focus()
+    await expect(issue.locator('[data-act="assign"]')).toHaveCount(1)
+    await expect(issue.locator('.card-state [data-act="assign"]')).toHaveCount(0)
+    await expect(issue.locator('.card-acts > :first-child')).toHaveAttribute('aria-label', 'Assign to Poise')
+    await expect(issue.locator('.card-acts > :nth-child(2)')).toHaveAttribute('aria-label', 'Copy')
+    await expect(assign).toHaveClass('ib')
+    await expect(assign).toHaveText('')
+    await expect(assign.locator('svg use')).toHaveAttribute('href', '#i-handoff')
+    const original = await assign.innerHTML()
+    await assign.click()
+    await expect(issue.getByRole('button', { name: 'Sure?' })).toBeVisible()
+    expect(world.assigned).toEqual([])
+    await page.clock.fastForward(4000)
+    // fastForward also fires the tooltip timer; hide it so it cannot cover the icon.
+    await page.keyboard.press('Escape')
+    await expect(assign).not.toHaveClass(/is-armed/)
+    expect(await assign.innerHTML()).toBe(original)
+    await expect(assign).toHaveText('')
+    await assign.click()
+    await expect(issue.getByRole('button', { name: 'Sure?' })).toBeVisible()
+    expect(world.assigned).toEqual([])
+    await issue.getByRole('button', { name: 'Sure?' }).click()
+    await expect(issue.getByRole('link', { name: 'Poise', exact: true })).toBeVisible()
+    await expect(issue.getByRole('button', { name: /Assign to Poise|Sure\?/ })).toHaveCount(0)
+    expect(world.assigned).toEqual(['acme/site#42'])
+  })
+}
+
+test('arming a second Assign disarms the first, and a rearmed Assign restores its icon', async ({ page }) => {
   const world: World = { records: RECORDS }
   await board(page, world)
-  const issue = card(page, 'Opened today')
-  await issue.getByRole('button', { name: 'Assign to Poise' }).click()
-  await expect(issue.getByRole('button', { name: 'Sure?' })).toBeVisible()
+  // Fake the clock before focusing: focus schedules the reference tooltip,
+  // and a real timer would show it over the action row mid-test.
+  await page.clock.install()
+  const first = card(page, 'Opened today')
+  const second = card(page, 'Old issue changed today')
+  const firstAssign = first.getByRole('button', { name: 'Assign to Poise' })
+  const secondAssign = second.getByRole('button', { name: 'Assign to Poise' })
+  await firstAssign.focus()
+  await firstAssign.click()
+  await expect(first.getByRole('button', { name: 'Sure?' })).toBeVisible()
+  await secondAssign.focus()
+  await secondAssign.click()
+  await expect(second.getByRole('button', { name: 'Sure?' })).toBeVisible()
+  await expect(first.getByRole('button', { name: 'Assign to Poise' })).toBeVisible()
+  await expect(first.getByRole('button', { name: 'Sure?' })).toHaveCount(0)
+  await page.clock.fastForward(4000)
+  // fastForward also fires the tooltip timer; hide it so it cannot cover the icon.
+  await page.keyboard.press('Escape')
+  await expect(second.getByRole('button', { name: 'Assign to Poise' })).toBeVisible()
+  const assign = first.getByRole('button', { name: 'Assign to Poise', exact: true })
+  await assign.focus()
+  const original = await assign.innerHTML()
+  await assign.click()
+  await expect(first.getByRole('button', { name: 'Sure?' })).toBeVisible()
+  await page.clock.fastForward(4000)
+  await page.keyboard.press('Escape')
+  expect(await assign.innerHTML()).toBe(original)
+  await expect(assign).toHaveText('')
+  await expect(assign.locator('svg use')).toHaveAttribute('href', '#i-handoff')
   expect(world.assigned).toEqual([])
-  await issue.getByRole('button', { name: 'Sure?' }).click()
-  await expect(issue.getByRole('link', { name: 'Poise', exact: true })).toBeVisible()
-  await expect(issue.getByRole('button', { name: /Assign to Poise|Sure\?/ })).toHaveCount(0)
-  expect(world.assigned).toEqual(['acme/site#42'])
+  await assign.click()
+  await expect(first.getByRole('button', { name: 'Sure?' })).toBeVisible()
+  expect(world.assigned).toEqual([])
 })
 
 test('a refused assignment keeps its reason on the row, and the chain being off is said', async ({ page }) => {
   await board(page, { records: RECORDS, assign: 'refused', chainEnabled: false })
   const issue = card(page, 'Opened today')
+  await issue.getByRole('button', { name: 'Assign to Poise' }).focus()
   await expect(issue.getByRole('button', { name: 'Assign to Poise' })).toHaveAttribute('title', /chain is off/)
   await issue.getByRole('button', { name: 'Assign to Poise' }).click()
   await issue.getByRole('button', { name: 'Sure?' }).click()
@@ -176,7 +254,11 @@ test('choosing a live item opens it beside the board, and a card’s chat opens 
   await beside.getByRole('button', { name: 'Close' }).click()
   await expect(beside).toBeHidden()
 
-  await card(page, 'Opened today').hover()
+  await card(page, 'Opened today').locator('.card-meta').click()
+  await expect(beside.getByRole('button', { name: 'Assign to Poise' })).toHaveText('Assign to Poise')
+  await beside.getByRole('button', { name: 'Close' }).click()
+
+  await card(page, 'Opened today').getByRole('button', { name: 'Chat about this, beside the board' }).focus()
   await card(page, 'Opened today').getByRole('button', { name: 'Chat about this, beside the board' }).click()
   await expect(page.locator('#chat-side-pane .chat-title')).toContainText('acme/site#42')
 })
@@ -239,6 +321,7 @@ test('a GitHub read that never succeeded reads as not read, never as zero', asyn
 test('a held repaint leaves an armed Assign armed', async ({ page }) => {
   const world: World = { records: RECORDS.map((r) => ({ ...r })) }
   await board(page, world)
+  await card(page, 'Opened today').getByRole('button', { name: 'Assign to Poise' }).focus()
   await card(page, 'Opened today').getByRole('button', { name: 'Assign to Poise' }).click()
   await expect(card(page, 'Opened today').getByRole('button', { name: 'Sure?' })).toBeVisible()
   await card(page, 'A pull request').focus()
@@ -311,6 +394,30 @@ test('another organization’s runs never stand for the one chosen', async ({ pa
   await expect(card(page, 'Beta’s own issue')).toHaveAttribute('data-state', '')
 })
 
+test('an organization the fresh settings no longer hold stops being read', async ({ page }) => {
+  let logins = ['acme', 'beta']
+  let hold = false
+  const held: Array<() => void> = []
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    if (hold) await new Promise<void>((resolve) => held.push(resolve))
+    const response = await route.fetch()
+    return route.fulfill({ response, json: { ...(await response.json()), organizations: logins.map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })) } })
+  })
+  await board(page, { records: RECORDS })
+  await page.locator('[data-menu="board-org-menu"]').click()
+  await page.locator('#board-org-menu [data-org="beta"]').click()
+  await expect(page.locator('[data-org-label]')).toHaveText('beta')
+  // beta is removed elsewhere; the reload opens on the remembered settings, then the fresh ones land.
+  logins = ['acme']
+  hold = true
+  await page.reload()
+  await expect(page.locator('[data-org-label]')).toHaveText('beta')
+  hold = false
+  held.forEach((resolve) => resolve())
+  await expect(page.locator('[data-org-label]')).toHaveText('All orgs')
+})
+
 /** Settings as the service answers them, with this GitHub user and these organizations. */
 async function settings(page: Page, as: () => { me: string, orgs?: string[] }): Promise<void> {
   await page.route('**/api/settings', async (route) => {
@@ -370,5 +477,29 @@ test('All orgs never stands for another set of organizations', async ({ page }) 
   await page.reload()
   await expect(page.locator('.lanes .lane')).toHaveCount(5)
   await page.waitForTimeout(500)
+  await expect(card(page, 'Opened today')).toHaveCount(0)
+})
+
+test('a read restored on remembered settings is dropped when the fresh ones name another GitHub user', async ({ page }) => {
+  let me = 'octocat'
+  let hold = false
+  const held: Array<() => void> = []
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    if (hold) await new Promise<void>((resolve) => held.push(resolve))
+    const response = await route.fetch()
+    return route.fulfill({ response, json: { ...(await response.json()), me } })
+  })
+  await board(page, { records: RECORDS })
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // Another GitHub user is named elsewhere; the reload opens on the remembered settings and the last read.
+  me = 'someone-else'
+  hold = true
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // The fresh settings land: the read restored for octocat goes.
+  hold = false
+  held.forEach((resolve) => resolve())
   await expect(card(page, 'Opened today')).toHaveCount(0)
 })
