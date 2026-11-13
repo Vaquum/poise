@@ -1657,8 +1657,10 @@ def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
     # These durable phases precede the controlled GitHub publication path.
     # An admitted/submitting request is deliberately excluded even when its
     # response was lost. Resource settlement is an independent prerequisite.
+    # PR deadlines keep the governed completion's inventory-validated result.
     conn.execute("update calls set action='not_started', outcome='preflight_failed', head_sha=null "
                  "where id=? and source='poise:behavior-chain' and status='failed' and resources_settled_at is not null and "
+                 "(behavior not in ('pr_review','pr_approve') or coalesce(error_code,'') != 'review_budget_exhausted') and "
                  "coalesce(error_code,'') not in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable') and "
                  "json_valid(artifact) and (json_extract(artifact,'$.phase') in ('preparing','prepared','executing','reviewing','preparing_publication') "
                  "or (action_plan is null and behavior in ('issue_review','implement_issue','repair_pr')))",
@@ -2172,7 +2174,21 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         try:
             facts = review_facts(mod, pr, pwd, actor, head, 0)
             receipt = review_receipt.get()
-            proven = receipt is None and _proven_no_action(failure)
+            deadline_no_action = False
+            # Capped approvals can also file an issue outside this inventory.
+            if failure.code == "review_budget_exhausted" and receipt is None and not capped:
+                with db() as conn:
+                    original = conn.execute("select artifact,review_id,receipts,head_sha from calls where id=?",
+                                            (call_id,)).fetchone()
+                # The durable pre-POST phase, not a diagnostic alone, proves
+                # that this invocation never attempted publication.
+                deadline_no_action = (original is not None
+                                      and json.loads(original["artifact"] or "{}").get("phase") == "reviewing"
+                                      and all(original[key] is None for key in ("review_id", "receipts", "head_sha"))
+                                      and not review_receipt.failure() and not review_receipt.conflict()
+                                      and (failure.diagnostic or {}).get("submission") in {None, "none"})
+            proven = receipt is None and (deadline_no_action if failure.code == "review_budget_exhausted"
+                                         else _proven_no_action(failure))
             # A re-verdict submits anew: even proven no-action needs the
             # quiet-inventory proof so recovery cannot create a duplicate.
             # Adoption stays skipped — nothing found can be this run's.
@@ -2183,7 +2199,7 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                 return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
                                                        receipt=receipt, call_id=call_id, prior_error=str(failure),
                                                        prior_code=failure.code, proven_no_action=proven)
-            if not proven or reverdict:
+            if not proven or reverdict or deadline_no_action:
                 own = own_reviews(before, facts, receipt, call_id, proven_no_action=proven)
                 if not proven:
                     if own is None:
@@ -2205,6 +2221,17 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                 if own is None and (_count(facts, "reviewer_reviews_since") != _count(before, "reviewer_reviews_since")
                         or facts.get("reviewer_latest_any_review_id") != before.get("reviewer_latest_any_review_id")):
                     raise RuntimeError("review activity changed without matching counters")
+                if deadline_no_action:
+                    earlier, later = _review_items(before), _review_items(facts)
+                    counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
+                    if (earlier is None or later is None or earlier != later
+                            or any(_count(snapshot, "reviewer_reviews_since") != len(items)
+                                   or len({item["id"] for item in items}) != len(items)
+                                   for snapshot, items in ((before, earlier), (facts, later)))
+                            or any(_count(facts, key) != _count(before, key) for key in counts)
+                            or "reviewer_latest_any_review_id" not in before or "reviewer_latest_any_review_id" not in facts
+                            or facts["reviewer_latest_any_review_id"] != before["reviewer_latest_any_review_id"]):
+                        raise RuntimeError("review deadline requires complete, quiet publication inventory")
             # A proven no-action run posted nothing: a later review is another
             # request's, never this run's recovery. The failure stands verbatim.
         except review_budget.ReviewLimitError as typed:
@@ -2218,6 +2245,8 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         except Exception as verification:
             raise review_budget.ReviewLimitError(
                 f"{failure}; could not prove a safe recovery: {verification}", failure.code, failure.diagnostic) from verification
+        if deadline_no_action:
+            raise atoms.AgentPreflightError(str(failure), failure.code, failure.diagnostic) from failure
         # Invalid approval verdicts get one fresh attempt by the admitted
         # model. Other recoverable failures retain their different-model path.
         # None of these replay an uncertain write.

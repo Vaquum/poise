@@ -594,6 +594,13 @@ export class BehaviorChainRuntime {
       || call.expected_head !== invocation.request.argv[invocation.request.argv.indexOf('--expected-head') + 1])) {
       throw new Error(`native action target conflicts with behavior admission ${invocation.id}`)
     }
+    const prReview = invocation.behavior === 'review-pr' || invocation.behavior === 'approve-pr'
+    if (prReview && call.status === 'failed' && call.action === 'not_started'
+      && (invocation.request.argv[1] !== `https://github.com/${chain.repository}/pull/${call.pr_id}`
+        || !invocation.request.argv.includes('--expected-head')
+        || call.expected_head !== invocation.request.argv[invocation.request.argv.indexOf('--expected-head') + 1])) {
+      throw new Error(`native review target conflicts with behavior admission ${invocation.id}`)
+    }
     if (call.status === 'running') return chain
     // Authentication is actionable even while native cleanup still owns the
     // reservation. Reconciliation below continues to require release proof.
@@ -681,8 +688,10 @@ export class BehaviorChainRuntime {
       this.operations.wake()
       return this.current(chain)
     }
-    const possibleWrite = call.action !== 'not_started' || invocation.behavior === 'review-issue'
+    const possibleWrite = call.action !== 'not_started' || (invocation.behavior === 'review-issue' || prReview)
       && (call.receipts != null || call.review_id != null || call.head_sha != null)
+      || prReview && (call.artifact?.phase === 'submitting_review' || call.artifact?.phase === 'review_submitted'
+        || call.error_code === 'review_budget_exhausted' && call.artifact?.phase !== 'reviewing')
     if (call.status === 'failed' && possibleWrite && ['implement-issue', 'repair-pr', 'review-issue', 'review-pr', 'approve-pr'].includes(invocation.behavior)) {
       if (invocation.state === 'uncertain' && invocation.evidence?.callId === call.id) {
         const evidence = { ...receipt(call), callId: call.id }

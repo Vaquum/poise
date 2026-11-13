@@ -275,6 +275,12 @@ never a refused submission. Claude's pinned
 inspection root is also carried in its explicit settings so shell tools retain
 repository access.
 
+Review and approval deadlines persist a failed no-action result only after
+validating the original pre-POST phase and quiet, complete live inventory.
+Failed recovery reads retain uncertainty through cleanup. The durable retry,
+resource-release and receipt rules are in
+[Behavior chain](../../docs/Behavior-chain.md#authority-and-recovery).
+
 When live GitHub state confirms the pull request closed or merged — at
 preparation, after provider execution, or during publication reconciliation —
 the obsolete round settles `superseded` under `review_target_closed`, never

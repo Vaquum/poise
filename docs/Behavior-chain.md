@@ -436,6 +436,18 @@ The plan contains metadata, not a replayable checkout. Closed-target
 reconciliation still forbids late publication and retains pending review evidence,
 including when a parent of an uncertain repair commit has merged.
 
+PR review and approval deadlines retain `failed` and their timeout code. Caller
+records `not_started` / `preflight_failed` only when the original durable phase
+is still `reviewing`, no publication receipt exists, and a successful recovery
+read validates the target/head and complete, unchanged reviewer inventory with
+no pending review. A diagnostic alone cannot supply that proof. Native
+settlement also matches the admitted PR/head, rejects contradictory receipts or
+submission phases, and waits for positive resource release. Ordinary backoff
+then permits at most three failed attempts before an explicit hold, retained
+across restart. Failed or incomplete recovery reads and an attempted POST keep
+the original effect fenced for receipt reconciliation; cleanup cannot promote
+them to no action.
+
 Durable model admissions use the existing semaphore's behavior-lane ceiling, including its interactive reserve. A fresh server process cannot fill that reserve with another background invocation merely because surviving workers hold no slots in its new in-memory semaphore. Existing work above a lowered ceiling finishes normally while new admissions wait. The journal's capacity check also precedes provider preparation, so waiting work cannot consume a provider recovery probe without launching; admission still rechecks capacity transactionally afterward.
 
 Provider-backoff waits are journaled on entry, when the reason changes and after
