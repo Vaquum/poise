@@ -1832,6 +1832,16 @@ type AgentLogSnapshot = Awaited<ReturnType<typeof fetchAgentLogSnapshot>>
 
 class BehaviorLogFeedError extends Error {}
 
+/** One call's evidence, the same in the whole history as in the call's own
+ *  read. The whole history leaves out progress events (server/agent.ts), so
+ *  they are no part of the comparison. */
+function sameCallEvidence(history: AgentLogSnapshot['entries'][number] | undefined, call: AgentLogSnapshot['entries'][number]): boolean {
+  if (!history) return false
+  const { progress: _history, ...recorded } = history
+  const { progress: _call, ...read } = call
+  return isDeepStrictEqual(recorded, read)
+}
+
 async function readBehaviorLogSnapshot(): Promise<AgentLogSnapshot> {
   try {
     return await fetchAgentLogSnapshot({ signal: behaviorSignal() })
@@ -3125,7 +3135,7 @@ function settleClaimAfterExit(
               claim.launchExpectedHead, claim.launchActor, call.model, target)
             retryable503 = isRunnable(behavior) && !!current && !current.launchQuarantine
               && (!current.launchCallId || current.launchCallId === call.id)
-              && isDeepStrictEqual(history.entries.find((entry) => entry.id === call.id), call)
+              && sameCallEvidence(history.entries.find((entry) => entry.id === call.id), call)
               && !logQuarantine(history, { repo: claim.launchRepo, prId: String(claim.launchPr), behavior: claim.launchBehavior })
               && !history.entries.some((entry) => entry.repo === claim.launchRepo && entry.pr_id === String(claim.launchPr)
                 && entry.behavior === claim.launchBehavior && !unambiguousAgentCall(history, entry))
