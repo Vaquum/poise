@@ -148,6 +148,9 @@ export function accountLoginsStrict(): AccountLogins {
     throw new Error(`The provider record is corrupt: ${error instanceof Error ? error.message : String(error)}`)
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The provider record is corrupt')
+  for (const [id, at] of Object.entries(value)) {
+    if (isAccountId(id) && typeof at !== 'string') throw new Error('The provider record is corrupt')
+  }
   return Object.fromEntries(Object.entries(value).filter(([id, at]) => isAccountId(id) && typeof at === 'string')) as AccountLogins
 }
 

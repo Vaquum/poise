@@ -63,13 +63,14 @@ it('reports a missing configured Codex once with its probe purpose and executabl
   expect(events()[0].context).toMatchObject({ code: 'ENOENT' })
 })
 
-it.each(['corrupt', 'unreadable'])('does not infer unused Codex from a %s configuration record', async kind => {
+it.each(['corrupt', 'unreadable', 'mistyped'])('does not infer unused Codex from a %s configuration record', async kind => {
   await rm(codex)
   if (kind === 'corrupt') setMeta('account_logins', 'not json')
+  else if (kind === 'mistyped') setMeta('account_logins', JSON.stringify({ codex: 123 }))
   else vi.spyOn(logins, 'accountLoginsStrict').mockImplementationOnce(() => { throw new Error('provider record could not be read') })
   await probeAccount('codex', runFile)
   expectFailure('codex.version')
-  expect(events()[0].context.configurationError).toMatch(kind === 'corrupt' ? /corrupt/ : /could not be read/)
+  expect(events()[0].context.configurationError).toMatch(kind === 'unreadable' ? /could not be read/ : /corrupt/)
 })
 
 it('reports an existing launcher with a missing interpreter even without configuration', async () => {
@@ -120,7 +121,9 @@ it('keeps a version probe permission failure visible', async () => {
 
 it.each(['--version', 'login status'])('keeps an unexpected exit from %s visible with stderr', async args => {
   await setScript(home, 'codex', { ...script('codex', STATUS.codexChatGpt), [args]: { stderr: 'broken Codex configuration\n', code: 2 } })
-  expect(await probeAccount('codex', runFile)).toMatchObject({ signedIn: null, detail: expect.stringContaining('broken Codex configuration') })
+  expect(await probeAccount('codex', runFile)).toMatchObject(args === '--version'
+    ? { signedIn: null, detail: expect.stringContaining('broken Codex configuration') }
+    : { signedIn: null, detail: '`codex login status` gave no answer Poise can read.' })
   expectFailure(args === '--version' ? 'codex.version' : 'codex.login.status')
   expect(events()[0]).toMatchObject({ exitCode: 2, stderr: 'broken Codex configuration\n' })
 })
