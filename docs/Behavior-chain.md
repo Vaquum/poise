@@ -275,14 +275,27 @@ Unsettled original receipts and resources still require reconciliation first.
 
 A pre-PR implementation can recover through the same bounded observation even
 with failure reporting disabled. Its original Caller artifact must retain
-`test_dependency`: independently read CI assertion evidence tying the original
+`test_dependency`: independently verified assertion evidence tying the original
 producing run to `prepared.checkout_head`, plus a distinct failing run on that
-exact base. Both completed main CI runs must have complete full-suite artifacts,
-with every failing test and assertion cause matching. Mixed or non-test failures,
-missing artifacts, changed original run attempts and worker diagnosis alone keep
-the hold. This path supports CI artifacts; relay output or its captured checkout
-digest is not an authoritative base/run mapping. In particular, #1505 remains
-held when its original evidence is unavailable.
+exact base. CI proof requires both completed main runs' complete full-suite
+artifacts. Relay proof instead requires gateway-authenticated completed Vitest
+assertions bound to the original Call's retained random capture binding. The box
+independently hashes the uploaded archive and actual source files before execution;
+the baseline must have a distinct capture and source digest and match the clean
+prepared base, independently of its uploaded index. Matching HEAD alone cannot
+make a dirty candidate into its baseline.
+
+Both paths compare the complete failure multiset and retain every case count
+under a failing title, including passing duplicate parameters. Mixed or non-test
+failures, missing/incomplete results, overflow, changed original evidence and
+worker diagnosis alone keep the hold. Relay proof currently supports direct
+Vitest commands, with runner-owned reporting of assertion, setup and unhandled
+errors; wrappers and other runners retain their hold. The gateway signs evidence
+only after genuine completion and returns it before deleting the run. Caller
+authenticates and retains those bounded, redacted receipts before checkout cleanup,
+then the existing seed observation revalidates them. A log, archive digest alone,
+canceled run or historical output without this provenance grants no recovery.
+In particular, #1505 remains held when its original evidence is unavailable.
 
 The existing seed observation verifies the remediation issue's exact closing PR
 merge on main and its ancestry after the failed base. A successful full-suite CI

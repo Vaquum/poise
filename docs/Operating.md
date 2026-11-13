@@ -872,6 +872,13 @@ as `test_relay.run.failed`, naming the workspace, the command and the reason; ev
 run is logged with its command, exit code and duration as `test_relay.run.finished`.
 The runner prints the captured-candidate digest and suite, then the existing run ID
 at each admission, so observed failures can name the attempt that produced them.
+The digest covers the original command specification and uncompressed captured
+tar bytes, including uncommitted edits, on both dependency-cache upload routes.
+For new atomic Calls, completed direct Vitest assertion failures can also retain
+bounded gateway-authenticated evidence before the relay deletes their run. Missing,
+interrupted, oversized or unaccounted results cannot authorize the existing
+[pre-PR recovery](Behavior-chain.md#bounded-reconciliation) path; historical worker
+logs remain diagnostic evidence only.
 An explicit gateway-restart failure is the one exception: the active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated

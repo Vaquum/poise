@@ -411,11 +411,14 @@ process.stdout.write(JSON.stringify(status ? { loggedIn: true, authMethod: 'clau
   }
 
   it('passes the hooks on, so that agents on Claude get them', () => {
-    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000' })
+    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000',
+      POISE_TEST_BINDING: '{"call":"original"}', POISE_TEST_EVIDENCE_DIR: '/original/evidence' })
     expect(seen.PYTHONPATH).toMatch(/\.poise\/test-offload:src$/)
     expect(seen.NODE_OPTIONS).toMatch(/--require ".*\.poise\/test-offload\/hook\.cjs"$/)
     expect(seen.BASH_DEFAULT_TIMEOUT_MS).toBe('600000')
     expect(seen.BASH_MAX_TIMEOUT_MS).toBe('3600000')
+    expect(seen.POISE_TEST_BINDING).toBe('{"call":"original"}')
+    expect(seen.POISE_TEST_EVIDENCE_DIR).toBe('/original/evidence')
   })
 
   it('still keeps out what those variables carry without the hooks', () => {
@@ -707,6 +710,91 @@ describe('a suite on a test box', () => {
     execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'first'])
     return repo
   }
+
+  it.each([null, 'crn-test'])('retains authenticated complete assertions before deleting a completed run (%s)', async baseService => {
+    await startAll({ baseService })
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    writeFileSync(join(repo, '.gitignore'), '.env\nnode_modules\n')
+    symlinkSync(resolve('node_modules'), join(repo, 'node_modules'), 'dir')
+    mkdirSync(join(repo, 'tests'))
+    writeFileSync(join(repo, 'vitest.config.mjs'), 'export default { test: { include: ["tests/*.test.mjs"], maxWorkers: 1 } }')
+    writeFileSync(join(repo, 'tests/shared.test.mjs'), `import { it, expect } from 'vitest';
+it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
+    execFileSync('git', ['-C', repo, 'add', '.'])
+    execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'shared failure'])
+    const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const baseline = join(temp(), 'base')
+    execFileSync('git', ['-C', repo, 'worktree', 'add', '--detach', baseline, base], { stdio: 'ignore' })
+    symlinkSync(resolve('node_modules'), join(baseline, 'node_modules'), 'dir')
+    writeFileSync(join(repo, 'tracked.txt'), 'uncommitted implementation\n')
+    const evidence = temp()
+    const binding = { call: 'a'.repeat(32), nonce: 'b'.repeat(64), repository: 'example/repo', base }
+    const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence }
+    const run = async (cwd: string) => {
+      const result = await suite(cwd, [process.execPath, resolve('node_modules/vitest/vitest.mjs'), 'run', '--root', cwd], env).done
+      expect(result.code, result.stderr).toBe(1)
+      const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
+      expect(id, result.stderr).toBeTruthy()
+      const receipt = JSON.parse(readFileSync(join(evidence, `${id}.json`), 'utf8')) as { payload: string, signature: string }
+      expect(relay.runs.has(id!)).toBe(false)
+      return { id, receipt }
+    }
+    const original = await run(repo)
+    const clean = await run(baseline)
+    const verify = (receipt: unknown, key = KEY) => fetch(`${relayUrl}/evidence/verify`, { method: 'POST',
+      headers: { authorization: `Bearer ${key}`, connection: 'close' }, body: JSON.stringify(receipt) })
+    const first = await (await verify(original.receipt)).json() as Record<string, unknown>
+    const second = await (await verify(clean.receipt)).json() as Record<string, unknown>
+    expect(first).toMatchObject({ binding, base, clean: false, run: original.id, exit: 1,
+      failures: [expect.objectContaining({ test: 'shared fixed title' }), expect.objectContaining({ test: 'shared fixed title' })],
+      totals: [{ file: 'tests/shared.test.mjs', test: 'shared fixed title', total: 2 }] })
+    expect(second).toMatchObject({ binding, base, clean: true, run: clean.id, failures: first.failures, totals: first.totals })
+    expect(first.source).not.toBe(second.source)
+    expect((await verify({ ...original.receipt, payload: original.receipt.payload + ' ' })).status).toBe(422)
+    expect((await verify(original.receipt, workspaceKey(privateKey, 'bob'))).status).toBe(403)
+    relay.stop()
+    await startAll2({ baseService })
+    expect((await verify(original.receipt)).status).toBe(200)
+  }, 30_000)
+
+  it('refuses unaccounted, incomplete and oversized assertion inventories instead of retaining an excerpt', async () => {
+    await startAll()
+    const { assertionResult, sourceCapture } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as {
+      assertionResult: (reporter: { report: string, completion: string }, capture: { top: string }) => unknown,
+      sourceCapture: (cwd: string) => { clean: boolean, source: string },
+    }
+    const directory = temp()
+    const reporter = { report: join(directory, 'report.json'), completion: join(directory, 'complete.json') }
+    const failure = { fullName: 'original failure', status: 'failed', failureMessages: ['expected []'] }
+    const report = { success: false, numFailedTests: 1, numTotalTests: 1,
+      testResults: [{ name: join(directory, 'tests/a.test.ts'), status: 'failed', message: '', assertionResults: [failure] }] }
+    const complete = { errors: 0, reason: 'failed', setupFailed: false }
+    const parse = (value = report, completion = complete) => {
+      writeFileSync(reporter.report, JSON.stringify(value))
+      writeFileSync(reporter.completion, JSON.stringify(completion))
+      return assertionResult(reporter, { top: directory })
+    }
+    expect(parse()).toMatchObject({ failures: [{ file: 'tests/a.test.ts', test: failure.fullName, cause: 'expected []' }] })
+    expect(parse(report, { ...complete, errors: 1 })).toBeNull()
+    expect(parse(report, { ...complete, setupFailed: true })).toBeNull()
+    expect(parse(report, { ...complete, reason: 'interrupted' })).toBeNull()
+    expect(parse({ ...report, numFailedTests: 2 })).toBeNull()
+    expect(parse({ ...report, testResults: [{ ...report.testResults[0], message: 'beforeAll failed' }] })).toBeNull()
+    expect(parse({ ...report, numFailedTests: 101, numTotalTests: 101,
+      testResults: [{ ...report.testResults[0], assertionResults: Array.from({ length: 101 }, () => failure) }] })).toBeNull()
+    rmSync(reporter.completion)
+    expect(assertionResult(reporter, { top: directory })).toBeNull()
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const clean = sourceCapture(repo)
+    expect(clean.clean).toBe(true)
+    // Same HEAD and an index flag cannot pass off the dirty candidate as base.
+    execFileSync('git', ['-C', repo, 'update-index', '--assume-unchanged', 'tracked.txt'])
+    writeFileSync(join(repo, 'tracked.txt'), 'dirty candidate')
+    expect(sourceCapture(repo)).toMatchObject({ clean: false })
+    expect(sourceCapture(repo).source).not.toBe(clean.source)
+  })
 
   it('starts a suite on a job of the base service, which costs less, and gives the agent its output and exit code', async () => {
     await startAll({ baseService: 'crn-test' })

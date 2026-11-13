@@ -180,7 +180,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       if (seed.full_suite) observation.fullSuite = object(seed.full_suite, 'full-suite recovery')
       if (testProof && originalTest) {
         const proof = object(seed.test_dependency, 'implementation test dependency')
-        if (proof.verified === true && ['base', 'run', 'runAttempt', 'baselineRun', 'baselineAttempt', 'remediation', 'failures']
+        if (proof.verified === true && ['base', 'run', 'runAttempt', 'baselineRun', 'baselineAttempt', 'remediation', 'failures',
+          ...(testProof.source === 'relay' ? ['source', 'capture', 'candidate', 'baselineCapture', 'relay', 'totals'] : [])]
           .some(key => chainBasis(proof[key]) !== chainBasis(testProof[key as keyof typeof testProof]))) throw new Error('original implementation test evidence changed')
         const recovery = proof.recovered === true ? object(proof.recovery, 'implementation test recovery') : null
         observation.testDependency = { invocationId: originalTest.id, verified: proof.verified === true, recovered: proof.recovered === true,
