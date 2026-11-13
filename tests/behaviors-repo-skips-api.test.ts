@@ -275,18 +275,76 @@ describe('Skip repositories API', () => {
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
-  it('contains a record with no readable status to its behavior and period through the metrics API', async () => {
+  it('retains actionable range coverage evidence once across metrics reads, until that range is verified', async () => {
     agentRows = [{ id: 'a'.repeat(32), repo: REPO, pr_id: '1', actor: 'review-bot', model: 'model',
       behavior: 'pr_review', source: 'poise:review-new-prs', prompt: '',
       started_at: '2026-10-17T10:00:00Z', completed_at: '2026-10-17T10:01:00Z', time_elapsed: '1m',
-      status: null, expected_head: HEAD, correlation_id: 'unreadable-call', error: 'Review failed' }]
-    const all = await fetch(`${base}/api/behavior-metrics`)
-    expect(await all.json()).toMatchObject({ error: expect.stringContaining('unreadable'), behaviors: {
-      'review-new-prs': null, 'approve-prs': { totalRuns: 0 }, 'review-new-issues': { totalRuns: 0 },
+      status: null, history_rowid: '1436', expected_head: HEAD, correlation_id: 'unreadable-call', error: 'Review failed' },
+    { id: 'b'.repeat(32), repo: REPO, pr_id: '2', actor: 'review-bot', model: 'model',
+      behavior: 'pr_approve', source: 'poise:approve-prs', prompt: '',
+      started_at: '2026-10-17T11:00:00Z', completed_at: '2026-10-17T11:02:00Z', time_elapsed: '2m',
+      status: 'completed', outcome: 'approved', action: 'approved', expected_head: HEAD, head_sha: HEAD,
+      correlation_id: 'verified-approval', error: '' }]
+    const { resetAgentLogCache } = await import('../server/agent')
+    const logging = await import('../server/logging')
+    const evidence = () => {
+      logging.loggingRuntime()!.flush()
+      return logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false })).events
+        .filter((event) => event.operation === 'behavior.metrics.coverage')
+    }
+    const read = async (query = 'since=2026-10-17T00:00:00Z&until=2026-10-18T00:00:00Z') => {
+      resetAgentLogCache()
+      const response = await fetch(`${base}/api/behavior-metrics?${query}`)
+      expect(response.status).toBe(200)
+      return await response.json() as import('../src/behavior-metrics').BehaviorMetricsReport
+    }
+    const first = await read()
+    expect(Object.keys(first).sort()).toEqual(['behaviors', 'error'])
+    expect(first).toMatchObject({ behaviors: {
+      'review-new-prs': null, 'approve-prs': { totalRuns: 1, durationMinutes: 2, successRate: 100 }, 'review-new-issues': { totalRuns: 0 },
     } })
-    const later = await fetch(`${base}/api/behavior-metrics?since=2026-10-18T00:00:00Z`)
-    expect(await later.json()).toMatchObject({ error: null, behaviors: { 'review-new-prs': { totalRuns: 0 } } })
+    for (const detail of ['2026-10-17T00:00:00.000Z', '2026-10-18T00:00:00.000Z', 'review-new-prs',
+      'totalRuns, durationMinutes, successRate', 'History row: 1436', `Call: ${'a'.repeat(32)}`, 'Correlation: unreadable-call', `${REPO}#1`, 'invalid status']) {
+      expect(first.error).toContain(detail)
+    }
+    expect(evidence()).toHaveLength(1)
+    expect(evidence()[0]).toMatchObject({ severity: 'error', context: {
+      range: { since: '2026-10-17T00:00:00.000Z', until: '2026-10-18T00:00:00.000Z' }, behaviors: ['review-new-prs'],
+      metrics: ['totalRuns', 'durationMinutes', 'successRate'],
+      records: [expect.objectContaining({ historyRowId: '1436', callId: 'a'.repeat(32), correlationId: 'unreadable-call', reason: 'agent-interface log record has invalid status' })],
+    } })
+    // New feed positions and polling times do not create a new gap.
+    const now = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(now + 61_000)
+    agentRows.reverse()
+    expect(await read()).toEqual(first)
+    expect(evidence()).toHaveLength(1)
+    expect((await read('since=2026-10-16T00:00:00Z&until=2026-10-17T00:00:00Z')).error).toBeNull()
+    expect(await read()).toEqual(first)
+    expect(evidence()).toHaveLength(1)
+    agentRows = agentRows.filter((row) => row.status !== null)
+    expect(await read()).toMatchObject({ error: null, behaviors: { 'review-new-prs': { totalRuns: 0 } } })
+    // Recovery clears the active condition, not its retained diagnostic.
+    expect(evidence()).toHaveLength(1)
+    expect(evidence()[0]!.message).toBe(first.error)
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('verifies an empty metrics day despite an independently identified older quarantine and untimed history', async () => {
+    agentRows = [{ id: 'c'.repeat(32), history_rowid: '1391', repo: REPO, pr_id: '3',
+      behavior: 'pr_review', source: 'poise:review-new-prs', status: null,
+      started_at: '2026-10-01T10:00:00Z', correlation_id: 'older-unrelated-call' }]
+    database!.db.prepare('INSERT INTO behavior_runs(id, behavior, started_at, status) VALUES (?, ?, ?, ?)')
+      .run('older-untimed', 'merge-prs', '2026-10-01T10:00:00Z', 'interrupted')
+    const response = await fetch(`${base}/api/behavior-metrics?since=2026-10-17T00:00:00Z&until=2026-10-18T00:00:00Z`)
+    expect(response.status).toBe(200)
+    const report = await response.json() as import('../src/behavior-metrics').BehaviorMetricsReport
+    expect(report.error).toBeNull()
+    for (const metrics of Object.values(report.behaviors)) expect(metrics).toEqual({ totalRuns: 0, durationMinutes: 0, successRate: null })
+    const logging = await import('../server/logging')
+    logging.loggingRuntime()!.flush()
+    expect(logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false })).events
+      .filter((event) => event.operation === 'behavior.metrics.coverage')).toEqual([])
   })
 
   it.each(['[broken', JSON.stringify({ at: 'invalid', target: 7 })])('keeps behavior controls readable when merge history is corrupt: %s', async (value) => {

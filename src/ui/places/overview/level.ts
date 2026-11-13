@@ -60,6 +60,7 @@ const NOTICE_GROUPS: Record<NoticeKind, Group | null> = {
   github_quota_warning: 'auto',
   github_quota_exhausted: 'auto',
   read_failed: 'auto',
+  behavior_metrics_incomplete: 'fault',
   chat_turn_finished: null,
   action_finished: null,
 }
