@@ -279,8 +279,8 @@ export const mount: MountPlace = (ctx) => {
   }
   const ASSIGN_WHAT = 'Adds the chain’s label on GitHub, as you. The chain takes the issue at its next check.'
   const assignable = (it: Item) => canAssign({ ...it, who: who(it) }, !!intake, everyIssueEnters()) && !assigned.has(it.id.toLowerCase())
-  const assignHTML = (it: Item, cls = 'btn-ghost card-assign') => (assignable(it)
-    ? `<button class="${cls}" data-act="assign" data-id="${esc(it.id)}" data-ref="card.assign" title="${chainOff() ? 'Adds the chain’s label on GitHub, as you. The chain is off, so it takes the issue once it is on.' : ASSIGN_WHAT}">Assign to Poise</button>` : '')
+  const assignHTML = (it: Item, cls = 'ib') => (assignable(it)
+    ? `<button class="${cls}" data-act="assign" data-id="${esc(it.id)}" data-ref="card.assign" aria-label="Assign to Poise" title="${chainOff() ? 'Adds the chain’s label on GitHub, as you. The chain is off, so it takes the issue once it is on.' : ASSIGN_WHAT}">${cls === 'ib' ? icon('handoff', 'sm') : 'Assign to Poise'}</button>` : '')
   const railFor = (it: Item): string => {
     if (it.chain) return railHTML(it.chain)
     const p = phaseOf(it)
@@ -298,7 +298,7 @@ export const mount: MountPlace = (ctx) => {
     const said = list ? esc(detail) : detail ? `${esc(detail)}${d.stuck ? ` · <span class="stuck" data-ref="card.stuck">${esc(d.text)}</span>` : ''}` : ''
     const refusal = assignErrors.get(it.id)
     const stateRow = list || assignable(it) || it.state !== 'idle' || detail || w
-      ? `<div class="card-state" data-ref="card.state">${stateHTML(it)}${said ? `<span class="detail"${it.lane === 'pr' && !settled ? ' data-ref="card.blocker"' : ''}>${said}</span>` : ''}${list ? `<span class="dwell" data-ref="card.dwell">${d.stuck ? `<span class="stuck" data-ref="card.stuck">${esc(d.text)}</span>` : esc(d.text)}</span>` : ''}${w ? `<a class="wk${w.kind === 'poise' ? ' is-mgr' : w.kind === 'worker' ? '' : ' is-own'}" href="${esc(whoHref(it))}" data-ref="${w.kind === 'poise' ? 'card.chain' : 'card.worker'}">${esc(w.tag)}</a>` : ''}${assignHTML(it)}</div>${refusal ? `<p class="card-refusal" role="alert" data-ref="card.assign">${esc(refusal)}</p>` : ''}`
+      ? `<div class="card-state" data-ref="card.state">${stateHTML(it)}${said ? `<span class="detail"${it.lane === 'pr' && !settled ? ' data-ref="card.blocker"' : ''}>${said}</span>` : ''}${list ? `<span class="dwell" data-ref="card.dwell">${d.stuck ? `<span class="stuck" data-ref="card.stuck">${esc(d.text)}</span>` : esc(d.text)}</span>` : ''}${w ? `<a class="wk${w.kind === 'poise' ? ' is-mgr' : w.kind === 'worker' ? '' : ' is-own'}" href="${esc(whoHref(it))}" data-ref="${w.kind === 'poise' ? 'card.chain' : 'card.worker'}">${esc(w.tag)}</a>` : ''}</div>${refusal ? `<p class="card-refusal" role="alert" data-ref="card.assign">${esc(refusal)}</p>` : ''}`
       : ''
     const rail = list || it.chain ? `<div class="card-rail">${railFor(it)}</div>` : ''
     const reviewWhy = settled ? `This pull request is ${it.record.state}: there is nothing to review.` : ''
@@ -309,7 +309,7 @@ export const mount: MountPlace = (ctx) => {
     return `<article class="card" data-id="${esc(it.id)}" data-kind="live" data-state="${it.state ?? ''}" tabindex="0" data-ref="card.live" aria-label="${it.lane === 'pr' ? 'Pull request' : 'Issue'} #${it.num}: ${esc(it.title)}">`
       + `<a class="card-title" href="${esc(it.url)}" target="_blank" rel="noopener" data-ref="card.link">${esc(it.title)}</a>`
       + `<div class="card-meta"><span class="repo">${esc(it.repo)}</span><span class="num">${num}</span>${isNew(it, now()) ? '<span class="new" data-ref="card.new">New</span>' : ''}${intakeHTML(it)}<time>${list ? `opened ${ago(minutesSince(it.record.created_at))} · changed ${ago(minutesSince(it.record.updated_at))}` : ago(minutesSince(it.record.updated_at))}</time></div>`
-      + `${rail}${stateRow}${lifeEl(it.id)}<div class="card-acts"><button class="ib" data-act="copy" aria-label="Copy" data-ref="card.copy">${icon('copy', 'sm')}</button><button class="ib" data-act="chat" aria-label="Chat about this, beside the board" data-ref="card.chat">${icon('chat', 'sm')}</button>${it.chain ? `<button class="ib" data-act="task" aria-label="Open its timeline" data-ref="card.timeline">${icon('chev', 'sm')}</button>` : ''}<button class="ib" data-act="open-chat" aria-label="Open in Chat" data-ref="card.open-chat">${icon('session', 'sm')}</button>${primary}</div></article>`
+      + `${rail}${stateRow}${lifeEl(it.id)}<div class="card-acts">${assignHTML(it)}<button class="ib" data-act="copy" aria-label="Copy" data-ref="card.copy">${icon('copy', 'sm')}</button><button class="ib" data-act="chat" aria-label="Chat about this, beside the board" data-ref="card.chat">${icon('chat', 'sm')}</button>${it.chain ? `<button class="ib" data-act="task" aria-label="Open its timeline" data-ref="card.timeline">${icon('chev', 'sm')}</button>` : ''}<button class="ib" data-act="open-chat" aria-label="Open in Chat" data-ref="card.open-chat">${icon('session', 'sm')}</button>${primary}</div></article>`
   }
 
   function writerHTML(lane: LaneDef): string {
@@ -522,7 +522,7 @@ export const mount: MountPlace = (ctx) => {
         for (const it of items) {
           const card = before.has(it.id) && before.get(it.id) !== sig(it) ? $(`.card[data-id="${CSS.escape(it.id)}"]`, lanesEl) as HTMLElement | null : null
           const focused = document.activeElement
-          if (!card || armedAssign === it.id || (focused !== card && card.contains(focused))) continue
+          if (!card || armedAssign?.id === it.id || (focused !== card && card.contains(focused))) continue
           const fresh = document.createElement('div')
           fresh.innerHTML = liveHTML(it)
           const next = fresh.firstElementChild as HTMLElement
@@ -783,13 +783,22 @@ export const mount: MountPlace = (ctx) => {
       toast(`The review did not start: ${(error as Error).message}`, 'failed')
     }
   }
-  let armedAssign: string | null = null
+  let armedAssign: { id: string, button: HTMLElement, original: string } | null = null
   async function assign(b: HTMLElement, it: Item): Promise<void> {
-    if (armedAssign !== it.id) {
-      armedAssign = it.id
+    if (armedAssign?.id !== it.id) {
+      const prev = armedAssign
+      if (prev && prev.button.isConnected) {
+        prev.button.innerHTML = prev.original
+        prev.button.setAttribute('aria-label', 'Assign to Poise')
+        prev.button.classList.remove('is-armed')
+      }
+      const original = b.innerHTML
+      const armed = { id: it.id, button: b, original }
+      armedAssign = armed
       b.textContent = 'Sure?'
+      b.setAttribute('aria-label', 'Sure?')
       b.classList.add('is-armed')
-      ctx.after(4000, () => { if (armedAssign === it.id) { armedAssign = null; if (b.isConnected) { b.textContent = 'Assign to Poise'; b.classList.remove('is-armed') } } })
+      ctx.after(4000, () => { if (armedAssign === armed) { armedAssign = null; if (b.isConnected) { b.innerHTML = original; b.setAttribute('aria-label', 'Assign to Poise'); b.classList.remove('is-armed') } } })
       return
     }
     armedAssign = null
