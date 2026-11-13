@@ -481,6 +481,63 @@ describe('readPrStatus', () => {
     expect(reply.rows[0].blocker.details).toEqual(['review-new-prs: review failed: HTTP 503 Service Unavailable', `review running: review-new-prs on ${NEXT.slice(0, 8)}`])
   })
 
+  it.each(['expired', 'future'] as const)('keeps an interrupted review held without advertising its %s failure timer', async (timer) => {
+    const { db, runtime, status } = await setup()
+    const now = Date.parse('2026-11-12T15:31:00Z')
+    const error = 'review interrupted; publication disposition unknown'
+    const old = seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}`, head: HEAD,
+      callId: 'a'.repeat(32), failureAt: '2026-11-12T15:14:00Z', error })
+    const live = seedReview(db, { behavior: 'review-new-prs', head: NEXT })
+    const refusalKey = `behavior_review_recovery:${old.behavior}:${old.target}:${old.callId}:${old.claimId}`
+    const refusal = `Legacy review retry held for Call ${old.callId} (correlation ${old.claimId}); original head ${HEAD}; observed head ${NEXT}; reviewer review-bot. Unclaimed publication: 1 reviews not attributed to this Call. Observed reviews: 91 APPROVED on ${HEAD}. Observed reviews are not this Call's receipt.`
+    db.setMeta(refusalKey, refusal)
+    db.setMeta(`behavior_review_new_prs_failure:${old.target}`, JSON.stringify({ kind: 'worker', consecutiveFailures: 1,
+      firstFailureAtMs: Date.parse('2026-11-12T15:14:00Z'), lastFailureAtMs: Date.parse('2026-11-12T15:14:00Z'),
+      nextRetryAtMs: Date.parse(timer === 'expired' ? '2026-11-12T15:15:00Z' : '2026-11-12T15:32:00Z'),
+      error, callId: old.callId, diagnostic: { severity: 'warning', code: 'held_result' } }))
+    db.reconcileBehaviorDeadLetters(new Set([`${pr.repo}#${pr.number}`]), undefined, undefined, undefined, 200, now)
+    fixture.agentLogs = [
+      agentLog({ id: old.callId, correlation_id: old.claimId, status: 'interrupted', expected_head: HEAD,
+        started_at: '2026-11-12T15:14:00Z', started_at_precise: '2026-11-12T15:14:00Z',
+        completed_at: '2026-11-12T15:14:41Z', error }),
+      agentLog({ id: live.callId, correlation_id: live.claimId, expected_head: NEXT,
+        started_at: '2026-11-12T15:30:00Z', started_at_precise: '2026-11-12T15:30:00Z' }),
+    ]
+    const snapshot = await (await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })
+    seedCache(runtime, new Date(now).toISOString(), { head: NEXT })
+    mocks.runFile.mockClear()
+    const dump = () => ({
+      seen: db.db.prepare('SELECT * FROM behavior_seen ORDER BY key, target').all(),
+      meta: db.db.prepare('SELECT key, value FROM meta ORDER BY key').all(),
+      letters: db.db.prepare('SELECT * FROM behavior_dead_letters ORDER BY id').all(),
+      calls: structuredClone(fixture.agentLogs),
+    })
+    const before = dump()
+
+    for (const evidence of [snapshot, null]) {
+      const incident = runtime.getBehaviorDiagnosticIncidents(evidence).find((row) => row.callId === old.callId)!
+      expect(incident).toMatchObject({ error: `${error} ${refusal}`, createdAt: '2026-11-12T15:14:00Z',
+        resolution: 'held', resolvedAt: new Date(now).toISOString() })
+      expect(incident.nextRetryAt).toBeUndefined()
+    }
+    const reply = await status.readPrStatus(50, now)
+    expect(reply.rows[0].blocker).toMatchObject({
+      id: 'held', line: 'held: review-new-prs held_result since 15:14Z',
+      details: [`review-new-prs: ${error} ${refusal}`, `review running: review-new-prs on ${NEXT.slice(0, 8)}`],
+    })
+    expect(dump()).toEqual(before)
+
+    // An unprobed interruption also needs publication verification, not a timer.
+    db.setMeta(refusalKey, '')
+    const unprobed = dump()
+    const pending = await status.readPrStatus(50, now)
+    expect(pending.rows[0].blocker.line).toBe('held: review-new-prs held_result since 15:14Z')
+    expect(pending.rows[0].blocker.details[0]).toBe(`review-new-prs: ${error} Publication disposition unverified for Call ${old.callId}. Inspect the original Call and reconcile publication before retrying.`)
+    expect(dump()).toEqual(unprobed)
+    expect(mocks.runFile.mock.calls.every(([command]) => command === 'github-datastore')).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
   it('keeps a same-head Grok stop primary and exposes the running Sol fallback', async () => {
     const { db, runtime, status } = await setup()
     const stopped = seedReview(db, { behavior: 'review-new-prs', head: HEAD, callId: 'a'.repeat(32),
@@ -491,6 +548,10 @@ describe('readPrStatus', () => {
       expected_head: HEAD, model: 'gpt-6.1-sol-max' }))
     await (await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })
     seedCache(runtime, '2026-11-12T15:31:00Z')
+    db.setMeta(`behavior_review_new_prs_failure:${stopped.target}`, JSON.stringify({ kind: 'worker', consecutiveFailures: 2,
+      lastFailureAtMs: Date.parse('2026-11-12T14:43:00Z'), nextRetryAtMs: Date.parse('2026-11-12T15:32:00Z'),
+      error: REVIEW_BUDGET_STOPPED, callId: stopped.callId }))
+    const before = db.db.prepare('SELECT * FROM behavior_dead_letters').all()
 
     const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
@@ -498,6 +559,8 @@ describe('readPrStatus', () => {
       id: 'held', line: 'held: review-new-prs review_budget_exhausted since 14:43Z',
       details: [`review-new-prs: ${REVIEW_BUDGET_STOPPED}`, `review running: review-new-prs on ${SHORT}`],
     })
+    expect(runtime.getBehaviorDiagnosticIncidents(null).find((row) => row.callId === stopped.callId)?.nextRetryAt).toBeUndefined()
+    expect(db.db.prepare('SELECT * FROM behavior_dead_letters').all()).toEqual(before)
   })
 
   it('shows the current review alongside both retained past-revision failures', async () => {
@@ -652,17 +715,22 @@ describe('readPrStatus', () => {
     expect(reply.rows).toEqual([])
   })
 
-  it('renders a 429 hold with its retry time', async () => {
+  it('renders an eligible no-action 429 preflight failure with its retry time', async () => {
     const { db, status } = await setup()
     const target = `${pr.repo}#${pr.number}@req=2026-10-29T15:00:00Z/r=2/head=${HEAD}`
     db.db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, actor, source, correlation_id, call_id, error, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('dl-1', 'approve-prs', target, pr.repo, pr.number,
       'review-bot', 'poise:approve-prs', 'c'.repeat(32), 'd'.repeat(32),
-      'review failed: API error (status 429 Too Many Requests)', '2026-10-29T15:54:00Z')
+      'review failed: GitHub 429 Too Many Requests', '2026-10-29T15:54:00Z')
     db.setMeta(`behavior_approve_prs_failure:${target}`, JSON.stringify({ kind: 'worker', consecutiveFailures: 2,
       lastFailureAtMs: Date.parse('2026-10-29T15:54:00Z'), nextRetryAtMs: Date.parse('2026-10-29T16:02:00Z'),
-      error: 'review failed: API error (status 429 Too Many Requests)', callId: 'd'.repeat(32),
+      error: 'review failed: GitHub 429 Too Many Requests', callId: 'd'.repeat(32),
       diagnostic: { severity: 'warning', code: 'rate_limit' } }))
+    fixture.agentLogs = [agentLog({ id: 'd'.repeat(32), behavior: 'pr_approve', correlation_id: 'c'.repeat(32),
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', expected_head: HEAD,
+      started_at: '2026-10-29T15:53:00Z', started_at_precise: '2026-10-29T15:53:00Z',
+      completed_at: '2026-10-29T15:54:00Z', error: 'review failed: GitHub 429 Too Many Requests' })]
+    await (await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })
     const reply = await status.readPrStatus(50, Date.parse('2026-10-29T16:00:00Z'))
     expect(reply.rows).toHaveLength(1)
     expect(reply.rows[0].blocker.id).toBe('held')
@@ -685,7 +753,7 @@ describe('readPrStatus', () => {
       nextRetryAtMs: Date.parse('2026-10-29T16:54:00Z'), callId: 'e'.repeat(32),
       diagnostic: { severity: 'warning', code: 'review_budget_exhausted' } }))
     const budget = await status.readPrStatus(50, Date.parse('2026-10-29T16:00:00Z'))
-    expect(budget.rows[0].blocker.line).toBe('held: approve-prs review_budget_exhausted since 15:54Z, retry 16:54Z')
+    expect(budget.rows[0].blocker.line).toBe('held: approve-prs review_budget_exhausted since 15:54Z')
   })
 
   it('flags age past 60 minutes at the exact boundary', async () => {
