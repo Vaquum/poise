@@ -202,7 +202,7 @@ def checkpoint_verified_resolution(response: dict, review_id: int | None, thread
 
 
 def work_publication(head: str, *, start_replies: bool = False) -> None:
-    """Checkpoint a pushed head, then reserve its planned replies before POST.
+    """Record write intent before push, then reserve planned replies before POST.
 
     Only a recorded unattempted reply batch can resume after worker settlement.
     A lost POST remains uncertain instead of authorizing another write.
@@ -219,7 +219,7 @@ def work_publication(head: str, *, start_replies: bool = False) -> None:
                            "and behavior in ('implement_issue','repair_pr') and action_plan is not null "
                            "and coalesce(error_code,'') not in ('stopping','stopped')", (call_id,)).fetchone()
         artifact = json.loads(row[0]) if row and row[0] else {}
-        if not row or artifact.get("phase") != "publishing" or not artifact.get("plan_sha"):
+        if not row or artifact.get("phase") not in {"preparing_publication", "publishing"} or not artifact.get("plan_sha"):
             raise RuntimeError("work publication lacks its original native action plan")
         if start_replies:
             ownership = json.loads(row[3]) if row[3] else None
@@ -237,7 +237,7 @@ def work_publication(head: str, *, start_replies: bool = False) -> None:
                     raise RuntimeError("planned replies lack their original active native ownership")
                 else:
                     scope.require_idle()
-            if row[1] not in {"running", "failed"} or (row[1] == "failed" and not resource_ownership.publication_released(row[2], row[3], artifact)) \
+            if artifact.get("phase") != "publishing" or row[1] not in {"running", "failed"} or (row[1] == "failed" and not resource_ownership.publication_released(row[2], row[3], artifact)) \
                     or (row[1] == "running" and (not resource_ownership.healthy(ownership)
                                                 or artifact.get("resource_error"))) \
                     or artifact.get("publication_head") != head or artifact.get("replies_started") is not False:
@@ -246,6 +246,7 @@ def work_publication(head: str, *, start_replies: bool = False) -> None:
         else:
             if row[1] != "running" or ("publication_head" in artifact and artifact["publication_head"] != head):
                 raise RuntimeError("work publication head conflicts with its original native receipt")
+            artifact["phase"] = "publishing"
             artifact.setdefault("publication_head", head)
             artifact.setdefault("replies_started", False)
         conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), call_id))

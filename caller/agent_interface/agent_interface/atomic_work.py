@@ -414,7 +414,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                         raise AtomicWorkBlocked("candidate CI failures remain unresolved alongside the shared dependency")
                     record({"phase": "waiting_baseline", "prepared": prepared, "ci_dependency": dependency})
                     return {"outcome": "no_changes", "head_sha": expected_head}
-            receipt = {"phase": "publishing", "prepared": prepared, "publication": publication}
+            receipt = {"phase": "preparing_publication", "prepared": prepared, "publication": publication}
             record(receipt)
             progress.stage("publishing", "Publishing the verified checkout through github-interface")
             published = issue_review.interface(*publication_args, "--mode", "publish", seconds=120)

@@ -1448,6 +1448,9 @@ and recovery evidence. Logging displays the original Call and restoration
 action even while its invocation is active. This diagnostic evidence grants no
 publication, retry or resource-release authority; [Behavior chain](Behavior-chain.md#authority-and-recovery)
 defines its reconciliation rules.
+Atomic publication also retains its original pre-write phase: a proven no-write
+failure settles through the existing Caller receipt after resource release;
+missing original push evidence stays visible in the chain wait with its fence intact.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;

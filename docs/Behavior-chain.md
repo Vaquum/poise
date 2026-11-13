@@ -410,6 +410,17 @@ The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
 PR titles, issue-closing references or reply targets fail as unstarted work,
 rather than becoming ambiguous writes that never occurred.
+After retaining the atomic plan, Caller records `preparing_publication` until
+the publication helper durably changes it to `publishing` before push or replies.
+A failed original still at that no-write checkpoint can become
+`not_started` / `preflight_failed` only after resource settlement; the journal
+then applies normal admission and backoff. A `publishing` receipt, local commit,
+plan digest or unstarted replies cannot prove that push was unattempted. Without
+an attributable pushed head, the existing wait names the missing original
+pre-push checkpoint or conclusive push result and retains the original fence.
+The plan contains metadata, not a replayable checkout. Closed-target
+reconciliation still forbids late publication and retains pending review evidence,
+including when a parent of an uncertain repair commit has merged.
 
 Durable model admissions use the existing semaphore's behavior-lane ceiling, including its interactive reserve. A fresh server process cannot fill that reserve with another background invocation merely because surviving workers hold no slots in its new in-memory semaphore. Existing work above a lowered ceiling finishes normally while new admissions wait. The journal's capacity check also precedes provider preparation, so waiting work cannot consume a provider recovery probe without launching; admission still rechecks capacity transactionally afterward.
 
