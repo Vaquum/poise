@@ -213,6 +213,9 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     let runtime = new BehaviorChainRuntime(journal, native)
     await runtime.run()
     expect(journal.read(chain.id)!.held).toBe(call.error)
+    const ciHold = ['ambiguous cause', 'missing failure identity', 'publication receipt'].includes(mode) ? undefined
+      : { invocationId: id, callId: call.id, head: ci.head_sha }
+    expect(journal.read(chain.id)!.ciHold).toEqual(ciHold)
     expect(observe).not.toHaveBeenCalled()
     await runtime.run()
     expect(launch).not.toHaveBeenCalled()
@@ -225,11 +228,13 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     await runtime.run()
     chain = journal.read(chain.id)!
     expect(chain.held).toBe(call.error)
+    expect(chain.ciHold).toEqual(ciHold)
     expect(chain.invocations[0].state).toBe(['uncertain publication', 'unreleased resources'].includes(mode) ? 'uncertain' : 'settled')
     const failedReceipt = structuredClone(chain.invocations[0])
     if (mode === 'operator hold') chain = record(journal, chain, { type: 'chain.held', reason: call.error })
     const history = journal.history(chain.id)
     journal.rebuild()
+    expect(journal.read(chain.id)!.ciHold).toEqual(mode === 'operator hold' ? undefined : ciHold)
     runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
     for (let tick = 0; tick < 3; tick++) await runtime.run()
     if (mode !== 'uncertain publication') expect(journal.history(chain.id)).toEqual(history)
@@ -645,7 +650,8 @@ it.each([false, true])('does not defer original model/resource settlement, with 
   let chain = seed(journal)
   chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-model', behavior: 'review-pr',
     actor: 'reviewer', model: 'fixture', slot: 'primary', basis: 'review', admittedAt: NOW - 5000,
-    request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--pr-review', 'https://github.com/acme/repo/pull/17',
+      '--expected-head', 'a'.repeat(40)] } } })
   chain = record(journal, chain, { type: 'invocation.started', invocationId: 'original-model' })
   chain = record(journal, chain, { type: 'chain.observed', observation: observation() })
   chain = record(journal, chain, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: chain.repository,
@@ -666,7 +672,7 @@ it.each([false, true])('does not defer original model/resource settlement, with 
   expect(observe).not.toHaveBeenCalled()
   expect(journal.liveModelInvocationCount()).toBe(1)
   Object.assign(call, { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
-    completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() })
+    head_sha: null, artifact: { phase: 'reviewing' }, completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() })
   visible = true
   await runtime.run()
   expect(readInvocations).toHaveBeenCalledTimes(3)

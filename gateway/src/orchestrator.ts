@@ -5,6 +5,7 @@ import { BEHAVIOR_RESOURCE_VARIABLES, type Config } from './config.js'
 import type { ContainerDetails, ContainerMount, ContainerSpec, ContainerSummary, DockerClient, TaskSpec } from './docker.js'
 import type { GatewayKeys } from './keys.js'
 import { errorMessage, type LogFields, type Logger } from './log.js'
+import { isUnreachable } from './proxy.js'
 import type { Store } from './store.js'
 import { workspaceKey, workspaceRelayUrl } from './test-relay.js'
 import { WORKSPACE_RESOLV_CONF } from './workspace-dns.js'
@@ -326,6 +327,19 @@ export class Orchestrator {
   /** The release a workspace is switching to, while it restarts onto it; null otherwise. */
   updatingTo(handle: string): string | null {
     return this.updating.get(handle)?.release ?? null
+  }
+
+  /** A reset belongs to a known switch only once a fresh probe cannot reach the old server or finds its replacement. */
+  async restartingForUpdate(handle: string, login: string): Promise<boolean> {
+    const release = this.updatingTo(handle)
+    if (release === null) return false
+    this.markNotReady(handle)
+    try {
+      const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+      return health.ok && health.release === release && this.updatingTo(handle) === release
+    } catch (error) {
+      return isUnreachable(error as NodeJS.ErrnoException) && this.updatingTo(handle) === release
+    }
   }
 
   /** Whether the workspace answers its health check; a refused connection just means it is not up yet. */

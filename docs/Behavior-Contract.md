@@ -293,14 +293,16 @@ the reviews it managed to prepare, and an `approve-prs` sweep still fires the
 approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
-An approval cycle failure retains its organization, last known phase, live
+Review and approval cycle failures retain their organization, last known phase, live
 effective deadline and observed check/launch counts in diagnostic context before
 clock cleanup, including a tick that returns on abort. Pending checks include
-unread or failed reads; prepared approvals still awaiting dispatch are counted
-separately. A deadline record retains the cursor, original launch claim,
+unfinished review preparation and unread or failed approval reads; prepared work
+is counted separately. A review timeout keeps the sweep identity even when a
+target attached its identity to the same exception. A deadline record retains
+the cursor, original launch claim,
 correlation, expected head and observed Call, plus the next scheduled tick.
 Only a proven deferral with matching, unambiguous running Call evidence and an
-available scheduled continuation is captured as Warning at the approval cycle.
+available scheduled continuation is captured as Warning at the sweep cycle.
 Missing or conflicting ownership, uncertain writes and unavailable continuation
 remain Errors. Read counts do not prove completed evaluation, and a launch does
 not prove publication: publication stays unverified until reconciliation proves
@@ -522,6 +524,17 @@ A closed legacy failure can recover when Caller subsequently supplies an exact
 and after restart. Other bounded, oversized-packet and invalid-result holds retain
 their existing rules; unrelated reviewers’ submitted receipts do not override
 an exact proof that this particular run never submitted.
+
+For legacy failed Calls with `action=null` and `outcome=null`, the existing
+publication probe retains its refusal on that exact held Call/correlation.
+Behaviors' held diagnostic and PR status `blocker.details` distinguish pending
+reviews, unclaimed reviews, incomplete identity inventory and unavailable reads,
+with the original/observed heads and at most three observed review IDs, states
+and commits where available. These observations never become the Call's receipt.
+The explanation survives ticks and restarts without another launch or changes to
+failure counts, backoff or the timeout-stop marker. Original Caller results and
+incident history remain intact; typed no-action and count-only zero-activity
+recovery retain their existing retry rules.
 
 ## Where the pull-request behaviors act
 

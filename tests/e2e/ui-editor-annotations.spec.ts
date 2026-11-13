@@ -91,7 +91,7 @@ test('marks a note whose text is gone as Passage changed, and opens and deletes 
   const mark = page.locator('.annotation-orphan')
   await expect(mark).toHaveCount(1)
   await expect(mark).toBeVisible()
-  await expect(mark).toHaveAttribute('title', 'Passage changed: Left behind')
+  await expect(mark).toHaveAttribute('data-help', 'Passage changed: Left behind')
   // The mark sits on the last line and is narrower than half of it.
   const markBox = await mark.boundingBox()
   const lineBox = await page.locator('#editor-doc .editor-line').last().boundingBox()

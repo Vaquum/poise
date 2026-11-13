@@ -291,6 +291,12 @@ never a refused submission. Claude's pinned
 inspection root is also carried in its explicit settings so shell tools retain
 repository access.
 
+Review and approval deadlines persist a failed no-action result only after
+validating the original pre-POST phase and quiet, complete live inventory.
+Failed recovery reads retain uncertainty through cleanup. The durable retry,
+resource-release and receipt rules are in
+[Behavior chain](../../docs/Behavior-chain.md#authority-and-recovery).
+
 When live GitHub state confirms the pull request closed or merged — at
 preparation, after provider execution, or during publication reconciliation —
 the obsolete round settles `superseded` under `review_target_closed`, never
@@ -489,7 +495,8 @@ GitHub must first confirm the same open head and no new or pending reviewer acti
 A verified completed action is adopted instead. Ambiguous activity, time exhaustion,
 or failed recovery leaves a typed failure for Poise to retain without automatically
 repeating unchanged input. Every recovery exit keeps the refused first attempt beside
-the re-verdict outcome, including a later supersede.
+the re-verdict outcome, including a later supersede. Failed recovery also retains
+the inner diagnostic, including a file-group deadline's timing and no-submission evidence.
 Logs include `review_policy` and `recovery_model`; capability discovery includes
 `policy: bounded-v1` so Poise can reject an incompatible runtime before launch.
 
@@ -545,7 +552,9 @@ for the authoritative outcome lookup. Submission keeps that verification
 reserve even when it is slow. After the first common-context turn, staged
 inspection uses an equal share of the remaining analysis allowance as a scheduling
 guide. A group can borrow slack after reserving the mean observed analysis time
-of completed groups for each remaining group, excluding the common-context turn.
+of completed groups for each remaining group, excluding the common-context turn
+and capping each later group's reserve at half the current equal share. An expensive
+early prefix therefore cannot reserve away the current group's borrowing room.
 After half the equal share, Caller asks the provider to omit optional inspection;
 required inspection and subsequent provider turns can still use the borrowed time.
 The inspection schema stays available even at the round limit, so a need for

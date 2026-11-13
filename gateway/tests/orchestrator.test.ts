@@ -1032,6 +1032,92 @@ describe('updates in place', () => {
     expect(call.json()).toMatchObject({ error: 'workspace_updating' })
   })
 
+  it.each(['GET', 'HEAD', 'navigation', 'recovered'])(
+    'returns the update response for a pre-response reset during a switch (%s), then freshly verifies recovery', async kind => {
+      await start()
+      const { workspaceCookie } = await h.openWorkspace('Alice')
+      const headers = { cookie: workspaceCookie, ...(kind === 'navigation' ? NAVIGATE : {}) }
+      const before = containerId()
+      // Cache readiness before accepting the switch: only the reset may invalidate it.
+      expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+      await h.orchestrator.upgradePass()
+      expect(h.orchestrator.updatingTo('alice')).toBe('new-release')
+      h.workspace.onRequest = request => {
+        if (request.url !== '/reset') return
+        if (kind === 'recovered') h.workspace.health.release = 'new-release'
+        else h.workspace.reachable = false
+      }
+
+      const method = kind === 'HEAD' ? 'HEAD' : 'GET'
+      const reset = await h.request({ host: ALICE, path: '/reset', method, headers })
+      expect(reset.status).toBe(503)
+      expect(reset.headers['x-poise-updating']).toBe('1')
+      expect(reset.headers['retry-after']).toBe('2')
+      if (kind === 'navigation') expect(reset.body).toContain('Updating to the latest version')
+      else if (kind === 'HEAD') expect(reset.body).toBe('')
+      else expect(reset.json()).toMatchObject({ error: 'workspace_updating' })
+      expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({
+        level: 'error', handle: 'alice', errno: 'ECONNRESET', release: 'new-release', method, route: '/',
+        requestId: expect.any(String), upstream: `127.0.0.1:${h.workspace.port}`, durationMs: expect.any(Number),
+      })
+      expect(events(h.logs, 'workspace.update.finished')).toHaveLength(0)
+
+      h.workspace.reachable = true
+      h.workspace.health.release = 'new-release'
+      h.workspace.health.switching = null
+      const probes = h.workspace.serviceRequests.length
+      expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+      expect(h.workspace.serviceRequests.slice(probes).map(request => request.url)).toEqual(['/api/service/health'])
+      expect(h.orchestrator.updatingTo('alice')).toBeNull()
+      expect(h.logs.find(entry => entry.event === 'workspace.update.finished')).toMatchObject({ release: 'new-release' })
+      expect(h.workspace.requests.filter(request => request.url === '/reset')).toHaveLength(1)
+      expect(h.workspace.switches).toEqual(['new-release'])
+      expect(containerId()).toBe(before)
+    })
+
+  it.each(['no update', 'healthy old release', 'unhealthy', 'refused health'])(
+    'keeps a reset actionable without proof of a restart (%s)', async kind => {
+      await start()
+      const { workspaceCookie } = await h.openWorkspace('Alice')
+      const headers = { cookie: workspaceCookie }
+      expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+      if (kind !== 'no update') await h.orchestrator.upgradePass()
+      if (kind === 'unhealthy') h.workspace.health.ok = false
+      if (kind === 'refused health') h.workspace.healthStatus = 503
+      const probes = h.workspace.serviceRequests.length
+
+      const reset = await h.request({ host: ALICE, path: '/reset', headers })
+      expect(reset.status).toBe(502)
+      expect(reset.json()).toMatchObject({ error: 'bad_gateway' })
+      expect(reset.headers['x-poise-updating']).toBeUndefined()
+      expect(h.workspace.serviceRequests.slice(probes).map(request => request.url))
+        .toEqual(kind === 'no update' ? [] : ['/api/service/health'])
+      expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({ level: 'error', errno: 'ECONNRESET' })
+      expect(events(h.logs, 'workspace.update.finished')).toHaveLength(0)
+      expect(h.workspace.requests.filter(request => request.url === '/reset')).toHaveLength(1)
+    })
+
+  it.each(['POST', 'DELETE'])('keeps an interrupted %s actionable during a switch without replaying its effect', async method => {
+    await start()
+    const { workspaceCookie } = await h.openWorkspace('Alice')
+    const headers = { cookie: workspaceCookie, 'content-type': 'application/json' }
+    expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+    await h.orchestrator.upgradePass()
+    h.workspace.onRequest = request => {
+      if (request.url === '/reset') h.workspace.reachable = false
+    }
+    const body = method === 'POST' ? '{"effect":"applied before reset"}' : ''
+    const reset = await h.request({ host: ALICE, path: '/reset', method, headers, body })
+    expect(reset.status).toBe(502)
+    expect(reset.headers['x-poise-updating']).toBeUndefined()
+    // The fixture records the received mutation before dropping its answer; its outcome is ambiguous to the client.
+    expect(h.workspace.requests.filter(request => request.url === '/reset')).toMatchObject([{ method, body }])
+    expect(h.workspace.requestLines.filter(line => line === `${method} /reset`)).toHaveLength(1)
+    expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({
+      level: 'error', method, errno: 'ECONNRESET', release: 'new-release',
+    })
+  })
+
   it('recreates the container when the new image has another base, its release made current first', async () => {
     await start({ oldBase: 'base-0', release: 'new-release' })
     const before = containerId()

@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import { LedgerError, type LedgerAdmission, type LedgerCaller, type LedgerOutcome, type LedgerPolicy, type LedgerRecord } from '../server/behavior-ledger-contract'
 
@@ -328,7 +328,22 @@ describe('behavior firing ledger store', () => {
     db.capture(admission('other-repo', { admissionKey: 'other-repo', repository: 'other/project', number: 7 }))
     db.capture(admission('mixed-case', { admissionKey: 'mixed-case', repository: 'Acme/Project', number: 7 }))
     complete(db, 'target-1')
+    const prepared = vi.spyOn(Database.prototype, 'prepare')
     const page = db.read({ operation: 'list', repository: 'acme/project', number: 7, limit: 100 })
+    const sql = prepared.mock.calls.find(([sql]) => sql.startsWith('SELECT * FROM ledger_instances WHERE creation_seq'))?.[0]
+    prepared.mockRestore()
+    expect(sql).toBeDefined()
+    const check = new Database(db.path, { readonly: true })
+    try {
+      // Explain the SQL the list actually prepared, including its range and
+      // ordering. Both target expressions must constrain the index seek.
+      for (const [repository, number] of [['acme/project', 7], ['acme/project', 999], ['missing/project', 7]] as const) {
+        const plan = check.prepare<unknown[], { detail: string }>(`EXPLAIN QUERY PLAN ${sql}`).all(0, 8, repository, number, 101)
+        expect(plan.map(row => row.detail)).toEqual([
+          expect.stringContaining('SEARCH ledger_instances USING INDEX ledger_target (<expr>=? AND <expr>=? AND rowid>? AND rowid<?)'),
+        ])
+      }
+    } finally { check.close() }
     expect(page.status).toBe(200)
     expect(page.body.records).toHaveLength(4)
     expect(page.body.records!.every((record) => record.target.repository.toLowerCase() === 'acme/project' && record.target.number === 7)).toBe(true)

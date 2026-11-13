@@ -11,7 +11,6 @@ import { takeOpenChat } from '../open-chat'
 import type { MountPlace } from '../router'
 import { foldListWhenNarrow, initChatView, openChatForSubject, openChatSession, openSwitchboardPane, stopChatRefresh } from './chat/view'
 import { placeSettings } from '../../config'
-import { installIconTooltips } from '../../icon-tooltips'
 
 let viewEl: HTMLElement | null = null
 let keep: HTMLElement | null = null
@@ -22,8 +21,6 @@ export function chatView(): HTMLElement {
     viewEl = document.createElement('section')
     viewEl.id = 'view-chat'
     viewEl.className = 'view'
-    // Classic's icon buttons explain themselves with classic's own tooltips.
-    installIconTooltips(viewEl)
   }
   return viewEl
 }
