@@ -2,8 +2,10 @@
 
 What needs you, and what Behaviors is doing, is in one place: Overview's
 Answer here. A bell at the end of the top bar, on every place, counts what is
-open and opens Answer here, with a route back to where you were. When nothing
-needs you, the bell shows no count.
+open and opens Answer here, with a route back to where you were. On Overview
+itself it brings Answer here to its top and moves focus to its first entry, or
+to its empty state when nothing is open at the level; its label says which.
+When nothing needs you, the bell shows no count.
 
 ## The bell
 

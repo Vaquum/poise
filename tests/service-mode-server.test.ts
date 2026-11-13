@@ -6,11 +6,13 @@
 import { existsSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server } from 'node:http'
+import { createRequire } from 'node:module'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
+import Database from 'better-sqlite3'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
 import { STATUS, assertFakeClis, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { fakePresetCommand } from './fixtures/accounts/fake-presets'
@@ -51,6 +53,19 @@ if (args[0] === '--models') {
   else { const timer = setInterval(() => { if (!fs.existsSync(${JSON.stringify(join(root, 'hold-models'))})) { clearInterval(timer); models() } }, 20) }
 }
 else if (args[0] === '--wait') { const timer = setInterval(() => { if (fs.existsSync(args[1])) clearInterval(timer) }, 20) }
+else if (args[0] === '--reclaim-native-resources') {
+  fs.writeFileSync(${JSON.stringify(join(root, 'cleanup-started'))}, '')
+  const timer = setInterval(() => {
+    if (fs.existsSync(${JSON.stringify(join(root, 'hold-cleanup'))})) return
+    clearInterval(timer)
+    fs.rmSync(require('node:path').join(process.env.AGENT_INTERFACE_DATA_DIR, 'native-resources', 'a'.repeat(32)), {recursive: true})
+    const Database = require(${JSON.stringify(createRequire(import.meta.url).resolve('better-sqlite3'))})
+    const db = new Database(require('node:path').join(process.env.AGENT_INTERFACE_DATA_DIR, 'calls.sqlite3'))
+    db.prepare('UPDATE calls SET resources_settled_at = ?, resource_cleanup = NULL WHERE id = ?').run(1234, 'a'.repeat(32))
+    db.close()
+    process.stdout.write(JSON.stringify({version: 1, examined: 1, released: ['a'.repeat(32)], held: []}))
+  }, 20)
+}
 else process.stdout.write('[]')
 `)
   await writeFile(join(bin, 'agent-interface'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(bin, 'fake-caller.cjs'))} "$@"\n`)
@@ -679,4 +694,66 @@ describe('Poise in service mode', () => {
   it('binds beyond loopback only in service mode', () => {
     expect(() => production.createProductionServer({ host: '0.0.0.0', service: null })).toThrow('Poise is a local application and only binds to a loopback host')
   })
+
+  it('finishes in-flight native cleanup and its original receipt before SQLite closes and exit 75', async () => {
+    const maintenance = await import('../server/storage-maintenance')
+    const { ServiceControl } = await import('../server/service/control')
+    const { getChatRuntime } = await import('../server/cache-plugin')
+    const { spawnDetached } = await import('../server/process')
+    const { runningCallerCalls } = await import('../server/service/caller-calls')
+    const { db } = await import('../server/db')
+    await maintenance.stopStorageMaintenanceRuntime()
+    const records = process.env.AGENT_INTERFACE_DATA_DIR!
+    await mkdir(records, { recursive: true })
+    const receipts = new Database(join(records, 'calls.sqlite3'))
+    receipts.exec('CREATE TABLE calls (id TEXT, status TEXT, pid INTEGER, runner TEXT, source TEXT, resources_settled_at REAL, resource_cleanup TEXT, artifact TEXT)')
+    const originalArtifact = JSON.stringify({ outcome: 'completed', head_sha: 'b'.repeat(40) })
+    receipts.prepare('INSERT INTO calls VALUES (?, ?, NULL, NULL, ?, NULL, ?, ?)')
+      .run('a'.repeat(32), 'completed', 'poise:behavior-chain', JSON.stringify({ token: 'original-claim' }), originalArtifact)
+    const heldReceipt = { id: 'a'.repeat(32), status: 'completed', pid: null, runner: null, source: 'poise:behavior-chain',
+      resources_settled_at: null, resource_cleanup: JSON.stringify({ token: 'original-claim' }), artifact: originalArtifact }
+    const resource = join(records, 'native-resources', 'a'.repeat(32))
+    await mkdir(resource, { recursive: true })
+    await writeFile(join(resource, 'owned'), 'original cleanup work')
+    const hold = join(root, 'hold-cleanup')
+    const releaseCaller = join(root, 'release-surviving-caller')
+    await writeFile(hold, '')
+    vi.stubEnv('POISE_NATIVE_CONTROL', '{}')
+    maintenance.startStorageMaintenanceRuntime()
+    await spawnDetached(join(bin, 'agent-interface'), ['--wait', releaseCaller])
+    const exit = vi.fn((code: number) => ({ code, resourcePresent: existsSync(resource), receipt: receipts.prepare('SELECT * FROM calls').get(),
+      databaseOpen: db.open, runningCallerCalls: runningCallerCalls().count }))
+    const shutdown = production.createProductionShutdown(server, exit)
+    const releases = join(root, 'releases')
+    await mkdir(join(releases, 'new'), { recursive: true })
+    await writeFile(join(releases, 'new', 'installed'), '')
+    await writeFile(join(releases, 'new', 'base'), 'same-base')
+    const service = new ServiceControl(getChatRuntime(), { releasesDir: releases, release: { name: 'old', base: 'same-base' },
+      drainTimeoutSeconds: 1800, canRestart: () => true, restart: () => { shutdown(75); return true } })
+    try {
+      await vi.waitFor(() => expect(existsSync(join(root, 'cleanup-started'))).toBe(true))
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+      service.switchRelease('new')
+      // Longer than production's unchanged shutdown budget, with the actual
+      // maintenance command still holding its original cleanup receipt.
+      await vi.advanceTimersByTimeAsync(11_000)
+      expect(receipts.prepare('SELECT * FROM calls').get()).toEqual(heldReceipt)
+      expect(existsSync(resource)).toBe(true)
+      expect(db.open).toBe(true)
+      expect(server.listening).toBe(true)
+      expect(exit).not.toHaveBeenCalled()
+
+      await rm(hold)
+      await vi.waitFor(() => expect(exit).toHaveBeenCalledExactlyOnceWith(75), { timeout: 5_000 })
+      expect(exit.mock.results[0].value).toEqual({ code: 75, resourcePresent: false, receipt: { ...heldReceipt, resources_settled_at: 1234, resource_cleanup: null },
+        databaseOpen: false, runningCallerCalls: 1 })
+      expect(server.listening).toBe(false)
+    } finally {
+      vi.useRealTimers()
+      await rm(hold, { force: true })
+      await writeFile(releaseCaller, '')
+      await production.shutdownProductionServer(server)
+      receipts.close()
+    }
+  }, 20_000)
 })

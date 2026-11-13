@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { staleDatastoreFailure } from './datastore-health'
+import { DATASTORE_MAX_AGE_SECONDS, staleDatastoreFailure } from './datastore-health'
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
@@ -133,6 +133,12 @@ function preferObservationError(current: Error | null, candidate: Error): Error 
 export class MissingPublicationPlanError extends Error {
   constructor(readonly callId: string, readonly planSha: string) {
     super(`Original Call ${callId} has no durable publication plan`)
+  }
+}
+
+export class ReviewScopeIndexingError extends Error {
+  constructor(repository: string, pull: number) {
+    super(`Repair report review awaits indexed PR closing references for ${repository}#${pull}`)
   }
 }
 
@@ -424,7 +430,28 @@ export class BehaviorChainRuntime {
                 }
                 const id = randomUUID()
                 phase = 'request-preparation'
-                let request = await this.operations.request(chain, observation, decision, id)
+                let request: ChainInvocation['request'] | null
+                try { request = await this.operations.request(chain, observation, decision, id) }
+                catch (error) {
+                  if (!(error instanceof ReviewScopeIndexingError)) throw error
+                  // The first wait for this PR survives rechecks, reason changes
+                  // and restarts, independently of successful organization syncs.
+                  let after = 0, firstWait: number | undefined
+                  while (firstWait === undefined) {
+                    const events = this.journal.history(chain.id, after)
+                    firstWait = events.find(row => {
+                      const event = JSON.parse(row.payload) as ChainEvent
+                      return event.type === 'chain.waiting' && event.reason === error.message
+                    })?.at
+                    if (events.length < 100) break
+                    after = events.at(-1)!.sequence
+                  }
+                  if (firstWait !== undefined && Date.now() - firstWait > DATASTORE_MAX_AGE_SECONDS * 1000) {
+                    throw new Error(`${error.message}; indexing delay exceeds ${DATASTORE_MAX_AGE_SECONDS} seconds`)
+                  }
+                  if (chain.waiting !== error.message) this.append(chain, { type: 'chain.waiting', reason: error.message })
+                  continue
+                }
                 if (!request) {
                   const reason = `${decision.behavior} is waiting for native provider backoff`
                   // Resume retains waiting; its first observed sweep starts a new episode.
