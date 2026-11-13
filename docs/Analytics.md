@@ -64,8 +64,18 @@ Five cards share one row where space permits and wrap on narrower screens.
 
 ## The day
 
-The control bar holds the day: previous day, the date, next day. Analytics
-opens on Today whenever Overview is entered; saving
+Overview's right-hand side has one set of filters, at its top right: the day
+(previous day, the date, next day), a search, and the organization. They apply
+to every panel on that side. The day is its only time filter: the day's
+numbers and the behaviors' runs, time and success follow it, and In motion,
+System health and the GitHub API quota, which are live, say *not for* the
+chosen day when it is not Today. The search shows in each panel only what
+matches its words, ignoring case: In motion lists every matching chat, issue,
+pull request or task whatever its state, with counts to match; the day's
+numbers, System health's cards, the behaviors and the API accounts show the
+matching ones. A panel with no match says so, and Escape clears the search.
+
+The day opens on Today whenever Overview is entered; saving
 settings while it shows keeps the chosen day. The arrows move one calendar
 day backward or forward; Next day is disabled on Today. Yesterday is named,
 and older days show a date including the year. Days start at midnight in the

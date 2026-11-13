@@ -12,6 +12,7 @@ import { getSelectedOrganization, organizationUrl, setSelectedOrganization } fro
 import { $, $$, esc, store } from '../../dom'
 import { hydrateIcons } from '../../icons'
 import { bins, bullet, spark, weekAt, yearChart } from './charts'
+import type { RightFilter } from './find'
 import { clockAt, reason, readLine, unread, type Read, type PartContext } from './util'
 
 export const TILES_KEY = 'poise-overview-tiles'
@@ -21,6 +22,13 @@ const SOURCES = ['overview-day', 'overview-history'] as const
 export function tileOrder(saved: unknown, labels: readonly string[]): string[] {
   const kept = Array.isArray(saved) ? saved.filter((label): label is string => typeof label === 'string' && labels.includes(label)) : []
   return [...new Set([...kept, ...labels])]
+}
+
+/** The day's work types as listed under a search: the leader is always the
+ *  day's own, from every type, and only the rows narrow, scaled against it. */
+export function workTypeRows<T extends { type: string, count: number }>(types: readonly T[], matches: (type: string) => boolean): { lead: T | undefined, rows: T[] } {
+  const counted = types.filter((entry) => entry.count > 0)
+  return { lead: counted[0], rows: counted.filter((entry) => matches(entry.type)) }
 }
 
 /** Moves `label` by `step` places, within the list. */
@@ -69,7 +77,10 @@ let lastDay: LastDay | null = (() => {
   try { return JSON.parse(localStorage.getItem(LAST_DAY_KEY) ?? 'null') as LastDay | null } catch { return null }
 })()
 
-export function mountDay(ctx: PartContext, main: HTMLElement): void {
+/** The day the right-hand side is for: its bounds in Settings' time zone and its name. */
+export interface ChosenDay { since: string, until: string, label: string, isToday: boolean }
+
+export function mountDay(ctx: PartContext, main: HTMLElement, find: RightFilter, onDay: (day: ChosenDay) => void): void {
   const { signal } = ctx
   let offset = 0
   let anchor = new Date()
@@ -135,7 +146,8 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
     }
     const productivity = group('productivity')
     order = tileOrder(store.get<unknown>(TILES_KEY, null), productivity.map((tile) => tile.label))
-    tiles.innerHTML = order.map((label) => productivity.find((tile) => tile.label === label)).filter((tile): tile is AnalyticsTile => !!tile).map(tileHTML).join('')
+    const shownTiles = order.map((label) => productivity.find((tile) => tile.label === label)).filter((tile): tile is AnalyticsTile => !!tile && find.matches(tile.label))
+    tiles.innerHTML = shownTiles.length ? shownTiles.map(tileHTML).join('') : `<p class="onote" role="status">${esc(find.none())}</p>`
     const fail = $('[data-dayfail]', main)
     if (fail) fail.innerHTML = failure()
     paintDetail()
@@ -151,16 +163,17 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
       friction.innerHTML = '<h3 class="ocard-h"><span class="t-micro" data-ref="ov.friction">Review</span></h3>'
       return
     }
-    perPr.innerHTML = group('per-merged-pr').map(smallHTML).join('')
+    const perPrTiles = group('per-merged-pr').filter((tile) => find.matches(tile.label))
+    perPr.innerHTML = perPrTiles.length ? perPrTiles.map(smallHTML).join('') : `<p class="onote" role="status">${esc(find.none())}</p>`
     const review = group('work-review')
     const type = review.find((tile) => tile.workTypes)
     const population = type?.population ?? 0
-    const types = (type?.workTypes ?? []).filter((entry) => entry.count > 0)
-    const lead = types[0]
+    const { lead, rows: types } = workTypeRows(type?.workTypes ?? [], (name) => find.matches(name, 'Work type'))
     work.innerHTML = `<h3 class="ocard-h"><span class="t-micro" data-ref="ov.worktype">Work type</span><span class="t-gloss">of ${population} merged</span></h3>
       ${lead && population ? `<p class="ova-lead"><b>${esc(lead.type)}</b> leads, ${Math.round((lead.count / population) * 100)}%</p>` : `<p class="onote">${esc(type?.note ?? 'No pull requests were merged.')}</p>`}
-      <ul class="wtype">${types.map((entry) => `<li><span class="wt-k t-mono">${esc(entry.type)}</span><svg viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect class="wt-t" width="100" height="6"/><rect class="wt-v" width="${lead ? ((entry.count / lead.count) * 100).toFixed(1) : 0}" height="6"/></svg><span class="wt-n">${entry.count}</span></li>`).join('')}</ul>`
-    friction.innerHTML = `<h3 class="ocard-h"><span class="t-micro" data-ref="ov.friction">Review</span><span class="t-gloss">what it took to merge</span></h3>${review.filter((tile) => !tile.workTypes).map((tile) => `<button class="ofric" data-small="${esc(tile.label)}" aria-expanded="${open === tile.label}" aria-label="${esc(tile.label)}: ${esc(tile.value)}." data-ref="ov.tile"><span class="otile-l">${esc(tile.label)}</span><span class="osmall-v">${esc(tile.value)}</span>${paceHTML(tile)}<span class="t-gloss">${esc(tile.comparison ?? '')}</span>${sparkFor(tile.label)}</button>`).join('')}`
+      ${types.length || !find.query() ? `<ul class="wtype">${types.map((entry) => `<li><span class="wt-k t-mono">${esc(entry.type)}</span><svg viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect class="wt-t" width="100" height="6"/><rect class="wt-v" width="${lead ? ((entry.count / lead.count) * 100).toFixed(1) : 0}" height="6"/></svg><span class="wt-n">${entry.count}</span></li>`).join('')}</ul>` : `<p class="onote" role="status">${esc(find.none())}</p>`}`
+    const frictionTiles = review.filter((tile) => !tile.workTypes && find.matches(tile.label, 'Review'))
+    friction.innerHTML = `<h3 class="ocard-h"><span class="t-micro" data-ref="ov.friction">Review</span><span class="t-gloss">what it took to merge</span></h3>${frictionTiles.length ? frictionTiles.map((tile) => `<button class="ofric" data-small="${esc(tile.label)}" aria-expanded="${open === tile.label}" aria-label="${esc(tile.label)}: ${esc(tile.value)}." data-ref="ov.tile"><span class="otile-l">${esc(tile.label)}</span><span class="osmall-v">${esc(tile.value)}</span>${paceHTML(tile)}<span class="t-gloss">${esc(tile.comparison ?? '')}</span>${sparkFor(tile.label)}</button>`).join('') : `<p class="onote" role="status">${esc(find.none())}</p>`}`
   }
 
   function paintDetail(): void {
@@ -211,9 +224,15 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
     const ctl = $('[data-dayctl]', main)
     const organizations = getOrganizations().filter((org) => org.status === 'ready')
     const selected = getSelectedOrganization()
-    ctl.innerHTML = `<div class="oday" role="group" aria-label="Day" data-ref="ov.day"><button class="ib" data-act="day-prev" aria-label="Previous day"><i data-i="chev" class="sm flip-x"></i></button><span class="oday-t" data-day-label>${esc(today.label)}</span><button class="ib" data-act="day-next" aria-label="Next day"${today.isToday ? ' aria-disabled="true"' : ''}><i data-i="chev" class="sm"></i></button></div>
-      ${organizations.length > 1 ? `<label class="oorg" data-ref="ov.org"><span class="sr">Organization</span><select data-org><option value="">All orgs</option>${organizations.map((org) => `<option value="${esc(org.login)}"${org.login === selected ? ' selected' : ''}>${esc(org.login)}</option>`).join('')}</select></label>` : ''}`
+    ctl.innerHTML = `<div class="oday" role="group" aria-label="Day" data-ref="ov.day"><button class="ib" data-act="day-prev" aria-label="Previous day"><i data-i="chev" class="sm flip-x"></i></button><span class="oday-t" data-day-label>${esc(today.label)}</span><button class="ib" data-act="day-next" aria-label="Next day"${today.isToday ? ' aria-disabled="true"' : ''}><i data-i="chev" class="sm"></i></button></div>`
     hydrateIcons(ctl)
+    // The organization stays where it was, beside the search, which is never redrawn under your typing.
+    const org = $('[data-orgctl]', main)
+    const orgKey = `${selected}|${organizations.map((value) => value.login).join(',')}`
+    if (org.dataset.shown !== orgKey) {
+      org.innerHTML = organizations.length > 1 ? `<label class="oorg" data-ref="ov.org"><span class="sr">Organization</span><select data-org><option value="">All orgs</option>${organizations.map((value) => `<option value="${esc(value.login)}"${value.login === selected ? ' selected' : ''}>${esc(value.login)}</option>`).join('')}</select></label>` : ''
+      org.dataset.shown = orgKey
+    }
     const line = $('[data-dayline]', main)
     if (line) line.textContent = `${today.label}${today.isToday && shown ? `, until ${clockAt(shown.snapshot.capturedAt)}` : ''} · ${selected || 'All orgs'} · against the 7 days before`
     const when = $('[data-when]', main)
@@ -245,7 +264,18 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
 
   const accountFailures = (errors: AnalyticsReport['errors']): ReadFailure[] => errors.map(({ org, error, stale }) => ({ key: `account:${org.toLowerCase()}`, title: `GitHub data for ${org} ${stale ? 'is not updating' : 'is unavailable'}`, body: error }))
 
+  /** The right-hand side follows the day: Behaviors reads it, live panels say they are live. */
+  let announced = ''
+  function announce(): void {
+    const day = analyticsDay(offset, anchor)
+    const key = `${day.since}|${day.until}`
+    if (key === announced) return
+    announced = key
+    onDay({ since: day.since, until: day.until, label: day.label, isToday: day.isToday })
+  }
+
   async function readDay(background: boolean): Promise<void> {
+    announce()
     const mine = ++generation
     const key = dayKey()
     read?.abort()
@@ -373,5 +403,6 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
   }
   midnight()
   window.addEventListener('poise:organization-filter-changed', () => void readDay(false), { signal })
+  find.onChange(() => { open = null; paint() })
   signal.addEventListener('abort', () => { for (const source of SOURCES) noticeFeed.reportReadErrors(source, []) })
 }

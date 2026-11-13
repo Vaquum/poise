@@ -607,9 +607,10 @@ failure retries with backoff. Errors after the write begins remain held.
 Behaviors uses the full table width. Its leading, unlabeled toggle controls
 activation; notification counts occupy the Status column after Behavior.
 The shaded numeric columns show total runs, total elapsed duration, and the
-percentage of finished runs that did not fail. Any time, Today, Yesterday,
-and This week filter all three metrics by run start, using the timezone in
-Settings, independently of Current. These filters do not change settings,
+percentage of finished runs that did not fail. In Settings → Behaviors, Any
+time, Today, Yesterday, and This week filter all three metrics by run start,
+using the timezone in Settings, independently of Current. On Overview they
+follow the day chosen at the top right instead, like the day's numbers. These filters do not change settings,
 notifications, or Last triggered. Live runs contribute elapsed time but are
 excluded from success rate. Where a value cannot exist, the cell says why in
 words: *no runs*, or *none finished* while every run is still live or

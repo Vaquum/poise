@@ -7,6 +7,7 @@ import { getOrganizations, getSettings } from '../../../config'
 import { getSelectedOrganization, organizationUrl } from '../../../organizations'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
+import type { RightFilter } from './find'
 import { clockAt, json, readLine, reason, reportRead, unread, whileVisible, type PartContext, type Read } from './util'
 
 const OK = ['ok', 'verified v2']
@@ -47,7 +48,7 @@ function sourceRow(source: HealthSource): string {
   return `<li>${name}<svg class="hbar" viewBox="0 0 100 6" preserveAspectRatio="none" role="img" aria-label="${esc(words)}"><title>${esc(words)}</title>${rects}</svg></li>`
 }
 
-export function mountHealth(ctx: PartContext, box: HTMLElement): void {
+export function mountHealth(ctx: PartContext, box: HTMLElement, find: RightFilter): void {
   const last = rememberedHealth(healthKey())
   let health: Read<AnalyticsHealth> = last ? { data: last.data, error: '', at: last.at } : unread()
   let generation = 0
@@ -58,7 +59,18 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
     el.querySelector(':scope > .t-gloss').textContent = note
   }
 
+  /** The search shows the cards whose name it finds, and says so when none. */
+  function filter(): void {
+    let shown = 0
+    for (const el of box.querySelectorAll<HTMLElement>('.ohealth')) {
+      el.hidden = !find.matches(el.querySelector('.otile-l')?.textContent, 'System health')
+      if (!el.hidden) shown++
+    }
+    $('[data-healthnone]', box).innerHTML = shown ? '' : `<p class="onote" role="status">${esc(find.none())}</p>`
+  }
+
   function paint(): void {
+    filter()
     // The last error's card opens that diagnostic in Logging, or Logging while there is none.
     $('[data-ref="ov.h.lasterror"]', box).setAttribute('href', placeHref('observe', { part: 'logging', incident: health.data?.lastError.error?.incident, back: 'overview' }))
     const line = readLine('System health', health)
@@ -109,6 +121,7 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
 
   if (last) paint()
   whileVisible(ctx, 60_000, () => { void read() })
+  find.onChange(filter)
   // Another organization's figures never stand for this one's.
   window.addEventListener('poise:organization-filter-changed', () => { health = unread(); paint(); void read() }, { signal: ctx.signal })
 }

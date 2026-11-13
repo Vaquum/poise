@@ -28,6 +28,9 @@ including the ones before it:
   bell counts.
 - **Everything:** also what Poise is handling on its own.
 
+Each level shows how many entries it lists now, so a level that would add
+nothing says so before it is chosen.
+
 Each entry expands in place to its full words, what happened and what can be
 done. Each line of what happened carries its time on Poise's clock: 24-hour in
 the time zone from Settings, whatever the browser's language, with the date for
