@@ -297,6 +297,34 @@ it('finds where a transcript\'s last turns begin from the turn-finish index', as
   expect(plan.join('\n')).toContain('USING INDEX idx_chat_events_turn_finished')
 })
 
+it('opens on fewer of the last turns when they are large: as many as fit the budget, and always the last', async () => {
+  const storage = await import('../server/chat/storage')
+  const id = await session()
+  const finished: number[] = []
+  for (const size of [10, 10, 4_000, 10]) {
+    const turnId = randomUUID()
+    storage.appendEvent(id, { type: 'turn.started', turnId, prompt: { text: 'x'.repeat(size), attachments: [], mentions: [] } })
+    finished.push(storage.finalizeTurn(id, { type: 'turn.finished', turnId, stopReason: 'end_turn' }).seq)
+  }
+  // Without a budget, as before: the last three turns begin after the first's finish.
+  expect(storage.lastTurnsStart(id, 3)).toBe(finished[0])
+  // The large third turn does not fit a small budget: the last turn alone opens.
+  expect(storage.lastTurnsStart(id, 3, 1_000)).toBe(finished[2])
+  // A budget that holds it opens on all three asked for.
+  expect(storage.lastTurnsStart(id, 3, 100_000)).toBe(finished[0])
+  // The last turn opens even when it alone is over the budget.
+  expect(storage.lastTurnsStart(id, 3, 10)).toBe(finished[2])
+
+  // While a turn runs, it is the latest: it opens alone when the large turn before it does not fit.
+  const busy = await session()
+  const large = randomUUID()
+  storage.appendEvent(busy, { type: 'turn.started', turnId: large, prompt: { text: 'x'.repeat(4_000), attachments: [], mentions: [] } })
+  const largeEnd = storage.finalizeTurn(busy, { type: 'turn.finished', turnId: large, stopReason: 'end_turn' }).seq
+  storage.appendEvent(busy, { type: 'turn.started', turnId: randomUUID(), prompt: { text: 'now', attachments: [], mentions: [] } })
+  expect(storage.lastTurnsStart(busy, 3, 1_000)).toBe(largeEnd)
+  expect(storage.lastTurnsStart(busy, 3, 100_000)).toBe(0)
+})
+
 it('uses the actual recent turns for a handoff after a transcript exceeds one history page', async () => {
   const storage = await import('../server/chat/storage')
   const id = await session()

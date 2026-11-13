@@ -453,6 +453,10 @@ export function speaksForPerson(req: IncomingMessage, service: boolean, authorit
   return !!req.headers.origin && (!service || authority.kind === 'gateway')
 }
 
+/** What a first open of a transcript carries at most, in characters: turns
+ *  with large tool output open on fewer of them, the rest a click away. */
+const OPEN_TRANSCRIPT_CHARS = 384 * 1024
+
 /** Handle /api/chat/* routes; returns false when the url is not ours.
  *  `person`: the request has the person's authority (see Switchboard.handle). */
 export async function handleChatApi(req: IncomingMessage, res: ServerResponse, url: string, runtime: ChatRuntime, switchboard?: Switchboard, person = true, control?: ChatControl): Promise<boolean> {
@@ -639,10 +643,11 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
         const session = runtime.get(id)
         if (!session) throw new ChatError(404, 'unknown session', 'unknown_session')
         const after = Number(query.get('after') || 0)
-        // A first open asks for its last turns; `from` says where they begin, and earlier ones are read on request.
+        // A first open asks for its last turns, as many as fit OPEN_TRANSCRIPT_CHARS
+        // and always the last; `from` says where they begin, and earlier ones are read on request.
         const turns = Number(query.get('turns') || 0)
         const from = Number.isSafeInteger(after) && after > 0 ? after
-          : Number.isSafeInteger(turns) && turns > 0 ? runtime.turnsStart(id, Math.min(turns, 200)) : 0
+          : Number.isSafeInteger(turns) && turns > 0 ? runtime.turnsStart(id, Math.min(turns, 200), OPEN_TRANSCRIPT_CHARS) : 0
         const { events, truncated } = runtime.events(id, from)
         return json(res, 200, { session, events: events.map(clientEnvelope), truncated, from }), true
       }
