@@ -107,6 +107,12 @@ four-level `poise-overview-level` carries over), `poise-overview-tiles`,
 `poise-observe-tab`, `poise-observe-github`, `poise-logging-filters`,
 `poise-board`, and Board's time and status filters in `poise-current-filters`.
 
+Last reads, painted at once on the next load while each part reads afresh:
+`poise-overview-answers` (Answer here's open entries as its cards show them,
+under the GitHub user and the configured organizations, written a moment after
+every source has read afresh), `poise-overview-health`, `poise-overview-motion`,
+`poise-overview-day` and `poise-board-last`.
+
 ## Tests
 
 `tests/e2e/ui-*.spec.ts` drive each place in a browser; `tests/ui-*.test.ts` cover

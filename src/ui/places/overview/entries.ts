@@ -63,6 +63,8 @@ export interface Entry {
   silenceable: boolean
   /** The behaviors it concerns, for their chips in the Behaviors table. */
   behaviors: string[]
+  /** Painted from the last read while its source reads afresh: shown, never answered. */
+  remembered?: boolean
   notice?: Notice
   request?: { sessionId: string, id: string, kind: 'permission' | 'question', options: string[] }
   decision?: { id: number }
@@ -393,4 +395,49 @@ export const KEPT_DISMISSALS: readonly Source[] = ['chain', 'diagnostic', 'reque
 /** Entries not put away at the revision they report now. */
 export function undismissed(entries: readonly Entry[], dismissals: ReadonlyMap<string, string>): Entry[] {
   return entries.filter((entry) => !KEPT_DISMISSALS.includes(entry.source) || dismissals.get(entry.id) !== entry.revision)
+}
+
+// ---------- The last read, kept across page loads ----------
+/** An entry as Answer here drew it, small enough to keep: what a card shows at
+ *  rest and where it opens, never what answering it needs. */
+export interface KeptEntry {
+  id: string, source: Source, group: Group, kind: string, title: string, where: string, since: string | null
+  detail?: string, options?: string[], primary?: number, reply?: string, open?: Opening, github?: string, timeline?: string
+}
+
+const SOURCES: readonly Source[] = ['notice', 'diagnostic', 'chain', 'request', 'decision', 'thread']
+const GROUPS_KEPT: readonly Group[] = ['needs-you', 'fault', 'auto']
+const cut = (value: string, max: number): string => value.length > max ? `${value.slice(0, max - 1)}…` : value
+
+/** What a reload paints at once: at most 200 entries, their words cut to what a card shows. */
+export function keepEntries(entries: readonly Entry[]): KeptEntry[] {
+  return entries.slice(0, 200).map((entry): KeptEntry => ({
+    id: entry.id, source: entry.source, group: entry.group, kind: entry.kind, title: cut(entry.title, 240), where: cut(entry.where, 120), since: entry.since,
+    ...(entry.detail ? { detail: cut(entry.detail, 200) } : {}),
+    ...(entry.options.length ? { options: entry.options.map((option) => cut(option.label, 80)), primary: Math.max(0, entry.options.findIndex((option) => option.primary)) } : {}),
+    ...(entry.freeText ? { reply: entry.freeText.label } : {}),
+    ...(entry.open ? { open: entry.open } : {}), ...(entry.github ? { github: entry.github } : {}), ...(entry.timeline ? { timeline: entry.timeline } : {}),
+  }))
+}
+
+/** Kept entries as Answer here draws them, remembered: their answers show, unanswerable, until their source reads afresh.
+ *  Anything kept in another shape is dropped, never guessed at. */
+export function restoreEntries(value: unknown): Entry[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((kept: KeptEntry): Entry[] => {
+    if (!kept || typeof kept.id !== 'string' || !SOURCES.includes(kept.source) || !GROUPS_KEPT.includes(kept.group)
+      || typeof kept.kind !== 'string' || typeof kept.title !== 'string' || typeof kept.where !== 'string') return []
+    const options = Array.isArray(kept.options) ? kept.options.filter((label): label is string => typeof label === 'string') : []
+    const href = (value: unknown) => typeof value === 'string' && (value.startsWith('?') || value.startsWith('https://')) ? value : undefined
+    const open = kept.open && href(kept.open.href) && typeof kept.open.label === 'string' ? { href: kept.open.href, label: kept.open.label, ...(kept.open.external ? { external: true } : {}) } : undefined
+    return [{
+      id: kept.id, source: kept.source, group: kept.group, kind: kept.kind, title: kept.title, where: kept.where,
+      since: typeof kept.since === 'string' ? kept.since : null, detail: typeof kept.detail === 'string' ? kept.detail : undefined,
+      who: '', state: GROUP_STATE[kept.group], body: '', details: [], behaviors: [],
+      options: options.map((label, i) => ({ key: label, label, primary: i === kept.primary })),
+      freeText: typeof kept.reply === 'string' ? { label: kept.reply, placeholder: '', send: '' } : undefined,
+      open, github: href(kept.github), timeline: href(kept.timeline),
+      dismissable: false, dismissWords: '', revision: 'remembered', silenceable: false, remembered: true,
+    }]
+  })
 }

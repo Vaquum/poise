@@ -52,6 +52,12 @@ datastore could not be read keeps its earlier rows, and a pull request with no
 status read waits on you.
 The heading counts what the level shows, and each group heading counts its own.
 
+A load paints the last read at once: the entries Answer here last showed, under
+the same GitHub user and organizations, quieter, with "Last read" and its time
+on the heading's line. Nothing on them acts until their source has read
+afresh, which replaces that source's entries; an entry its first read no longer
+lists leaves at once, even under the pointer.
+
 Each entry is a card as on Board: its title (a pull request's own title, a
 chain's first reason), one line on what it waits on, and its kind, place and
 age. Only what acts is a button on it: Merge, an answer's options and Other, a
