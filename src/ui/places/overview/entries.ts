@@ -124,6 +124,20 @@ export function prGroup(row: PrStatus | undefined): Group {
   return PR_MOVING.includes(id) ? 'auto' : 'needs-you'
 }
 
+/** What /api/behavior-ledger/pr-status answered, as pull requests' next actors.
+ *  An unavailable answer is a failed read, never "no pull requests": it throws,
+ *  so the last good read stays. An organization whose datastore could not be
+ *  read keeps the rows read before. */
+export function prStatusesFrom(value: unknown, previous: PrStatuses | null): Map<string, PrStatus> {
+  const body = value as { health?: { status?: string }, rows?: unknown, datastore?: { orgs?: { org: string | null, status: string }[] } } | null
+  if (!body || !Array.isArray(body.rows)) throw new Error('the service answered with something this page cannot read')
+  if (body.health?.status === 'unavailable') throw new Error('Poise could not read its pull requests just now')
+  const next = new Map((body.rows as PrStatus[]).map((row) => [prKey(row.repository, row.number), row]))
+  const unread = new Set((body.datastore?.orgs ?? []).filter((org) => org.org && org.status !== 'ready').map((org) => org.org!.toLowerCase()))
+  for (const [key, row] of previous ?? []) if (!next.has(key) && unread.has(row.repository.split('/')[0].toLowerCase())) next.set(key, row)
+  return next
+}
+
 /** Diagnostics only you can clear: a sign-in, or access only you can grant. */
 const YOURS = new Set(['authentication', 'github_access'])
 /** Diagnostics Poise retries on its own. */
@@ -191,7 +205,8 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
         chain: step && chain ? { id: step.chain, sequence: chain.sequence } : undefined,
       }]
     }
-    const group = diagnosticGroup(item.code, item.title)
+    // A retry still failing four hours after it began is stuck.
+    const group = stuck(diagnosticGroup(item.code, item.title), item.began ?? null, now)
     return [{
       ...base, id: item.id, source: 'diagnostic', group, kind: 'Behaviors', title: item.title, who: item.source,
       detail: [item.body, item.scope].filter(Boolean).join(' · ') || undefined,

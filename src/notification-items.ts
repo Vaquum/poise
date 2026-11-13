@@ -46,6 +46,8 @@ export interface NotificationItem extends EvidenceAttachment {
   chainJournal?: string
   /** A diagnostic's code, or the strongest one joined to a notice. */
   code?: string
+  /** When a diagnostic's failures began, the earliest of its lines, when known. */
+  began?: string | null
   /** The chain's attention row behind a chain item. */
   chain?: ChainAttentionRow
 }
@@ -114,6 +116,14 @@ function concerns(entry: DiagnosticEntry, subject: NoticeSubject): boolean {
     && (entry.target === subject.target || targetRef(entry.target) === targetRef(subject.target))
 }
 
+function earliest(entries: readonly DiagnosticEntry[]): string | null {
+  let best: string | null = null
+  for (const entry of entries) {
+    if (entry.since && Number.isFinite(Date.parse(entry.since)) && (best === null || Date.parse(entry.since) < Date.parse(best))) best = entry.since
+  }
+  return best
+}
+
 function latest(entries: readonly DiagnosticEntry[]): string | null {
   let best: string | null = null
   for (const entry of entries) {
@@ -160,7 +170,7 @@ export function notificationItems(notices: readonly Notice[], diagnostics: Behav
         group.code === 'datastore_stale' ? group.entries[0].correlationId : group.message])}`,
       ...SEVERITY_LOOK[group.severity], title: group.message, body: behaviors.map(behaviorLabel).join(', '),
       source: 'Behaviors', scope: group.scope, when: latest(group.entries), meta: '',
-      details: group.entries, behaviors, notice: null, code: group.code,
+      details: group.entries, behaviors, notice: null, code: group.code, began: earliest(group.entries),
     })
   }
   for (const entry of attention) {

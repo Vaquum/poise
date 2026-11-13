@@ -4,7 +4,7 @@ import type { NotificationItem } from '../src/notification-items'
 import { bellTally, DEFAULT_LEVEL, LEVEL_KEY, noticeGroup, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from '../src/ui/places/overview/level'
 import { chatOpening, diagnosticHref, itemOf, journalStep, targetOpening, timelineHref } from '../src/ui/places/overview/targets'
 import { chatState, countStates, issueState, pullState, taskPhase, taskState, type ChainLike } from '../src/ui/places/overview/states'
-import { decisionEntries, diagnosticGroup, foldWaiting, itemEntries, ordered, prGroup, requestEntries, requestsFrom, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
+import { decisionEntries, diagnosticGroup, foldWaiting, itemEntries, ordered, prGroup, prStatusesFrom, requestEntries, requestsFrom, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
 import { STALLED_MESSAGE } from '../src/behavior-diagnostics'
 import type { ChainAttentionRow } from '../src/notification-items'
 import type { PrStatus } from '../src/ui/places/board/model'
@@ -267,6 +267,27 @@ describe('Answer here’s entries', () => {
       where: 'acme/site #7 → #12', options: [], quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] })
     expect(chain('2026-11-13T11:00:00Z', null)).toMatchObject({ group: 'auto', kind: 'Behavior chain', quiet: undefined })
     expect(chain('2026-11-13T07:59:00Z', null)).toMatchObject({ group: 'fault', kind: 'Chain stuck' })
+  })
+
+  it('reads pull requests’ status as a failed read when Poise could not read them, keeping what an unread organization had', () => {
+    const before = prStatusesFrom({ health: { status: 'ok' }, rows: [status('in_queue')], datastore: { orgs: [{ org: 'acme', status: 'ready' }] } }, null)
+    expect([...before.keys()]).toEqual(['acme/site#14'])
+    // Unavailable is not "no pull requests": the last read stays.
+    expect(() => prStatusesFrom({ health: { status: 'unavailable' }, rows: [], datastore: { orgs: [] } }, before)).toThrow('could not read its pull requests')
+    expect(() => prStatusesFrom({ error: 'invalid_query' }, before)).toThrow('cannot read')
+    // An organization whose datastore could not be read keeps its rows; one read afresh does not.
+    const partial = prStatusesFrom({ health: { status: 'stale' }, rows: [], datastore: { orgs: [{ org: 'acme', status: 'unavailable' }] } }, before)
+    expect(partial.get('acme/site#14')?.blocker.id).toBe('in_queue')
+    expect(prStatusesFrom({ health: { status: 'ok' }, rows: [], datastore: { orgs: [{ org: 'acme', status: 'ready' }] } }, before).size).toBe(0)
+  })
+
+  it('makes a retry still failing four hours after it began a fault', () => {
+    const now = Date.parse('2026-11-13T12:00:00Z')
+    const retry = (began: string | null) => itemEntries([{ id: 'diagnostic:["rate_limit"]', group: 'auto', tone: 'slate', icon: 'retry', title: 'The service is limiting requests. Poise will try again.', body: '', source: 'Behaviors', scope: null,
+      when: '2026-11-13T11:59:00Z', meta: '', details: [], behaviors: [], notice: null, code: 'rate_limit', began } as NotificationItem], role, new Map(), new Map(), now)[0].group
+    expect(retry('2026-11-13T09:00:00Z')).toBe('auto')
+    expect(retry('2026-11-13T07:59:00Z')).toBe('fault')
+    expect(retry(null)).toBe('auto')
   })
 
   it('puts a Behaviors diagnostic with whoever clears it', () => {

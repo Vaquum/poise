@@ -220,7 +220,9 @@ describe('scan health and dependency recovery', () => {
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
     const failureKey = `behavior_${behavior.replace(/-/g, '_')}_failure:${pr.repo}#17:check`
-    const failure = JSON.stringify({ kind: 'operation', consecutiveFailures: 2, lastFailureAtMs: Date.now() - 120_000, nextRetryAtMs: Date.now() - 1, error: 'previous check failed' })
+    // A streak recorded before its start was kept: its last failure stands in for its start.
+    const began = Date.now() - 120_000
+    const failure = JSON.stringify({ kind: 'operation', consecutiveFailures: 2, lastFailureAtMs: began, nextRetryAtMs: Date.now() - 1, error: 'previous check failed' })
     db.setMeta(failureKey, failure)
     const blocker = db.claimPrOperationOwned(`${pr.repo}#17`, 65_000)!
     const claim = vi.spyOn(db, 'claimPrOperationOwned')
@@ -237,7 +239,10 @@ describe('scan health and dependency recovery', () => {
       return original(command, args, options)
     })
     await runtime.runEnabledBehaviorsOnce()
-    expect(JSON.parse(db.getMeta(failureKey)!)).toMatchObject({ consecutiveFailures: 3, error: 'check still failing', nextRetryAtMs: Date.now() + 240_000 })
+    expect(JSON.parse(db.getMeta(failureKey)!)).toMatchObject({ consecutiveFailures: 3, error: 'check still failing', nextRetryAtMs: Date.now() + 240_000, firstFailureAtMs: began })
+    // Answer here reads how long it has stood (#1463): from the streak's start, not its latest failure.
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ target: `${pr.repo}#17:check`, consecutiveFailures: 3, failingSince: new Date(began).toISOString() })]))
   })
 
   it('clears an approval check diagnostic without resetting its worker retry', async () => {

@@ -13,6 +13,8 @@ export interface DiagnosticEntry extends EvidenceAttachment {
   target: string | null
   /** When it last happened, when known. */
   at: string | null
+  /** When it began failing, for a failure Poise retries: how long it has stood. */
+  since?: string | null
   /** When the next check runs, for a failing behavior with one scheduled. */
   next: string | null
   detail: string
@@ -104,7 +106,7 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
       add(classification, failure.org ? `Datastore (${failure.org})` : 'Datastore',
         'GitHub mirror is stale. Behaviors will check again.',
         `${failure.behavior}: ${cause}`, { behavior: failure.behavior, target: failure.target ?? null,
-          at: failure.lastFailureAt || null, next: failure.nextRetryAt || null,
+          at: failure.lastFailureAt || null, next: failure.nextRetryAt || null, since: failure.failingSince ?? null,
           correlationId: failure.correlationId, ...evidenceAttachment(failure) }, failure.correlationId)
       continue
     }
@@ -121,7 +123,7 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
       ? `GitHub target is unavailable to ${diagnostics.identity.actor || 'the reviewer'}; check repository access.`
       : diagnosticMessage(classification.code, cause)
     const detail = `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s) — ${cause}`
-    add(classification, scope, message, detail, { behavior: failure.behavior, target: failure.target ?? null, at: failure.lastFailureAt || null, next: failure.nextRetryAt || null, callId: failure.callId, correlationId: failure.correlationId, ...evidenceAttachment(failure) })
+    add(classification, scope, message, detail, { behavior: failure.behavior, target: failure.target ?? null, at: failure.lastFailureAt || null, next: failure.nextRetryAt || null, since: failure.failingSince ?? null, callId: failure.callId, correlationId: failure.correlationId, ...evidenceAttachment(failure) })
   }
   // One held state per repository the agent account cannot read, however
   // many behaviors it holds. No notice joins it: entries carry every held

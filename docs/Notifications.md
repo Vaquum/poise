@@ -33,8 +33,10 @@ the one before it:
 - **+ Faults:** also what is stuck. Chain work that is held or has not moved
   for four hours, a behavior that gave up on a target, Poise's own failures
   (a review outcome to verify, an unusable result, a failed command), a stalled
-  ledger, and anything automatic still open after four hours. The default, and
-  what the bell counts.
+  ledger, and anything automatic still open after four hours: a notice from
+  when it was raised, chain work from its last verified advance, a retried
+  Behaviors failure from when its run of failures began. The default, and what
+  the bell counts.
 - **Everything:** also what Poise is handling on its own: chain work that moved
   in the last four hours, pull requests a behavior or the chain is moving
   (reviewing, in the merge queue, checks running, a branch update), and
@@ -45,6 +47,9 @@ What has finished, a chat's turn or an action, is not listed; Handled today
 keeps what was settled here. A pull request's notice takes its group from the
 pull request's current blocker, read from
 `/api/behavior-ledger/pr-status`; the line under its title says that blocker.
+When that status cannot be read, the last read stays, an organization whose
+datastore could not be read keeps its earlier rows, and a pull request with no
+status read waits on you.
 The heading counts what the level shows, and each group heading counts its own.
 
 Each entry is a card as on Board: its title (a pull request's own title, a

@@ -152,10 +152,11 @@ async function press(card: Locator, name: string, role: 'button' | 'link' = 'but
   await card.hover()
   await card.getByRole(role, { name, exact: true }).click()
 }
-/** Unfolds what Poise handles on its own, which folds while anything else is listed. */
+/** Unfolds what Poise handles on its own, folded while anything else is listed, once its entries have been read. */
 async function unfoldAuto(page: Page): Promise<void> {
   const show = answers(page).locator('[data-key="g:auto"]').getByRole('button', { name: 'Show', exact: true })
-  if (await show.count()) await show.click()
+  await expect(show).toBeVisible()
+  await show.click()
 }
 
 test('several requests at once are separate entries, each answered through the chat by its own id', async ({ page }) => {
@@ -331,6 +332,18 @@ test('a card shows only what acts; its other actions wait under the pointer, as 
   await expect(acts.getByRole('button', { name: 'Dismiss' })).toHaveAttribute('data-words', 'puts it away until it happens again')
 })
 
+test('a question you answer here shows whole; a long title is cut short only where More shows it whole', async ({ page }) => {
+  const long = 'Which of the two release branches should carry the fix for the login timeout that customers reported on Tuesday, given that the hotfix window closes tonight and the other branch is frozen for the audit?'
+  const quota = { id: 'held', kind: 'storage_low', title: long, body: 'Free space is low.', since: ago(5), due: ago(5), silenceable: false, target: null }
+  await open(page, { notices: [quota], decisions: [], revision: 1, requests: [question('q1', 's1', { question: long, options: ['main', 'release'], freeText: true })] })
+  const clipped = (id: string) => entry(page, id).locator('.card-title').evaluate((el) => el.scrollHeight > el.clientHeight + 1)
+  expect(await clipped('request:q1')).toBe(false)
+  await expect(entry(page, 'request:q1')).not.toHaveClass(/is-clamped/)
+  expect(await clipped('notice:held')).toBe(true)
+  await press(entry(page, 'notice:held'), 'Show more')
+  expect(await clipped('notice:held')).toBe(false)
+})
+
 test('a pull request Poise is moving waits on nobody: it shows under Everything, not Only you', async ({ page }) => {
   const notices = [{ id: 'pr', kind: 'pr_ready', title: 'acme/site#9 is ready to merge', body: 'Fix the login', since: ago(20), due: ago(5), silenceable: true, target: { pullRequest: 'https://github.com/acme/site/pull/9' } }]
   await open(page, { notices, requests: [], decisions: [], revision: 1, prs: [{ repository: 'acme/site', number: 9, blocker: { id: 'in_queue', line: 'in merge queue since 12:12Z', since: ago(5), sinceRestart: false, details: [] } }] })
@@ -338,8 +351,8 @@ test('a pull request Poise is moving waits on nobody: it shows under Everything,
   await expect(entry(page, 'notice:pr')).toHaveCount(0)
   await expect(page.locator('[data-ncount]')).toHaveText('0')
   await answers(page).getByRole('radio', { name: 'Everything', exact: true }).click()
+  // Alone in the list, what Poise handles is not folded.
   await expect(answers(page).locator('[data-key="g:auto"]')).toContainText('Handled automatically')
-  await unfoldAuto(page)
   await expect(entry(page, 'notice:pr').locator('.nc-d')).toHaveText('in merge queue since 12:12Z')
 })
 

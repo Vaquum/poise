@@ -86,6 +86,8 @@ export interface BehaviorDiagnostics {
     target?: string
     kind: string
     consecutiveFailures: number
+    /** When this run of failures began; absent from a server before it was kept. */
+    failingSince?: string
     lastFailureAt: string
     nextRetryAt: string
     error?: string

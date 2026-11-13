@@ -20,7 +20,7 @@ import { paintTerms } from '../../reference'
 import { lifeHTML, toast, type Stage } from '../../shell'
 import type { PrStatus } from '../board/model'
 import {
-  decisionEntries, foldWaiting, itemEntries, KEPT_DISMISSALS, openDecision, ordered, prKey, requestEntries, requestsFrom, threadEntries, undismissed,
+  decisionEntries, foldWaiting, itemEntries, KEPT_DISMISSALS, openDecision, ordered, prStatusesFrom, requestEntries, requestsFrom, threadEntries, undismissed,
   type DecisionItem, type Entry, type Publication, type RequestsRead, type Role, type ThreadReview,
 } from './entries'
 import { answersChanged, GROUPS, LEVELS, readLevel, saveLevel, setAnswerGroups, shownAt, tally, type Group } from './level'
@@ -236,7 +236,9 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       ? `<a class="card-title" id="${titleId}" href="${esc(entry.open.href)}"${entry.open.external ? ' target="_blank" rel="noopener"' : ''} data-act="open">${esc(entry.title)}</a>`
       : `<span class="card-title" id="${titleId}">${esc(entry.title)}</span>`
     const edge = p?.settled || gone ? 'done' : EDGE[entry.group]
-    return `<article class="card nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}${isOpenDetail ? ' is-open' : ''}" data-state="${edge}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="${titleId}">
+    // Its title and line are cut short only where More shows them whole, and never on a question you answer here.
+    const clamped = !!more && !isOpenDetail && !(entry.options.length || entry.freeText || entry.questions)
+    return `<article class="card nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}${clamped ? ' is-clamped' : ''}" data-state="${edge}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="${titleId}">
       <h3 class="nc-t">${title}</h3>
       ${entry.detail ? `<p class="nc-d">${esc(entry.detail)}</p>` : ''}
       ${closed && !p?.settled ? `<p class="nc-gone" data-ref="ov.gone">${esc(closed)}</p>` : ''}
@@ -761,9 +763,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
 
   async function readPrs(): Promise<void> {
     try {
-      const data = await json<{ rows?: PrStatus[] }>('/api/behavior-ledger/pr-status?limit=100')
-      if (!Array.isArray(data.rows)) throw new Error('the service answered with something this page cannot read')
-      prs.data = new Map(data.rows.map((row) => [prKey(row.repository, row.number), row]))
+      prs.data = prStatusesFrom(await json('/api/behavior-ledger/pr-status?limit=100'), prs.data)
       prs.error = ''
       prs.at = Date.now()
     } catch (error) {

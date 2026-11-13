@@ -7,8 +7,7 @@ import { getBehaviorDiagnostics, refreshState } from '../../../behaviors'
 import { chatClient } from '../../../chat-client'
 import { LOCAL_NOTICE_KINDS, noticeFeed } from '../../../notices'
 import { notificationItems, type ChainAttentionRow } from '../../../notification-items'
-import type { PrStatus } from '../board/model'
-import { decisionEntries, foldWaiting, itemEntries, prKey, requestEntries, requestsFrom, threadEntries, undismissed, type DecisionItem, type Entry, type OpenRequest, type Publication, type PrStatuses, type ThreadReview } from './entries'
+import { decisionEntries, foldWaiting, itemEntries, prStatusesFrom, requestEntries, requestsFrom, threadEntries, undismissed, type DecisionItem, type Entry, type OpenRequest, type Publication, type PrStatuses, type ThreadReview } from './entries'
 import type { Group } from './level'
 import { json, reason } from './util'
 
@@ -68,7 +67,7 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
       json<{ chains?: { id: string, sequence: number, held: string | null }[], attention?: ChainAttentionRow[] }>('/api/behavior-chains?state=active'),
       refreshState(),
       json<{ dismissals?: { key: string, revision: string }[] }>('/api/answers/dismissals'),
-      json<{ rows?: PrStatus[] }>('/api/behavior-ledger/pr-status?limit=100'),
+      json('/api/behavior-ledger/pr-status?limit=100'),
     ])
     reading = false
     const unread = 'the service answered with something this page cannot read'
@@ -105,9 +104,11 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     report('overview-reviews', 'Review threads could not be read', failed(v, Array.isArray(read)))
     report('overview-dismissals', 'Put-away entries could not be read', failed(d, Array.isArray(putAway)))
     report('overview-chains', 'Attention evidence unavailable', failed(c, !!chainsRead))
-    const rows = p.status === 'fulfilled' ? p.value.rows : null
-    if (Array.isArray(rows)) prs = new Map(rows.map((row) => [prKey(row.repository, row.number), row]))
-    report('overview-prs', 'Pull requests’ status could not be read', failed(p, Array.isArray(rows)))
+    let prsError = p.status === 'rejected' ? reason(p.reason) : ''
+    if (p.status === 'fulfilled') {
+      try { prs = prStatusesFrom(p.value, prs) } catch (error) { prsError = reason(error) }
+    }
+    report('overview-prs', 'Pull requests’ status could not be read', prsError)
     changed()
   }
   const soon = (): void => {
