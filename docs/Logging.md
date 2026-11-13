@@ -291,6 +291,12 @@ is retained again. This recognition changes neither readiness nor retry policy.
 The gateway retains its separate central `logging.db` in `poise-gateway-data`.
 Existing volume backup/restore snapshots it with the other SQLite databases.
 Gateway warnings/errors are redacted before Docker stdout and retained directly.
+New `disk.workspace.over_budget` Warnings retain measured usage as `context.bytes`
+and the configured threshold as `context.budget`, in bytes, in the existing
+expanded detail. Each count is independently validated as a non-negative safe
+integer; zero is kept, while missing or invalid counts remain unknown without
+coercion. Previously retained entries cannot recover discarded fields.
+Recovery remains `disk.workspace.within_budget` at Info and is not retained.
 Every 15 seconds the independent collector reads bounded Docker logs/lifecycle
 windows for managed workspaces, Poise Compose services and release-install
 tasks. Only validated structured workspace envelopes enter private history;

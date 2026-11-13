@@ -1,9 +1,14 @@
 import { sign } from 'node:crypto'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { normalize } from '../src/diagnostics/contract.js'
+import { normalize, type LogEvent } from '../src/diagnostics/contract.js'
+import { gatewayDiagnostic } from '../src/diagnostics/collectors.js'
+import { DiagnosticRuntime } from '../src/diagnostics/runtime.js'
 import { DiagnosticStore } from '../src/diagnostics/store.js'
 import { parseLoggingQuery } from '../src/diagnostics/query-parser.js'
+import { DiskWatch } from '../src/disk.js'
+import { DockerClient } from '../src/docker.js'
+import { createLogger } from '../src/log.js'
 import { startHarness, workspaceHost, type Harness } from './harness.js'
 
 describe('authorized retained diagnostic reads', () => {
@@ -40,6 +45,48 @@ describe('authorized retained diagnostic reads', () => {
     expect(lines[1]).toMatchObject({ type: 'event', event: { id: own.id } })
     expect(exported.body).not.toContain('bob-private-cause')
     expect(h.workspace.requests).toHaveLength(0)
+  })
+
+  it('retains newly emitted disk warnings through the logger and authorized detail query without retaining recovery Info', async () => {
+    const bytes = 189628338659, budget = 53687091200
+    const runtime = new DiagnosticRuntime({ path: join(h.config.dataDir, 'logging.db') })
+    const lines: string[] = []
+    const log = createLogger((line) => lines.push(line), (level, operation, fields) => runtime.emit(gatewayDiagnostic(level, operation, fields)))
+    const disk = new DiskWatch({ config: h.config, docker: new DockerClient(h.config.dockerSocket), log, now: h.context.deps.now,
+      space: async () => ({ free: 200 * 1024 ** 3, total: 290 * 1024 ** 3 }) })
+    h.docker.volumes.add('poise-home-alice')
+    h.docker.volumeSizes.set('poise-home-alice', bytes)
+    expect(h.config.workspaceDiskBudgetBytes).toBe(budget)
+    try {
+      await disk.measure()
+      await disk.measure()
+      runtime.flush()
+      const list = await request('alice', alice, '?source=gateway')
+      expect(list.status).toBe(200)
+      expect(list.json()).toMatchObject({ total: 1, events: [{ operation: 'disk.workspace.over_budget', severity: 'warning',
+        workspace: 'alice', visibility: 'infrastructure', context: { bytes, budget } }] })
+      const id = list.json<{ events: LogEvent[] }>().events[0].id
+      const detail = await request('alice', alice, '/events/' + id)
+      expect(detail.status).toBe(200)
+      expect(detail.json()).toMatchObject({ event: { id, severity: 'warning', context: { bytes, budget } } })
+      const bob = (await h.openWorkspace('bob')).workspaceCookie
+      expect((await request('bob', bob, '?source=gateway')).json()).toMatchObject({ total: 0, events: [] })
+      expect((await request('bob', bob, '/events/' + id)).status).toBe(404)
+
+      h.docker.volumeSizes.set('poise-home-alice', budget)
+      await disk.measure()
+      runtime.flush()
+      expect(lines.map((line) => JSON.parse(line))).toMatchObject([
+        { event: 'disk.workspace.over_budget', level: 'warn', bytes, budget },
+        { event: 'disk.workspace.within_budget', level: 'info', bytes: budget, budget },
+      ])
+      expect((await request('alice', alice, '?source=gateway')).json()).toMatchObject({ total: 1 })
+      h.docker.volumeSizes.set('poise-home-alice', bytes)
+      await disk.measure()
+      await disk.measure()
+      runtime.flush()
+      expect((await request('alice', alice, '?source=gateway')).json()).toMatchObject({ total: 2 })
+    } finally { runtime.stop() }
   })
 
   it('requires explicit current admin access and never exposes another owner private record', async () => {
