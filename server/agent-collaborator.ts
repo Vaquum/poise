@@ -8,6 +8,7 @@
 import { getMeta, setMeta } from './db'
 import { readyOrganizations } from './organizations'
 import { runFile } from './process'
+import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from './release-background'
 
 const GH_INTERFACE = 'github-interface'
 const PASS_INTERVAL_MS = 60_000
@@ -318,11 +319,12 @@ export function startAgentCollaboratorRuntime(): void {
   if (timer) return
   stopping = false
   const tick = () => {
-    if (stopping || passing) return
+    if (stopping || passing || releaseBackgroundPaused() || releaseSwitchPending()) return
+    const release = trackReleaseBackground()
     passing = reconcileAgentCollaborators().catch((error: unknown) => {
       console.error('[agent-collaborator] the reconciliation pass failed:', error instanceof Error ? error.message : String(error))
       return { repos: 0, invited: [], accepted: [] }
-    }).finally(() => { passing = undefined })
+    }).finally(() => { passing = undefined; release() })
   }
   tick()
   timer = setInterval(tick, PASS_INTERVAL_MS)
