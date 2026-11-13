@@ -10,9 +10,7 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
-from unittest.mock import patch
 from uuid import uuid4
 
 signal.alarm(120)
@@ -47,8 +45,7 @@ if sys.argv[1:2] == ['worker']:
         root = resource_ownership.allocate(api.DB, call, resource_ownership.call_directory(api.DB, call))
         if mode == 'neighbor':
             (root / 'heartbeat').write_text(str(time.monotonic()))
-        print(json.dumps({'call': call, 'root': str(root)}), flush=True)
-        if mode == 'neighbor':
+            print(json.dumps({'call': call, 'root': str(root)}), flush=True)
             while not select.select([0], [], [], 0.1)[0]:
                 native_namespace.active().require_idle()
                 native_namespace.active().read()
@@ -62,6 +59,8 @@ if sys.argv[1:2] == ['worker']:
 import mmap, os, sys, tempfile, time
 from pathlib import Path
 mode, root = sys.argv[1], Path(sys.argv[2])
+print('ready', flush=True)
+assert os.read(0, 1) == b'G'
 time.sleep(2)
 if mode == 'memory':
     chunks = []
@@ -84,16 +83,22 @@ else:
         while True: time.sleep(0.1)
 while True: time.sleep(0.1)
 '''
-        child = subprocess.Popen([sys.executable, '-c', body, 'memory' if is_memory else mode, str(root)])
+        child = subprocess.Popen([sys.executable, '-c', body, 'memory' if is_memory else mode, str(root)],
+                                 stdout=subprocess.PIPE, text=True)
+        assert child.stdout.readline() == 'ready\n'
+        print(json.dumps({'call': call, 'root': str(root)}), flush=True)
         child.wait()
         raise AssertionError('allocation child ended without enforcement')
 
     args = ['agent-interface', '--native-action', '--source', 'poise:behavior-chain', '--correlation-id', correlation]
     if mode != 'neighbor':
         args += ['--resource-limits-json', json.dumps(ceilings)]
-    with patch.object(sys, 'argv', args), patch.object(api, '_main', side_effect=allocation):
-        api.main()
+    sys.argv = args
+    api._main = allocation
+    api.main()
     raise SystemExit(0)
+
+import urllib.request
 
 assert sys.argv[1] in ('baseline', 'enforced')
 baseline = sys.argv[1] == 'baseline'
@@ -136,6 +141,9 @@ try:
                 if initial_memory is None:
                     initial_memory = rss
                     assert initial_memory < 256 * MiB, initial_memory
+                    # The complete idle tree must pass before allocation starts.
+                    worker.stdin.write('G')
+                    worker.stdin.flush()
                 disk = 0
                 seen = set()
                 for directory in directories:
@@ -186,6 +194,7 @@ try:
                 assert empty_observed is not None and empty_observed - failure['observedMonotonic'] <= 2, row
             assert time.monotonic() - failure['observedMonotonic'] <= 10, failure
             if is_memory:
+                assert observed_overrun, observations
                 assert guard['peakMemoryBytes'] <= 256 * MiB + 192 * MiB, guard
                 assert max(sample['rssBytes'] for sample in observations if 'rssBytes' in sample) <= 256 * MiB + 192 * MiB
             elif mode != 'unavailable':
