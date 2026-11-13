@@ -1,6 +1,5 @@
 import { expect, test } from '@playwright/test'
 import { BEHAVIORS } from '../../src/behaviors'
-import { workspace } from './fixtures/workspace'
 
 test('old PR closing requires whole days, persists its setting and skips, and links its last close', async ({ page }) => {
   let enabled = false
@@ -83,65 +82,6 @@ test('old PR closing requires whole days, persists its setting and skips, and li
   await expect(toggle).not.toBeChecked()
   await expect.poll(() => enabled).toBe(false)
   expect(writes).toEqual([{ days: 30, skipRepos: ['acme/skip'] }, { enabled: true }, { enabled: false }])
-})
-
-test('classic Behaviors view configures close-after days and enables with them', async ({ page }) => {
-  let enabled = false
-  let days: number | null = null
-  let skipRepos: string[] = []
-  const writes: Array<Record<string, unknown>> = []
-  await workspace(page, 'main', undefined, { path: '/classic.html' })
-  await page.route('**/api/repos', (route) => route.fulfill({ json: { repos: ['acme/app', 'acme/skip'] } }))
-  await page.route('**/api/behaviors/close-old-prs', async (route) => {
-    const body = route.request().postDataJSON() as Record<string, unknown>
-    writes.push(body)
-    if (typeof body.days === 'number') days = body.days
-    if (typeof body.enabled === 'boolean') enabled = body.enabled
-    if (Array.isArray(body.skipRepos)) skipRepos = body.skipRepos as string[]
-    return route.fulfill({ json: { ok: true, enabled, days, skipRepos } })
-  })
-  await page.route('**/api/behaviors', (route) => {
-    const behavior = { owner: 'review-bot', enabled: false, setting: null, reviewers: null, scratchpad: null, skipRepos: [], lastTriggered: null }
-    return route.fulfill({ json: {
-      'review-new-prs': { ...behavior, setting: 'p2', reviewers: 1, scratchpad: '' },
-      'approve-prs': { ...behavior, scratchpad: '' },
-      'resolve-unblocking': behavior,
-      'merge-prs': behavior,
-      'close-old-prs': { ...behavior, enabled, days, skipRepos, lastTriggered: { at: new Date().toISOString(), target: 'acme/app#7', url: 'https://github.com/acme/app/pull/7' } },
-      'review-new-issues': { ...behavior, reviewers: 1, repos: [], authors: ['octocat'], scratchpad: '' },
-      diagnostics: { status: 'ok', agentLogsError: null, failures: [], deadLetters: [], holds: [],
-        datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null },
-        identity: { status: 'valid', actor: 'review-bot', error: null } },
-    } })
-  })
-  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  const row = page.locator('tr[data-behavior="close-old-prs"]')
-  const toggle = row.locator('input[type="checkbox"]')
-  await expect(row).toContainText('Close Old Pull Requests')
-  await expect(toggle).toBeEnabled()
-  await expect(toggle).not.toBeChecked()
-  await expect(row.locator('.behavior-triggers-btn')).toHaveText('Set days')
-  await expect(row.locator('.behavior-last-link')).toHaveAttribute('href', 'https://github.com/acme/app/pull/7')
-  await row.locator('.behavior-triggers-btn').click()
-  const dialog = page.getByRole('dialog', { name: 'Setting for Close Old Pull Requests' })
-  const input = dialog.getByRole('spinbutton', { name: 'Close after days' })
-  await input.fill('1.5')
-  await dialog.getByRole('button', { name: 'Done' }).click()
-  await expect(dialog).toBeVisible()
-  expect(writes).toEqual([])
-  await input.fill('30')
-  await dialog.getByRole('checkbox', { name: 'acme/skip', exact: true }).check()
-  await dialog.getByRole('button', { name: 'Done' }).click()
-  await expect.poll(() => skipRepos).toEqual(['acme/skip'])
-  await expect.poll(() => days).toBe(30)
-  await row.locator('.toggle').click()
-  await expect(toggle).toBeChecked()
-  await expect.poll(() => enabled).toBe(true)
-  await page.reload()
-  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  await expect(toggle).toBeChecked()
-  await expect(row.locator('.behavior-triggers-btn')).toHaveText('30 days, skip 1')
-  expect(writes).toEqual([{ days: 30, skipRepos: ['acme/skip'] }, { enabled: true }])
 })
 
 test('leaving Settings with invalid days keeps the error and the previous threshold', async ({ page }) => {

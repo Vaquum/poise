@@ -206,6 +206,9 @@ temporary-filesystem pressure retain measurements known at the source.
 Managed datastore failures are reported once by `datastore.sync` or
 `datastore.activate`, retaining the process exit code and stderr alongside retry
 and freshness context. Standalone datastore process failures are still reported.
+JavaScript DOMException identity and numeric code are retained in context as
+`exceptionName` and `exceptionCode`, with no process `exitCode`. Actual subprocess
+exit codes remain process evidence, even when the same number names an exception.
 
 Untyped GitHub 5xx and transport failures from `github-interface`,
 `github-datastore` and Caller completions retain Warning evidence. A bare exit
@@ -547,8 +550,7 @@ workflow incident, alert dedupe key and material-cause hash retain their separat
 lifecycle roles. Source, workspace, target and material cause must match; a newer
 record about the same PR cannot substitute for missing evidence.
 
-Opening evidence preserves dismissal/silence state; in classic it also closes a
-floating rail and leaves a docked rail open. Arrival cards keep their primary controls. Known links
+Opening evidence preserves dismissal/silence state. Arrival cards keep their primary controls. Known links
 keep the ordinary 410 expiry, indistinguishable unknown/foreign 404 and honest
 503 unavailable behavior described above. Recovery, Notifications off and
 container replacement do not delete retained source evidence.

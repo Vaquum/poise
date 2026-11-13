@@ -25,10 +25,7 @@ shape, motion and meaning colours the Style panel holds, and the writing ones.
 
 Explanations appear after half a second over any element that has one, and on
 keyboard focus; `?` opens the full reference ([Interface](Interface.md#the-reference)).
-Chat, the Manager place, the Editor and Settings' sections built on classic's
-views keep classic's own tooltips for now.
+Chat, the Manager place, the Editor and reused Settings components keep their
+existing tooltips.
 Errors, account state and pairing instructions remain visible. Existing account,
 pairing and admin links open their destination directly.
-
-The previous interface, at `/classic.html` until it is removed, keeps its burger
-menu, Navigation and Typography as they were.

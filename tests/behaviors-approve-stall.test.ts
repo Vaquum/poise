@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CheckSemaphore } from '../server/check-semaphore'
-import { mocks, pr, NEXT_HEAD_SHA, loadModules, arrangeCli, fixture, deferred, recordCompletedInitialReview } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, arrangeCli, fixture, deferred, recordCompletedInitialReview, agentLog, resetLogCache } from './behaviors-runtime-fixture'
 
 // This file pins sweep-deadline and cursor behavior under load, not the
 // shared launch budget: an open budget lets every eligible PR launch, and
@@ -228,6 +228,224 @@ describe('approve-prs under load', () => {
     const stored = JSON.parse(db.getMeta(key)!)
     expect(stored.consecutiveFailures).toBe(9)
     expect(stored.nextRetryAtMs - stored.lastFailureAtMs).toBe(60 * 60_000)
+  })
+
+  it('retains one cycle failure and the original Call when the deadline leaves another PR unread', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const startedAt = Date.now()
+    const open = Array.from({ length: 11 }, (_, index) => ({
+      ...pr, number: 17 + index, url: `https://github.com/${pr.repo}/pull/${17 + index}`,
+    }))
+    const { database: db, behaviors: runtime } = await startApproving(open)
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      const result = await original(command, args, options)
+      if (command !== 'github-interface' || args[0] !== '--requested-changes-addressed' || !args.includes('--requests-json')) return result
+      const packet = JSON.parse(result.stdout)
+      // Only #17 in the first batch has an author response. #27 is still
+      // eligible, but its batch must not be read before the deadline expires.
+      return { ...result, stdout: JSON.stringify({ ...packet,
+        records: (packet.records as Array<{ pull_number: number }>).map((record) =>
+          record.pull_number > 17 && record.pull_number < 27
+            ? { ...record, status: false, commits_after_request: 0, author_commits_after_request: 0, response_count: 0 } : record),
+      }) }
+    })
+    const preparing = deferred<void>(), prepared = deferred<void>()
+    const launched = deferred<void>(), released = deferred<void>()
+    const { prepareModelClis } = await import('../server/provider-clis')
+    vi.mocked(prepareModelClis).mockImplementationOnce(async () => {
+      preparing.resolve()
+      await prepared.promise
+      return {}
+    })
+    const callId = 'b'.repeat(32)
+    mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[1] !== '#17') return
+      fixture.agentLogs.push(agentLog({ id: callId, behavior: 'pr_approve',
+        correlation_id: args[args.indexOf('--correlation-id') + 1], expected_head: HEAD_SHA }))
+      launched.resolve()
+      await released.promise
+    })
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const run = runtime.runEnabledBehaviorsOnce()
+      await preparing.promise
+      // Preparation pauses the work clock: the retained deadline must come
+      // from that clock, rather than startedAt + the 55-second work budget.
+      await vi.advanceTimersByTimeAsync(3_000)
+      prepared.resolve()
+      await launched.promise
+      const claim = db.listBehaviorLaunchClaims('approve-prs')[0]!
+      expect(claim.launchCorrelationId).toBe(fixture.agentLogs[0]!.correlation_id)
+      await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+      released.resolve()
+      await run
+
+      const events = () => {
+        logging.loggingRuntime()!.flush()
+        return logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false })).events
+          .filter((event) => event.operation === 'application.behaviors')
+      }
+      expect(events()).toEqual([expect.objectContaining({
+        severity: 'error', occurrences: 1, behavior: 'approve-prs', phase: 'launch', exitCode: null,
+        message: 'The operation was aborted due to timeout',
+        context: expect.objectContaining({ organization: 'Vaquum', deadline: startedAt + 58_000,
+          exceptionName: 'TimeoutError', exceptionCode: 23,
+          progress: { eligiblePrs: 11, checksPending: 1, changeChecksRead: 10, activityChecksRead: 1, launched: 1, publication: 'unverified' } }),
+      })])
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual([])
+      expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
+        behavior: 'approve-prs', error: 'The operation was aborted due to timeout',
+      }))
+      const requests = () => mocks.runFile.mock.calls.filter(([command, args]) =>
+        command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json'))
+        .flatMap(([, args]) => JSON.parse(args[args.indexOf('--requests-json') + 1]) as Array<{ number: number }>)
+      expect(requests().some((request) => request.number === 27)).toBe(false)
+
+      // The next sweep reconciles the original running Call. The unread PR
+      // stays behind its existing retry gate until its next eligible sweep.
+      const retryAt = Date.now() + 60_000
+      db.setMeta(`behavior_approve_prs_failure:${pr.repo}#27:check`, JSON.stringify({
+        kind: 'operation', consecutiveFailures: 1, lastFailureAtMs: Date.now(), nextRetryAtMs: retryAt, error: 'check timed out',
+      }))
+      await resetLogCache()
+      await runtime.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      expect(requests().some((request) => request.number === 27)).toBe(false)
+      expect(db.listBehaviorLaunchClaims('approve-prs')).toContainEqual(expect.objectContaining({
+        claimId: claim.claimId, launchCorrelationId: claim.launchCorrelationId, launchCallId: callId,
+      }))
+      vi.setSystemTime(retryAt + 1)
+      await runtime.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached.mock.calls.map(([, args]) => args[1])).toEqual(['#17', '#27'])
+      expect(db.listBehaviorLaunchClaims('approve-prs')).toContainEqual(expect.objectContaining({
+        claimId: claim.claimId, launchCorrelationId: claim.launchCorrelationId, launchCallId: callId,
+      }))
+      expect(fixture.agentLogs).toEqual([expect.objectContaining({ id: callId, correlation_id: claim.claimId, status: 'running' })])
+      expect(events()).toHaveLength(1)
+    } finally {
+      prepared.resolve()
+      released.resolve()
+      await logging.stopLogging()
+    }
+  })
+
+  it('retains one actionable cycle failure when eligible work cannot be established', async () => {
+    const { behaviors: runtime } = await startApproving([pr, secondPr])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      if (command === 'github-datastore' && args[0] === 'view') throw new Error('eligible pull requests unreadable')
+      return original(command, args, options)
+    })
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const { withNoticeDiagnosticIdentity } = await import('../server/logging-context')
+      // A check-slot release can wake a sweep from an earlier PR's context.
+      await withNoticeDiagnosticIdentity({ correlationId: 'c'.repeat(32), behavior: 'review-new-prs',
+        target: `${pr.repo}#99`, repository: pr.repo, account: 'review-bot', phase: 'prior-work' },
+      () => runtime.runEnabledBehaviorsOnce())
+      logging.loggingRuntime()!.flush()
+      const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
+      expect(events.filter((event) => event.operation === 'application.behaviors')).toEqual([expect.objectContaining({
+        severity: 'error', occurrences: 1, behavior: 'approve-prs', phase: 'listing', message: 'eligible pull requests unreadable',
+        context: expect.objectContaining({ organization: 'Vaquum', deadline: expect.any(Number),
+          progress: { eligiblePrs: null, checksPending: null, changeChecksRead: 0, activityChecksRead: 0, launched: 0, publication: 'unverified' } }),
+      })])
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    } finally { await logging.stopLogging() }
+  })
+
+  it('keeps a timed-out activity read pending on the retained cycle failure', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const { database: db, behaviors: runtime } = await startApproving([pr, secondPr])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      const result = await original(command, args, options)
+      if (command !== 'github-interface' || args[0] !== '--review-activity-since' || !args.includes('--requests-json')) return result
+      const packet = JSON.parse(result.stdout)
+      return { ...result, stdout: JSON.stringify({ ...packet,
+        records: (packet.records as Array<Record<string, unknown>>).map((record) =>
+          record.pull_number === 17
+            ? { repository: record.repository, pull_number: 17, error: 'Command timed out after 30000ms: github-interface' }
+            : record),
+      }) }
+    })
+    const launched = deferred<void>(), released = deferred<void>()
+    mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[1] !== '#18') return
+      launched.resolve()
+      await released.promise
+    })
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const run = runtime.runEnabledBehaviorsOnce()
+      await launched.promise
+      await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+      released.resolve()
+      await run
+      logging.loggingRuntime()!.flush()
+      const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
+      expect(JSON.parse(db.getMeta(`behavior_approve_prs_failure:${pr.repo}#17:check`)!).error).toContain('timed out')
+      expect(events.filter((event) => event.operation === 'application.behaviors'
+        && event.message === 'The operation was aborted due to timeout')).toEqual([expect.objectContaining({
+        severity: 'error', behavior: 'approve-prs', phase: 'launch',
+        context: expect.objectContaining({
+          progress: { eligiblePrs: 2, checksPending: 1, changeChecksRead: 2, activityChecksRead: 1, launched: 1, publication: 'unverified' } }),
+      })])
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    } finally {
+      released.resolve()
+      await logging.stopLogging()
+    }
+  })
+
+  it('keeps a launch-preparation failure on its PR claim instead of the cycle', async () => {
+    const { database: db, behaviors: runtime } = await startApproving([pr])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      return original(command, args, options)
+    })
+    const { prepareModelClis } = await import('../server/provider-clis')
+    vi.mocked(prepareModelClis).mockRejectedValueOnce(new Error('provider preparation failed'))
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      await runtime.runEnabledBehaviorsOnce()
+      logging.loggingRuntime()!.flush()
+      const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
+      const stored = JSON.parse(db.getMeta(`behavior_approve_prs_failure:${pr.repo}#17:check`)!)
+      expect(stored.error).toContain('provider preparation failed')
+      const diagnostic = events.find((event) => event.operation === 'application.behaviors' && event.message.includes('provider preparation failed'))
+      expect(diagnostic).toMatchObject({
+        behavior: 'approve-prs', target: `${pr.repo}#17`, correlationId: stored.correlationId,
+      })
+      const { behaviorEvidence } = await import('../server/notification-evidence')
+      const joined = await behaviorEvidence({ failures: [{ behavior: 'approve-prs', target: `${pr.repo}#17:check`, error: stored.error, correlationId: stored.correlationId }], deadLetters: [] })
+      expect((joined.failures[0] as { evidenceStatus?: string })?.evidenceStatus).toBe('retained')
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    } finally { await logging.stopLogging() }
   })
 
   it('still fires prepared approvals when a slow check pushes the sweep past its deadline, and resumes the rest next pass', async () => {

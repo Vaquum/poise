@@ -7,8 +7,6 @@ during live updates, the Manager's controls, and clear feedback. The design it
 was built from, and the review of every element of the interface it replaced,
 are in [`design/interface/`](design/interface/) (#556).
 
-Until it is removed, the previous interface is at `/classic.html`.
-
 ## Places
 
 The top bar is fixed: **Overview · Board · Chat · Editor · Observe · Settings**.
@@ -18,9 +16,9 @@ It is drawn once; moving between places mounts the place under it.
 | --- | --- |
 | **Overview** | *Answer here*: everything that wants you, with the answer on each entry, from notices, open chat requests, the Switchboard's decisions and review threads. *In motion*: the work in the seven states. The day's numbers with their pace and year, the 30 days before in five bins under each year, Behaviors' runs, minutes and success, and System health, live over the last 24 hours, each card opening its evidence. The bell on every place counts what Overview's level shows and opens *Answer here*. |
 | **Board** | Ideas, plans, issues and pull requests in the seven states. A chained issue and its pull request are one task card; a card's chat opens beside the board. **List** shows the same work as rows, with its phase, whether Poise owns it, what is happening and *Assign to Poise*. In both views, Assign is the first action icon, before Copy, on eligible issues. Board keeps the view you left. |
-| **Chat** | Conversations with agents, the Manager and its workers, on classic's chat: the list in the seven states, the conversation and its composer, the open chat's timers, and the Switchboard pane. JEV is in Chat. |
+| **Chat** | Conversations with agents, the Manager and its workers: the list in the seven states, the conversation and its composer, the open chat's timers, and the Switchboard pane. JEV is in Chat. |
 | **Manager** | Reached from Chat and from Settings → *The Manager*: the Manager's chat beside the Switchboard, with its wake-up interval in its header. Its controls are in Settings → Manager. |
-| **Editor** | Long-form writing on classic's Editor, with its own panels for Comments, Reviews and Publish and the document chat beside it. Passage and review threads stay inline. |
+| **Editor** | Long-form writing, with panels for Comments, Reviews and Publish and the document chat beside it. Passage and review threads stay inline. |
 | **Observe** | **Tasks** (the chain's evidence: its state line, Needs attention, each task's timeline, Hold and Resume), **Behaviors** (every run), **GitHub** (issues and pull requests) and **Logging** (diagnostics, with Work impact). |
 | **Settings** | General, Accounts, Models, Extensions, Publishing, Behaviors, Snippets, Admin, Style and Manager, each at its own address, with Find. Each setting saves itself on its row and says when it applies. |
 
@@ -49,8 +47,8 @@ The service's and notices' links keep working (`src/ui/address.ts`):
 
 The frame, Overview, Board, Observe and Settings' own rows take every word, tooltip
 and full reference from one registry, `src/ui/registry/`, so they cannot drift
-apart; Chat, the Manager place, the Editor and Settings' sections built on
-classic's views keep classic's words for now. Chats, runs, issues and pull
+apart; Chat, the Manager place, the Editor and reused Settings components keep
+their existing words. Chats, runs, issues and pull
 requests share seven states, each with one meaning and one colour:
 
 | State | Meaning |
@@ -109,6 +107,4 @@ makes room for them.
 ## Tests
 
 `tests/e2e/ui-*.spec.ts` drive each place in a browser; `tests/ui-*.test.ts` cover
-the registry, the addresses, the tokens and each place's pure mappings. The
-previous interface's specs run against `/classic.html` through
-`tests/e2e/fixtures/classic.ts` until it is removed.
+the registry, the addresses, the tokens and each place's pure mappings.

@@ -5,9 +5,6 @@ Answer here. A bell at the end of the top bar, on every place, counts what is
 open and opens Answer here, with a route back to where you were. When nothing
 needs you, the bell shows no count.
 
-Classic, at `/classic.html` until it is removed (#556), keeps its notification
-rail as it was.
-
 ## The bell
 
 The count is what Answer here shows at its default level: what needs you, Poise
@@ -39,17 +36,14 @@ another day and the year for another year.
 ## What shows
 
 Server notices are unresolved alerts, the same alerts
-[Poise Link](Poise-Link.md) shows on the desktop. In the new interface a failed
+[Poise Link](Poise-Link.md) shows on the desktop. A failed
 read shows on the element it belongs to, and as a tab-local Poise fault in
-Answer here, which the bell counts. In classic, Swarm,
-Current, Archive, Behaviors, Snippets, Editor and Analytics report browser
-read failures in the rail as tab-local Poise faults. Failed writes and conflicts also
+Answer here, which the bell counts. Failed writes and conflicts also
 appear here, classified as faults or actions needing the person. Changed failures
 receive a fresh notice; repeating the same failure keeps its dismissal. Unreadable
-Swarm records are tracked by stable record identity instead: reworded evidence for
+run records are tracked by stable record identity instead: reworded evidence for
 known rows updates the notice in place, and only a never-before-seen row raises a
-fresh alert. These views show no local loading, empty-state, save-status or
-explanatory messages.
+fresh alert.
 Routine loading and saving diagnostics go to the browser console. Data labels,
 controls and Chat-related guidance remain. Chat, JEV, Settings, Publishing and
 reviews, Admin and pairing, Setup and terminal messages are unchanged. These failures are shared across
@@ -95,9 +89,6 @@ which also decides its group. When the current incident records the legacy stop
 after two review timeouts, the notice explains that automatic retries stopped
 and asks you to change the head or model, or retry explicitly. It keeps the link
 to that incident's Call; an unknown stop keeps the generic wording.
-In classic, each Behaviors row shows that
-behavior's counts: Poise faults, needs you and automatic; a count opens the rail
-on that behavior with its first entry in that group expanded.
 
 Existing managed-work entries also show [verified work impact](Logging.md#observe--logging)
 from each entry's own retained evidence: current impact, work target and stage,
@@ -152,14 +143,13 @@ lost. They open Observe → Behaviors.
 ## Pull requests ready to merge
 
 Every two minutes Poise checks your own open pull requests, the ones your
-GitHub account or the agent account opened, with the rule classic's Current
-uses for green: the merge button is green, no check fails or is still running, and no
+GitHub account or the agent account opened: the merge button is green, no check fails or is still running, and no
 conversation is unresolved.
 
-Classic's Current and notifications share a simultaneous check of the same pull request
-when both use the same agent GitHub account. Its answer is cached for 60 seconds
+Simultaneous checks of the same pull request share one read
+when they use the same agent GitHub account. Its answer is cached for 60 seconds
 from the start of the check; a different agent account gets its own check.
-Showing the checks (Overview, and classic's Current) answers with a check up to
+Showing the checks in Overview answers with a check up to
 five minutes past those 60 seconds and reads it again behind the answer, five
 at a time; with none that recent, it waits. This check always waits for a
 fresh one.
@@ -287,17 +277,14 @@ other alerts go on as before.
 The page reads `GET /api/notices` every ten seconds while it is in front, and
 at once when it comes back to the front. The code is `server/alerts/notices.ts`
 on the server. In the page, Answer here is `src/ui/places/overview/` and the
-bell `src/ui/shell.ts`; classic's rail is `src/views/notification-rail.ts`, with
-what it lists in `src/notification-items.ts`.
+bell `src/ui/shell.ts`, with shared notice classification in
+`src/notification-items.ts`.
 
 ## Retained evidence
 
-In classic, expanded rail entries, including diagnostic-only conditions, show
-**View in Logging** when exact retained evidence is available. Distinct attempts keep their
-own references; additional retained history is labelled. Pending collection and
-unavailable diagnostics remain explicit. A missing record never borrows another
-review's failure. [Logging](Logging.md#notification-evidence) defines identity and
-expiry behavior. This secondary action never dismisses or silences; the primary
-Open action keeps its existing dismissal behavior. Arrival cards are unchanged.
+Entries with exact retained evidence offer **Open its diagnostic**, opening
+that record in Observe → Logging. A missing record never borrows another
+review's failure. [Logging](Logging.md#notification-evidence) defines identity
+and expiry behavior.
 
 Logging table counts, retention bounds, snapshot times and closed coverage gaps are inspection metadata, not notification producers. They appear only in Logging’s structured Data and collection control. Current source faults retain qualifying diagnostic events; historical incompleteness alone must not create a persistent current-failure signal.
