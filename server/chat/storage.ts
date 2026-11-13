@@ -344,7 +344,7 @@ export function listEvents(sessionId: string, afterSeq: number, limit: number = 
 /** The seq after which a transcript's last `turns` turns begin, read from the
  *  turn-finish index; 0 when it has no more finished turns than that. Given a
  *  budget in characters, fewer of them when they are large: as many as fit,
- *  and always the last one. */
+ *  and always the latest, which is the running turn while one runs. */
 export function lastTurnsStart(sessionId: string, turns: number, budget = Infinity): number {
   const finishes = db.prepare(`SELECT seq FROM chat_events INDEXED BY idx_chat_events_turn_finished
     WHERE session_id = ? AND json_extract(event, '$.type') = 'turn.finished'
@@ -353,13 +353,18 @@ export function lastTurnsStart(sessionId: string, turns: number, budget = Infini
   if (!Number.isFinite(budget)) return start(turns)
   const sizes = db.prepare('SELECT seq, length(event) AS size FROM chat_events WHERE session_id = ? AND seq > ? ORDER BY seq DESC')
     .all(sessionId, start(turns)) as Array<{ seq: number, size: number }>
+  // While a turn runs, its events follow the last finish, and it alone is the latest.
+  const least = sizes.length > 0 && sizes[0].seq > start(0) ? 0 : 1
   let total = 0
   let index = 0
-  for (let count = 1; count <= turns; count++) {
+  let fits = least
+  for (let count = 0; count <= turns; count++) {
     for (; index < sizes.length && sizes[index].seq > start(count); index++) total += sizes[index].size
-    if (count > 1 && total > budget) return start(count - 1)
+    if (count <= least) continue
+    if (total > budget) break
+    fits = count
   }
-  return start(turns)
+  return start(fits)
 }
 
 export function lastEvent(sessionId: string): ChatEnvelope | null {

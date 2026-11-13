@@ -314,6 +314,15 @@ it('opens on fewer of the last turns when they are large: as many as fit the bud
   expect(storage.lastTurnsStart(id, 3, 100_000)).toBe(finished[0])
   // The last turn opens even when it alone is over the budget.
   expect(storage.lastTurnsStart(id, 3, 10)).toBe(finished[2])
+
+  // While a turn runs, it is the latest: it opens alone when the large turn before it does not fit.
+  const busy = await session()
+  const large = randomUUID()
+  storage.appendEvent(busy, { type: 'turn.started', turnId: large, prompt: { text: 'x'.repeat(4_000), attachments: [], mentions: [] } })
+  const largeEnd = storage.finalizeTurn(busy, { type: 'turn.finished', turnId: large, stopReason: 'end_turn' }).seq
+  storage.appendEvent(busy, { type: 'turn.started', turnId: randomUUID(), prompt: { text: 'now', attachments: [], mentions: [] } })
+  expect(storage.lastTurnsStart(busy, 3, 1_000)).toBe(largeEnd)
+  expect(storage.lastTurnsStart(busy, 3, 100_000)).toBe(0)
 })
 
 it('uses the actual recent turns for a handoff after a transcript exceeds one history page', async () => {
