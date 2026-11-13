@@ -70,6 +70,7 @@ export function diagnostic(input: Omit<DiagnosticInput, 'source' | 'workspace'> 
 
 export function diagnosticFailure(operation: string, error: unknown, context: Record<string, unknown> = {}, options: { level?: 'error' | 'warning'; secrets?: readonly string[]; stderr?: boolean; condition?: string } = {}): string | null {
   const value = error instanceof Error ? error : new Error(typeof error === 'string' ? error : 'Operation failed without an Error')
+  const exception = value instanceof DOMException
   const fields = error as { stderr?: unknown; code?: unknown; signal?: unknown; errno?: unknown; killed?: unknown } | null
   const cause: string[] = []
   const seen = new Set<Error>([value])
@@ -81,10 +82,11 @@ export function diagnosticFailure(operation: string, error: unknown, context: Re
     callId: identity('callId'), correlationId: identity('correlationId'), requestId: identity('requestId'), behavior: identity('behavior'), target: identity('target'), phase: identity('phase'),
     timeoutMs: typeof context.timeoutMs === 'number' ? context.timeoutMs : null, message: value.message, stack: value.stack,
     stderr: options.stderr === false ? null : typeof fields?.stderr === 'string' ? fields.stderr : null,
-    exitCode: typeof fields?.code === 'number' ? fields.code : null,
+    exitCode: !exception && typeof fields?.code === 'number' ? fields.code : null,
     signal: typeof fields?.signal === 'string' ? fields.signal : null,
     errno: typeof fields?.errno === 'string' || typeof fields?.errno === 'number' ? fields.errno : null,
-    context: { ...context, code: typeof fields?.code === 'string' ? fields.code : null, killed: fields?.killed === true } }, options.secrets)
+    context: { ...context, ...(exception ? { exceptionName: value.name, exceptionCode: value.code } : {}),
+      code: typeof fields?.code === 'string' ? fields.code : null, killed: fields?.killed === true } }, options.secrets)
 }
 
 function saveCallerCheckpoint(): void {

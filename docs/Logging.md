@@ -206,6 +206,9 @@ temporary-filesystem pressure retain measurements known at the source.
 Managed datastore failures are reported once by `datastore.sync` or
 `datastore.activate`, retaining the process exit code and stderr alongside retry
 and freshness context. Standalone datastore process failures are still reported.
+JavaScript DOMException identity and numeric code are retained in context as
+`exceptionName` and `exceptionCode`, with no process `exitCode`. Actual subprocess
+exit codes remain process evidence, even when the same number names an exception.
 
 Untyped GitHub 5xx and transport failures from `github-interface`,
 `github-datastore` and Caller completions retain Warning evidence. A bare exit

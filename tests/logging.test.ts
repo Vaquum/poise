@@ -135,6 +135,20 @@ else { process.stderr.write(failure); process.exitCode = 1 }
     for (const value of ['private-output', 'private-argument']) expect(JSON.stringify(page)).not.toContain(value)
   })
 
+  it('distinguishes a TimeoutError code from an actual subprocess exit with the same code', async () => {
+    start()
+    const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    expect(timeout.code).toBe(23)
+    diagnosticFailure('cycle.timeout', timeout)
+    await expect(runFile(process.execPath, ['-e', 'process.exit(23)'])).rejects.toThrow('Command failed (23)')
+    loggingRuntime()!.flush()
+    const { events } = loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false }))
+    expect(events.find((event) => event.operation === 'cycle.timeout')).toMatchObject({
+      exitCode: null, context: { exceptionName: 'TimeoutError', exceptionCode: 23 },
+    })
+    expect(events.find((event) => event.operation === process.execPath)).toMatchObject({ exitCode: 23 })
+  })
+
   it.each([
     ['github-interface', 'error: GitHub 500: Internal Server Error', 'warning'],
     ['github-interface', 'httpx.ConnectError: connection reset', 'warning'],
