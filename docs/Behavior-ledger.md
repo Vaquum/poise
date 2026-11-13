@@ -131,6 +131,12 @@ churn during integration never masquerades as the blocker. A vanished queue
 entry reads as a removal without inventing its cause. Flags are display
 only and never raise alerts or influence execution.
 
+Legacy rows also include live PR-scoped review and approval check failures in
+`blocker.details`, ahead of historical details, with their recorded target, lane,
+review slot, reason and retry time. Their revision is unverified. An uncleared
+retry reads as due at and after its timestamp; clearing the scheduler failure,
+including through a successful no-op, removes the detail without changing blocker precedence.
+
 For legacy PRs, a live review on the verified current head can move past-revision
 review failures into `blocker.details`, retaining their head, cause and time.
 Attribution uses full-SHA targets, matching launch evidence, or already-cached
@@ -180,9 +186,11 @@ V2 uses the decision path's two-minute observation-freshness bound. Missing or
 unrecognized check rollups stay unknown; an empty failing-check list is not
 proof of success. Held/uncertain ownership remains visible even when PR state
 is stale. A legitimately owned model invocation remains the current phase with
-its age while the runtime intentionally skips GitHub re-observation; those old
-facets remain unknown without falsely marking the collector stale. Missing
-observations remain distinct. Other stale chain evidence marks reply health
+its age. Running PR reviews refresh open PR evidence on the existing two-minute
+boundary, so queue admission can surface in work diagnostics before review settles.
+Other owned invocations skip GitHub re-observation; those old facets remain unknown
+without falsely marking the collector stale. Missing observations remain distinct.
+Other stale chain evidence marks reply health
 stale. Current phase switches/pauses, the chain admission pause and the release
 barrier remain meaningful; recorded holds and policy refusals are retained. A contradictory
 journal or ambiguous ownership fails the existing endpoint with 503 instead of

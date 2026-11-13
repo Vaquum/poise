@@ -6,7 +6,7 @@ import { diagnostic, diagnosticFailure, diagnosticPage, fatalDiagnostic, logging
 import { runFile } from '../server/process'
 import * as processes from '../server/process'
 import { credentialVariables } from './fixtures/cli-isolation'
-import { fetchAgentLogSnapshot, fetchRunningAgentLogSnapshot, resetAgentLogCache } from '../server/agent'
+import { fetchAgentLogSnapshot, fetchAgentResponse, fetchRunningAgentLogSnapshot, resetAgentLogCache } from '../server/agent'
 import { withNoticeDiagnosticIdentity } from '../server/logging-context'
 
 let directory = ''
@@ -21,6 +21,45 @@ function start(blocked = false) {
 }
 
 describe('independent application capture', () => {
+  it('keeps typed History absence out of Error and retains Call ID and purpose for required or broken reads', async () => {
+    start()
+    vi.stubEnv('CALLER_BIN_ROOT', directory)
+    const callId = 'a'.repeat(32)
+    const state = join(directory, 'response-state')
+    writeFileSync(state, 'absent')
+    writeFileSync(join(directory, 'agent-interface'), `#!${process.execPath}
+const { readFileSync } = require('node:fs')
+const mode = readFileSync(${JSON.stringify(state)}, 'utf8')
+if (mode === 'available') process.stdout.write('original response\\n')
+else if (mode === 'missing') { process.stderr.write('promised response file is missing'); process.exitCode = 1 }
+else {
+  process.stdout.write(JSON.stringify({ id: mode === 'wrong-call' ? 'b'.repeat(32) : process.argv[3],
+    disposition: 'unavailable', reason: 'The Call ended without a response' }))
+  process.exitCode = 3
+}
+`, { mode: 0o755 })
+    const events = () => {
+      loggingRuntime()!.flush()
+      return loggingRuntime()!.query(db => db.query({ workspace: 'alice', operator: false }, { source: 'poise' })).events
+    }
+    await expect(fetchAgentResponse(callId, 'history')).resolves.toEqual({ id: callId,
+      disposition: 'unavailable', reason: 'The Call ended without a response' })
+    expect(events()).toEqual([])
+    await expect(fetchAgentResponse(callId, 'content-finalization')).rejects.toMatchObject({ code: 3 })
+    expect(events()).toContainEqual(expect.objectContaining({ severity: 'error', callId,
+      context: expect.objectContaining({ readerPurpose: 'content-finalization' }) }))
+    for (const mode of ['wrong-call', 'missing']) {
+      writeFileSync(state, mode)
+      await expect(fetchAgentResponse(callId, 'history')).rejects.toThrow('Command failed')
+    }
+    const history = events().filter(event => event.context.readerPurpose === 'history')
+    expect(history).toHaveLength(2)
+    expect(history.every(event => event.severity === 'error' && event.callId === callId)).toBe(true)
+    expect(history.some(event => event.stderr === 'promised response file is missing')).toBe(true)
+    writeFileSync(state, 'available')
+    await expect(fetchAgentResponse(callId, 'history')).resolves.toEqual({ id: callId, body: 'original response\n' })
+  })
+
   it('retains one history episode across failed shared reads, with bounded first evidence and explicit recovery', async () => {
     start()
     resetAgentLogCache()
@@ -133,6 +172,45 @@ else { process.stderr.write(failure); process.exitCode = 1 }
     const page = loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false }))
     expect(page.events.some((event) => event.exitCode === 9 && event.stderr === 'precise stderr')).toBe(true)
     for (const value of ['private-output', 'private-argument']) expect(JSON.stringify(page)).not.toContain(value)
+  })
+
+  it.each(['head-sha', 'requested-changes-addressed'])('retains the %s child identity through nested scheduler contexts', async (primitive) => {
+    start()
+    vi.stubEnv('CALLER_BIN_ROOT', directory)
+    writeFileSync(join(directory, 'github-interface'), `#!${process.execPath}\nprocess.stderr.write('precise probe failure');process.exit(1)`, { mode: 0o755 })
+    const outer = { correlationId: 'a'.repeat(32), behavior: 'review-new-prs', repository: 'acme/repo', target: 'acme/repo#17', account: 'bot', phase: 'sweep' }
+    const inner = { ...outer, phase: 'preparation', progress: { primitive, slot: 'secondary', expectedHead: 'b'.repeat(40) } }
+    try {
+      await withNoticeDiagnosticIdentity(outer, () => withNoticeDiagnosticIdentity(inner,
+        () => runFile('github-interface', [`--${primitive}`, '#17'])))
+      expect.fail('the child must fail')
+    } catch (error) { diagnosticFailure('scheduler.review', error) }
+    loggingRuntime()!.flush()
+    const events = diagnosticPage(null).events.filter((event) => [
+      `github-interface.${primitive}`, 'scheduler.review',
+    ].includes(event.operation))
+    expect(events).toHaveLength(2)
+    for (const event of events) expect(event).toMatchObject({ correlationId: outer.correlationId, phase: 'preparation',
+      target: outer.target, exitCode: 1, stderr: 'precise probe failure', context: { progress: inner.progress } })
+  })
+
+  it('keeps the sweep identity when a target attached to the shared sweep TimeoutError', async () => {
+    start()
+    const outer = { correlationId: 'a'.repeat(32), behavior: 'review-new-prs', repository: null, target: null, account: null, phase: 'preparation' }
+    const inner = { ...outer, repository: 'acme/repo', target: 'acme/repo#17', account: 'bot',
+      progress: { primitive: 'head-sha', slot: 'primary', expectedHead: null } }
+    const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    try {
+      await withNoticeDiagnosticIdentity(outer, () => withNoticeDiagnosticIdentity(inner,
+        () => Promise.reject(timeout)))
+      expect.fail('the sweep must time out')
+    } catch (error) { diagnosticFailure('application.behaviors', error) }
+    loggingRuntime()!.flush()
+    const events = diagnosticPage(null).events.filter((event) => event.operation === 'application.behaviors')
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ correlationId: outer.correlationId, phase: 'preparation',
+      target: null, repository: null, account: null, context: { exceptionName: 'TimeoutError' } })
+    expect(events[0]!.context.progress).toBeUndefined()
   })
 
   it('distinguishes a TimeoutError code from an actual subprocess exit with the same code', async () => {

@@ -168,7 +168,8 @@ export function startLogging(options: { captureFatal?: boolean } = {}): void {
   setProcessFailureObserver((error, evidence) => {
     const code = ['github-interface', 'github-datastore'].includes(evidence.command)
       ? classifyBehaviorDiagnostic(behaviorErrorMessage(error, Infinity)).code : null
-    diagnosticFailure(evidence.operation, error, { executable: evidence.executable, configuredCommand: evidence.command, cwd: evidence.cwd, elapsedMs: evidence.elapsedMs, timeoutMs: evidence.timeoutMs },
+    diagnosticFailure(evidence.operation, error, { executable: evidence.executable, configuredCommand: evidence.command, cwd: evidence.cwd, elapsedMs: evidence.elapsedMs, timeoutMs: evidence.timeoutMs,
+      callId: evidence.callId, readerPurpose: evidence.readerPurpose },
       { level: code === 'upstream_unavailable' || code === 'network_interruption' ? 'warning' : 'error', secrets: evidence.secrets, stderr: evidence.stderrAllowed })
   })
   active.observe('application', 'poise', workspace)

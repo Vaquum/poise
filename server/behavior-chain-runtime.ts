@@ -407,10 +407,13 @@ export class BehaviorChainRuntime {
               }
               if (chain.mergeSha && owned && !released) continue
               if (owned && call && (call.status === 'running' || !nativeResourcesReleased(call))) {
-                // The authoritative admission already owns this invocation. Only
-                // its native settlement can advance it; rereading GitHub while it
-                // runs adds no decision evidence and burns shared API quota.
-                continue
+                // Running PR reviews still need bounded queue visibility. This
+                // observation cannot settle or replace their native invocation.
+                const prior = chain.observation as ChainObservation | null
+                if (owned.behavior !== 'review-pr' || call.status !== 'running'
+                  || prior?.pull?.state !== 'open' || prior.pull.merged
+                  || Number.isFinite(prior.checkedAt) && prior.checkedAt <= Date.now()
+                    && Date.now() - prior.checkedAt < CHAIN_OBSERVATION_MAX_AGE_MS) continue
               }
               phase = 'observation'
               let observation: ChainObservation
@@ -447,6 +450,7 @@ export class BehaviorChainRuntime {
                 chain = this.append(chain, { type: 'chain.merged', mergeSha: observation.pull.mergeSha, evidence: { repository: chain.repository,
                   pull_number: observation.pull.number, merged: true, merge_sha: observation.pull.mergeSha, review_complete: false } })
               }
+              if (owned && call?.status === 'running') continue
               const pendingInvocation = chain.invocations.find((invocation) => invocation.state !== 'settled')
               if (pendingInvocation) {
                 phase = 'invocation-recovery'

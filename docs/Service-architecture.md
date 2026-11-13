@@ -1290,6 +1290,16 @@ whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
 its own, keeping its volume and respecting the native settlement barrier.
 The reporting allowlist is reconciled separately through trusted service
 configuration without replacing a compatible running container.
+Replacement pins stop and removal to the inspected container ID. If stopping
+fails, the gateway inspects that ID and the current workspace name separately.
+It continues only for the same owned container with an explicit stopped state;
+an absent, unreadable or malformed target cannot authorize removal. An already
+serving successor is left alone and observed only after the old container is
+confirmed stopped or absent and its own ownership, image, settings and health
+(including the intended release) match. Otherwise the upgrade retains an Error
+with the stop cause and safe old/current identity and inspection evidence.
+Abandoning replacement releases a drain only while the original container still
+owns the workspace name.
 The operator scripts retain an exact-release rollout receipt beyond their
 bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
 receipt through the existing workspace health/image proof without initiating
@@ -1702,6 +1712,14 @@ empty queue cannot authorize another enqueue. See
 [native action receipts](Behavior-chain.md#native-action-receipts).
 Conversation-resolution summaries also expose the original Call's validated
 per-thread progress; partial progress retains the original action's uncertainty.
+
+History response details distinguish typed ordinary Caller absence from a
+promised response that is missing or unreadable. `/api/agent-response/CALL_ID`
+returns `{id, disposition: "unavailable", reason}` for ordinary absence, keeping
+it out of process Error; actual failures remain 502 and retain the exact Call ID
+and reader purpose. Required content and native-action reads still reject absent
+results, preserving receipt digests and publication/retry fences. The CLI's
+response-read contract is in [agent_interface](../caller/agent_interface/README.md#reading-a-response).
 
 Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
 code and existing v1 diagnostic into chain receipts and History. The unchanged
