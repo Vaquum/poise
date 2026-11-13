@@ -130,10 +130,13 @@ only and never raise alerts or influence execution.
 
 For legacy PRs, a live review on the verified current head can move past-revision
 review failures into `blocker.details`, retaining their head, cause and time.
-Attribution uses full-SHA targets or launch evidence matching the incident's
-behavior, target and Call ID; a newer launch on the same target supplies no
-identity for an older incident. Current-head, conflicting or unattributable holds
-and PR-wide quarantine keep precedence. Without usable merge-candidate head
+Attribution uses full-SHA targets, matching launch evidence, or already-cached
+Caller history matching the original Call/correlation, repository/PR, behavior,
+actor and source after its launch is released. A newer launch on the same target
+supplies no identity for an older incident. Current-head, conflicting,
+unreadable or unattributable holds, ambiguous publication and PR-wide quarantine
+keep precedence. A same-head model stop stays primary while a live review on
+that head appears alongside it in `blocker.details`. Without usable merge-candidate head
 evidence and a matching live claim, retained incidents remain held. The row's
 ledger link keeps the original evidence accessible; execution gates are unchanged.
 

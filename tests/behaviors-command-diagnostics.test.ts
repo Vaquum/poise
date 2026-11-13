@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { CheckSemaphore } from '../server/check-semaphore'
 import type { RunFileOptions } from '../server/process'
 import { completedReviewCall } from './review-response-fixture'
-import { arrangeCli, fixture, HEAD_SHA, NEXT_HEAD_SHA, loadModules, mocks, pr } from './behaviors-runtime-fixture'
+import { agentLog, arrangeCli, fixture, HEAD_SHA, NEXT_HEAD_SHA, loadModules, mocks, pr, resetLogCache } from './behaviors-runtime-fixture'
 
 let logging: typeof import('../server/logging') | null = null
 afterEach(async () => { await logging?.stopLogging(); logging = null; vi.unstubAllEnvs() })
@@ -14,11 +14,18 @@ const TARGET = `${pr.repo}#${pr.number}`
 const CHECK = `${TARGET}:check`
 const MARKER = ' (no conversation was resolved before this failure)'
 const LIMIT = 'error: GitHub 403: You have exceeded a secondary rate limit. retry-after: 300'
+const APPROVAL_CHECKS = [
+  ['requested-changes-addressed', 'changes-addressed'],
+  ['review-activity-since', 'review-activity'],
+  ['head-sha', 'head-check'],
+] as const
 
 async function start(primitive = RESOLVE, script = "setInterval(() => {}, 1000)", timeout = false) {
-  arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+  const approval = APPROVAL_CHECKS.some(([check]) => check === primitive)
+  if (approval) arrangeCli(true)
+  else arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
   const { database, behaviors } = await loadModules()
-  const behavior = primitive === RESOLVE ? 'resolve-unblocking' : 'merge-prs'
+  const behavior = approval ? 'approve-prs' : primitive === RESOLVE ? 'resolve-unblocking' : 'merge-prs'
   behaviors.startBehaviorsRuntime()
   database.setMeta('me', 'poise-user')
   database.setMeta(`behavior_${behavior.replaceAll('-', '_')}_enabled`, '1')
@@ -26,8 +33,9 @@ async function start(primitive = RESOLVE, script = "setInterval(() => {}, 1000)"
   vi.stubEnv('CALLER_BIN_ROOT', fixture.tempRoot)
   writeFileSync(join(fixture.tempRoot, 'github-interface'), `#!${process.execPath}\n${script}\n`, { mode: 0o700 })
   const original = mocks.runFile.getMockImplementation()!
+  let failing = true
   mocks.runFile.mockImplementation((command: string, args: string[], options: RunFileOptions) => {
-    if (command === 'github-interface' && args[0] === `--${primitive}`) {
+    if (failing && command === 'github-interface' && args[0] === `--${primitive}`) {
       return mocks.realRunFile!(command, args, timeout ? { ...options, timeoutMs: 500 } : options)
     }
     if (command === 'github-interface' && args[0] === '--merge-candidates') return Promise.resolve({
@@ -45,7 +53,7 @@ async function start(primitive = RESOLVE, script = "setInterval(() => {}, 1000)"
   logging = await import('../server/logging')
   vi.spyOn(process.stderr, 'write').mockReturnValue(true)
   logging.startLogging()
-  return { database, behaviors }
+  return { database, behaviors, resume: () => { failing = false } }
 }
 
 function failureScript(stderr: string): string {
@@ -57,6 +65,135 @@ function events() {
   while (runtime.health().queued) expect(runtime.flush()).toBe(true)
   return runtime.query((store) => store.query({ workspace: logging!.loggingWorkspace(), operator: false }, { limit: 100 })).events
 }
+
+it.each(APPROVAL_CHECKS)('retains one attributed approval timeout and retries normally (%s)', async (primitive, phase) => {
+  const script = "process.stdout.write('private-output'); process.stderr.write('delayed read\\nAuthorization: Bearer private-credential\\n'); setInterval(() => {}, 1000)"
+  const { database, behaviors, resume } = await start(primitive, script, true)
+  await behaviors.runEnabledBehaviorsOnce()
+  const retry = behaviors.getBehaviorFailureState('approve-prs', CHECK)!
+  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: expect.any(String) })
+  expect(Date.parse(retry.nextRetryAt) - Date.parse(retry.lastFailureAt)).toBe(60_000)
+  const recorded = events()
+  expect(recorded).toEqual([expect.objectContaining({
+    operation: `github-interface.${primitive}`, behavior: 'approve-prs', phase, severity: 'error',
+    exitCode: null, signal: 'SIGKILL', timeoutMs: 500, correlationId: retry.correlationId,
+    stderr: expect.stringContaining('delayed read'),
+    context: expect.objectContaining({ killed: true, elapsedMs: expect.any(Number),
+      executable: join(fixture.tempRoot, 'github-interface'), configuredCommand: 'github-interface' }),
+  })])
+  expect(Number(recorded[0]!.context.elapsedMs)).toBeGreaterThanOrEqual(500)
+  if (primitive === 'head-sha') {
+    expect(recorded[0]).toMatchObject({ repository: pr.repo, target: TARGET,
+      context: { expectedHead: HEAD_SHA, retry } })
+  } else {
+    expect(recorded[0]).toMatchObject({ repository: null, target: null, context: {
+      targets: [{ target: TARGET, ...(primitive === 'review-activity-since' ? { expectedHead: HEAD_SHA } : {}) }],
+      retry: [{ target: TARGET, nextRetryAt: retry.nextRetryAt, consecutiveFailures: 1 }],
+    } })
+  }
+  for (const secret of ['private-output', 'private-credential', '--requests-json', '--token-user']) {
+    expect(JSON.stringify(recorded)).not.toContain(secret)
+  }
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  expect(database.listBehaviorLaunchClaims('approve-prs')).toEqual([])
+  const calls = mocks.runFile.mock.calls.filter(([, args]) => args[0] === `--${primitive}`).length
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === `--${primitive}`)).toHaveLength(calls)
+  expect(events()).toHaveLength(1)
+  resume()
+  const key = `behavior_approve_prs_failure:${CHECK}`
+  database.setMeta(key, JSON.stringify({ ...JSON.parse(database.getMeta(key)!), nextRetryAtMs: 1 }))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+  expect(mocks.spawnDetached.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+  expect(behaviors.getBehaviorFailureState('approve-prs', CHECK)).toBeNull()
+  expect(events()).toHaveLength(1)
+})
+
+it('keeps distinct failed approval batches under the same sweep correlation and across sweeps', async () => {
+  const { database, behaviors } = await start('requested-changes-addressed', undefined, true)
+  fixture.listedPrs = Array.from({ length: 11 }, (_, index) => ({ ...pr, number: 17 + index,
+    url: `https://github.com/${pr.repo}/pull/${17 + index}` }))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(events()).toHaveLength(2)
+  expect(new Set(events().map((event) => event.correlationId)).size).toBe(1)
+  for (const pull of fixture.listedPrs) {
+    const key = `behavior_approve_prs_failure:${pull.repo}#${pull.number}:check`
+    database.setMeta(key, JSON.stringify({ ...JSON.parse(database.getMeta(key)!), nextRetryAtMs: 1 }))
+  }
+  await behaviors.runEnabledBehaviorsOnce()
+  const recorded = events()
+  expect(recorded).toHaveLength(4)
+  expect(new Set(recorded.map((event) => event.id)).size).toBe(4)
+  expect(new Set(recorded.map((event) => event.correlationId)).size).toBe(2)
+  expect(recorded.every((event) => event.operation === 'github-interface.requested-changes-addressed' && event.severity === 'error')).toBe(true)
+})
+
+it.each(['requested-changes-addressed', 'review-activity-since'])('keeps a full batch diagnostic under the context cap (%s)', async (primitive) => {
+  const { behaviors } = await start(primitive, failureScript('E'.repeat(300)))
+  const repo = `Vaquum/${'r'.repeat(130)}`
+  fixture.listedPrs = Array.from({ length: 10 }, (_, index) => ({ ...pr, repo, number: 17 + index,
+    url: `https://github.com/${repo}/pull/${17 + index}` }))
+  await behaviors.runEnabledBehaviorsOnce()
+  const recorded = events()
+  expect(recorded).toHaveLength(1)
+  const event = recorded[0]!
+  expect(event.operation).toBe(`github-interface.${primitive}`)
+  expect(event.context.targets).toHaveLength(10)
+  expect(event.context.retry).toHaveLength(10)
+  expect(event.context).toMatchObject({ elapsedMs: expect.any(Number) })
+  expect(event.context.truncated).not.toBe(true)
+  expect(Buffer.byteLength(JSON.stringify(event.context))).toBeLessThanOrEqual(8192)
+  for (const entry of event.context.retry as Array<Record<string, unknown>>) {
+    expect(Object.keys(entry).sort()).toEqual(['consecutiveFailures', 'nextRetryAt', 'target'])
+    expect(entry).toMatchObject({ consecutiveFailures: 1, nextRetryAt: expect.any(String) })
+  }
+  if (primitive === 'review-activity-since') {
+    for (const target of event.context.targets as Array<Record<string, unknown>>) {
+      expect(target).toMatchObject({ expectedHead: HEAD_SHA })
+    }
+  }
+})
+
+it.each(['requested-changes-addressed', 'head-sha'])('keeps the original approval process failure when retry bookkeeping throws (%s)', async (primitive) => {
+  const { database, behaviors } = await start(primitive, failureScript('original read failure'))
+  const setMeta = database.setMeta
+  vi.spyOn(database, 'setMeta').mockImplementation((key, value) => {
+    if (key === `behavior_approve_prs_failure:${CHECK}`) throw new Error('retry bookkeeping failed')
+    return setMeta(key, value)
+  })
+  await behaviors.runEnabledBehaviorsOnce()
+  const recorded = events()
+  expect(recorded.filter((event) => event.operation === `github-interface.${primitive}`)).toEqual([
+    expect.objectContaining({ severity: 'error', exitCode: 1, stderr: 'original read failure', context: expect.objectContaining({ retry: null }) }),
+  ])
+  expect(recorded.some((event) => event.message === 'retry bookkeeping failed')).toBe(true)
+})
+
+it('retains an independent approval launch failure after a successful head check', async () => {
+  const { behaviors, resume } = await start('head-sha')
+  resume()
+  mocks.spawnDetached.mockRejectedValueOnce(new Error('approval launch failed'))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(events()).toEqual([expect.objectContaining({ operation: 'application.behaviors', severity: 'error',
+    message: 'approval launch failed', target: TARGET, phase: 'launch', exitCode: null,
+    context: expect.objectContaining({ expectedHead: HEAD_SHA, retry: expect.objectContaining({ consecutiveFailures: 1 }) }),
+  })])
+})
+
+it.each(['requested-changes-addressed', 'head-sha'])('keeps a failed approval read if shutdown interrupts its handler (%s)', async (primitive) => {
+  const { behaviors } = await start(primitive, failureScript('original read failure'))
+  const original = mocks.runFile.getMockImplementation()!
+  let stopping: Promise<void> | undefined
+  mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
+    try { return await original(command, args, options) }
+    catch (error) { stopping = behaviors.stopBehaviorsRuntime(); throw error }
+  })
+  await behaviors.runEnabledBehaviorsOnce()
+  await stopping
+  expect(events()).toEqual([expect.objectContaining({ operation: `github-interface.${primitive}`,
+    severity: 'error', exitCode: 1, stderr: 'original read failure', context: expect.objectContaining({ retry: null }) })])
+})
 
 it('persists one Error per real timeout and distinguishes identical attempts in the same incident', async () => {
   const { database, behaviors } = await start(RESOLVE, undefined, true)
@@ -163,7 +300,7 @@ it('retains the failed command through cancellation before the outer log point',
     .toMatchObject({ sideEffects: 'none', nativeId: events()[0]!.correlationId })
 })
 
-async function startReviewCheck(phase: string, primitive: string, slot = 'secondary') {
+async function startReviewCheck(phase: string, primitive: string, slot = 'secondary', delayUnattributed = false) {
   vi.useFakeTimers({ toFake: ['Date'] })
   vi.setSystemTime(new Date('2026-11-13T18:00:00Z'))
   arrangeCli(false)
@@ -193,9 +330,10 @@ setInterval(() => {}, 1000)
     }
     const context = diagnosticIdentity()
     if (command === 'github-interface' && args[0] === `--${primitive}` && args[1] === `#${pr.number}`
-      && context?.phase === phase && context.progress?.slot === slot && state.failures > 0) {
+      && state.failures > 0
+      && ((context?.phase === phase && context.progress?.slot === slot) || (delayUnattributed && !context?.progress))) {
       expect(options.timeoutMs).toBe(30_000)
-      checks.push({ correlationId: context.correlationId, phase, slot, expectedHead: context.progress.expectedHead })
+      checks.push({ correlationId: context?.correlationId ?? 'unattributed', phase, slot, expectedHead: context?.progress?.expectedHead })
       state.failures--
       try { return await mocks.realRunFile!(command, args, { ...options, timeoutMs: 500 }) }
       catch (error) { state.onFailure?.(); throw error }
@@ -307,4 +445,55 @@ it('keeps bookkeeping errors after a successful revalidation separate from child
   expect(events().some((event) => event.message === 'head deferral bookkeeping rejected')).toBe(true)
   expect(events().some((event) => event.operation === 'github-interface.head-sha')).toBe(false)
   expect(mocks.spawnDetached).not.toHaveBeenCalled()
+})
+
+it.each([
+  ['packet-blocked hold', null],
+  ['failed-launch recovery', HEAD_SHA],
+])('attributes an early preparation head-sha timeout during %s to its slot with a recorded retry', async (kind, expectedHead) => {
+  const { database, behaviors, state, checks, checkTarget } = await startReviewCheck('preparation', 'head-sha', 'secondary', true)
+  state.failures = 1
+  if (kind === 'packet-blocked hold') {
+    database.setMeta(`packet_block:review-new-prs:${TARGET}`, HEAD_SHA)
+  } else {
+    const target = `${TARGET}:secondary`
+    const claimId = database.claimSeenOwned('review-new-prs', target)!
+    const callId = 'b'.repeat(32)
+    expect(database.markBehaviorLaunchIntentOwned({ key: 'review-new-prs', target, claimId, launchBehavior: 'pr_review',
+      repo: pr.repo, pr: pr.number, requestedAt: new Date(Date.now() - 10_000).toISOString(),
+      expectedHead: HEAD_SHA, actor: 'review-bot', source: 'poise:review-new-prs', correlationId: claimId })
+      && database.linkBehaviorLaunchCallOwned('review-new-prs', target, claimId, callId)
+      && database.setBehaviorLaunchErrorOwned('review-new-prs', target, claimId, 'worker failed')
+      && database.completeSeenOwned('review-new-prs', target, claimId)).toBe(true)
+    fixture.agentLogs = [agentLog({ id: callId, correlation_id: claimId, expected_head: HEAD_SHA,
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'review_packet_too_large', error: 'remaining review input is too large' })]
+    await resetLogCache()
+  }
+  const launches = () => mocks.spawnDetached.mock.calls.map(([, args]) => args as string[])
+  await behaviors.runEnabledBehaviorsOnce()
+  // The failed secondary never launches; a held packet also holds its siblings, while the other PR's panel proceeds.
+  expect(launches().filter((args) => args.includes('#17'))).toHaveLength(kind === 'packet-blocked hold' ? 0 : 2)
+  expect(launches().filter((args) => args.includes('#18'))).toHaveLength(3)
+  const retry = behaviors.getBehaviorFailureState('review-new-prs', checkTarget)!
+  expect(retry).toMatchObject({ consecutiveFailures: 1 })
+  const recorded = events()
+  expect(recorded).toHaveLength(1)
+  expect(recorded[0]).toMatchObject({ operation: 'github-interface.head-sha', severity: 'error',
+    behavior: 'review-new-prs', target: TARGET, repository: pr.repo, account: 'review-bot', phase: 'preparation',
+    timeoutMs: 30_000, exitCode: null, signal: 'SIGKILL', stderr: expect.stringContaining('delayed review check'),
+    context: { primitive: 'head-sha', slot: 'secondary', expectedHead, killed: true, retry: { nextRetryAt: retry.nextRetryAt } },
+  })
+  expect(recorded[0]!.correlationId).toBe(retry.correlationId)
+  expect(checks.at(-1)).toMatchObject({ expectedHead, correlationId: retry.correlationId })
+  vi.setSystemTime(new Date(Date.parse(retry.nextRetryAt) - 1))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(events()).toHaveLength(1)
+  expect(launches().filter((args) => args.includes('#17'))).toHaveLength(kind === 'packet-blocked hold' ? 0 : 2)
+  state.head = NEXT_HEAD_SHA
+  vi.setSystemTime(new Date(retry.nextRetryAt))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(launches().filter((args) => args.includes('#17'))).toHaveLength(3)
+  expect(launches().filter((args) => args.includes('#18'))).toHaveLength(3)
+  expect(behaviors.getBehaviorFailureState('review-new-prs', checkTarget)).toBeNull()
 })

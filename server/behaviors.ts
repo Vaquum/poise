@@ -101,7 +101,7 @@ import { classifyBehaviorDiagnostic, diagnosticClassification, isRepoAccessDenie
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { DATASTORE_MAX_AGE_SECONDS, datastoreFreshnessByOrganization, initialDatastoreFreshness, openStaleMirrors, recordStaleMirrorBlock, runDatastoreHealth, staleDatastoreFailure, staleMirrorMessage, type DatastoreFreshness, type StaleDatastoreError } from './datastore-health'
 import { resolveReviewCheckout } from './review-checkout'
-import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDetached } from './process'
+import { claudeSubscriptionEnvironment, isAbortError, processFailureEvidence, runFile, runningCallerLaunches, spawnDetached } from './process'
 import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type CheckSlotStats } from './check-semaphore'
 import { ProcessLockError, withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
@@ -395,9 +395,11 @@ const META_PREFIX = 'behavior_'
 function enabledKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_enabled' }
 function settingKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_setting' }
 
-export function isEnabled(key: BehaviorKey): boolean {
+/** Whether a behavior is switched on, here: in an account's scope, only while
+ *  that account is ready. `ready` passes accounts the caller already read. */
+export function isEnabled(key: BehaviorKey, ready?: readonly Organization[]): boolean {
   const org = behaviorOrganization.getStore()
-  if (org && !readyOrganizations().some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
+  if (org && !(ready ?? readyOrganizations()).some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
     && candidate.datastorePath === org.datastorePath)) return false
   const saved = getMeta(enabledKey(key))
   return saved === '1' || (saved === null && (key === 'implement-issues' || key === 'repair-prs'))
@@ -918,6 +920,15 @@ function isPreparationBudgetExhaustion(call: LogEntry): boolean {
       'preparing_provider', 'acquiring_checkout'].includes(phase))
 }
 
+// A staged group's deadline stays on its revision, even when it limits local
+// inspection. It still counts toward that target's retry stop.
+function isFileGroupBudgetExhaustion(call: LogEntry): boolean {
+  return call.error_code === 'review_budget_exhausted'
+    && (call.diagnostic?.operation === 'provider.review' || call.diagnostic?.operation === 'github-interface')
+    && call.diagnostic.phase === 'file_group' && call.diagnostic.outcome === 'timed_out'
+    && call.diagnostic.context.submission === 'none'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -947,7 +958,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // verdict, the next slot is strictly more useful than the same dead run.
   if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit') return 'provider'
   if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)
-    && !isPreparationBudgetExhaustion(call)) return 'budget'
+    && !isPreparationBudgetExhaustion(call) && !isFileGroupBudgetExhaustion(call)) return 'budget'
   return null
 }
 
@@ -3216,10 +3227,6 @@ async function prepareReviewTarget(
   const checkTarget = `${target}:check`
   if (!isEnabled('review-new-prs') || behaviorAborted()) return null
   if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) return null
-  if (await packetBlocked('review-new-prs', pr.repo, pr.number, reviewer)) {
-    if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, reviewer)
-    return null
-  }
   const operationId = await claimEligiblePrOperation('review-new-prs', target)
   if (!operationId) {
     console.log(`[behaviors] review-new-prs deferred for ${key}: PR operation busy`)
@@ -3230,9 +3237,14 @@ async function prepareReviewTarget(
     target: `${pr.repo}#${pr.number}`, account: reviewer, phase: 'preparation' }
   try {
     return await withNoticeDiagnosticIdentity(identity, async () => {
+      if (await withNoticeDiagnosticIdentity({ ...identity, progress: { slot, primitive: 'head-sha', expectedHead: null } },
+        () => packetBlocked('review-new-prs', pr.repo, pr.number, reviewer, undefined, false))) {
+        if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, reviewer)
+        return null
+      }
       // Recovery probe only: release a dead no-action launch so the claim
       // phase can reclaim this target. Its own writes are claim-guarded.
-      await releaseFailedBehaviorIfNoAction('review-new-prs', pr.repo, pr.number, target)
+      await releaseFailedBehaviorIfNoAction('review-new-prs', pr.repo, pr.number, target, { slot })
       const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
       if (!m) throw new Error('not a github PR url: ' + pr.url)
       const [, owner, repo, num] = m
@@ -4025,12 +4037,12 @@ function packetBlockKey(behavior: string, repo: string, number: number): string 
 }
 
 async function packetBlocked(
-  behavior: ActiveClaim['behavior'], repo: string, number: number, reviewer: string, head?: string,
+  behavior: ActiveClaim['behavior'], repo: string, number: number, reviewer: string, head?: string, reportFailure = true,
 ): Promise<boolean> {
   const key = packetBlockKey(behavior, repo, number)
   const blockedHead = getMeta(key)
   if (!blockedHead) return false
-  const current = head ?? await currentHeadSha(repo, number, reviewer)
+  const current = head ?? await currentHeadSha(repo, number, reviewer, reportFailure)
   if (current === blockedHead) return true
   // A changed head is new input. The old launch remains in the audit trail;
   // initial-review recovery still verifies its exact no-action provenance.
@@ -4047,10 +4059,9 @@ function boundedReviewFailure(call: LogEntry): boolean {
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
 }
 
-// A budget-exhausted run that proved it posted nothing is a provider-side
-// failure, not an ambiguous side effect: Caller verifies against live
-// GitHub before failing this way, and says so when it cannot. It retries
-// the same head on backoff until two matching automatic timeouts. An
+// A budget-exhausted run that proved it posted nothing can retry on this head:
+// Caller verifies against live GitHub before failing this way, and says so
+// when it cannot. It retries on backoff until two matching automatic timeouts. An
 // uncertain submission or deterministic input exhaustion holds immediately.
 function budgetExhaustedProvenNoAction(call: LogEntry): boolean {
   return call.review_policy === REVIEW_POLICY
@@ -4073,7 +4084,7 @@ function prReviewRetryState(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call))
   const timeouts = calls.filter((call) => call.model === model && budgetExhaustedProvenNoAction(call)
-    && reviewerTripKind(call) === 'budget'
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
   const stopped = timeouts.length >= 2 || retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
     claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head
@@ -4130,7 +4141,7 @@ function ensureBudgetStopHold(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call)
     && call.model === model && budgetExhaustedProvenNoAction(call)
-    && reviewerTripKind(call) === 'budget'
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
     .sort((a, b) => Date.parse(agentCallStartedAt(b)) - Date.parse(agentCallStartedAt(a)))
   const latest = timeouts[0]
@@ -4282,6 +4293,7 @@ async function releaseFailedBehaviorIfNoAction(
   repo: string,
   number: number,
   target: string,
+  headProbe?: { slot: ReviewerSlot },
 ): Promise<boolean> {
   const launchBehavior = upstreamBehavior(behavior)
   const source = `poise:${behavior}`
@@ -4294,6 +4306,10 @@ async function releaseFailedBehaviorIfNoAction(
     || failed.launchSource !== source) {
     return false
   }
+  const currentHead = headProbe
+    ? () => withNoticeDiagnosticIdentity({ ...diagnosticIdentity()!, progress: { slot: headProbe.slot, primitive: 'head-sha', expectedHead: failed.launchExpectedHead } },
+      () => currentHeadSha(repo, number, failed.launchActor, false))
+    : () => currentHeadSha(repo, number, failed.launchActor)
   const snapshot = await readBehaviorLogSnapshot()
   if (quarantineFailedLog(snapshot, failed)) return false
   const logs = snapshot.entries
@@ -4356,15 +4372,15 @@ async function releaseFailedBehaviorIfNoAction(
   }
   if (prReviewRetryState(snapshot, behavior, repo, number, failed.launchExpectedHead,
     failed.launchActor, configuredModel ?? call.model, target).stopped
-    && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
+    && await currentHead() === failed.launchExpectedHead) return false
   if (boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call)
     && (configuredModel == null || call.model === configuredModel)
-    && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
+    && await currentHead() === failed.launchExpectedHead) return false
   const blockedPacket = call.action === 'not_started'
     && call.outcome === 'preflight_failed'
     && call.error_code === 'review_packet_too_large'
   if (blockedPacket) {
-    if (await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
+    if (await currentHead() === failed.launchExpectedHead) return false
     return releaseFailedBehaviorLaunch(behavior, target, failed.launchCallId, failed.launchExpectedHead)
   }
   // Older Caller logs were closed before their no-action outcome was typed.
@@ -4524,7 +4540,7 @@ async function readChangesAddressedBatch(
     '--requested-changes-addressed', '--requests-json',
     JSON.stringify(prs.map((pr) => ({ repository: pr.repo, number: pr.number }))),
     '--username', reviewer, '--token-user', reviewer,
-  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false })
   const packet = objectValue(
     parseJson(stdout, 'github-interface --requested-changes-addressed batch'),
     'github-interface --requested-changes-addressed batch',
@@ -4556,13 +4572,14 @@ async function readChangesAddressedBatch(
 async function readReviewActivityBatch(
   requests: { pr: DatastorePr, since: string }[],
   reviewer: string,
+  reportFailure = true,
 ): Promise<BatchRead<ReviewActivityResult>[]> {
   const { stdout } = await runFile(GH_INTERFACE, [
     '--review-activity-since', '--requests-json',
     JSON.stringify(requests.map(({ pr, since }) => ({ repository: pr.repo, number: pr.number,
       since: reviewer.toLowerCase() === (getMeta('me') || '').toLowerCase() ? '1970-01-01T00:00:00Z' : since }))),
     '--username', reviewer, '--token-user', reviewer,
-  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(), reportFailure })
   const packet = objectValue(
     parseJson(stdout, 'github-interface --review-activity-since batch'),
     'github-interface --review-activity-since batch',
@@ -4624,7 +4641,7 @@ async function fireApprove(
   admittedReviewer?: string,
   replacesFailedCallId?: string,
 ): Promise<boolean> {
-  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author) }, async () => {
+  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author), phase: 'launch', expectedHead }, async () => {
   if (!isRunnable('approve-prs')) return false
   const accounts = prAccounts()
   const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
@@ -4649,7 +4666,8 @@ async function fireApprove(
   // does not discard it. Only shutdown or disable discards prepared work.
   return underLifecycleSignal(async () => {
   try {
-  const currentHead = await currentHeadSha(pr.repo, pr.number, actor)
+  const currentHead = await withNoticeDiagnosticIdentity({ ...diagnosticIdentity()!, phase: 'head-check' },
+    () => currentHeadSha(pr.repo, pr.number, actor, false))
   // The head-SHA lookup above is a subprocess with a 30s timeout, so the user
   // has a real window to turn the behaviour off while it is out. Nothing
   // re-read the flag between it returning and the spawn below, so a toggle-off
@@ -4776,9 +4794,15 @@ async function fireApprove(
     // The sweep deadline may expire while a launch is in flight; tickApprovePrs
     // reads that as an abort and would drop a genuine failure silently, so log
     // and record it here, as review-new-prs phase 3 does.
-    if (behaviorAborted()) return false
-    if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
-    recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+    let retry: BehaviorFailureState | null = null
+    try {
+      if (behaviorAborted()) return false
+      recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+      retry = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+    } finally {
+      if (!(err instanceof BehaviorLogFeedError) && !isAbortError(err)) diagnosticFailure(
+        processFailureEvidence(err)?.operation ?? 'application.behaviors', err, { retry })
+    }
     return false
   }
   })
@@ -4961,11 +4985,22 @@ async function tickApprovePrs(): Promise<void> {
         progress.changeChecksRead += read
         progress.checksPending -= read
       } catch (err) {
-        if (behaviorAborted()) return
-        console.error('[behaviors] approve-prs batch check failed:', err)
-        for (const pr of batch) {
-          // One error for the whole batch: unattributable to any repository.
-          recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+        let retry: Array<{ target: string, consecutiveFailures: number | null, nextRetryAt: string | null }> | null = null
+        try {
+          if (behaviorAborted()) return
+          for (const pr of batch) {
+            // One error for the whole batch: unattributable to any repository.
+            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+          }
+          retry = batch.map((pr) => {
+            const state = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+            return { target: `${pr.repo}#${pr.number}`,
+              consecutiveFailures: state?.consecutiveFailures ?? null, nextRetryAt: state?.nextRetryAt ?? null }
+          })
+        } finally {
+          if (!isAbortError(err)) diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err, {
+            account: reviewer, phase: 'changes-addressed', targets: batch.map((pr) => ({ target: `${pr.repo}#${pr.number}` })), retry,
+          })
         }
         continue
       }
@@ -5050,16 +5085,28 @@ async function tickApprovePrs(): Promise<void> {
         let activityRecords: BatchRead<ReviewActivityResult>[]
         try {
           if (context) context.phase = 'review-activity'
-          activityRecords = await readReviewActivityBatch(activityBatch, reviewer)
+          activityRecords = await readReviewActivityBatch(activityBatch, reviewer, false)
           const activityRead = activityRecords.filter((record) => record.error === null).length
           progress.activityChecksRead += activityRead
           progress.checksPending -= activityRead
         } catch (err) {
-          if (behaviorAborted()) return
-          console.error('[behaviors] approve-prs batch activity check failed:', err)
-          for (const { pr } of activityBatch) {
-            // One error for the whole batch: unattributable to any repository.
-            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+          let retry: Array<{ target: string, consecutiveFailures: number | null, nextRetryAt: string | null }> | null = null
+          try {
+            if (behaviorAborted()) return
+            for (const { pr } of activityBatch) {
+              // One error for the whole batch: unattributable to any repository.
+              recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+            }
+            retry = activityBatch.map(({ pr }) => {
+              const state = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+              return { target: `${pr.repo}#${pr.number}`,
+                consecutiveFailures: state?.consecutiveFailures ?? null, nextRetryAt: state?.nextRetryAt ?? null }
+            })
+          } finally {
+            if (!isAbortError(err)) diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err, {
+              account: reviewer, phase: 'review-activity',
+              targets: activityBatch.map(({ pr, check }) => ({ target: `${pr.repo}#${pr.number}`, expectedHead: check.headSha })), retry,
+            })
           }
           continue
         }
@@ -8606,6 +8653,15 @@ export interface BehaviorsRuntimeHealth {
 }
 
 function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): BehaviorsRuntimeHealth {
+  // Each behavior's switch, read once for this report: the checks below ask
+  // again and again, and each ask read every account afresh.
+  const ready = readyOrganizations()
+  const switches = new Map<BehaviorKey, boolean>()
+  const enabled = (key: BehaviorKey): boolean => {
+    let on = switches.get(key)
+    if (on === undefined) switches.set(key, on = isEnabled(key, ready))
+    return on
+  }
   const now = Date.now()
   const busyEntries = [...behaviorOperationStartedAt.entries()].filter(([key]) => key.startsWith(`${currentOrganization()?.login.toLowerCase() ?? 'legacy'}:`))
   const busy = busyEntries.map(([key, since]) => ({
@@ -8621,7 +8677,7 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
     .some(([key, startedAt]) => now > (behaviorOperationClocks.get(key)?.expiresAt ?? startedAt + BEHAVIOR_OPERATION_TIMEOUT_MS) + BEHAVIOR_HEALTH_GRACE_MS)
   const staleEpisodes = openStaleMirrors(currentOrganization())
   const failures = BEHAVIOR_KEYS.flatMap((behavior) => {
-    if (!isEnabled(behavior)) return []
+    if (!enabled(behavior)) return []
     return [undefined, ...behaviorFailureTargets(behavior)].flatMap((target) => {
       const failure = readBehaviorFailure(behavior, target)
       let recovered = false
@@ -8670,14 +8726,14 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
   for (const episode of staleEpisodes) {
     for (const behavior of episode.behaviors) {
       if (!(BEHAVIOR_KEYS as readonly string[]).includes(behavior)
-        || !isEnabled(behavior as BehaviorKey)
+        || !enabled(behavior as BehaviorKey)
         || failures.some((failure) => failure.behavior === behavior && failure.correlationId === episode.id)) continue
       failures.push({ behavior: behavior as BehaviorKey, kind: 'operation', consecutiveFailures: 1,
         failingSince: episode.startedAt, lastFailureAt: episode.startedAt, nextRetryAt: '', error: staleMirrorMessage(episode),
         diagnostic: diagnosticClassification('datastore_stale'), correlationId: episode.id })
     }
   }
-  const enabledForRuntime = (key: BehaviorKey) => isEnabled(key)
+  const enabledForRuntime = (key: BehaviorKey) => enabled(key)
     && (key !== 'implement-issues' && key !== 'repair-prs' || getBehaviorChainSettings().enabled)
   const anyEnabled = BEHAVIOR_KEYS.some(enabledForRuntime)
   let reviewer: string | null = null

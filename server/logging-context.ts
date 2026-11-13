@@ -6,6 +6,7 @@ export interface NoticeDiagnosticIdentity {
   correlationId: string; behavior: string; target: string | null; repository: string | null; account: string | null
   organization?: string
   phase?: string
+  expectedHead?: string
   deadline?: number
   progress?: Record<string, string | number | null | Array<Record<string, string | number | null>>>
 }
