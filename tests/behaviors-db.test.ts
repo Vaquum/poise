@@ -24,6 +24,43 @@ afterEach(async () => {
   tempRoot = ''
 })
 
+describe('rotation cursors', () => {
+  it('commits a cursor on its own connection, visible at once and kept across a restart', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const path = join(tempRoot, 'cache.db')
+    let module = await loadIsolatedDb(path)
+    // Not on the main connection, which waits for the disk on every commit.
+    const main = vi.spyOn(module.db, 'prepare')
+    module.setMeta('behavior_merge_prs_cursor', 'alpha/one#1')
+    // A managed organization's behaviors scope the same cursor by its login.
+    module.setMeta('org:alpha:behavior_merge_prs_cursor', 'alpha/two#1')
+    expect(main).not.toHaveBeenCalled()
+    module.setMeta('org:alpha:behavior_merge_prs_skip_repos', '[]')
+    expect(main).toHaveBeenCalledTimes(1)
+    main.mockRestore()
+    expect(module.getMeta('org:alpha:behavior_merge_prs_cursor')).toBe('alpha/two#1')
+    expect(module.getMeta('behavior_merge_prs_cursor')).toBe('alpha/one#1')
+    module.setMeta('behavior_merge_prs_cursor', 'alpha/one#2')
+    expect(module.db.prepare("SELECT value FROM meta WHERE key = 'behavior_merge_prs_cursor'").get()).toEqual({ value: 'alpha/one#2' })
+    module.closeDatabase()
+    module = await loadIsolatedDb(path)
+    expect(module.getMeta('behavior_merge_prs_cursor')).toBe('alpha/one#2')
+  })
+
+  it('keeps a cursor written inside a transaction with that transaction', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const { db, getMeta, setMeta } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    setMeta('behavior_approve_prs_cursor', 'alpha/one#1')
+    expect(() => db.transaction(() => {
+      setMeta('behavior_approve_prs_cursor', 'alpha/one#2')
+      throw new Error('rolled back')
+    })()).toThrow('rolled back')
+    expect(getMeta('behavior_approve_prs_cursor')).toBe('alpha/one#1')
+    db.transaction(() => setMeta('behavior_approve_prs_cursor', 'alpha/one#3'))()
+    expect(getMeta('behavior_approve_prs_cursor')).toBe('alpha/one#3')
+  })
+})
+
 describe('behavior database lifecycle', () => {
   it('migrates legacy cards once, preserves content, and purges retired credentials', async () => {
     tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
