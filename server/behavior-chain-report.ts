@@ -619,13 +619,13 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     ? `Original Call ${original!.call} publication remains uncertain: reconcile its missing pre-push no-write checkpoint or conclusive push result. ` : ''
   if (!issue) return `${publicationAction}${label} report creation is unconfirmed; no matching issue is visible yet. Reconcile the same marker; do not create a replacement`
   if (report.issueNumber === null) { report.issueNumber = issue.number; save() }
-  const link = `${publicationAction}${label} report ${issue.url}`
-  if (issue.state === 'closed') {
-    const closedReport = `${link} is closed; no replacement will be created`
-    return cause === IMPLEMENTATION_CAUSE && chain.held && chain.invocations.at(-1)?.behavior === 'repair-pr'
-      ? `Stage: repair-pr. Worker-reported blocker: ${behaviorErrorMessage(chain.held, 500)}. Next action: inspect the repair Call, address the blocker, then explicitly Resume. Historical ${closedReport}`
-      : closedReport
-  }
+  const last = chain.invocations.at(-1)?.behavior
+  const repair = last === 'repair-pr'
+  const source = cause === IMPLEMENTATION_CAUSE && chain.held && (repair || last === 'implement-issue')
+    ? `Stage: ${repair ? 'repair-pr' : 'implement-issue'}. Worker-reported blocker: ${behaviorErrorMessage(chain.held, 500)}. Next action: inspect the ${repair ? 'repair' : 'implementation'} Call, address the blocker, then explicitly Resume. `
+    : ''
+  const link = `${publicationAction}${source}${issue.state === 'closed' ? 'Historical ' : ''}${label} report ${issue.url} (last verified ${new Date().toISOString()}; not live status)`
+  if (issue.state === 'closed') return `${link} is closed; no replacement will be created`
   if (!issue.labels.some(label => label.toLowerCase() === 'poise') && enabled(db, chain.repository) && allowed()) {
     try { issue = (await reconcileRepairReport(chain.repository, marker, issue.number, true, linkedReport))! }
     catch (error) { return `${link}: poise label pending: ${error instanceof Error ? error.message : String(error)}` }

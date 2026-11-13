@@ -10,7 +10,7 @@ import {
   type LedgerRecord, type LedgerReference, type LedgerReply, type LedgerResult, type LedgerSlot, type LedgerState,
 } from './behavior-ledger-contract'
 
-interface Row { creation_seq: number; id: string; parent_id: string | null; native_id: string | null; payload: string; source_at: string | null; native_override: number; bytes: number }
+interface Row { creation_seq: number; id: string; parent_id: string | null; native_id: string | null; payload: string; source_at: string | null; native_override: number; bytes: number; terminal: number }
 interface Cursor { version: 1; generation: string; kind: 'list' | 'changes'; position: number; boundary: number; watermark: number; parent: string | null; repository?: string | null; number?: number | null }
 interface Journal { version: 1; epoch: string; closed: boolean; health: LedgerHealth }
 const ID = /^[a-f0-9]{64}$/
@@ -133,6 +133,14 @@ export class BehaviorLedgerStore {
       this.initialized = true
       this.refreshUsage()
       this.db.transaction(() => {
+        // Older rows ranked terminal state alone. Rebuild eviction eligibility
+        // from retained evidence before pruning, including unresolved children.
+        this.connection().exec(`UPDATE ledger_instances SET terminal =
+          json_extract(payload,'$.state') IN ('completed','failed','superseded')
+          AND json_extract(payload,'$.activity') = 'settled';
+          UPDATE ledger_instances SET terminal=0 WHERE parent_id IS NULL AND EXISTS (
+            SELECT 1 FROM ledger_instances AS child WHERE child.parent_id=ledger_instances.id AND child.terminal=0);
+          UPDATE ledger_instances SET no_write=0 WHERE terminal=0;`)
         // A detached direct command has no passive Caller row after its observer dies.
         this.pendingRows.clear()
         for (const row of this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL')) {
@@ -374,9 +382,12 @@ export class BehaviorLedgerStore {
   }
   private put(record: LedgerRecord, row: Row, force = false, nativeOverride = row.native_override, sourceAt = row.source_at): void {
     const before = recordOf(row)
+    const terminal = TERMINAL.has(record.state) && record.activity === 'settled'
+      && (record.parentId !== null || !this.connection().prepare('SELECT 1 FROM ledger_instances WHERE parent_id=? AND terminal=0 LIMIT 1').get(record.id)) ? 1 : 0
+    const noWrite = terminal && directNoWrite(record) ? 1 : 0
     const semantic = (value: LedgerRecord) => ({ ...value, revision: 0, observedAt: '' })
     if (!force && JSON.stringify(semantic(before)) === JSON.stringify(semantic(record))) {
-      this.connection().prepare('UPDATE ledger_instances SET source_at=? WHERE id=?').run(sourceAt, record.id)
+      this.connection().prepare('UPDATE ledger_instances SET source_at=?,terminal=?,no_write=? WHERE id=?').run(sourceAt, terminal, noWrite, record.id)
       return
     }
     this.checkRecord(record)
@@ -389,8 +400,6 @@ export class BehaviorLedgerStore {
     const changeRowBytes = Buffer.byteLength(encoded) + 256
     this.connection().prepare('UPDATE ledger_changes SET payload=?,bytes=? WHERE seq=?').run(encoded, changeRowBytes, record.revision)
     this.changeBytes += changeRowBytes
-    const terminal = TERMINAL.has(record.state) ? 1 : 0
-    const noWrite = directNoWrite(record) ? 1 : 0
     const rowBytes = Buffer.byteLength(payload) + 512
     this.connection().prepare('UPDATE ledger_instances SET payload=?,updated_at=?,source_at=?,native_override=?,bytes=?,terminal=?,no_write=? WHERE id=?')
       .run(payload, this.time(), sourceAt, nativeOverride, rowBytes, terminal, noWrite, record.id)
@@ -536,7 +545,8 @@ export class BehaviorLedgerStore {
       victims.push(row)
     }
     const count = rows.length - this.policy.maxAttempts
-    for (const row of victims.slice(-count)) this.remove(row)
+    victims.sort((a, b) => b.terminal - a.terminal || a.creation_seq - b.creation_seq)
+    for (const row of victims.slice(0, count)) this.remove(row)
     const root = this.byId(id)!
     const record = recordOf(root)
     this.put({ ...record, omittedAttempts: record.omittedAttempts + Math.min(count, victims.length) }, root)
@@ -573,13 +583,13 @@ export class BehaviorLedgerStore {
   }
   private prune(): void {
     const cutoff = new Date(this.now() - this.policy.retentionMs).toISOString()
-    for (const row of this.budgetScan(() => this.rows('SELECT * FROM ledger_instances WHERE parent_id IS NULL AND updated_at < ?', cutoff))) this.remove(row)
+    for (const row of this.budgetScan(() => this.rows('SELECT * FROM ledger_instances WHERE parent_id IS NULL AND terminal=1 AND updated_at < ?', cutoff))) this.remove(row)
     this.trimChanges()
     let usage = this.usage()
     while (usage.instances > this.policy.maxInstances || usage.bytes > this.policy.maxBytes) {
       // Preserve panel work ahead of repetitive terminal direct no-write firings.
       const victim = this.budgetScan(() => this.rows('SELECT * FROM ledger_instances INDEXED BY ledger_pressure WHERE parent_id IS NULL ORDER BY no_write DESC,terminal DESC,creation_seq ASC LIMIT 1'))[0]
-      if (usage.instances > this.policy.maxInstances || !usage.changes || (victim && recordOf(victim).state === 'completed' && directNoWrite(recordOf(victim)))) {
+      if (usage.instances > this.policy.maxInstances || !usage.changes || (victim?.terminal === 1 && directNoWrite(recordOf(victim)))) {
         if (!victim) break
         this.remove(victim)
       } else {

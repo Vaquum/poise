@@ -308,6 +308,35 @@ async function readKept<T>(path: string | undefined, key: string, marked: boolea
 /** A read kept with the datastore file version and content mark it was read
  *  at, and the later version the mark last vouched for. */
 interface KeptRead<T> { version: string, content: string | null, vouched: string | null, readAt: number, value: T }
+
+/** A read over several datastores, kept by the same rule as one view's read
+ *  (readKept): while every datastore's file version is unchanged, or, within
+ *  CONTENT_KEPT_MS of the read, while every one's content mark is. Nothing is
+ *  kept while any datastore has no version, nor a value `keep` refuses (a read
+ *  that failed in part: its failure may pass with no file changing). */
+export interface KeptAcross<T> { versions: string[], contents: Array<string | null>, vouched: string[] | null, readAt: number, value: T }
+export async function readKeptAcross<T>(paths: readonly string[], key: string, reads: Map<string, KeptAcross<T>>, read: () => Promise<T>,
+  options: { keep?: (value: T) => boolean, bound?: number } = {}): Promise<T> {
+  const found = await Promise.all(paths.map((path) => datastoreVersion(path)))
+  if (found.some((version) => version === null)) return read()
+  const versions = found as string[]
+  const same = (other: readonly string[] | null) => !!other && other.length === versions.length && other.every((version, i) => version === versions[i])
+  const last = reads.get(key)
+  if (last && same(last.versions)) return last.value
+  const vouching = last !== undefined && Date.now() - last.readAt < CONTENT_KEPT_MS
+  if (vouching && same(last.vouched)) return last.value
+  const contents = await Promise.all(paths.map((path, i) => datastoreContent(path, versions[i])))
+  if (vouching && contents.every((content, i) => content !== null && content === last.contents[i])) {
+    last.vouched = versions
+    return last.value
+  }
+  const value = await read()
+  if (options.keep && !options.keep(value)) return value
+  reads.delete(key)
+  reads.set(key, { versions, contents, vouched: null, readAt: Date.now(), value })
+  if (reads.size > (options.bound ?? 8)) reads.delete(reads.keys().next().value!)
+  return value
+}
 /** View reads, the oldest dropped first past READS_KEPT. */
 const viewReads = new Map<string, KeptRead<DatastoreRecord[]>>()
 const READS_KEPT = 200
