@@ -12,6 +12,7 @@ import { nativeResourcesPending, resourceReleaseContradicted } from './behavior-
 import { dependencySnapshot, type LedgerHistory, type Dependencies } from './health'
 import { getOrganizations, type Organization } from './organizations'
 import { HttpError } from './http'
+import { servedRead, type ServedRead } from './served-read'
 
 const DAY = 86_400_000
 
@@ -447,10 +448,26 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
   return result
 }
 
-export function readAnalyticsHealth(scope = '', signal?: AbortSignal): Promise<AnalyticsHealth> {
+/** A read waits this long for a fresh projection before it takes the last one. */
+const HEALTH_WAIT_MS = 300
+/** The last projection answers a read while it is younger than this. */
+const HEALTH_SERVED_MS = 2 * 60_000
+const healthReads = new Map<string, ServedRead<AnalyticsHealth>>()
+
+/** System health, projected once for everyone asking at once. A projection
+ *  that takes longer than HEALTH_WAIT_MS (a cold memo after a restart, or a
+ *  busy server: seconds on production) is answered with the last one, at most
+ *  HEALTH_SERVED_MS old, and its result answers the next read. Each result
+ *  carries the time it was read at. */
+export function readAnalyticsHealth(scope = ''): Promise<AnalyticsHealth> {
   const organizations = getOrganizations().filter(org => !scope || org.login.toLowerCase() === scope.toLowerCase())
   if (scope && !organizations.length) throw new HttpError(400, 'GitHub account is not configured')
-  const snapshot = dependencySnapshot()
-  return projectAnalyticsHealth(behaviorChainJournal(), { now: Date.now(), scope, organizations,
-    dependencies: snapshot.dependencies, history: snapshot.history.ledger, signal })
+  const key = scope.toLowerCase()
+  let state = healthReads.get(key)
+  if (!state) healthReads.set(key, state = { running: null, last: null })
+  return servedRead(state, async () => {
+    const snapshot = dependencySnapshot()
+    return projectAnalyticsHealth(behaviorChainJournal(), { now: Date.now(), scope, organizations,
+      dependencies: snapshot.dependencies, history: snapshot.history.ledger })
+  }, { waitMs: HEALTH_WAIT_MS, servedMs: HEALTH_SERVED_MS })
 }
