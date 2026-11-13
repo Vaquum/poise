@@ -5,7 +5,11 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 // status ledger, the chains and the running jobs are stood in for here; your
 // cards are the test server's own.
 
-const NOW = Date.now()
+// Midday of a fixed day in the browser's own zone, pinned to UTC (Settings name
+// none, so Board's Today follows the browser), with each page's clock set to it:
+// "today" never crosses midnight while a test runs, on any runner.
+test.use({ timezoneId: 'UTC' })
+const NOW = Date.parse('2026-10-15T12:00:00Z')
 const iso = (minutesAgo: number) => new Date(NOW - minutesAgo * 60_000).toISOString()
 
 interface Record { kind: 'pr' | 'issue', repo: string, number: number, state: 'open' | 'closed' | 'merged', title: string, url: string, created_at: string, updated_at: string, merged_at: string | null }
@@ -72,6 +76,7 @@ const card = (page: Page, text: string) => page.locator('.card', { hasText: text
 const view = (page: Page, name: 'Lanes' | 'List') => page.getByRole('group', { name: 'View' }).getByRole('button', { name })
 
 test.beforeEach(async ({ page }) => {
+  await page.clock.install({ time: NOW })
   await page.addInitScript(() => { if (!sessionStorage.getItem('board-spec')) { localStorage.clear(); sessionStorage.setItem('board-spec', '1') } })
 })
 
