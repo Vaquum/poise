@@ -39,6 +39,14 @@ def _failures(results: dict) -> list:
     return failures
 
 
+def _totals(results: dict, keys: set) -> list:
+    # Every case the original run executed under a failing title, passing or
+    # not: a recovered report matching only the originally passing cases must
+    # not stand in for the removed failing one.
+    return [{"file": path, "test": name, "total": len(entries)}
+            for (path, name), entries in sorted(results.items()) if (path, name) in keys]
+
+
 async def inspect(client, target: str, value: dict, current_base: str) -> dict:
     result = {"verified": False, "recovered": False}
     try:
@@ -51,12 +59,14 @@ async def inspect(client, target: str, value: dict, current_base: str) -> dict:
             raise ValueError("test dependency requires an existing repository remediation issue")
         original = await _run(client, target, value["run"], value["base"], "failure")
         baseline = await _run(client, target, value["baselineRun"], value["base"], "failure")
-        failures = _failures(await full_suite_repair.test_results(client, target, original, causes=True))
+        original_results = await full_suite_repair.test_results(client, target, original, causes=True)
+        failures = _failures(original_results)
         if failures != _failures(await full_suite_repair.test_results(client, target, baseline, causes=True)):
             raise ValueError("original and exact-base runs do not demonstrate every same assertion/cause")
+        totals = _totals(original_results, {(item["file"], item["test"]) for item in failures})
         proof = {"base": value["base"], "run": original["id"], "runAttempt": original["attempt"],
                  "baselineRun": baseline["id"], "baselineAttempt": baseline["attempt"],
-                 "remediation": value["remediation"], "failures": failures}
+                 "remediation": value["remediation"], "failures": failures, "totals": totals}
         # Once retained by Caller, reruns or changed artifact contents cannot
         # replace the original cause, even if the new attempt is green.
         if value.get("verified") is True and any(value.get(key) != entry for key, entry in proof.items()):
@@ -88,12 +98,9 @@ async def inspect(client, target: str, value: dict, current_base: str) -> dict:
         recovered = await _run(client, target, latest["id"], current_base, "success")
         passed = await full_suite_repair.test_results(client, target, recovered, causes=True)
         # Parameterized cases can share one fixed title; the recovered report
-        # must pass at least as many cases per title as originally failed, so
-        # removing a case cannot stand in for fixing it.
-        required = {}
-        for failure in failures:
-            key = (failure["file"], failure["test"])
-            required[key] = required.get(key, 0) + 1
+        # must pass at least as many cases per failing title as originally
+        # ran, so removing a case cannot stand in for fixing it.
+        required = {(item["file"], item["test"]): item["total"] for item in totals}
         if any(entries["status"] == "failed" for results in passed.values() for entries in results) \
                 or any(len(passed.get(key, [])) < count
                        or any(entry["status"] != "passed" for entry in passed.get(key, []))
