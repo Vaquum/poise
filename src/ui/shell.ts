@@ -5,7 +5,7 @@
 import { $, $$, esc } from './dom'
 import { icon, hydrateIcons } from './icons'
 import { noticeFeed, READ_INTERVAL_MS } from '../notices'
-import { PLACE_NAMES, placeHref, type Address, type Place } from './address'
+import { PLACE_NAMES, placeHref, readAddress, type Address, type Place } from './address'
 import { styleSettingsHref } from './style-panel'
 import { awayGroups, watchAway } from './places/overview/away'
 import { bellTally, onBellChange, onOverview } from './places/overview/level'
@@ -201,7 +201,9 @@ function watchBell(btn: HTMLElement | null): void {
     if (tone) badge.dataset.tone = tone; else delete badge.dataset.tone
     btn.setAttribute('aria-label', `Notifications, ${count} open. Opens Answer here in Overview.`)
   }
-  const readAway = watchAway(() => !onOverview(), paint)
+  // While the address is Overview, Overview reads these sources and hands over
+  // its entries as it mounts; the bell reads them itself only on another place.
+  const readAway = watchAway(() => !onOverview() && readAddress(location.search).address.place !== 'overview', paint)
   noticeFeed.subscribe(paint)
   onBellChange(() => { readAway(); paint() })
   paint()

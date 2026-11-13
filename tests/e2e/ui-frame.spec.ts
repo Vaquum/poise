@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page, type Route } from '@playwright/test'
 
 // The frame of the new interface (#556 PR 1): the top bar, addresses, the
 // Settings menu, the Style panel, the reference, the bell and the page's states.
@@ -188,6 +188,28 @@ test('the bell counts what needs you and opens Answer here with a route back', a
   await expect(nav(page).getByRole('link', { name: 'Overview' })).toHaveAttribute('aria-current', 'page')
   expect(Object.fromEntries(query(page))).toEqual({ view: 'overview', back: 'board' })
   expect(new URL(page.url()).hash).toBe('#answer')
+})
+
+test('opening Overview reads Answer here’s sources once: the bell reads them itself once you leave', async ({ page }) => {
+  const reads: string[] = []
+  const read = (name: string, json: unknown) => (route: Route) => { reads.push(name); return route.fulfill({ json }) }
+  const count = (name: string) => reads.filter((each) => each === name).length
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
+  await page.route('**/api/behaviors', read('behaviors', {}))
+  await page.route('**/api/behavior-chains**', read('chains', { chains: [], attention: [] }))
+  await page.route('**/api/chat/requests', read('requests', { revision: 1, complete: true, requests: [] }))
+  await page.route('**/api/chat/switchboard', read('switchboard', { revision: 1, items: [] }))
+  await page.route('**/api/editor/reviews', read('reviews', { publications: [{ slug: 'notes', openThreads: 1 }] }))
+  await page.route('**/api/editor/doc/notes/reviews', read('threads', { reviews: [] }))
+  await open(page, '/?view=overview')
+  // Overview has read its sources once it reads the threads it found open.
+  await expect.poll(() => count('threads')).toBe(1)
+  await expect.poll(() => [count('behaviors'), count('chains')]).toEqual([1, 1])
+  expect(count('reviews')).toBe(1)
+
+  await nav(page).getByRole('link', { name: 'Board' }).click()
+  await expect.poll(() => count('reviews')).toBe(2)
+  await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('1')
 })
 
 test('Claude’s subscription sits at the foot and the page makes room; updating dims the frame', async ({ page }) => {
