@@ -6,6 +6,8 @@
 // It deliberately knows nothing else: no git, no build, no network. A switch
 // or rollback is a pointer rewrite followed by a restart, and this file is
 // what makes the restart land on the pointer.
+// First: sizes libuv's thread pool before anything starts it.
+import './threadpool.mjs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { readJson } from './atomic.mjs'

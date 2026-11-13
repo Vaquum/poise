@@ -37,7 +37,9 @@ function setup(behavior: ChainBehavior | null = 'repair-pr', started = false) {
   if (behavior) chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original', behavior,
     actor: ['implement-issue', 'repair-pr'].includes(behavior) ? 'author' : 'reviewer', model: 'fixture', slot: 'primary',
     basis: 'original', admittedAt: NOW - 60_000, reservation: { memoryBytes: 8, diskBytes: 16 },
-    request: { command: 'agent-interface', cwd: '/isolated', argv: ['--atomic-work', 'aaa/repo#7', '--model', 'fixture'] } } })
+    request: { command: 'agent-interface', cwd: '/isolated', argv: behavior === 'review-pr' || behavior === 'approve-pr'
+      ? ['--pr-review', 'https://github.com/aaa/repo/pull/17', '--expected-head', HEAD, '--model', 'fixture']
+      : ['--atomic-work', 'aaa/repo#7', '--model', 'fixture'] } } })
   if (started) chain = record(journal, chain, { type: 'invocation.started', invocationId: 'original' })
   const calls: LogEntry[] = []
   const forbidden = vi.fn(async () => { throw new Error('closed work must not execute') })
@@ -162,7 +164,7 @@ it('keeps a running original and uncertain resource ownership until native settl
   const runtime = new BehaviorChainRuntime(journal, operations)
   await runtime.run()
   Object.assign(call, { status: 'failed', action: 'not_started', outcome: 'preflight_failed', head_sha: null,
-    error: 'original target closed before the provider ran', completed_at: new Date().toISOString() })
+    review_id: null, error: 'original target closed before the provider ran', completed_at: new Date().toISOString() })
   await runtime.run()
   expect(journal.liveModelInvocationCount()).toBe(1)
   expect(operations.observe).not.toHaveBeenCalled()

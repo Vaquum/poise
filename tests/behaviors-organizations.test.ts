@@ -186,6 +186,22 @@ describe('multiple organization behavior isolation', () => {
     })
   })
 
+  it('reads the ready accounts once per account for a health report, however many switches it checks', async () => {
+    const { behaviors: runtime } = await arrangeOrganizations()
+    for (const key of ['review-new-prs', 'approve-prs', 'merge-prs', 'rerun-grey-ci'] as const) await runtime.setEnabled(key, true)
+    const organizations = await import('../server/organizations')
+    const ready = vi.spyOn(organizations, 'readyOrganizations')
+    let reads = 0
+    try {
+      runtime.getBehaviorsRuntimeHealth()
+    } finally {
+      // Read before restoring: restoring a spy clears its calls.
+      reads = ready.mock.calls.length
+      ready.mockRestore()
+    }
+    expect(reads).toBeLessThanOrEqual(3)
+  })
+
   it('rejects freshness reported for a different database without affecting legacy health', async () => {
     const { behaviors: runtime, rows } = await arrangeOrganizations()
     await runtime.setEnabled('review-new-prs', true)

@@ -54,7 +54,7 @@ ownership, capacity, active/held work, sequence-checked Hold/Resume and
 paginated journal history. Notifications' Journal evidence action opens its
 recorded journal cursor there, including after reload. These are reads of the
 canonical chain journal, separate from Logging's diagnostics and their Work impact;
-they create no new Logging events or severity mapping. General keeps only chain
+they create no new Logging events. General keeps only chain
 preferences and guarded cutover controls.
 
 Column headers own the severity, time, source and exact identity filters. Columns selects optional workspace/account/repository/call/correlation/incident fields; an active filter keeps its field visible until cleared. Search and the event count remain in the native toolbar. Filters stay usable after a failed query.
@@ -85,6 +85,16 @@ unreadable associations show unknown. A failed workspace read leaves retained
 Logging evidence usable, including in service mode. Source severity and Count
 (retained event/occurrence count) keep their separate meanings. This annotation
 neither starts work nor changes execution or holds.
+For a new typed analysis handoff with positive no-submission evidence, the
+displayed severity is Warning only after a later admission for that original
+Call's same PR, head, review basis and slot, or its attributed substantive
+successor verdict. A changed head, green CI, an earlier or independent sibling
+review, or generic work progress cannot confirm the handoff. No successor,
+failed recovery, a current hold, uncertain publication or unavailable evidence
+keeps Error. The active blocker and next action remain visible. The retained
+source event stays Error: severity filters, counts and exports continue to use
+that immutable source severity. Refresh replaces the displayed work assessment;
+historical rows without typed no-submission proof remain unproven.
 For a verified merge with a pending native review obligation, the next action is
 to reconcile original pre-merge review evidence, including when a durable hold
 is retained. Resume cannot start a new review after merge.
@@ -214,6 +224,13 @@ erase that original failure; independent wrapper and invalid-output failures
 remain visible. Resolve uses Warning only for a confirmed no-action transient
 exit with a recorded safe retry. Uncertain outcomes, timeouts and policy
 refusals remain Errors. Separate attempts retain separate event IDs.
+Legacy approval batch reads and the final head check likewise retain one Error
+per failed child after recording the scheduler consequence. The fixed primitive,
+phase, checked targets, available expected heads, correlation, original process
+timing/result and recorded retry state travel together. Two failed children
+remain separate even within one sweep correlation; cancellation or failed retry
+bookkeeping cannot erase either cause. These diagnostics do not change backoff,
+launch progress or the exact-head publication checks.
 JavaScript DOMException identity and numeric code are retained in context as
 `exceptionName` and `exceptionCode`, with no process `exitCode`. Actual subprocess
 exit codes remain process evidence, even when the same number names an exception.
@@ -437,11 +454,15 @@ reaches its ten-second deadline, including pending runtime/HTTP phases and known
 rejection causes. `pendingPhases` also names unresolved runtime stops, such as
 `runtime_stop.agent_collaborator`, including the later ledger and Logging stops.
 It commits through the same independent diagnostic store before
-exit 1, including after runtime teardown has stopped Logging. The supervisor
-can also record a generic exit event for the same shutdown. Logging retains
-those events after a healthy successor starts. The current supervisor provides
-no per-launch shutdown match: the same release and nearby timestamps alone never
-downgrade an exit Error. Clean update exits (75) stay quiet.
+exit 1, including after runtime teardown has stopped Logging. Each supervisor
+spawn overrides `POISE_SHUTDOWN_DIAGNOSTIC_ID` with a fresh launch ID. Only a
+read-only lookup confirming that exact normalized event ID, owner, release and
+shutdown Error permits a distinct `workspace.exit` Warning. Both records use
+the launch ID as `correlationId`; the Error retains the shutdown cause and the
+Warning retains the supervisor's actual exit code and signal. Missing,
+unavailable or mismatched records leave an independent exit Error, and lookup
+failure does not change supervision. Logging retains those events after a
+healthy successor starts. Clean update exits (75) stay quiet.
 
 Container discovery includes stopped containers and removes checkpoints only for absent container IDs; retained events survive that cleanup. Operator ingress deduplicates exact record replays, while separate records sharing a request ID retain distinct occurrence IDs. Bootstrap line capture keeps folded credential-header state across child output chunks before reporting or persistence.
 

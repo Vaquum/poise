@@ -660,9 +660,15 @@ def finish(
             error = "Stopped by user" if error_code == "stopped" else prior_cause["error"]
             action, outcome = None, None
         persisted = False
+        previous_path = None
         if response:
             prior = conn.execute("select behavior,artifact,response_path from calls where id=?", (id_,)).fetchone()
             artifact = json.loads(prior["artifact"] or "{}") if prior else {}
+            previous_path = prior["response_path"] if prior else None
+            if prior and prior["behavior"] in {"pr_review", "pr_approve"} and prior["response_path"]:
+                retained = caller_store.response(Path(prior["response_path"]), RESPONSES).read_text()
+                if not response.startswith(retained):
+                    response = retained + "\n" + response
             if prior and prior["behavior"] in {"native_action", "native_publication"} \
                     and prior["response_path"] == path and artifact.get("response_sha") == hashlib.sha256(response.encode()).hexdigest():
                 if caller_store.response(Path(path), RESPONSES).read_text() != response:
@@ -679,13 +685,14 @@ def finish(
                 return float(row["ended_at"])
     if response and changed == 1 and not persisted:
         try:
-            caller_store.response(Path(path), RESPONSES).write_text(response)
+            caller_store.write_response_text(Path(path), RESPONSES, response)
         except OSError as persist_error:
             # The row is terminal; a response persistence failure must not
-            # reopen it. Clear the dangling path and retain the cause.
+            # reopen it. Keep an already-retained response readable and retain
+            # the cause.
             with db() as conn:
-                conn.execute("update calls set response_path=null, diagnostic=coalesce(diagnostic, ?) where id=?",
-                             (json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
+                conn.execute("update calls set response_path=?, diagnostic=coalesce(diagnostic, ?) where id=?",
+                             (previous_path, json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
                                                              outcome="persist_failed",
                                                              stderr=str(persist_error)[:500], call_id=id_)), id_))
     return ended_at
@@ -834,12 +841,14 @@ def _decode_history_text(value: bytes) -> object:
         return _UNREADABLE_LOG_TEXT
 
 
-def logs(status: str | None = None):
+def logs(status: str | None = None, without_progress: bool = False):
     """Every retained call, oldest first; with status, only the running ones.
 
     The running-only read is indexed on (status, started_at), so retained
     history does not raise its cost. Full history quarantines unreadable rows.
-    Use logs_page for bounded history."""
+    Use logs_page for bounded history. Without progress, full history leaves
+    out each call's progress events, the largest field, which only a call's
+    own view shows (its page, its id or the running read)."""
     if status is not None and status != "running":
         raise ValueError("logs status filter must be running")
     reap_interrupted()
@@ -852,7 +861,11 @@ def logs(status: str | None = None):
         ).fetchall()
     if status:
         return [{**_log_row(row), "history_rowid": str(row["rowid"])} for row in rows]
-    return [_full_history_log_row(row) for row in rows]
+    history = [_full_history_log_row(row) for row in rows]
+    if without_progress:
+        for entry in history:
+            entry.pop("progress", None)
+    return history
 
 
 LOGS_PAGE_LIMIT_MAX = 1000
@@ -1657,8 +1670,10 @@ def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
     # These durable phases precede the controlled GitHub publication path.
     # An admitted/submitting request is deliberately excluded even when its
     # response was lost. Resource settlement is an independent prerequisite.
+    # PR deadlines keep the governed completion's inventory-validated result.
     conn.execute("update calls set action='not_started', outcome='preflight_failed', head_sha=null "
                  "where id=? and source='poise:behavior-chain' and status='failed' and resources_settled_at is not null and "
+                 "(behavior not in ('pr_review','pr_approve') or coalesce(error_code,'') != 'review_budget_exhausted') and "
                  "coalesce(error_code,'') not in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable') and "
                  "json_valid(artifact) and (json_extract(artifact,'$.phase') in ('preparing','prepared','executing','reviewing','preparing_publication') "
                  "or (action_plan is null and behavior in ('issue_review','implement_issue','repair_pr')))",
@@ -2156,6 +2171,23 @@ def _repeat_only_refusal(failure: BaseException) -> bool:
             and diagnostic.get("refusal") == "repeat_only")
 
 
+def _pre_post_no_action_proof(call_id: str, failure: review_budget.ReviewLimitError, receipt: dict | None,
+                              capped: bool) -> bool:
+    # Capped approvals can also file an issue outside this inventory.
+    if failure.code != "review_budget_exhausted" or receipt is not None or capped:
+        return False
+    with db() as conn:
+        original = conn.execute("select artifact,review_id,receipts,head_sha from calls where id=?",
+                                (call_id,)).fetchone()
+    # The durable pre-POST phase, not a diagnostic alone, proves
+    # that this invocation never attempted publication.
+    return (original is not None
+            and json.loads(original["artifact"] or "{}").get("phase") == "reviewing"
+            and all(original[key] is None for key in ("review_id", "receipts", "head_sha"))
+            and not review_receipt.failure() and not review_receipt.conflict()
+            and (failure.diagnostic or {}).get("submission") in {None, "none"})
+
+
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
                               capped=False, review_round=None, review_cap=None, review_scope=""):
     # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
@@ -2185,7 +2217,9 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         try:
             facts = review_facts(mod, pr, pwd, actor, head, 0)
             receipt = review_receipt.get()
-            proven = receipt is None and _proven_no_action(failure)
+            deadline_no_action = _pre_post_no_action_proof(call_id, failure, receipt, capped)
+            proven = receipt is None and (deadline_no_action if failure.code == "review_budget_exhausted"
+                                         else _proven_no_action(failure))
             # A re-verdict submits anew: even proven no-action needs the
             # quiet-inventory proof so recovery cannot create a duplicate.
             # Adoption stays skipped — nothing found can be this run's.
@@ -2196,7 +2230,7 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                 return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
                                                        receipt=receipt, call_id=call_id, prior_error=str(failure),
                                                        prior_code=failure.code, proven_no_action=proven)
-            if not proven or reverdict:
+            if not proven or reverdict or deadline_no_action:
                 own = own_reviews(before, facts, receipt, call_id, proven_no_action=proven)
                 if not proven:
                     if own is None:
@@ -2218,6 +2252,17 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                 if own is None and (_count(facts, "reviewer_reviews_since") != _count(before, "reviewer_reviews_since")
                         or facts.get("reviewer_latest_any_review_id") != before.get("reviewer_latest_any_review_id")):
                     raise RuntimeError("review activity changed without matching counters")
+                if deadline_no_action:
+                    earlier, later = _review_items(before), _review_items(facts)
+                    counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
+                    if (earlier is None or later is None or earlier != later
+                            or any(_count(snapshot, "reviewer_reviews_since") != len(items)
+                                   or len({item["id"] for item in items}) != len(items)
+                                   for snapshot, items in ((before, earlier), (facts, later)))
+                            or any(_count(facts, key) != _count(before, key) for key in counts)
+                            or "reviewer_latest_any_review_id" not in before or "reviewer_latest_any_review_id" not in facts
+                            or facts["reviewer_latest_any_review_id"] != before["reviewer_latest_any_review_id"]):
+                        raise RuntimeError("review deadline requires complete, quiet publication inventory")
             # A proven no-action run posted nothing: a later review is another
             # request's, never this run's recovery. The failure stands verbatim.
         except review_budget.ReviewLimitError as typed:
@@ -2231,6 +2276,8 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         except Exception as verification:
             raise review_budget.ReviewLimitError(
                 f"{failure}; could not prove a safe recovery: {verification}", failure.code, failure.diagnostic) from verification
+        if deadline_no_action:
+            raise atoms.AgentPreflightError(str(failure), failure.code, failure.diagnostic) from failure
         # Invalid approval verdicts get one fresh attempt by the admitted
         # model. Other recoverable failures retain their different-model path.
         # None of these replay an uncertain write.
@@ -2242,6 +2289,11 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         try:
             review_budget.timeout(seconds, reserve=review_budget.FINAL_CHECK_SECONDS)
         except review_budget.ReviewLimitError as exhausted:
+            # Quiet verification already authorized a retry; a budget
+            # exhaustion then defers it to backoff instead of recovery.
+            if _pre_post_no_action_proof(call_id, exhausted, receipt, capped):
+                message = f"{exhausted}; prior: {failure}" if verdict_failure else str(exhausted)
+                raise atoms.AgentPreflightError(message, exhausted.code, exhausted.diagnostic) from exhausted
             if verdict_failure:
                 raise review_budget.ReviewLimitError(
                     f"{exhausted}; prior: {failure}", exhausted.code, exhausted.diagnostic) from exhausted
@@ -2816,6 +2868,7 @@ behaviors:
   --logs --id CALL_ID
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
+  --logs --without-progress
   --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
   --diagnostics [after-sequence] [limit-1..10]
   --stop CALL_ID
@@ -3065,6 +3118,9 @@ def _main():
             except ValueError as error:
                 usage(error=str(error))
             print(json.dumps(selected, separators=(",", ":")))
+            return
+        if sys.argv[2:] == ["--without-progress"]:
+            print(json.dumps(logs(without_progress=True), separators=(",", ":")))
             return
         if len(sys.argv) == 4 and sys.argv[2] == "--select":
             try:

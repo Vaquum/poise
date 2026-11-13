@@ -15,7 +15,7 @@ import { effectiveTimezone, midnightInZone } from '../../../config'
 import { TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../../../time-range'
 import {
   LOGGING_LEVELS, LOGGING_SOURCES, LoggingApiError, loggingAccess, loggingCallId, loggingErrorBounds, loggingEvent, loggingExport, loggingHealth,
-  loggingPage, loggingParameters, loggingPullRequest, loggingWorkImpacts, parseLoggingLink, subscribeDiagnosticRefresh,
+  loggingPage, loggingParameters, loggingPullRequest, loggingSeverity, loggingWorkImpacts, parseLoggingLink, subscribeDiagnosticRefresh,
   type LoggingAccess, type LoggingEvent, type LoggingHealth, type LoggingLink, type LoggingPage, type LoggingQuery, type LoggingWorkImpact,
 } from '../../../logging'
 import { readLoggingTime } from '../../../../gateway/src/diagnostics/query-time'
@@ -340,7 +340,10 @@ export function createLogging(ctx: PartContext): ObservePart {
       const summary = work ? [work.impact, work.target, work.stage].filter(Boolean).join(' · ') : 'unknown'
       return `<td class="lg-c-impact${work ? ` is-${work.impact}` : ' dim'}" title="${esc(summary)}" data-ref="lg.impact">${esc(summary)}</td>`
     }
-    if (key === 'severity') return `<td class="lg-c-severity"><span class="sev is-${event.severity}" data-ref="lg.severity">${label(event.severity)}</span></td>`
+    if (key === 'severity') {
+      const severity = loggingSeverity(event, impacts.get(event.id)?.value)
+      return `<td class="lg-c-severity"><span class="sev is-${severity}" data-ref="lg.severity">${label(severity)}</span></td>`
+    }
     if (key === 'source') return `<td class="lg-c-source" data-ref="lg.source">${esc(event.source)}</td>`
     if (key === 'occurrences') return `<td class="num" title="Retained occurrences in this incident">${(event.occurrences ?? 0).toLocaleString('en-US')}</td>`
     const value = String(event[key as keyof LoggingEvent] ?? '') || '—'
