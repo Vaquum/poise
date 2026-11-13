@@ -1701,6 +1701,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
 
     previous_sigterm = signal.signal(signal.SIGTERM, review_watch_interrupted)
     failure = None
+    failure_message = None
     try:
         with review_budget.ReviewBudget(issue_review.TIMEOUT_SECONDS, cap=issue_review.TIMEOUT_SECONDS), \
                 progress.Progress(DB, id_, "preparing_issue", "Preparing an atomic behavior"), \
@@ -1716,7 +1717,11 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                         trip = _retained_account_signal(original_error) or _retained_rate_limit_signal(original_error)
                         if trip:
                             failure["message"] = atoms.bounded_cause(f"{trip}: {failure['message']}")
-                        failure = retain_native_failure(id_, error, diagnostic=failure)
+                        failure_message = failure["message"]
+                    else:
+                        failure = error.diagnostic
+                        failure_message = str(error)[:2000]
+                    failure = retain_native_failure(id_, error, diagnostic=failure)
                     raise
             outcome = result.get("outcome")
             if outcome not in {"published", "no_changes", "superseded"}:
@@ -1735,7 +1740,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
             row = conn.execute("select error_code from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
         no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline"}
-        finish(id_, "failed", error="Stopped by user" if stopped else failure["message"] if failure else str(error)[:2000] or INTERRUPTED_ERROR,
+        finish(id_, "failed", error="Stopped by user" if stopped else failure_message or str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
                action="not_started" if no_publication else None,
                outcome="preflight_failed" if no_publication else None,

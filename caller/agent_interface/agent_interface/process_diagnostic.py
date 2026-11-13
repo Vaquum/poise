@@ -1,25 +1,50 @@
 """Read only the versioned, redacted diagnostic envelope from github-interface."""
 import errno
 import json
+import math
 import os
 import re
 import subprocess
 from datetime import datetime, timezone
 
 PREFIX = "caller_diagnostic: "
+CONTEXT_FIELDS = ("event_time", "executable", "resolved_executable", "cwd", "pid", "exit_code", "signal", "timeout_seconds", "errno",
+                  "elapsed_ms", "message", "workspace", "container", "release", "repository", "pr", "expected_head", "observed_head",
+                  "base_sha", "merge_base_sha", "call_id", "correlation_id", "reviewer", "behavior", "submission", "refusal")
+FILESYSTEM_FIELDS = ("path", "free_bytes", "total_bytes", "free_inodes", "total_inodes", "measured_at", "measurement_error")
 
 
 def diagnostic_from_stderr(stderr: str, phase: str) -> dict | None:
     for line in stderr.splitlines():
         if not line.startswith(PREFIX):
             continue
-        value = json.loads(line[len(PREFIX):])
-        if (not isinstance(value, dict) or value.get("version") != 1
+        if len(line.encode()) > 128 * 1024:
+            return None
+        try:
+            value = json.loads(line[len(PREFIX):])
+        except (ValueError, RecursionError):
+            return None
+        if (not isinstance(value, dict) or type(value.get("version")) is not int or value.get("version") != 1
                 or value.get("source") != "caller" or value.get("severity") != "error"
                 or not isinstance(value.get("operation"), str) or not isinstance(value.get("stderr"), str)
-                or len(line.encode()) > 128 * 1024):
-            raise ValueError("invalid Caller process diagnostic")
-        return {**value, "phase": phase}
+                or value.get("message") is not None and not isinstance(value["message"], str)
+                or value.get("outcome") is not None and not isinstance(value["outcome"], str)
+                or value.get("stderr_truncated") is not None and type(value["stderr_truncated"]) is not bool):
+            return None
+        filesystem = value.get("filesystem")
+        if filesystem is not None and not isinstance(filesystem, dict):
+            return None
+        try:
+            for row, keys in ((value, CONTEXT_FIELDS), (filesystem or {}, FILESYSTEM_FIELDS)):
+                if any(item is not None and not isinstance(item, str)
+                       and not (type(item) in (int, float) and math.isfinite(item))
+                       for item in (row.get(key) for key in keys)):
+                    return None
+        except OverflowError:
+            return None
+        fields = ("version", "source", "severity", "operation", "outcome", "stderr", "stderr_truncated", *CONTEXT_FIELDS)
+        return {**{key: value[key] for key in fields if key in value}, "phase": phase,
+                "filesystem": {key: filesystem[key] for key in FILESYSTEM_FIELDS if key in filesystem} if filesystem is not None else None}
     return None
 
 
