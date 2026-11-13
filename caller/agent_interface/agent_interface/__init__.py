@@ -663,6 +663,10 @@ def finish(
         if response:
             prior = conn.execute("select behavior,artifact,response_path from calls where id=?", (id_,)).fetchone()
             artifact = json.loads(prior["artifact"] or "{}") if prior else {}
+            if prior and prior["behavior"] in {"pr_review", "pr_approve"} and prior["response_path"]:
+                retained = caller_store.response(Path(prior["response_path"]), RESPONSES).read_text()
+                if not response.startswith(retained):
+                    response = retained + "\n" + response
             if prior and prior["behavior"] in {"native_action", "native_publication"} \
                     and prior["response_path"] == path and artifact.get("response_sha") == hashlib.sha256(response.encode()).hexdigest():
                 if caller_store.response(Path(path), RESPONSES).read_text() != response:

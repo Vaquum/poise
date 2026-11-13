@@ -839,7 +839,7 @@ class TestSincePositions(TestCase):
                                          self._full(self.REMOVAL))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                      "a" * 40, "p2", since_head=None)
+                                      "a" * 40, "p2", since_head=None, reserve=120)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
@@ -926,7 +926,7 @@ class TestSincePositions(TestCase):
         result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(full))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                      "a" * 40, "p2", since_head=None)
+                                      "a" * 40, "p2", since_head=None, reserve=120)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
@@ -1137,7 +1137,7 @@ class TestSincePositions(TestCase):
                 result, _, fetch = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
                 self.assertIn('"review_id": 91', result)
                 fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                              "a" * 40, priority, since_head=None)
+                                              "a" * 40, priority, since_head=None, reserve=120)
 
     def test_missing_priority_fails_closed_without_fetch_or_submit(self):
         verdict = {"assessment": ASSESSMENT, "action": "request_changes",
@@ -1179,7 +1179,7 @@ class TestSincePositions(TestCase):
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         full = self._full(self.REMOVAL)
 
-        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None):
+        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None, *, reserve=0):
             atoms._priority(p)
             return full
 
