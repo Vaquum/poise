@@ -6,11 +6,15 @@ never retried by creating a second branch or pull request.
 import asyncio
 import base64
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
 
+import httpx
+
 from github_interface.atoms.local import _run, checkout_repo
+from github_interface.atoms.process_diagnostic import STDERR_BYTES, redact
 from github_interface.atoms.pulls import get_pull
 from github_interface.atoms.review_identity import work_publication
 from github_interface.client import GitHubClient
@@ -105,7 +109,38 @@ async def review_replies(client: GitHubClient, target: str, pull: int, actor: st
     return receipts
 
 
+def failure_diagnostic(error: Exception, mode: str, token: str | None = None) -> dict:
+    env = dict(os.environ)
+    if isinstance(token, str):
+        env["GITHUB_INTERFACE_TOKEN"] = token
+    request_error = error if isinstance(error, httpx.HTTPError) else error.__cause__
+    try:
+        request = request_error.request if isinstance(request_error, (httpx.RequestError, httpx.HTTPStatusError)) else None
+    except RuntimeError:
+        # Standalone transport errors can lack an attached request.
+        request = None
+    check = f"{request.method} {request.url.path}: " if request else ""
+    cause = redact(check + (str(error) or type(error).__name__), env).encode("utf-8")
+    return {
+        "version": 1, "source": "caller", "severity": "error", "operation": f"issue_work.{mode}",
+        "phase": "issue_work", "outcome": "refused" if isinstance(error, ValueError) else "exception",
+        "stderr": cause[:STDERR_BYTES].decode("utf-8", errors="replace"), "stderr_truncated": len(cause) > STDERR_BYTES,
+    }
+
+
 async def run(client: GitHubClient, payload: dict) -> dict:
+    try:
+        return await _issue_work(client, payload)
+    except (RuntimeError, ValueError, httpx.HTTPError, KeyError, TypeError) as error:
+        if getattr(error, "diagnostic", None):
+            raise
+        diagnostic = failure_diagnostic(error, str(payload.get("mode") or ""), client.token)
+        failure = (ValueError if isinstance(error, ValueError) else RuntimeError)(diagnostic["stderr"])
+        failure.diagnostic = diagnostic
+        raise failure from error
+
+
+async def _issue_work(client: GitHubClient, payload: dict) -> dict:
     owner, repo = repository(payload)
     number = str(payload.get("issue", "")).lstrip("#")
     branch = str(payload.get("branch") or "")
@@ -227,14 +262,25 @@ async def run(client: GitHubClient, payload: dict) -> dict:
         return {**result, "outcome": "closed", "state": "closed", "coverage": verified}
     if result["existing_pulls"]:
         raise ValueError("seed issue already has another open pull request; its existing owner must continue")
+    expected = str(payload.get("expected_head") or "").lower()
+    if mode in {"validate", "publish"} and pull is not None and (pull.get("merged") or pull.get("merged_at")):
+        merged_head = (pull.get("head") or {}).get("sha")
+        if pull_number is None or pull.get("number") != pull_number or pull.get("state") != "closed" \
+                or pull.get("merged") is not True or not isinstance(pull.get("merged_at"), str) or not pull["merged_at"] \
+                or not SHA.fullmatch(str(pull.get("merge_commit_sha") or "")) \
+                or not SHA.fullmatch(expected) or merged_head != expected \
+                or str(payload.get("starting_head") or "").lower() != expected or remote_head not in (None, merged_head):
+            raise ValueError("same-head merge check lacks consistent evidence for the original repair")
+        # The branch may already be deleted. The owned PR retains its verified
+        # head, which Caller needs to decode and settle this no-write receipt.
+        return {**result, "outcome": "superseded", "head_sha": merged_head, "merged": True}
     issue = await client.get(f"/repos/{target}/issues/{issue_number}")
     if issue.get("state") != "open" or "pull_request" in issue:
         raise ValueError("behavior chain seed is no longer an open issue")
-    expected = str(payload.get("expected_head") or "")
+    if pull is not None and (pull.get("state") != "open" or pull.get("merged_at") or pull.get("merged")):
+        raise ValueError("behavior chain pull request is no longer open")
     if expected and (not SHA.fullmatch(expected) or expected.lower() != str(remote_head).lower()):
         return {**result, "outcome": "superseded"}
-    if pull is not None and (pull.get("state") != "open" or pull.get("merged_at")):
-        raise ValueError("behavior chain pull request is no longer open")
     if mode == "complete":
         call_id = str(payload.get("invocation_id") or "")
         title, body = str(payload.get("title") or ""), str(payload.get("body") or "")

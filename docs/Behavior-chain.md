@@ -477,6 +477,14 @@ The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
 PR titles, issue-closing references or reply targets fail as unstarted work,
 rather than becoming ambiguous writes that never occurred.
+Validation and publication both return the existing no-write `superseded`
+outcome when GitHub confirms that the original owned PR merged at the repair's
+unchanged head, before rejecting a closed seed. The receipt retains the verified
+PR head even after branch deletion. The existing chain settles it only after
+resource release and records the observed merge. Unverified closures,
+ownership mismatches, contradictory evidence and unavailable reads remain
+errors with bounded, redacted v1 `caller_diagnostic` evidence identifying the
+failed check; arbitrary stderr remains inadmissible.
 After retaining the atomic plan, Caller records `preparing_publication` until
 the publication helper durably changes it to `publishing` before push or replies.
 A failed original still at that no-write checkpoint can become

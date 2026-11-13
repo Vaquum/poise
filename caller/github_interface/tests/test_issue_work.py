@@ -3,6 +3,8 @@ import json
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 from github_interface.behaviors import pr_review
 from github_interface.behaviors.issue_work import confirmed_pull, publication_body, publication_metadata, review_replies, run
 from github_interface.client import GitHubClient
@@ -108,6 +110,96 @@ class IssueOwnership(IsolatedAsyncioTestCase):
                 patch('github_interface.behaviors.issue_work.checkout_repo') as checkout:
             await run(self.client, {**self.payload, "mode": "prepare", "path": "/unused"})
         checkout.assert_not_called()
+
+
+class MergedRepair(IsolatedAsyncioTestCase):
+    async def test_same_head_merge_is_read_only_before_closed_seed_rejection_even_without_branch(self):
+        head = "b" * 40
+        pull = {"number": 3, "state": "closed", "merged": True, "merged_at": "2026-11-13T20:51:13Z",
+                "merge_commit_sha": "d" * 40, "user": {"login": "author"},
+                "body": "<!-- poise-chain example/repo#7 -->",
+                "head": {"ref": "poise/issue-7", "sha": head, "repo": {"full_name": "example/repo"}}}
+        payload = {"repository": "example/repo", "token_user": "author", "issue": 7,
+                   "branch": "poise/issue-7", "pull_number": 3, "expected_head": head, "starting_head": head,
+                   "replies_json": '[{"commentId":17,"body":"Completed repair answer."}]'}
+        for mode in ("validate", "publish"):
+            for deleted in (False, True):
+                with self.subTest(mode=mode, deleted=deleted):
+                    client = AsyncMock(token="private-token")
+                    client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"}, pull]
+                    client.paginate.side_effect = [[pull], []]
+                    client.graphql.return_value = {"repository": {
+                        "ref": None if deleted else {"target": {"oid": head, "message": "Original head"}},
+                        "defaultBranchRef": {"target": {"oid": "d" * 40}},
+                        "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+                    with patch('github_interface.behaviors.issue_work._run') as git, \
+                            patch('github_interface.behaviors.issue_work.checkout_repo') as checkout, \
+                            patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
+                        result = await run(client, {**payload, "mode": mode})
+                    self.assertEqual((result["outcome"], result["head_sha"], result["merged"], result["merge_sha"]),
+                                     ("superseded", head, True, "d" * 40))
+                    git.assert_not_called()
+                    checkout.assert_not_called()
+                    checkpoint.assert_not_called()
+                    client.post.assert_not_awaited()
+                    client.patch.assert_not_awaited()
+                    self.assertNotIn("/repos/example/repo/issues/7", [call.args[0] for call in client.get.call_args_list])
+
+    async def test_closure_without_merge_ownership_or_consistent_same_head_proof_remains_an_error(self):
+        head = "b" * 40
+        pull = {"number": 3, "state": "closed", "merged": True, "merged_at": "2026-11-13T20:51:13Z",
+                "merge_commit_sha": "d" * 40, "user": {"login": "author"},
+                "body": "<!-- poise-chain example/repo#7 -->",
+                "head": {"ref": "poise/issue-7", "sha": head, "repo": {"full_name": "example/repo"}}}
+        payload = {"repository": "example/repo", "token_user": "author", "issue": 7,
+                   "branch": "poise/issue-7", "pull_number": 3, "expected_head": head, "starting_head": head}
+        cases = [
+            ({"merged": False, "merged_at": None}, {}),  # A merge SHA alone proves nothing.
+            ({"merged": False}, {}), ({"merged": None}, {}), ({"merged_at": None}, {}),
+            ({"merge_commit_sha": None}, {}), ({"state": "open"}, {}), ({"number": 4}, {}),
+            ({"user": {"login": "someone-else"}}, {}), ({"body": "Unowned PR"}, {}),
+            ({"head": {**pull["head"], "repo": {"full_name": "other/repo"}}}, {}),
+            ({"head": {**pull["head"], "ref": "other-branch"}}, {}),
+            ({}, {"expected_head": "c" * 40}), ({}, {"starting_head": "c" * 40}),
+            ({}, {"expected_head": ""}), ({}, {"starting_head": ""}),
+        ]
+        for mode, seed_state in (("validate", "open"), ("publish", "closed")):
+            for changed, arguments, remote in [(changed, arguments, None) for changed, arguments in cases] + [({}, {}, "c" * 40)]:
+                with self.subTest(mode=mode, changed=changed, arguments=arguments):
+                    client = AsyncMock(token="private-token")
+                    client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"},
+                                              {**pull, **changed}, {"state": seed_state}]
+                    client.paginate.side_effect = [[], []]
+                    client.graphql.return_value = {"repository": {"ref": {"target": {"oid": remote}} if remote else None,
+                        "defaultBranchRef": {"target": {"oid": "d" * 40}},
+                        "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+                    with patch('github_interface.behaviors.issue_work._run') as git, \
+                            patch('github_interface.behaviors.issue_work.work_publication') as checkpoint, \
+                            self.assertRaises(ValueError) as caught:
+                        await run(client, {**payload, "mode": mode, **arguments})
+                    self.assertEqual(caught.exception.diagnostic["operation"], f"issue_work.{mode}")
+                    self.assertEqual(caught.exception.diagnostic["outcome"], "refused")
+                    self.assertTrue(caught.exception.diagnostic["stderr"])
+                    git.assert_not_called()
+                    checkpoint.assert_not_called()
+                    client.post.assert_not_awaited()
+                    client.patch.assert_not_awaited()
+
+    async def test_failed_github_read_identifies_the_request_and_redacts_before_bounding(self):
+        client = AsyncMock(token="private-token")
+        request = httpx.Request("GET", "https://api.github.com/repos/example/repo")
+        client.get.side_effect = httpx.ReadError("private-token ghp_hiddenkey unavailable " + "x" * 20_000, request=request)
+        with self.assertRaises(RuntimeError) as caught:
+            await run(client, {"repository": "example/repo", "token_user": "author", "issue": 7,
+                               "branch": "poise/issue-7", "mode": "validate"})
+        diagnostic = caught.exception.diagnostic
+        self.assertTrue(diagnostic["stderr_truncated"])
+        self.assertLessEqual(len(diagnostic["stderr"].encode()), 16 * 1024)
+        self.assertIn("GET /repos/example/repo", diagnostic["stderr"])
+        self.assertIn("unavailable", diagnostic["stderr"])
+        for secret in ("private-token", "ghp_hiddenkey"):
+            self.assertNotIn(secret, str(caught.exception))
+            self.assertNotIn(secret, json.dumps(diagnostic))
 
 
 class ReviewReplyReceipts(IsolatedAsyncioTestCase):
