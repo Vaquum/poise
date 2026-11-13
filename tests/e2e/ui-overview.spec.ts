@@ -42,6 +42,8 @@ interface Workspace {
   dismissed?: unknown[]
   /** Every POST that could act on the chain. */
   chainActions?: unknown[]
+  /** Behaviors' agent log error, a diagnostic with no time of its own. */
+  agentLogsError?: string | null
   /** Review publications and each document's threads; a reply appends to its thread. */
   publications?: unknown[]
   threads?: Record<string, { id: string, messages: { author: string, body: string, createdAt: string }[] }[]>
@@ -107,8 +109,13 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       workspace.dismissals = [{ key: body.key, revision: body.revision, at: new Date().toISOString() }, ...(workspace.dismissals ?? []).filter((row) => row.key !== body.key)]
       return json(route, { dismissals: workspace.dismissals })
     }
+    if (path === '/api/answers/dismissals/forget' && method === 'POST') {
+      const { keys } = route.request().postDataJSON() as { keys: string[] }
+      workspace.dismissals = (workspace.dismissals ?? []).filter((row) => !keys.includes(row.key))
+      return json(route, { dismissals: workspace.dismissals })
+    }
     if (path === '/api/answers/dismissals') return json(route, { dismissals: workspace.dismissals ?? [] })
-    if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
+    if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: workspace.agentLogsError ?? null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
     if (path === '/api/settings' && method === 'GET') return json(route, { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
     if (path === '/api/analytics') return json(route, { window: { since: url.searchParams.get('since'), until: url.searchParams.get('until') }, agentAccount: 'bot', ...day, ...(url.searchParams.get('dailyBounds') ? { daily: Array.from({ length: 7 }, () => day) } : {}), errors: [] })
     if (path === '/api/analytics/history') {
@@ -328,6 +335,26 @@ test('Answer here lists the newest first, and every card can be put away without
   // Putting it away sent nothing to any chat and resumed nothing.
   expect(socket.frames.map((frame) => frame.command.type).filter((type) => /respond|answer|resume|message|send|prompt/i.test(String(type)))).toEqual([])
   expect(workspace.chainActions ?? []).toEqual([])
+})
+
+test('a put-away diagnostic with no time of its own shows again when it recurs after clearing (#1379)', async ({ page }) => {
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, agentLogsError: 'agent-interface --logs failed: database is locked' }
+  await open(page, workspace)
+  const card = answers(page).locator('[data-notice^="diagnostic:"]')
+  await expect(card).toHaveCount(1)
+  await card.getByRole('button', { name: 'Dismiss' }).click()
+  await expect.poll(() => workspace.dismissals?.length ?? 0, { timeout: 12_000 }).toBe(1)
+  await page.mouse.move(1000, 600)
+  await expect(card).toHaveCount(0)
+  const reread = () => page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  // It clears: its dismissal is forgotten.
+  workspace.agentLogsError = null
+  await reread()
+  await expect.poll(() => workspace.dismissals?.length ?? 0, { timeout: 15_000 }).toBe(0)
+  // It happens again, word for word: it shows again.
+  workspace.agentLogsError = 'agent-interface --logs failed: database is locked'
+  await reread()
+  await expect(card).toHaveCount(1, { timeout: 15_000 })
 })
 
 test('a review thread answered here stays settled though the reply changes what it reports (#1379)', async ({ page }) => {

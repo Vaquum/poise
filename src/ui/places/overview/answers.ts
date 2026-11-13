@@ -523,7 +523,11 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const hidden = new Set(foldWaiting(itemEntries(notificationItems([], getBehaviorDiagnostics(), Date.now(), []), options.role, chains)).map((entry) => entry.id))
     const keys = [...dismissals.data.keys()].filter((key) => key.startsWith('diagnostic:') && !listed.has(key) && !hidden.has(key) && !forgetting.has(key)).slice(0, 200)
     if (!keys.length) return
-    for (const key of keys) forgetting.add(key)
+    // Gone from its source, it leaves this tab's settled list too, so a recurrence shows.
+    for (const key of keys) {
+      forgetting.add(key)
+      if (!holds.has(key)) { done.delete(key); progress.delete(key) }
+    }
     void json<{ dismissals?: { key: string, revision: string }[] }>('/api/answers/dismissals/forget', { method: 'POST', body: JSON.stringify({ keys }) })
       .then(acceptDismissals, () => undefined).finally(() => { for (const key of keys) forgetting.delete(key) })
   }
