@@ -8,7 +8,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, ReviewScopeIndexingError, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
-import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, setRepairReportRepositories } from '../server/behavior-chain-report'
+import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, setRepairReportRepositories } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
 import { nativeRequestSha } from '../server/behavior-chain-action'
 import { behaviorChainWorkImpact } from '../server/behavior-chain-summary'
@@ -979,6 +979,33 @@ it('reports three native PR review budget failures once and preserves the source
   await runtime.run()
   expect(posts()).toHaveLength(1)
   expect(journal.read(source.id)).toMatchObject({ held: source.held, resumedAfterSequence: 0, invocations: source.invocations })
+})
+
+it('shares an existing review report between legacy and v2 owners', async () => {
+  const { db, journal } = setup()
+  const source = record(journal, await exhaustedReviews(journal), { type: 'chain.observed', observation: fresh })
+  await operations(db, journal).reportHold!(source)
+  expect(posts()).toHaveLength(1)
+  const hold = journal.read(source.id)
+  const legacy = { repository: source.repository, pull: 21, author: source.author, reviewer: source.reviewer,
+    behavior: 'review-new-prs' as const, target: 'acme/repo#21', head: HEAD, slot: 'primary', heldAt: NOW, attempts: [] }
+  expect(await reportLegacyReviewTimeout(db, journal, legacy, async () => false, () => true))
+    .toContain('https://github.com/acme/repo/issues/99')
+  // A report created by legacy has the PR identity rather than the chain seed.
+  const stored = reports(db)[0]
+  const report = JSON.parse(stored.value)
+  db.prepare('DELETE FROM meta WHERE key = ?').run(`behavior_chain_repair_report:${report.key}`)
+  report.source = 'acme/repo#21'
+  report.key = chainBasis(['review_budget_exhausted', report.source, 21])
+  remote[0].body = remote[0].body.replace(/<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/,
+    `<!-- poise-repair-exhaustion:${report.key} -->`)
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run(`behavior_chain_repair_report:${report.key}`, JSON.stringify(report))
+  await operations(db, journal).reportHold!(source)
+  journal.rebuild()
+  await operations(db, journal).reportHold!(journal.read(source.id)!)
+  expect(posts()).toHaveLength(1)
+  expect(reports(db)).toHaveLength(1)
+  expect(journal.read(source.id)).toEqual(hold)
 })
 
 it('reports mixed native PR review timeouts after Resume once across observations and restart', async () => {

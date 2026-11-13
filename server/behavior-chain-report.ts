@@ -1,4 +1,5 @@
 import type { Database } from 'better-sqlite3'
+import type { LogEntry } from './agent-log-parse'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal } from './behavior-chain-store'
 import { ReviewScopeIndexingError } from './behavior-chain-runtime'
@@ -140,6 +141,120 @@ export function setRepairReportRepositories(db: Database, configured: unknown): 
 
 function enabled(db: Database, repository: string): boolean {
   return repositoryNames(repairReportRepositories(db)).some(value => value.toLowerCase() === repository.toLowerCase())
+}
+
+// Review reports describe the PR obligation, including when ownership moves
+// between the legacy ledger and a chain with a different source issue.
+function existingReviewReport(db: Database, repository: string, pull: number) {
+  const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
+    AND json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.pull') = ?
+    ORDER BY json_extract(value, '$.issueNumber') IS NULL, key`)
+    .all(PREFIX + '*', repository.toLowerCase() + '#*', pull) as Array<{ key: string, value: string }>
+  return rows.find(row => {
+    const report = JSON.parse(row.value) as RepairReport
+    return row.key === PREFIX + report.key && report.key === chainBasis(['review_budget_exhausted', report.source, pull])
+  })
+}
+
+function reserveReport(db: Database, report: RepairReport): boolean {
+  if (db.pragma('synchronous', { simple: true }) !== 2) db.pragma('synchronous = FULL')
+  return db.transaction(() => {
+    if (report.pull !== null && report.key === chainBasis(['review_budget_exhausted', report.source, report.pull])
+      && existingReviewReport(db, report.source.split('#')[0], report.pull)) return false
+    return db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
+      .run(PREFIX + report.key, JSON.stringify(report)).changes !== 0
+  }).immediate()
+}
+
+async function createReport(db: Database, repository: string, report: RepairReport, title: string, body: string) {
+  const result = await handleGhBody({ operation: 'open_issue', repository_full_name: repository, title, body, labels: ['poise'] })
+  const publication = result.body as { record?: { number?: unknown, url?: unknown }, error?: string }
+  if (result.status !== 200 || !Number.isSafeInteger(publication.record?.number) || Number(publication.record?.number) < 1
+    || publication.record?.url !== `https://github.com/${repository}/issues/${publication.record?.number}`) {
+    throw new Error(`Repair report ${report.key} creation is unconfirmed: ${publication.error || 'no verified issue receipt'}; reconcile its marker before any further action`)
+  }
+  report.issueNumber = Number(publication.record.number)
+  db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(report), PREFIX + report.key)
+}
+
+export interface LegacyReviewTimeout {
+  repository: string
+  pull: number
+  author: string
+  reviewer: string
+  behavior: 'review-new-prs' | 'approve-prs'
+  target: string
+  head: string
+  slot: string
+  heldAt: number
+  attempts: LogEntry[]
+}
+
+/** Evidence and the retained stop are checked by legacy reconciliation, without
+ * making a chain or borrowing v2's retry policy. Publication uses the same intent. */
+export async function reportLegacyReviewTimeout(db: Database, journal: BehaviorChainJournal, source: LegacyReviewTimeout,
+  verify: () => Promise<boolean>, allowed: () => boolean): Promise<string | null> {
+  if (!enabled(db, source.repository) || !allowed()) return null
+  const linked = existingReviewReport(db, source.repository, source.pull)
+  let report = linked ? JSON.parse(linked.value) as RepairReport : null
+  const accountsMatch = () => {
+    const accounts = getSettings()
+    return accounts.me.toLowerCase() === source.author.toLowerCase()
+      && accounts.agentAccount.toLowerCase() === source.reviewer.toLowerCase()
+  }
+  if (!report) {
+    if (!accountsMatch() || !await verify()) return null
+    const identity = `${source.repository.toLowerCase()}#${source.pull}`
+    const key = chainBasis(['review_budget_exhausted', identity, source.pull])
+    const marker = `<!-- poise-repair-exhaustion:${key} -->`
+    const { stdout } = await runFile('github-interface', ['--read-issue', String(source.pull), '--repository', source.repository,
+      '--token-user', source.author], { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
+    const original = JSON.parse(stdout) as { repository: string, issue_number: number,
+      issue?: { number: number, body: string | null, state: string, html_url: string, pull_request?: unknown } }
+    const issue = original.issue
+    if (original.repository !== source.repository || original.issue_number !== source.pull || issue?.number !== source.pull
+      || !issue.pull_request || issue.html_url !== `https://github.com/${source.repository}/pull/${source.pull}`
+      || issue.body !== null && typeof issue.body !== 'string' || !['open', 'closed'].includes(issue.state)) {
+      throw new Error('Legacy review report source PR is unavailable')
+    }
+    if (issue.state !== 'open' || REPORT_MARKER.test(issue.body ?? '')) return null
+    const existing = await reconcileRepairReport(source.repository, marker, null)
+    // Re-read the native target and stop after all publication discovery reads.
+    if (!await verify() || !accountsMatch() || !enabled(db, source.repository) || !allowed()) return null
+    // A chain reporter may have reserved the same obligation while we read GitHub.
+    const concurrent = existingReviewReport(db, source.repository, source.pull)
+    if (concurrent) report = JSON.parse(concurrent.value) as RepairReport
+    else {
+      report = { key, source: identity, pull: source.pull, holdSequence: null, heldAt: source.heldAt,
+        head: source.head, basis: chainBasis([source.behavior, source.target, source.head]), slot: source.slot,
+        attempts: source.attempts.map(call => ({ invocation: call.correlation_id!, call: call.id,
+          completedAt: Date.parse(call.completed_at!) })), issueNumber: existing?.number ?? null }
+      if (!reserveReport(db, report)) return 'Repair exhaustion report pending: another reconciliation reserved this report'
+      if (!existing) {
+        if (!enabled(db, source.repository) || !allowed()) return 'Repair exhaustion report creation is unconfirmed; admissions are paused'
+        const body = [marker, '', `Poise is holding https://github.com/${source.repository}/pull/${source.pull}.`, '',
+          `Stage: ${source.behavior}. Cause: review_budget_exhausted. Held since ${new Date(source.heldAt).toISOString()}.`,
+          `Retained legacy target: ${source.target}; head ${source.head}; slot ${source.slot}.`,
+          `Retry-stop model: ${/^[a-zA-Z0-9_.-]{1,160}$/.test(source.attempts.at(-1)!.model) ? source.attempts.at(-1)!.model : 'unknown'}.`,
+          'Retry-stop cause: two qualifying automatic same-head/model review timeouts; automatic retries stopped.',
+          'Verified original Caller attempts failed before review submission. Fresh target and activity evidence still verify this hold.', '',
+          ...source.attempts.map(call => reviewAttemptLine(call.correlation_id!, call.id, Date.parse(call.completed_at!), call.error_code, call.diagnostic)), '',
+          'Next action: inspect the original Calls and timeout diagnostics, address the cause, then explicitly retry the held review when appropriate. This report preserves the source hold and PR; it does not relaunch review or relax publication, review, admission or merge gates.',
+          '', REMEDIATION_SCOPE, '', SCOPE_DIRECTIVE].join('\n')
+        await createReport(db, source.repository, report, `fix: PR review exhausted its time limits for #${source.pull}`, body)
+      }
+    }
+  }
+  return confirmReport(db, journal, source, report, 'Repair exhaustion', allowed)
+}
+
+function reviewAttemptLine(invocation: string, call: string, completedAt: number, errorCode: unknown, diagnostic?: ProcessDiagnostic | null) {
+  const step = (['operation', 'phase'] as const).map(field => {
+    const value = diagnostic?.[field]
+    return `${field}=${typeof value === 'string' && /^[a-zA-Z0-9_.-]{1,160}$/.test(value) ? value : 'unknown'}`
+  }).join('; ')
+  const timeout = diagnostic?.context?.timeout_seconds
+  return `- Invocation ${invocation}; Caller ${call}; completed ${new Date(completedAt).toISOString()}; error_code=${errorCode}; ${step}; timeout_seconds=${typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 ? timeout : 'unknown'}.`
 }
 
 /** The normal decision still has to request work on precisely this basis.
@@ -343,20 +458,20 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   const linked = closed ? db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
     AND json_extract(value, '$.source') = ? AND json_extract(value, '$.pull') = ?
     ORDER BY json_extract(value, '$.issueNumber') IS NULL, key LIMIT 1`)
-    .get(PREFIX + '*', chain.id, observation.pull!.number) as { key: string, value: string } | undefined : undefined
-  const intent = linked ? { cause: CLOSED_CAUSE, key: (JSON.parse(linked.value) as RepairReport).key,
+    .get(PREFIX + '*', chain.id, observation.pull!.number) as { key: string, value: string } | undefined
+    : qualifying?.cause === 'review_budget_exhausted' ? existingReviewReport(db, chain.repository, observation.pull!.number) : undefined
+  const intent = linked ? { cause: closed ? CLOSED_CAUSE : 'review_budget_exhausted', key: (JSON.parse(linked.value) as RepairReport).key,
     storageKey: linked.key, stored: linked }
     : intents.find(intent => intent.cause === (merge ? MERGE_CAUSE : closed ? CLOSED_CAUSE : implementation ? IMPLEMENTATION_CAUSE : qualifying?.cause)) ?? intents.find(intent => intent.stored)
   if (!intent) return pendingMerge || !observation.pull ? null : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
   const { cause, key, storageKey, stored } = intent
   const label = cause === CLOSED_CAUSE ? 'Closed PR continuation' : cause === MERGE_CAUSE ? 'Merge submission' : cause === IMPLEMENTATION_CAUSE ? 'Implementation hold' : 'Repair exhaustion'
   let report: RepairReport | null = stored ? JSON.parse(stored.value) as RepairReport : null
-  if (report && (storageKey !== PREFIX + key || report.key !== key || report.source !== chain.id || report.pull !== (cause === IMPLEMENTATION_CAUSE ? null : observation.pull!.number)
+  if (report && (storageKey !== PREFIX + key || report.key !== key || (!linked && report.source !== chain.id) || report.pull !== (cause === IMPLEMENTATION_CAUSE ? null : observation.pull!.number)
     || report.issueNumber !== null && (!Number.isSafeInteger(report.issueNumber) || report.issueNumber < 1))) {
     throw new Error('Repair report intent conflicts with its source hold')
   }
   const marker = `<!-- poise-repair-exhaustion:${key} -->`
-  const save = () => db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(report), storageKey)
   if (report && cause === IMPLEMENTATION_CAUSE && getBehaviorChainSettings().seedMode === 'label') {
     const fresh = await verify()
     const settings = getBehaviorChainSettings()
@@ -463,9 +578,9 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     // FULL durability precedes the external effect. A competing runtime or a
     // crash after this insert may reconcile, but may never create again.
     if (!enabled(db, chain.repository) || !allowed()) return null
-    if (db.pragma('synchronous', { simple: true }) !== 2) db.pragma('synchronous = FULL')
-    const claimed = db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING').run(storageKey, JSON.stringify(report))
-    if (!claimed.changes) return `${label} report pending: another reconciliation reserved this report`
+    const concurrent = cause === 'review_budget_exhausted' ? existingReviewReport(db, chain.repository, report.pull!) : undefined
+    if (concurrent) return confirmReport(db, journal, chain, JSON.parse(concurrent.value) as RepairReport, label, allowed)
+    if (!reserveReport(db, report)) return `${label} report pending: another reconciliation reserved this report`
     if (!existing) {
       if (!enabled(db, chain.repository)) return null
       if (!allowed()) return `${label} report creation is unconfirmed; admissions are paused`
@@ -511,14 +626,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           const line = `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}`
           if (!review) return `${line}.`
           const evidence = verified!.attempts[index].evidence!
-          const diagnostic = evidence.diagnostic as ProcessDiagnostic | undefined
-          // Project only bounded identifiers and a numeric deadline, never CLI arguments or raw errors.
-          const step = (['operation', 'phase'] as const).map(field => {
-            const value = diagnostic?.[field]
-            return `${field}=${typeof value === 'string' && /^[a-zA-Z0-9_.-]{1,160}$/.test(value) ? value : 'unknown'}`
-          }).join('; ')
-          const timeout = diagnostic?.context?.timeout_seconds
-          return `${line}; error_code=${evidence.error_code}; ${step}; timeout_seconds=${typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 ? timeout : 'unknown'}.`
+          return reviewAttemptLine(attempt.invocation, attempt.call, attempt.completedAt, evidence.error_code, evidence.diagnostic as ProcessDiagnostic | undefined)
         }), '',
         workSnapshot, '',
         cause === CLOSED_CAUSE
@@ -530,29 +638,30 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           : `Next action: inspect the ${review ? 'PR review timeouts' : budget ? 'repair execution budget' : 'repair reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover ${review ? 'review' : 'repair'} or relax any review, admission or merge gate.`,
         '', REMEDIATION_SCOPE, '', 'Include this exact paragraph in the linked PR review.',
       ].join('\n')
-      const result = await handleGhBody({ operation: 'open_issue', repository_full_name: chain.repository,
-        title: cause === CLOSED_CAUSE ? `fix: continue #${chain.issue} after closed unmerged PR #${report.pull}`
+      await createReport(db, chain.repository, report,
+        cause === CLOSED_CAUSE ? `fix: continue #${chain.issue} after closed unmerged PR #${report.pull}`
           : cause === IMPLEMENTATION_CAUSE ? `fix: blocked implementation for #${chain.issue}`
           : cause === MERGE_CAUSE ? `fix: uncertain merge submission for #${report.pull}`
-          : `fix: ${review ? 'PR review exhausted its time limits' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
-      const publication = result.body as { record?: { number?: unknown, url?: unknown }, error?: string }
-      if (result.status !== 200 || !Number.isSafeInteger(publication.record?.number) || Number(publication.record?.number) < 1
-        || publication.record?.url !== `https://github.com/${chain.repository}/issues/${publication.record?.number}`) {
-        throw new Error(`Repair report ${key} creation is unconfirmed: ${publication.error || 'no verified issue receipt'}; reconcile its marker before any further action`)
-      }
-      report.issueNumber = Number(publication.record.number)
-      save()
+          : `fix: ${review ? 'PR review exhausted its time limits' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body)
     }
   }
+  const closedPrefix = cause === IMPLEMENTATION_CAUSE && chain.held && chain.invocations.at(-1)?.behavior === 'repair-pr'
+    ? `Stage: repair-pr. Worker-reported blocker: ${behaviorErrorMessage(chain.held, 500)}. Next action: inspect the repair Call, address the blocker, then explicitly Resume. Historical ` : ''
+  return confirmReport(db, journal, chain, report, label, allowed, closedPrefix)
+}
+
+async function confirmReport(db: Database, journal: BehaviorChainJournal,
+  chain: Pick<BehaviorChain, 'repository' | 'author' | 'reviewer'>, report: RepairReport,
+  label: string, allowed: () => boolean, closedPrefix = ''): Promise<string> {
+  const marker = `<!-- poise-repair-exhaustion:${report.key} -->`
+  const save = () => db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(report), PREFIX + report.key)
   let issue = await reconcileRepairReport(chain.repository, marker, report.issueNumber)
   if (!issue) return `${label} report creation is unconfirmed; no matching issue is visible yet. Reconcile the same marker; do not create a replacement`
   if (report.issueNumber === null) { report.issueNumber = issue.number; save() }
   const link = `${label} report ${issue.url}`
   if (issue.state === 'closed') {
     const closedReport = `${link} is closed; no replacement will be created`
-    return cause === IMPLEMENTATION_CAUSE && chain.held && chain.invocations.at(-1)?.behavior === 'repair-pr'
-      ? `Stage: repair-pr. Worker-reported blocker: ${behaviorErrorMessage(chain.held, 500)}. Next action: inspect the repair Call, address the blocker, then explicitly Resume. Historical ${closedReport}`
-      : closedReport
+    return closedPrefix + closedReport
   }
   if (!issue.labels.some(label => label.toLowerCase() === 'poise') && enabled(db, chain.repository) && allowed()) {
     try { issue = (await reconcileRepairReport(chain.repository, marker, issue.number, true))! }
