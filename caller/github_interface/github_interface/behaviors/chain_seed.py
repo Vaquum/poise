@@ -5,8 +5,9 @@ inspection — concurrently on one shared client, so one observation pays one
 interpreter startup and one auth lookup instead of three. Each facet reuses
 its existing behavior projection unchanged; any facet failure fails the
 whole read, exactly like the previous three separate calls failing their
-joint observation. Closed seeds without an owned PR also resolve merged closing
-references, separately from publication ownership. There is no partial envelope:
+joint observation. Closed seeds without an owned PR, or with one confirmed closed
+without merge, also resolve merged closing references separately from publication
+ownership. There is no partial envelope:
 a failed facet is an unavailable read, never an empty value.
 """
 import asyncio
@@ -44,7 +45,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "comments": comments["comments"],
         "publication": publication,
     }
-    if read["issue"].get("state") == "closed" and publication["pull_number"] is None:
+    if read["issue"].get("state") == "closed" and (publication["pull_number"] is None
+            or publication["state"] == "closed" and publication["merged"] is False):
         result["external_merge"] = await _external_merge(client, owner, repo, number)
     if read["issue"].get("state") == "closed" and read["issue"].get("title") == full_suite_repair.TITLE:
         pull = await get_pull(client, owner, repo, publication["pull_number"]) if publication["pull_number"] else None

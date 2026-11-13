@@ -364,3 +364,119 @@ test('In motion says what was never read, rather than zero or clear', async ({ p
   await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
   await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
 })
+
+test('a reload paints In motion’s last reads at once, while it reads them again', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const people = page.locator('[data-counts="people"] b').first()
+  const items = page.locator('[data-counts="items"] b').first()
+  await expect(people).not.toHaveText('—')
+  await expect(items).not.toHaveText('—')
+  // GitHub's reads and the chats are held; the reload paints the last ones anyway.
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.route('**/api/chat/sessions', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(people).not.toHaveText('—', { timeout: 2_000 })
+  await expect(items).not.toHaveText('—', { timeout: 2_000 })
+})
+
+test('In motion never paints another organization’s last issues and pull requests', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const items = page.locator('[data-counts="items"] b').first()
+  await expect(items).not.toHaveText('—')
+  // Another organization is chosen, and GitHub's reads are held.
+  await page.evaluate(() => localStorage.setItem('poise-organization', 'acme'))
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(page.locator('[data-counts="people"] b').first()).not.toHaveText('—')
+  await expect(items).toHaveText('—')
+})
+
+test('In motion keeps an organization’s last reads only from its own latest read', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  // Two organizations; all organizations' read is held, beta's answers at once with its one issue.
+  const organizations = ['acme', 'beta'].map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }))
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, { org: '', organizations, me: 'me', agentAccount: 'bot', timezone: 'UTC' }))
+  const issue = (repo: string, number: number) => ({ kind: 'issue', repo, number, title: `Issue ${number}`, state: 'open' })
+  let release = () => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/gh', async (route) => {
+    const body = route.request().postDataJSON() as { operation: string, org?: string }
+    if (body.operation !== 'list') return json(route, { records: [], held: [], errors: [] })
+    if (!body.org) { await held; return json(route, { records: [issue('acme/site', 1), issue('acme/site', 2), issue('beta/api', 3)], errors: [] }) }
+    return json(route, { records: [issue('beta/api', 3)], errors: [] })
+  })
+  await page.reload()
+  await expect(page.locator('select[data-org]')).toBeVisible()
+  // beta is chosen while all organizations' read is still out, and In motion reads again.
+  await page.locator('select[data-org]').selectOption('beta')
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  const items = page.locator('[data-counts="items"] b')
+  const total = async () => (await items.allTextContents()).reduce((sum, text) => sum + (Number(text) || 0), 0)
+  await expect.poll(total).toBe(1)
+  // The overtaken read lands late; beta keeps its own.
+  release()
+  await page.waitForTimeout(500)
+  expect(await total()).toBe(1)
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect.poll(total).toBe(1)
+})
+
+test('a read that lands after Overview was left keeps nothing', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-counts="people"] b').first()).not.toHaveText('—')
+  let release = () => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/chat/sessions', async (route) => {
+    await held
+    return json(route, { instance: 'poise-dev:test', sessions: [{ id: 'late', title: 'Late chat', role: null, status: 'idle', agent: 'claude', createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), lastSeq: 0, pendingRequests: [] }] })
+  })
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await page.getByRole('navigation', { name: 'Poise' }).getByRole('link', { name: 'Board' }).click()
+  release()
+  await page.waitForTimeout(500)
+  expect(await page.evaluate(() => localStorage.getItem('poise-overview-motion'))).not.toContain('Late chat')
+})
+
+test('a reload paints the day’s last numbers at once, with when they were read, while it reads again', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  await expect(page.getByText('Reading the day’s numbers…')).toHaveCount(0)
+  // The day's reads are held; the reload paints the last numbers anyway.
+  await page.route(/\/api\/analytics(\?|\/history)/, async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(page.locator('[data-tile]').first()).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('[data-dayline]')).toContainText('until')
+  await expect(page.getByText('Reading the day’s numbers…')).toHaveCount(0)
+})
+
+test('a reload never paints another GitHub user’s day', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  // Settings now name another GitHub user, and the day's reads are held.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'other', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }))
+  await page.route(/\/api\/analytics(\?|\/history)/, async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(page.getByText('Reading the day’s numbers…')).toBeVisible()
+  await expect(page.locator('[data-tile]')).toHaveCount(0)
+})
+
+test('a reload reads the 30 days again when they failed, though the year was read', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  // A first read whose 30 days fail while the year is read.
+  let fail = true
+  await page.route('**/api/analytics/history**', (route) => fail && (new URL(route.request().url()).searchParams.get('bounds') ?? '').split(',').length <= 31
+    ? json(route, { error: 'history store unavailable' }, 503) : route.fallback())
+  await page.evaluate(() => localStorage.removeItem('poise-overview-day'))
+  await page.reload()
+  const failed = page.locator('p.onote.is-warn', { hasText: 'The 30 days' })
+  await page.locator('[data-tile]').first().click()
+  await expect(failed).toBeVisible()
+  // The service recovers; the next reload paints the remembered day and reads the 30 days again.
+  fail = false
+  await page.reload()
+  await page.locator('[data-tile]').first().click()
+  await expect(page.getByText(/of 30 days known/)).toBeVisible()
+  await expect(failed).toHaveCount(0)
+})

@@ -1,10 +1,11 @@
 #!/bin/bash
 # Hold a deployment-enabled fork's main through CI and its serialized Deploy
-# attempt. No state is stored: Actions runs and the attempted Deploy SHA are
-# the evidence. A failed candidate or a two-hour timeout admits a newer fix.
+# attempt. Actions runs and the SHA-named host apply are the evidence. A
+# failed candidate admits a newer fix or offers one retry if main stays put.
 set -euo pipefail
 
 evidence=()
+retry=''
 finish() {
   local state=$1 proceed=$2 reason=$3
   printf '%s: %s\n' "$state" "$reason"
@@ -16,6 +17,7 @@ finish() {
   fi
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'proceed=%s\nsha=%s\n' "$proceed" "${tip:-}" >>"$GITHUB_OUTPUT"
+    if [ -n "$retry" ]; then printf 'retry=%s\n' "$retry" >>"$GITHUB_OUTPUT"; fi
   fi
 }
 
@@ -23,6 +25,17 @@ fail() {
   echo "::error::$1" >&2
   finish blocked false "$1"
   exit 1
+}
+
+offer_retry() {
+  local run=$1
+  [ -z "$retry" ] && [ "$(jq -r '.run_attempt' <<<"$run")" = 1 ] || return 0
+  case "$(jq -r '.conclusion' <<<"$run")" in
+    failure | cancelled | timed_out | startup_failure)
+      retry=$(jq -er '.id | select(type == "number" and . > 0)' <<<"$run") \
+        || fail "cannot read the failed run ID for $tip"
+      ;;
+  esac
 }
 
 read_runs() {
@@ -47,6 +60,22 @@ fi
 tip=$(jq -r '.sha // empty' <<<"$response" 2>/dev/null) \
   || fail "cannot read the tip of $REPO's main: unexpected answer"
 [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || fail "cannot read the tip of $REPO's main: unexpected answer"
+
+# Caller can wake an early Deploy that exits successfully without applying
+# anything. Only an actual apply may use this event to release a held merge.
+if [ -n "${SUCCESSFUL_DEPLOY_RUN_ID:-}" ]; then
+  [[ "$SUCCESSFUL_DEPLOY_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail 'invalid completed Deploy run ID'
+  if ! jobs=$(gh api "repos/$REPO/actions/runs/$SUCCESSFUL_DEPLOY_RUN_ID/jobs?per_page=100" 2>&1); then
+    fail "cannot read completed Deploy $SUCCESSFUL_DEPLOY_RUN_ID: $jobs"
+  fi
+  applied=$(jq -er --arg step "Deploy $tip" '
+    [.jobs[].steps[]? | select(.name == $step and .conclusion == "success")] | length' <<<"$jobs") \
+    || fail "cannot read completed Deploy $SUCCESSFUL_DEPLOY_RUN_ID steps: unexpected answer"
+  if (( applied == 0 )); then
+    finish 'waiting for Deploy' false "Completed Deploy $SUCCESSFUL_DEPLOY_RUN_ID did not apply $tip."
+    exit 0
+  fi
+fi
 
 blocked=()
 waiting=()
@@ -73,6 +102,7 @@ for workflow in ci.yml caller.yml; do
     waiting+=("$workflow is $status ($url)")
   elif [ "$conclusion" != success ]; then
     blocked+=("$workflow concluded $conclusion ($url)")
+    offer_retry "$run"
   fi
 done
 
@@ -91,6 +121,7 @@ fi
 
 runs=$(read_runs deploy.yml deploy)
 in_flight=false
+failed_run=''
 while IFS= read -r run; do
   status=$(jq -r '.status' <<<"$run")
   url=$(jq -r '.html_url' <<<"$run")
@@ -117,8 +148,8 @@ while IFS= read -r run; do
   conclusion=$(jq -r '.conclusion' <<<"$run")
   applied=$(jq -r --arg step "Deploy $tip" '
     [.jobs[].steps[]? | select(.name == $step and .conclusion == "success")] | length' <<<"$jobs")
-  if [ "$conclusion" = success ] && (( applied > 0 )); then
-    finish 'deploy attempt completed' true "Deploy attempted $tip ($url). Workspace verification and health release establish what is serving."
+  if (( applied > 0 )) && [ -z "$failed_run" ]; then
+    finish 'host applied' true "Deploy applied $tip ($url). Workspace verification and health release establish what is serving."
     exit 0
   fi
   # An early refusal is not the final CI -> Deploy handoff. A later failed or
@@ -127,14 +158,18 @@ while IFS= read -r run; do
     [.jobs[].steps[]? | select(.name == "Refuse any tip whose required CI did not pass on it"
       and .started_at != null and .started_at >= $verified)] | length' <<<"$jobs")
   created=$(jq -r '.created_at' <<<"$run")
-  if [ "$conclusion" != success ] \
+  if [ -z "$failed_run" ] && [ "$conclusion" != success ] \
     && { (( attempted > 0 || admitted > 0 )) || [[ "$created" > "$verified_at" || "$created" = "$verified_at" ]]; }; then
-    finish blocked true "Deploy concluded $conclusion for $tip ($url). Allowing a newer upstream fix."
-    exit 0
+    failed_run=$run
   fi
 done < <(jq -c '.[]' <<<"$runs")
 
-if (( $(date +%s) - started >= 7200 )); then
+if [ -n "$failed_run" ] && [ "$in_flight" = false ]; then
+  offer_retry "$failed_run"
+  conclusion=$(jq -r '.conclusion' <<<"$failed_run")
+  url=$(jq -r '.html_url' <<<"$failed_run")
+  finish blocked true "Deploy concluded $conclusion for $tip ($url). Allowing a newer upstream fix."
+elif (( $(date +%s) - started >= 7200 )); then
   finish blocked true 'Verification/deployment exceeded two hours. Allowing a newer upstream fix.'
 elif [ "$in_flight" = true ]; then
   finish 'waiting for Deploy' false "Deploy is queued or running; retaining $tip until it finishes."

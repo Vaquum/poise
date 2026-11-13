@@ -14,6 +14,7 @@ export interface StubHealth {
   activeChatTurns: number
   runningCallerCalls: number
   unsettledNativeCalls?: number | null
+  nativeCleanupHold?: { callId: string; reason: string | null }
   backgroundWork: number
   draining: boolean
   /** The release its supervisor runs; null for a workspace started without one. */
@@ -35,6 +36,8 @@ export interface WorkspaceStub {
   healthStatus: number
   /** False makes a drain POST answer without applying the drain, as a refusal before admission. */
   drainApplies: boolean
+  /** A non-200 resume refuses the request before releasing the drain. */
+  resumeStatus: number
   health: StubHealth
   /** Bytes of filler added to every health and drain answer, as a hostile workspace could. */
   healthPadding: number
@@ -42,6 +45,7 @@ export interface WorkspaceStub {
   answerDelayMs: number
   requests: SeenRequest[]
   serviceRequests: SeenRequest[]
+  onServiceRequest?: (request: SeenRequest) => void
   /** The releases POST /api/service/switch was asked for. */
   switches: string[]
   /** Releases the workspace refuses because they failed to start there. */
@@ -67,6 +71,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
     reachable: true,
     healthStatus: 200,
     drainApplies: true,
+    resumeStatus: 200,
     health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0, draining: false, release: null, switching: null },
     switches: [],
     failedReleases: [],
@@ -124,10 +129,14 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
       const seen = { method: req.method ?? '', url, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') }
       if (url.startsWith('/api/service/')) {
         stub.serviceRequests.push(seen)
+        stub.onServiceRequest?.(seen)
         // A drain takes effect when received, even when its answer is slow past the gateway timeout —
         // unless the stub refuses admission, in which case the answer reports no drain.
         if (url === '/api/service/drain' && req.method === 'POST' && stub.drainApplies) stub.health.draining = true
-        if (url === '/api/service/resume' && req.method === 'POST') stub.health.draining = false
+        if (url === '/api/service/resume' && req.method === 'POST') {
+          if (stub.resumeStatus !== 200) return json(res, stub.resumeStatus, { error: 'refused' })
+          stub.health.draining = false
+        }
         const answer = (status: number, body: unknown): void => {
           if (stub.answerDelayMs > 0) setTimeout(() => json(res, status, body), stub.answerDelayMs)
           else json(res, status, body)

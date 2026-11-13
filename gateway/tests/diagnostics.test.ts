@@ -249,6 +249,48 @@ describe('retained authorized queries', () => {
     }
   })
 
+  it('keeps only the newest tombstones up to their cap', () => {
+    // maxEvents 1 evicts each event as the next arrives; the cap is two tombstones.
+    const policy = { retentionMs: 30 * 86_400_000, maxBytes: 100_000, maxEvents: 1 }
+    let now = NOW
+    const db = new DiagnosticStore(':memory:', policy, () => now); stores.push(db)
+    const records = Array.from({ length: 6 }, (_, i) => event('capped-' + i))
+    for (const record of records) { now += 1; db.append([record]) }
+    expect(records.slice(0, 3).map((record) => db.lookup(alice, record.id).status)).toEqual(['unavailable', 'unavailable', 'unavailable'])
+    expect(records.slice(3, 5).map((record) => db.lookup(alice, record.id).status)).toEqual(['expired', 'expired'])
+    expect(db.lookup(alice, records[5].id).status).toBe('found')
+  })
+
+  it('reads the tombstone cap again only once new tombstones have built up', () => {
+    // A cap of 4,096 tombstones is read again after 64 new ones, never on every prune.
+    const policy = { retentionMs: 30 * 86_400_000, maxBytes: 4 * 1024 * 1024, maxEvents: 2048 }
+    const db = store(policy)
+    const counted = vi.spyOn(Database.prototype, 'prepare')
+    try {
+      db.prune()
+      const counts = () => counted.mock.calls.filter(([sql]) => String(sql).includes('COUNT(*) AS count FROM log_expired')).length
+      expect(counts()).toBe(1)
+      for (let i = 0; i < 20; i++) db.prune()
+      expect(counts()).toBe(1)
+    } finally { counted.mockRestore() }
+  })
+
+  it('holds the tombstone cap again after a rejected append rolled back the check made inside it', () => {
+    const policy = { retentionMs: 30 * 86_400_000, maxBytes: 4 * 1024 * 1024, maxEvents: 2048 }
+    const db = store(policy)
+    const counted = vi.spyOn(Database.prototype, 'prepare')
+    try {
+      const counts = () => counted.mock.calls.filter(([sql]) => String(sql).includes('COUNT(*) AS count FROM log_expired')).length
+      // The batch's first prune holds the cap, then its invalid record rolls the whole append back.
+      expect(() => db.append([event('kept-then-rolled-back'), { ...event('rejected'), version: 2 } as unknown as LogEvent])).toThrow()
+      expect(counts()).toBe(1)
+      db.prune()
+      expect(counts()).toBe(2)
+      db.prune()
+      expect(counts()).toBe(2)
+    } finally { counted.mockRestore() }
+  })
+
   it('bounds actual bytes and never resurrects a tombstoned replay', () => {
     const policy = { retentionMs: 100_000, maxBytes: 20_000, maxEvents: 100 }
     const db = store(policy)

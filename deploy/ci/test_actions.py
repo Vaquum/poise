@@ -225,6 +225,7 @@ class DeployTest(unittest.TestCase):
         work = self.work.name
         self.calls = os.path.join(work, 'calls.log')
         self.ssh_calls = os.path.join(work, 'ssh.log')
+        self.apply_modes = os.path.join(work, 'apply-modes.log')
         self.origin = os.path.join(work, 'origin.git')
         self.path = os.path.join(work, 'srv', 'poise')
         self.bin = os.path.join(work, 'bin')
@@ -251,6 +252,7 @@ class DeployTest(unittest.TestCase):
         deploy = os.path.join(self.seed, 'deploy')
         os.makedirs(deploy, exist_ok=True)
         log = f'printf "%s %s\\n" "$(basename "$0") $*" "$(git rev-parse HEAD)" >>"{self.calls}"\n'
+        log += f'printf "%s\\n" "$POISE_DEPLOY_APPLY_ONLY" >>"{self.apply_modes}"\n'
         write_script(os.path.join(deploy, 'install.sh'), f'#!/bin/sh\n{log}touch "{self.work.name}/installed"\n')
         write_script(os.path.join(deploy, 'upgrade.sh'), f'#!/bin/sh\n{log}')
         with open(os.path.join(self.seed, 'version'), 'w') as file:
@@ -260,7 +262,7 @@ class DeployTest(unittest.TestCase):
         self.git('-C', self.seed, 'push', '--quiet', 'origin', 'HEAD:main')
         return self.git('-C', self.seed, 'rev-parse', 'HEAD')
 
-    def deploy(self, sha, variables=None, google_secret=None):
+    def deploy(self, sha, variables=None, google_secret=None, apply_only=None):
         env = clean_env(
             HOME=self.work.name,
             PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
@@ -273,6 +275,8 @@ class DeployTest(unittest.TestCase):
         )
         if google_secret is not None:
             env['POISE_GOOGLE_CLIENT_SECRET'] = google_secret
+        if apply_only is not None:
+            env['APPLY_ONLY'] = apply_only
         return subprocess.run([os.path.join(ACTIONS, 'deploy.sh')], capture_output=True, text=True, env=env)
 
     def calls_made(self):
@@ -428,6 +432,11 @@ if [ "$1" = workflow ]; then
   case " $GH_FAIL " in *" dispatch "*) echo "boom" >&2; exit 1;; esac
   exit 0
 fi
+if [ "$1" = run ]; then
+  [ "$2" = rerun ] && [ "$4" = --repo ] && [ "$5" = "$REPO" ] || exit 99
+  printf '%s\\n' "$*" >>"$GH_CALLS"
+  exit 0
+fi
 path="$2"
 if [ "$path" = --method ]; then path="$4"; fi
 case "$path" in
@@ -440,6 +449,7 @@ case "$path" in
     id=${path#*/actions/runs/}; id=${id%%/*}
     file=jobs-$id.json
     [ -f "$GH_FIXTURES/$file" ] || file=jobs.json;;
+  *actions/runs/*) file=run-${path##*/}.json;;
   *) echo "unexpected gh api path: $path" >&2; exit 99;;
 esac
 printf '%s\\n' "$path" >>"$GH_CALLS"
@@ -511,12 +521,12 @@ cat "$GH_FIXTURES/$file"
                  for name in ('Set up job', 'Audit dependencies', 'Complete job')]
         self.fixture('jobs.json', {'total_count': 1, 'jobs': [{'steps': steps}]})
 
-    def gate(self, trigger='workflow_run', fail='', script='gate.sh'):
+    def gate(self, trigger='workflow_run', fail='', script='gate.sh', **variables):
         env = clean_env(
             PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
             GH_FIXTURES=self.fixtures, GH_CALLS=self.calls, GH_FAIL=fail,
             GITHUB_OUTPUT=self.output, GITHUB_STEP_SUMMARY=self.summary,
-            REPO=self.REPO, TRIGGER=trigger,
+            REPO=self.REPO, TRIGGER=trigger, **variables,
         )
         if os.path.exists(self.output):
             os.unlink(self.output)
@@ -649,20 +659,33 @@ cat "$GH_FIXTURES/$file"
         self.assertEqual(result.returncode, 1)
         self.assertIn('no deploy trigger', result.stderr)
 
-    def sync(self, fail=''):
-        result, outputs = self.gate(fail=fail, script='sync-gate.sh')
+    def sync(self, fail='', **variables):
+        result, outputs = self.gate(fail=fail, script='sync-gate.sh', **variables)
         if result.returncode == 0 and outputs['proceed'] == 'true':
             with open(WORKFLOWS[1]) as file:
-                merge = textwrap.dedent(file.read().split('        run: |\n')[1])
+                body = file.read().split('        run: |\n', 1)[1]
+                merge = textwrap.dedent(body.split('\n      - name: Retry', 1)[0])
             env = clean_env(
                 HOME=self.work.name, PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
                 GH_FIXTURES=self.fixtures, GH_CALLS=self.calls, GH_FAIL=fail,
                 GITHUB_REPOSITORY=self.REPO, GITHUB_STEP_SUMMARY=self.summary,
+                GITHUB_OUTPUT=self.output,
                 PREVIOUS_SHA=outputs['sha'], WORKFLOW_TOKEN_ONLY='false', WORKFLOW_TOKEN='fixture',
             )
             result = subprocess.run(['bash', '-euo', 'pipefail', '-c', merge],
                                     capture_output=True, text=True, env=env)
+            with open(self.output) as file:
+                unchanged = 'unchanged=true' in file.read().splitlines()
+            if result.returncode == 0 and unchanged and 'retry' in outputs:
+                result = self.retry(outputs)
         return result, outputs
+
+    def retry(self, outputs):
+        return subprocess.run([os.path.join(ACTIONS, 'retry.sh')], capture_output=True, text=True, env=clean_env(
+            PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}', GH_FIXTURES=self.fixtures,
+            GH_CALLS=self.calls, REPO=self.REPO, GITHUB_REPOSITORY=self.REPO,
+            GITHUB_STEP_SUMMARY=self.summary, CANDIDATE=outputs['sha'], RUN_ID=outputs['retry'],
+        ))
 
     def wake(self, token='wake-fixture', fail=''):
         with open(WORKFLOWS[2]) as file:
@@ -709,11 +732,33 @@ cat "$GH_FIXTURES/$file"
     def deploy_run(self, run_id=301, apply='skipped', apply_sha=None, **changes):
         run = self.workflow_run(run_id, **{'event': 'workflow_run', 'created_at': self.verified_at, **changes})
         self.fixture('deploy-runs.json', {'workflow_runs': [run]})
+        self.fixture(f'run-{run_id}.json', run)
         self.fixture(f'jobs-{run_id}.json', {'jobs': [{'steps': [
             {'name': 'Refuse any tip whose required CI did not pass on it',
              'started_at': run['created_at'], 'conclusion': 'success'},
             {'name': f'Deploy {apply_sha or self.TIP}', 'conclusion': apply},
         ]}]})
+
+    def test_successful_deploy_wake_releases_a_held_merge_after_exact_apply(self):
+        self.green()
+        newest = 'c' * 40
+        self.fixture('upstream.json', {'sha': newest})
+        for apply, sha in [('skipped', self.TIP), ('success', 'a' * 40)]:
+            self.deploy_run(apply=apply, apply_sha=sha)
+            result, outputs = self.sync(SUCCESSFUL_DEPLOY_RUN_ID='301')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(outputs, {'proceed': 'false', 'sha': self.TIP})
+        with open(self.calls) as file:
+            calls = file.read()
+        self.assertNotIn('/merge-upstream', calls)
+        self.assertNotIn('workflow run', calls)
+
+        self.deploy_run(apply='success', head_sha='a' * 40)
+        result, outputs = self.sync(SUCCESSFUL_DEPLOY_RUN_ID='301')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'true', 'sha': self.TIP})
+        with open(os.path.join(self.fixtures, 'tip.json')) as file:
+            self.assertEqual(json.load(file)['sha'], newest)
 
     def test_sync_recovers_a_missed_completion_wake_without_an_upstream_merge(self):
         self.green()
@@ -784,7 +829,9 @@ cat "$GH_FIXTURES/$file"
         self.assertEqual(outputs['proceed'], 'true')
         self.assertIn('Deploy concluded failure', self.summary_text())
         with open(self.calls) as file:
-            self.assertNotIn('workflow run', file.read())
+            calls = file.read()
+        self.assertNotIn('workflow run', calls)
+        self.assertIn(f'run rerun 301 --repo {self.REPO}', calls)
 
     def test_sync_recovery_requires_verification_of_an_intervening_newer_tip(self):
         older = 'a' * 40
@@ -934,7 +981,9 @@ cat "$GH_FIXTURES/$file"
                     self.assertEqual(outputs['proceed'], 'true')
                     self.assertIn(f'concluded {conclusion}', self.summary_text())
                     with open(self.calls) as file:
-                        self.assertNotIn('workflow run', file.read())
+                        calls = file.read()
+                    self.assertNotIn('workflow run', calls)
+                    self.assertNotIn('run rerun', calls)
                     # The fix must get its own CI; the failed candidate's
                     # evidence cannot authorize its deployment.
                     self.fixture('ci-runs.json', {'workflow_runs': []})
@@ -949,6 +998,66 @@ cat "$GH_FIXTURES/$file"
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(approved, {'proceed': 'true', 'sha': fix})
                         self.assertEqual(self.workspace_proof(approved['sha'], fix).returncode, 0)
+
+    def test_sync_retries_one_failed_attempt_only_when_main_stays_unchanged(self):
+        for workflow, run_id in (('ci.yml', 101), ('caller.yml', 102), ('deploy.yml', 301)):
+            with self.subTest(workflow=workflow):
+                self.green()
+                self.fixture('upstream.json', {'sha': self.TIP})
+                for attempt in (1, 2):
+                    failed = self.workflow_run(run_id, conclusion='failure', run_attempt=attempt)
+                    self.fixture(f'run-{run_id}.json', failed)
+                    if workflow == 'deploy.yml':
+                        self.deploy_run(run_id, apply='failure', conclusion='failure', run_attempt=attempt)
+                    else:
+                        self.fixture(workflow.replace('.yml', '-runs.json'), {'workflow_runs': [failed]})
+                    result, outputs = self.sync()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(outputs.get('retry'), str(run_id) if attempt == 1 else None)
+                with open(self.calls) as file:
+                    self.assertEqual(file.read().count(f'run rerun {run_id} --repo {self.REPO}'), 1)
+
+    def test_retry_rechecks_the_candidate_and_attempt(self):
+        self.green()
+        outputs = {'retry': '101', 'sha': self.TIP}
+        self.fixture('run-101.json', self.workflow_run(101, run_attempt=2))
+        result = self.retry(outputs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('already moved to attempt 2', result.stdout)
+        self.fixture('tip.json', {'sha': 'd' * 40})
+        result = self.retry(outputs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('main advanced', result.stdout)
+        with open(self.calls) as file:
+            self.assertNotIn('run rerun', file.read())
+
+    def test_sync_does_not_repeat_a_successful_apply_when_proof_wait_fails(self):
+        self.green()
+        self.fixture('upstream.json', {'sha': self.TIP})
+        self.deploy_run(apply='success', conclusion='failure')
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'true', 'sha': self.TIP})
+        self.assertIn('host applied', self.summary_text())
+        with open(self.calls) as file:
+            calls = file.read()
+        self.assertNotIn('run rerun', calls)
+        self.assertNotIn('workflow run', calls)
+
+    def test_sync_retries_a_failed_settings_reapply_after_earlier_success(self):
+        self.green()
+        self.fixture('upstream.json', {'sha': self.TIP})
+        self.deploy_run(301, apply='success')
+        self.deploy_run(302, apply='failure', conclusion='failure')
+        self.fixture('deploy-runs.json', {'workflow_runs': [
+            self.workflow_run(301, event='workflow_run', created_at=self.verified_at),
+            self.workflow_run(302, event='workflow_dispatch', created_at=self.verified_at, conclusion='failure'),
+        ]})
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['retry'], '302')
+        with open(self.calls) as file:
+            self.assertIn(f'run rerun 302 --repo {self.REPO}', file.read())
 
     def test_sync_does_not_confuse_an_early_refusal_or_an_old_deploy_with_a_final_attempt(self):
         self.green()
@@ -982,7 +1091,7 @@ cat "$GH_FIXTURES/$file"
         result, outputs = self.gate(script='sync-gate.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs['proceed'], 'true')
-        self.assertIn('deploy attempt completed', result.stdout)
+        self.assertIn('host applied', result.stdout)
         self.fixture('ci-runs.json', {'workflow_runs': []})
         result, outputs = self.gate(script='sync-gate.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1034,7 +1143,9 @@ class DeployWiringTest(unittest.TestCase):
         self.assertIn('ref: ${{ github.sha }}', deploy)
         self.assertIn('ref: ${{ steps.gate.outputs.sha }}', deploy)
         self.assertIn('SHA: ${{ steps.gate.outputs.sha }}', deploy)
-        self.assertEqual(deploy.count("if: steps.gate.outputs.proceed == 'true'"), 3)
+        self.assertEqual(deploy.count("if: steps.gate.outputs.proceed == 'true'"), 4)
+        self.assertLess(deploy.index('deploy/actions/deploy.sh'), deploy.index('deploy/actions/verify.sh'))
+        self.assertIn("APPLY_ONLY: 'true'", deploy)
 
     def test_every_completion_reaches_the_gate(self):
         deploy = self.workflow('deploy.yml')

@@ -58,6 +58,7 @@ import { retryFailedPrReviews, setBehaviorCheckSlots } from './behaviors'
 import { setWorkerChatReader } from './worker-capacity'
 import { bindings as workBindings } from './chat/control-store'
 import { enforceApiRequest, httpStatus, readJson, setApiHeaders, type RequestAuthority } from './http'
+import { stallSnapshot } from './stall-observer'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
 import { ChatSocketServer, handleChatApi, speaksForPerson } from './chat/transport'
@@ -401,6 +402,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // while draining: it performs no I/O, so no dependency can slow it.
         if (url === '/api/health/live' && req.method === 'GET') {
           return json(res, 200, livenessSnapshot())
+        }
+        // Where the main thread stalls (server/stall-observer.ts): in-memory, no I/O.
+        if (url === '/api/health/stalls' && req.method === 'GET') {
+          return json(res, 200, stallSnapshot())
         }
         if (path === CHAT_CONTROL_PATH) {
           if (!chatControl) return json(res, 503, { error: 'native chat control is not started' })
@@ -878,7 +883,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // See server/behavior-estimates.ts.
         if (path === '/api/behavior-estimates' && req.method === 'GET') {
           try {
-            const [running, history] = await Promise.all([fetchRunningAgentLogSnapshot(), fetchAgentLogSnapshot()])
+            // The whole history only shapes the estimates: its last snapshot answers at once.
+            const [running, history] = await Promise.all([fetchRunningAgentLogSnapshot(), fetchAgentLogSnapshot({ lastObserved: true })])
             return json(res, 200, { estimates: readBehaviorEstimates(history.entries, running.entries) })
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })
@@ -915,7 +921,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const query = new URLSearchParams(url.split('?')[1] || '')
           const window = parseWindow(query.get('since'), query.get('until'))
           try {
-            const snapshot = await fetchAgentLogSnapshot()
+            const snapshot = await fetchAgentLogSnapshot({ lastObserved: true })
             return json(res, 200, readBehaviorMetrics(snapshot.entries, window, null, snapshot.quarantined))
           } catch (error) {
             return json(res, 200, readBehaviorMetrics([], window, error instanceof Error ? error.message : String(error)))
@@ -954,10 +960,11 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           let snapshot: Awaited<ReturnType<typeof fetchAgentLogSnapshot>> | null = null
           let agentLogsError: string | null = null
           try {
+            // Behaviors' table takes the last snapshot at once; it is read again behind.
             snapshot = await fetchSelectedAgentLogSnapshot({
               latest: triggers.flatMap(([behavior, source]) => accounts.map(account => ({ behavior, source, owner: account.login }))),
               ids: [...pending].sort(),
-            })
+            }, { lastObserved: true })
             logs = snapshot.entries
             if (snapshot.quarantined.length > 0) agentLogsError = `${snapshot.quarantined.length} unreadable worker log row(s) quarantined`
           } catch (error) {
@@ -1230,7 +1237,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
 
         if (path === '/api/github-quota' && req.method === 'GET') {
           try {
-            return json(res, 200, await readGithubQuota())
+            return json(res, 200, await readGithubQuota({ lastObserved: true }))
           } catch (error: unknown) {
             return json(res, 502, { error: error instanceof Error ? error.message : String(error) })
           }

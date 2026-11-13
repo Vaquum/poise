@@ -344,6 +344,11 @@ describe('behavior database lifecycle', () => {
     expect(db.prepare(`
       SELECT count(*) FROM behavior_dead_letters WHERE retired_at IS NOT NULL
     `).pluck().get()).toBe(1)
+    // Each tick reads only the open dead letters, from their partial index, never the retired history.
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN SELECT id, behavior, repo, pr
+      FROM behavior_dead_letters AS dead INDEXED BY idx_behavior_dead_letters_open
+      WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL`).all() as Array<{ detail: string }>).map((row) => row.detail).join('\n')
+    expect(plan).toMatch(/USING (COVERING )?INDEX idx_behavior_dead_letters_open/)
   })
 
   it('persists quarantine occupancy independently of the invalid result and never loses running uncertainty', async () => {

@@ -1791,6 +1791,12 @@ export class ChatRuntime extends EventEmitter {
     return storage.listEvents(id, afterSeq)
   }
 
+  /** Where the last `turns` turns of a transcript begin: a first open reads from there. */
+  turnsStart(id: string, turns: number): number {
+    this.get(id)
+    return storage.lastTurnsStart(id, turns)
+  }
+
   ownsSession(id: string): boolean {
     return storage.sessionInstance(id) === this.instance
   }

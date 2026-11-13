@@ -113,6 +113,69 @@ describe('identity-scoped reads', () => {
     expect(mocks.runFile).toHaveBeenCalledTimes(4)
   })
 
+  it('answers the browser from the last observation at once and reads it again behind the answer', async () => {
+    database.setMeta('me', 'Octocat')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload(100)) }))
+    const first = await quota.readGithubQuota()
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    vi.setSystemTime(T0 + quota.QUOTA_INTERVAL_MS + 1)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
+      await gate
+      return { stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload(200)) }
+    })
+    // GitHub is held: the answer still comes, from the last observation, with when it was made.
+    const stale = await quota.readGithubQuota({ lastObserved: true })
+    expect(stale.accounts[0].checkedAt).toBe(first.accounts[0].checkedAt)
+    expect(mocks.runFile).toHaveBeenCalledTimes(3)
+    release()
+    await vi.waitFor(async () => expect((await quota.readGithubQuota({ lastObserved: true })).accounts[0].checkedAt).not.toBe(first.accounts[0].checkedAt))
+  })
+
+  it('never writes an older observation back over the monitor’s, even racing it', async () => {
+    database.setMeta('me', 'a-user')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'token-a' : JSON.stringify(payload(100)) }))
+    await quota.readGithubQuota()
+    database.setMeta('agentAccount', 'b-agent')
+    vi.setSystemTime(T0 + quota.QUOTA_INTERVAL_MS + 1)
+    let releaseB!: () => void
+    const gateB = new Promise<void>((resolve) => { releaseB = resolve })
+    mocks.runFile.mockImplementation(async (_command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      if (args[0] === 'auth') return { stdout: args.at(-1) === 'b-agent' ? 'token-b' : 'token-a' }
+      if (options.env.GH_TOKEN === 'token-b') { await gateB; return { stdout: JSON.stringify(payload(100)) } }
+      // a-user's budget is now spent.
+      return { stdout: JSON.stringify(payload(5000)) }
+    })
+    // The monitor reads both fresh; the browser takes a-user's older snapshot and joins b-agent's read.
+    const monitor = quota.readGithubQuota()
+    const browser = quota.readGithubQuota({ lastObserved: true })
+    releaseB()
+    await monitor
+    expect((await browser).accounts.find((account) => account.login === 'a-user')!.buckets.find((bucket) => bucket.resource === 'core')!.remaining).toBe(4900)
+    expect(alerts.openAlerts().map((alert) => alert.kind)).toContain('github_quota_exhausted')
+  })
+
+  it('writes a read\'s quota histories and risk windows in one commit each, never one per key', async () => {
+    database.setMeta('me', 'Octocat')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload()) }))
+    const written: boolean[] = []
+    const write = database.setMeta
+    const spy = vi.spyOn(database, 'setMeta').mockImplementation((key: string, value: string) => { written.push(database.db.inTransaction); return write(key, value) })
+    try { await quota.readGithubQuota() } finally { spy.mockRestore() }
+    // The core and graphql histories, three resources' samples and their windows: all inside a transaction.
+    expect(written.length).toBeGreaterThanOrEqual(5)
+    expect(written.every(Boolean)).toBe(true)
+  })
+
+  it('reads an account never observed now, even for the browser', async () => {
+    database.setMeta('me', 'Octocat')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload()) }))
+    const report = await quota.readGithubQuota({ lastObserved: true })
+    expect(report.accounts[0].error).toBe(null)
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+  })
+
   it('expires the cache from request start so CLI latency does not skip the next tick', async () => {
     database.setMeta('me', 'Octocat')
     mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {

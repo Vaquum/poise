@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { afterAll, afterEach, expect, it } from 'vitest'
 import { BehaviorChainJournal } from '../server/behavior-chain-store'
 import { behaviorChainAttention, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
+import { decideBehaviorChain } from '../server/behavior-chain-decision'
 import { normalize } from '../gateway/src/diagnostics/contract'
 import { DiagnosticStore } from '../gateway/src/diagnostics/store'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
@@ -88,6 +89,36 @@ it('reads completed chains and refuses missing, conflicting and ambiguous exact 
   expect(behaviorChainWorkImpact(journal, call, other.chain.invocations[0].id)).toBeNull()
   loggingWorkFixture(journal, 'acme/repo', 9, correlation, call, at)
   expect(behaviorChainWorkImpact(journal, call, correlation)).toBeNull()
+})
+
+it('directs a held merged chain to original review evidence despite an external approval', () => {
+  const journal = new BehaviorChainJournal(db)
+  const fixture = loggingWorkFixture(journal, 'acme/repo', 7, correlation, call, at)
+  const before = structuredClone(fixture.observation)
+  before.checkedAt = at + 3500
+  before.prReviewers = [before.approver]
+  Object.assign(before.pull!, { approved: true, ready: true, checksState: 'SUCCESS', failing: [], reviewIds: [91], reviewReceipts: [{ id: 91,
+    head: before.pull!.head, state: 'APPROVED', invocation: null, response: null, submittedAt: at + 3500 }] })
+  const current = fixture.append({ type: 'chain.observed', observation: before }, at + 3500)
+  expect(decideBehaviorChain(current, before, at + 3500)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+  const merged = structuredClone(before)
+  merged.checkedAt = at + 4500
+  Object.assign(merged.pull!, { state: 'closed', merged: true, mergeSha: 'c'.repeat(40), mergedAt: at + 4000 })
+  Object.assign(merged.publication, { state: 'closed', merged: true, merge_sha: 'c'.repeat(40) })
+  const reason = 'confirmed merge retains an open review obligation: qualifying pre-merge review response is missing'
+  expect(decideBehaviorChain(journal.read(fixture.chain.id)!, merged, at + 4500)).toEqual({ kind: 'hold', reason })
+  fixture.append({ type: 'chain.observed', observation: merged }, at + 4500)
+  fixture.append({ type: 'chain.merged', mergeSha: 'c'.repeat(40), evidence: { repository: 'acme/repo', pull_number: 107,
+    merged: true, merge_sha: 'c'.repeat(40), review_complete: false } }, at + 4500)
+  const retained = fixture.append({ type: 'chain.held', reason }, at + 4500)
+  const history = journal.history(retained.id)
+  journal.rebuild()
+  expect(behaviorChainWorkImpact(journal, call, correlation)).toMatchObject({ impact: 'blocked', stage: 'Merged', retryAt: null,
+    nextAction: 'Reconcile original pre-merge review evidence; no new invocation can start after merge' })
+  expect(decideBehaviorChain(journal.read(retained.id)!, merged, at + 4500,
+    { before, firstMerged: merged })).toEqual({ kind: 'hold', reason })
+  expect(journal.read(retained.id)).toEqual(retained)
+  expect(journal.history(retained.id)).toEqual(history)
 })
 
 it('keeps a current backoff retry time when progress advances past its wait note', () => {

@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync, existsSync } from 'node:fs'
 import { homedir } from 'os'
 import { join, dirname } from 'path'
+import { cachedStatement } from './statements'
 
 // Poise's local SQLite holds:
 //   meta          — small key-value store for org / me / timezone settings
@@ -414,6 +415,11 @@ const migrateSchema = db.transaction(() => {
       ON behavior_seen(launch_repo, launch_pr);
     CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_created
       ON behavior_dead_letters(created_at DESC);
+    -- The open dead letters each behaviors tick checks against closed pull
+    -- requests: retired rows are kept forever, so a scan grew with history.
+    CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_open
+      ON behavior_dead_letters(behavior, repo, pr, id)
+      WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_one_unresolved
       ON alerts(dedupe_key) WHERE resolved_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_alerts_created
@@ -462,7 +468,7 @@ if (secureDeleteRebuilt !== 'complete') {
 // cheap and makes schema initialization safe to repeat.
 
 export function getMeta(key: string): string | null {
-  const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
+  const row = cachedStatement(db, 'SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
   return row ? row.value : null
 }
 
@@ -714,7 +720,7 @@ export function markBehaviorLaunchIntentOwned(input: {
 }
 
 export function listBehaviorLaunchClaims(key: string): BehaviorLaunchClaim[] {
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     SELECT key, target, seen_at, claim_id, lease_until, launch_behavior,
            launch_repo, launch_pr, launch_requested_at, launch_call_id, launch_error, launch_quarantine, launch_quarantine_may_run,
            launch_expected_head, launch_actor, launch_source, launch_correlation_id,
@@ -1063,7 +1069,7 @@ export function listCompletedBehaviorActions(): CompletedBehaviorAction[] {
 // posted is quarantined for a person instead of being silently released. The
 // review-round cap reads this at launch time.
 export function countReviewRounds(repo: string, pr: number): number {
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT
       COUNT(DISTINCT CASE WHEN key = 'review-new-prs' THEN launch_head_sha END)
       + COUNT(CASE WHEN key = 'approve-prs' THEN 1 END) AS n
@@ -1299,7 +1305,7 @@ export function retireBehaviorDeadLettersForClosedPrs(
 ): number {
   const rows = (db.prepare(`
     SELECT id, behavior, repo, pr
-    FROM behavior_dead_letters AS dead
+    FROM behavior_dead_letters AS dead INDEXED BY idx_behavior_dead_letters_open
     WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL
   `).all() as Array<{ id: string, behavior: string, repo: string, pr: number }>)
     .filter((row) => behaviors.includes(row.behavior)
@@ -1603,7 +1609,7 @@ function readBehaviorDeadLetters(
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
     throw new Error('dead-letter limit must be between 1 and 500')
   }
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     WITH active AS (
     SELECT dead.*
     FROM behavior_dead_letters AS dead

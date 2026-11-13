@@ -336,6 +336,43 @@ it('excludes confirmed closed seeds without a PR from blocked work', async () =>
   expect(report.blocked.items).toEqual([])
 })
 
+it('excludes a held binding retired by a different merged closing PR', async () => {
+  const f = setup()
+  const reviewer = { model: 'fixture', slot: 'primary', recovery: 'fixture' }
+  const closing = 'https://github.com/acme/repo/pull/1260'
+  const TEST_MERGE = '307c8a031acceae31843add8e66d97ce93ef5e13'
+  const makeClosed = (existingPulls: string[], externalMerge?: ChainObservation['externalMerge']): ChainObservation => ({
+    checkedAt: NOW, existingPulls, issue: { open: false, eligible: true, revision: 'issue', commentIds: [] },
+    issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer,
+    prerequisites: { wait: null, base: HEAD, evidence: [] },
+    publication: { pull_number: 1259, head_sha: HEAD, head_invocation: null, state: 'closed', merged: false, merge_sha: TEST_MERGE },
+    pull: { number: 1259, head: HEAD, headSince: NOW - HOUR, state: 'closed', draft: false, merged: false, mergeSha: null,
+      mergedAt: null, queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'review', greyRuns: [], pending: false, failing: [], conflict: false, behind: false, checksState: null },
+    ...(externalMerge === undefined ? {} : { externalMerge }),
+  })
+  const settle = (issue: number, observation: ChainObservation) => {
+    let chain = f.seed(issue)
+    chain = f.append(chain, { type: 'invocation.admitted', invocation: { id: chainBasis(`${chain.id}:closed`).slice(0, 32),
+      behavior: 'review-issue', actor: 'reviewer', slot: 'primary', basis: 'issue', model: 'fixture',
+      admittedAt: NOW - 48 * HOUR, request: { command: 'agent-interface', argv: [], cwd: '/fixture' } } }, NOW - 48 * HOUR)
+    chain = f.append(chain, { type: 'invocation.started', invocationId: chain.invocations[0].id }, NOW - 48 * HOUR + 1)
+    chain = f.append(chain, { type: 'invocation.settled', invocationId: chain.invocations[0].id, callId: chain.invocations[0].id,
+      outcome: 'commented', evidence: { status: 'completed', action: 'commented', outcome: 'commented', completedAt: NOW - 47 * HOUR } }, NOW - 47 * HOUR)
+    chain = f.append(chain, { type: 'chain.observed', observation }, NOW - HOUR)
+    return f.append(chain, { type: 'chain.held', reason: `seed issue already belongs to existing work: ${closing}` }, NOW - HOUR + 1)
+  }
+  const retired = settle(1, makeClosed([closing], { pull_number: 1260, merge_sha: MERGE }))
+  const missing = settle(2, makeClosed([closing]))
+  const extra = settle(3, makeClosed([closing, 'https://github.com/acme/repo/pull/1261'], { pull_number: 1260, merge_sha: MERGE }))
+  const incomplete = settle(4, makeClosed([closing], { pull_number: 1260 } as unknown as ChainObservation['externalMerge']))
+  expect(f.journal.page('', 100, false).map(chain => chain.id)).toEqual([missing.id, extra.id, incomplete.id].sort())
+  const report = await f.read()
+  expect(report.blocked.count).toBe(3)
+  expect(report.blocked.items.map(item => item.work).sort()).toEqual([missing.id, extra.id, incomplete.id].sort())
+  expect(report.blocked.items.map(item => item.work)).not.toContain(retired.id)
+})
+
 it('counts a pre-merge failure reconciled after merging via its admitted attempt', async () => {
   const f = setup()
   let chain = f.seed(1)

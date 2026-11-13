@@ -662,6 +662,11 @@ assertion may only resume, and anything else is refused with 403):
   - `unsettledNativeCalls` exposes the same bounded Caller read's count of
     native Calls awaiting durable resource release or cleanup-claim retirement.
     It is `null` when that read is unknown, never an assumed zero.
+  - Optional `nativeCleanupHold` identifies one terminal Call with a recorded
+    cleanup failure from that same snapshot. It exposes `callId` and a bounded,
+    redacted `reason`, which is `null` while a retry owns the claim and has yet
+    to record its result. Before requesting a replacement drain, the gateway
+    defers on a hold in fresh health, including on its first pass after restart.
   - `backgroundWork` counts everything else a restart would cut: the Chat
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),
@@ -1195,6 +1200,8 @@ bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
 receipt through the existing workspace health/image proof without initiating
 another rollout; [Upgrades](Operating.md#upgrades) defines its outcomes and
 retained evidence. This adds no gateway or workspace API.
+Fork Deploy verifies the receipt in a separate step after host apply. Sync
+rechecks the current applied receipt after the bounded wait.
 The Sync workflow's separate release observer uses the existing five-minute
 schedule and Actions summary even when upstream sync is disabled. It reads
 exact-main workflow evidence, retained rollout inventory and fresh workspace
@@ -1388,6 +1395,11 @@ For a closed seed without an owned PR, Caller's seed read can identify a sole
 merged closing PR on the expected base repository and default branch. The normal
 PR read confirms its merge SHA before reconciliation records the external outcome;
 missing original review evidence remains pending and publication ownership is unchanged.
+For a bound PR confirmed closed without merge, the same verifier retains a
+different merged closing PR separately in `externalMerge`. Only that verified
+closing reference is discounted from the active-list exclusion; the original
+binding and receipts remain unchanged, and its test-merge SHA cannot establish
+a merge. Remaining publication, native resource and review obligations stay active.
 Recovered full-suite repairs can instead end with verified supersession. The
 same journal retains failure/recovery runs, covering merges, the duplicate head
 and its native close receipt; summaries expose that evidence separately from

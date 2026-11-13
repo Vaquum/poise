@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
+import { cachedStatement } from './statements'
 import type { BehaviorCutoverState } from '../src/behavior-cutover'
 import { budgetShortfall, validateExecutionLimits, type BehaviorExecutionLimits, type BehaviorResourceBudget, type BehaviorResourceReservation } from './behavior-resources'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
@@ -427,12 +428,12 @@ export class BehaviorChainJournal {
   /** Bounded status lookup, including completed chains while the datastore
    * still lists their PR. The journal hash validates the selected projection. */
   forPull(repository: string, number: number, identity?: { headRef: string | null, headRepo: string | null }): BehaviorChain | null {
-    let rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current
+    let rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current
       WHERE lower(json_extract(state, '$.repository')) = lower(?)
         AND json_extract(state, '$.observation.publication.pull_number') = ? LIMIT 2`)
       .all(repository, number) as Array<{ chain_id: string }>
     if (!rows.length && identity?.headRef && identity.headRepo?.toLowerCase() === repository.toLowerCase()) {
-      rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current
+      rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current
         WHERE merged = 0 AND lower(json_extract(state, '$.repository')) = lower(?) AND json_extract(state, '$.branch') = ? LIMIT 2`)
         .all(repository, identity.headRef) as Array<{ chain_id: string }>
     }
@@ -470,13 +471,15 @@ export class BehaviorChainJournal {
         ${merged ? '' : `AND json_extract(state, '$.supersession') IS NULL AND NOT coalesce((
           json_type(state, '$.observation.issue.open') = 'false'
           AND json_type(state, '$.observation.existingPulls') = 'array'
-          AND json_array_length(state, '$.observation.existingPulls') = 0
+          AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.observation.existingPulls') p
+            WHERE json_extract(state, '$.observation.externalMerge.merge_sha') IS NULL
+              OR lower(p.value) IS NOT lower('https://github.com/' || json_extract(state, '$.repository') || '/pull/' || json_extract(state, '$.observation.externalMerge.pull_number')))
           AND resource_pending = 0 AND json_extract(state, '$.reviewPending') IS NOT 1
           AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i WHERE json_extract(i.value, '$.state') IS NOT 'settled')
           AND json_extract(state, '$.observation.publication.merged') IS 0
-          AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
           AND ((json_type(state, '$.observation.pull') = 'null'
             AND json_type(state, '$.observation.publication.pull_number') = 'null'
+            AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
             AND json_type(state, '$.observation.publication.state') = 'null')
           OR (json_extract(state, '$.observation.pull.state') = 'closed'
             AND json_extract(state, '$.observation.publication.state') = 'closed'

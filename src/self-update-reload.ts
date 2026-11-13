@@ -1,5 +1,5 @@
 // Decides when a tab may reload itself onto a newly promoted build. Pure state
-// over observations of `/api/health` and reports from the app's own guards,
+// over observations of `/api/health/live` and reports from the app's own guards,
 // so every rule here has a unit test and the DOM wiring (self-update-watch)
 // only carries observations in and actions out.
 //
@@ -77,7 +77,7 @@ export class ReloadController {
     this.now = opts.now ?? (() => Date.now())
   }
 
-  /** Record a `/api/health` answer; `null` means the request itself failed. */
+  /** Record a `/api/health/live` answer; `null` means the request itself failed. */
   observe(obs: HealthObservation | null): void {
     if (!obs || !obs.ok) {
       this.lastOk = false

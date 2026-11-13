@@ -323,7 +323,12 @@ the current minute window of event-loop delay, where fan-out stalls show up
 first. Every such CLI process starts from a worker thread: on Linux, starting a
 process blocks the starting thread until the child runs, and under CPU
 contention that wait held the event loop. Should the worker fail, processes
-start on the main thread again.
+start on the main thread again. GitHub lists (`/api/gh`) start no process for
+the datastore's `pr`, `issue` and `user` views: one long-lived worker thread
+reads each datastore file read-only with the CLI's own query
+(`server/datastore-views.ts`), reopens a file that was replaced, and gives an
+identical read already in flight the same answer. Other views, and any read the
+worker fails, still run `github-datastore view`.
 
 `merge-prs` is disabled unless `behavior_merge_prs_enabled` is explicitly `1`.
 It uses Caller directly without a model launch: after fresh datastore eligibility,
@@ -447,6 +452,8 @@ Behaviors groups those refusals under the same episode while keeping each
 behavior's refusal. Changing sync ages, later ticks and server restarts do not
 open another episode. Evidence is ordered by successful sync timestamp, then
 age within that sync; late stale or healthy results cannot replace newer evidence.
+Closed-target reconciliation uses the same episode for verified stale refusals,
+without adding Error rows on later probes or reading targets before freshness returns.
 Healthy probes keep advancing the retained evidence after recovery. Only a
 validated successful healthy probe records recovery and rearms the mirror.
 Caller's normal stale stderr with validated stale JSON is an expected probe

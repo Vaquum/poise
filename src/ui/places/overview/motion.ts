@@ -4,7 +4,8 @@
 // behavior chain's tasks by phase. Read here, not through another place.
 import type { SessionRecord } from '../../../../server/chat/protocol'
 import { chatClient } from '../../../chat-client'
-import { organizationPayload, organizationUrl } from '../../../organizations'
+import { getSettings } from '../../../config'
+import { getSelectedOrganization, organizationPayload, organizationUrl } from '../../../organizations'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
 import { term } from '../../registry'
@@ -30,6 +31,21 @@ export interface Motion {
 
 const key = (repo: string, number: number | string) => `${repo.toLowerCase()}#${String(number).replace(/^#/, '')}`
 
+/** The last reads, kept across visits and page loads: a return or a reload
+ *  paints them at once, then reads again. Chats and the chain's tasks are the
+ *  workspace's; issues, pull requests and runs are one organization's. Another
+ *  GitHub user's or organization's reads never stand for these. */
+interface LastMotion { me: string, org: string, sessions: Read<SessionRecord[]>, items: Read<GhRecord[]>, pulls: Read<GreenRead>, running: Read<RunningLog[]>, chains: Read<ChainLike[]> }
+const LAST_MOTION_KEY = 'poise-overview-motion'
+function rememberedMotion(): LastMotion | null {
+  try {
+    const last = JSON.parse(localStorage.getItem(LAST_MOTION_KEY) ?? 'null') as LastMotion | null
+    return last && last.me === (getSettings().me ?? '') ? last : null
+  } catch {
+    return null
+  }
+}
+
 export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   const { signal } = ctx
   const sessions: Read<Map<string, SessionRecord>> = { ...unread<Map<string, SessionRecord>>(), data: null }
@@ -39,6 +55,25 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   let chains: Read<ChainLike[]> = unread()
   let pick: { group: 'people' | 'items', state: State } | { phase: Phase } = { group: 'people', state: 'running' }
   const sessionListeners = new Set<() => void>()
+  // The GitHub user this mount reads for, and the organization of the issues,
+  // pull requests and runs it holds; a read overtaken by a later one is dropped.
+  const me = getSettings().me ?? ''
+  let itemsOrg = getSelectedOrganization()
+  let itemsRead = 0
+  const last = rememberedMotion()
+  if (last) {
+    if (last.sessions.data) Object.assign(sessions, { data: new Map(last.sessions.data.map((session) => [session.id, session])), at: last.sessions.at })
+    chains = last.chains
+    if (last.org === itemsOrg) ({ items, pulls, running } = last)
+  }
+  function remember(): void {
+    // A place left, or a GitHub user changed since it opened, keeps nothing.
+    if (signal.aborted || (getSettings().me ?? '') !== me) return
+    const kept = <T>(read: Read<T>): Read<T> => ({ data: read.data, error: '', at: read.at })
+    const last: LastMotion = { me, org: itemsOrg, sessions: kept({ data: sessions.data ? [...sessions.data.values()] : null, error: '', at: sessions.at }),
+      items: kept(items), pulls: kept(pulls), running: kept(running), chains: kept(chains) }
+    try { localStorage.setItem(LAST_MOTION_KEY, JSON.stringify(last)) } catch { /* the next page reads them anew */ }
+  }
 
   function work(): Work[] {
     const out: Work[] = []
@@ -133,22 +168,30 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
     }
     reportRead(ctx, 'overview-chats', 'Chats could not be read', sessions)
     paint()
+    remember()
     for (const listener of sessionListeners) listener()
   }
   async function readItems(): Promise<void> {
+    // Another organization's last reads never stand for this one's.
+    const org = getSelectedOrganization()
+    if (org !== itemsOrg) { [items, pulls, running] = [unread(), unread(), unread()]; itemsOrg = org }
+    const mine = ++itemsRead
     const gh = (body: Record<string, unknown>) => json<Record<string, unknown>>('/api/gh', { method: 'POST', body: JSON.stringify({ ...body, ...organizationPayload() }) })
     const settle = async <T>(target: Read<T>, read: () => Promise<T>): Promise<Read<T>> => {
       try { return { data: await read(), error: '', at: Date.now() } } catch (error) { return { ...target, error: reason(error) } }
     }
-    ;[items, pulls, running] = await Promise.all([
+    const read = await Promise.all([
       settle(items, async () => ((await gh({ operation: 'list', record_type: 'all', record_state: 'open', limit: 200, offset: 0 })).records ?? []) as GhRecord[]),
       settle(pulls, async () => await gh({ operation: 'green_pr' }) as GreenRead),
       settle(running, async () => ((await json<{ logs?: RunningLog[] }>(organizationUrl('/api/agent-logs?status=running'))).logs ?? []).filter((log) => log.status === 'running')),
     ])
+    if (mine !== itemsRead || signal.aborted) return
+    ;[items, pulls, running] = read
     reportRead(ctx, 'overview-items', 'Issues and pull requests could not be read', items)
     reportRead(ctx, 'overview-pulls', 'Pull requests’ status checks could not be read', pulls)
     reportRead(ctx, 'overview-running', 'Running runs could not be read', running)
     paint()
+    remember()
   }
 
   // A chat created or changed elsewhere moves at once.
@@ -163,7 +206,7 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   whileVisible(ctx, 60_000, () => { void readSessions(); void readItems() })
 
   return {
-    setChains(next, error, at) { chains = error ? { ...chains, error } : { data: next, error: '', at }; paint() },
+    setChains(next, error, at) { chains = error ? { ...chains, error } : { data: next, error: '', at }; paint(); if (!error) remember() },
     role: (chat) => sessions.data?.get(chat)?.role ?? null,
     sessions: () => [...(sessions.data?.values() ?? [])],
     onSessions: (listener) => { sessionListeners.add(listener) },

@@ -60,10 +60,15 @@ export class CallerReceiptStoreError extends Error {
 
 let failure: CallerReceiptStoreError | null = null
 
+export interface NativeCleanupHold { callId: string, reason: string | null }
+interface CallerActivity { live: number, pendingResources: number | null, cleanupHold?: NativeCleanupHold, cause?: unknown }
+type ResourceRead = 'skip' | 'count' | 'health'
+const pendingNative = "source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)"
+
 /** Caller calls recorded as running whose process is alive, whichever server
  *  started them; null when the records exist but cannot be read. */
-function callerActivity(dataDir: string | undefined, behaviorOnly: boolean, resources: boolean): { live: number, pendingResources: number | null } | null {
-  let activity: { live: number, pendingResources: number | null, cause?: unknown } | null = null
+function callerActivity(dataDir: string | undefined, behaviorOnly: boolean, resources: ResourceRead): CallerActivity | null {
+  let activity: CallerActivity | null = null
   try {
     activity = callerDatabase(dataDir, path => readCallerActivity(path, behaviorOnly, resources))
     if (activity.pendingResources === null) throw activity.cause
@@ -103,7 +108,7 @@ function callerActivity(dataDir: string | undefined, behaviorOnly: boolean, reso
   }
 }
 
-function readCallerActivity(path: string, behaviorOnly: boolean, resources: boolean): { live: number, pendingResources: number | null, cause?: unknown } {
+function readCallerActivity(path: string, behaviorOnly: boolean, resources: ResourceRead): CallerActivity {
   if (!path || !existsSync(path)) return { live: 0, pendingResources: 0 }
   let db: InstanceType<typeof Database> | undefined
   try {
@@ -114,14 +119,23 @@ function readCallerActivity(path: string, behaviorOnly: boolean, resources: bool
       + (behaviorOnly ? ` and (source is null or source in (${BEHAVIOR_CALL_SOURCES.map(() => '?').join(',')}))` : ''))
       .all(...(behaviorOnly ? BEHAVIOR_CALL_SOURCES : [])) as Array<{ pid: unknown }>
     const live = rows.filter(({ pid }) => Number.isSafeInteger(Number(pid)) && Number(pid) > 0 && alive(Number(pid))).length
-    let pendingResources = 0
-    if (resources) {
-      try {
-        const pending = db.prepare("select count(*) as count from calls where source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)").get() as { count: number }
-        pendingResources = pending.count
-      } catch (cause) { return { live, pendingResources: null, cause } }
-    }
-    return { live, pendingResources }
+    if (resources === 'skip') return { live, pendingResources: 0 }
+    try {
+      const { count: pendingResources } = db.prepare(`select count(*) as count from calls where ${pendingNative}`).get() as { count: number }
+      if (resources !== 'health' || pendingResources === 0) return { live, pendingResources }
+      // The failure counter survives a retry taking the private claim. Report
+      // one terminal hold from the same snapshot as the replacement gate.
+      const hold = db.prepare(`
+        select id as callId, case when json_type(resource_cleanup, '$.last_error') = 'text'
+          then substr(json_extract(resource_cleanup, '$.last_error'), 1, 2000) end as reason
+        from calls where ${pendingNative} and status <> 'running'
+          and case when json_valid(resource_cleanup) then json_type(resource_cleanup, '$.failures') = 'integer'
+            and json_extract(resource_cleanup, '$.failures') > 0 end
+        order by id limit 1
+      `).get() as NativeCleanupHold | undefined
+      if (!hold || !/^[a-f0-9]{32}$/.test(hold.callId)) return { live, pendingResources }
+      return { live, pendingResources, cleanupHold: hold }
+    } catch (cause) { return { live, pendingResources: null, cause } }
   } finally {
     db?.close()
   }
@@ -129,18 +143,19 @@ function readCallerActivity(path: string, behaviorOnly: boolean, resources: bool
 
 /** Rechecked by managed work at its existing final admission boundaries. */
 export function requireCallerReceipts(): void {
-  callerActivity(process.env.AGENT_INTERFACE_DATA_DIR, false, true)
+  callerActivity(process.env.AGENT_INTERFACE_DATA_DIR, false, 'count')
   if (failure) throw failure
 }
 
 export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR, behaviorOnly = false): number | null {
-  return callerActivity(dataDir, behaviorOnly, false)?.live ?? null
+  return callerActivity(dataDir, behaviorOnly, 'skip')?.live ?? null
 }
 
 /** The Caller calls a restart would cut. `known` is false while Caller's
  *  records cannot be read; `count` then holds this server's own launches. */
-export function runningCallerCalls(behaviorOnly = false): { count: number, pendingResources: number, known: boolean } {
-  const activity = callerActivity(process.env.AGENT_INTERFACE_DATA_DIR, behaviorOnly, true)
+export function runningCallerCalls(behaviorOnly = false): { count: number, pendingResources: number, known: boolean, cleanupHold?: NativeCleanupHold } {
+  const activity = callerActivity(process.env.AGENT_INTERFACE_DATA_DIR, behaviorOnly, behaviorOnly ? 'count' : 'health')
   return { count: Math.max(runningCallerLaunches(behaviorOnly) + (behaviorOnly ? 0 : debates), activity?.live ?? 0),
-    pendingResources: activity?.pendingResources ?? 0, known: activity !== null && activity.pendingResources !== null }
+    pendingResources: activity?.pendingResources ?? 0, known: activity !== null && activity.pendingResources !== null,
+    cleanupHold: activity?.cleanupHold }
 }

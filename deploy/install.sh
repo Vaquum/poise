@@ -107,6 +107,7 @@ EOF
 require_linux
 require_docker
 require_env_file
+lock_deployment --timeout 600
 ensure_caller_guard
 require_free_ports
 image=$(runtime_image)
@@ -122,7 +123,5 @@ fi
 compose up --detach --build
 wait_for_gateway
 check_gateway_networks
-verify_workspaces "$sha" "$image" "$expected_workspaces"
-ensure_caller_guard
-prune_docker_storage "$image"
+finish_deployment "$sha" "$image" "$expected_workspaces"
 next_steps

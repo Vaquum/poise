@@ -999,14 +999,25 @@ describe('a suite on a test box', () => {
     expect(stderr).toContain('cannot start /no/such/command')
   })
 
-  it('destroys the box of a suite too slow for it at the time limit, and sends the agent to CI', async () => {
+  it.each([false, true])('retains observed output before a relay timeout (test failure: %s)', async (failed) => {
     await startAll({ limitSeconds: 2 })
     const started = Date.now()
-    const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'setInterval(() => {}, 1000)']).done
+    const assertion = `try { require('node:assert/strict').equal(1, 2) } catch (error) { console.error('FAIL fixture.validation::test_first_failure\\n' + error.stack) }; `
+    const script = (failed ? assertion : '') + 'setInterval(() => {}, 1000)'
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
     expect(code).toBe(124)
     expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
     expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
     expect(stderr).toContain('let CI run the tests')
+    const admission = /\[poise\] candidate ([a-f0-9]{64}), suite .*, run ([a-f0-9]{32})/.exec(stderr)
+    expect(admission).not.toBeNull()
+    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![2] }))
+    if (failed) {
+      const failure = 'FAIL fixture.validation::test_first_failure\nAssertionError'
+      expect(stderr).toContain(failure)
+      expect(stderr.indexOf(admission![0])).toBeLessThan(stderr.indexOf(failure))
+      expect(stderr.indexOf('AssertionError')).toBeLessThan(stderr.indexOf('no test result:'))
+    } else expect(stderr).not.toContain('AssertionError')
     expect(Date.now() - started).toBeLessThan(10_000)
     const box = runBox()
     await until(() => terminated.includes(box.id), 'the box to be terminated')

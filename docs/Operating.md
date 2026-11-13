@@ -15,6 +15,20 @@ For an external Caddy proxy, install the optional
 [bounded diagnostic reader](../deploy/ingress/README.md) on its operator-owned
 Docker host to connect the external ingress source with expiring health.
 
+## Main-thread stalls
+
+`GET /api/health/stalls` reports, from memory and with no I/O, where the
+server's main thread has stalled since it started (`server/stall-observer.ts`):
+- garbage-collection pauses;
+- SQLite calls of 50 ms or more, with SQL literals masked and the three frames
+  that made the call, including each transaction's `BEGIN` and `COMMIT`;
+- how long a trivial file read waited for the file-I/O threads, probed every
+  2 s;
+- the event loop's delay and the process's memory.
+
+Nothing triggers, writes or exports anything; it is always on, and its cost is
+two clock reads per SQLite call.
+
 ## Bounded CPU capture
 
 The direct service-mode production server accepts at most one operator-requested
@@ -363,6 +377,11 @@ API (`GET /config/`) to confirm every gateway handler has the retry window.
 record the old and new gateway container IDs, start public requests while the
 gateway listener is absent, and wait for their completed results through the
 successor. Include a POST handled exactly once; readiness alone is insufficient.
+The deployment test runs on an isolated Docker Engine with
+`"userland-proxy": false`, so the published port refuses dials until the gateway
+listens. Docker's userspace proxy can accept a connection during startup and
+then reset it before the gateway listens. Caddy treats that reset as a
+connected failure and returns 502 for a POST whose delivery it cannot verify.
 
 Point the DNS records at the proxy. The OAuth App and everything after it
 are the same as above.
@@ -503,30 +522,36 @@ The wake sends only `ref: main`, never a candidate SHA. The fork still requires
 `POISE_UPSTREAM_SYNC=true`; forks cannot dispatch the production wake themselves.
 
 Sync retains its five-minute schedule to reconcile missed or failed wakes.
+A successful Deploy wakes Sync for the next upstream changes once its apply
+step succeeds. A failed Deploy wakes Sync to reconcile the failure.
 Duplicate or stale wakes enter the same serialized Sync, which reads current
 main: they introduce no additional deployment or rollback. This does not prevent
 an operator from reapplying settings through Deploy on the same green tip.
-Promptness applies to requesting Sync; a retained candidate can still wait for
-later reconciliation. With `POISE_DEPLOY_HOST` set, Sync
+With `POISE_DEPLOY_HOST` set, Sync
 retains the fork's current main through both required push workflows (CI and
 Caller) and its gated, serialized Deploy attempt. Green CI alone does not
 release the candidate, nor does a successful Deploy that skipped its apply
 step. If the completion wake is missed after both required workflows pass,
 Sync dispatches the normal gated Deploy and retains the candidate for that
 tick, even with nothing new upstream. Queued or running Deploys suppress
-recovery, as does a successful run's `Deploy <sha>` step: a run recorded on an
+recovery, as does a successful `Deploy <sha>` step: a run recorded on an
 older head can deploy the current tip.
 Then Sync merges directly to the newest upstream main, coalescing changes
 that arrived during verification. Forks without deployment keep syncing every
 five minutes. GitHub may start a scheduled run some minutes late when it is busy.
 
-Missing verification, a failed or cancelled required workflow or Deploy attempt,
-or two hours since verification began lets the next sync admit a newer fix;
-it never permits deployment without that fix's own required CI. API errors stop
-the sync visibly. Sync's Actions summary names waiting, blocked and superseded
-SHAs and links the available runs. A completed Deploy attempt alone is not a
-serving claim: the existing [workspace verification](#upgrades) and
-`/api/service/health`'s `release` establish the commit actually serving.
+Missing verification, a failed or cancelled required workflow or host apply,
+or two hours since verification began lets Sync admit a newer fix with its own
+required CI. When the fork stays on the same candidate, Sync retries the first
+failed, cancelled or timed-out CI, Caller or host apply attempt once. An
+exhausted retry remains visible in Actions. Deployment-enabled forks reconcile
+their own main even with upstream merging disabled. API errors stop Sync visibly.
+Its summary names waiting, blocked and superseded SHAs and links the runs.
+
+Deploy records host apply and workspace proof as separate steps. The
+[workspace verifier](#upgrades) establishes the commit actually serving.
+After a proof timeout or interruption, Sync rechecks the current applied
+rollout using the original workspace inventory and image ID.
 A change to Poise alone then reaches the running workspaces within five more
 minutes. A change to the system under `deploy/runtime/` first waits for their
 running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
@@ -838,6 +863,8 @@ run the tests. It exits with 125, or 124 at the time limit, and never falls back
 running in the workspace. Each that the gateway can see also reaches its diagnostics
 as `test_relay.run.failed`, naming the workspace, the command and the reason; every
 run is logged with its command, exit code and duration as `test_relay.run.finished`.
+The runner prints the captured-candidate digest and suite, then the existing run ID
+at each admission, so observed failures can name the attempt that produced them.
 An explicit gateway-restart failure is the one exception: the active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated
@@ -860,7 +887,11 @@ command, diagnostic/reason, incomplete local verification and required CI in `bo
 Caller validates and publishes through its normal PR path; required CI and review
 still gate merge. Exit 124/125 alone, a genuine suite failure, an interrupted attempt
 followed by a suite result, provider execution-budget exhaustion and other blockers
-do not authorize this handoff. A previously held Call stays failed. If its checkout
+do not authorize this handoff. An observed test failure stays blocked even if the
+relay later times out; retain its first assertion/failure excerpt, suite/test and
+available captured-candidate and producing-run identities in `blocked` as defined
+in [chain outcomes](Behavior-chain.md#handoffs-and-outcomes). A previously held Call
+stays failed. If its checkout
 was reclaimed before publication, resource release proves neither surviving edits
 nor a publication plan: use the existing **Resume** and a fresh invocation to produce
 a new candidate, including for #1039, rather than claim to publish the old one.
@@ -967,6 +998,11 @@ Timeout, missing workspaces and unreadable health remain `pending`, and the
 command exits nonzero. Invoke it again later to observe activation. A different
 `desiredRelease` alone never establishes failure or supersession.
 
+Deployment-enabled forks recheck pending host-applied rollouts on the Sync
+schedule. The proof uses the exact active release and build and requires no
+pending switch. The recheck performs only inventory and health reads and
+updates the retained receipt. Check a legacy receipt by its rollout ID.
+
 The outcome becomes `complete` only after every expected workspace passes the
 proof. A supervisor `failed` marker for the exact target release establishes
 `failed`; a subsequent deployment replacing the target SHA or image establishes
@@ -1005,9 +1041,12 @@ the original cleanup witnesses alive. Older workspaces can still upgrade when
 cooperatively idle. Abrupt container loss without original cleanup proof keeps
 the disk and reservation held; a restart cannot prove reclamation.
 Pending or unknown native cleanup without a live Caller releases the drain
-immediately, without activation or waiting out its deadline. Later upgrade passes
-retry the same check while ordinary maintenance retries cleanup; a permanent
-resource hold cannot continuously drain Chat.
+immediately. A recorded terminal cleanup failure also releases the drain if
+other Caller work is active. Before requesting a replacement drain, the gateway
+reads health and defers when it reports a terminal cleanup hold. The gateway
+logs the blocking Call and its available reason and retries resume while health
+still shows an admitted drain. Ordinary maintenance continues to retry cleanup
+between passes and across gateway restarts.
 After starting the replacement the gateway
 waits for its health before declaring the upgrade finished, within the two-minute
 idle-to-ready bound; past it the miss is recorded (`workspace.upgrade.ready.missed`),

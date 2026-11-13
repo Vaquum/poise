@@ -7,6 +7,7 @@
 // write is one short transaction; nothing here talks to an agent.
 
 import { db } from '../db'
+import { cachedStatement } from '../statements'
 import { claimQueuedMessage, delegateQueue, deleteMessageQueue, pauseQueue, settleQueuedTurn, queueOwner, readQueue } from './message-queue'
 import type { ChatEnvelope, ChatEvent, SessionRecord, SessionStatus, MessageQueue, SubjectSurface } from './protocol'
 import type { AttachmentRecord } from './attachments'
@@ -211,7 +212,7 @@ export function sessionsForCheckout(checkout: string): CheckoutSession[] {
 }
 
 export function listSessions(instance: string): SessionRecord[] {
-  const rows = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
+  const rows = cachedStatement(db, 'SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
     .all(instance) as Array<{ record: string, last_seq: number, status: string, role: string | null }>
   return rows.map(parseRecord)
 }
@@ -340,6 +341,15 @@ export function listEvents(sessionId: string, afterSeq: number, limit: number = 
   }
 }
 
+/** The seq after which a transcript's last `turns` turns begin, read from the
+ *  turn-finish index; 0 when it has no more finished turns than that. */
+export function lastTurnsStart(sessionId: string, turns: number): number {
+  const row = db.prepare(`SELECT seq FROM chat_events INDEXED BY idx_chat_events_turn_finished
+    WHERE session_id = ? AND json_extract(event, '$.type') = 'turn.finished'
+    ORDER BY seq DESC LIMIT 1 OFFSET ?`).get(sessionId, turns) as { seq: number } | undefined
+  return row?.seq ?? 0
+}
+
 export function lastEvent(sessionId: string): ChatEnvelope | null {
   const row = db.prepare('SELECT seq, at, event FROM chat_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1').get(sessionId) as { seq: number, at: string, event: string } | undefined
   return row ? { seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent } : null
@@ -390,7 +400,7 @@ export function pendingRequestDetail(sessionId: string, requestId: string): { ki
 }
 
 export function listPendingRequests(sessionId: string): PendingRequest[] {
-  return (db.prepare('SELECT request_id, session_id, kind, seq FROM chat_pending WHERE session_id = ? ORDER BY seq').all(sessionId) as Array<{ request_id: string, session_id: string, kind: 'permission' | 'question', seq: number }>)
+  return (cachedStatement(db, 'SELECT request_id, session_id, kind, seq FROM chat_pending WHERE session_id = ? ORDER BY seq').all(sessionId) as Array<{ request_id: string, session_id: string, kind: 'permission' | 'question', seq: number }>)
     .map((row) => ({ requestId: row.request_id, sessionId: row.session_id, kind: row.kind, seq: row.seq }))
 }
 
