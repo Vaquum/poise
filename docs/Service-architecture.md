@@ -479,7 +479,11 @@ its own instead of refusing with dirty_unowned.
   marked failed and never run again; the image's own release takes over.
   Production shutdown synchronously retains deadline and rejection evidence in
   the private Logging store before exit 1, even after Logging stops. The
-  supervisor records its own abnormal exit event. Clean exit 75 stays quiet.
+  supervisor supplies a fresh `POISE_SHUTDOWN_DIAGNOSTIC_ID` for every launch.
+  A read-only lookup of that launch's owner-scoped shutdown Error permits a
+  distinct `workspace.exit` Warning linked by `correlationId`, retaining the
+  actual exit code and signal. Missing, unavailable or mismatched evidence keeps
+  the independent exit Error. Clean exit 75 stays quiet.
   On Linux the same supervisor owns the private native-cleanup controller.
   Its uid-only Unix socket and random generation are passed to Poise and
   Caller as `POISE_NATIVE_CONTROL`; neither the address nor per-Call tokens

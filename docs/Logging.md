@@ -435,9 +435,15 @@ unavailability is a collection Warning rather than an invented application cause
 Production shutdown retains one `process.shutdown` Error when cleanup rejects or
 reaches its ten-second deadline, including pending runtime/HTTP phases and known
 rejection causes. It commits through the same independent diagnostic store before
-exit 1, including after runtime teardown has stopped Logging. The supervisor
-can also record a generic exit event for the same shutdown. Logging retains
-those events after a healthy successor starts. Clean update exits (75) stay quiet.
+exit 1, including after runtime teardown has stopped Logging. Each supervisor
+spawn overrides `POISE_SHUTDOWN_DIAGNOSTIC_ID` with a fresh launch ID. Only a
+read-only lookup confirming that exact normalized event ID, owner, release and
+shutdown Error permits a distinct `workspace.exit` Warning. Both records use
+the launch ID as `correlationId`; the Error retains the shutdown cause and the
+Warning retains the supervisor's actual exit code and signal. Missing,
+unavailable or mismatched records leave an independent exit Error, and lookup
+failure does not change supervision. Logging retains those events after a
+healthy successor starts. Clean update exits (75) stay quiet.
 
 Container discovery includes stopped containers and removes checkpoints only for absent container IDs; retained events survive that cleanup. Operator ingress deduplicates exact record replays, while separate records sharing a request ID retain distinct occurrence IDs. Bootstrap line capture keeps folded credential-header state across child output chunks before reporting or persistence.
 

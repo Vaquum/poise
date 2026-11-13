@@ -420,7 +420,8 @@ export function createProductionShutdown(
       }
       // Runtime teardown can already have stopped Logging. Commit synchronously
       // through its independent store before the immediate process exit.
-      recordRuntimeDiagnostic({ id: process.env.POISE_SHUTDOWN_DIAGNOSTIC_ID, source: 'poise', component: 'production',
+      recordRuntimeDiagnostic({ id: process.env.POISE_SHUTDOWN_DIAGNOSTIC_ID, correlationId: process.env.POISE_SHUTDOWN_DIAGNOSTIC_ID,
+        source: 'poise', component: 'production',
         operation: 'process.shutdown', level: 'error', phase: timedOut ? 'shutdown_deadline' : 'shutdown_rejected',
         message: timedOut ? `Production shutdown reached its ${PRODUCTION_SHUTDOWN_TIMEOUT_MS} ms deadline; pending: ${[...state.pending].join(', ')}`
           : `Production shutdown rejected during ${state.failures.map(({ phase }) => phase).join(', ')}`,
