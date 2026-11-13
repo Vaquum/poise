@@ -33,6 +33,13 @@ Call has `not_started` / `preflight_failed`, no executed head, and either
 failure evidence remains authoritative. This classification changes neither
 Caller status nor publication, retry or hold rules.
 
+The typed pre-publication [issue revision fence](Issue-review.md#when-a-reviewer-fails)
+is routine supersession and creates no new Logging event or work-error count.
+The metadata-only diagnostic feed carries that invariant without receipts or
+publication artifacts; omitted fields alone never prove that nothing was posted.
+This correction applies to future collection. Retained events are immutable, so
+an Error already stored for a stale review keeps its original classification.
+
 Credentials, encoded Git authentication, authorization/cookie headers and
 credential-bearing URLs are redacted before persistence. Context excludes
 prompts, content, responses, stdout, arguments, environment and conversation

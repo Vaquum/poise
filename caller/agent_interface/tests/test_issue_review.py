@@ -120,20 +120,20 @@ class IssueReviewCase(TestCase):
             self.addCleanup(target.stop)
         agent_interface.init_db()
 
-    def run_review(self, github, supervise, model="opus-5-max", recovery=None, expect_exit=False, expected=None):
+    def run_review(self, github, supervise, model="opus-5-max", recovery=None, expect_exit=False, expected=None, correlation="claim-1"):
         with patch.object(issue_review, "interface", github), patch.object(issue_review, "supervise", supervise), \
                 redirect_stdout(io.StringIO()) as output:
             if expect_exit:
                 with self.assertRaises(SystemExit):
-                    agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", "claim-1",
+                    agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", correlation,
                                                      model, recovery, note="Remember the charts.",
                                                      expected_issue_revision=expected)
             else:
-                agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", "claim-1",
+                agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", correlation,
                                                  model, recovery, note="Remember the charts.",
                                                  expected_issue_revision=expected)
         with agent_interface.db() as conn:
-            row = conn.execute("select * from calls where correlation_id='claim-1'").fetchone()
+            row = conn.execute("select * from calls where correlation_id=?", (correlation,)).fetchone()
         return row, json.loads(output.getvalue())
 
     def exported(self, row):
@@ -334,6 +334,42 @@ class TestIssueReviewRun(IssueReviewCase):
 
 
 class TestRevisionBoundReview(IssueReviewCase):
+    def assert_superseded_projection_and_replacement(self, row, github):
+        original = dict(row)
+        exported = self.exported(row)
+        self.assertEqual((row["action"], row["outcome"]), ("not_started", "preflight_failed"))
+        self.assertIsNone(exported["receipts"])
+        self.assertFalse((issue_review.WORK_ROOT / row["id"]).exists())
+        diagnostic, = agent_interface.diagnostics()["events"]
+        self.assertEqual(diagnostic["id"], row["id"])
+        for omitted in ("receipts", "artifact", "resource_ownership", "resources_settled_at"):
+            self.assertNotIn(omitted, diagnostic)
+        repo = Path(__file__).resolve().parents[3]
+        output = repo / "test-results"
+        output.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="issue-revision-", dir=output) as work:
+            root = Path(work)
+            environment = {"PATH": os.environ["PATH"], "HOME": self.work.name, "TMPDIR": work}
+            wire = root / "caller.json"
+            wire.write_text(json.dumps({"logs": [exported], "diagnostic": diagnostic}))
+            build = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"),
+                                    str(repo / "tests/fixtures/issue-review-projection.ts"), "--bundle", "--platform=node",
+                                    "--packages=external", "--format=esm", "--target=node22", f"--outfile={root / 'contract.mjs'}"],
+                                   cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            projected = subprocess.run(["node", str(root / "contract.mjs"), str(wire)], cwd=repo,
+                                       env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(projected.returncode, 0, projected.stderr)
+        replacement = issue_review.revision(github.issues[452])
+        reviewed, _ = self.run_review(github, agent_writes({"comments": [{"issue": "#452", "body": "Updated review."}]}),
+                                     expected=replacement, correlation="replacement")
+        self.assertEqual((reviewed["status"], reviewed["issue_revision"]), ("completed", replacement))
+        posted = [call for call in github.calls if call[0] == "--comment-issue"]
+        self.assertEqual(len(posted), 1)
+        self.assertIn(f"rev `{replacement[:8]}`", posted[0][6])
+        with agent_interface.db() as conn:
+            self.assertEqual(dict(conn.execute("select * from calls where id=?", (row["id"],)).fetchone()), original)
+
     def test_revision_is_the_exact_title_and_body(self):
         # Shared vector with Poise's agent.test: changing either side's
         # digest computation breaks the revision binding.
@@ -370,6 +406,8 @@ class TestRevisionBoundReview(IssueReviewCase):
         self.assertEqual((row["status"], row["error_code"]), ("failed", "issue_revision_changed"))
         self.assertIsNone(self.exported(row)["receipts"])
         self.assertFalse([call for call in github.calls if call[0] == "--comment-issue"])
+        self.assertEqual(row["issue_revision"], expected)
+        self.assert_superseded_projection_and_replacement(row, github)
 
     def test_a_wrong_expected_revision_fails_without_reading_further(self):
         github = FakeGitHub()
@@ -377,6 +415,8 @@ class TestRevisionBoundReview(IssueReviewCase):
                                  expect_exit=True, expected="0" * 64)
         self.assertEqual((row["status"], row["error_code"]), ("failed", "issue_revision_changed"))
         self.assertFalse([call for call in github.calls if call[0] == "--comment-issue"])
+        self.assertIsNone(row["issue_revision"])
+        self.assert_superseded_projection_and_replacement(row, github)
 
     def test_child_only_output_cannot_fulfill_a_revision_bound_request(self):
         expected = issue_review.revision({"title": "Issue 452", "body": "Body 452"})

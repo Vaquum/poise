@@ -506,6 +506,20 @@ describe('collection independence and Caller evidence', () => {
     expect(callerDiagnostic({ ...row, diagnostic: null, outcome: 'changes_requested' }, 'alice')).toMatchObject({ level: 'error', message: row.error })
   })
 
+  it('excludes only the typed issue revision fence, with contradictory publication evidence kept visible', () => {
+    const row = { id: 'a'.repeat(32), behavior: 'issue_review', status: 'failed', error_code: 'issue_revision_changed',
+      action: 'not_started', outcome: 'preflight_failed', error: 'seed issue changed during review; no comments posted' }
+    // This is also the metadata-only --diagnostics shape: absence is not the proof.
+    expect(callerDiagnostic(row, 'alice')).toBeNull()
+    expect(callerDiagnostic({ ...row, receipts: null, artifact: { phase: 'reviewing', resource_root: '/owned' } }, 'alice')).toBeNull()
+    for (const change of [{ behavior: 'pr_review' }, { status: 'error' }, { error_code: null }, { error_code: 'posting_failed' },
+      { action: null }, { outcome: null }, { receipts: [] }, { receipts: [{ comment_id: 17 }] }, { review_id: 17 }, { head_sha: 'b'.repeat(40) },
+      { artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } },
+      { artifact: { phase: 'reviewing', plan_sha: 'b'.repeat(64) } }, { artifact: { phase: 'reviewing', resource_error: 'cleanup_failed' } }]) {
+      expect(callerDiagnostic({ ...row, ...change }, 'alice'), JSON.stringify(change)).toMatchObject({ level: 'error', message: row.error })
+    }
+  })
+
   it.each(['changes_requested', 'clean', 'approved'])('retains a failed Caller operation despite its %s verdict and missing structured evidence', (outcome) => {
     const row = { id: 'b'.repeat(32), status: 'failed', outcome, diagnostic: null, error: 'Review receipt validation failed after publication', behavior: 'review' }
     const input = callerDiagnostic(row, 'alice')!

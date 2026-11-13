@@ -139,6 +139,21 @@ describe('runs in the seven state words', () => {
     expect(statusOf(running, now)).toMatchObject({ state: 'running', warn: true, note: 'No provider update for 3m; last: reasoning reported' })
   })
 
+  it('shows a proven stale issue review as superseded without rewriting its receipt', () => {
+    const stale = run({ behavior: 'issue_review', status: 'failed', error_code: 'issue_revision_changed', action: 'not_started',
+      outcome: 'preflight_failed', error: 'seed issue changed during review; no comments posted', receipts: null })
+    const before = structuredClone(stale)
+    expect(statusOf(stale)).toEqual({ state: 'idle', word: 'Superseded', note: 'Issue changed', warn: false })
+    expect(matchesSearch(stale, 'issue changed')).toBe(true)
+    expect(stale).toEqual(before)
+    const publication = { ...stale, id: 'b'.repeat(32), artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } }
+    expect(groupRuns([stale, publication])).toHaveLength(2)
+    for (const change of [{ behavior: 'pr_review' }, { status: 'error' }, { error_code: null }, { error_code: 'posting_failed' },
+      { action: null }, { outcome: null }, { receipts: [] }, { artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } }]) {
+      expect(statusOf({ ...stale, ...change }).state, JSON.stringify(change)).toBe('failed')
+    }
+  })
+
   it('names a chain’s own GitHub action for what it did, with no model, and behaviors by their own names', () => {
     const native = run({ model: 'native-action', behavior: 'native_action', prompt: '--merge-if-ready' })
     expect(behaviorName(native)).toBe('Merge if ready')

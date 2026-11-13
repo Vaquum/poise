@@ -113,6 +113,9 @@ const RUNS = [
   run(hex(32, 'd'), { status: 'running', completed_at: null, outcome: null, started_at_precise: iso(NOW - minutes(2)) }),
   run(CALL, { pr_id: '493', behavior: 'issue_review', outcome: 'commented', response: 'Posted two comments.' }),
   run(hex(32, 'e'), { model: 'native-action', behavior: 'native_action', prompt: '--merge-if-ready', outcome: null, pr_id: '502' }),
+  ...['f', '9'].map(seed => run(hex(32, seed), { behavior: 'issue_review', status: 'failed', outcome: 'preflight_failed',
+    error_code: 'issue_revision_changed', action: 'not_started', error: 'seed issue changed during review; no comments posted',
+    receipts: seed === 'f' ? null : [] })),
 ]
 async function serveRuns(page: Page): Promise<void> {
   await page.route((url) => url.pathname === '/api/agent-logs', (route) => {
@@ -261,6 +264,15 @@ test('Logging’s Work impact shows on the row and in the detail, and opens its 
   await page.getByRole('link', { name: 'Back to Overview' }).click()
   expect(query(page).view).toBe('overview')
   expect(JSON.parse(await page.evaluate(() => localStorage.getItem('poise-logging-filters') ?? '{}'))).toMatchObject({ time: 'week', severities: ['critical', 'error'] })
+})
+
+test('a stale issue review shows supersession while uncertain posting remains a failure', async ({ page }) => {
+  await open(page, '/?view=observe&part=behaviors')
+  const behaviors = page.locator('[data-panel="behaviors"]')
+  const stale = behaviors.locator(`tr[data-run="${hex(32, 'f')}"] [data-ref="bh.status"]`)
+  await expect(stale).toContainText('Superseded')
+  await expect(stale).toContainText('Issue changed')
+  await expect(behaviors.locator(`tr[data-run="${hex(32, '9')}"] [data-ref="bh.status"]`)).toContainText('Failed · Preflight failed')
 })
 
 test('a run link opens that run unfolded in Behaviors, and a chain’s own GitHub action names what it did with no model', async ({ page }) => {
