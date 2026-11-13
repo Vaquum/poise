@@ -18,6 +18,7 @@ import {
   db,
   getMeta,
 } from './db'
+import { cachedStatement } from './statements'
 import { claudeAuth } from './claude-auth'
 import { isClaudeModel, loadCatalog } from './models'
 import { HttpError } from './http'
@@ -190,7 +191,7 @@ export function enqueueContentJob(input: {
   const slug = input.slug || contentSlugForCallId(callId)
   if (!CANONICAL_SLUG_RE.test(slug)) throw new Error('invalid content article slug')
   const now = new Date().toISOString()
-  db.prepare(`
+  cachedStatement(db, `
     INSERT OR IGNORE INTO content_jobs (
       call_id, session_id, topic, started_at, status, slug,
       next_attempt_at, created_at, updated_at
@@ -210,7 +211,7 @@ export function enqueueContentJob(input: {
 }
 
 export function getContentJob(callId: string): ContentJob | null {
-  const row = db.prepare('SELECT * FROM content_jobs WHERE call_id = ?').get(callId) as ContentJobRow | undefined
+  const row = cachedStatement(db, 'SELECT * FROM content_jobs WHERE call_id = ?').get(callId) as ContentJobRow | undefined
   return row ? fromRow(row) : null
 }
 
@@ -221,7 +222,7 @@ export function getContentJobResponse(callId: string): ContentJobResponse | null
 
 /** The launch that linked a call, for the transcript's content card. */
 export function contentLaunchIdForCall(callId: string): string {
-  const row = db.prepare('SELECT launch_id FROM content_launches WHERE call_id = ?').get(callId) as { launch_id: string } | undefined
+  const row = cachedStatement(db, 'SELECT launch_id FROM content_launches WHERE call_id = ?').get(callId) as { launch_id: string } | undefined
   if (!row) throw new Error(`author-content launch for call ${callId} not found`)
   return row.launch_id
 }
@@ -230,7 +231,7 @@ export function contentLaunchIdForCall(callId: string): string {
  *  launch links, it answers the job; an expired unlinked launch shows its
  *  error instead of spinning forever. */
 export function getContentLaunchResponse(launchId: string): ContentJobResponse | { launch_id: string, status: 'pending' | 'failed', error?: string } | null {
-  const launch = db.prepare('SELECT * FROM content_launches WHERE launch_id = ?').get(launchId) as ContentLaunchRow | undefined
+  const launch = cachedStatement(db, 'SELECT * FROM content_launches WHERE launch_id = ?').get(launchId) as ContentLaunchRow | undefined
   if (!launch) return null
   if (launch.call_id) {
     const job = getContentJob(launch.call_id)
@@ -247,7 +248,7 @@ const claimNextTransaction = db.transaction((
   afterCreatedAt: string,
   afterCallId: string,
 ) => {
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT * FROM content_jobs
     WHERE status IN ('pending', 'running')
       AND next_attempt_at <= ?
@@ -259,7 +260,7 @@ const claimNextTransaction = db.transaction((
   if (!row) return null
 
   const updatedAt = new Date(now).toISOString()
-  const claimed = db.prepare(`
+  const claimed = cachedStatement(db, `
     UPDATE content_jobs
     SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
     WHERE call_id = ?
@@ -293,7 +294,7 @@ function deferOwned(
   nextAttemptAt: number,
   responseHash: string | null,
 ): boolean {
-  const result = db.prepare(`
+  const result = cachedStatement(db, `
     UPDATE content_jobs
     SET status = ?, response_hash = COALESCE(?, response_hash), error = NULL,
         error_count = 0, next_attempt_at = ?, lease_owner = NULL,
@@ -305,7 +306,7 @@ function deferOwned(
 
 function failOwned(callId: string, owner: string, error: string, responseHash: string | null = null): boolean {
   const now = new Date().toISOString()
-  const result = db.prepare(`
+  const result = cachedStatement(db, `
     UPDATE content_jobs
     SET status = 'failed', response_hash = COALESCE(?, response_hash), error = ?,
         lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, completed_at = ?
@@ -323,7 +324,7 @@ function recordWorkerError(
 ): void {
   const errorCount = job.error_count + 1
   const delay = Math.min(retryDelayMs * (2 ** (errorCount - 1)), 60_000)
-  db.prepare(`
+  cachedStatement(db, `
     UPDATE content_jobs
     SET error = ?, error_count = ?, next_attempt_at = ?, lease_owner = NULL,
         lease_expires_at = NULL, updated_at = ?
@@ -338,7 +339,7 @@ function completeOwned(
   articleCreated: boolean,
 ): boolean {
   const now = new Date().toISOString()
-  const result = db.prepare(`
+  const result = cachedStatement(db, `
     UPDATE content_jobs
     SET status = 'completed', response_hash = ?, error = NULL,
         article_created = ?, lease_owner = NULL, lease_expires_at = NULL,
@@ -422,7 +423,7 @@ const persistLegacyContentMappings = db.transaction((
   mappings: LegacyContentMapping[],
   completedAt: string,
 ) => {
-  const alreadyMapped = db.prepare('SELECT 1 FROM meta WHERE key = ?')
+  const alreadyMapped = cachedStatement(db, 'SELECT 1 FROM meta WHERE key = ?')
     .get(CONTENT_LEGACY_MAPPING_KEY)
   if (alreadyMapped) return 0
 
@@ -447,7 +448,7 @@ const persistLegacyContentMappings = db.transaction((
       completedAt,
     ).changes
   }
-  db.prepare('INSERT INTO meta(key, value) VALUES(?, ?)').run(
+  cachedStatement(db, 'INSERT INTO meta(key, value) VALUES(?, ?)').run(
     CONTENT_LEGACY_MAPPING_KEY,
     completedAt,
   )
@@ -643,7 +644,7 @@ const REGISTRATION_DEADLINE_ERROR = 'author-content registration deadline expire
 function expirePendingLaunches(now: number, sessionId?: string): number {
   const updatedAt = new Date(now).toISOString()
   const result = sessionId
-    ? db.prepare(`
+    ? cachedStatement(db, `
         UPDATE content_launches
         SET status = 'failed', error = ?, updated_at = ?
         WHERE status = 'pending'
@@ -651,7 +652,7 @@ function expirePendingLaunches(now: number, sessionId?: string): number {
           AND registration_deadline_at <= ?
           AND session_id = ?
       `).run(REGISTRATION_DEADLINE_ERROR, updatedAt, now, sessionId)
-    : db.prepare(`
+    : cachedStatement(db, `
         UPDATE content_launches
         SET status = 'failed', error = ?, updated_at = ?
         WHERE status = 'pending'
@@ -666,7 +667,7 @@ function persistLaunchIntent(sessionId: string, topic: string): ContentLaunchRow
   // A periodic worker is not required for retry safety. The next launch also
   // terminalizes an expired predecessor before enforcing one pending session.
   expirePendingLaunches(nowMs, sessionId)
-  const existing = db.prepare(`
+  const existing = cachedStatement(db, `
     SELECT * FROM content_launches
     WHERE session_id = ? AND (status = 'pending'
       OR (call_id IS NULL AND recovery_eligible = 1 AND evidence_unreadable = 1))
@@ -677,7 +678,7 @@ function persistLaunchIntent(sessionId: string, topic: string): ContentLaunchRow
   const launchId = randomUUID()
   const now = new Date(nowMs).toISOString()
   try {
-    db.prepare(`
+    cachedStatement(db, `
       INSERT INTO content_launches (
         launch_id, session_id, topic, requested_at,
         registration_deadline_at, recovery_eligible, status, updated_at
@@ -691,7 +692,7 @@ function persistLaunchIntent(sessionId: string, topic: string): ContentLaunchRow
       now,
     )
   } catch (error: any) {
-    const pending = db.prepare(`
+    const pending = cachedStatement(db, `
       SELECT 1 FROM content_launches
       WHERE session_id = ? AND status = 'pending'
     `).get(sessionId)
@@ -700,12 +701,12 @@ function persistLaunchIntent(sessionId: string, topic: string): ContentLaunchRow
     }
     throw error
   }
-  return db.prepare('SELECT * FROM content_launches WHERE launch_id = ?')
+  return cachedStatement(db, 'SELECT * FROM content_launches WHERE launch_id = ?')
     .get(launchId) as ContentLaunchRow
 }
 
 function markLaunchAttempted(launchId: string): void {
-  const updated = db.prepare(`
+  const updated = cachedStatement(db, `
     UPDATE content_launches
     SET recovery_eligible = 1, updated_at = ?
     WHERE launch_id = ? AND status = 'pending'
@@ -714,7 +715,7 @@ function markLaunchAttempted(launchId: string): void {
 }
 
 function updatePendingLaunchError(launchId: string, error: string, evidenceUnreadable = false): void {
-  db.prepare(`
+  cachedStatement(db, `
     UPDATE content_launches
     SET error = ?, updated_at = ?, evidence_unreadable = MAX(evidence_unreadable, ?)
     WHERE launch_id = ? AND status = 'pending'
@@ -722,7 +723,7 @@ function updatePendingLaunchError(launchId: string, error: string, evidenceUnrea
 }
 
 function failPendingLaunch(launchId: string, error: string): void {
-  db.prepare(`
+  cachedStatement(db, `
     UPDATE content_launches
     SET status = 'failed', recovery_eligible = 0, error = ?, updated_at = ?
     WHERE launch_id = ? AND status = 'pending'
@@ -730,7 +731,7 @@ function failPendingLaunch(launchId: string, error: string): void {
 }
 
 function invalidateLaunchRecovery(launchId: string, error: string): void {
-  db.prepare(`
+  cachedStatement(db, `
     UPDATE content_launches
     SET status = 'failed', recovery_eligible = 0, error = ?, updated_at = ?
     WHERE launch_id = ? AND call_id IS NULL
@@ -739,7 +740,7 @@ function invalidateLaunchRecovery(launchId: string, error: string): void {
 
 function holdUnreadableLaunch(launchId: string, error: unknown, now: number): void {
   const message = `author-content log recovery unavailable: ${error instanceof Error ? error.message : String(error)}`
-  db.prepare(`UPDATE content_launches SET error = ?, updated_at = ?, evidence_unreadable = 1
+  cachedStatement(db, `UPDATE content_launches SET error = ?, updated_at = ?, evidence_unreadable = 1
     WHERE launch_id = ? AND call_id IS NULL`)
     .run(message.slice(0, 4_000), new Date(now).toISOString(), launchId)
 }
@@ -750,14 +751,14 @@ function recordLaunchRecoveryState(
   now: number,
 ): void {
   if (intent.status === 'pending' && now >= intent.registration_deadline_at) {
-    db.prepare(`
+    cachedStatement(db, `
       UPDATE content_launches
       SET status = 'failed', error = ?, updated_at = ?
       WHERE launch_id = ? AND status = 'pending'
     `).run(error.slice(0, 4_000), new Date(now).toISOString(), intent.launch_id)
     return
   }
-  db.prepare(`
+  cachedStatement(db, `
     UPDATE content_launches
     SET error = ?, updated_at = ?
     WHERE launch_id = ?
@@ -773,7 +774,7 @@ const linkLaunchTransaction = db.transaction((
   topic: string,
   startedAt: string,
 ) => {
-  const launch = db.prepare(`
+  const launch = cachedStatement(db, `
     SELECT status, recovery_eligible, call_id
     FROM content_launches WHERE launch_id = ?
   `).get(launchId) as {
@@ -789,7 +790,7 @@ const linkLaunchTransaction = db.transaction((
     throw new Error('author-content launch intent is no longer recoverable')
   }
   const job = enqueueContentJob({ callId, sessionId, topic, startedAt })
-  const linked = db.prepare(`
+  const linked = cachedStatement(db, `
     UPDATE content_launches
     SET status = 'linked', call_id = ?, recovery_eligible = 0,
         error = NULL, updated_at = ?
@@ -886,7 +887,7 @@ export async function recoverPendingContentLaunches(
   listCalls: ContentFinalizerDependencies['listCalls'] = defaultDependencies.listCalls,
 ): Promise<number> {
   const recovered = await withProcessLock({ path: launchLockPath() }, async () => {
-    const intents = db.prepare(`
+    const intents = cachedStatement(db, `
       SELECT * FROM content_launches
       WHERE status = 'pending'
          OR (status = 'failed' AND recovery_eligible = 1 AND call_id IS NULL)
@@ -947,7 +948,7 @@ export async function recoverPendingContentLaunches(
         unreadSessions.set(sessionId, error)
       }
     }
-    const linkedCallIds = new Set((db.prepare(`
+    const linkedCallIds = new Set((cachedStatement(db, `
       SELECT call_id FROM content_launches WHERE call_id IS NOT NULL
     `).all() as Array<{ call_id: string }>).map((row) => row.call_id.toLowerCase()))
 
@@ -1011,7 +1012,7 @@ export async function recoverPendingContentLaunches(
         holdUnreadableLaunch(intent.launch_id, unread, now)
         continue
       }
-      db.prepare('UPDATE content_launches SET evidence_unreadable = 0 WHERE launch_id = ?').run(intent.launch_id)
+      cachedStatement(db, 'UPDATE content_launches SET evidence_unreadable = 0 WHERE launch_id = ?').run(intent.launch_id)
       const candidates = matchesByIntent.get(intent.launch_id) || []
       if (candidates.length === 0) {
         if (intent.status === 'pending') {
