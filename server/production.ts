@@ -41,7 +41,7 @@ if (isProductionEntrypoint && process.env.POISE_MODE === 'service') installProdu
 const { startLogging } = await import('./logging')
 startLogging({ captureFatal: true })
 const { recordRuntimeDiagnostic } = await import('./runtime-diagnostic')
-const { attachChatSockets, createPoiseMiddleware, stopDailyModelRefresh, stopPoiseRuntime } = await import('./cache-plugin')
+const { attachChatSockets, createPoiseMiddleware, stopDailyModelRefresh, stopPoiseRuntime, pendingRuntimeStops } = await import('./cache-plugin')
 const { closeDatabase } = await import('./db')
 
 const DEFAULT_HOST = '127.0.0.1'
@@ -403,6 +403,7 @@ export function createProductionShutdown(
     started = true
     const recordFailure = (timedOut: boolean) => {
       const state = serverShutdowns.get(server)!
+      const pending = [...state.pending, ...pendingRuntimeStops().map((step) => `runtime_stop.${step}`)]
       const cause: string[] = []
       let truncated = false
       for (const { phase, error } of state.failures) {
@@ -422,10 +423,10 @@ export function createProductionShutdown(
       // through its independent store before the immediate process exit.
       recordRuntimeDiagnostic({ id: process.env.POISE_SHUTDOWN_DIAGNOSTIC_ID, source: 'poise', component: 'production',
         operation: 'process.shutdown', level: 'error', phase: timedOut ? 'shutdown_deadline' : 'shutdown_rejected',
-        message: timedOut ? `Production shutdown reached its ${PRODUCTION_SHUTDOWN_TIMEOUT_MS} ms deadline; pending: ${[...state.pending].join(', ')}`
+        message: timedOut ? `Production shutdown reached its ${PRODUCTION_SHUTDOWN_TIMEOUT_MS} ms deadline; pending: ${pending.join(', ')}`
           : `Production shutdown rejected during ${state.failures.map(({ phase }) => phase).join(', ')}`,
         cause, truncated, exitCode: 1, timeoutMs: PRODUCTION_SHUTDOWN_TIMEOUT_MS,
-        context: { requestedExitCode: exitCode, pendingPhases: [...state.pending] } },
+        context: { requestedExitCode: exitCode, pendingPhases: pending } },
       { write: (event) => { writeSync(2, JSON.stringify({ poiseDiagnostic: event }) + '\n') } })
     }
     const deadline = setTimeout(() => {

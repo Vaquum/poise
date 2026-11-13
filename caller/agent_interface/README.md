@@ -438,10 +438,12 @@ the remaining review budget. Structured analysis also caps each inspection by
 the remaining analysis allowance and current file group's deadline, keeping the
 60-second submission and 60-second verification reserves even after a provider
 returns near the analysis cutoff.
-A timeout records `review_inspection_timeout` and
+A local 30-second timeout records `review_inspection_timeout` and
 retains the inspection phase, deadline and pinned target in the existing process
 diagnostic, without command arguments or inspection content in the error.
-Poise excludes this diagnostic from provider backoff, including older calls
+If a file-group, provider-analysis or overall deadline limits the inspection
+first, that limiting phase is retained with `review_budget_exhausted` instead.
+Poise excludes local inspection timeouts from provider backoff, including older calls
 labeled `review_budget_exhausted`. The existing behavior chain retries the same
 review basis and slot after resource release and native failure backoff, holding
 after three failed attempts; Caller adds no inspection retry loop.
@@ -520,11 +522,17 @@ groups and inspection rounds, retaining earlier analysis and inspected source.
 Structured reviews reserve 60 seconds for submission and another 60 seconds
 for the authoritative outcome lookup. Submission keeps that verification
 reserve even when it is slow. After the first common-context turn, staged
-inspection shares the remaining analysis allowance across the remaining file
-groups. Each group stops offering further inspection once half its allowance
-is spent and requests a terminal assessment on the evidence already held.
-Provider execution and inspection stay within the group's deadline; a timeout
-still fails without submitting an incomplete review. Every stage's findings
+inspection uses an equal share of the remaining analysis allowance as a scheduling
+guide. A group can borrow slack after reserving the mean observed analysis time
+of completed groups for each remaining group, excluding the common-context turn.
+After half the equal share, Caller asks the provider to omit optional inspection;
+required inspection and subsequent provider turns can still use the borrowed time.
+The inspection schema stays available even at the round limit, so a need for
+further evidence fails explicitly as incomplete analysis rather than forcing a verdict.
+Provider execution and inspection stay within the group's deadline and the shared
+analysis cutoff. Deadline failures retain the limiting phase (`file_group`,
+`provider_analysis`, `inspection` or `overall`), group/count, elapsed time and
+remaining analysis allowance in bounded diagnostics. Every stage's findings
 combine into one verdict; a packet that fits in one group needs no staging.
 Before finalization, the original Call retains the complete verdict in its
 response file, readable with `agent-interface --read-response CALL_ID` after
