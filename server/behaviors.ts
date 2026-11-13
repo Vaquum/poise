@@ -93,6 +93,7 @@ import {
   type CompletedApprovalBasisLaunch,
   type DeadLetterReconcileResult,
 } from './db'
+import { cachedStatement } from './statements'
 import { HttpError } from './http'
 import { eventLoopDelayStats, type EventLoopDelayStats } from './event-loop-delay'
 import { behaviorErrorMessage, behaviorIncidentDiagnostics, REVIEW_BUDGET_STOPPED } from './behavior-diagnostics'
@@ -2009,8 +2010,8 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
 }
 
 function failedBehaviorLaunches(behavior: string): BehaviorLaunchClaim[] {
-  const rows = db.prepare(`
-    SELECT target FROM behavior_seen AS launch
+  const rows = cachedStatement(db, `
+    SELECT target FROM behavior_seen AS launch INDEXED BY idx_behavior_seen_failed_launches
     WHERE key = ? AND claim_id = '' AND launch_call_id IS NOT NULL
       AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
       AND (launch_quarantine IS NOT NULL OR EXISTS (
