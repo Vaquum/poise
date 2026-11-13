@@ -1676,6 +1676,7 @@ Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
 opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review timeout exhaustion, verified automatic implementation holds before a PR,
+terminal uncertain implementation publication,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
 sources without an explicit hold, supplied by trusted service configuration or the
@@ -1687,6 +1688,11 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Uncertain implementation reports instead require the original failed `publishing`
+Call, verified resource release and fresh open-source eligibility and publication
+reconciliation. They preserve its missing-push-evidence action and execution fence,
+reusing verified matching linked reports even when closed and markerless; they
+authorize neither replacement implementation nor a second push.
 Durable creation intent prevents another POST after an uncertain result; the source state,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. Closed-PR continuations verify existing source/PR

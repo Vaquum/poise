@@ -68,9 +68,10 @@ async function resolveMeToken(me: string): Promise<string> {
   }
 }
 
-/** Reconcile a marked repair report, including closed issues. Search absence
- * never establishes whether an earlier creation request took effect. */
-export async function reconcileRepairReport(repository: string, marker: string, number: number | null, label = false) {
+/** Reconcile a marked report or verify an explicitly linked report, including
+ * closed issues. Search absence never proves an earlier POST had no effect. */
+export async function reconcileRepairReport(repository: string, marker: string, number: number | null, label = false,
+  linked?: (body: string, author: string) => boolean) {
   requireConfiguredRepository(repository)
   const me = getMeta('me')
   if (!me) throw new Error('Repair reporting requires the configured GitHub account')
@@ -108,11 +109,16 @@ export async function reconcileRepairReport(repository: string, marker: string, 
     }
     const issue = object(raw)
     const author = object(issue.user)
+    if (number !== null && linked && 'pull_request' in issue) return null
     if ('pull_request' in issue || !Number.isSafeInteger(issue.number) || Number(issue.number) < 1
-      || number !== null && issue.number !== number || typeof issue.body !== 'string' || !issue.body.includes(marker)
-      || typeof author.login !== 'string' || author.login.toLowerCase() !== me.toLowerCase()
+      || number !== null && issue.number !== number || typeof issue.body !== 'string' || typeof author.login !== 'string'
       || !['open', 'closed'].includes(String(issue.state))
       || String(issue.html_url).toLowerCase() !== `https://github.com/${repository}/issues/${issue.number}`.toLowerCase()) {
+      throw new Error('Repair report issue identity differs from its durable intent')
+    }
+    if (!issue.body.includes(marker) && number !== null && linked) {
+      if (!linked(issue.body, author.login)) return null
+    } else if (!issue.body.includes(marker) || author.login.toLowerCase() !== me.toLowerCase()) {
       throw new Error('Repair report issue identity differs from its durable intent')
     }
     let applied = labels(issue.labels)
