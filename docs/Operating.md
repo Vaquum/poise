@@ -593,7 +593,35 @@ release controls intact. If the host cannot be read, the summary reports the
 unavailable condition/age and leaves the host's episode untouched. GitHub must
 keep the scheduled workflow enabled for observation to run.
 
-The token is required because GitHub never lets a workflow's own token change
+To opt into issue intake for stalled replacement drains, set the fork's Actions
+variable `POISE_RELEASE_REPORT_REPOSITORY` to the authorized `owner/repo` with
+Issues enabled and a `poise` label. Set `POISE_RELEASE_REPORT_TOKEN` to a
+dedicated fine-grained token restricted to **that repository only**, with
+**Issues: read and write** and no contents, workflows or other write permissions.
+The observer's workflow token remains read-only; the issue credential stays in
+Actions and is never sent to the deployment host. An unset destination disables
+publication; an opted-in destination without its credential fails visibly.
+
+Publication requires a successful SHA-named host apply and that same job's
+failed verifier, whose timestamped log identifies the exact retained rollout,
+image and exhausted 600-second wait, plus fresh healthy workspace evidence with
+`draining=true`. A generic failed workflow, stale-release warning or pending
+switch is insufficient; replacement drains need no pending-switch fields.
+The report includes requested/serving releases, workspace admission state,
+available blocker details and counters, last retained observation, next action
+and verification/observation links. Missing progress or blocker details stay
+explicit. The condition marker reconciles closed as well as open issues.
+Warning delivery does not consume publication. A creation intent in the existing
+diagnostic file prevents another POST after an ambiguous result; subsequent Sync
+observations retry lookup. Failed lookups cannot authorize creation, and explicit
+HTTP rejections leave creation retryable. Publication failures fail the observation
+step with their cause in its summary, within the existing bounded job.
+New candidates keep one report during a continuous pause. Fresh health proving
+all expected workspaces resumed rearms reporting even if release lag remains;
+a later drain needs its own verifier exhaustion after that boundary. Recovery
+leaves filed remediation issues open and never changes native safety gates.
+
+`POISE_SYNC_TOKEN` is required because GitHub never lets a workflow's own token change
 a workflow file, anything under `.github/workflows/`. autonomio/poise changes
 its workflows from time to time. Without the token, the first such change
 stops the sync, and the fork stays on the commit before it until someone
