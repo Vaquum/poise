@@ -65,7 +65,9 @@ requests share seven states, each with one meaning and one colour:
 
 Any element marked with `data-ref` explains itself. Resting the pointer on it,
 focusing it from the keyboard or a long press on touch shows a tooltip after
-`--dur-tip`; `?` opens the full reference, which dims the page, keeps the element
+`--dur-tip` (half a second). Moving away, pressing or clicking cancels a pending
+tooltip and hides a shown one, and a pressed element shows none again until the
+pointer leaves it. `?` opens the full reference, which dims the page, keeps the element
 lit and answers what it is, what it does, what its current value means, its other
 values, what it affects, when a change applies, what stays unchanged, how the
 result shows, where the information comes from and why it is unavailable. Opening
