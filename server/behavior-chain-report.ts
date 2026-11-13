@@ -454,11 +454,14 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     return { cause, key, storageKey, stored }
   })
   // A closed target must keep any prior source/PR report, including one under
-  // another cause or an uncertain merge's invocation-based key.
+  // another cause, an uncertain merge's invocation-based key, or a legacy
+  // PR-scoped source after a v2 chain takes ownership.
   const linked = closed ? db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
-    AND json_extract(value, '$.source') = ? AND json_extract(value, '$.pull') = ?
+    AND json_extract(value, '$.pull') = ?
+    AND (json_extract(value, '$.source') = ? OR json_extract(value, '$.source') = ?)
     ORDER BY json_extract(value, '$.issueNumber') IS NULL, key LIMIT 1`)
-    .get(PREFIX + '*', chain.id, observation.pull!.number) as { key: string, value: string } | undefined
+    .get(PREFIX + '*', observation.pull!.number, chain.id,
+      `${chain.repository.toLowerCase()}#${observation.pull!.number}`) as { key: string, value: string } | undefined
     : qualifying?.cause === 'review_budget_exhausted' ? existingReviewReport(db, chain.repository, observation.pull!.number) : undefined
   const intent = linked ? { cause: closed ? CLOSED_CAUSE : 'review_budget_exhausted', key: (JSON.parse(linked.value) as RepairReport).key,
     storageKey: linked.key, stored: linked }

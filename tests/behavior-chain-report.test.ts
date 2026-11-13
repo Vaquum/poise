@@ -464,6 +464,28 @@ it('keeps a verified report under another cause when its source PR closes unmerg
   expect(posts()).toHaveLength(1)
 })
 
+it('keeps a legacy PR-scoped report when its source PR closes unmerged under a v2 chain', async () => {
+  const { db, journal } = setup()
+  const source = record(journal, await exhaustedReviews(journal), { type: 'chain.observed', observation: fresh })
+  await operations(db, journal).reportHold!(source)
+  expect(posts()).toHaveLength(1)
+  // The stored report predates the v2 chain: PR-scoped legacy source.
+  const stored = reports(db)[0]
+  const report = JSON.parse(stored.value)
+  db.prepare('DELETE FROM meta WHERE key = ?').run(`behavior_chain_repair_report:${report.key}`)
+  report.source = 'acme/repo#21'
+  report.key = chainBasis(['review_budget_exhausted', report.source, 21])
+  remote[0].body = remote[0].body.replace(/<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/,
+    `<!-- poise-repair-exhaustion:${report.key} -->`)
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run(`behavior_chain_repair_report:${report.key}`, JSON.stringify(report))
+  fresh = closedObservation()
+  vi.setSystemTime(NOW + 86_400_000); fresh.checkedAt = Date.now()
+  journal.rebuild()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(posts()).toHaveLength(1)
+  expect(reports(db)).toHaveLength(1)
+})
+
 it.each([false, true])('reports one verified implementation hold before a PR without relaunching it (diagnostic=%s)', async diagnostic => {
   const { db, journal } = setup()
   const { chain, call } = blockedImplementation(journal)
