@@ -876,7 +876,7 @@ it('seeds roster draws and resolutions by the chain seed issue', async () => {
   expect(roster).toHaveBeenCalledWith('example/repo#7')
   const decision = { kind: 'invoke', behavior: 'review-issue', basis: '', actor: 'reviewer', reviewer, reason: '' } as const
   await operations.request(chain, observation, decision, 'test-id')
-  expect(resolve).toHaveBeenCalledWith(decision, 'example/repo#7')
+  expect(resolve).toHaveBeenCalledWith(decision, 'example/repo#7', chain, observation)
 })
 
 it('reads the seed issue, comments and publication inspection in one native process', async () => {
