@@ -538,8 +538,18 @@ Provider execution and inspection stay within the group's deadline and the share
 analysis cutoff. Deadline failures retain the limiting phase (`file_group`,
 `provider_analysis`, `inspection` or `overall`), group/count, elapsed time and
 remaining analysis allowance in bounded diagnostics. Every stage's findings
-combine into the single verdict the harness submits; a packet that fits in one
-group needs no staging.
+combine into one verdict; a packet that fits in one group needs no staging.
+Before finalization, the original Call retains the complete verdict in its
+response file, readable with `agent-interface --read-response CALL_ID` after
+temporary review cleanup, including on failure. Finding bodies stay outside
+the bounded log artifact. Each provider group remains limited to 100 findings;
+an aggregate exceeding the existing 100-inline-finding publication limit holds
+with all findings retained instead of truncating or submitting another review.
+Position remapping and capped follow-up filing also leave both 60-second
+reserves. Exhaustion after completed analysis holds the review rather than
+handing it to another model. Rejected writes remain distinct from possibly
+accepted writes; a lost issue or review POST response holds without replay or
+approval.
 A follow-up (`--pr-approve`) round reviews the diff since
 the reviewer's last submitted review instead of the whole PR again: new
 findings on current lines stay on current-head lines, while a defect caused

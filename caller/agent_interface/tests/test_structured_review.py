@@ -554,6 +554,35 @@ class TestStagedReview(TestCase):
                       text_packet=staged_packet(["src/other.py"]))
         self.assertEqual(failure.exception.code, "review_contract_violation")
 
+    def test_first_retention_failure_holds_completed_review(self):
+        packet = staged_packet(["src/only.py"])
+        finding = {"path": "src/only.py", "line": 1, "side": "RIGHT", "body": "[p1] Blocking defect."}
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [finding]}
+        calls = []
+
+        def process(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}), stderr="")
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process), \
+                patch.object(structured_review.review_receipt, "retain_verdict",
+                             side_effect=OSError("simulated storage failure")):
+            with self.assertRaises(review_budget.ReviewLimitError) as failure:
+                structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis",
+                                      "a" * 40, 60, packet=packet)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("could not retain its findings", str(failure.exception))
+        self.assertNotIn("retained on the original Call", str(failure.exception))
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
+        self.assertEqual([args for args, _ in calls if args[0] == "github-interface"], [])
+
     def test_stages_keep_repository_inspection_with_one_combined_submission(self):
         request = {"operation": "read", "path": "src/old.py", "query": "", "start_line": 1}
         calls = []
@@ -960,7 +989,7 @@ class TestSincePositions(TestCase):
                                          self._full(self.REMOVAL))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                      "a" * 40, "p2", since_head=None)
+                                      "a" * 40, "p2", since_head=None, reserve=120)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
@@ -1047,7 +1076,7 @@ class TestSincePositions(TestCase):
         result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(full))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                      "a" * 40, "p2", since_head=None)
+                                      "a" * 40, "p2", since_head=None, reserve=120)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
@@ -1258,7 +1287,7 @@ class TestSincePositions(TestCase):
                 result, _, fetch = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
                 self.assertIn('"review_id": 91', result)
                 fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                              "a" * 40, priority, since_head=None)
+                                              "a" * 40, priority, since_head=None, reserve=120)
 
     def test_missing_priority_fails_closed_without_fetch_or_submit(self):
         verdict = {"assessment": ASSESSMENT, "action": "request_changes",
@@ -1300,7 +1329,7 @@ class TestSincePositions(TestCase):
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         full = self._full(self.REMOVAL)
 
-        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None):
+        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None, *, reserve=0):
             atoms._priority(p)
             return full
 

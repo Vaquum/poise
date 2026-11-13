@@ -660,9 +660,15 @@ def finish(
             error = "Stopped by user" if error_code == "stopped" else prior_cause["error"]
             action, outcome = None, None
         persisted = False
+        previous_path = None
         if response:
             prior = conn.execute("select behavior,artifact,response_path from calls where id=?", (id_,)).fetchone()
             artifact = json.loads(prior["artifact"] or "{}") if prior else {}
+            previous_path = prior["response_path"] if prior else None
+            if prior and prior["behavior"] in {"pr_review", "pr_approve"} and prior["response_path"]:
+                retained = caller_store.response(Path(prior["response_path"]), RESPONSES).read_text()
+                if not response.startswith(retained):
+                    response = retained + "\n" + response
             if prior and prior["behavior"] in {"native_action", "native_publication"} \
                     and prior["response_path"] == path and artifact.get("response_sha") == hashlib.sha256(response.encode()).hexdigest():
                 if caller_store.response(Path(path), RESPONSES).read_text() != response:
@@ -679,13 +685,14 @@ def finish(
                 return float(row["ended_at"])
     if response and changed == 1 and not persisted:
         try:
-            caller_store.response(Path(path), RESPONSES).write_text(response)
+            caller_store.write_response_text(Path(path), RESPONSES, response)
         except OSError as persist_error:
             # The row is terminal; a response persistence failure must not
-            # reopen it. Clear the dangling path and retain the cause.
+            # reopen it. Keep an already-retained response readable and retain
+            # the cause.
             with db() as conn:
-                conn.execute("update calls set response_path=null, diagnostic=coalesce(diagnostic, ?) where id=?",
-                             (json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
+                conn.execute("update calls set response_path=?, diagnostic=coalesce(diagnostic, ?) where id=?",
+                             (previous_path, json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
                                                              outcome="persist_failed",
                                                              stderr=str(persist_error)[:500], call_id=id_)), id_))
     return ended_at
