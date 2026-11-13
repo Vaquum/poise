@@ -5078,8 +5078,11 @@ function approveCheckFresh(pr: DatastorePr, snapshot: ApproveCheckSnapshot): boo
   }
 }
 
+// A watermark the gate can lose: a commit lost to a power cut only checks the
+// pull request again, so it never waits for the disk on the server's thread
+// (up to 0.8 s on production).
 function recordApproveCheck(pr: DatastorePr, snapshot: ApproveCheckSnapshot): void {
-  setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() }))
+  writeObservation(() => setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() })))
 }
 
 // A dismissed approval that never gets re-selected is invisible without a
