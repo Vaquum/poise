@@ -4,7 +4,7 @@ import { STATUS_CODES, createServer, type IncomingMessage, type Server, type Ser
 import type { Duplex } from 'node:stream'
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
+import { HttpError, endJson, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
 import { assertCallerRelease } from './caller-release'
 import { refuseInspectorActivation, registerProductionShutdownSignals } from './production-signals'
 import { abandonProductionCpuCapture, installProductionCpuCapture } from './production-cpu-profile'
@@ -102,7 +102,7 @@ function sendJson(res: ServerResponse, statusCode: number, body: unknown): void 
   setApiHeaders(res)
   res.statusCode = statusCode
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.end(JSON.stringify(body))
+  endJson(res, JSON.stringify(body))
 }
 
 function sendFailure(res: ServerResponse, statusCode: number, error: unknown): void {

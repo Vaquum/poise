@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { brotliCompressSync, constants as zlibConstants, gzipSync } from 'node:zlib'
 import { MCP_READ_PATH, type McpGrantScope } from '../gateway/src/mcp-contract'
 import type { ServiceConfig } from './service/config'
 import { IDENTITY_HEADER, scopeAllowsPath, verifyIdentityAssertion, type AssertionScope } from './service/identity'
@@ -251,4 +252,42 @@ export async function readJson<T = Record<string, unknown>>(
 
 export function httpStatus(error: unknown, fallback: number): number {
   return error instanceof HttpError ? error.statusCode : fallback
+}
+
+/** Smaller JSON goes as it is: compressing it would save less than it costs. */
+const COMPRESS_FROM_CHARS = 8 * 1024
+
+/** The compressed encoding a request accepts, Brotli before gzip; null for neither. */
+export function acceptedEncoding(header: string | string[] | undefined): 'br' | 'gzip' | null {
+  const offered = new Map<string, number>()
+  for (const part of (Array.isArray(header) ? header.join(',') : header ?? '').split(',')) {
+    const [name, ...params] = part.trim().toLowerCase().split(';').map((value) => value.trim())
+    if (!name) continue
+    const q = params.find((param) => param.startsWith('q='))
+    const quality = q === undefined ? 1 : Number(q.slice(2))
+    offered.set(name, Number.isFinite(quality) ? quality : 0)
+  }
+  const accepts = (name: string) => (offered.get(name) ?? offered.get('*') ?? 0) > 0
+  return accepts('br') ? 'br' : accepts('gzip') ? 'gzip' : null
+}
+
+/** Ends a JSON response. Poise's front proxy relays its responses as they are
+ *  written, uncompressed, so event streams arrive at once; a JSON body of
+ *  some size is compressed here instead, when the request accepts it.
+ *  Uncompressed, the 250–450 KB bodies Board and Overview read took 0.2–0.5 s
+ *  to download. */
+export function endJson(res: ServerResponse, text: string): void {
+  const encoding = text.length >= COMPRESS_FROM_CHARS && res.req?.method !== 'HEAD' && !res.headersSent
+    && res.getHeader('Content-Encoding') === undefined ? acceptedEncoding(res.req?.headers['accept-encoding']) : null
+  if (!encoding) {
+    res.end(text)
+    return
+  }
+  const body = Buffer.from(text)
+  const vary = res.getHeader('Vary')
+  res.setHeader('Content-Encoding', encoding)
+  res.setHeader('Vary', vary === undefined ? 'Accept-Encoding' : `${String(vary)}, Accept-Encoding`)
+  res.end(encoding === 'br'
+    ? brotliCompressSync(body, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 4, [zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length } })
+    : gzipSync(body, { level: 5 }))
 }
