@@ -82,7 +82,7 @@ export class Context {
    * Each phone signed in within its finish window, by the hash of its secret: the session it got, so a
    * retried request gets the same one. Kept in memory only, and only until the window closes.
    */
-  readonly phoneSignIns = new Map<string, { id: string; idHash: string; until: number }>()
+  readonly phoneSignIns = new Map<string, { id: string; idHash: string; handle: string; until: number }>()
   /** What each apex session's browser holds open through this gateway right now: WebSockets and answers in flight. */
   private readonly sessionTraffic = new Map<string, Set<Closable>>()
   /** The Link event streams open through this gateway, per paired device. */

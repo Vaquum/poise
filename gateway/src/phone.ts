@@ -209,6 +209,11 @@ export function phonePage(ctx: Context, req: IncomingMessage, res: ServerRespons
     return
   }
   const binding = heldBinding(req)
+  // Signed in already, yet the phone asks again: it dropped the request whose answer carried its sign-in
+  // and retried. Within the window it gets the same sign-in again, even if its code is gone meanwhile,
+  // as it is when the computer that showed it signs out.
+  const held = binding ? ctx.phoneSignIns.get(hashSecret(binding)) : undefined
+  if (binding && held && held.until > ctx.deps.now()) return finishAgain(ctx, res, binding, held)
   const code = binding ? ctx.deps.store.phoneCodeByBinding(binding) : null
   if (!binding || !code) {
     const principal = ctx.apexPrincipal(req)
@@ -225,9 +230,6 @@ export function phonePage(ctx: Context, req: IncomingMessage, res: ServerRespons
   }
   const now = ctx.deps.now()
   if (code.state === 'approved' && code.expiresAt > now) return finish(ctx, res, owner, binding, code.expiresAt, clear)
-  // Signed in already, yet the phone asks again: it dropped the request whose answer carried its sign-in
-  // and retried, or never received that answer. Within the window it gets the same sign-in again.
-  if (code.state === 'signed_in' && code.expiresAt > now) return finishAgain(ctx, res, owner, binding, clear)
   if (code.state === 'scanned' && code.expiresAt > now) {
     return page(ctx, res, 200, phoneWaitingPage({ device: code.device ?? 'This phone' }))
   }
@@ -292,16 +294,20 @@ function finish(ctx: Context, res: ServerResponse, owner: User, binding: string,
   if (!done) return page(ctx, res, 410, EXPIRED(), [clear])
   const now = ctx.deps.now()
   for (const [key, held] of ctx.phoneSignIns) if (held.until <= now) ctx.phoneSignIns.delete(key)
-  ctx.phoneSignIns.set(hashSecret(binding), { id: done.id, idHash: done.session.idHash, until })
+  ctx.phoneSignIns.set(hashSecret(binding), { id: done.id, idHash: done.session.idHash, handle: owner.handle, until })
   ctx.deps.log.info('phone.signed_in', { login: owner.login, device: done.phone.device })
   signedIn(ctx, res, owner, done.id, done.session, clear)
 }
 
 /** The same sign-in again for a phone that retried within its finish window, while that sign-in lives. */
-function finishAgain(ctx: Context, res: ServerResponse, owner: User, binding: string, clear: string): void {
-  const held = ctx.phoneSignIns.get(hashSecret(binding))
-  const session = held && held.until > ctx.deps.now() ? ctx.deps.store.sessionByHash(held.idHash) : null
-  if (!held || !session) return page(ctx, res, 410, EXPIRED(), [clear])
+function finishAgain(ctx: Context, res: ServerResponse, binding: string, held: { id: string; idHash: string; handle: string }): void {
+  const clear = ctx.cookie(PHONE_COOKIE, '', 0, PHONE_PATH)
+  const owner = ctx.deps.store.getUser(held.handle)
+  const session = ctx.deps.store.sessionByHash(held.idHash)
+  if (!owner || !ctx.isAllowed(owner) || !session) {
+    ctx.phoneSignIns.delete(hashSecret(binding))
+    return page(ctx, res, 410, EXPIRED(), [clear])
+  }
   ctx.deps.log.info('phone.signed_in.again', { login: owner.login })
   signedIn(ctx, res, owner, held.id, session, clear)
 }

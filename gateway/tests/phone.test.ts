@@ -301,6 +301,17 @@ describe('signing in on a phone with the QR code in Settings', () => {
     expect(late.setCookie('poise_gw')).toBeUndefined()
   })
 
+  it('gives a retrying phone its sign-in even after the computer that showed the code signed out', async () => {
+    const { binding, apex } = await signInPhone()
+    // Signing the computer out ends its apex session, and the codes it minted go with it.
+    const desktop = h.store.findSession(owner.split('=')[1])
+    h.store.deleteSession(desktop?.parentHash ?? '')
+    expect((await api(h, ROOT, owner, 'account')).status).toBe(401)
+    const again = await phone(h, '/auth/phone', binding)
+    expect(again.status).toBe(200)
+    expect(again.cookie('poise_gw')).toBe(apex)
+  })
+
   it('gives a phone signed out in the meantime nothing again', async () => {
     const { binding } = await signInPhone()
     const [listed] = (await overview()).phones
