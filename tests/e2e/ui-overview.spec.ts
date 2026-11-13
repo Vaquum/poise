@@ -35,6 +35,8 @@ interface Workspace {
   chatsFail?: boolean
   /** The runs read fails from the start. */
   runsFail?: boolean
+  /** The chat requests read waits for this first. */
+  requestsLate?: Promise<void>
   /** What /api/behavior-metrics answers. */
   metrics?: unknown
   /** The behavior-metrics reads asked, as their search parameters. */
@@ -68,7 +70,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     const path = url.pathname
     if (path === '/api/notices' && method === 'GET') return json(route, { enabled: true, notices: workspace.notices })
     if (path === '/api/notices/handled') return json(route, { handled: [] })
-    if (path === '/api/chat/requests') return json(route, { revision: workspace.revision, complete: true, requests: workspace.requests })
+    if (path === '/api/chat/requests') { await workspace.requestsLate; return json(route, { revision: workspace.revision, complete: true, requests: workspace.requests }) }
     if (path === '/api/chat/switchboard') return json(route, { revision: 1, status: 'live', items: workspace.decisions })
     if (/^\/api\/chat\/switchboard\/items\/\d+\/answer$/.test(path) && workspace.answerDecision) {
       await workspace.answerDecision.delay
@@ -337,6 +339,24 @@ test('the bell on Overview brings Answer here to its first entry with the focus 
   expect(await first.evaluate((el) => getComputedStyle(el).outlineStyle)).toBe('solid')
   expect(await page.locator('.ova-list').evaluate((el) => el.scrollTop)).toBe(0)
   expect(new URL(page.url()).searchParams.get('view')).toBe('overview')
+})
+
+test('the bell’s focus ring stays through a live redraw, and follows the first entry when the first read lands late (#1433)', async ({ page }) => {
+  let release!: () => void
+  // As the bell from another place opens it: Overview at #answer, before the requests have been read.
+  const workspace: Workspace = { notices: [], requests: [permission('p1', 's1', 'Run gh pr create')], decisions: [], revision: 1,
+    requestsLate: new Promise<void>((resolve) => { release = resolve }) }
+  await open(page, workspace, '/?view=overview&back=board#answer')
+  await expect(answers(page).locator('[data-key="empty"]')).toBeFocused()
+  release()
+  const card = entry(page, 'request:p1')
+  await expect(card).toBeFocused()
+  expect(await card.evaluate((el) => getComputedStyle(el).outlineStyle)).toBe('solid')
+  // A live redraw keeps the ring while focus stays.
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await page.waitForTimeout(1500)
+  await expect(card).toBeFocused()
+  expect(await card.evaluate((el) => getComputedStyle(el).outlineStyle)).toBe('solid')
 })
 
 test('with nothing at the level, the bell focuses Answer here’s empty state (#1433)', async ({ page }) => {

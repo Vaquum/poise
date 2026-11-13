@@ -89,6 +89,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   const actionIds = new Map<string, string>()
   const impacts = new Map<string, { text: string, at: number }>()
   let autoOpen = false
+  /** What the bell focused, drawn with the keyboard's ring until focus leaves it: an entry's id, or 'empty'. */
+  let ringed: string | null = null
   let handledOpen = false
   let inFlight = 0
 
@@ -216,7 +218,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     ].filter(Boolean).join('')
     const ref = entry.notice?.kind === 'worker_idle' ? 'ov.idle' : 'ov.notice'
     const metaRef = entry.source === 'chain' ? ' data-ref="ov.advance"' : ''
-    return `<article class="nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}" data-key="e:${esc(entry.id)}" data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="nt-${slug(entry.id)}">
+    return `<article class="nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="nt-${slug(entry.id)}">
       <header class="nc-h"><span class="t-micro">${esc(entry.kind)}</span>${fresh.has(entry.id) ? '<span class="chip is-agent">New</span>' : ''}${entry.meta ? `<span class="nc-meta"${metaRef}>${esc(entry.meta)}</span>` : ''}<span class="nc-when">${entry.since ? `<time datetime="${esc(entry.since)}" title="${esc(clockAt(entry.since))}">${esc(ago(entry.since))}</time>` : ''}</span></header>
       <h3 class="nc-t" id="nt-${slug(entry.id)}">${esc(entry.title)}</h3>
       <p class="nc-m">${entry.state ? chip(entry.state) : ''}<span>${esc(entry.who)}</span>${entry.where ? `<span class="dim">· ${esc(entry.where)}</span>` : ''}</p>
@@ -270,7 +272,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       return `<section class="ng is-${group}" data-key="g:${group}" aria-label="${esc(name)}">${head}${folded ? '' : items.map((entry) => entryHTML(entry, goneIds.has(entry.id) ? goneWords(entry) : '')).join('')}</section>`
     }).join('')
     const off = feed.enabled || !noticeFeed.answered ? '' : `<p class="nempty" data-key="off">Notifications are off in <a class="lnk" href="${esc(placeHref('settings', { settings: 'general', back: 'overview' }))}">Settings, General</a>. Your chats’ requests, your documents’ review threads and Behaviors’ diagnostics still show here.</p>`
-    const empty = shown.length ? '' : `<p class="nempty" data-key="empty" tabindex="-1">Nothing ${level === 0 ? 'needs you' : 'is open at this level'}. ${level < 3 ? 'Show more with the control above, or rest.' : 'Rest.'}</p>`
+    const empty = shown.length ? '' : `<p class="nempty" data-key="empty" tabindex="-1"${ringed === 'empty' ? ' data-focus-ring' : ''}>Nothing ${level === 0 ? 'needs you' : 'is open at this level'}. ${level < 3 ? 'Show more with the control above, or rest.' : 'Rest.'}</p>`
     const rows = handledRows()
     const handledHTML = `<section class="ng is-handled" data-key="g:handled"><h2 class="ng-h"><span class="t-micro">Handled today</span><span class="n">${rows.length}</span><button class="lnk" data-act="handled" aria-expanded="${handledOpen}" data-ref="ov.handled">${handledOpen ? 'Fold' : 'Show'}</button></h2>${handledOpen ? `<ul class="hl">${rows.map((row) => `<li><span class="sdot is-saved"></span><span class="hl-t">${esc(row.title)}</span><span class="hl-n">${esc(row.note)} · ${clockAt(row.at)}</span>${row.undo && holds.has(row.undo) ? `<button class="lnk" data-act="undo" data-undo="${esc(row.undo)}" data-ref="ov.undo">Undo</button>` : ''}</li>`).join('')}</ul>` : ''}</section>`
     return off + groups + empty + coverage() + handledHTML
@@ -307,7 +309,14 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     for (const id of [...done.keys()]) if (!current.some((entry) => entry.id === id) && !progress.get(id)?.settled) done.delete(id)
     const focused = document.activeElement instanceof HTMLElement && list.contains(document.activeElement) ? document.activeElement : null
     patchContent(list, listHTML())
-    if (focused && !focused.isConnected) $(`[data-notice="${CSS.escape(focused.closest<HTMLElement>('[data-notice]')?.dataset.notice ?? '')}"]`, list)?.focus({ preventScroll: true })
+    if (focused && !focused.isConnected) {
+      const id = focused.closest<HTMLElement>('[data-notice]')?.dataset.notice
+      let next = (id ? $(`[data-notice="${CSS.escape(id)}"]`, list) : null) as HTMLElement | null
+      // The empty state gave way to entries, as when the first read lands after the bell: focus moves to the first.
+      if (!next && focused.dataset.key === 'empty') next = ($('[data-notice]', list) ?? $('[data-key="empty"]', list)) as HTMLElement | null
+      if (next && ringed !== null && (ringed === id || ringed === 'empty')) { ringed = next.dataset.notice ?? 'empty'; next.dataset.focusRing = '' }
+      next?.focus({ preventScroll: true })
+    }
     paintTerms(list)
     const levelBox = $('[data-levelbox]', root)
     const counts = levelCounts()
@@ -818,12 +827,24 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   function bringToFirst(): void {
     list.scrollTop = 0
     root.scrollIntoView({ block: 'start' })
-    const target = ($('[data-notice]', list) ?? $('[data-key="empty"]', list) ?? $('[data-ref="ov.answer"]', root)) as HTMLElement | null
+    const card = $('[data-notice]', list) as HTMLElement | null
+    ringed = card ? card.dataset.notice! : 'empty'
+    const target = (card ?? $('[data-key="empty"]', list) ?? $('[data-ref="ov.answer"]', root)) as HTMLElement | null
     if (!target) return
     target.dataset.focusRing = ''
-    target.addEventListener('blur', () => { delete target.dataset.focusRing }, { once: true })
     target.focus({ preventScroll: true })
   }
+  // The ring stays while focus does, through every redraw, and goes when focus leaves.
+  list.addEventListener('focusout', () => {
+    window.setTimeout(() => {
+      if (ringed === null) return
+      const active = document.activeElement as HTMLElement | null
+      const at = active && list.contains(active) ? active.dataset.notice ?? (active.dataset.key === 'empty' ? 'empty' : null) : null
+      if (at === ringed) return
+      ringed = null
+      for (const el of list.querySelectorAll<HTMLElement>('[data-focus-ring]')) delete el.dataset.focusRing
+    })
+  }, { signal })
   document.addEventListener('poise:answer-here', bringToFirst, { signal })
   if (location.hash === '#answer') requestAnimationFrame(bringToFirst)
 
