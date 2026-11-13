@@ -1027,8 +1027,8 @@ function reviewerTripped(identity: string): boolean {
   return trips.some(trip => trip && Date.now() < trip.nextRetryAtMs) && !authTripRecovery(identity, trips)
 }
 
-// Claims this launch as the backoff window's probe: bumps every due trip
-// record for the identity first, so waiting targets behind it in the same
+// Claims this launch as the backoff window's probe: reserves every due trip's
+// retry window without recording a failure, so waiting targets in the same
 // tick resolve the substitute instead of launching a wave of probes. The
 // probe's success clears the trip; its failure re-trips with a longer
 // backoff. True for a reviewer with no trip at all. Two racing ticks may
@@ -1041,8 +1041,11 @@ function claimReviewerTripProbe(identity: string): boolean {
     if (recovering && !consumeProviderRecovery('codex')) return false
     for (const { behavior, trip } of trips) {
       if (!trip) continue
-      recordBehaviorFailure(behavior, 'operation', trip.error ?? `${identity} cannot review`, reviewerTripTarget(identity),
-        { callId: trip.callId, ...(trip.diagnostic?.code === 'authentication' ? { errorCode: 'authentication_failed' } : {}) })
+      const delayMs = Math.min(
+        BEHAVIOR_RETRY_BASE_MS * (2 ** Math.min(trip.consecutiveFailures, 20)),
+        isTimeoutCause(trip.error ?? '') ? BEHAVIOR_RETRY_TRANSIENT_MAX_MS : BEHAVIOR_RETRY_MAX_MS,
+      )
+      setMeta(failureKey(behavior, reviewerTripTarget(identity)), JSON.stringify({ ...trip, nextRetryAtMs: Date.now() + delayMs }))
     }
     return true
   }).immediate()
