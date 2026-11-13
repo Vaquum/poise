@@ -60,6 +60,7 @@ vi.mock('../server/gh', () => ({
 }))
 
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchAgentLogsSince, fetchAgentLogWatermark, fetchRunningAgentLogs, fetchRunningAgentLogSnapshot, quarantinedLogMayMatch, resetAgentLogCache } from '../server/agent'
+import { parseAgentLogList } from '../server/agent-log-parse'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
 
 function logRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -105,20 +106,22 @@ describe('agent log compatibility', () => {
     const snapshot = await fetchAgentLogSnapshot()
     expect(mocks.observeSnapshot).toHaveBeenCalledExactlyOnceWith(snapshot)
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
-    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--without-progress'])
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--without-progress', '--changed-after', '0', '--limit', '2000'])
     expect(mocks.captureAdmission).not.toHaveBeenCalled()
     expect(mocks.diagnostic).not.toHaveBeenCalled()
   })
 
-  it('reads history without progress events, and whole from a Caller that does not know the flag', async () => {
-    mocks.runFile.mockRejectedValueOnce(Object.assign(new Error('Command failed (2): agent-interface'), {
+  it('reads history whole, and with progress, from a Caller that knows neither changed reads nor the flag', async () => {
+    const usage = () => Object.assign(new Error('Command failed (2): agent-interface'), {
       stdout: '', stderr: 'usage: agent-interface BEHAVIOR ...',
-    })).mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    })
+    mocks.runFile.mockRejectedValueOnce(usage()).mockRejectedValueOnce(usage())
+      .mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
     expect((await fetchAgentLogSnapshot()).entries).toHaveLength(1)
-    expect(mocks.runFile.mock.calls.map((call) => call[1])).toEqual([['--logs', '--without-progress'], ['--logs']])
+    expect(mocks.runFile.mock.calls.map((call) => call[1])).toEqual([['--logs', '--without-progress', '--changed-after', '0', '--limit', '2000'], ['--logs', '--without-progress'], ['--logs']])
     // The older Caller is remembered: the next read asks for the whole history at once.
     await fetchAgentLogSnapshot({ fresh: true })
-    expect(mocks.runFile.mock.calls.map((call) => call[1])).toEqual([['--logs', '--without-progress'], ['--logs'], ['--logs']])
+    expect(mocks.runFile.mock.calls.map((call) => call[1]).slice(3)).toEqual([['--logs']])
     expect(mocks.diagnosticFailure).not.toHaveBeenCalled()
   })
 
@@ -131,7 +134,7 @@ describe('agent log compatibility', () => {
     expect(snapshot.entries).toHaveLength(1)
     expect(snapshot.entries[0]!.prompt).toBe(prompt)
     expect(snapshot.quarantined).toEqual([])
-    expect(mocks.runFile).toHaveBeenCalledExactlyOnceWith('agent-interface', ['--logs', '--without-progress'],
+    expect(mocks.runFile).toHaveBeenCalledExactlyOnceWith('agent-interface', ['--logs', '--without-progress', '--changed-after', '0', '--limit', '2000'],
       expect.objectContaining({ maxOutputBytes: 134217728 }))
     expect(mocks.diagnostic).not.toHaveBeenCalled()
   })
@@ -225,7 +228,7 @@ describe('agent log compatibility', () => {
     expect(snapshot.entries).toMatchObject([{ status: 'failed', outcome: null, action: null,
       diagnostic: { outcome: null, stderr_truncated: null, context: { submission: diagnostic.submission } } }])
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
-    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--without-progress'])
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--without-progress', '--changed-after', '0', '--limit', '2000'])
   })
 
   it('keeps a historical unqualified repository row readable', async () => {
@@ -291,6 +294,88 @@ describe('agent log compatibility', () => {
       outcome: 'superseded',
       head_sha: 'c'.repeat(40),
     }])
+  })
+})
+
+describe('changed-call history reads', () => {
+  beforeEach(() => { mocks.runFile.mockReset() })
+
+  // Caller's calls table as both its reads see it: the whole history in
+  // start order (logs), and the calls changed after a change number with that
+  // order (logs_changed). A stand-in for the real one, which
+  // caller/agent_interface/tests/test_logs_changed.py checks against logs.
+  function callerTable() {
+    const calls: Array<{ rowid: number, seq: number, started: number, row: Record<string, unknown> }> = []
+    let newest = 0
+    const ordered = () => [...calls].sort((a, b) => a.started - b.started || a.rowid - b.rowid)
+    const table = {
+      reads: [] as string[][],
+      insert(row: Record<string, unknown>, started: number) { calls.push({ rowid: calls.length + 1, seq: ++newest, started, row }) },
+      update(rowid: number, patch: Record<string, unknown>) {
+        const call = calls[rowid - 1]!
+        call.row = { ...call.row, ...patch }
+        call.seq = ++newest
+      },
+      replace() { calls.length = 0; newest = 0 },
+      whole: () => ordered().map((call) => call.row),
+    }
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
+      table.reads.push(args)
+      if (args.includes('--changed-after')) {
+        const after = Number(args[args.indexOf('--changed-after') + 1])
+        const limit = Number(args[args.indexOf('--limit') + 1])
+        const changed = calls.filter((call) => call.seq > after).sort((a, b) => a.seq - b.seq)
+        const page = changed.slice(0, limit)
+        return { stdout: JSON.stringify({ rows: page.map(({ rowid, seq, row }) => ({ rowid, seq, row })),
+          cursor: page.at(-1)?.seq ?? after, more: changed.length > limit, order: ordered().map((call) => call.rowid), newest }), stderr: '' }
+      }
+      return { stdout: JSON.stringify(table.whole()), stderr: '' }
+    })
+    return table
+  }
+  const call = (n: number, overrides: Record<string, unknown> = {}) => logRow({ id: n.toString(16).padStart(32, '0'), pr_id: String(n), ...overrides })
+
+  it('builds the whole history from changed calls alone, equal to a whole read through every kind of change', async () => {
+    const table = callerTable()
+    for (let n = 1; n <= 30; n++) table.insert(call(n), n % 7 === 0 ? 1000 - n : 1000 + n)
+    table.insert({ ...call(31), id: 'not-a-call-id' }, 900)
+    table.insert({ ...call(32), status: 'unknown-status' }, 1500)
+    expect(await fetchAgentLogSnapshot({ fresh: true })).toEqual(parseAgentLogList(table.whole()))
+    // Updates, a call that turns unreadable, new calls before and after the
+    // others (moving quarantined rows' positions), and one that heals.
+    table.update(3, { status: 'failed', error: 'boom', error_code: 'review_budget_exhausted' })
+    table.update(5, { model: 42 })
+    table.insert(call(33), 1)
+    table.insert(call(34), 5000)
+    table.update(32, { status: 'completed' })
+    const before = table.reads.length
+    expect(await fetchAgentLogSnapshot({ fresh: true })).toEqual(parseAgentLogList(table.whole()))
+    const refresh = table.reads.slice(before)
+    expect(refresh).toHaveLength(1)
+    expect(Number(refresh[0]![refresh[0]!.indexOf('--changed-after') + 1])).toBeGreaterThan(0)
+    // Nothing changed: one read, the same history.
+    expect(await fetchAgentLogSnapshot({ fresh: true })).toEqual(parseAgentLogList(table.whole()))
+    expect(table.reads.every((args) => args.includes('--changed-after'))).toBe(true)
+  })
+
+  it('reads every call again from a replaced database, and pages a long history', async () => {
+    const table = callerTable()
+    for (let n = 1; n <= 5003; n++) table.insert(call(n), n)
+    expect(await fetchAgentLogSnapshot({ fresh: true })).toEqual(parseAgentLogList(table.whole()))
+    expect(table.reads.map((args) => args[args.indexOf('--changed-after') + 1])).toEqual(['0', '2000', '4000'])
+    table.replace()
+    for (let n = 1; n <= 3; n++) table.insert(call(100 + n, { status: 'running', completed_at: null }), n)
+    expect(await fetchAgentLogSnapshot({ fresh: true })).toEqual(parseAgentLogList(table.whole()))
+    expect((await fetchAgentLogSnapshot({ fresh: true })).entries.map((entry) => entry.pr_id)).toEqual(['103', '102', '101'])
+  })
+
+  it('keeps its snapshot frozen, as every reader expects', async () => {
+    const table = callerTable()
+    table.insert(call(1), 1)
+    const snapshot = await fetchAgentLogSnapshot({ fresh: true })
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(Object.isFrozen(snapshot.entries)).toBe(true)
+    expect(Object.isFrozen(snapshot.entries[0])).toBe(true)
   })
 })
 
