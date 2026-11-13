@@ -156,6 +156,18 @@ describe('identity-scoped reads', () => {
     expect(alerts.openAlerts().map((alert) => alert.kind)).toContain('github_quota_exhausted')
   })
 
+  it('writes a read\'s quota histories and risk windows in one commit each, never one per key', async () => {
+    database.setMeta('me', 'Octocat')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload()) }))
+    const written: boolean[] = []
+    const write = database.setMeta
+    const spy = vi.spyOn(database, 'setMeta').mockImplementation((key: string, value: string) => { written.push(database.db.inTransaction); return write(key, value) })
+    try { await quota.readGithubQuota() } finally { spy.mockRestore() }
+    // The core and graphql histories, three resources' samples and their windows: all inside a transaction.
+    expect(written.length).toBeGreaterThanOrEqual(5)
+    expect(written.every(Boolean)).toBe(true)
+  })
+
   it('reads an account never observed now, even for the browser', async () => {
     database.setMeta('me', 'Octocat')
     mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload()) }))
