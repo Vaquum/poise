@@ -158,6 +158,8 @@ export function showPlace(address: Address): void {
   })
   styleSettingsHref(placeHref('settings', { settings: 'style', back }))
   bellBack = here
+  // A place shown away from Overview has the bell read, though Overview never mounted to say it left.
+  readBell?.()
 }
 
 // ---------- The route back ----------
@@ -191,6 +193,7 @@ function watchConnection(el: HTMLElement | null): void {
 // ---------- The bell: what needs you, opening Overview's Answer here ----------
 // It counts what Overview's level shows, in its colour (places/overview/level.ts).
 let bellBack: Place = 'overview'
+let readBell: (() => void) | null = null
 function watchBell(btn: HTMLElement | null): void {
   const badge = btn?.querySelector<HTMLElement>('[data-bell]')
   if (!btn || !badge) return
@@ -206,6 +209,7 @@ function watchBell(btn: HTMLElement | null): void {
   const readAway = watchAway(() => !onOverview() && readAddress(location.search).address.place !== 'overview', paint)
   noticeFeed.subscribe(paint)
   onBellChange(() => { readAway(); paint() })
+  readBell = readAway
   paint()
   btn.addEventListener('click', () => {
     const href = `${placeHref('overview', { back: bellBack === 'overview' ? null : bellBack })}#answer`

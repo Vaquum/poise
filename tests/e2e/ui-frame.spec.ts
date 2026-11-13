@@ -212,6 +212,26 @@ test('opening Overview reads Answer here’s sources once: the bell reads them i
   await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('1')
 })
 
+test('leaving Overview before it has mounted, the bell reads Answer here’s sources at once', async ({ page }) => {
+  let reviews = 0
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
+  await page.route('**/api/behaviors', (route) => route.fulfill({ json: {} }))
+  await page.route('**/api/behavior-chains**', (route) => route.fulfill({ json: { chains: [], attention: [] } }))
+  await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [] } }))
+  await page.route('**/api/chat/switchboard', (route) => route.fulfill({ json: { revision: 1, items: [] } }))
+  await page.route('**/api/editor/reviews', (route) => { reviews++; return route.fulfill({ json: { publications: [{ slug: 'notes', openThreads: 1 }] } }) })
+  // Overview waits on its settings, so it never mounts before the move.
+  let release = () => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/settings', async (route) => { if (route.request().method() === 'GET') await held; return route.fallback() })
+  await open(page, '/?view=overview')
+  expect(reviews).toBe(0)
+  await nav(page).getByRole('link', { name: 'Board' }).click()
+  await expect.poll(() => reviews).toBe(1)
+  await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('1')
+  release()
+})
+
 test('Claude’s subscription sits at the foot and the page makes room; updating dims the frame', async ({ page }) => {
   await open(page, '/', { claude: 'reauth_required' })
   const strip = page.locator('.foot #claude-auth-banner')
