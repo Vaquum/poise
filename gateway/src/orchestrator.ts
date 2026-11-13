@@ -186,14 +186,11 @@ function parseHealth(text: string, what: string): ServiceHealth {
   }
 }
 
-function replacementHasNoCallerOrBackgroundWork(health: ServiceHealth): boolean {
-  const retained = health.nativeCleanupHold?.retainedCalls ?? 0
-  return health.unsettledNativeCalls === retained && health.backgroundWork === retained && health.runningCallerCalls === 0
-}
-
 function replacementIdle(health: ServiceHealth): boolean {
-  return health.idle || health.nativeCleanupHold?.retainedCalls !== undefined
-    && health.activeChatTurns === 0 && replacementHasNoCallerOrBackgroundWork(health)
+  const retained = health.nativeCleanupHold?.retainedCalls
+  return health.idle || retained !== undefined
+    && health.unsettledNativeCalls === retained && health.backgroundWork === retained
+    && health.runningCallerCalls === 0 && health.activeChatTurns === 0
 }
 
 function nativeCleanupBlocksReplacement(health: ServiceHealth): boolean {
@@ -825,7 +822,7 @@ export class Orchestrator {
           // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
           // idle. A drain that timed out on confirmed busy work cuts it anyway; one that only timed out
           // or was never admitted aborts instead of recreating a slow workspace blind. A forced stop
-          // additionally needs a fresh native-cleanup zero below; lost witnesses cannot be recovered.
+          // still needs a fresh native-cleanup zero below.
           let retainedCleanup: ServiceHealth['nativeCleanupHold']
           if (running && drainedIdle) {
             this.upgradingPhase = 'recheck'
@@ -967,7 +964,8 @@ export class Orchestrator {
       }
       return { idle: replacementIdle(health), unknown: false, down: false, draining: true,
         // An admitted tick/launch can still be between spawn and Call registration.
-        nativeIdle: replacementHasNoCallerOrBackgroundWork(health), unsettledNativeCalls: health.unsettledNativeCalls,
+        nativeIdle: health.unsettledNativeCalls === 0 && health.runningCallerCalls === 0 && health.backgroundWork === 0,
+        unsettledNativeCalls: health.unsettledNativeCalls,
         retainedCleanup: health.nativeCleanupHold?.retainedCalls === undefined ? undefined : health.nativeCleanupHold }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error

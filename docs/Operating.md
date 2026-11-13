@@ -1041,10 +1041,11 @@ is idle, the gateway recreates it on the new image with the same home volume.
 A terminal cleanup failure can carry across replacement once Caller has
 recorded that the original process namespace is empty. The original Call,
 disk and reservation stay held. The gateway logs the retained cleanup with
-`workspace.upgrade.cleanup-retained`. Past `POISE_DRAIN_TIMEOUT` seconds
-(90 minutes by default), cutting confirmed busy work requires a fresh admitted
-drain with no Caller processes, background operations or other unsettled native
-Calls. This includes launches before Call registration.
+`workspace.upgrade.cleanup-retained` after all live work has finished.
+Past `POISE_DRAIN_TIMEOUT` seconds (90 minutes by default), cutting confirmed
+busy work requires a fresh admitted drain with zero unsettled native Calls,
+Caller processes and background operations, including launches before Call
+registration.
 Cleanup without that process proof, unreadable cleanup records and unconfirmed
 drains defer replacement and release the drain (`workspace.upgrade.aborted`,
 `workspace.upgrade.native-pending`). An older workspace can still upgrade

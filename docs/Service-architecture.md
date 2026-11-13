@@ -760,7 +760,7 @@ assertion may only resume, and anything else is refused with 403):
   admitted drain reports `idle`, or when retained cleanup accounts for every
   unsettled Call and background operation and no Chat turn or Caller is running.
   Past the budget, cutting confirmed busy work requires a fresh admitted drain
-  with no Caller, other native cleanup or other background operations, including
+  with `unsettledNativeCalls: 0` and no Caller or background work, including
   launches before Call registration. Cleanup without settled process proof and
   unreadable or unconfirmed answers defer replacement. The gateway releases
   the drain for the next pass (`workspace.upgrade.aborted`). When pending
@@ -786,7 +786,7 @@ assertion may only resume, and anything else is refused with 403):
     naming the update, and the agent keeps its context for the next prompt.
     `idle` follows once the stopped turn settles and the other health counters
     clear. Past the gateway's own timeout, confirmed busy work can be cut
-    once the only native cleanup is eligible for retention. Older workspaces
+    only after native cleanup is positively clear. Older workspaces
     without the native count still upgrade when cooperatively idle; they cannot
     authorize a forced busy replacement.
   - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
