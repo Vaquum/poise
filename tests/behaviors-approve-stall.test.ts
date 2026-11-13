@@ -478,6 +478,88 @@ describe('approve-prs under load', () => {
     }
   })
 
+  it('cancels the deadline diagnostic read when shutdown clears the runtime first', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const startedAt = Date.now()
+    const { database: db, behaviors: runtime } = await startApproving([pr])
+    openLaunchBudget(runtime)
+    const original = mocks.runFile.getMockImplementation()!
+    let stopping: Promise<void> | undefined
+    let shutdownStarted = false
+    let freshReadSpawned = false
+    const hangRelease = deferred<void>()
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      if (command === 'agent-interface' && args[0] === '--logs' && shutdownStarted) {
+        // The diagnostic's fresh read must cancel instead of spawning another
+        // 30-second CLI wait while shutdown is awaiting this cycle.
+        freshReadSpawned = true
+        const signal = (options as { signal?: AbortSignal } | null)?.signal
+        if (signal) await new Promise<void>((_resolve, reject) => {
+          if (signal.aborted) reject(signal.reason)
+          else signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        else await hangRelease.promise
+        throw new Error('unreachable')
+      }
+      return original(command, args, options)
+    })
+    // Shutdown lands between the deadline and the diagnostic's fresh read:
+    // the finally lists its claims first, so starting the stop there clears
+    // the controller before the read evaluates its signal.
+    const listClaims = db.listBehaviorLaunchClaims
+    const listSpy = vi.spyOn(db, 'listBehaviorLaunchClaims').mockImplementation((...args: Parameters<typeof listClaims>) => {
+      const result = listClaims(...args)
+      if (!shutdownStarted && Date.now() >= startedAt + runtime.BEHAVIOR_OPERATION_TIMEOUT_MS) {
+        shutdownStarted = true
+        stopping = runtime.stopBehaviorsRuntime()
+      }
+      return result
+    })
+    const launched = deferred<void>(), released = deferred<void>()
+    const callId = 'b'.repeat(32)
+    mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[1] !== '#17') return
+      fixture.agentLogs.push(agentLog({ id: callId, behavior: 'pr_approve',
+        correlation_id: args[args.indexOf('--correlation-id') + 1], expected_head: HEAD_SHA }))
+      launched.resolve()
+      await released.promise
+    })
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const run = runtime.runEnabledBehaviorsOnce()
+      await launched.promise
+      await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+      released.resolve()
+      // Both the cycle and the stop settle without another CLI timeout.
+      let runSettled = false
+      void run.then(() => runSettled = true, () => runSettled = true)
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(stopping).toBeDefined()
+      expect(runSettled).toBe(true)
+      await run
+      await stopping!
+      expect(freshReadSpawned).toBe(false)
+      // Shutdown suppresses the cycle failure by design; the shutdown itself
+      // is the assertion: no second CLI wait, nothing left busy or failing.
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual([])
+      expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+      expect(runtime.getBehaviorsRuntimeHealth().running).toBe(false)
+    } finally {
+      hangRelease.resolve()
+      released.resolve()
+      listSpy.mockRestore()
+      await logging.stopLogging()
+      await runtime.stopBehaviorsRuntime()
+    }
+  })
+
   it('retains one actionable cycle failure when eligible work cannot be established', async () => {
     const { behaviors: runtime } = await startApproving([pr, secondPr])
     const original = mocks.runFile.getMockImplementation()!

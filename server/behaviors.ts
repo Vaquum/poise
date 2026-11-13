@@ -4811,6 +4811,9 @@ async function tickApprovePrs(): Promise<void> {
   const progress = { eligiblePrs: null as number | null, checksPending: null as number | null,
     changeChecksRead: 0, activityChecksRead: 0, launchesPending: 0, launched: 0, publication: 'unverified' }
   const attemptedClaims = new Set<string>()
+  // Shutdown aborts and clears the controller before awaiting this cycle;
+  // retain its signal so the deadline diagnostic's fresh read still cancels.
+  const lifecycleSignal = behaviorAbortController?.signal
   if (context) context.phase = 'listing'
   try {
     const prs = await listEligiblePrs('approve-prs', author)
@@ -5173,7 +5176,7 @@ async function tickApprovePrs(): Promise<void> {
         try {
           // The work deadline has expired, but Caller may have registered a
           // launch since the last read. Observe it without admitting more work.
-          snapshot = await fetchAgentLogSnapshot({ fresh: true, signal: behaviorAbortController?.signal })
+          snapshot = await fetchAgentLogSnapshot({ fresh: true, signal: lifecycleSignal })
         } catch (error) { ownershipError = behaviorErrorMessage(error) }
         const launches = claims.map((claim) => {
           const call = snapshot?.entries.find((row) => row.correlation_id === claim.launchCorrelationId)
