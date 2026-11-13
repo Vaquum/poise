@@ -189,15 +189,18 @@ export function parsePressure(text: string | null) {
 
 // Contention the server shares with everything else in its container, read
 // from the kernel at the moment of asking: whether the CPU quota froze the
-// container (cpu.stat's nr_throttled and throttled_usec), how much of recent
-// time tasks waited for CPU, memory and I/O (pressure), and how long the main
+// container (cpu.stat's nr_throttled and throttled_usec), whether it went over
+// its memory limits, how much of recent time tasks waited for CPU, memory and
+// I/O (pressure), and how long the main
 // thread itself waited for a CPU (schedstat). Pseudo-files, so each read is a
 // small copy from the kernel; on a system without one, its field is null.
 function hostSnapshot() {
   const usage = process.resourceUsage()
   const sched = readKernel('/proc/self/schedstat')?.split(/\s+/).map(Number)
   const memoryMax = readKernel('/sys/fs/cgroup/memory.max')
+  const memoryHigh = readKernel('/sys/fs/cgroup/memory.high')
   const memoryCurrent = readKernel('/sys/fs/cgroup/memory.current')
+  const limitMb = (limit: string | null) => limit === null || limit === 'max' ? limit : mb(Number(limit))
   return {
     cpus: availableParallelism(),
     loadAvg: loadavg().map((load) => Math.round(load * 100) / 100),
@@ -210,10 +213,10 @@ function hostSnapshot() {
       memory: parsePressure(readKernel('/sys/fs/cgroup/memory.pressure')),
       io: parsePressure(readKernel('/sys/fs/cgroup/io.pressure')),
     },
-    memoryMb: {
-      current: memoryCurrent === null ? null : mb(Number(memoryCurrent)),
-      max: memoryMax === null || memoryMax === 'max' ? memoryMax : mb(Number(memoryMax)),
-    },
+    memoryMb: { current: memoryCurrent === null ? null : mb(Number(memoryCurrent)), high: limitMb(memoryHigh), max: limitMb(memoryMax) },
+    // How often the container went over its memory limits: past `high`, the
+    // kernel slows its allocations; at `max`, it reclaims or kills.
+    memoryEvents: parseKeyed(readKernel('/sys/fs/cgroup/memory.events')),
     mainThread: sched && sched.length >= 3 ? { ranMs: Math.round(sched[0] / 1e6), waitedMs: Math.round(sched[1] / 1e6), slices: sched[2] } : null,
     process: {
       userCpuMs: Math.round(usage.userCPUTime / 1000),
