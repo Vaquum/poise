@@ -149,16 +149,18 @@ test('a tooltip waits for the pointer to rest half a second; leaving or pressing
   await heading.hover()
   await page.clock.runFor(600)
   await expect(tip).toContainText('Overview')
+})
 
-  // A press keeps its element quiet only until the keyboard moves: Tab away and back explains it again.
-  const level = page.getByRole('radio', { name: 'Everything' })
-  await level.click()
-  await page.clock.runFor(1000)
+test('a press keeps its element quiet only until the keyboard moves: Tab away and back explains it again', async ({ page }) => {
+  // Real time: a click waits for the element to settle, which a paused clock never lets happen.
+  await open(page)
+  const tip = page.getByRole('tooltip')
+  await page.getByRole('radio', { name: 'Everything' }).click()
+  await page.waitForTimeout(1200)
   await expect(tip).toHaveCount(0)
   await page.keyboard.press('Tab')
   await page.keyboard.press('Shift+Tab')
   await expect(page.getByRole('radio', { name: 'Everything' })).toBeFocused()
-  await page.clock.runFor(600)
   await expect(tip).toContainText('Show')
 })
 
