@@ -4,9 +4,11 @@
 // requests, the Switchboard's open decisions, and review threads. Pure: it
 // turns what was read into entries; answers.ts reads, draws and acts.
 import { evidenceReferences, type DiagnosticEvidence } from '../../../../gateway/src/diagnostics/evidence-contract'
+import { STALLED_MESSAGE } from '../../../behavior-diagnostics'
 import type { NotificationItem } from '../../../notification-items'
 import type { Notice, NoticeKind } from '../../../notices'
-import { noticeGroup, type Group } from './level'
+import type { BlockerId, PrStatus } from '../board/model'
+import { noticeGroup, STUCK_MS, type Group } from './level'
 import type { State } from './states'
 import { chatOpening, itemOf, journalStep, targetOpening, timelineHref, type Opening } from './targets'
 
@@ -35,12 +37,16 @@ export interface Entry {
   /** The state capsule beside it; none for what plainly needs you. */
   state: State | null
   since: string | null
+  /** One line under the title: who acts next, or what it is waiting on. */
+  detail?: string
   body: string
   code?: string
   meta?: string
   why?: string
   details: string[]
   options: Option[]
+  /** Actions that stay under the pointer with the card's other icons: [option key, label, icon]. */
+  quiet?: { key: string, label: string, icon: string }[]
   /** A question's form: several questions, choices or free text. */
   questions?: QuestionField[]
   /** An answer in your own words: [button, placeholder, send]. */
@@ -76,8 +82,7 @@ const KIND_WORDS: Record<NoticeKind, string> = {
   action_needed: 'Action needed', action_finished: 'Finished',
 }
 
-const ITEM_GROUP: Record<NotificationItem['group'], Group> = { needs: 'needs-you', faults: 'fault', ready: 'ready', auto: 'auto' }
-const GROUP_STATE: Record<Group, State | null> = { 'needs-you': null, fault: 'failed', ready: 'done', auto: 'waiting' }
+const GROUP_STATE: Record<Group, State | null> = { 'needs-you': null, fault: 'failed', auto: 'waiting' }
 /** What Dismiss says on each kind of entry. */
 const NOTICE_DISMISS = 'puts it away until it happens again'
 const WAITING_DISMISS = 'hides it here; the chat still waits for your answer in Chat'
@@ -97,45 +102,103 @@ function noticeOptions(notice: Notice): Option[] {
   return []
 }
 
-/** Classic's rail items as entries. A notice joined with a diagnostic takes
- *  the diagnostic's group, which says who can correct it; a notice alone
- *  takes its kind's group; chain work that needs attention needs you. */
-export function itemEntries(items: readonly NotificationItem[], role: Role, chains: ReadonlyMap<string, { sequence: number, held: string | null }>): Entry[] {
-  return items.map((item): Entry => {
+/** Pull requests by `owner/repo#number`, in lower case: who moves each next. */
+export type PrStatuses = ReadonlyMap<string, PrStatus>
+export const prKey = (repo: string, number: number): string => `${repo.toLowerCase()}#${number}`
+
+// A behavior moves the pull request on its own (server/behavior-pr-status.ts).
+const PR_MOVING: readonly BlockerId[] = ['review_running', 'awaiting_review', 'ci_pending', 'behind', 'approved_not_enqueued', 'in_queue']
+
+/** A pull request's notice by who acts on it next. A chain or a behavior
+ *  moving it is automatic and a held behavior is a fault. Changes requested,
+ *  a conflict, failing checks, unresolved conversations, a refusal, a review
+ *  cap reached, merging turned off, or no status at all: only you. */
+export function prGroup(row: PrStatus | undefined): Group {
+  if (!row) return 'needs-you'
+  if (row.ownership?.chainId) return 'auto'
+  const { id, line } = row.blocker
+  if (id === 'held') return 'fault'
+  if (id === 'ci_failing') return /grey rerun pending/.test(line) ? 'auto' : 'needs-you'
+  if (id === 'awaiting_review' && /cap reached/.test(line)) return 'needs-you'
+  if (id === 'approved_not_enqueued' && /merge-prs (disabled|paused)/.test(line)) return 'needs-you'
+  return PR_MOVING.includes(id) ? 'auto' : 'needs-you'
+}
+
+/** Diagnostics only you can clear: a sign-in, or access only you can grant. */
+const YOURS = new Set(['authentication', 'github_access'])
+/** Diagnostics Poise retries on its own. */
+const RETRYING = new Set(['head_changed', 'provider_capacity', 'rate_limit', 'upstream_unavailable', 'network_interruption',
+  'approval_blocked_unresolved_conversations', 'datastore_stale', 'runtime_status_unknown'])
+
+/** A Behaviors diagnostic by who clears it: you, Poise retrying, or nobody: a fault. */
+export function diagnosticGroup(code: string | undefined, message: string): Group {
+  if (code && YOURS.has(code)) return 'needs-you'
+  if (code && RETRYING.has(code)) return 'auto'
+  return code === 'unknown' && message === STALLED_MESSAGE ? 'auto' : 'fault'
+}
+
+/** Automatic work that has not moved for four hours is stuck. */
+const stuck = (group: Group, since: string | null, now: number): Group => {
+  const at = since === null ? NaN : Date.parse(since)
+  return group === 'auto' && Number.isFinite(at) && now - at >= STUCK_MS ? 'fault' : group
+}
+
+const firstLine = (value: string): string => value.split('\n')[0].trim()
+
+/** Classic's rail items as entries, by who acts. A notice joined with a
+ *  diagnostic takes the diagnostic's group; a pull request's notice takes who
+ *  moves the pull request next; finished work is not listed. Chain work never
+ *  waits on you: held, or not moved for four hours, it is a fault. */
+export function itemEntries(items: readonly NotificationItem[], role: Role, chains: ReadonlyMap<string, { sequence: number, held: string | null }>,
+  prs: PrStatuses = new Map(), now = Date.now()): Entry[] {
+  return items.flatMap((item): Entry[] => {
     const refs = evidenceReferences(item)
     const details = item.details.map((line) => line.detail)
     const base = { details, behaviors: item.behaviors, diagnostic: refs[0], since: item.when, meta: item.meta || undefined }
     if (item.notice) {
       const notice = item.notice
-      const group = item.details.length ? ITEM_GROUP[item.group] : noticeGroup(notice.kind)
       const pull = pullOf(notice)
-      return {
-        ...base, id: `notice:${notice.id}`, source: 'notice', group, kind: KIND_WORDS[notice.kind], title: notice.title,
-        who: item.source, where: item.scope ?? '', state: GROUP_STATE[group], body: notice.body, options: noticeOptions(notice),
+      const status = pull ? prs.get(prKey(pull.repo, pull.number)) : undefined
+      const kept = item.details.length ? diagnosticGroup(item.code, item.body) : noticeGroup(notice.kind)
+      if (kept === null) return []
+      const byPull = !item.details.length && pull && (notice.kind === 'pr_ready' || notice.kind === 'pr_conflict')
+      const group = stuck(byPull ? prGroup(status) : kept, item.when, now)
+      return [{
+        ...base, id: `notice:${notice.id}`, source: 'notice', group, kind: KIND_WORDS[notice.kind],
+        // A pull request's own title; its notice's words are its kind and where.
+        title: pull && notice.body ? notice.body : notice.title,
+        detail: byPull && status ? status.blocker.line : pull ? undefined : firstLine(notice.body) || undefined,
+        who: item.source, where: pull ? `${pull.repo} #${pull.number}` : item.scope ?? '', state: GROUP_STATE[group], body: notice.body, options: noticeOptions(notice),
         open: notice.target ? targetOpening(notice.target, role) : undefined, github: pull?.url,
         dismissable: true, dismissWords: NOTICE_DISMISS, revision: notice.due, silenceable: notice.silenceable, notice, pull,
-      }
+      }]
     }
     if (item.chainJournal) {
       const step = journalStep(item.chainJournal)
       const chain = step ? chains.get(step.chain) : undefined
-      return {
-        ...base, id: item.id, source: 'chain', group: 'needs-you', kind: chain?.held ? 'Chain held' : 'Behavior chain', title: item.title,
-        who: 'the chain', where: '', state: chain?.held ? null : 'waiting', body: item.body,
-        options: step && chain?.held ? [{ key: 'resume', label: 'Resume', primary: true }] : [],
+      const row = item.chain
+      const progressed = row ? row.progressAt : Date.parse(item.when ?? '')
+      const group: Group = chain?.held || !Number.isFinite(progressed) || now - progressed >= STUCK_MS ? 'fault' : 'auto'
+      return [{
+        ...base, id: item.id, source: 'chain', group, kind: chain?.held ? 'Chain held' : group === 'fault' ? 'Chain stuck' : 'Behavior chain',
+        // Its first reason as the title; every reason, and the evidence, under More.
+        title: row?.blocker ? firstLine(row.blocker).split('; ')[0] : item.title, detail: row ? row.step : item.meta,
+        who: 'the chain', where: row ? `${row.repository} #${row.issue}${row.pullNumber ? ` → #${row.pullNumber}` : ''}` : '', state: GROUP_STATE[group], body: item.body,
+        options: [], quiet: step && chain?.held ? [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] : undefined,
         timeline: step ? timelineHref(step.chain, step.after) : undefined, silenceable: false,
         dismissable: true, dismissWords: chain?.held ? 'hides it until the chain moves; the chain stays held' : 'hides it until the chain moves; nothing is retried',
         revision: `${item.when}|${item.title}|${item.body}`,
         chain: step && chain ? { id: step.chain, sequence: chain.sequence } : undefined,
-      }
+      }]
     }
-    const group = ITEM_GROUP[item.group]
-    return {
+    const group = diagnosticGroup(item.code, item.title)
+    return [{
       ...base, id: item.id, source: 'diagnostic', group, kind: 'Behaviors', title: item.title, who: item.source,
-      where: [item.body, item.scope].filter(Boolean).join(' · '), state: group === 'auto' ? 'waiting' : GROUP_STATE[group], body: '',
+      detail: [item.body, item.scope].filter(Boolean).join(' · ') || undefined,
+      where: item.scope ?? '', state: GROUP_STATE[group], body: '',
       options: [], silenceable: false,
       dismissable: true, dismissWords: 'hides it until it happens again; nothing is retried', revision: `${item.when}|${item.title}`,
-    }
+    }]
   })
 }
 
@@ -193,7 +256,7 @@ export function requestEntries(requests: readonly OpenRequest[], role: Role): En
       const options = Array.isArray(content?.options) ? content!.options.filter((o: { id?: unknown, name?: unknown }) => typeof o?.id === 'string' && typeof o?.name === 'string') as { id: string, name: string, kind?: string }[] : []
       if (typeof content?.title !== 'string' || !options.length) return []
       return [{
-        ...base, kind: 'Permission', title: content.title, where: 'asks before a step', body: typeof content.description === 'string' ? content.description : '',
+        ...base, kind: 'Permission', title: content.title, where: request.sessionTitle, detail: 'Asks before a step', body: typeof content.description === 'string' ? content.description : '',
         code: preview(content.input) || undefined,
         options: options.map((o, i) => ({ key: o.id, label: o.name, primary: i === 0 })),
         request: { sessionId: request.sessionId, id: request.id, kind: 'permission', options: options.map((o) => o.id) },
@@ -212,7 +275,7 @@ export function requestEntries(requests: readonly OpenRequest[], role: Role): En
     const managerPrompt = role(request.sessionId) === 'manager' && questions.some((q) => q.options.length > 0) && other
     return [{
       ...base, kind: 'Question', title: questions.length === 1 ? questions[0].question : `${questions.length} questions`,
-      where: questions.length === 1 && questions[0].header ? questions[0].header : 'asks you', body: '',
+      where: request.sessionTitle, detail: questions.length === 1 && questions[0].header ? questions[0].header : undefined, body: '',
       options: quick ? quick.options.map((o, i) => ({ key: o.label, label: o.label, primary: i === 0, detail: o.description ?? null })) : [],
       questions: quick ? undefined : questions,
       freeText: quick?.freeText ? { label: quick.options.length ? 'Other' : 'Answer…', placeholder: `Your answer to ${request.sessionTitle}`, send: 'Send answer' } : undefined,
@@ -243,7 +306,7 @@ export function decisionEntries(items: readonly DecisionItem[], role: Role): Ent
     const stale = item.source.turnsSince ? `${item.source.title} has started ${item.source.turnsSince === 1 ? 'a turn' : `${item.source.turnsSince} turns`} since it asked; the question may be out of date.` : ''
     return {
       id: `decision:${item.id}`, source: 'decision', group: 'needs-you', kind: 'Decision', title: item.text, who: item.source.title,
-      where: 'brought by the Switchboard', state: null, since: item.createdAt, body: [item.detail, stale].filter(Boolean).join('\n'), details: [],
+      where: item.source.title, detail: stale || undefined, state: null, since: item.createdAt, body: [item.detail, stale].filter(Boolean).join('\n'), details: [],
       options: options.map((o) => ({ key: o.id, label: o.recommended ? `${o.label} (recommended)` : o.label, primary: o.recommended, detail: o.detail })),
       freeText: { label: options.length ? 'Other' : 'Answer…', placeholder: `Your answer to ${item.source.title}`, send: 'Send answer' },
       open: item.source.exists ? chatOpening(item.source.sessionId, role(item.source.sessionId)) : undefined,
@@ -273,7 +336,7 @@ export function threadEntries(publication: Publication, reviews: readonly Thread
     return {
       id: `thread:${publication.slug}:${review.id}`, source: 'thread', group: 'needs-you', kind: 'Review comment',
       title: first ? clip(first.body, 140) : 'An open review thread', who: first?.author ?? 'a reviewer',
-      where: `${publication.site} · ${review.repo}#${review.pr}${review.path ? ` · ${review.path}` : ''}`, state: null,
+      where: `${review.repo} #${review.pr}`, detail: `${first?.author ?? 'A reviewer'} on ${publication.site}${review.path ? ` · ${review.path}` : ''}`, state: null,
       since: review.messages[review.messages.length - 1]?.createdAt ?? null,
       body: review.messages.map((m) => `${m.author}: ${m.body}`).join('\n\n'), details: [],
       options: review.canResolve ? [{ key: 'resolve', label: 'Resolve', primary: !review.canReply }] : [],
@@ -297,7 +360,7 @@ export function foldWaiting(entries: readonly Entry[]): Entry[] {
   })
 }
 
-const GROUP_ORDER: Record<Group, number> = { 'needs-you': 0, fault: 1, ready: 2, auto: 3 }
+const GROUP_ORDER: Record<Group, number> = { 'needs-you': 0, fault: 1, auto: 2 }
 
 /** By who acts, then newest first (#1379); an entry without a time goes last,
  *  and equal times keep their sources' order. */

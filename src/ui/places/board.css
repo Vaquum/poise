@@ -47,27 +47,10 @@
 .empty { padding: var(--sp-4) var(--sp-3); border: var(--line-hair) dashed var(--c-line); border-radius: var(--r-card); font-size: var(--fs-micro); color: var(--c-text-muted); text-align: center; line-height: var(--lh-body); }
 .empty .clear { display: block; margin: var(--sp-2) auto 0; font-weight: var(--fw-strong); color: var(--c-agent-on); }
 
-/* ---------- Cards: borders at rest, a lift only while you touch them ---------- */
-.card { position: relative; background: var(--c-surface); border: var(--line-hair) solid var(--c-line); border-radius: var(--r-card); padding: var(--sp-3) var(--sp-3) var(--sp-3) var(--sp-4); transition: border-color var(--dur-feedback) var(--ease-out), box-shadow var(--dur-feedback) var(--ease-out), opacity var(--dur-feedback) var(--ease-out); }
+/* ---------- Cards: the shared card is in components.css; Board's own additions ---------- */
 .card[data-kind="mine"] { cursor: grab; }
-.card:hover, .card:focus-within { border-color: var(--c-edge); box-shadow: var(--shadow-hover); }
 .card.is-changed { border-color: var(--c-attention-edge); }
 .card.is-dragging { opacity: 0.45; }
-/* The edge says the state, in the seven state colours */
-.card::before { content: ""; position: absolute; left: var(--sp-1); top: var(--sp-3); bottom: var(--sp-3); width: var(--cap-stroke); border-radius: var(--r-pill); }
-.card[data-state="needs-you"]::before { background: var(--c-state-needs-you); }
-.card[data-state="blocked"]::before { background: var(--c-state-blocked); }
-.card[data-state="failed"]::before { background: var(--c-state-failed); }
-.card[data-state="running"]::before { background: var(--c-state-running); animation: pulse calc(var(--dur-settle) * 2.4) var(--ease-out) infinite; }
-.card[data-state="waiting"]::before { width: 0; border-left: var(--cap-stroke) dashed var(--c-state-waiting); }
-.card[data-state="done"]::before { background: var(--c-state-done); }
-.card-text, .card-title { display: block; font-size: var(--fs-row); line-height: var(--lh-ui); color: var(--c-text); overflow-wrap: anywhere; }
-.card-title:hover { text-decoration: underline; text-decoration-color: var(--c-edge-strong); text-underline-offset: var(--sp-half); }
-.card-meta { display: flex; align-items: center; gap: var(--sp-2); height: var(--size-chip); margin-top: var(--sp-1); font-size: var(--fs-micro); color: var(--c-text-muted); min-width: 0; }
-.card-meta .repo { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.card-meta .num { font-family: var(--font-mono); flex: none; }
-.card-meta time { margin-left: auto; font-family: var(--font-mono); flex: none; }
-.card-meta .new { flex: none; height: var(--size-chip); padding: 0 var(--sp-2); border-radius: var(--r-pill); background: var(--c-agent-tint); color: var(--c-agent-on); font-weight: var(--fw-strong); display: inline-flex; align-items: center; }
 /* Rows of a fixed height, so a tag or chip coming or going never shifts the cards below */
 .card-state { display: flex; align-items: center; gap: var(--sp-2); height: var(--size-chip); margin-top: var(--sp-1); font-size: var(--fs-micro); color: var(--c-text-soft); min-width: 0; }
 .card-state b { font-weight: var(--fw-strong); color: var(--c-text); white-space: nowrap; }
@@ -80,11 +63,6 @@
 .card .life[hidden] { display: none; }
 .card .note { margin-top: var(--sp-2); font-size: var(--fs-micro); color: var(--c-text-muted); line-height: var(--lh-body); }
 
-/* Actions appear while you touch a card, over its lower right */
-.card-acts { position: absolute; right: var(--sp-2); bottom: var(--sp-1); display: flex; gap: var(--sp-half); padding-left: var(--sp-5); background: linear-gradient(to right, transparent, var(--c-surface) var(--sp-5)); opacity: 0; pointer-events: none; transition: opacity var(--dur-feedback) var(--ease-out); }
-.card:hover .card-acts, .card:focus-within .card-acts { opacity: 1; }
-/* Only the buttons take a click; the strip's fade lets it through to the card. */
-.card:hover .card-acts > *, .card:focus-within .card-acts > * { pointer-events: auto; }
 .card-acts .ib.is-armed { width: auto; padding: 0 var(--sp-2); background: var(--c-failed-tint); color: var(--c-failed-on); font-size: var(--fs-micro); font-weight: var(--fw-strong); }
 
 /* ---------- Writing: composers and the editor, in place ---------- */

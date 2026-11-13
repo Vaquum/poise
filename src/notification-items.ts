@@ -44,6 +44,10 @@ export interface NotificationItem extends EvidenceAttachment {
   /** The notice behind it, which can be opened, put away or silenced. */
   notice: Notice | null
   chainJournal?: string
+  /** A diagnostic's code, or the strongest one joined to a notice. */
+  code?: string
+  /** The chain's attention row behind a chain item. */
+  chain?: ChainAttentionRow
 }
 
 export interface ChainAttentionRow {
@@ -132,6 +136,7 @@ export function notificationItems(notices: readonly Notice[], diagnostics: Behav
     if (!subject) return item
     let strongest: DiagnosticSeverity | null = null
     let message = ''
+    let code = ''
     for (const group of groups) {
       const mine = group.entries.filter((entry) => concerns(entry, subject))
       if (!mine.length) continue
@@ -140,9 +145,10 @@ export function notificationItems(notices: readonly Notice[], diagnostics: Behav
       if (strongest === null || SEVERITY_RANK[group.severity] > SEVERITY_RANK[strongest]) {
         strongest = group.severity
         message = group.message
+        code = group.code
       }
     }
-    if (strongest !== null) Object.assign(item, SEVERITY_LOOK[strongest], { body: message })
+    if (strongest !== null) Object.assign(item, SEVERITY_LOOK[strongest], { body: message, code })
     return item
   })
   for (const group of groups) {
@@ -154,7 +160,7 @@ export function notificationItems(notices: readonly Notice[], diagnostics: Behav
         group.code === 'datastore_stale' ? group.entries[0].correlationId : group.message])}`,
       ...SEVERITY_LOOK[group.severity], title: group.message, body: behaviors.map(behaviorLabel).join(', '),
       source: 'Behaviors', scope: group.scope, when: latest(group.entries), meta: '',
-      details: group.entries, behaviors, notice: null,
+      details: group.entries, behaviors, notice: null, code: group.code,
     })
   }
   for (const entry of attention) {
@@ -172,7 +178,7 @@ export function notificationItems(notices: readonly Notice[], diagnostics: Behav
         detail(`PR evidence: ${entry.evidence.state}${entry.evidence.checkedAt !== null ? ` · observed ${new Date(entry.evidence.checkedAt).toLocaleString()}` : ''}. ${entry.evidence.gates.join('; ')}`,
           entry.pullNumber ? { label: `PR #${entry.pullNumber}`, url: `https://github.com/${entry.repository}/pull/${entry.pullNumber}` } : undefined),
         detail(`Next: ${entry.nextAction}${entry.retryAt !== null ? ` · ${new Date(entry.retryAt).toLocaleString()}` : ''}. ${recheck}`)],
-      behaviors: [], notice: null, chainJournal: entry.journal })
+      behaviors: [], notice: null, chainJournal: entry.journal, chain: entry })
   }
   for (const item of items) {
     const attachments = [...(item.notice ? [item.notice] : []), ...item.details]

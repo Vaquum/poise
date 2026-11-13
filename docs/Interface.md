@@ -102,7 +102,8 @@ makes room for them.
 
 ## Kept in this browser
 
-`poise-style`, `poise-overview-level`, `poise-overview-tiles`,
+`poise-style`, `poise-overview-show` (Answer here's level; a choice kept under the
+four-level `poise-overview-level` carries over), `poise-overview-tiles`,
 `poise-observe-tab`, `poise-observe-github`, `poise-logging-filters`,
 `poise-board`, and Board's time and status filters in `poise-current-filters`.
 

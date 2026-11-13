@@ -15,14 +15,16 @@ import { notificationItems, type ChainAttentionRow } from '../../../notification
 import { registerReloadGuard } from '../../../self-update-guards'
 import { placeHref } from '../../address'
 import { $, $$, esc } from '../../dom'
+import { icon } from '../../icons'
 import { paintTerms } from '../../reference'
-import { term } from '../../registry'
 import { lifeHTML, toast, type Stage } from '../../shell'
+import type { PrStatus } from '../board/model'
 import {
-  decisionEntries, foldWaiting, itemEntries, KEPT_DISMISSALS, openDecision, ordered, requestEntries, requestsFrom, threadEntries, undismissed,
+  decisionEntries, foldWaiting, itemEntries, KEPT_DISMISSALS, openDecision, ordered, prKey, requestEntries, requestsFrom, threadEntries, undismissed,
   type DecisionItem, type Entry, type Publication, type RequestsRead, type Role, type ThreadReview,
 } from './entries'
-import { answersChanged, GROUPS, LEVELS, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from './level'
+import { answersChanged, GROUPS, LEVELS, readLevel, saveLevel, setAnswerGroups, shownAt, tally, type Group } from './level'
+import type { Opening } from './targets'
 import { ago, clockAt, json, readLine, reason, reportRead, ServiceError, slug, uid, unread, whileVisible, type Read, type PartContext } from './util'
 
 /** How long Dismiss and Silence wait in the tab, which is their Undo. */
@@ -70,6 +72,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   const handled: Read<ServerHandled[]> = unread()
   /** Put-away entries that are not notices or decisions: key → the revision put away. */
   const dismissals: Read<Map<string, string>> = unread()
+  /** Each open pull request's next actor, which decides whom its notice waits on. */
+  const prs: Read<Map<string, PrStatus>> = unread()
 
   let level = readLevel()
   let current: Entry[] = []
@@ -102,7 +106,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const items = notificationItems(notices, getBehaviorDiagnostics(), Date.now(), attention)
     const reviewed = (reviews.data ?? []).flatMap((publication) => threadEntries(publication, threads.get(publication.slug)?.reviews ?? [], editorHref))
     return ordered(undismissed(foldWaiting([
-      ...itemEntries(items, options.role, chains),
+      ...itemEntries(items, options.role, chains, prs.data ?? new Map(), Date.now()),
       ...requestEntries(requests.data?.requests ?? [], options.role),
       ...decisionEntries(board.data ?? [], options.role),
       ...reviewed,
@@ -134,7 +138,6 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   }
 
   // ---------- Drawing ----------
-  const chip = (state: string) => `<span class="st" data-state="${state}" data-ref="state"><span data-term="state.${state}">${esc(term(`state.${state}`))}</span></span>`
 
   function statusHTML(p: Progress | undefined): string {
     if (!p) return ''
@@ -172,15 +175,20 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       const free = q.freeText ? `<input type="text" class="nc-qt" name="${esc(`free-${id}-${qi}`)}" value="${esc(draft.get(`free-${id}-${qi}\u0000`)?.value ?? '')}" placeholder="${q.options.length ? 'Other: your own answer…' : 'Type an answer…'}" aria-label="Your answer to ${esc(q.question)}"${disabled}>` : ''
       return `<fieldset class="nc-q" data-qid="${esc(q.id)}" data-multi="${q.multiSelect ? 1 : 0}"><legend>${q.header ? `<span class="t-micro">${esc(q.header)}</span> ` : ''}${esc(q.question)}</legend>${choices}${free}</fieldset>`
     }).join('')
-    return `<form class="nc-form" data-form="${esc(entry.id)}">${fields}<div class="nc-acts"><button type="submit" class="btn-ghost is-primary" data-ref="ov.option"${blocked || sending ? ` aria-disabled="true" data-why="${esc(blocked || sending)}"` : ''}>Submit</button></div></form>`
+    return `<form class="nc-form" data-form="${esc(entry.id)}">${fields}<div class="nc-acts"><button type="submit" class="btn btn-primary" data-ref="ov.option"${blocked || sending ? ` aria-disabled="true" data-why="${esc(blocked || sending)}"` : ''}>Submit</button></div></form>`
   }
 
   function replyHTML(entry: Entry, disabled: string): string {
     const free = entry.freeText!
     const draft = entry.request ? questionDraft(entry).get(`free-${entry.request.id}-0\u0000`)?.value ?? '' : replyDrafts.get(entry.id) ?? ''
-    return `<div class="nc-reply"><textarea rows="2" data-reply="${esc(entry.id)}" placeholder="${esc(free.placeholder)}" aria-label="${esc(free.placeholder)}">${esc(draft)}</textarea><div class="nc-acts"><button class="btn-ghost is-primary" data-act="send" data-ref="ov.reply"${disabled || !draft.trim() ? ' aria-disabled="true"' : ''}${disabled ? ` data-why="${esc(disabled)}"` : ''}>${esc(free.send)}</button>${entry.options.length ? '<button class="btn-ghost" data-act="reply-cancel">Cancel</button>' : ''}</div></div>`
+    return `<div class="nc-reply"><textarea rows="2" data-reply="${esc(entry.id)}" placeholder="${esc(free.placeholder)}" aria-label="${esc(free.placeholder)}">${esc(draft)}</textarea><div class="nc-acts"><button class="btn btn-primary" data-act="send" data-ref="ov.reply"${disabled || !draft.trim() ? ' aria-disabled="true"' : ''}${disabled ? ` data-why="${esc(disabled)}"` : ''}>${esc(free.send)}</button>${entry.options.length ? '<button class="btn btn-line" data-act="reply-cancel">Cancel</button>' : ''}</div></div>`
   }
   const replyDrafts = new Map<string, string>()
+
+  /** The card's edge, in Board's state colours. */
+  const EDGE: Record<Group, string> = { 'needs-you': 'needs-you', fault: 'failed', auto: 'waiting' }
+  /** Where Open goes, as Board's icons say it. */
+  const openIcon = (open: Opening): string => open.external ? 'external' : /[?&]view=chat\b/.test(open.href) ? 'session' : /[?&]view=board\b/.test(open.href) ? 'card' : /[?&]view=editor\b/.test(open.href) ? 'edit' : 'chev'
 
   function entryHTML(entry: Entry, gone: string): string {
     const p = progress.get(entry.id)
@@ -190,13 +198,14 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const off = (why: string) => (why ? ` aria-disabled="true" data-why="${esc(why)}"` : '')
     const isOpenDetail = opened.has(entry.id)
     const answerable = !p?.settled && !busy
-    const opts = answerable ? entry.options.map((o, i) => `<button class="btn-ghost${o.primary ? ' is-primary' : ''}" data-act="answer" data-option="${esc(o.key)}" data-ref="ov.option"${off(blocked)}${o.detail ? ` title="${esc(o.detail)}"` : ''}><span class="k">${i + 1}</span>${esc(o.label)}</button>`).join('') : ''
+    // Only what acts is a button; its digit answers from the keyboard.
+    const opts = answerable ? entry.options.map((o, i) => `<button class="btn ${o.primary ? 'btn-primary' : 'btn-line'}" data-act="answer" data-option="${esc(o.key)}" data-ref="ov.option" aria-keyshortcuts="${i + 1}"${off(blocked)}${o.detail ? ` title="${esc(o.detail)}"` : ''}>${esc(o.label)}</button>`).join('') : ''
     const typed = !entry.options.length || replying.has(entry.id)
     // Your own words stay on screen while an answer is on its way, so typing
     // goes on; a failed send keeps what is there now.
     const sending = busy ? 'Sending your answer.' : ''
     const reply = !p?.settled && entry.freeText
-      ? (typed ? replyHTML(entry, blocked || sending) : answerable ? `<button class="btn-ghost" data-act="reply-open" data-ref="ov.reply"${off(blocked)}>${esc(entry.freeText.label)}</button>` : '')
+      ? (typed ? replyHTML(entry, blocked || sending) : answerable ? `<button class="btn btn-line" data-act="reply-open" data-ref="ov.reply"${off(blocked)}>${esc(entry.freeText.label)}</button>` : '')
       : ''
     const form = !p?.settled && entry.questions ? formHTML(entry, blocked, sending) : ''
     const acts = opts || (reply && !typed) ? `<div class="nc-acts">${opts}${typed ? '' : reply}</div>` : ''
@@ -209,27 +218,34 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       entry.why ? `<p class="nc-why" data-ref="mgr.why">Why this came to you: ${esc(entry.why)}</p>` : '',
     ].join('') : ''
     const more = entry.body || entry.code || entry.details.length || entry.why || entry.diagnostic
+    // Everything else waits under the pointer, as on Board's cards.
+    const ib = (inner: string, label: string, attrs: string) => `<${attrs.startsWith('href') ? 'a' : 'button'} class="ib" ${attrs} aria-label="${esc(label)}">${inner}</${attrs.startsWith('href') ? 'a' : 'button'}>`
     const tools = p?.settled ? '' : [
-      entry.open ? `<a class="lnk" href="${esc(entry.open.href)}"${entry.open.external ? ' target="_blank" rel="noopener"' : ''} data-act="open" data-ref="ov.open">${esc(entry.open.label)}${entry.open.external ? ' ↗' : ''}</a>` : '',
-      entry.github && !entry.open?.external ? `<a class="lnk" href="${esc(entry.github)}" target="_blank" rel="noopener" data-ref="ov.open">Open on GitHub ↗</a>` : '',
-      entry.timeline ? `<a class="lnk" href="${esc(entry.timeline)}" data-act="open" data-ref="ov.timeline">Open its timeline</a>` : '',
-      entry.diagnostic ? `<a class="lnk" href="${esc(diagnosticLink(entry.diagnostic))}" data-act="open" data-ref="ov.diagnostic">Open its diagnostic</a>` : '',
-      entry.silenceable && !busy ? '<button class="lnk" data-act="silence" data-ref="ov.silence">Silence reminders</button>' : '',
-      entry.dismissable && !busy ? `<span class="nc-dis"><button class="lnk" data-act="dismiss" data-ref="ov.dismiss">Dismiss</button><span class="t-gloss">${esc(entry.dismissWords)}</span></span>` : '',
-      more ? `<button class="lnk" data-act="more" aria-expanded="${isOpenDetail}">${isOpenDetail ? 'Less' : 'More'}</button>` : '',
-    ].filter(Boolean).join('')
+      ...(answerable ? entry.quiet ?? [] : []).map((q) => ib(icon(q.icon, 'sm'), q.label, `data-act="answer" data-option="${esc(q.key)}" data-ref="ov.option"${off(blocked)}`)),
+      entry.open ? ib(icon(openIcon(entry.open), 'sm'), entry.open.label, `href="${esc(entry.open.href)}"${entry.open.external ? ' target="_blank" rel="noopener"' : ''} data-act="open" data-ref="ov.open"`) : '',
+      entry.github && !entry.open?.external ? ib(icon('external', 'sm'), 'Open on GitHub', `href="${esc(entry.github)}" target="_blank" rel="noopener" data-ref="ov.github"`) : '',
+      entry.timeline ? ib(icon('chev', 'sm'), 'Open its timeline', `href="${esc(entry.timeline)}" data-act="open" data-ref="ov.timeline"`) : '',
+      entry.diagnostic ? ib(icon('term', 'sm'), 'Open its diagnostic', `href="${esc(diagnosticLink(entry.diagnostic))}" data-act="open" data-ref="ov.diagnostic"`) : '',
+      more ? ib(icon('down', 'sm'), isOpenDetail ? 'Show less' : 'Show more', `data-act="more" data-ref="ov.more" aria-expanded="${isOpenDetail}"`) : '',
+      entry.silenceable && !busy ? ib(icon('mute', 'sm'), 'Silence reminders', 'data-act="silence" data-ref="ov.silence"') : '',
+      entry.dismissable && !busy ? ib(icon('cross', 'sm'), 'Dismiss', `data-act="dismiss" data-ref="ov.dismiss" data-words="${esc(entry.dismissWords)}"`) : '',
+    ].join('')
     const ref = entry.notice?.kind === 'worker_idle' ? 'ov.idle' : 'ov.notice'
-    const metaRef = entry.source === 'chain' ? ' data-ref="ov.advance"' : ''
-    return `<article class="nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="nt-${slug(entry.id)}">
-      <header class="nc-h"><span class="t-micro">${esc(entry.kind)}</span>${fresh.has(entry.id) ? '<span class="chip is-agent">New</span>' : ''}${entry.meta ? `<span class="nc-meta"${metaRef}>${esc(entry.meta)}</span>` : ''}<span class="nc-when">${entry.since ? `<time datetime="${esc(entry.since)}" title="${esc(clockAt(entry.since))}">${esc(ago(entry.since))}</time>` : ''}</span></header>
-      <h3 class="nc-t" id="nt-${slug(entry.id)}">${esc(entry.title)}</h3>
-      <p class="nc-m">${entry.state ? chip(entry.state) : ''}<span>${esc(entry.who)}</span>${entry.where ? `<span class="dim">· ${esc(entry.where)}</span>` : ''}</p>
+    const titleId = `nt-${slug(entry.id)}`
+    const title = entry.open && !p?.settled
+      ? `<a class="card-title" id="${titleId}" href="${esc(entry.open.href)}"${entry.open.external ? ' target="_blank" rel="noopener"' : ''} data-act="open">${esc(entry.title)}</a>`
+      : `<span class="card-title" id="${titleId}">${esc(entry.title)}</span>`
+    const edge = p?.settled || gone ? 'done' : EDGE[entry.group]
+    return `<article class="card nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}${isOpenDetail ? ' is-open' : ''}" data-state="${edge}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="${titleId}">
+      <h3 class="nc-t">${title}</h3>
+      ${entry.detail ? `<p class="nc-d">${esc(entry.detail)}</p>` : ''}
       ${closed && !p?.settled ? `<p class="nc-gone" data-ref="ov.gone">${esc(closed)}</p>` : ''}
       ${body ? `<div class="nc-b">${body}</div>` : ''}
       ${statusHTML(p)}
       ${p?.uncertain && entry.open ? `<p class="nc-fail"><a class="lnk" href="${esc(entry.open.href)}" data-act="open" data-ref="ov.open">${esc(entry.open.label)}</a> to see what happened.</p>` : ''}
       ${acts}${typed ? reply : ''}${form}
-      ${tools ? `<footer class="nc-f">${tools}</footer>` : ''}
+      <div class="card-meta"><span class="nc-kind">${esc(entry.kind)}</span>${fresh.has(entry.id) ? '<span class="new">New</span>' : ''}${entry.where ? `<span class="repo">${esc(entry.where)}</span>` : ''}${entry.since ? `<time datetime="${esc(entry.since)}" title="${esc(clockAt(entry.since))}">${esc(ago(entry.since))}</time>` : ''}</div>
+      ${tools ? `<div class="card-acts">${tools}</div>` : ''}
     </article>`
   }
   const diagnosticLink = (ref: DiagnosticEvidence) => placeHref('observe', { part: 'logging', event: ref.eventId, from: ref.from, to: ref.to, back: 'overview' })
@@ -246,6 +262,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       requests.data && !requests.data.complete ? 'Only the newest 200 chat requests are listed; open Chat for the rest.' : '',
       readLine('The Switchboard’s decisions', board),
       readLine('Review threads', reviews),
+      readLine('Pull requests’ status', prs),
       ...[...threads].flatMap(([name, value]) => value.error ? [`Review threads of ${name} could not be read: ${value.error}`] : []),
       ...(reviews.data ?? []).flatMap((publication) => publication.problems.length ? [`${publication.site} · ${publication.repo}#${publication.pr}: ${publication.problems.join(' ')}${publication.checkedAt ? ` Last checked ${clockAt(publication.checkedAt)}.` : ''}`] : []),
       readLine('Handled today', handled),
@@ -275,20 +292,15 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       return `<section class="ng is-${group}" data-key="g:${group}" aria-label="${esc(name)}">${head}${folded ? '' : items.map((entry) => entryHTML(entry, goneIds.has(entry.id) ? goneWords(entry) : '')).join('')}</section>`
     }).join('')
     const off = feed.enabled || !noticeFeed.answered ? '' : `<p class="nempty" data-key="off">Notifications are off in <a class="lnk" href="${esc(placeHref('settings', { settings: 'general', back: 'overview' }))}">Settings, General</a>. Your chats’ requests, your documents’ review threads and Behaviors’ diagnostics still show here.</p>`
-    const empty = shown.length ? '' : `<p class="nempty" data-key="empty" tabindex="-1"${ringed === 'empty' ? ' data-focus-ring' : ''}>Nothing ${level === 0 ? 'needs you' : 'is open at this level'}. ${level < 3 ? 'Show more with the control above, or rest.' : 'Rest.'}</p>`
+    const empty = shown.length ? '' : `<p class="nempty" data-key="empty" tabindex="-1"${ringed === 'empty' ? ' data-focus-ring' : ''}>Nothing ${level === 0 ? 'waits on you' : 'is open at this level'}. ${level < LEVELS.length - 1 ? 'Show more with the control above, or rest.' : 'Rest.'}</p>`
     const rows = handledRows()
     const handledHTML = `<section class="ng is-handled" data-key="g:handled"><h2 class="ng-h"><span class="t-micro">Handled today</span><span class="n">${rows.length}</span><button class="lnk" data-act="handled" aria-expanded="${handledOpen}" data-ref="ov.handled">${handledOpen ? 'Fold' : 'Show'}</button></h2>${handledOpen ? `<ul class="hl">${rows.map((row) => `<li><span class="sdot is-saved"></span><span class="hl-t">${esc(row.title)}</span><span class="hl-n">${esc(row.note)} · ${clockAt(row.at)}</span>${row.undo && holds.has(row.undo) ? `<button class="lnk" data-act="undo" data-undo="${esc(row.undo)}" data-ref="ov.undo">Undo</button>` : ''}</li>`).join('')}</ul>` : ''}</section>`
     return off + groups + empty + coverage() + handledHTML
   }
 
-  /** How many entries each level shows: choosing one visibly does what it says (#1380). */
-  const levelCounts = (): number[] => {
-    const open = openEntries()
-    return LEVELS.map((_, i) => open.filter((entry) => shownAt(entry.group, i)).length)
-  }
-  const levelName = (name: string, n: number) => `${name}, ${n} ${n === 1 ? 'entry' : 'entries'}`
-  function levelHTML(counts: number[]): string {
-    return `<div class="seg olevel" role="radiogroup" aria-label="How much to show" data-ref="ov.level">${LEVELS.map(([name, gloss], i) => `<button role="radio" aria-checked="${i === level}" aria-pressed="${i === level}" tabindex="${i === level ? 0 : -1}" data-level="${i}" title="${esc(gloss)}" aria-label="${esc(levelName(name, counts[i]))}">${esc(name)}<small data-level-n>${counts[i]}</small></button>`).join('')}</div>`
+  // The count of what the level shows is the heading's; each group heading counts its own.
+  function levelHTML(): string {
+    return `<div class="seg olevel" role="radiogroup" aria-label="How much to show" data-ref="ov.level">${LEVELS.map(([name, gloss], i) => `<button role="radio" aria-checked="${i === level}" aria-pressed="${i === level}" tabindex="${i === level ? 0 : -1}" data-level="${i}" data-gloss="${esc(gloss)}">${esc(name)}</button>`).join('')}</div>`
   }
 
   // A source's first read is the list loading, not an arrival: its entries
@@ -329,16 +341,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     }
     paintTerms(list)
     const levelBox = $('[data-levelbox]', root)
-    const counts = levelCounts()
-    if (levelBox && levelBox.dataset.shown !== String(level)) { levelBox.innerHTML = levelHTML(counts); levelBox.dataset.shown = String(level) }
-    // Counts change in place, so focus on a level is never lost to a redraw.
-    else if (levelBox) {
-      const buttons = Array.from((levelBox as HTMLElement).querySelectorAll<HTMLElement>('[data-level]'))
-      buttons.forEach((button, i) => {
-        const n = button.querySelector('[data-level-n]')
-        if (n && n.textContent !== String(counts[i])) { n.textContent = String(counts[i]); button.setAttribute('aria-label', levelName(LEVELS[i][0], counts[i])) }
-      })
-    }
+    if (levelBox && levelBox.dataset.shown !== String(level)) { levelBox.innerHTML = levelHTML(); levelBox.dataset.shown = String(level) }
     const count = $('[data-ncount]', root)
     const t = tally(openEntries().map((entry) => entry.group), level)
     if (count) { count.textContent = String(t.count); if (t.tone) count.dataset.tone = t.tone; else delete count.dataset.tone }
@@ -382,8 +385,10 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   // ---------- Answering ----------
   function setProgress(id: string, next: Progress): void { progress.set(id, next); paint() }
   /** `revision`, for a card being put away: only that report goes; an answer settles the card whatever it reports next. */
+  /** What Handled today calls it: a chain's reason or a pull request's title says where only with its place. */
+  const handledTitle = (entry: Entry): string => (entry.source === 'chain' || entry.pull) && entry.where ? `${entry.where} · ${entry.title}` : entry.title
   function settle(entry: Entry, label: string, words: string, extra: Partial<Progress> = {}, revision?: string): void {
-    const row: HandledRow = { title: entry.title, note: `${label} · ${words}`, at: Date.now(), ...(extra.undo ? { undo: entry.id } : {}),
+    const row: HandledRow = { title: handledTitle(entry), note: `${label} · ${words}`, at: Date.now(), ...(extra.undo ? { undo: entry.id } : {}),
       ...(revision !== undefined ? { revision } : {}) }
     done.set(entry.id, row)
     settledHere.unshift(row)
@@ -415,7 +420,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const p = progress.get(entry.id)
     if (p && p.stage !== 'Failed') return
     if (p?.uncertain) return
-    const option = key === null ? null : entry.options.find((o) => o.key === key)
+    const option = key === null ? null : entry.options.find((o) => o.key === key) ?? entry.quiet?.find((q) => q.key === key)
     const label = text !== null ? `“${text.length > 60 ? `${text.slice(0, 59)}…` : text}”` : option?.label ?? (entry.questions ? 'Answered' : key ?? '')
     setProgress(entry.id, { stage: 'Accepted', label, words: 'sending', at: Date.now() })
     inFlight += 1
@@ -498,7 +503,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
 
   // ---------- Dismiss and Silence: held for eight seconds, with Undo ----------
   function holdSend(entry: Entry, kind: 'dismiss' | 'silence'): void {
-    const kept = kind === 'dismiss' && KEPT_DISMISSALS.includes(entry.source) ? { key: entry.id, revision: entry.revision, title: entry.title } : undefined
+    const kept = kind === 'dismiss' && KEPT_DISMISSALS.includes(entry.source) ? { key: entry.id, revision: entry.revision, title: handledTitle(entry) } : undefined
     if (!(entry.notice || entry.decision || kept) || holds.has(entry.id)) return
     const timer = window.setTimeout(() => sendHeld(entry.id), HOLD_MS)
     holds.set(entry.id, { kind, notice: entry.notice, decision: entry.decision?.id, kept, timer })
@@ -754,6 +759,20 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     paint()
   }
 
+  async function readPrs(): Promise<void> {
+    try {
+      const data = await json<{ rows?: PrStatus[] }>('/api/behavior-ledger/pr-status?limit=100')
+      if (!Array.isArray(data.rows)) throw new Error('the service answered with something this page cannot read')
+      prs.data = new Map(data.rows.map((row) => [prKey(row.repository, row.number), row]))
+      prs.error = ''
+      prs.at = Date.now()
+    } catch (error) {
+      prs.error = reason(error)
+    }
+    reportRead(ctx, 'overview-prs', 'Pull requests’ status could not be read', prs)
+    paint()
+  }
+
   async function readHandled(): Promise<void> {
     try {
       const data = await json<{ handled?: ServerHandled[] }>(`/api/notices/handled?${new URLSearchParams({ since: midnightInZone(0).toISOString() })}`)
@@ -888,7 +907,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   paint()
   void readRequests()
   void readBoard()
-  whileVisible(ctx, 60_000, () => { void readReviews(); void readHandled(); void readDismissals() })
+  whileVisible(ctx, 60_000, () => { void readReviews(); void readHandled(); void readDismissals(); void readPrs() })
   // The bell, here or from another place: Answer here at its top, focus on its
   // first entry, or on its empty state, with the ring keyboard focus shows.
   function bringToFirst(): void {

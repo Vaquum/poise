@@ -51,10 +51,11 @@ export function targetRef(target: string): string {
   return target.match(/^[^#]+#\d+/)?.[0] ?? target
 }
 
+/** An unclassified timeout: the sweep ran out of time under load, and retries on its own. */
+export const STALLED_MESSAGE = 'The sweep is stalled under load. Poise retries automatically.'
+
 function diagnosticMessage(code: string, cause: string): string {
-  if (code === 'unknown' && isTimeoutCause(cause)) {
-    return 'The sweep is stalled under load. Poise retries automatically.'
-  }
+  if (code === 'unknown' && isTimeoutCause(cause)) return STALLED_MESSAGE
   return ({
     head_changed: 'PR updated. Poise will reconsider the latest revision.',
     provider_capacity: 'The model is busy. Poise will try again.',

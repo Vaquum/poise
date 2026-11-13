@@ -4,70 +4,77 @@
 import { store } from '../../dom'
 import type { NoticeKind } from '../../../notices'
 
-/** Who acts, in the order the list shows them. */
-export type Group = 'needs-you' | 'fault' | 'ready' | 'auto'
+/** Who acts, in the order the list shows them. Finished work is not listed. */
+export type Group = 'needs-you' | 'fault' | 'auto'
 
 export const GROUPS: readonly (readonly [Group, string, string])[] = [
-  ['needs-you', 'Needs you', 'What only you can do.'],
-  ['fault', 'Poise faults', 'Poise itself needs repair.'],
-  ['ready', 'Done', 'Finished, for you to see.'],
-  ['auto', 'Handled automatically', 'Poise is retrying; there is nothing to do.'],
+  ['needs-you', 'Only you', 'Nothing moves until you act.'],
+  ['fault', 'Faults', 'Stuck: broken, or not moved in 4 hours.'],
+  ['auto', 'Handled automatically', 'Poise is on it.'],
 ]
 
 /** Each level includes the ones before it: [name, gloss]. */
 export const LEVELS: readonly (readonly [string, string])[] = [
-  ['Only you', 'Only what needs you'],
-  ['+ Faults', 'What needs you, and Poise faults'],
-  ['+ Done', 'Also what has finished. The bell counts this'],
-  ['Everything', 'Also what Poise handles on its own'],
+  ['Only you', 'Only what waits on you: nothing moves until you act'],
+  ['+ Faults', 'Also what is stuck: broken, or not moved in 4 hours'],
+  ['Everything', 'Also what Poise is handling on its own'],
 ]
 
-export const LEVEL_KEY = 'poise-overview-level'
-export const DEFAULT_LEVEL = 2
+/** Automatic work that has not moved for this long is stuck: a fault. */
+export const STUCK_MS = 4 * 60 * 60 * 1000
+
+export const LEVEL_KEY = 'poise-overview-show'
+/** The four-level key before Done left the list: Only you, + Faults, + Done, Everything. */
+const OLD_LEVEL_KEY = 'poise-overview-level'
+export const DEFAULT_LEVEL = 1
 
 export function readLevel(): number {
-  const value = Number(store.get<unknown>(LEVEL_KEY, DEFAULT_LEVEL))
+  const saved = store.get<unknown>(LEVEL_KEY, null)
+  // + Done showed what + Faults shows now; Everything moved up by one.
+  const value = saved === null ? [0, 1, 1, 2][Number(store.get<unknown>(OLD_LEVEL_KEY, DEFAULT_LEVEL))] ?? DEFAULT_LEVEL : Number(saved)
   return Number.isInteger(value) && value >= 0 && value < LEVELS.length ? value : DEFAULT_LEVEL
 }
 
 export const groupRank = (group: Group): number => GROUPS.findIndex(([key]) => key === group)
 export const shownAt = (group: Group, level: number): boolean => groupRank(group) <= level
 
-// The notices' groups follow #556's mapping (Design → Vocabulary): main's
-// Ready is Done, a pull request ready to merge needs you because green means
-// Done, and only Poise's own failures are faults.
-const NOTICE_GROUPS: Record<NoticeKind, Group> = {
+// Only you is what stays put until you act. Poise's own work never is: when it
+// is stuck it is a fault, and while it moves it is handled automatically. A
+// pull request's notice is decided by who acts on it next (prGroup, in
+// entries.ts); finished work (null) is not listed.
+const NOTICE_GROUPS: Record<NoticeKind, Group | null> = {
   chat_waiting: 'needs-you',
   sign_in_needed: 'needs-you',
-  behavior_held: 'needs-you',
-  datastore_sync_failing: 'needs-you',
-  storage_low: 'needs-you',
-  github_quota_warning: 'needs-you',
-  action_needed: 'needs-you',
-  pr_ready: 'needs-you',
   review_requested: 'needs-you',
+  storage_low: 'needs-you',
+  action_needed: 'needs-you',
+  action_failed: 'needs-you',
+  pr_ready: 'needs-you',
   pr_conflict: 'needs-you',
+  // Idle slots with an empty backlog: only you label an issue or file one.
   worker_idle: 'needs-you',
-  github_quota_exhausted: 'fault',
-  read_failed: 'fault',
-  action_failed: 'fault',
+  behavior_held: 'fault',
   ledger_queue_stalled: 'fault',
   ledger_capture_loss: 'fault',
-  chat_turn_finished: 'ready',
-  action_finished: 'ready',
+  datastore_sync_failing: 'auto',
+  github_quota_warning: 'auto',
+  github_quota_exhausted: 'auto',
+  read_failed: 'auto',
+  chat_turn_finished: null,
+  action_finished: null,
 }
 
-export function noticeGroup(kind: NoticeKind): Group {
+export function noticeGroup(kind: NoticeKind): Group | null {
   return NOTICE_GROUPS[kind]
 }
 
-export interface Tally { count: number, tone: '' | 'failed' | 'needs-you' | 'done' }
+export interface Tally { count: number, tone: '' | 'failed' | 'needs-you' }
 
 /** What the level shows, never what Poise handles on its own, in the colour
- *  of the most urgent: a fault, then what needs you, then what is done. */
+ *  of the most urgent: a fault, then what waits on you. */
 export function tally(groups: readonly Group[], level: number): Tally {
   const shown = groups.filter((group) => group !== 'auto' && shownAt(group, level))
-  const tone = shown.includes('fault') ? 'failed' : shown.includes('needs-you') ? 'needs-you' : shown.length ? 'done' : ''
+  const tone = shown.includes('fault') ? 'failed' : shown.length ? 'needs-you' : ''
   return { count: shown.length, tone }
 }
 

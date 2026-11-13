@@ -96,7 +96,7 @@ Sources, in ~/dev/poise as of 21 Oct:
 Everything at once, arranged by function, on one screen at 1440 × 900 (`overview.html`).
 - **Left: Answer here.**
   - It runs the full height and scrolls inside itself.
-  - The level control sits on top, as four segments: Only you, + Faults, + Done, Everything.
+  - The level control sits on top, as three segments: Only you, + Faults, Everything. Finished work is not listed.
   - Notices are grouped by who acts; each has its answers on it and expands in place.
 - **Right, at the top: In motion.** The seven states, counted for chats and workers, and for issues and pull requests, and the chain's tasks by phase, from Intake to Merge. Choose a state or a phase to list its work underneath; it opens on Running.
 - **The day.**
