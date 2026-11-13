@@ -6,6 +6,7 @@
 import { formatShortDuration } from '../../../analytics-format'
 import type { BehaviorMetrics, BehaviorMetricsReport } from '../../../behavior-metrics'
 import { BEHAVIORS, getLastTriggered, getPausedUntil, isBehaviorStateLoaded, isEnabled, setEnabled, type BehaviorKey } from '../../../behaviors'
+import { getOrganizations, getSettings } from '../../../config'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
 import { toast } from '../../shell'
@@ -20,6 +21,30 @@ const RUNNING_KEYS: Record<string, BehaviorKey> = {
   pr_review: 'review-new-prs', pr_approve: 'approve-prs', issue_review: 'review-new-issues', implement_issue: 'implement-issues', repair_pr: 'repair-prs',
 }
 interface Estimate { id: string, behavior: string, startedAt: string, estimate: { remainingMs: number } | { overrun: true } | null }
+
+/** The last reads, kept across page loads: a reload paints them at once,
+ *  then reads again. Each switch shows its last state but takes no press until
+ *  Behaviors is read afresh. They stand only for the GitHub user and the
+ *  organizations configured, each with its status; runs, time and success only
+ *  for the day they were read for. Written at most once a minute. */
+interface KeptState { on: boolean, paused: string | null, last: { at: string, target: string } | null }
+interface LastBehaviors { key: string, at: number, since: string, state: Partial<Record<BehaviorKey, KeptState>>, metrics: BehaviorMetricsReport, estimates: Estimate[] }
+const LAST_BEHAVIORS_KEY = 'poise-overview-behaviors'
+const KEEP_EVERY_MS = 60_000
+function behaviorsKey(): string {
+  const me = getSettings().me ?? ''
+  const configured = getOrganizations().map((org) => `${org.login.toLowerCase()}:${org.status}`).sort().join(',')
+  return me ? `${me}|${configured}` : ''
+}
+function rememberedBehaviors(key: string): LastBehaviors | null {
+  if (!key) return null
+  try {
+    const last = JSON.parse(localStorage.getItem(LAST_BEHAVIORS_KEY) ?? 'null') as LastBehaviors | null
+    return last?.key === key && typeof last.at === 'number' && typeof last.since === 'string' && !!last.state && !!last.metrics?.behaviors && Array.isArray(last.estimates) ? last : null
+  } catch {
+    return null
+  }
+}
 
 export interface BehaviorsTable {
   /** /api/behaviors was read again. */
@@ -40,6 +65,32 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
   const rowErrors = new Map<BehaviorKey, string>()
   const saving = new Set<BehaviorKey>()
   let generation = 0
+  const key = behaviorsKey()
+  const last = rememberedBehaviors(key)
+  let metricsFresh = false
+  let keptAt = 0
+  if (last) estimates = { data: last.estimates, error: '', at: last.at }
+
+  /** Its switch, pause and last run: as read, or as last read while Behaviors reads afresh. */
+  function stateOf(behavior: BehaviorKey): KeptState & { known: boolean, remembered: boolean } {
+    const kept = last?.state[behavior]
+    if (isBehaviorStateLoaded() || stateError || !kept) {
+      const run = getLastTriggered(behavior)
+      return { known: isBehaviorStateLoaded(), remembered: false, on: isEnabled(behavior), paused: getPausedUntil(behavior), last: run ? { at: run.at, target: run.target } : null }
+    }
+    return { ...kept, known: true, remembered: true }
+  }
+
+  /** Keeps what the table draws once Behaviors and the day's runs are read afresh, at most once a minute. */
+  function keep(): void {
+    if (!key || signal.aborted || key !== behaviorsKey() || !isBehaviorStateLoaded() || !metricsFresh || !metrics.data || !day || Date.now() - keptAt < KEEP_EVERY_MS) return
+    keptAt = Date.now()
+    const state = Object.fromEntries(BEHAVIORS.map((meta) => {
+      const run = getLastTriggered(meta.key)
+      return [meta.key, { on: isEnabled(meta.key), paused: getPausedUntil(meta.key), last: run ? { at: run.at, target: run.target } : null } satisfies KeptState]
+    }))
+    try { localStorage.setItem(LAST_BEHAVIORS_KEY, JSON.stringify({ key, at: keptAt, since: day.since, state, metrics: metrics.data, estimates: estimates.data ?? [] } satisfies LastBehaviors)) } catch { /* the next page reads them anew */ }
+  }
 
   function runningWords(key: BehaviorKey): string {
     const runs = (estimates.data ?? []).filter((run) => RUNNING_KEYS[run.behavior] === key)
@@ -72,13 +123,11 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
   }
 
   function row(key: BehaviorKey, label: string): string {
-    const loaded = isBehaviorStateLoaded()
-    const on = isEnabled(key)
-    const paused = getPausedUntil(key)
-    const last = getLastTriggered(key)
+    const { known: loaded, remembered, on, paused, last } = stateOf(key)
     const m = metrics.data?.behaviors[key]
     const running = runningWords(key)
-    const why = !loaded ? 'Behaviors could not be read, so their switches are unknown.' : saving.has(key) ? 'Saving the last change.' : ''
+    const why = remembered ? 'Reading what is current: the switch works once read.'
+      : !loaded ? 'Behaviors could not be read, so their switches are unknown.' : saving.has(key) ? 'Saving the last change.' : ''
     const lastRun = running
       ? `<span class="st" data-state="running"><span data-term="state.running">Running</span></span><span class="onote">${esc(running)}</span>`
       : last ? `<span class="onote"><a class="lnk" href="${esc(placeHref('observe', { part: 'behaviors', pr: /^[\w.-]+\/[\w.-]+#\d+$/.test(last.target) ? last.target : null, back: 'overview' }))}" title="See its runs in Observe">${clockAt(last.at)} · ${esc(last.target)}</a></span>` : '<span class="onote">No run recorded</span>'
@@ -114,6 +163,8 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
       if (!data?.behaviors) throw new Error('the service answered with something this page cannot read')
       if (mine !== generation) return
       metrics = { data, error: '', at: Date.now() }
+      metricsFresh = true
+      keep()
     } catch (error) {
       if (mine !== generation) return
       metrics = { ...metrics, error: reason(error) }
@@ -159,11 +210,13 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
     dayChanged(next) {
       if (day && next.since === day.since && next.until === day.until) return
       day = next
-      metrics = { ...metrics, data: null }
+      // The day's last read stands until its fresh one lands; another day's never does.
+      metricsFresh = false
+      metrics = last && last.since === next.since ? { data: last.metrics, error: '', at: last.at } : { ...metrics, data: null }
       paint()
       void readMetrics()
     },
-    stateChanged(error) { stateError = error; paint() },
+    stateChanged(error) { stateError = error; paint(); keep() },
     entriesChanged(next) {
       const before = entries.map((entry) => `${entry.id}:${entry.group}`).join()
       entries = next
