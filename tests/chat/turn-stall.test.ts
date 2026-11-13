@@ -5,7 +5,7 @@
 import '../fixtures/light-git-gate'
 import '../fixtures/workspace-template'
 import { spawnSync } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
@@ -17,7 +17,7 @@ import { CATALOG } from '../model-catalog-fixture'
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>()
-  return { ...actual, readdir: vi.fn(actual.readdir) }
+  return { ...actual, readdir: vi.fn(actual.readdir), lstat: vi.fn(actual.lstat) }
 })
 
 // Process starts stall past the global 10 s under suite load: the fixture
@@ -1324,6 +1324,27 @@ describe('turn stall detection and waking', () => {
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 4)
     await waitFor(() => lastStatus(events, session.id) === 'idle')
     expect(runtime.get(session.id)?.stall).toBeUndefined()
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('finds task repos with one probe per directory, never one per file', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-probes:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const app = join(session.checkout, 'app')
+    await mkdir(join(app, '.git'), { recursive: true })
+    await mkdir(join(app, 'src'))
+    await mkdir(join(session.checkout, 'notes'))
+    for (let n = 0; n < 200; n++) await writeFile(join(app, 'src', `f${n}.ts`), '')
+    for (let n = 0; n < 50; n++) await writeFile(join(session.checkout, 'notes', `n${n}.md`), '')
+    vi.mocked(lstat).mockClear()
+    const scan = await runtime.nestedTaskRepos(session.checkout)
+    expect(scan).toMatchObject({ complete: true, dirs: [app] })
+    // Each directory below the checkout is probed for its own .git once.
+    const probed = vi.mocked(lstat).mock.calls.map(([path]) => String(path)).filter((path) => path.startsWith(session.checkout))
+    expect(probed.every((path) => path.endsWith('/.git'))).toBe(true)
+    expect(probed.length).toBeLessThan(20)
     await runtime.stop({ handover: false })
   }, 40_000)
 
