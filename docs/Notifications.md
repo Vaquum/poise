@@ -28,8 +28,10 @@ including the ones before it:
   bell counts.
 - **Everything:** also what Poise is handling on its own.
 
-Each entry expands in place to its full words, what happened and what can be
-done. Each line of what happened carries its time on Poise's clock: 24-hour in
+Within each group the newest entry is on top: a notice by when it began, a
+request or decision by when it was asked, a review thread by its latest reply,
+chain work by its last verified advance. Each entry expands in place to its full
+words, what happened and what can be done. Each line of what happened carries its time on Poise's clock: 24-hour in
 the time zone from Settings, whatever the browser's language, with the date for
 another day and the year for another year.
 
@@ -216,15 +218,38 @@ diagnostics and General settings; it does not depend on notices or add a poller.
   - A failed behavior without a recorded agent call has nothing to open. Its
     diagnostic is in the entry itself.
 - **Dismiss** puts it away: for good, or for a ready pull request or idle
-  worker slots until its next reminder.
+  worker slots until its next reminder. Every entry in Answer here has it (see
+  below).
 - **Silence reminders**, on a ready pull request, a requested review, or idle
   worker slots, silences it: no more reminders while a ready pull request
   stays open, nothing more about a review request until the request is
   removed, and nothing more about idle slots until a slot fills or a ticket
   is labelled.
 
-Behaviors' conditions cannot be put away. They leave Answer here when the
-condition clears.
+## Putting any entry away
+
+No entry is ever stuck. Every entry can be dismissed, except a prompt that
+offers options: a decision the Switchboard reports, or a question from the
+Manager's chat. Those always offer **Other**, which opens a text field whose
+words are sent as the answer, so they need no Dismiss. A Manager's question
+whose agent takes only its options keeps Dismiss instead.
+
+Dismiss only hides: it never resumes a chain, retries a run or tells a chat
+anything, and each entry says beside it what happens to the rest. It waits
+eight seconds in the tab, with Undo, like a notice's. The server keeps the
+dismissal by the entry's key and what it reported, so every device and the bell
+agree, and the entry comes back when that changes:
+
+- chain work, when the chain advances or its blocker changes; a held chain
+  stays held;
+- a Behaviors condition, when it happens again;
+- a chat's permission or question, never while it stays open: the chat still
+  waits for the answer in Chat;
+- a review thread, when someone replies; it stays open on GitHub;
+- a decision without options goes from the Switchboard, which tells its chat
+  nothing.
+
+Dismissals are kept for thirty days, and each is recorded under Handled today.
 
 ## Arrivals
 
@@ -273,6 +298,11 @@ other alerts go on as before.
     requested review.
 - `POST /api/settings` with `{ "notifications": { "enabled": false } }` turns
   them off; `true` turns them on.
+- `GET /api/answers/dismissals` answers `{ dismissals: [{ key, revision, at }] }`,
+  newest first: Answer here's put-away entries that are not notices.
+  `POST /api/answers/dismissals` with `{ key, revision, title }` puts one away;
+  the key is the entry's id (`chain:`, `diagnostic:`, `request:` or `thread:`).
+  It is the person's action, taken in the browser: anyone else gets 403.
 
 The page reads `GET /api/notices` every ten seconds while it is in front, and
 at once when it comes back to the front. The code is `server/alerts/notices.ts`

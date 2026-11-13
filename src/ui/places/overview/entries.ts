@@ -50,6 +50,10 @@ export interface Entry {
   diagnostic?: DiagnosticEvidence
   timeline?: string
   dismissable: boolean
+  /** What Dismiss does to this entry, said on the entry: it never resumes, retries or tells a chat anything. */
+  dismissWords: string
+  /** What the entry reports, for its dismissal: a put-away entry returns when this changes. */
+  revision: string
   silenceable: boolean
   /** The behaviors it concerns, for their chips in the Behaviors table. */
   behaviors: string[]
@@ -74,6 +78,9 @@ const KIND_WORDS: Record<NoticeKind, string> = {
 
 const ITEM_GROUP: Record<NotificationItem['group'], Group> = { needs: 'needs-you', faults: 'fault', ready: 'ready', auto: 'auto' }
 const GROUP_STATE: Record<Group, State | null> = { 'needs-you': null, fault: 'failed', ready: 'done', auto: 'waiting' }
+/** What Dismiss says on each kind of entry. */
+const NOTICE_DISMISS = 'puts it away until it happens again'
+const WAITING_DISMISS = 'hides it here; the chat still waits for your answer in Chat'
 
 function pullOf(notice: Notice): Entry['pull'] {
   const target = notice.target
@@ -106,7 +113,7 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
         ...base, id: `notice:${notice.id}`, source: 'notice', group, kind: KIND_WORDS[notice.kind], title: notice.title,
         who: item.source, where: item.scope ?? '', state: GROUP_STATE[group], body: notice.body, options: noticeOptions(notice),
         open: notice.target ? targetOpening(notice.target, role) : undefined, github: pull?.url,
-        dismissable: true, silenceable: notice.silenceable, notice, pull,
+        dismissable: true, dismissWords: NOTICE_DISMISS, revision: notice.due, silenceable: notice.silenceable, notice, pull,
       }
     }
     if (item.chainJournal) {
@@ -116,7 +123,9 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
         ...base, id: item.id, source: 'chain', group: 'needs-you', kind: chain?.held ? 'Chain held' : 'Behavior chain', title: item.title,
         who: 'the chain', where: '', state: chain?.held ? null : 'waiting', body: item.body,
         options: step && chain?.held ? [{ key: 'resume', label: 'Resume', primary: true }] : [],
-        timeline: step ? timelineHref(step.chain, step.after) : undefined, dismissable: false, silenceable: false,
+        timeline: step ? timelineHref(step.chain, step.after) : undefined, silenceable: false,
+        dismissable: true, dismissWords: chain?.held ? 'hides it until the chain moves; the chain stays held' : 'hides it until the chain moves; nothing is retried',
+        revision: `${item.when}|${item.title}|${item.body}`,
         chain: step && chain ? { id: step.chain, sequence: chain.sequence } : undefined,
       }
     }
@@ -124,7 +133,8 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
     return {
       ...base, id: item.id, source: 'diagnostic', group, kind: 'Behaviors', title: item.title, who: item.source,
       where: [item.body, item.scope].filter(Boolean).join(' · '), state: group === 'auto' ? 'waiting' : GROUP_STATE[group], body: '',
-      options: [], dismissable: false, silenceable: false,
+      options: [], silenceable: false,
+      dismissable: true, dismissWords: 'hides it until it happens again; nothing is retried', revision: `${item.when}|${item.title}`,
     }
   })
 }
@@ -174,7 +184,8 @@ export function requestEntries(requests: readonly OpenRequest[], role: Role): En
   return requests.flatMap((request): Entry[] => {
     const base = {
       id: `request:${request.id}`, source: 'request' as const, group: 'needs-you' as const, who: request.sessionTitle,
-      since: request.createdAt, state: null, details: [], behaviors: [], dismissable: false, silenceable: false,
+      since: request.createdAt, state: null, details: [], behaviors: [], silenceable: false,
+      dismissable: true, dismissWords: WAITING_DISMISS, revision: 'open',
       open: chatOpening(request.sessionId, role(request.sessionId)), why: request.escalation ?? undefined,
     }
     if (request.kind === 'permission') {
@@ -194,13 +205,19 @@ export function requestEntries(requests: readonly OpenRequest[], role: Role): En
     // where it takes them; several questions or several choices are Chat's form.
     const single = questions.length === 1 && !questions[0].multiSelect ? questions[0] : null
     const quick = single && (single.options.length || single.freeText) ? single : null
+    // A Manager's question that offers options always takes Other, in your own
+    // words, so it needs no Dismiss. One that takes only its options keeps Dismiss,
+    // so no card is ever stuck.
+    const other = questions.every((q) => q.freeText)
+    const managerPrompt = role(request.sessionId) === 'manager' && questions.some((q) => q.options.length > 0) && other
     return [{
       ...base, kind: 'Question', title: questions.length === 1 ? questions[0].question : `${questions.length} questions`,
       where: questions.length === 1 && questions[0].header ? questions[0].header : 'asks you', body: '',
       options: quick ? quick.options.map((o, i) => ({ key: o.label, label: o.label, primary: i === 0, detail: o.description ?? null })) : [],
       questions: quick ? undefined : questions,
-      freeText: quick?.freeText ? { label: quick.options.length ? 'Something else…' : 'Answer…', placeholder: `Your answer to ${request.sessionTitle}`, send: 'Send answer' } : undefined,
+      freeText: quick?.freeText ? { label: quick.options.length ? 'Other' : 'Answer…', placeholder: `Your answer to ${request.sessionTitle}`, send: 'Send answer' } : undefined,
       request: { sessionId: request.sessionId, id: request.id, kind: 'question', options: quick ? [quick.id] : questions.map((q) => q.id) },
+      ...(managerPrompt ? { dismissable: false, dismissWords: '' } : {}),
     }]
   })
 }
@@ -228,10 +245,12 @@ export function decisionEntries(items: readonly DecisionItem[], role: Role): Ent
       id: `decision:${item.id}`, source: 'decision', group: 'needs-you', kind: 'Decision', title: item.text, who: item.source.title,
       where: 'brought by the Switchboard', state: null, since: item.createdAt, body: [item.detail, stale].filter(Boolean).join('\n'), details: [],
       options: options.map((o) => ({ key: o.id, label: o.recommended ? `${o.label} (recommended)` : o.label, primary: o.recommended, detail: o.detail })),
-      freeText: { label: options.length ? 'Something else…' : 'Answer…', placeholder: `Your answer to ${item.source.title}`, send: 'Send answer' },
+      freeText: { label: options.length ? 'Other' : 'Answer…', placeholder: `Your answer to ${item.source.title}`, send: 'Send answer' },
       open: item.source.exists ? chatOpening(item.source.sessionId, role(item.source.sessionId)) : undefined,
-      // Answering settles a decision; one whose chat is gone can only be put away.
-      dismissable: !item.source.exists, silenceable: false, behaviors: [], decision: { id: item.id },
+      // A decision that offers options always takes Other, in your own words, so
+      // it needs no Dismiss while its chat exists; any other can be put away.
+      dismissable: !options.length || !item.source.exists, dismissWords: 'hides it from the Switchboard; the chat is told nothing',
+      revision: 'open', silenceable: false, behaviors: [], decision: { id: item.id },
     }
   })
 }
@@ -260,7 +279,9 @@ export function threadEntries(publication: Publication, reviews: readonly Thread
       options: review.canResolve ? [{ key: 'resolve', label: 'Resolve', primary: !review.canReply }] : [],
       freeText: review.canReply ? { label: 'Reply…', placeholder: 'Your reply, posted on GitHub as you', send: 'Send reply' } : undefined,
       open: { href: editorHref(publication.slug), label: 'Open in Editor' }, github: review.prUrl,
-      dismissable: false, silenceable: false, behaviors: [], thread: { slug: publication.slug, id: review.id },
+      dismissable: true, dismissWords: 'hides it until someone replies; the thread stays open on GitHub',
+      revision: `${review.messages.length}|${review.messages[review.messages.length - 1]?.createdAt ?? ''}`,
+      silenceable: false, behaviors: [], thread: { slug: publication.slug, id: review.id },
     }
   })
 }
@@ -278,11 +299,20 @@ export function foldWaiting(entries: readonly Entry[]): Entry[] {
 
 const GROUP_ORDER: Record<Group, number> = { 'needs-you': 0, fault: 1, ready: 2, auto: 3 }
 
-/** By who acts, then as each source lists them: requests and decisions first,
- *  for whoever asked is waiting. */
+/** By who acts, then newest first (#1379); an entry without a time goes last,
+ *  and equal times keep their sources' order. */
 export function ordered(entries: readonly Entry[]): Entry[] {
-  const SOURCE_ORDER: Record<Source, number> = { request: 0, decision: 1, notice: 2, chain: 3, thread: 4, diagnostic: 5 }
-  return entries.map((entry, index) => ({ entry, index }))
-    .sort((a, b) => GROUP_ORDER[a.entry.group] - GROUP_ORDER[b.entry.group] || SOURCE_ORDER[a.entry.source] - SOURCE_ORDER[b.entry.source] || a.index - b.index)
+  const time = (entry: Entry) => { const at = entry.since === null ? NaN : Date.parse(entry.since); return Number.isFinite(at) ? at : -Infinity }
+  return entries.map((entry, index) => ({ entry, index, at: time(entry) }))
+    .sort((a, b) => GROUP_ORDER[a.entry.group] - GROUP_ORDER[b.entry.group] || (b.at === a.at ? 0 : b.at > a.at ? 1 : -1) || a.index - b.index)
     .map(({ entry }) => entry)
+}
+
+/** Sources whose put-away entries Answer here keeps (server/answer-dismissals.ts):
+ *  notices and decisions keep their own dismissal. */
+export const KEPT_DISMISSALS: readonly Source[] = ['chain', 'diagnostic', 'request', 'thread']
+
+/** Entries not put away at the revision they report now. */
+export function undismissed(entries: readonly Entry[], dismissals: ReadonlyMap<string, string>): Entry[] {
+  return entries.filter((entry) => !KEPT_DISMISSALS.includes(entry.source) || dismissals.get(entry.id) !== entry.revision)
 }

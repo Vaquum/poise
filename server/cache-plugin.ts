@@ -62,6 +62,7 @@ import { stallSnapshot } from './stall-observer'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
 import { ChatSocketServer, handleChatApi, speaksForPerson } from './chat/transport'
+import { dismissAnswer, listAnswerDismissals } from './answer-dismissals'
 import { Switchboard } from './chat/switchboard'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
@@ -677,6 +678,20 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             if (noticeAction[2] === 'dismiss') dismissNotice(id)
             else silenceNotice(id, Date.now(), person ? 'person' : 'api')
             return json(res, 200, await noticeEvidence(noticesState()))
+          } catch (error) {
+            return json(res, httpStatus(error, 400), { error: (error as Error).message })
+          }
+        }
+        // Answer here's put-away cards that are not notices (server/answer-dismissals.ts).
+        if (path === '/api/answers/dismissals' && req.method === 'GET') {
+          return json(res, 200, { dismissals: listAnswerDismissals() })
+        }
+        if (path === '/api/answers/dismissals' && req.method === 'POST') {
+          if (!speaksForPerson(req, !!service, authority)) {
+            return json(res, 403, { error: 'Putting a card away is the person\'s action, taken in the browser.', code: 'invalid' })
+          }
+          try {
+            return json(res, 200, { dismissals: dismissAnswer(await readJson<unknown>(req)) })
           } catch (error) {
             return json(res, httpStatus(error, 400), { error: (error as Error).message })
           }

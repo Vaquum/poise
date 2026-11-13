@@ -35,6 +35,11 @@ interface Workspace {
   chatsFail?: boolean
   /** The runs read fails from the start. */
   runsFail?: boolean
+  /** The chain's attention rows. */
+  attention?: unknown[]
+  /** Put-away entries the server keeps, and what was posted to it. */
+  dismissals?: { key: string, revision: string, at: string }[]
+  dismissed?: unknown[]
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -70,7 +75,14 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     }
     if (path === '/api/chat/sessions') return workspace.chatsFail ? json(route, { error: 'the chat service did not answer' }, 503) : json(route, { instance: 'poise-dev:test', sessions: [] })
     if (path === '/api/editor/reviews') return json(route, { publications: [], sweep: { publications: 0, longestDelayMinutes: 15 } })
-    if (path === '/api/behavior-chains') return json(route, { chains: [], attention: [] })
+    if (path === '/api/behavior-chains') return json(route, { chains: [], attention: workspace.attention ?? [] })
+    if (path === '/api/answers/dismissals' && method === 'POST') {
+      const body = route.request().postDataJSON() as { key: string, revision: string }
+      ;(workspace.dismissed ??= []).push(body)
+      workspace.dismissals = [{ key: body.key, revision: body.revision, at: new Date().toISOString() }, ...(workspace.dismissals ?? []).filter((row) => row.key !== body.key)]
+      return json(route, { dismissals: workspace.dismissals })
+    }
+    if (path === '/api/answers/dismissals') return json(route, { dismissals: workspace.dismissals ?? [] })
     if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
     if (path === '/api/settings' && method === 'GET') return json(route, { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
     if (path === '/api/analytics') return json(route, { window: { since: url.searchParams.get('since'), until: url.searchParams.get('until') }, agentAccount: 'bot', ...day, ...(url.searchParams.get('dailyBounds') ? { daily: Array.from({ length: 7 }, () => day) } : {}), errors: [] })
@@ -168,7 +180,7 @@ test('an answer that fails shows the service’s reason, and keeps what was type
   }
   await open(page, workspace)
   const card = entry(page, 'decision:7')
-  await card.getByRole('button', { name: 'Something else…' }).click()
+  await card.getByRole('button', { name: 'Other' }).click()
   const box = card.getByRole('textbox')
   await box.fill('Keep both')
   await card.getByRole('button', { name: 'Send answer' }).click()
@@ -258,6 +270,38 @@ test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {
   await entry(page, 'notice:disk').getByRole('button', { name: 'Undo' }).click()
   await expect(entry(page, 'notice:disk').getByRole('button', { name: 'Dismiss' })).toBeVisible()
   expect(sent).toEqual([])
+})
+
+test('Answer here lists the newest first, and every card can be put away without acting on it (#1379)', async ({ page }) => {
+  const attention = (issue: number, minutes: number) => ({ id: `autonomio/poise#${issue}`, repository: 'autonomio/poise', issue, pullNumber: null, step: 'repair-pr: uncertain',
+    progressAt: NOW - minutes * 60_000, ageMs: minutes * 60_000, blocker: 'Original outcome requires reconciliation', evidence: { state: 'open', checkedAt: null, gates: [] },
+    nextAction: 'reconcile', retryAt: null, journal: `/api/behavior-chains?id=${encodeURIComponent(`autonomio/poise#${issue}`)}&after=3`,
+    reconciliation: { nextObservationAt: null, waitingForResourceRelease: false } })
+  const decision = { id: 9, kind: 'decision', text: 'Which repair goes first?', detail: null, createdAt: ago(1), source: { sessionId: 'm1', title: 'Manager', agent: 'claude', model: 'opus', exists: true }, sourceSeq: 2,
+    options: [{ id: 'a', label: 'The failing check', detail: null, recommended: true }], explanation: { state: 'none' } }
+  const workspace: Workspace = { notices: [], decisions: [decision], revision: 1, requests: [permission('p1', 's1', 'Run gh pr create')], attention: [attention(898, 4 * 1440), attention(1169, 60)] }
+  const socket = await open(page, workspace)
+  const ids = () => page.locator('[data-answers] [data-notice]').evaluateAll((cards) => cards.map((card) => (card as HTMLElement).dataset.notice))
+  // Newest first: the decision (1 min), the permission (3 min), then the chain cards by their last verified advance.
+  await expect.poll(ids).toEqual(['decision:9', 'request:p1', 'chain:autonomio/poise#1169', 'chain:autonomio/poise#898'])
+
+  // A Manager's prompt with options answers with them or Other, in your own words; it has no Dismiss.
+  await expect(entry(page, 'decision:9').getByRole('button', { name: 'Dismiss' })).toHaveCount(0)
+  await entry(page, 'decision:9').getByRole('button', { name: 'Other' }).click()
+  await expect(entry(page, 'decision:9').getByRole('textbox')).toBeFocused()
+  // Every other card says what Dismiss does.
+  await expect(entry(page, 'request:p1')).toContainText('the chat still waits for your answer in Chat')
+  await expect(entry(page, 'chain:autonomio/poise#898')).toContainText('hides it until the chain moves')
+
+  await entry(page, 'chain:autonomio/poise#1169').getByRole('button', { name: 'Dismiss' }).click()
+  await expect(entry(page, 'chain:autonomio/poise#1169')).toContainText('Dismissed')
+  await expect.poll(() => workspace.dismissed, { timeout: 12_000 }).toEqual([{ key: 'chain:autonomio/poise#1169',
+    revision: `${new Date(NOW - 60 * 60_000).toISOString()}|autonomio/poise#1169 · repair-pr: uncertain|Original outcome requires reconciliation`, title: 'autonomio/poise#1169 · repair-pr: uncertain' }])
+  await page.mouse.move(1000, 600)
+  await expect(entry(page, 'chain:autonomio/poise#1169')).toHaveCount(0)
+  await expect(page.locator('[data-ncount]')).toHaveText('3')
+  // Putting it away sent nothing to any chat and resumed nothing.
+  expect(socket.frames.map((frame) => frame.command.type).filter((type) => /respond|answer|resume|message|send|prompt/i.test(String(type)))).toEqual([])
 })
 
 test('a decision whose chat is gone says so, and Dismiss puts it away', async ({ page }) => {

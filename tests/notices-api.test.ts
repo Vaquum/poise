@@ -490,3 +490,33 @@ describe('the handling log', () => {
     expect((await handled()).body.handled).toEqual([])
   })
 })
+
+// #1379: every Answer here entry can be put away. Entries that are not notices
+// are kept here by key and revision; putting one away acts on nothing else.
+describe('Answer here dismissals', () => {
+  const chainCard = { key: 'chain:autonomio/poise#898', revision: '2026-11-08T18:35:17.371Z|autonomio/poise#898 · repair-pr: uncertain|held', title: 'autonomio/poise#898 · repair-pr: uncertain' }
+
+  it('keeps a put-away entry at its revision for every device, records it as handled, and refuses one without the person', async () => {
+    expect((await call('POST', '/api/answers/dismissals', chainCard)).status).toBe(403)
+    expect((await call('GET', '/api/answers/dismissals')).body).toEqual({ dismissals: [] })
+    for (const bad of [{ ...chainCard, key: 'notice:1' }, { ...chainCard, key: 'chain:' }, { ...chainCard, revision: '' }, { ...chainCard, title: ' ' }, null]) {
+      expect((await call('POST', '/api/answers/dismissals', bad, true)).status).toBe(400)
+    }
+    const put = await call('POST', '/api/answers/dismissals', chainCard, true)
+    expect(put.status).toBe(200)
+    expect(put.body.dismissals).toEqual([{ key: chainCard.key, revision: chainCard.revision, at: expect.any(String) }])
+    expect((await call('GET', '/api/answers/dismissals')).body.dismissals).toEqual(put.body.dismissals)
+    const handledRows = (await call('GET', '/api/notices/handled')).body.handled
+    expect(handledRows).toMatchObject([{ title: chainCard.title, outcome: 'dismissed', actor: 'person', source: 'answer-here:chain' }])
+    // Put away again at a newer revision: one row, the newest revision.
+    await call('POST', '/api/answers/dismissals', { ...chainCard, revision: 'newer' }, true)
+    expect((await call('GET', '/api/answers/dismissals')).body.dismissals.map((row: { revision: string }) => row.revision)).toEqual(['newer'])
+    // Nothing was acted on: no agent call, no process.
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('forgets a dismissal after thirty days', async () => {
+    database!.db.prepare('INSERT INTO answer_dismissals (key, revision, dismissed_at) VALUES (?, ?, ?)').run('thread:doc:t1', '1|x', new Date(Date.now() - 31 * 86_400_000).toISOString())
+    expect((await call('GET', '/api/answers/dismissals')).body.dismissals).toEqual([])
+  })
+})

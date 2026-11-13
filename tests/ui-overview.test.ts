@@ -4,7 +4,7 @@ import type { NotificationItem } from '../src/notification-items'
 import { bellTally, DEFAULT_LEVEL, LEVEL_KEY, noticeGroup, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from '../src/ui/places/overview/level'
 import { chatOpening, diagnosticHref, itemOf, journalStep, targetOpening, timelineHref } from '../src/ui/places/overview/targets'
 import { chatState, countStates, issueState, pullState, taskPhase, taskState, type ChainLike } from '../src/ui/places/overview/states'
-import { decisionEntries, foldWaiting, itemEntries, ordered, requestEntries, requestsFrom, type OpenRequest } from '../src/ui/places/overview/entries'
+import { decisionEntries, foldWaiting, itemEntries, ordered, requestEntries, requestsFrom, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
 import { countPair, moveTile, tileOrder } from '../src/ui/places/overview/day'
 import type { AnalyticsReport } from '../src/analytics-format'
 
@@ -175,7 +175,7 @@ describe('Answer here’s entries', () => {
   it('answers one choice with a press, free text in your words, and several questions with Chat’s form', () => {
     const one = requestEntries([request({ kind: 'question', content: { questions: [{ id: 'q', question: 'Which?', options: [{ label: 'A' }, { label: 'B' }], multiSelect: false, freeText: true }] } })], role)[0]
     expect(one.options.map((o) => o.key)).toEqual(['A', 'B'])
-    expect(one.freeText?.label).toBe('Something else…')
+    expect(one.freeText?.label).toBe('Other')
     expect(one.questions).toBeUndefined()
     const free = requestEntries([request({ kind: 'question', content: { questions: [{ id: 'q', question: 'Why?', options: [], multiSelect: false, freeText: true }] } })], role)[0]
     expect(free.options).toEqual([])
@@ -207,14 +207,56 @@ describe('Answer here’s entries', () => {
     expect(ordered([entries[2], entries[1], entries[0]]).map((entry) => entry.group)).toEqual(['needs-you', 'fault', 'ready'])
   })
 
-  it('puts a decision’s recommendation first, with Something else…', () => {
+  it('puts a decision’s recommendation first, with Other', () => {
     const [entry] = decisionEntries([
       { id: 3, kind: 'decision', text: 'Which filter wins?', detail: null, createdAt: '2026-11-11T08:00:00Z', source: { sessionId: 'w1', title: 'W3', exists: true }, options: [{ id: 'a', label: 'A', detail: null, recommended: false }, { id: 'b', label: 'B', detail: null, recommended: true }] },
       { id: 4, kind: 'decision', text: 'Answered', detail: null, createdAt: '2026-11-11T08:00:00Z', source: { sessionId: 'w1', title: 'W3', exists: true }, answer: { label: 'A', freeText: false, at: '2026-11-11T08:01:00Z', relay: 'delivered' } },
     ], role)
     expect(entry.options.map((o) => o.key)).toEqual(['b', 'a'])
-    expect(entry.freeText?.label).toBe('Something else…')
+    expect(entry.freeText?.label).toBe('Other')
     expect(entry.open?.href).toBe('?view=chat&chat=w1&back=overview')
+  })
+
+  // #1379: no entry is stuck. Every one can be put away, except a Manager’s
+  // prompt that offers options, which always takes Other in your own words.
+  it('lets every entry be dismissed, saying what Dismiss does, except a Manager’s prompt with options', () => {
+    const manager = (chat: string) => (chat === 'm1' ? 'manager' : null)
+    const ask = (sessionId: string, freeText: boolean) => requestEntries([request({ sessionId, kind: 'question', content: { questions: [{ id: 'q', question: 'Which?', options: [{ label: 'A' }], multiSelect: false, freeText }] } })], manager)[0]
+    expect(ask('m1', true)).toMatchObject({ dismissable: false, freeText: { label: 'Other' } })
+    // A Manager’s question that cannot take your own words keeps Dismiss, so it is never stuck.
+    expect(ask('m1', false)).toMatchObject({ dismissable: true, dismissWords: 'hides it here; the chat still waits for your answer in Chat' })
+    expect(ask('s2', true)).toMatchObject({ dismissable: true })
+    const permission = requestEntries([request({ content: { title: 'Run it', options: [{ id: 'a', name: 'Allow' }] } })], manager)[0]
+    expect(permission).toMatchObject({ dismissable: true, dismissWords: expect.stringContaining('the chat still waits') })
+
+    const decision = (options: boolean, exists: boolean) => decisionEntries([{ id: 5, kind: 'decision', text: 'Which?', detail: null, createdAt: '2026-11-11T08:00:00Z',
+      source: { sessionId: 'w1', title: 'W3', exists }, options: options ? [{ id: 'a', label: 'A', detail: null, recommended: true }] : [] }], role)[0]
+    expect(decision(true, true)).toMatchObject({ dismissable: false, freeText: { label: 'Other' } })
+    expect(decision(false, true)).toMatchObject({ dismissable: true, dismissWords: 'hides it from the Switchboard; the chat is told nothing' })
+    expect(decision(true, false).dismissable).toBe(true)
+
+    const chain = itemEntries([{ id: 'chain:acme/site#7', group: 'needs', tone: 'amber', icon: 'held', title: 'acme/site#7 · repair-pr: uncertain', body: 'held', source: 'Behavior chain', scope: null,
+      when: '2026-11-08T18:35:17.371Z', meta: 'No verified advance for 4d', details: [], behaviors: [], notice: null, chainJournal: '/api/behavior-chains?id=acme%2Fsite%237&after=4' } as NotificationItem], role,
+    new Map([['acme/site#7', { sequence: 5, held: 'Original outcome requires reconciliation' }]]))[0]
+    expect(chain).toMatchObject({ source: 'chain', dismissable: true, dismissWords: 'hides it until the chain moves; the chain stays held',
+      revision: '2026-11-08T18:35:17.371Z|acme/site#7 · repair-pr: uncertain|held', options: [{ key: 'resume', label: 'Resume' }] })
+    const diagnostic = itemEntries([{ id: 'diagnostic:["x"]', group: 'needs', tone: 'amber', icon: 'held', title: 'Reviews time out', body: '', source: 'Behaviors', scope: null,
+      when: '2026-11-12T10:00:00Z', meta: '', details: [], behaviors: [], notice: null } as NotificationItem], role, new Map())[0]
+    expect(diagnostic).toMatchObject({ dismissable: true, revision: '2026-11-12T10:00:00Z|Reviews time out' })
+    const [thread] = threadEntries({ slug: 'doc', site: 'site', repo: 'acme/site', pr: 3, prUrl: 'u', checkedAt: null, active: true, stale: false, problems: [], openThreads: 1 },
+      [{ id: 't1', kind: 'thread', repo: 'acme/site', site: 'site', pr: 3, prUrl: 'u', resolved: false, canReply: true, canResolve: true, messages: [{ author: 'ann', body: 'Typo', createdAt: '2026-11-12T09:00:00Z' }] }], (slug) => slug)
+    expect(thread).toMatchObject({ dismissable: true, revision: '1|2026-11-12T09:00:00Z', dismissWords: expect.stringContaining('the thread stays open on GitHub') })
+
+    // A put-away entry stays away until what it reports changes; notices keep their own dismissal.
+    const put = new Map([[chain.id, chain.revision], [diagnostic.id, 'an older occurrence']])
+    expect(undismissed([chain, diagnostic, permission], put).map((entry) => entry.id)).toEqual([diagnostic.id, permission.id])
+  })
+
+  it('lists the newest entry first within each group, and an entry without a time last', () => {
+    const at = (id: string, since: string | null, group: 'needs-you' | 'fault' = 'needs-you') =>
+      ({ ...requestEntries([request({ id, createdAt: since ?? '', content: { title: id, options: [{ id: 'a', name: 'Allow' }] } })], role)[0], since, group })
+    const list = ordered([at('old', '2026-11-04T15:55:00Z'), at('none', null), at('fault', '2026-11-13T09:00:00Z', 'fault'), at('new', '2026-11-12T20:00:00Z'), at('mid', '2026-11-08T18:35:00Z')])
+    expect(list.map((entry) => entry.title)).toEqual(['new', 'mid', 'old', 'none', 'fault'])
   })
 })
 

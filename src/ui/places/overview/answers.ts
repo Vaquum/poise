@@ -19,7 +19,7 @@ import { paintTerms } from '../../reference'
 import { term } from '../../registry'
 import { lifeHTML, toast, type Stage } from '../../shell'
 import {
-  decisionEntries, foldWaiting, itemEntries, openDecision, ordered, requestEntries, requestsFrom, threadEntries,
+  decisionEntries, foldWaiting, itemEntries, KEPT_DISMISSALS, openDecision, ordered, requestEntries, requestsFrom, threadEntries, undismissed,
   type DecisionItem, type Entry, type Publication, type RequestsRead, type Role, type ThreadReview,
 } from './entries'
 import { answersChanged, GROUPS, LEVELS, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from './level'
@@ -68,6 +68,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   const reviews: Read<Publication[]> = unread()
   const threads = new Map<string, { reviews: ThreadReview[], openThreads: number, error: string }>()
   const handled: Read<ServerHandled[]> = unread()
+  /** Put-away entries that are not notices or decisions: key → the revision put away. */
+  const dismissals: Read<Map<string, string>> = unread()
 
   let level = readLevel()
   let current: Entry[] = []
@@ -81,7 +83,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   /** Settled here, kept off the open list while its source still lists it. */
   const done = new Map<string, HandledRow>()
   const settledHere: HandledRow[] = []
-  const holds = new Map<string, { kind: 'dismiss' | 'silence', notice?: Notice, decision?: number, timer: number }>()
+  const holds = new Map<string, { kind: 'dismiss' | 'silence', notice?: Notice, decision?: number, kept?: { key: string, revision: string, title: string }, timer: number }>()
   const opened = new Set<string>()
   const replying = new Set<string>()
   const fresh = new Set<string>()
@@ -97,12 +99,12 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const notices = feed.notices.filter((notice) => feed.enabled || (LOCAL_NOTICE_KINDS as readonly string[]).includes(notice.kind))
     const items = notificationItems(notices, getBehaviorDiagnostics(), Date.now(), attention)
     const reviewed = (reviews.data ?? []).flatMap((publication) => threadEntries(publication, threads.get(publication.slug)?.reviews ?? [], editorHref))
-    return ordered(foldWaiting([
+    return ordered(undismissed(foldWaiting([
       ...itemEntries(items, options.role, chains),
       ...requestEntries(requests.data?.requests ?? [], options.role),
       ...decisionEntries(board.data ?? [], options.role),
       ...reviewed,
-    ]))
+    ]), dismissals.data ?? new Map()))
   }
   const editorHref = (slugName: string) => placeHref('editor', { doc: slugName, back: 'overview' })
 
@@ -165,7 +167,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
         const checked = draft.get(`${name}\u0000${o.label}`)?.checked
         return `<label class="nc-qo"><input type="${q.multiSelect ? 'checkbox' : 'radio'}" name="${esc(name)}" value="${esc(o.label)}"${checked ? ' checked' : ''}${disabled}><span class="k">${oi + 1}</span><span>${esc(o.label)}</span>${o.description ? `<span class="dim">${esc(o.description)}</span>` : ''}</label>`
       }).join('')
-      const free = q.freeText ? `<input type="text" class="nc-qt" name="${esc(`free-${id}-${qi}`)}" value="${esc(draft.get(`free-${id}-${qi}\u0000`)?.value ?? '')}" placeholder="Type an answer…" aria-label="Your answer to ${esc(q.question)}"${disabled}>` : ''
+      const free = q.freeText ? `<input type="text" class="nc-qt" name="${esc(`free-${id}-${qi}`)}" value="${esc(draft.get(`free-${id}-${qi}\u0000`)?.value ?? '')}" placeholder="${q.options.length ? 'Other: your own answer…' : 'Type an answer…'}" aria-label="Your answer to ${esc(q.question)}"${disabled}>` : ''
       return `<fieldset class="nc-q" data-qid="${esc(q.id)}" data-multi="${q.multiSelect ? 1 : 0}"><legend>${q.header ? `<span class="t-micro">${esc(q.header)}</span> ` : ''}${esc(q.question)}</legend>${choices}${free}</fieldset>`
     }).join('')
     return `<form class="nc-form" data-form="${esc(entry.id)}">${fields}<div class="nc-acts"><button type="submit" class="btn-ghost is-primary" data-ref="ov.option"${blocked || sending ? ` aria-disabled="true" data-why="${esc(blocked || sending)}"` : ''}>Submit</button></div></form>`
@@ -211,7 +213,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       entry.timeline ? `<a class="lnk" href="${esc(entry.timeline)}" data-act="open" data-ref="ov.timeline">Open its timeline</a>` : '',
       entry.diagnostic ? `<a class="lnk" href="${esc(diagnosticLink(entry.diagnostic))}" data-act="open" data-ref="ov.diagnostic">Open its diagnostic</a>` : '',
       entry.silenceable && !busy ? '<button class="lnk" data-act="silence" data-ref="ov.silence">Silence reminders</button>' : '',
-      entry.dismissable && !busy ? '<button class="lnk" data-act="dismiss" data-ref="ov.dismiss">Dismiss</button>' : '',
+      entry.dismissable && !busy ? `<span class="nc-dis"><button class="lnk" data-act="dismiss" data-ref="ov.dismiss">Dismiss</button><span class="t-gloss">${esc(entry.dismissWords)}</span></span>` : '',
       more ? `<button class="lnk" data-act="more" aria-expanded="${isOpenDetail}">${isOpenDetail ? 'Less' : 'More'}</button>` : '',
     ].filter(Boolean).join('')
     const ref = entry.notice?.kind === 'worker_idle' ? 'ov.idle' : 'ov.notice'
@@ -245,6 +247,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       ...[...threads].flatMap(([name, value]) => value.error ? [`Review threads of ${name} could not be read: ${value.error}`] : []),
       ...(reviews.data ?? []).flatMap((publication) => publication.problems.length ? [`${publication.site} · ${publication.repo}#${publication.pr}: ${publication.problems.join(' ')}${publication.checkedAt ? ` Last checked ${clockAt(publication.checkedAt)}.` : ''}`] : []),
       readLine('Handled today', handled),
+      readLine('Put-away entries', dismissals),
     ].filter(Boolean)
     const checked = (reviews.data ?? []).map((publication) => publication.checkedAt).filter((at): at is string => !!at).sort()[0]
     const reviewLine = reviews.data?.length && checked ? `Review threads last checked ${clockAt(checked)}.` : ''
@@ -462,10 +465,11 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
 
   // ---------- Dismiss and Silence: held for eight seconds, with Undo ----------
   function holdSend(entry: Entry, kind: 'dismiss' | 'silence'): void {
-    if (!(entry.notice || entry.decision) || holds.has(entry.id)) return
+    const kept = kind === 'dismiss' && KEPT_DISMISSALS.includes(entry.source) ? { key: entry.id, revision: entry.revision, title: entry.title } : undefined
+    if (!(entry.notice || entry.decision || kept) || holds.has(entry.id)) return
     const timer = window.setTimeout(() => sendHeld(entry.id), HOLD_MS)
-    holds.set(entry.id, { kind, notice: entry.notice, decision: entry.decision?.id, timer })
-    settle(entry, kind === 'dismiss' ? 'Dismissed' : 'Silenced', kind === 'dismiss' ? 'Put away' : 'No more reminders while it stays open', { undo: true })
+    holds.set(entry.id, { kind, notice: entry.notice, decision: entry.decision?.id, kept, timer })
+    settle(entry, kind === 'dismiss' ? 'Dismissed' : 'Silenced', kind === 'dismiss' ? `Put away: ${entry.dismissWords}` : 'No more reminders while it stays open', { undo: true })
   }
   function undo(id: string): void {
     const hold = holds.get(id)
@@ -485,17 +489,22 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     holds.delete(id)
     const p = progress.get(id)
     if (p) progress.set(id, { ...p, undo: false })
-    const { notice, decision } = hold
-    const action = decision !== undefined
-      ? chatClient.dismissSwitchboardItem(decision).then((state) => { const next = parseBoard(state); if (next) acceptBoard(next) }, () => undefined)
-      : hold.kind === 'dismiss' ? noticeFeed.dismiss(notice!.id) : noticeFeed.silence(notice!.id)
+    const { notice, decision, kept } = hold
+    const action = kept
+      ? json<{ dismissals?: { key: string, revision: string }[] }>('/api/answers/dismissals', { method: 'POST', body: JSON.stringify(kept), keepalive: leaving })
+        .then(acceptDismissals, () => undefined)
+      : decision !== undefined
+        ? chatClient.dismissSwitchboardItem(decision).then((state) => { const next = parseBoard(state); if (next) acceptBoard(next) }, () => undefined)
+        : hold.kind === 'dismiss' ? noticeFeed.dismiss(notice!.id) : noticeFeed.silence(notice!.id)
     if (leaving) return
     paint()
     void action.then(() => {
       // Put away when the next read omits it; one still there could not be.
-      const still = decision !== undefined
-        ? (board.data ?? []).some((item) => item.id === decision && openDecision(item))
-        : noticeFeed.current.notices.some((value) => value.id === notice!.id && (hold.kind === 'silence' || value.due === notice!.due))
+      const still = kept
+        ? dismissals.data?.get(kept.key) !== kept.revision
+        : decision !== undefined
+          ? (board.data ?? []).some((item) => item.id === decision && openDecision(item))
+          : noticeFeed.current.notices.some((value) => value.id === notice!.id && (hold.kind === 'silence' || value.due === notice!.due))
       if (!still || signal.aborted) return
       done.delete(id)
       progress.set(id, { stage: 'Failed', label: hold.kind === 'dismiss' ? 'Dismiss' : 'Silence', words: 'It could not be put away; it is still open.', at: Date.now() })
@@ -507,6 +516,10 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     for (const [id, hold] of holds) {
       window.clearTimeout(hold.timer)
       holds.delete(id)
+      if (hold.kept) {
+        void fetch('/api/answers/dismissals', { method: 'POST', keepalive: true, headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(hold.kept) }).catch(() => undefined)
+        continue
+      }
       const path = hold.decision !== undefined ? `/api/chat/switchboard/items/${hold.decision}/dismiss` : `/api/notices/${encodeURIComponent(hold.notice!.id)}/${hold.kind}`
       void fetch(path, { method: 'POST', keepalive: true, headers: { Accept: 'application/json' } }).catch(() => undefined)
     }
@@ -663,6 +676,22 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     paint()
   }
 
+  function acceptDismissals(data: { dismissals?: { key: string, revision: string }[] }): void {
+    if (!Array.isArray(data.dismissals)) throw new Error('the service answered with something this page cannot read')
+    dismissals.data = new Map(data.dismissals.map((row) => [row.key, row.revision]))
+    dismissals.error = ''
+    dismissals.at = Date.now()
+  }
+  async function readDismissals(): Promise<void> {
+    try {
+      acceptDismissals(await json<{ dismissals?: { key: string, revision: string }[] }>('/api/answers/dismissals'))
+    } catch (error) {
+      dismissals.error = reason(error)
+    }
+    reportRead(ctx, 'overview-dismissals', 'Put-away entries could not be read', dismissals)
+    paint()
+  }
+
   async function readHandled(): Promise<void> {
     try {
       const data = await json<{ handled?: ServerHandled[] }>(`/api/notices/handled?${new URLSearchParams({ since: midnightInZone(0).toISOString() })}`)
@@ -797,7 +826,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   paint()
   void readRequests()
   void readBoard()
-  whileVisible(ctx, 60_000, () => { void readReviews(); void readHandled() })
+  whileVisible(ctx, 60_000, () => { void readReviews(); void readHandled(); void readDismissals() })
   if (location.hash === '#answer') requestAnimationFrame(() => (($('[data-notice]', list) as HTMLElement | null) ?? $('[data-ref="ov.answer"]', root))?.focus?.({ preventScroll: true }))
 
   return {
