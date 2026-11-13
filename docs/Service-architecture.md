@@ -1519,6 +1519,12 @@ This uses the existing owner workspace boundary and canonical journal, including
 completed chains. Ambiguous or missing matches remain unknown, as does a failed
 workspace read; central Logging queries and retained evidence remain independent.
 No gateway read, scope, ingestion or execution authority is added.
+Typed provider analysis handoffs use the existing v1 diagnostic envelope and
+positive no-submission evidence. The same work-impact read confirms only later
+same-PR/head/basis/slot successor admissions or attributed review verdicts for
+Warning display; current blockers retain Error. Source events and their IDs
+remain immutable, including historical unproven handoffs. The exact display and
+source-filter distinction is defined in [Logging](Logging.md#observe--logging).
 Initial remediation report bodies retain a dated snapshot of this projection;
 later recovery does not rewrite it. Optional annotation failure leaves impact
 unknown and does not consume the report's creation attempt.

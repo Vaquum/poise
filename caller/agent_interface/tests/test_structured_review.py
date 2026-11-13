@@ -639,6 +639,11 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertEqual(run.elapsed, 800)
         self.assertEqual(run.error.code, "review_budget_exhausted")
         self.assertEqual(str(run.error), GROK_HANDOFF)
+        self.assertEqual(run.error.diagnostic, {
+            "version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+            "phase": "analysis", "outcome": "handoff", "stderr": "", "stderr_truncated": False,
+            "provider": "grok", "submission": "none",
+        })
         run.submit.assert_not_called()
 
     def test_inspection_rounds_stop_at_the_ceiling(self):
@@ -691,6 +696,19 @@ class TestGrokAnalysisCeiling(TestCase):
                                    repository=INSPECTED, **kwargs)
                 self.assertEqual(run.launches, expected)
                 self.assertEqual(run.error.code, "review_budget_exhausted")
+                self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
+                self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
+                self.assertEqual(run.error.diagnostic["submission"], "none")
+
+    def test_a_shorter_file_group_deadline_is_not_a_provider_handoff(self):
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [1, NEVER_RETURNS], INSPECT,
+                           repository=INSPECTED, packet=packet)
+        self.assertLess(run.elapsed, 800)
+        self.assertEqual(run.error.diagnostic["phase"], "file_group")
+        self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
+        self.assertNotIn("handing off", str(run.error))
+        run.submit.assert_not_called()
 
     def test_other_providers_keep_the_remaining_analysis_budget(self):
         for name, turns, reply, repository, expected in (

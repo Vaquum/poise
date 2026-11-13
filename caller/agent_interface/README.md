@@ -452,6 +452,11 @@ inspection rounds. With no verdict by then the run stops, posts nothing and fail
 with `review_budget_exhausted`, which Poise reads as a hand-off to the next slot. A
 verdict returned inside the ceiling still submits within the shared budget. Other
 providers and Grok issue reviews are unchanged.
+The existing v1 diagnostic records this planned handoff as `provider.review`,
+phase `analysis`, outcome `handoff`, and positive `submission: none` evidence.
+A shorter overall or file-group deadline remains a terminal timeout, not a
+provider handoff. [Logging](../../docs/Logging.md#observe--logging) requires
+attributed successor evidence before displaying the handoff as Warning.
 
 On an Opus output-limit error or a repeat-only publication refusal, Caller can recover
 once with the recovery model using the same immutable packet and remaining budget.

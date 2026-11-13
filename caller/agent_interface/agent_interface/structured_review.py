@@ -378,12 +378,18 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
     verdict["comments"][:] = kept
 
 
-def _time_limit_message(provider: str) -> str:
+def _time_limit_error(provider: str, limit: str = "total") -> review_budget.ReviewLimitError:
     # Poise moves the PR on for review_budget_exhausted unless this text matches
     # its inspection-limit wording, and it reads any "rate limit" as a throttle.
-    if provider in PROVIDER_ANALYSIS_SECONDS:
-        return f"{provider} review reached its analysis time limit; handing off so the next model can run instead"
-    return "Review reached its total time limit; needs attention"
+    handoff = limit == "analysis"
+    message = (f"{provider} review reached its analysis time limit; handing off so the next model can run instead"
+               if handoff else "Review file group reached its time limit; needs attention"
+               if limit == "file_group" else "Review reached its total time limit; needs attention")
+    return review_budget.ReviewLimitError(
+        message, "review_budget_exhausted",
+        diagnostic_envelope(operation="provider.review", phase=limit,
+                            outcome="handoff" if handoff else "timed_out",
+                            provider=provider, submission="none"))
 
 
 def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
@@ -398,8 +404,13 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
     verdict_reserve = 0
     while round_number <= MAX_INSPECTION_ROUNDS:
         timeout = review_budget.timeout(timeout_s, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
+        limit = "total"
         if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS or correction_attempted:
-            timeout = min(deadline - monotonic(), timeout)
+            remaining = deadline - monotonic()
+            if remaining < timeout:
+                timeout = remaining
+                if PROVIDER_ANALYSIS_SECONDS.get(model.provider, timeout_s) < timeout_s:
+                    limit = "analysis"
         if groups_remaining is not None and not initializing and group_deadline is None:
             allowance = timeout / groups_remaining
             group_deadline = monotonic() + allowance
@@ -407,9 +418,11 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             # is spent, leaving time for its terminal assessment.
             verdict_reserve = allowance / 2
         if group_deadline is not None:
-            timeout = min(group_deadline - monotonic(), timeout)
+            remaining = group_deadline - monotonic()
+            if remaining <= timeout:
+                timeout, limit = remaining, "file_group"
         if timeout <= 0:
-            raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted")
+            raise _time_limit_error(model.provider, limit)
         if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
             # Loop-driven growth, not #186's initial-packet overflow: keep
             # it out of the packet block so the head is not pinned.
@@ -431,7 +444,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                      "Return a terminal verdict as soon as the supplied evidence is sufficient. "
                      "Do not repeat completed reads or searches."
                      if repository is not None else "")
-        raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
+        try:
+            raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
+        except subprocess.TimeoutExpired as error:
+            raise _time_limit_error(model.provider, limit) from error
         initializing = False
         progress.stage("validating", "Validating review result")
         try:
@@ -484,7 +500,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
         if group_deadline is not None:
             inspection_timeout = min(group_deadline - monotonic(), inspection_timeout)
         if inspection_timeout <= 0:
-            raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted")
+            raise _time_limit_error(model.provider)
         result = repository.inspect(requests, timeout_s=inspection_timeout)
         context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
         round_number += 1
@@ -556,7 +572,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {cause}",
                                   "review_contract_violation", diagnostic) from error
     except subprocess.TimeoutExpired as error:
-        raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted") from error
+        raise _time_limit_error(model.provider) from error
     except (ValueError, OSError) as error:
         code = ("review_packet_too_large" if "Input exceeds the maximum length" in str(error)
                 else "review_contract_violation" if isinstance(error, (InvalidVerdict, json.JSONDecodeError))
