@@ -32,10 +32,17 @@ export function awayGroups(): Group[] {
   return [...entries.map((entry) => entry.group), ...Array<Group>(threads).fill('needs-you')]
 }
 
-/** Reads while `away()`; returns what reads now unless a read is under a minute old. */
+/** A place's own reads go first: the bell reads a moment after whatever asked
+ *  for it, so a load or a move never has its five sources compete with the
+ *  reads that draw the place. */
+export const AWAY_READ_DELAY_MS = 2_500
+
+/** Reads while `away()`, a moment after it is asked; returns what asks, which
+ *  reads unless a read is under a minute old. */
 export function watchAway(away: () => boolean, changed: () => void): () => void {
   let readAt = 0
   let reading = false
+  let pending: ReturnType<typeof setTimeout> | null = null
   const read = async (): Promise<void> => {
     if (reading || !away() || document.visibilityState !== 'visible' || Date.now() - readAt < 60_000) return
     reading = true
@@ -67,8 +74,12 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     report('overview-chains', 'Attention evidence unavailable', failed(c, !!chainsRead))
     changed()
   }
-  setInterval(() => { void read() }, 60_000)
-  document.addEventListener('visibilitychange', () => { void read() })
-  void read()
-  return () => { void read() }
+  const soon = (): void => {
+    if (pending !== null) return
+    pending = setTimeout(() => { pending = null; void read() }, AWAY_READ_DELAY_MS)
+  }
+  setInterval(soon, 60_000)
+  document.addEventListener('visibilitychange', soon)
+  soon()
+  return soon
 }
