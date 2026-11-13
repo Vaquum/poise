@@ -27,10 +27,13 @@ async def _run(client, target: str, ident: int, base: str, conclusion: str) -> d
 def _failures(results: dict) -> list:
     failures = []
     for (path, name), entries in sorted(results.items()):
-        if len(entries) != 1:
-            raise ValueError("test artifact has duplicate assertion identities")
-        if entries[0]["status"] == "failed":
-            failures.append({"file": path, "test": name, "cause": entries[0]["cause"]})
+        # Parameterized cases can share one fixed title (e.g. it.each without
+        # placeholders); passing duplicates carry no failure and failing ones
+        # must match as a multiset across both runs.
+        for entry in sorted(entries, key=lambda item: item["cause"]):
+            if entry["status"] == "failed":
+                failures.append({"file": path, "test": name, "cause": entry["cause"]})
+    failures.sort(key=lambda item: (item["file"], item["test"], item["cause"]))
     if not failures or len(failures) > 100 or sum(len(item["cause"]) for item in failures) > 32 * 1024:
         raise ValueError("CI run lacks bounded complete assertion failures")
     return failures
@@ -85,8 +88,8 @@ async def inspect(client, target: str, value: dict, current_base: str) -> dict:
         recovered = await _run(client, target, latest["id"], current_base, "success")
         passed = await full_suite_repair.test_results(client, target, recovered, causes=True)
         if any(entries["status"] == "failed" for results in passed.values() for entries in results) \
-                or any(len(passed.get((failure["file"], failure["test"]), [])) != 1
-                       or passed[(failure["file"], failure["test"])][0]["status"] != "passed" for failure in failures):
+                or any(not passed.get((failure["file"], failure["test"]))
+                       or any(entry["status"] != "passed" for entry in passed[(failure["file"], failure["test"])]) for failure in failures):
             raise ValueError("recovered base did not pass every original failing assertion")
         result.update(recovered=True, recovery={"merge": merge, "base": current_base,
                       "run": {key: entry for key, entry in recovered.items() if key != "unit_conclusions"}})

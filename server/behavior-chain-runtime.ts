@@ -523,6 +523,10 @@ export class BehaviorChainRuntime {
                   const fresh = await this.operations.observe(chain)
                   chain = this.append(chain, { type: 'chain.observed', observation: fresh })
                   if (!recoveredImplementation(chain, fresh, Date.now()) || fresh.prerequisites?.wait !== null) continue
+                  // The recovered decision is stale when a required review no
+                  // longer posts; re-decide on the fresh observation.
+                  const redecided = decideBehaviorChain(chain, fresh, Date.now())
+                  if (redecided.kind !== 'invoke' || redecided.behavior !== decision.behavior || redecided.basis !== decision.basis) continue
                   if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
                 }
                 phase = 'invocation-admission'

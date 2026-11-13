@@ -74,7 +74,7 @@ function captureDiagnostics() {
 
 it.each(['recovery', 'restart before admission', 'identical operator hold', 'missing original proof', 'unreleased resources',
   'unknown publication', 'changed source', 'ineligible source', 'pushed branch', 'bound PR', 'competing work',
-  'unrelated passing run', 'source changes during preparation', 'missing review'])(
+  'unrelated passing run', 'source changes during preparation', 'missing review', 'review disappears during preparation'])(
   'recovers one pre-PR implementation on attempt three through normal admission: %s', async mode => {
     const { db, journal } = setup()
     let chain = seed(journal)
@@ -117,6 +117,7 @@ it.each(['recovery', 'restart before admission', 'identical operator hold', 'mis
       readInvocations: async () => parseAgentLogStdout(JSON.stringify(calls), 'pre-PR test recovery'),
       request: async () => {
         if (mode === 'source changes during preparation') obs.existingPulls = ['https://github.com/acme/repo/pull/99']
+        if (mode === 'review disappears during preparation') obs.issue.commentIds = []
         return { command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] }
       } })
     let runtime = new BehaviorChainRuntime(journal, native)

@@ -124,3 +124,14 @@ class TestDependency(IsolatedAsyncioTestCase):
         self.runs[3]["path"] = ".github/workflows/unrelated.yml"
         self.assertFalse((await self.inspect())["recovered"])
         self.assertFalse((await self.inspect({**self.value, "run": "relay-run", "base": "d" * 64}))["verified"])
+
+    async def test_passing_parameterized_duplicates_with_one_fixed_title_do_not_block_proof(self):
+        duplicates = [{"fullName": "rejects malformed preparation envelopes through the read error path",
+                       "status": "passed", "failureMessages": []} for _ in range(2)]
+        for ident in (1, 2, 3):
+            self.tests[ident].extend(copy.deepcopy(duplicates))
+        proof = await self.inspect()
+        self.assertTrue(proof["verified"], proof)
+        self.assertEqual(len(proof["failures"]), 1)
+        self.delivered = True
+        self.assertTrue((await self.inspect(proof))["recovered"])
