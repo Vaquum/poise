@@ -105,9 +105,21 @@ describe('agent log compatibility', () => {
     const snapshot = await fetchAgentLogSnapshot()
     expect(mocks.observeSnapshot).toHaveBeenCalledExactlyOnceWith(snapshot)
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
-    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs'])
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--without-progress'])
     expect(mocks.captureAdmission).not.toHaveBeenCalled()
     expect(mocks.diagnostic).not.toHaveBeenCalled()
+  })
+
+  it('reads history without progress events, and whole from a Caller that does not know the flag', async () => {
+    mocks.runFile.mockRejectedValueOnce(Object.assign(new Error('Command failed (2): agent-interface'), {
+      stdout: '', stderr: 'usage: agent-interface BEHAVIOR ...',
+    })).mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    expect((await fetchAgentLogSnapshot()).entries).toHaveLength(1)
+    expect(mocks.runFile.mock.calls.map((call) => call[1])).toEqual([['--logs', '--without-progress'], ['--logs']])
+    // The older Caller is remembered: the next read asks for the whole history at once.
+    await fetchAgentLogSnapshot({ fresh: true })
+    expect(mocks.runFile.mock.calls.map((call) => call[1])).toEqual([['--logs', '--without-progress'], ['--logs'], ['--logs']])
+    expect(mocks.diagnosticFailure).not.toHaveBeenCalled()
   })
 
   it('decodes history above 32 MiB with a 128 MiB process output cap', async () => {
@@ -119,7 +131,7 @@ describe('agent log compatibility', () => {
     expect(snapshot.entries).toHaveLength(1)
     expect(snapshot.entries[0]!.prompt).toBe(prompt)
     expect(snapshot.quarantined).toEqual([])
-    expect(mocks.runFile).toHaveBeenCalledExactlyOnceWith('agent-interface', ['--logs'],
+    expect(mocks.runFile).toHaveBeenCalledExactlyOnceWith('agent-interface', ['--logs', '--without-progress'],
       expect.objectContaining({ maxOutputBytes: 134217728 }))
     expect(mocks.diagnostic).not.toHaveBeenCalled()
   })
@@ -213,7 +225,7 @@ describe('agent log compatibility', () => {
     expect(snapshot.entries).toMatchObject([{ status: 'failed', outcome: null, action: null,
       diagnostic: { outcome: null, stderr_truncated: null, context: { submission: diagnostic.submission } } }])
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
-    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs'])
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--without-progress'])
   })
 
   it('keeps a historical unqualified repository row readable', async () => {
@@ -944,6 +956,35 @@ describe('stopping a run', () => {
     await expect(stopAgentJob('A'.repeat(32))).resolves.toEqual({ id: 'a'.repeat(32), stopped: true, status: 'failed', error_code: 'stopped' })
     expect(mocks.runFile).toHaveBeenCalledWith('agent-interface', ['--stop', 'a'.repeat(32)], expect.objectContaining({ timeoutMs: 30_000 }))
   })
+  it('drops the running views\' last snapshot once a run is stopped', async () => {
+    const { stopAgentJob } = await import('../server/agent')
+    mocks.runFile.mockResolvedValueOnce({ stdout: JSON.stringify([logRow({ status: 'running', completed_at: null })]), stderr: '' })
+    expect((await fetchRunningAgentLogSnapshot()).entries).toHaveLength(1)
+    mocks.runFile.mockResolvedValueOnce({ stdout: JSON.stringify({ id: 'a'.repeat(32), stopped: true, status: 'failed', error_code: 'stopped' }), stderr: '' })
+    await stopAgentJob('a'.repeat(32))
+    mocks.runFile.mockResolvedValueOnce({ stdout: '[]', stderr: '' })
+    expect((await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).entries).toEqual([])
+    expect(mocks.runFile).toHaveBeenCalledTimes(3)
+  })
+  it('keeps a running read started before a stop from answering later readers or becoming the last snapshot', async () => {
+    const { stopAgentJob } = await import('../server/agent')
+    const reads: Array<(value: { stdout: string, stderr: string }) => void> = []
+    mocks.runFile.mockImplementation((_command: string, args: string[]) => args[0] === '--stop'
+      ? Promise.resolve({ stdout: JSON.stringify({ id: 'a'.repeat(32), stopped: true, status: 'failed', error_code: 'stopped' }), stderr: '' })
+      : new Promise(resolve => { reads.push(resolve) }))
+    // In flight before the stop, and still seeing the run.
+    const before = fetchRunningAgentLogSnapshot()
+    expect(reads).toHaveLength(1)
+    await stopAgentJob('a'.repeat(32))
+    const after = fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })
+    reads[0]!({ stdout: JSON.stringify([logRow({ status: 'running', completed_at: null })]), stderr: '' })
+    expect((await before).entries).toHaveLength(1)
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!({ stdout: '[]', stderr: '' })
+    expect((await after).entries).toEqual([])
+    expect((await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).entries).toEqual([])
+    expect(reads).toHaveLength(2)
+  })
   it('refuses a malformed id before running anything, and an old Caller after', async () => {
     const { stopAgentJob } = await import('../server/agent')
     await expect(stopAgentJob('../etc')).rejects.toThrow('invalid agent call id')
@@ -1332,6 +1373,31 @@ describe('selected agent-log reads', () => {
       expect(mocks.runFile).toHaveBeenCalledTimes(2)
       answer({ stdout: JSON.stringify([logRow({ id: 'b'.repeat(32) })]), stderr: '' })
       await vi.waitFor(async () => expect((await fetchSelectedAgentLogSnapshot(own, { lastObserved: true })).entries[0]!.id).toBe('b'.repeat(32)))
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('answers the running views at once from a running snapshot within their age, and reads an older one now', async () => {
+    const running = (overrides: Record<string, unknown> = {}) => logRow({ status: 'running', completed_at: null, ...overrides })
+    mocks.runFile.mockResolvedValueOnce({ stdout: JSON.stringify([running()]), stderr: '' })
+    const first = await fetchRunningAgentLogSnapshot()
+    let answer!: (value: { stdout: string, stderr: string }) => void
+    mocks.runFile.mockImplementation(() => new Promise(resolve => { answer = resolve }))
+    const start = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start + 6_000)
+    try {
+      // Past its five seconds, within the views' age: at once, read again behind.
+      expect(await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).toBe(first)
+      expect(mocks.runFile).toHaveBeenCalledTimes(2)
+      answer({ stdout: JSON.stringify([running({ id: 'b'.repeat(32) })]), stderr: '' })
+      await vi.waitFor(async () => expect((await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })).entries[0]!.id).toBe('b'.repeat(32)))
+      // Older than the views' age: the reader waits for a read of now.
+      clock.mockReturnValue(start + 60_000)
+      const waiting = fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: 30_000 })
+      expect(mocks.runFile).toHaveBeenCalledTimes(3)
+      answer({ stdout: JSON.stringify([running({ id: 'c'.repeat(32) })]), stderr: '' })
+      expect((await waiting).entries[0]!.id).toBe('c'.repeat(32))
     } finally {
       clock.mockRestore()
     }

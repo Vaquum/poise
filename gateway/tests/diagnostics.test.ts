@@ -105,6 +105,23 @@ describe('one diagnostic contract', () => {
     expect(JSON.stringify(input)).not.toContain('private argument')
   })
 
+  it.each(['error', 'warning'])('retains a typed no-submission handoff at Error pending successor evidence (source %s)', severity => {
+    const row = { id: 'a'.repeat(32), status: 'failed', behavior: 'pr_review', error_code: 'review_budget_exhausted',
+      error: 'analysis time limit; handing off', expected_head: 'b'.repeat(40),
+      diagnostic: { version: 1, source: 'caller', severity, operation: 'provider.review', phase: 'analysis',
+        outcome: 'handoff', submission: 'none', stderr: '', stderr_truncated: false } }
+    const event = workspaceEnvelope(normalize(callerDiagnostic(row, 'alice')!, NOW)!, 'alice', NOW, [])
+    expect(event).toMatchObject({ severity: 'error', operation: 'provider.review.handoff', phase: 'analysis',
+      context: { submission: 'none', errorCode: row.error_code, expectedHead: row.expected_head } })
+    expect(event.context).not.toHaveProperty('priorWarning')
+    for (const diagnostic of [null, { ...row.diagnostic, submission: null },
+      { ...row.diagnostic, phase: 'submitting', submission: 'uncertain' }, { ...row.diagnostic, outcome: 'timed_out' }]) {
+      const input = callerDiagnostic({ ...row, diagnostic }, 'alice')!
+      expect(input.level).toBe('error')
+      expect(input.operation).not.toBe('provider.review.handoff')
+    }
+  })
+
   it.each([
     { error_code: 'atomic_work_failed', error: 'repair did not answer every unresolved review finding' },
     { error_code: 'atomic_work_blocked', error: 'atomic behavior blocked: required CI is failing' },

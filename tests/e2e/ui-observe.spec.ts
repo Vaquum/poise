@@ -275,6 +275,35 @@ test('a stale issue review shows supersession while uncertain posting remains a 
   await expect(behaviors.locator(`tr[data-run="${hex(32, '9')}"] [data-ref="bh.status"]`)).toContainText('Failed · Preflight failed')
 })
 
+test('Logging shows confirmed handoffs as Warning while keeping an absent successor or current hold at Error', async ({ page }) => {
+  await open(page, '/?view=observe&part=logging')
+  const event = diagnostic('d', { source: 'caller', operation: 'provider.review.handoff', phase: 'analysis', callId: CALL,
+    behavior: 'pr_review', context: { errorCode: 'review_budget_exhausted', submission: 'none' },
+    message: 'Analysis time limit; handing off to the next model' })
+  let impact: 'unknown' | 'retrying' | 'recovered' | 'blocked' = 'unknown'
+  await page.route(url => url.pathname === '/api/logging', route => route.fulfill({ json: {
+    version: 1, countKind: 'events', total: 1, events: [event], coverage: [], bounds, policy, watermark: 'w1', nextCursor: null,
+  } }))
+  await page.route(url => url.pathname === '/api/behavior-chains', route => {
+    if (!new URL(route.request().url()).searchParams.has('batch')) return route.fallback()
+    return route.fulfill({ json: { impacts: [{ impact, recovered: impact === 'recovered' || impact === 'blocked',
+      invocationId: 'i495a', repository: 'acme/site', behavior: 'review-pr', callerBehavior: 'pr_review',
+      stage: 'review-pr: started', target: 'acme/site#496', progressAt: NOW - minutes(15), retryAt: null,
+      nextAction: impact === 'blocked' ? 'Resolve the hold: recovery exhausted' : 'Await the successor verdict',
+      journal: '/api/behavior-chains?id=acme%2Fsite%23493&after=159' }] } })
+  })
+  for (const state of ['unknown', 'retrying', 'recovered', 'blocked'] as const) {
+    impact = state
+    await page.reload()
+    const row = logging(page).locator(`tr[data-ev="${event.id}"]`)
+    await expect(row.locator('[data-ref="lg.severity"]')).toHaveText(state === 'retrying' || state === 'recovered' ? 'Warning' : 'Error')
+    await expect(row.locator('[data-ref="lg.impact"]')).toContainText(state)
+  }
+  await logging(page).locator(`tr[data-ev="${event.id}"]`).getByRole('button', { name: /evidence/i }).click()
+  await expect(logging(page).locator(`#lg-detail-${event.id}`)).toContainText('Resolve the hold: recovery exhausted')
+  await expect(logging(page).locator(`#lg-detail-${event.id} dt`).filter({ hasText: 'Source severity' }).locator('..')).toContainText('error')
+})
+
 test('a run link opens that run unfolded in Behaviors, and a chain’s own GitHub action names what it did with no model', async ({ page }) => {
   await open(page, `/?view=observe&part=behaviors&call=${CALL}`)
   const behaviors = page.locator('[data-panel="behaviors"]')

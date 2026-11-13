@@ -660,9 +660,15 @@ def finish(
             error = "Stopped by user" if error_code == "stopped" else prior_cause["error"]
             action, outcome = None, None
         persisted = False
+        previous_path = None
         if response:
             prior = conn.execute("select behavior,artifact,response_path from calls where id=?", (id_,)).fetchone()
             artifact = json.loads(prior["artifact"] or "{}") if prior else {}
+            previous_path = prior["response_path"] if prior else None
+            if prior and prior["behavior"] in {"pr_review", "pr_approve"} and prior["response_path"]:
+                retained = caller_store.response(Path(prior["response_path"]), RESPONSES).read_text()
+                if not response.startswith(retained):
+                    response = retained + "\n" + response
             if prior and prior["behavior"] in {"native_action", "native_publication"} \
                     and prior["response_path"] == path and artifact.get("response_sha") == hashlib.sha256(response.encode()).hexdigest():
                 if caller_store.response(Path(path), RESPONSES).read_text() != response:
@@ -679,13 +685,14 @@ def finish(
                 return float(row["ended_at"])
     if response and changed == 1 and not persisted:
         try:
-            caller_store.response(Path(path), RESPONSES).write_text(response)
+            caller_store.write_response_text(Path(path), RESPONSES, response)
         except OSError as persist_error:
             # The row is terminal; a response persistence failure must not
-            # reopen it. Clear the dangling path and retain the cause.
+            # reopen it. Keep an already-retained response readable and retain
+            # the cause.
             with db() as conn:
-                conn.execute("update calls set response_path=null, diagnostic=coalesce(diagnostic, ?) where id=?",
-                             (json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
+                conn.execute("update calls set response_path=?, diagnostic=coalesce(diagnostic, ?) where id=?",
+                             (previous_path, json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
                                                              outcome="persist_failed",
                                                              stderr=str(persist_error)[:500], call_id=id_)), id_))
     return ended_at
@@ -834,12 +841,14 @@ def _decode_history_text(value: bytes) -> object:
         return _UNREADABLE_LOG_TEXT
 
 
-def logs(status: str | None = None):
+def logs(status: str | None = None, without_progress: bool = False):
     """Every retained call, oldest first; with status, only the running ones.
 
     The running-only read is indexed on (status, started_at), so retained
     history does not raise its cost. Full history quarantines unreadable rows.
-    Use logs_page for bounded history."""
+    Use logs_page for bounded history. Without progress, full history leaves
+    out each call's progress events, the largest field, which only a call's
+    own view shows (its page, its id or the running read)."""
     if status is not None and status != "running":
         raise ValueError("logs status filter must be running")
     reap_interrupted()
@@ -852,7 +861,11 @@ def logs(status: str | None = None):
         ).fetchall()
     if status:
         return [{**_log_row(row), "history_rowid": str(row["rowid"])} for row in rows]
-    return [_full_history_log_row(row) for row in rows]
+    history = [_full_history_log_row(row) for row in rows]
+    if without_progress:
+        for entry in history:
+            entry.pop("progress", None)
+    return history
 
 
 LOGS_PAGE_LIMIT_MAX = 1000
@@ -940,6 +953,15 @@ LOGS_SEARCH_SQL = """lower(
     || ' ' || coalesce(repo,'') || '#' || coalesce(pr_id,'')
     || ' ' || '#' || coalesce(pr_id,'')
     || ' ' || coalesce(session_id,'') || ' ' || coalesce(outcome,'') || ' ' || coalesce(error,'')
+    || ' ' || case when behavior='issue_review' and status='failed' and error_code='issue_revision_changed'
+      and action='not_started' and outcome='preflight_failed'
+      and receipts is null and head_sha is null and review_id is null and review_comments is null
+      and (artifact is null or (json_valid(artifact)
+        and json_extract(artifact,'$.phase')='reviewing'
+        and json_extract(artifact,'$.resource_error') is null))
+      and (resource_ownership is null or (json_valid(resource_ownership)
+        and json_array_length(resource_ownership,'$.errors')=0))
+      then 'superseded issue changed' else '' end
 ) like '%' || ? || '%' escape '\\'"""
 
 
@@ -2813,6 +2835,7 @@ behaviors:
   --logs --id CALL_ID
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
+  --logs --without-progress
   --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
   --diagnostics [after-sequence] [limit-1..10]
   --stop CALL_ID
@@ -3062,6 +3085,9 @@ def _main():
             except ValueError as error:
                 usage(error=str(error))
             print(json.dumps(selected, separators=(",", ":")))
+            return
+        if sys.argv[2:] == ["--without-progress"]:
+            print(json.dumps(logs(without_progress=True), separators=(",", ":")))
             return
         if len(sys.argv) == 4 and sys.argv[2] == "--select":
             try:

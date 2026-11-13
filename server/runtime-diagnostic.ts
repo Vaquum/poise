@@ -172,6 +172,23 @@ export function recordRuntimeDiagnostic(input: DiagnosticInput, options: Capture
   } catch { forward(2, 'poise-runtime: diagnostic reporting unavailable.\n'); return null }
 }
 
+/** Only a retained shutdown Error for this launch can explain its supervisor exit. */
+export function hasShutdownDiagnostic(id: string, release: string | null, options: CaptureOptions = {}): boolean {
+  const workspace = options.workspace ?? process.env.POISE_WORKSPACE_HANDLE ?? 'local'
+  const expected = normalize({ id, source: 'poise', component: 'production', operation: 'process.shutdown', level: 'error',
+    message: '', workspace, visibility: 'workspace', release, correlationId: id })!
+  const path = options.path ?? join(process.env.POISE_DB ? dirname(process.env.POISE_DB) : join(homedir(), '.poise'), 'logging.db')
+  const store = new DiagnosticStore(path, diagnosticConfig(process.env).policy, Date.now, true)
+  try {
+    const result = store.lookup({ workspace, operator: false }, expected.id)
+    if (result.status !== 'found') return false
+    const event = result.event
+    return event.id === expected.id && event.workspace === workspace && event.visibility === 'workspace'
+      && event.source === 'poise' && event.component === 'production' && event.operation === 'process.shutdown'
+      && event.severity === 'error' && event.release === expected.release && event.correlationId === expected.correlationId
+  } finally { store.close() }
+}
+
 // This module is also bundled into the production server for shutdown reporting.
 if (process.argv[1] && /(?:^|[/\\])runtime-diagnostic\.(?:js|ts)$/.test(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [command, ...args] = process.argv.slice(2)

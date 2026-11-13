@@ -500,6 +500,32 @@ class TestRevisionBoundReview(IssueReviewCase):
         self.assertEqual([event["id"] for event in second["events"]], [call])
         self.assertEqual(second["events"][0]["ownership_error"], "ownership_failed")
 
+    def test_superseded_search_finds_only_clean_stale_reviews(self):
+        github = FakeGitHub()
+        row, _ = self.run_review(github, agent_writes({"comments": [{"issue": "#452", "body": "One."}]}),
+                                 expect_exit=True, expected="0" * 64)
+        page = agent_interface.logs_page(10, search="superseded")
+        self.assertEqual([entry["id"] for entry in page["rows"]], [row["id"]])
+        self.assertEqual(page["total"], 1)
+        self.assertEqual(agent_interface.logs_page(10, search="Superseded")["total"], 1)
+        self.assertEqual(agent_interface.logs_page(10, search="superseded issue changed")["total"], 1)
+        with agent_interface.db() as conn:
+            conn.execute("insert into calls (id, model, prompt, started_at, ended_at, status, behavior, outcome, error)"
+                         " values (?,?,?,?,?,?,?,?,?)",
+                         ("b" * 32, "opus-5-max", "note", 1761000000.0, 1761000060.0,
+                          "superseded", "pr_review", "superseded", ""))
+        page = agent_interface.logs_page(10, search="superseded")
+        self.assertEqual(page["total"], 2)
+        with agent_interface.db() as conn:
+            conn.execute("update calls set receipts='[]' where id=?", (row["id"],))
+        page = agent_interface.logs_page(10, search="superseded")
+        self.assertEqual([entry["id"] for entry in page["rows"]], ["b" * 32])
+        with agent_interface.db() as conn:
+            conn.execute("update calls set receipts=null, artifact=json_set(coalesce(artifact,'{}'),"
+                         "'$.resource_error','cleanup_failed') where id=?", (row["id"],))
+        page = agent_interface.logs_page(10, search="superseded")
+        self.assertEqual([entry["id"] for entry in page["rows"]], ["b" * 32])
+
     def test_child_only_output_cannot_fulfill_a_revision_bound_request(self):
         expected = issue_review.revision({"title": "Issue 452", "body": "Body 452"})
         github = FakeGitHub()

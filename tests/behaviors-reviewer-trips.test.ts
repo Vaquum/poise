@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { LogEntry } from '../server/agent'
 import { mocks, pr, HEAD_SHA, loadModules, resetLogCache, arrangeCli, agentLog, fixture } from './behaviors-runtime-fixture'
 
@@ -102,7 +102,7 @@ describe('reviewer account trips', () => {
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
-      expect.objectContaining({ target: `reviewer:${identity}`, consecutiveFailures: 3 }),
+      expect.objectContaining({ target: `reviewer:${identity}`, consecutiveFailures: 2 }),
     ]))
   })
 
@@ -298,6 +298,8 @@ describe('reviewer account trips', () => {
   })
 
   it('probes a due trip with one launch while the other waiting targets hold', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-13T14:00:00.000Z'))
     const { db, runtime } = await startPrReviews({
       primary: 'grok-4.6-xhigh', secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
     })
@@ -311,20 +313,34 @@ describe('reviewer account trips', () => {
     await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+    const failureKey = 'behavior_review_new_prs_failure:reviewer:grok-4.6-xhigh'
+    const originalFailure = JSON.parse(db.getMeta(failureKey)!)
+    expect(originalFailure).toMatchObject({
+      consecutiveFailures: 1, firstFailureAtMs: Date.now(), lastFailureAtMs: Date.now(), callId: '1'.repeat(32),
+    })
 
     // Two reviews wait while the trip is due: exactly one probes.
-    expireBackoff(db, 'review_new_prs', 'reviewer:grok-4.6-xhigh')
+    vi.setSystemTime(originalFailure.nextRetryAtMs + 1)
+    const reservedUntil = Date.now() + 2 * runtime.BEHAVIOR_RETRY_BASE_MS
     fixture.listedPrs = [pr, { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18' }]
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(db.listBehaviorLaunchClaims('review-new-prs')).toHaveLength(1)
     expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('grok-4.6-xhigh')
+    expect(JSON.parse(db.getMeta(failureKey)!)).toEqual({ ...originalFailure, nextRetryAtMs: reservedUntil })
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
-      expect.objectContaining({ target: 'reviewer:grok-4.6-xhigh', consecutiveFailures: 2 }),
+      expect.objectContaining({ target: 'reviewer:grok-4.6-xhigh', consecutiveFailures: 1,
+        failingSince: new Date(originalFailure.firstFailureAtMs).toISOString(),
+        lastFailureAt: new Date(originalFailure.lastFailureAtMs).toISOString(),
+        callId: originalFailure.callId, nextRetryAt: new Date(reservedUntil).toISOString() }),
     ]))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(db.getMeta(failureKey)!)).toEqual({ ...originalFailure, nextRetryAtMs: reservedUntil })
 
     // The probe's failure re-trips instead of launching the waiter.
     const probe = db.listBehaviorLaunchClaims('review-new-prs')[0]
+    vi.setSystemTime(Date.now() + 1000)
     fixture.agentLogs = [agentLog({
       id: '3'.repeat(32),
       model: 'grok-4.6-xhigh',
@@ -347,8 +363,29 @@ describe('reviewer account trips', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(db.listBehaviorDeadLetters()).toEqual([])
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
-      expect.objectContaining({ target: 'reviewer:grok-4.6-xhigh', consecutiveFailures: 3 }),
+      expect.objectContaining({ target: 'reviewer:grok-4.6-xhigh', consecutiveFailures: 2,
+        failingSince: new Date(originalFailure.firstFailureAtMs).toISOString(),
+        lastFailureAt: new Date().toISOString(), callId: '3'.repeat(32),
+        nextRetryAt: new Date(Date.now() + 2 * runtime.BEHAVIOR_RETRY_BASE_MS).toISOString() }),
     ]))
+
+    // The next due probe succeeds and clears the trip.
+    const failedProbe = JSON.parse(db.getMeta(failureKey)!)
+    vi.setSystemTime(failedProbe.nextRetryAtMs + 1)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    const successfulProbe = db.listBehaviorLaunchClaims('review-new-prs')[0]
+    fixture.agentLogs = [agentLog({
+      id: '4'.repeat(32), model: 'grok-4.6-xhigh', pr_id: String(successfulProbe.launchPr),
+      started_at: successfulProbe.launchRequestedAt, started_at_precise: successfulProbe.launchRequestedAt,
+      status: 'completed', action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA,
+      expected_head: successfulProbe.launchExpectedHead, actor: successfulProbe.launchActor,
+      source: successfulProbe.launchSource, correlation_id: successfulProbe.launchCorrelationId,
+    })]
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(runtime.getBehaviorsRuntimeHealth().failures.map(failure => failure.target)).not.toContain('reviewer:grok-4.6-xhigh')
+    expect(db.getMeta(failureKey)).toBe('')
   })
 
   it('trips the recovery model on its 402 and holds the target', async () => {

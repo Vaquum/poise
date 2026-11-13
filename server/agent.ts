@@ -98,6 +98,8 @@ interface AgentLogRead {
   waiters: Set<AgentLogWaiter>
   started: boolean
   settled: boolean
+  /** The lane's generation when this read started. */
+  generation?: number
 }
 
 interface AgentLogLane {
@@ -105,16 +107,29 @@ interface AgentLogLane {
   source: string
   running: AgentLogRead | null
   queued: AgentLogRead | null
-  cached: { snapshot: AgentLogSnapshot, expiresAt: number } | null
+  cached: { snapshot: AgentLogSnapshot, expiresAt: number, readAt: number } | null
   /** The latest read failed: the last snapshot no longer answers a reader at once. */
   failed?: boolean
+  /** Bumped when the lane's calls changed under it (a stop): a read started
+   *  before answers only its own waiters and never becomes the last snapshot. */
+  generation?: number
 }
 
 const AGENT_LOG_SNAPSHOT_TTL_MS = 5_000
+/** How old a running snapshot the running views take at once, read again
+ *  behind the answer: under load, starting agent-interface takes seconds, and
+ *  every open view polls the running lane. */
+export const RUNNING_SNAPSHOT_SERVED_MS = 30_000
 
+// History leaves out each call's progress events, the largest field: no
+// reader of the whole history uses them (a call's own view reads them by its
+// page, its id or the running read). A Caller from before the flag answers
+// with its usage, and history is read whole, as before.
 const historyAgentLogLane: AgentLogLane = {
-  args: ['--logs'], source: 'agent-interface --logs', running: null, queued: null, cached: null,
+  args: ['--logs', '--without-progress'], source: 'agent-interface --logs', running: null, queued: null, cached: null,
 }
+const FULL_HISTORY_ARGS: readonly string[] = ['--logs']
+let historyArgs: readonly string[] = historyAgentLogLane.args
 
 let historyReadFailure: { id: string, firstFailureAt: string, failedReads: number } | null = null
 
@@ -128,11 +143,17 @@ const selectedAgentLogLanes = new Map<string, AgentLogLane>()
 // Production never calls it; in-flight reads are untouched.
 export function resetAgentLogCache(): void {
   historyAgentLogLane.cached = null
+  historyArgs = historyAgentLogLane.args
   runningAgentLogLane.cached = null
   for (const [key, lane] of selectedAgentLogLanes) {
     lane.cached = null
     if (!lane.running && !lane.queued) selectedAgentLogLanes.delete(key)
   }
+}
+
+/** Retained history only: never starts a read or reuses evidence after a failed read. */
+export function getCachedAgentLogSnapshot(): AgentLogSnapshot | null {
+  return historyAgentLogLane.failed ? null : historyAgentLogLane.cached?.snapshot ?? null
 }
 
 // Shaped like runFile's own abort rejection, minus the child-kill fields:
@@ -151,15 +172,18 @@ export async function fetchAgentLogSnapshot(
   return laneAgentLogSnapshot(historyAgentLogLane, options, readHistoryAgentLogSnapshot)
 }
 
+/** Running calls. `lastObserved` answers at once from a snapshot read within
+ *  `lastObservedMs` and reads it again behind the answer; an older one is
+ *  read now. */
 export async function fetchRunningAgentLogSnapshot(
-  options: { signal?: AbortSignal, fresh?: boolean } = {},
+  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean, lastObservedMs?: number } = {},
 ): Promise<AgentLogSnapshot> {
   return laneAgentLogSnapshot(runningAgentLogLane, options, readRunningAgentLogSnapshot)
 }
 
 async function laneAgentLogSnapshot(
   lane: AgentLogLane,
-  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean },
+  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean, lastObservedMs?: number },
   read: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
 ): Promise<AgentLogSnapshot> {
   // A caller that is already gone never joins work it cannot use.
@@ -168,12 +192,15 @@ async function laneAgentLogSnapshot(
   // A reader that takes the last snapshot gets it at once, past its time, and
   // the lane reads again behind it.
   // A refresh that failed is reported by the next read, never hidden behind the last snapshot.
-  if (options.lastObserved && !options.fresh && lane.cached && !lane.failed) {
+  if (options.lastObserved && !options.fresh && lane.cached && !lane.failed
+    && (options.lastObservedMs === undefined || Date.now() - lane.cached.readAt <= options.lastObservedMs)) {
     if (!lane.running) startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
     return lane.cached.snapshot
   }
+  // A read started before the lane's calls changed is not joined: the next one is.
+  const current = lane.running !== null && lane.running.generation === (lane.generation ?? 0)
   const target = lane.running
-    ? (!options.fresh ? lane.running : (lane.queued ?? createLaneAgentLogRead(lane)))
+    ? (!options.fresh && current ? lane.running : (lane.queued ?? createLaneAgentLogRead(lane)))
     : startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
   return new Promise<AgentLogSnapshot>((resolve, reject) => {
     const waiter: AgentLogWaiter = { signal: options.signal, onAbort: () => {}, resolve, reject }
@@ -215,11 +242,15 @@ function startLaneAgentLogRead(
   readSnapshot: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
 ): AgentLogRead {
   read.started = true
+  read.generation = lane.generation ?? 0
   lane.running = read
   readSnapshot(read.controller.signal).then(
     (snapshot) => {
-      lane.cached = { snapshot, expiresAt: Date.now() + AGENT_LOG_SNAPSHOT_TTL_MS }
-      lane.failed = false
+      if (read.generation === (lane.generation ?? 0)) {
+        const readAt = Date.now()
+        lane.cached = { snapshot, expiresAt: readAt + AGENT_LOG_SNAPSHOT_TTL_MS, readAt }
+        lane.failed = false
+      }
       settleLaneAgentLogRead(lane, read, { snapshot }, readSnapshot)
     },
     (error) => {
@@ -285,7 +316,13 @@ async function readHistoryAgentLogSnapshot(signal: AbortSignal): Promise<AgentLo
   let stdout: string
   let snapshot: AgentLogSnapshot
   try {
-    ({ stdout } = await spawnAgentLogRead(historyAgentLogLane.args, signal))
+    try {
+      ({ stdout } = await spawnAgentLogRead(historyArgs, signal))
+    } catch (error) {
+      if (historyArgs === FULL_HISTORY_ARGS || !callerUsageError(error)) throw error
+      historyArgs = FULL_HISTORY_ARGS
+      ;({ stdout } = await spawnAgentLogRead(historyArgs, signal))
+    }
     snapshot = await decodeAgentLogSnapshot(stdout, historyAgentLogLane.source, signal)
   } catch (error) {
     if (!signal.aborted) {
@@ -341,16 +378,21 @@ function spawnAgentLogRead(args: readonly string[], signal: AbortSignal | undefi
     timeoutMs: 30_000,
     maxOutputBytes: AGENT_LOG_READ_CAP_BYTES,
     signal,
-    reportFailure: args !== historyAgentLogLane.args,
+    reportFailure: args !== historyAgentLogLane.args && args !== FULL_HISTORY_ARGS,
   }))
 }
 
 // An older Caller answers the new flags with its usage text. Name the fix;
 // anything else is a real failure and passes through untouched.
+/** Caller answered with its usage text: it does not know these flags. */
+function callerUsageError(error: unknown): boolean {
+  const stderr = (error as { stderr?: unknown } | null)?.stderr
+  return typeof stderr === 'string' && stderr.includes('usage:')
+}
+
 function callerUpdateError(args: readonly string[], error: unknown): Error | null {
   if (args.length < 2) return null
-  const stderr = (error as { stderr?: unknown } | null)?.stderr
-  if (typeof stderr !== 'string' || !stderr.includes('usage:')) return null
+  if (!callerUsageError(error)) return null
   const feature = args.includes('--status') ? 'running-only'
     : args.includes('--limit') ? 'paged' : 'selected'
   return new Error(`Update Caller: ${feature} log reads are unavailable`, { cause: error })
@@ -619,6 +661,12 @@ export async function stopAgentJob(callId: string): Promise<StopResult> {
   const value = result as Record<string, unknown>
   if (typeof value?.id !== 'string' || typeof value.stopped !== 'boolean' || typeof value.status !== 'string') {
     throw new Error('Update Caller: stopping a run is unavailable')
+  }
+  // A stopped run must not stay in the running views' last snapshot, nor
+  // come back with a read that started before it stopped.
+  if (value.stopped) {
+    runningAgentLogLane.cached = null
+    runningAgentLogLane.generation = (runningAgentLogLane.generation ?? 0) + 1
   }
   return { id: value.id, stopped: value.stopped, status: value.status, error_code: typeof value.error_code === 'string' ? value.error_code : null }
 }

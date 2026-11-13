@@ -479,7 +479,11 @@ its own instead of refusing with dirty_unowned.
   marked failed and never run again; the image's own release takes over.
   Production shutdown synchronously retains deadline and rejection evidence in
   the private Logging store before exit 1, even after Logging stops. The
-  supervisor records its own abnormal exit event. Clean exit 75 stays quiet.
+  supervisor supplies a fresh `POISE_SHUTDOWN_DIAGNOSTIC_ID` for every launch.
+  A read-only lookup of that launch's owner-scoped shutdown Error permits a
+  distinct `workspace.exit` Warning linked by `correlationId`, retaining the
+  actual exit code and signal. Missing, unavailable or mismatched evidence keeps
+  the independent exit Error. Clean exit 75 stays quiet.
   On Linux the same supervisor owns the private native-cleanup controller.
   Its uid-only Unix socket and random generation are passed to Poise and
   Caller as `POISE_NATIVE_CONTROL`; neither the address nor per-Call tokens
@@ -553,9 +557,13 @@ its own instead of refusing with dirty_unowned.
 - **Shutdown.** Active HTTP responses finish before their keep-alive sockets
   retire. Storage-pressure passes, including native Caller cleanup and receipt
   reconciliation, join the background barrier: a release switch waits for the
-  admitted pass before starting shutdown. Clean shutdown waits for runtime cleanup
+  admitted pass before starting shutdown. Collaborator reconciliation also joins
+  that barrier, retaining the admitted invitation's account confirmation before
+  the switch; new passes wait during a pending switch or drain.
+  Clean shutdown waits for runtime cleanup
   and HTTP closure, closes SQLite, then exits 75. The existing ten-second deadline
   still exits 1 with one structured Error naming pending shutdown phases and
+  unresolved runtime stops (including `runtime_stop.agent_collaborator`) and
   retaining known cleanup failure causes.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
@@ -1519,6 +1527,12 @@ This uses the existing owner workspace boundary and canonical journal, including
 completed chains. Ambiguous or missing matches remain unknown, as does a failed
 workspace read; central Logging queries and retained evidence remain independent.
 No gateway read, scope, ingestion or execution authority is added.
+Typed provider analysis handoffs use the existing v1 diagnostic envelope and
+positive no-submission evidence. The same work-impact read confirms only later
+same-PR/head/basis/slot successor admissions or attributed review verdicts for
+Warning display; current blockers retain Error. Source events and their IDs
+remain immutable, including historical unproven handoffs. The exact display and
+source-filter distinction is defined in [Logging](Logging.md#observe--logging).
 Initial remediation report bodies retain a dated snapshot of this projection;
 later recovery does not rewrite it. Optional annotation failure leaves impact
 unknown and does not consume the report's creation attempt.
@@ -1672,6 +1686,7 @@ Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
 opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review timeout exhaustion, verified automatic implementation holds before a PR,
+terminal uncertain implementation publication,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
 sources without an explicit hold, supplied by trusted service configuration or the
@@ -1683,6 +1698,11 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Uncertain implementation reports instead require the original failed `publishing`
+Call, verified resource release and fresh open-source eligibility and publication
+reconciliation. They preserve its missing-push-evidence action and execution fence,
+reusing verified matching linked reports even when closed and markerless; they
+authorize neither replacement implementation nor a second push.
 Durable creation intent prevents another POST after an uncertain result; the source state,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. Closed-PR continuations verify existing source/PR
