@@ -318,6 +318,22 @@ test('each Show level says how many entries it shows (#1380)', async ({ page }) 
   await expect(level('+ Faults')).toContainText('2')
 })
 
+for (const width of [1440, 1000, 375]) {
+  test(`Show's levels fit Answer here's row at ${width} pixels, whatever their counts (#1439)`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 })
+    const notice = (id: number) => ({ id: `n${id}`, kind: 'storage_low', title: `Disk ${id}`, body: '', since: ago(id), due: ago(id), silenceable: false, target: null })
+    await open(page, { notices: Array.from({ length: 120 }, (_, i) => notice(i + 1)), requests: [], decisions: [], revision: 1 })
+    const seg = answers(page).locator('.olevel')
+    await expect(seg.getByRole('radio', { name: /^Everything,/ })).toHaveAccessibleName('Everything, 120 entries')
+    const fit = await seg.evaluate((el) => {
+      const row = el.closest<HTMLElement>('.ova-level')!.getBoundingClientRect()
+      const box = el.getBoundingClientRect()
+      return { inside: box.left >= row.left - 0.5 && box.right <= row.right + 0.5, buttons: [...el.querySelectorAll('button')].every((button) => button.scrollWidth <= button.clientWidth + 0.5) }
+    })
+    expect(fit).toEqual({ inside: true, buttons: true })
+  })
+}
+
 test('the bell on Overview brings Answer here to its first entry with the focus ring; its count follows Show (#1433)', async ({ page }) => {
   const notice = (id: string, kind: string, minutes: number) => ({ id, kind, title: `${kind} title`, body: '', since: ago(minutes), due: ago(minutes), silenceable: false, target: null })
   await open(page, { notices: [notice('n1', 'storage_low', 5), notice('n2', 'ledger_queue_stalled', 6), notice('n3', 'chat_turn_finished', 7)], requests: [], decisions: [], revision: 1 })
