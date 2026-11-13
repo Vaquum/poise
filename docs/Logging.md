@@ -214,6 +214,13 @@ erase that original failure; independent wrapper and invalid-output failures
 remain visible. Resolve uses Warning only for a confirmed no-action transient
 exit with a recorded safe retry. Uncertain outcomes, timeouts and policy
 refusals remain Errors. Separate attempts retain separate event IDs.
+Legacy approval batch reads and the final head check likewise retain one Error
+per failed child after recording the scheduler consequence. The fixed primitive,
+phase, checked targets, available expected heads, correlation, original process
+timing/result and recorded retry state travel together. Two failed children
+remain separate even within one sweep correlation; cancellation or failed retry
+bookkeeping cannot erase either cause. These diagnostics do not change backoff,
+launch progress or the exact-head publication checks.
 JavaScript DOMException identity and numeric code are retained in context as
 `exceptionName` and `exceptionCode`, with no process `exitCode`. Actual subprocess
 exit codes remain process evidence, even when the same number names an exception.
