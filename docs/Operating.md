@@ -1352,9 +1352,10 @@ build cache are removed after each deploy ([Upgrades](#upgrades)).
 
 ### Storage maintenance
 
-Each workspace also cleans itself: every 6 hours, whenever its own disk
-passes 80% used, and on demand from Settings → Storage, which shows the
-storage breakdown and the last run. A run removes a closed session's scratch
+Each workspace also cleans itself: every 6 hours, counted from the last run
+so that a restart does not start one early, and never in the first 10 minutes
+after a start; whenever its own disk passes 80% used; and on demand from
+Settings → Storage, which shows the storage breakdown and the last run. A run removes a closed session's scratch
 workspace after 24 hours when its tree is clean and nothing is unpushed,
 requiring a remote-tracking ref to contain every local branch tip and any
 detached HEAD; remote-less committed work stays held. Open idle sessions keep

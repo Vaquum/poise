@@ -40,6 +40,10 @@ export const WORKSPACE_IDLE_PRUNE_MS = 3 * 24 * 60 * 60_000
 export const INCIDENT_RECOVERY_RETENTION_MS = 30 * 24 * 60 * 60_000
 /** Full maintenance runs on this timer, and at startup. */
 export const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60_000
+/** A start never begins a pass sooner: each deploy restarts the server just as
+ *  the person's page reloads onto the new build, and a pass takes each closed
+ *  workspace's checkout lease, a synced write on the server's main thread. */
+export const MAINTENANCE_START_DELAY_MS = 10 * 60_000
 /** Disk pressure is re-measured this often; a statfs, not a tree walk. */
 export const PRESSURE_CHECK_MS = 60_000
 /** At this used percentage maintenance runs at once, shedding caches first. */
@@ -997,12 +1001,23 @@ let maintenanceTimer: ReturnType<typeof setInterval> | null = null
 let pressureTimer: ReturnType<typeof setInterval> | null = null
 let pressurePass: Promise<unknown> | null = null
 
+/** How long a start waits for its first pass: every 6 hours counted from the
+ *  last finished run, which a restart keeps, never within MAINTENANCE_START_DELAY_MS
+ *  of the start, and never more than one interval when the clock went back. */
+export function firstMaintenanceDelay(now: number, last: Pick<MaintenanceReport, 'finishedAt'> | null): number {
+  const finished = Date.parse(last?.finishedAt ?? '')
+  const due = Number.isFinite(finished) ? finished + MAINTENANCE_INTERVAL_MS - now : 0
+  return Math.min(MAINTENANCE_INTERVAL_MS, Math.max(MAINTENANCE_START_DELAY_MS, due))
+}
+
 export function startStorageMaintenanceRuntime(): void {
   if (maintenanceTimer) return
-  void runStorageMaintenanceOnce().catch((error: unknown) => console.error('[storage] maintenance failed:', error))
-  maintenanceTimer = setInterval(() => {
-    void runStorageMaintenanceOnce().catch((error: unknown) => console.error('[storage] maintenance failed:', error))
-  }, MAINTENANCE_INTERVAL_MS)
+  const pass = () => { void runStorageMaintenanceOnce().catch((error: unknown) => console.error('[storage] maintenance failed:', error)) }
+  maintenanceTimer = setTimeout(() => {
+    pass()
+    maintenanceTimer = setInterval(pass, MAINTENANCE_INTERVAL_MS)
+    maintenanceTimer.unref?.()
+  }, firstMaintenanceDelay(Date.now(), lastMaintenanceRun()))
   maintenanceTimer.unref?.()
   const pressure = () => {
     if (pressurePass) return

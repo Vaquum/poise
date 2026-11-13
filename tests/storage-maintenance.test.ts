@@ -627,6 +627,19 @@ process.exit(1)
   })
 })
 
+describe('maintenance schedule', () => {
+  it('starts the first pass 6 hours after the last finished run, never within minutes of a start', () => {
+    const now = Date.parse('2026-11-13T02:00:00Z')
+    const at = (hoursAgo: number) => ({ finishedAt: new Date(now - hoursAgo * 3_600_000).toISOString() })
+    expect(maintenance.firstMaintenanceDelay(now, null)).toBe(maintenance.MAINTENANCE_START_DELAY_MS)
+    expect(maintenance.firstMaintenanceDelay(now, at(1))).toBe(5 * 3_600_000)
+    expect(maintenance.firstMaintenanceDelay(now, at(5.95))).toBe(maintenance.MAINTENANCE_START_DELAY_MS)
+    expect(maintenance.firstMaintenanceDelay(now, at(7))).toBe(maintenance.MAINTENANCE_START_DELAY_MS)
+    expect(maintenance.firstMaintenanceDelay(now, at(-2))).toBe(maintenance.MAINTENANCE_INTERVAL_MS)
+    expect(maintenance.firstMaintenanceDelay(now, { finishedAt: 'not a time' })).toBe(maintenance.MAINTENANCE_START_DELAY_MS)
+  })
+})
+
 describe('disk pressure', () => {
   it('runs maintenance and alerts past the threshold, and resolves below the clear line', async () => {
     const alerts = await import('../server/alerts/store')
