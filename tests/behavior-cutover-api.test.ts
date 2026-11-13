@@ -336,7 +336,6 @@ it('batches exact work-impact lookups through the existing classifier without ch
   const at = Date.now() - 10_000
   const call = '4'.repeat(32), correlation = '5'.repeat(32), other = '6'.repeat(32)
   const fixture = loggingWorkFixture(journal, 'api/impact', 7, correlation, call, at)
-  fixture.append({ type: 'chain.held', reason: 'independent hold' }, at + 4000)
   const completed = loggingWorkFixture(journal, 'api/impact', 8, other, other, at)
   completed.append({ type: 'chain.merged', mergeSha: 'c'.repeat(40), evidence: { repository: 'api/impact', pull_number: 108,
     merged: true, merge_sha: 'c'.repeat(40), review_complete: true } }, at + 4000)
@@ -351,8 +350,12 @@ it('batches exact work-impact lookups through the existing classifier without ch
     for (const [callId, correlationId] of [[call, correlation], ['', other], ['7'.repeat(32), ''], [call, other]]) {
       params.append('callId', callId); params.append('correlationId', correlationId)
     }
+    const batchLookup = vi.spyOn(journal, 'forInvocations')
+    const singleLookup = vi.spyOn(journal, 'forInvocation')
     const response = await fetch(`${base}?${params}`)
     expect(response.status).toBe(200)
+    expect(batchLookup).toHaveBeenCalledTimes(1)
+    expect(singleLookup).not.toHaveBeenCalled()
     expect(await response.json()).toEqual({ impacts: [behaviorChainWorkImpact(journal, call, correlation),
       behaviorChainWorkImpact(journal, null, other), null, null] })
     const single = await (await fetch(`${base}?callId=${call}&correlationId=${correlation}`)).json()
@@ -362,12 +365,28 @@ it('batches exact work-impact lookups through the existing classifier without ch
       expect((await fetch(`${base}?${query}`)).status).toBe(400)
     }
     const bounded = new URLSearchParams({ batch: '1' })
-    for (let index = 0; index < 100; index++) { bounded.append('callId', call); bounded.append('correlationId', '') }
+    for (let index = 0; index < 100; index++) {
+      bounded.append('callId', index ? index.toString(16).padStart(32, '0') : call)
+      bounded.append('correlationId', '')
+    }
     const full = await fetch(`${base}?${bounded}`)
     expect(full.status).toBe(200)
-    expect((await full.json()).impacts).toHaveLength(100)
+    expect((await full.json()).impacts).toEqual([behaviorChainWorkImpact(journal, call, null), ...Array(99).fill(null)])
     bounded.append('callId', call); bounded.append('correlationId', '')
     expect((await fetch(`${base}?${bounded}`)).status).toBe(400)
     expect([journal.history(fixture.chain.id), journal.history(completed.chain.id)]).toEqual(before)
+    const appendedId = '8'.repeat(32)
+    fixture.append({ type: 'invocation.admitted', invocation: { ...fixture.chain.invocations[0], id: appendedId, admittedAt: at + 5000 } }, at + 5000)
+    fixture.append({ type: 'invocation.reconciled', invocationId: appendedId,
+      evidence: { nativeCallId: '7'.repeat(32), callId: '7'.repeat(32) } }, at + 6000)
+    const withInvocation = await (await fetch(`${base}?${params}`)).json()
+    expect(withInvocation.impacts[2]).toMatchObject({ invocationId: appendedId, stage: 'repair-pr: admitted' })
+    expect(withInvocation.impacts[2]).toEqual(behaviorChainWorkImpact(journal, '7'.repeat(32), null))
+    fixture.append({ type: 'chain.held', reason: 'independent hold' }, at + 7000)
+    const afterAppend = journal.history(fixture.chain.id)
+    const refreshed = await (await fetch(`${base}?${params}`)).json()
+    expect(refreshed.impacts[0]).toMatchObject({ impact: 'blocked', nextAction: expect.stringContaining('independent hold') })
+    expect(refreshed.impacts[0]).toEqual(behaviorChainWorkImpact(journal, call, correlation))
+    expect([journal.history(fixture.chain.id), journal.history(completed.chain.id)]).toEqual([afterAppend, before[1]])
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })

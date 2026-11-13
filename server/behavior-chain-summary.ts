@@ -238,7 +238,14 @@ function foldProgress(fold: ProgressFold, rows: Iterable<ProgressRow>, id: strin
 
 /** Read-only incident annotation, independent of attention's age/active filters. */
 export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: string | null, correlationId: string | null): LoggingWorkImpact | null {
-  const match = journal.forInvocation(callId, correlationId)
+  return invocationWorkImpact(journal, journal.forInvocation(callId, correlationId))
+}
+
+export function behaviorChainWorkImpacts(journal: BehaviorChainJournal, identities: Array<{ callId: string | null, correlationId: string | null }>): Array<LoggingWorkImpact | null> {
+  return journal.forInvocations(identities).map(match => invocationWorkImpact(journal, match))
+}
+
+function invocationWorkImpact(journal: BehaviorChainJournal, match: ReturnType<BehaviorChainJournal['forInvocation']>): LoggingWorkImpact | null {
   if (!match) return null
   const { chain, invocation } = match
   const progress = chainProgress(journal, chain.id, invocation.id)

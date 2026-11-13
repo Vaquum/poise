@@ -6,7 +6,7 @@ import { getBehaviorChainSettings, getSettings } from './settings'
 import { getBehaviorChainCapacity, getBehaviorChainRuntimeHealth } from './behaviors'
 import { behaviorCutoverBlockers } from './behavior-cutover'
 import type { BehaviorChain, ChainEvent } from './behavior-chain-store'
-import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact } from './behavior-chain-summary'
+import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact, behaviorChainWorkImpacts } from './behavior-chain-summary'
 import { nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 
 function reply(res: ServerResponse, status: number, value: unknown): void {
@@ -42,8 +42,9 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
           })) {
           throw new HttpError(400, 'valid Call or correlation identity is required')
         }
-        const impacts = calls.map((callId, index) => behaviorChainWorkImpact(journal, callId, correlations[index]))
-        return reply(res, 200, batch ? { impacts } : { impact: impacts[0] })
+        return reply(res, 200, batch
+          ? { impacts: behaviorChainWorkImpacts(journal, calls.map((callId, index) => ({ callId, correlationId: correlations[index] }))) }
+          : { impact: behaviorChainWorkImpact(journal, calls[0], correlations[0]) })
       }
       const id = params.get('id')
       if (id) {
