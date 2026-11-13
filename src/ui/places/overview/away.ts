@@ -33,11 +33,12 @@ export function awayGroups(): Group[] {
   const notices = feed.notices.filter((notice) => feed.enabled || (LOCAL_NOTICE_KINDS as readonly string[]).includes(notice.kind))
   const items = notificationItems(notices, getBehaviorDiagnostics(), Date.now(), attention)
   const entries = undismissed(foldWaiting([...itemEntries(items, noRole, chains), ...requestEntries(requests, noRole), ...decisionEntries(decisions, noRole)]), dismissals)
-  // A document's threads count as Answer here lists them, put-away ones off; one
-  // whose threads could not be read counts every open thread.
+  // A document's open threads, as its sweep counts them, less those put away at
+  // what they report now: a reply, or a thread its cache does not list, counts.
   const threads = publications.reduce((sum, publication) => {
-    const read = threadsRead.get(publication.slug)
-    return sum + (read?.entries ? undismissed(read.entries, dismissals).length : publication.openThreads)
+    const entries = threadsRead.get(publication.slug)?.entries ?? []
+    const putAway = entries.length - undismissed(entries, dismissals).length
+    return sum + Math.max(0, publication.openThreads - putAway)
   }, 0)
   return [...entries.map((entry) => entry.group), ...Array<Group>(threads).fill('needs-you')]
 }
