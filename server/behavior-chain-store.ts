@@ -118,7 +118,9 @@ const RECHECK_AT_SQL = `CASE
     AND json_extract(state, '$.invocations[#-1].behavior') IN ('merge-pr', 'resolve-threads') THEN
       CASE WHEN json_type(state, '$.invocations[#-1].evidence.nativeActionReceipt') IS NULL THEN NULL ELSE 0 END
   WHEN json_extract(state, '$.observation.checkedAt') IS NULL THEN 0
-  WHEN json_extract(state, '$.ciHold') IS NOT NULL THEN json_extract(state, '$.observation.checkedAt') + 120000
+  WHEN json_extract(state, '$.ciHold') IS NOT NULL
+    OR (json_extract(state, '$.held') IS NOT NULL AND json_extract(state, '$.mergeSha') IS NULL
+      AND json_extract(state, '$.observation.pull.state') = 'open') THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,
     json_extract(state, '$.observation.checkedAt') - coalesce(json_extract(state, '$.observation.pull.mergedAt'),
       json_extract(state, '$.invocations[0].admittedAt'), 0))) END`
