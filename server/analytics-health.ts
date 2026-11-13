@@ -33,15 +33,36 @@ export function healthIntervals(history: LedgerHistory, since: number, until: nu
   })
 }
 
+// A chain's journal only grows (nothing rewrites or deletes an event), so a
+// chain's rows are read from the database once and then only its new events:
+// a chain with a new event, or whose errors cross the clock, used to be read
+// whole again. Rows are parsed afresh for each reading, so nothing that folds
+// them changes what the next reading sees. The chains read last are kept, up
+// to HISTORY_KEPT_ROWS rows in all.
+const HISTORY_KEPT_ROWS = 10_000
+type HistoryRow = ReturnType<BehaviorChainJournal['history']>[number]
+const historyByJournal = new WeakMap<BehaviorChainJournal, Map<string, HistoryRow[]>>()
+
 function historyRows(journal: BehaviorChainJournal, id: string) {
-  const rows = []
-  let after = 0
-  for (;;) {
+  let kept = historyByJournal.get(journal)
+  if (!kept) historyByJournal.set(journal, kept = new Map())
+  const raw = kept.get(id) ?? []
+  for (let after = raw.at(-1)?.sequence ?? 0; ;) {
     const page = journal.history(id, after)
-    rows.push(...page.map(row => ({ ...row, event: JSON.parse(row.payload) as ChainEvent })))
-    if (page.length < 100) return rows
+    raw.push(...page)
+    if (page.length < 100) break
     after = page.at(-1)!.sequence
   }
+  kept.delete(id)
+  kept.set(id, raw)
+  let total = 0
+  for (const rows of kept.values()) total += rows.length
+  for (const [key, rows] of kept) {
+    if (total <= HISTORY_KEPT_ROWS || key === id) break
+    kept.delete(key)
+    total -= rows.length
+  }
+  return raw.map(row => ({ ...row, event: JSON.parse(row.payload) as ChainEvent }))
 }
 
 function journalHref(id: string, sequence = 1): string {

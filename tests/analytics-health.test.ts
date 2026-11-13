@@ -845,3 +845,22 @@ it('keeps the thread in slices across the journal rather than yielding after eve
   expect(turns).toBeLessThan(10)
 })
 
+
+it('reads a chain\'s history once and then only its new events, projecting what a fresh read projects', async () => {
+  const f = setup()
+  let chain = f.seed(1)
+  // Past one page of history, so the kept rows span pages.
+  for (let n = 0; n < 130; n++) chain = f.observe(chain, NOW - 40 * HOUR + n * 1000)
+  chain = f.fail(chain, 'first', NOW - 2 * HOUR)
+  await f.read()
+  const history = vi.spyOn(f.journal, 'history')
+  chain = f.fail(chain, 'second', NOW - HOUR)
+  const kept = await f.read()
+  const reads = history.mock.calls.filter(([id]) => id === chain.id)
+  expect(reads.length).toBeGreaterThan(0)
+  expect(reads.every(([, after]) => Number(after) > 0)).toBe(true)
+  history.mockRestore()
+  // A journal with nothing kept reads the whole history and projects the same.
+  expect(kept).toEqual(await projectAnalyticsHealth(new BehaviorChainJournal(f.db), f.input))
+  expect(kept.lastError.error?.at).toBe(NOW - HOUR)
+})
