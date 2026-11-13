@@ -32,7 +32,7 @@ export async function readNativeInvocations(ids: string[], mode: 'strict' | 'res
 }
 export interface NativeChainHooks {
   roster(chainKey: string): Promise<Roster>
-  resolve(decision: Invoke, chainKey: string): Promise<ChainReviewer | null>
+  resolve(decision: Invoke, chainKey: string, chain: BehaviorChain, observation: ChainObservation): Promise<ChainReviewer | null>
   prepare(identities: string[]): Promise<NodeJS.ProcessEnv>
   borrow(): (() => void) | null
   available(): boolean
@@ -421,7 +421,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const note = [await hooks.note(decision.behavior, chain, pull), decision.reason,
         dependency ? `Retained shared baseline CI dependency; keep candidate repairs scoped and do not duplicate its remediation: ${JSON.stringify(dependency.dependency)}` : ''].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
-        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`)
+        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`, chain, observation)
         if (!selected) return null
         const model = ['--model', selected.model, '--recovery-model', selected.recovery]
         if (decision.behavior === 'review-issue') return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: ['--issue-review', `${chain.repository}#${chain.issue}`,

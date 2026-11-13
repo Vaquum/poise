@@ -8322,7 +8322,7 @@ async function runBehaviorChains(): Promise<void> {
     }
     const operations = nativeChainOperations(org, {
       roster,
-      async resolve(decision, chainKey) {
+      async resolve(decision, chainKey, chain, observation) {
         if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
           const place = decision.behavior === 'review-issue' ? 'issue_review' : 'pr_review'
           const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), place, `${chainKey}:${place}:panel`)
@@ -8342,10 +8342,32 @@ async function runBehaviorChains(): Promise<void> {
         const slots = resolveSlots(catalog, getModelSettings().slots)
         const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
         const ordered = stored === 'random' ? [...MODEL_SLOTS] : MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(selected.slot))
+        const attempts = chain.invocations.filter(invocation => invocation.behavior === 'repair-pr' && invocation.basis === decision.basis
+          && invocation.slot === decision.reviewer?.slot && invocation.admissionSequence > chain.resumedAfterSequence
+          && invocation.evidence?.status !== 'deferred')
+        const exhausted = decision.behavior === 'repair-pr' && attempts.length === 2 && attempts.every(invocation => {
+          const evidence = invocation.evidence
+          const artifact = evidence?.artifact as Record<string, unknown> | null | undefined
+          const argv = invocation.request.argv
+          return invocation.state === 'settled' && !!invocation.callId && invocation.actor === decision.actor
+            && invocation.model === selected.model && invocation.slot === selected.slot
+            && invocation.request.context?.head === observation.pull?.head
+            && invocation.request.context?.reviewRevision === observation.pull?.reviewRevision
+            && argv.includes('--expected-issue-revision') && argv[argv.indexOf('--expected-issue-revision') + 1] === observation.issue.revision
+            && evidence?.status === 'failed' && evidence.action === 'not_started' && evidence.outcome === 'preflight_failed'
+            && evidence.error_code === 'atomic_work_execution_budget_exhausted'
+            && artifact?.phase === 'executing'
+            && [artifact.plan_sha, artifact.publication_head, artifact.replies_started, artifact.publication, artifact.result,
+              artifact.receipts, evidence.receipts, evidence.review_id, evidence.head_sha, evidence.publicationPlan,
+              evidence.publicationResume, evidence.publicationReceipt, evidence.nativeActionReceipt].every(value => value == null)
+            && resourceReleaseProven(evidence, true)
+        })
         const candidates = [selected.model, ...ordered.map((slot) => slots[slot])]
-        const model = candidates.find((identity) => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
+          .filter(identity => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
+        // Spend the existing final attempt on an alternate without changing its retry slot or basis.
+        const model = (exhausted ? candidates.find(identity => identity !== selected.model) : null) ?? candidates[0]
         if (!model || !claimReviewerTripProbe(model)) return null
-        const slot = stored === 'random' ? (MODEL_SLOTS.find((candidate) => slots[candidate] === model) ?? selected.slot) : selected.slot
+        const slot = stored === 'random' && !exhausted ? (MODEL_SLOTS.find((candidate) => slots[candidate] === model) ?? selected.slot) : selected.slot
         return { slot, model, recovery: model }
       },
       async prepare(identities) {
