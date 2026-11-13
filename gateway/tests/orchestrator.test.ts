@@ -644,6 +644,28 @@ describe('image upgrades', () => {
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
   })
 
+  it.each([false, true])('replaces with retained cleanup after live Caller work ends (Chat reaches deadline: %s)', async (chatWaits) => {
+    await start({ env: { POISE_DRAIN_TIMEOUT: '1' } })
+    const before = h.docker.containers.get('poise-ws-alice')?.id
+    const hold = { callId: 'a'.repeat(32), reason: 'Original native resource handle is unavailable', retainedCalls: 1 }
+    Object.assign(h.workspace.health, { activeChatTurns: Number(chatWaits), unsettledNativeCalls: 2,
+      backgroundWork: 2, runningCallerCalls: 1, nativeCleanupHold: hold })
+    const upgrade = h.orchestrator.upgradePass()
+    await waitFor(() => h.workspace.health.draining || events(h.logs, 'workspace.upgrade.native-pending').length > 0, 'a replacement decision')
+    expect(h.workspace.health.draining).toBe(true)
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(before)
+    Object.assign(h.workspace.health, { unsettledNativeCalls: 1, backgroundWork: 1, runningCallerCalls: 0 })
+    await upgrade
+
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+    expect(h.workspace.health.nativeCleanupHold).toEqual(hold)
+    expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(0)
+    expect(events(h.logs, 'workspace.drain.timeout')).toHaveLength(chatWaits ? 1 : 0)
+    expect(h.logs.find(entry => entry.event === 'workspace.upgrade.cleanup-retained')).toMatchObject({
+      callId: hold.callId, retainedCalls: 1,
+    })
+  })
+
   it('notices a drain lifted while it waits instead of silently draining again', async () => {
     await start({ drainRenewMs: 200 })
     h.workspace.health.runningCallerCalls = 1

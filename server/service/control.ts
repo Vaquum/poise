@@ -179,7 +179,7 @@ export class ServiceControl {
       activeChatTurns,
       runningCallerCalls: calls.count,
       unsettledNativeCalls: calls.known ? calls.pendingResources : null,
-      ...(cleanupHold && { nativeCleanupHold: { callId: cleanupHold.callId,
+      ...(cleanupHold && { nativeCleanupHold: { ...cleanupHold,
         reason: cleanupHold.reason === null ? null : redact(cleanupHold.reason, environmentSecrets()).slice(0, 2000) } }),
       backgroundWork,
       // Never idle while Caller's records cannot be read: calls an earlier server started may still run.

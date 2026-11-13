@@ -1029,24 +1029,21 @@ the workspace refuses new Chat turns and agent launches, which then answer
 that Poise is installing an update, and lets running work finish. One Chat
 turn holds the drain at most 30 minutes: past that the workspace stops it
 with a notice in its transcript, naming the update, and the agent keeps its
-context for the next prompt. Once an admitted drain reports the workspace idle
-the gateway recreates the container on the new image with the same home volume;
-past `POISE_DRAIN_TIMEOUT` seconds (90 minutes by default), cutting confirmed
-busy work requires a fresh admitted drain reporting zero unsettled native Calls,
-Caller processes and background operations, including launches before registration.
-Pending or unknown native cleanup, an older busy answer without that count, or
-an unreachable workspace defers replacement and releases the drain for the next
-pass (`workspace.upgrade.aborted`, `workspace.upgrade.native-pending`). This keeps
-the original cleanup witnesses alive. Older workspaces can still upgrade when
-cooperatively idle. Abrupt container loss without original cleanup proof keeps
-the disk and reservation held; a restart cannot prove reclamation.
-Pending or unknown native cleanup without a live Caller releases the drain
-immediately. A recorded terminal cleanup failure also releases the drain if
-other Caller work is active. Before requesting a replacement drain, the gateway
-reads health and defers when it reports a terminal cleanup hold. The gateway
-logs the blocking Call and its available reason and retries resume while health
-still shows an admitted drain. Ordinary maintenance continues to retry cleanup
-between passes and across gateway restarts.
+context for the next prompt. After a fresh admitted drain confirms the workspace
+is idle, the gateway recreates it on the new image with the same home volume.
+A terminal cleanup failure can carry across replacement once Caller has
+recorded that the original process namespace is empty. The original Call,
+disk and reservation stay held. The gateway logs the retained cleanup with
+`workspace.upgrade.cleanup-retained`. Past `POISE_DRAIN_TIMEOUT` seconds
+(90 minutes by default), cutting confirmed busy work requires a fresh admitted
+drain with no Caller processes, background operations or other unsettled native
+Calls. This includes launches before Call registration.
+Cleanup without that process proof, unreadable cleanup records and unconfirmed
+drains defer replacement and release the drain (`workspace.upgrade.aborted`,
+`workspace.upgrade.native-pending`). An older workspace can still upgrade
+when it reports cooperative idle. When a hold blocks replacement, the gateway
+logs the Call and its available reason and retries resume while health still
+shows an admitted drain. Existing maintenance continues to retry cleanup.
 After starting the replacement the gateway
 waits for its health before declaring the upgrade finished, within the two-minute
 idle-to-ready bound; past it the miss is recorded (`workspace.upgrade.ready.missed`),
@@ -1103,7 +1100,7 @@ one drained first, a stopped one without starting it. It may be at most
 The optional [native behavior budgets and reservations](../gateway/README.md)
 also pass from `deploy/.env` to each workspace. Configure both values for every
 bounded dimension. Applying an addition, change or removal uses that same
-cooperative replacement and preserves unsettled native work. Unset budgets
+replacement drain and retains original cleanup records. Unset budgets
 remain unbounded; existing invocation ceilings never change in place.
 
 ## Backups

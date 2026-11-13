@@ -670,8 +670,10 @@ assertion may only resume, and anything else is refused with 403):
   - Optional `nativeCleanupHold` identifies one terminal Call with a recorded
     cleanup failure from that same snapshot. It exposes `callId` and a bounded,
     redacted `reason`, which is `null` while a retry owns the claim and has yet
-    to record its result. Before requesting a replacement drain, the gateway
-    defers on a hold in fresh health, including on its first pass after restart.
+    to record its result. If every reported cleanup failure has a terminal Call
+    and durable settlement of its original process namespace, `retainedCalls`
+    counts those failures. The gateway can carry that cleanup across replacement
+    after a fresh drain confirms no other blocking work.
   - `backgroundWork` counts everything else a restart would cut: the Chat
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),
@@ -680,8 +682,7 @@ assertion may only resume, and anything else is refused with 403):
     count and pending-resource count use one bounded read transaction. Unknown
     cleanup records keep `idle` false. Cleanup continues on the existing
     one-minute maintenance opportunity while admissions and behavior ticks are
-    paused, so an ordinary drain preserves original supervisor witnesses until
-    their durable cleanup acknowledgement.
+    paused.
 - `POST /api/service/config` takes `{ repairExhaustionRepositories }`, a string
   of explicit comma-separated `owner/repo` names up to 8 KiB or empty to disable
   reporting, persists it in the workspace metadata store and returns health (200).
@@ -697,18 +698,18 @@ assertion may only resume, and anything else is refused with 403):
   unless it is renewed: while the gateway polls health it re-POSTs
   `/api/service/drain` at least every 5 minutes. One `POISE_DRAIN_TIMEOUT`
   budget (default 5400, 90 minutes) covers the whole workspace operation: every
-  drain, recheck and re-drain. Once an admitted drain reports `idle` the gateway
-  recreates the container. Past the budget, cutting confirmed busy work requires
-  a fresh admitted drain answer with `unsettledNativeCalls: 0` and no Caller or
-  background work. This covers launches still before their Call registration.
-  Positive, null or missing native counts, unreachable workspaces and unconfirmed drain answers
-  abort replacement, preserving the original supervisor's cleanup witnesses and
-  releasing its drain for the next pass (`workspace.upgrade.aborted`). While it
-  has pending or unknown native cleanup but no live Caller, it defers immediately
-  and releases the drain without activation or waiting out the deadline. Existing
-  maintenance retries cleanup independently; a permanent hold cannot keep Chat
-  continuously drained across upgrade passes. While waiting for live work, the gateway
-  logs `workspace.drain.waiting` at each renew with the counters and the
+  drain, recheck and re-drain. The gateway recreates the container after an
+  admitted drain reports `idle`, or when retained cleanup accounts for every
+  unsettled Call and background operation and no Chat turn or Caller is running.
+  Past the budget, cutting confirmed busy work requires a fresh admitted drain
+  with no Caller, other native cleanup or other background operations, including
+  launches before Call registration. Cleanup without settled process proof and
+  unreadable or unconfirmed answers defer replacement. The gateway releases
+  the drain for the next pass (`workspace.upgrade.aborted`). When pending
+  cleanup blocks replacement and no Caller is live, it releases the drain
+  immediately. Existing maintenance retries cleanup independently. While
+  waiting for live work, the gateway logs `workspace.drain.waiting` at each renew
+  with the counters and the
   time left, `workspace.drain.lifted` when a drain it saw on is gone while the
   workspace still isn't idle, and `workspace.drain.timeout` with the last known
   counters. After starting the replacement the gateway waits for its health before
@@ -725,9 +726,9 @@ assertion may only resume, and anything else is refused with 403):
   - One Chat turn holds a refusing drain at most 30 minutes: past that the
     drain stops it through the person's Stop path, with a transcript notice
     naming the update, and the agent keeps its context for the next prompt.
-    `idle` still means nothing a restart would cut; it follows once the
-    stopped turn settles. Past the gateway's own timeout, confirmed busy work
-    can be cut only after native cleanup is positively clear. Older workspaces
+    `idle` follows once the stopped turn settles and the other health counters
+    clear. Past the gateway's own timeout, confirmed busy work can be cut
+    once the only native cleanup is eligible for retention. Older workspaces
     without the native count still upgrade when cooperatively idle; they cannot
     authorize a forced busy replacement.
   - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
@@ -1543,11 +1544,11 @@ directory before another request runs. Handle closure follows this positive
 proof; its first certificate survives a cleanup
 worker's death before the Caller receipt commits. Private claim attempts never
 enter journal evidence. A new container or lost supervisor without retained
-positive proof remains held, with its disk and reservation retained. Managed
-replacement uses the existing service drain to finish native cleanup before
-destroying those witnesses. Neither a forced restart nor a changed inode after
-restart can authorize deletion or release; the abrupt-loss acceptance outcome
-is a visible hold, not reclaimed capacity.
+positive proof leaves the disk and reservation held. Managed replacement gives
+native cleanup its existing drain opportunity. A terminal Call with a recorded
+cleanup failure and original process settlement can retain its disk and
+reservation across replacement. Reclamation still requires the original
+positive proof.
 Before retrying registered child handles, each bounded cleanup pass commits
 coverage from verified original reclaimed ancestors. Coverage also runs after
 the pass's own reclamations, within the same 15-second budget. Later passes

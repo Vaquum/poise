@@ -41,7 +41,7 @@ export interface ServiceHealth {
   runningCallerCalls: number
   /** Missing on older workspaces; null when their native resource records are unreadable. */
   unsettledNativeCalls?: number | null
-  nativeCleanupHold?: { callId: string; reason: string | null }
+  nativeCleanupHold?: { callId: string; reason: string | null; retainedCalls?: number }
   backgroundWork: number
   /** True only when activeChatTurns, runningCallerCalls and backgroundWork are all 0. */
   idle: boolean
@@ -164,7 +164,12 @@ function parseHealth(text: string, what: string): ServiceHealth {
         || !('reason' in hold) || (hold.reason !== null && (typeof hold.reason !== 'string' || hold.reason.length > 2000))) {
       throw new WorkspaceAnswerError(`the workspace answered ${what} with an invalid native cleanup hold`)
     }
-    nativeCleanupHold = { callId: hold.callId, reason: hold.reason }
+    const retained = 'retainedCalls' in hold ? hold.retainedCalls : undefined
+    if (retained !== undefined && (typeof retained !== 'number' || !Number.isSafeInteger(retained)
+        || retained <= 0 || retained > nativeCalls || retained > value.backgroundWork)) {
+      throw new WorkspaceAnswerError(`the workspace answered ${what} with an invalid retained native cleanup count`)
+    }
+    nativeCleanupHold = { callId: hold.callId, reason: hold.reason, ...(retained !== undefined && { retainedCalls: retained }) }
   }
   return {
     ok: value.ok,
@@ -179,6 +184,22 @@ function parseHealth(text: string, what: string): ServiceHealth {
     switching: typeof value.switching === 'string' && value.switching ? value.switching : null,
     ...(value.repairExhaustionRepositories === undefined ? {} : { repairExhaustionRepositories: value.repairExhaustionRepositories }),
   }
+}
+
+function replacementHasNoCallerOrBackgroundWork(health: ServiceHealth): boolean {
+  const retained = health.nativeCleanupHold?.retainedCalls ?? 0
+  return health.unsettledNativeCalls === retained && health.backgroundWork === retained && health.runningCallerCalls === 0
+}
+
+function replacementIdle(health: ServiceHealth): boolean {
+  return health.idle || health.nativeCleanupHold?.retainedCalls !== undefined
+    && health.activeChatTurns === 0 && replacementHasNoCallerOrBackgroundWork(health)
+}
+
+function nativeCleanupBlocksReplacement(health: ServiceHealth): boolean {
+  const hold = health.nativeCleanupHold
+  return (hold !== undefined && hold.retainedCalls === undefined)
+    || (health.runningCallerCalls === 0 && (health.unsettledNativeCalls ?? Infinity) > (hold?.retainedCalls ?? 0))
 }
 
 /** A health or drain answer is a few hundred bytes; a workspace sending more is not read further. */
@@ -504,6 +525,7 @@ export class Orchestrator {
         this.reportedCleanup.delete(handle)
         return false
       }
+      if (!nativeCleanupBlocksReplacement(health)) return false
       this.notePendingCleanup(handle, health)
       if (health.draining) await this.releaseDrain(handle, login, 'original native cleanup remains held')
       return true
@@ -804,10 +826,12 @@ export class Orchestrator {
           // idle. A drain that timed out on confirmed busy work cuts it anyway; one that only timed out
           // or was never admitted aborts instead of recreating a slow workspace blind. A forced stop
           // additionally needs a fresh native-cleanup zero below; lost witnesses cannot be recovered.
+          let retainedCleanup: ServiceHealth['nativeCleanupHold']
           if (running && drainedIdle) {
             this.upgradingPhase = 'recheck'
             const recheck = await this.idleUnderDrain(handle, login)
             this.upgradingPhase = 'upgrade'
+            retainedCleanup = recheck.retainedCleanup
             if (!recheck.idle) {
               // The recheck observed drain state too: an answer showing the drain off un-admits at
               // once, so a later silent round cannot preserve a stale admission into a forced stop.
@@ -833,10 +857,13 @@ export class Orchestrator {
                 unsettledNativeCalls: fresh.unsettledNativeCalls ?? null })
               return 'abort-unknown'
             }
+            retainedCleanup = fresh.retainedCleanup
           }
           this.ready.delete(handle)
           let stoppedAt = 0
           if (running) {
+            if (retainedCleanup) this.deps.log.warn('workspace.upgrade.cleanup-retained', { handle, callId: retainedCleanup.callId,
+              cleanupReason: retainedCleanup.reason, retainedCalls: retainedCleanup.retainedCalls })
             await docker.stopContainer(container)
             stoppedAt = this.deps.now()
             this.lifecycle('workspace.container.stopped', handle, { reason: 'upgrade' })
@@ -927,7 +954,7 @@ export class Orchestrator {
    * reports the drain as this answer showed it, so the caller learns a lost admission even when the
    * recheck cannot proceed; null when nothing observed it.
    */
-  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean; draining: boolean | null; unsettledNativeCalls?: number | null; nativeIdle?: boolean }> {
+  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean; draining: boolean | null; unsettledNativeCalls?: number | null; nativeIdle?: boolean; retainedCleanup?: ServiceHealth['nativeCleanupHold'] }> {
     try {
       const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
       // The recheck is the last gate before the stop: only an idle answer behind an applied drain lets
@@ -938,10 +965,10 @@ export class Orchestrator {
           activeChatTurns: health.activeChatTurns, runningCallerCalls: health.runningCallerCalls, backgroundWork: health.backgroundWork })
         return { idle: false, unknown: true, down: false, draining: health.ok ? health.draining : null }
       }
-      return { idle: health.idle, unknown: false, down: false, draining: true,
+      return { idle: replacementIdle(health), unknown: false, down: false, draining: true,
         // An admitted tick/launch can still be between spawn and Call registration.
-        nativeIdle: health.unsettledNativeCalls === 0 && health.runningCallerCalls === 0 && health.backgroundWork === 0,
-        unsettledNativeCalls: health.unsettledNativeCalls }
+        nativeIdle: replacementHasNoCallerOrBackgroundWork(health), unsettledNativeCalls: health.unsettledNativeCalls,
+        retainedCleanup: health.nativeCleanupHold?.retainedCalls === undefined ? undefined : health.nativeCleanupHold }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       this.deps.log.warn('workspace.drain.recheck.failed', { handle, error: errorMessage(error) })
@@ -1026,8 +1053,7 @@ export class Orchestrator {
     }
     // Original cleanup may be permanently held after controller loss. It must not subject Chat
     // to a full drain deadline on every upgrade pass; existing maintenance can retry without it.
-    const pendingCleanup = (health: ServiceHealth): boolean => !health.idle
-      && (health.nativeCleanupHold !== undefined || (health.unsettledNativeCalls !== 0 && health.runningCallerCalls === 0))
+    const pendingCleanup = (health: ServiceHealth): boolean => !health.idle && nativeCleanupBlocksReplacement(health)
     const waiting = (health: ServiceHealth): void => {
       log.info('workspace.drain.waiting', {
         handle,
@@ -1088,7 +1114,7 @@ export class Orchestrator {
       } else {
         this.lifecycle('workspace.drain.requested', handle, counts(health))
         note(health)
-        if (health.idle) return done(true)
+        if (replacementIdle(health)) return done(true)
         if (pendingCleanup(health)) return done(false, health)
       }
     } catch (error) {
@@ -1110,7 +1136,7 @@ export class Orchestrator {
             if (!admitted) this.lifecycle('workspace.drain.requested', handle, counts(health))
             note(health)
             if (pendingCleanup(health)) return done(false, health)
-            if (health.idle) {
+            if (replacementIdle(health)) {
               this.lifecycle('workspace.drain.idle', handle)
               return done(true)
             }
@@ -1123,7 +1149,7 @@ export class Orchestrator {
           if (health.ok && health.draining && pendingCleanup(health)) return done(false, health)
           // Idle behind an applied drain finishes; idle without one waits for a renewal to admit.
           // A lifted drain re-applies on renewal, so waiting costs one renew cycle, never safety.
-          if (health.ok && health.idle && health.draining) {
+          if (health.ok && replacementIdle(health) && health.draining) {
             this.lifecycle('workspace.drain.idle', handle)
             return done(true)
           }

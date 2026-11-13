@@ -116,13 +116,13 @@ describe('service health', () => {
     const records = join(root, 'native-cleanup-records')
     await mkdir(records, { recursive: true })
     const database = new Database(join(records, 'calls.sqlite3'))
-    database.exec('create table calls (id text, status text, pid integer, runner text, source text, resources_settled_at real, resource_cleanup text)')
-    const insert = database.prepare('insert into calls values (?,?,?,?,?,?,?)')
+    database.exec('create table calls (id text, status text, pid integer, runner text, source text, resources_settled_at real, resource_cleanup text, resource_ownership text, correlation_id text)')
+    const insert = database.prepare('insert into calls values (?,?,?,?,?,?,?,?,?)')
     const heldId = 'a'.repeat(32)
     const claim = { token: 'private-cleanup-token', failures: 2, last_error: 'Original handle missing: Bearer sample-credential' }
-    insert.run(heldId, 'failed', null, null, 'poise:behavior-chain', null, JSON.stringify(claim))
-    insert.run('fenced', 'superseded', null, null, 'poise:behavior-chain', 1, null)
-    insert.run('chat', 'failed', null, 'external', 'poise:chat', null, null)
+    insert.run(heldId, 'failed', null, null, 'poise:behavior-chain', null, JSON.stringify(claim), null, 'review-1')
+    insert.run('fenced', 'superseded', null, null, 'poise:behavior-chain', 1, null, null, null)
+    insert.run('chat', 'failed', null, 'external', 'poise:chat', null, null, null, null)
     vi.stubEnv('AGENT_INTERFACE_DATA_DIR', records)
     vi.stubEnv('POISE_MODE', 'service')
     try {
@@ -141,8 +141,27 @@ describe('service health', () => {
         expect(service.health()).toMatchObject({ repairExhaustionRepositories: repositories, draining: true, unsettledNativeCalls: 1, idle: false })
         expect(readHeld.get(heldId)).toEqual(original)
       }
+      const setOwnership = database.prepare('update calls set resource_ownership=? where id=?')
+      const namespace = { state: 'settled', callId: heldId, correlation: 'review-1', settled_at: 1 }
+      setOwnership.run(JSON.stringify({ version: 2, process_pending: true, namespace }), heldId)
+      expect(service.health().nativeCleanupHold).toEqual(hold)
+      setOwnership.run(JSON.stringify({ version: 2, process_pending: false, namespace }), heldId)
+      const unsettled = readHeld.get(heldId)
+      const retainedHold = { ...hold, retainedCalls: 1 }
+      expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, nativeCleanupHold: retainedHold, backgroundWork: 1, idle: false })
+      expect(readHeld.get(heldId)).toEqual(unsettled)
+
+      const otherId = 'b'.repeat(32)
+      insert.run(otherId, 'failed', null, null, 'poise:behavior-chain', null, JSON.stringify(claim), null, 'review-2')
+      expect(service.health()).toMatchObject({ unsettledNativeCalls: 2, nativeCleanupHold: { ...hold, callId: otherId } })
+      expect(service.health().nativeCleanupHold?.retainedCalls).toBeUndefined()
+      setOwnership.run(JSON.stringify({ version: 2, process_pending: false,
+        namespace: { ...namespace, callId: otherId, correlation: 'review-2' } }), otherId)
+      expect(service.health()).toMatchObject({ unsettledNativeCalls: 2, nativeCleanupHold: { ...hold, retainedCalls: 2 } })
+      database.prepare('delete from calls where id=?').run(otherId)
+
       database.prepare('update calls set resources_settled_at=1 where id=?').run(heldId)
-      expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, nativeCleanupHold: hold, backgroundWork: 1, idle: false })
+      expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, nativeCleanupHold: retainedHold, backgroundWork: 1, idle: false })
       database.prepare('update calls set resource_cleanup=null where id=?').run(heldId)
       expect(service.health()).toMatchObject({ unsettledNativeCalls: 0, backgroundWork: 0, idle: true, draining: true })
       expect(service.health().nativeCleanupHold).toBeUndefined()
