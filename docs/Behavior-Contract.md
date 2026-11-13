@@ -612,13 +612,20 @@ time, Today, Yesterday, and This week filter all three metrics by run start,
 using the timezone in Settings, independently of Current. On Overview they
 follow the day chosen at the top right instead, like the day's numbers. These filters do not change settings,
 notifications, or Last triggered. Live runs contribute elapsed time but are
-excluded from success rate; no finished runs shows a dash.
+excluded from success rate. Where a value cannot exist, the cell says why in
+words: *no runs*, or *none finished* while every run is still live or
+interrupted.
 
 Agent metrics use only automatic runs with the matching behavior and Poise
-source. A failed log read withholds agent metrics; a quarantined row withholds
-only the behavior and start-time window it could affect. Missing provenance
-stays conservative, and conflicting duplicate identities cannot escape through
-contradictory scope hints. Unavailable metrics remain unknown, never zero.
+source. A failed log read withholds agent metrics. A quarantined row counts as a
+run when Caller still reads its behavior, source, status and start: damage to
+its JSON columns (diagnostic, artifact, progress) leaves those intact, and the
+row's end, when it reads, times it. A quarantined row missing any of them, or
+sharing a readable row's identity, withholds only the behavior and start-time
+window it could affect, and that row says *unknown: some of its run records
+cannot be read*. Missing provenance stays conservative, and conflicting
+duplicate identities cannot escape through contradictory scope hints.
+Unavailable metrics remain unknown, never zero.
 Historical Caller v1 diagnostics may omit outcome, stderr or truncation facts;
 these read as null, retaining submission uncertainty and the failed lifecycle.
 Present malformed fields and unsupported versions remain quarantined. Diagnostic
@@ -629,9 +636,9 @@ unavailable. Eligibility checks and resolution polls that change no conversation
 are excluded. Safe no-write merge/rerun/close receipts count as successful executions;
 errors count as failures. A direct run whose owner died without finishing
 closes as interrupted with its completion unknown: it stays out of the
-success rate and its duration stays unknown. Durations use explicit units, such
-as `6s`, `8m 30s` or `4h`; a known zero is `0s`, and an unknown duration shows a
-dash. The ledger uses indexed
+success rate, and its duration is never guessed. Time adds the runs whose
+duration is known and says how many are untimed (`+ 6 untimed`). Durations use
+explicit units, such as `6s`, `8m 30s` or `4h`; a known zero is `0s`. The ledger uses indexed
 time windows and cached database aggregates; unchanged refreshes do not scan its
 history. Narrow windows scroll the table without compressing its controls.
 

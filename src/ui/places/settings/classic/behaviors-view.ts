@@ -43,7 +43,8 @@ function metricCells(key: BehaviorKey): string {
   const format = (value: number | null | undefined, decimals = 0) => value == null ? '—'
     : value.toLocaleString(undefined, { maximumFractionDigits: decimals })
   const minutes = metrics?.durationMinutes
-  const duration = minutes === 0 ? '0s' : formatShortDuration(minutes == null ? null : minutes * 60_000)
+  const untimed = metrics?.untimedRuns ? ` + ${metrics.untimedRuns.toLocaleString()} untimed` : ''
+  const duration = `${minutes === 0 ? '0s' : formatShortDuration(minutes == null ? null : minutes * 60_000)}${untimed}`
   return `<td class="behavior-metric behavior-metrics-start" title="${escapeHtml(note)}">${format(metrics?.totalRuns)}</td>
     <td class="behavior-metric" title="${escapeHtml(note)}">${duration}</td>
     <td class="behavior-metric" title="${escapeHtml(note)}">${metrics?.successRate == null ? '—' : `${format(metrics.successRate, 1)}%`}</td>`

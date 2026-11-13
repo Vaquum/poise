@@ -146,6 +146,36 @@ describe('organization data aggregation', () => {
   })
 })
 
+describe('repository lists kept across restarts', () => {
+  it('answers a picker from the list kept before a restart and reads it again behind; validation and older lists wait for GitHub', async () => {
+    let names = ['alpha/fresh']
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    mocks.runFile.mockImplementation(async () => { await gate; return { stdout: JSON.stringify({ repos: names.map((full_name) => ({ full_name })) }), stderr: '' } })
+    // Kept by an earlier process, after the organizations last changed here.
+    mocks.meta['repo_list:octocat:alpha'] = JSON.stringify({ repos: ['alpha/kept'], at: Date.now() + 1 })
+    expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/kept'])
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    release()
+    await vi.waitFor(async () => expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/fresh']))
+    // A changed list is kept for the next restart; an unchanged one is not written again.
+    const setMeta = (await import('../server/db')).setMeta as unknown as ReturnType<typeof vi.fn>
+    expect(setMeta).toHaveBeenCalledWith('repo_list:octocat:alpha', expect.stringContaining('"repos":["alpha/fresh"]'))
+    // A list kept before the organizations changed here, or outside the organization, is never shown.
+    invalidateRepoListCache()
+    mocks.meta['repo_list:octocat:alpha'] = JSON.stringify({ repos: ['alpha/old'], at: Date.now() - 1 })
+    names = ['alpha/fresh', 'alpha/new']
+    expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/fresh', 'alpha/new'])
+    invalidateRepoListCache()
+    mocks.meta['repo_list:octocat:alpha'] = JSON.stringify({ repos: ['beta/other'], at: Date.now() + 1 })
+    expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/fresh', 'alpha/new'])
+    // Validation never takes a kept list.
+    invalidateRepoListCache()
+    mocks.meta['repo_list:octocat:alpha'] = JSON.stringify({ repos: ['alpha/kept'], at: Date.now() + 1 })
+    expect(await listOrgRepos('alpha')).toEqual(['alpha/fresh', 'alpha/new'])
+  })
+})
+
 describe('the accounts GitHub is read as', () => {
   it('answers a picker from the last repository list once it is old and reads it again behind; validation waits for a fresh one', async () => {
     vi.useFakeTimers({ now: Date.parse('2026-11-13T05:00:00Z'), toFake: ['Date'] })

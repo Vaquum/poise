@@ -1,10 +1,14 @@
-import { EventEmitter } from 'node:events'
+import { spawn } from 'node:child_process'
+import { EventEmitter, once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { build } from 'esbuild'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FAILED_START_MS, openNamespaceWitness, supervisor, UPDATE_EXIT_CODE } from '../deploy/runtime/supervisor.mjs'
+import { gatewayKeys, serviceEnvironment } from './service-fixture'
 
 // The workspace supervisor (deploy/runtime/supervisor.mjs): which release it
 // runs, how it switches without stopping the container, and what it does
@@ -246,3 +250,91 @@ it('records a release fallback without changing the selected release or failed m
     context: { elapsedMs: 2000, startupWindowMs: FAILED_START_MS, fallbackRelease: 'r1' } })
   instance.stop('SIGTERM'); started[1].child.exit(0); await running
 })
+
+it('serves the installed build before the 600-second verifier deadline during an active monitor sweep', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'poise-release-handover-'))
+  const home = join(root, 'home')
+  const releases = join(home, '.poise', 'releases')
+  const previous = '0'.repeat(40), target = '1'.repeat(40)
+  const children = []
+  let logs = ''
+  const reservation = createServer()
+  await new Promise(resolve => reservation.listen(0, '127.0.0.1', resolve))
+  const address = reservation.address()
+  if (!address || typeof address === 'string') throw new Error('fixture needs a TCP port')
+  const port = address.port
+  await new Promise(resolve => reservation.close(() => resolve()))
+  for (const release of [previous, target]) {
+    const poise = join(releases, release, 'poise')
+    await mkdir(poise, { recursive: true })
+    await symlink(resolve('node_modules'), join(poise, 'node_modules'), 'dir')
+    await writeFile(join(releases, release, 'base'), 'handover-base')
+    await writeFile(join(releases, release, 'installed'), '')
+    await build({ entryPoints: ['tests/fixtures/service-release-handover.ts'], bundle: true,
+      platform: 'node', format: 'esm', packages: 'external', outfile: join(poise, 'server.mjs'),
+      define: { __POISE_BUILD_SHA__: JSON.stringify(release) }, logLevel: 'silent' })
+  }
+  const instance = supervisor({ home, base: 'handover-base', nativeControlFactory: null,
+    image: { name: previous, poise: join(releases, previous, 'poise'), venv: join(root, 'venv') },
+    env: { ...process.env, ...serviceEnvironment(gatewayKeys()), HOME: home, POISE_PORT: String(port),
+      POISE_DB: join(home, 'cache.db'), POISE_LOCK_DIR: join(home, 'locks'),
+      AGENT_INTERFACE_DATA_DIR: join(home, 'caller') },
+    start: (release, env) => {
+      const child = spawn(process.execPath, [join(release.poise, 'server.mjs')], { cwd: release.poise, env, stdio: ['ignore', 'pipe', 'pipe'] })
+      child.stdout?.on('data', chunk => { logs += chunk })
+      child.stderr?.on('data', chunk => { logs += chunk })
+      children.push(child)
+      return child
+    }, log: () => {},
+  })
+  const running = instance.run()
+  const origin = `http://127.0.0.1:${port}`
+  const get = async (path) => (await fetch(`${origin}${path}`)).json()
+  const waitFor = async (check) => {
+    const deadline = Date.now() + 20_000
+    for (;;) {
+      let ready = false
+      try { ready = await check() } catch (error) {
+        if (!(error instanceof TypeError)) throw error // A restarting HTTP listener is temporarily unreachable.
+      }
+      if (ready) return
+      if (Date.now() > deadline) throw new Error(`release handover did not settle: ${logs}`)
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+  }
+  try {
+    await waitFor(async () => (await get('/evidence')).reading === true)
+    const bindings = (await get('/evidence')).bindings
+    const requestedAt = Date.now()
+    const switched = await fetch(`${origin}/api/service/switch`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ release: target }) })
+    expect(switched.status).toBe(202)
+    // New control ticks remain due while the first admitted unit is held.
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    expect(await get('/api/service/health')).toMatchObject({ release: previous, version: previous,
+      switching: target, activeChatTurns: 0, switchWaitingOn: '1 background operation' })
+    expect(children).toHaveLength(1)
+    await get('/finish-read')
+    await waitFor(async () => {
+      const health = await get('/api/service/health')
+      return health.release === target && health.version === target && health.switching === null
+    })
+    expect(Date.now() - requestedAt).toBeLessThan(600_000)
+    expect(children).toHaveLength(2)
+    await waitFor(async () => (await get('/evidence')).observations.every((row) => row !== null))
+    const evidence = await get('/evidence')
+    expect(evidence.bindings).toEqual(bindings)
+    expect(evidence.observations[0].fingerprint).toBeTruthy()
+    // The original observation survived, so adoption never re-reads that unit.
+    expect((await readFile(join(home, 'reads'), 'utf8')).trim().split('\n')).toEqual(['1', '2', '3'])
+  } finally {
+    instance.stop('SIGTERM')
+    await Promise.all(children.filter(child => child.exitCode === null && child.signalCode === null).map(async child => {
+      const exited = once(child, 'exit')
+      child.kill('SIGTERM')
+      await exited
+    }))
+    await running
+    await rm(root, { recursive: true, force: true })
+  }
+}, 60_000)

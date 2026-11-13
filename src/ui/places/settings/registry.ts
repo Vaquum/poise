@@ -187,6 +187,28 @@ export const SETTINGS: Registry = {
     'set.devices': { name: 'Paired computers', kind: 'Setting', what: 'Computers whose Poise Link may reach this workspace.', now: nowOf, source: 'The gateway.' },
     'set.device.row': { name: 'Paired computer', kind: 'Display', what: 'A computer running Poise Link, when it was paired, and whether it is connected now.', now: itemNow },
     'set.device.revoke': { name: 'Revoke', kind: 'Action', what: 'Stops this computer from reaching the workspace.', when: 'After you confirm with “Sure?”; Undo stays for eight seconds.', unchanged: 'Snippets already on that computer.' },
+    'set.phone': {
+      name: 'Sign in on your phone', kind: 'Setting', what: 'Signs your phone in to this Poise as you, with no password: scan a code with the phone’s camera, then approve the phone here.',
+      does: 'The phone gets a sign-in of its own; this browser’s stays as it is.', source: 'The gateway, which checks each code and signs the phone in.'
+    },
+    'set.phone.show': {
+      name: 'Show the code', kind: 'Action', what: 'Shows a QR code for your phone’s camera.',
+      when: 'Each code works once, for two minutes. While it is shown it is replaced before it expires, for about ten minutes; then it says it expired, with Show a new code.'
+    },
+    'set.phone.code': { name: 'Code', kind: 'Display', what: 'The QR code your phone’s camera opens. Opening it does not sign the phone in: it asks you to approve it here first.' },
+    'set.phone.hide': { name: 'Hide the code', kind: 'Action', what: 'Takes the code off the screen.', unchanged: 'A phone that already opened it still waits for you here, and the code stops working when it expires.' },
+    'set.phone.request': { name: 'Phone waiting', kind: 'Display', what: 'The device that opened the code, by its kind and browser, waiting for you to approve or deny it.' },
+    'set.phone.approve': {
+      name: 'Approve', kind: 'Action', what: 'Signs this phone in as you.', does: 'Approve only a phone you are holding: anyone who photographed the code could open it too.',
+      shows: 'Signing in…, then signed in, and the phone at the top of Phones signed in with a code.'
+    },
+    'set.phone.deny': { name: 'Deny', kind: 'Action', what: 'Refuses this phone. It is not signed in, and the code no longer works.' },
+    'set.phones': { name: 'Phones signed in with a code', kind: 'Setting', what: 'The phones signed in by scanning a code, each until it signs out, you sign it out here, or its sign-in ends after 14 days.', source: 'The gateway.' },
+    'set.phone.row': { name: 'Signed-in phone', kind: 'Display', what: 'A phone signed in with a code: its kind and browser, and when.', now: itemNow },
+    'set.phone.sign-out': {
+      name: 'Sign out', kind: 'Action', what: 'Signs this phone out of Poise at once.', when: 'After you confirm with “Sure?”.',
+      unchanged: 'Your other sign-ins, this browser’s included.'
+    },
     'set.ssh': { name: 'SSH keys', kind: 'Setting', what: 'The keys in ~/.ssh on your workspace: each private key file by name, with its public key’s fingerprint.', now: nowOf, scope: 'This workspace. ssh uses them, and so do chats’ shell commands when you ask for work on your servers.', source: 'The public key files in ~/.ssh. Poise never opens a private key file, so a private key cannot leave the workspace through Poise.' },
     'set.ssh.row': { name: 'SSH key', kind: 'Display', what: 'A key file in ~/.ssh, with its public key’s SHA256 fingerprint.', now: itemNow, values: [['Ready', 'ssh can use it.'], ['No public key', 'Its .pub is missing, and the row says how to derive it; or the .pub holds no readable key.'], ['Public key only', 'A .pub with no private file beside it.'], ['ssh refuses it', 'Its permissions let others read it; the row gives the fix, chmod 600.']] },
     'set.ssh.add': { name: 'Add an SSH key', kind: 'Action', what: 'Opens a terminal that asks for a file name and the private key, which you paste. Nothing shows while you paste.', does: 'Saves it in ~/.ssh with 0600, keeps ~/.ssh at 0700, and derives its public key.', unchanged: 'Existing files, which are never overwritten. A key ssh-keygen refuses is not kept.', shows: 'The new key first in the list, with its fingerprint.', unavailable: why('A terminal is open; finish or close it first.') },
