@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -485,6 +486,169 @@ def test_original_publication_boundary_reconciles_without_repeating_work(databas
         assert built.returncode == 0, built.stderr
         consumed = subprocess.run(["node", str(bundle), str(wire), scenario], cwd=repo, env=environment,
                                   capture_output=True, text=True, timeout=30)
+        assert consumed.returncode == 0, consumed.stderr
+
+
+@pytest.mark.parametrize("database", ["/dev/shm" if sys.platform == "linux" else None], indirect=True)
+@pytest.mark.parametrize("output,cleanup_error", [
+    ("git", False), ("git", True), ("git-signal", False), ("git-empty", False),
+    ("unsafe", False), ("absent", False), ("malformed", False), ("oversized", False), ("invalid-shape", False), ("cli-signal", False),
+])
+def test_publication_process_failure_survives_caller_cleanup_and_logging(database, tmp_path, monkeypatch, decode_failure, output, cleanup_error):
+    parent, candidate = "b" * 40, "c" * 40
+    private = "private-publication-output"
+    token = "test-private-token"
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    git = binaries / "git"
+    # Only the external Git/GitHub/provider transports are stand-ins. The
+    # publication runner, CLI, subprocess wrapper and durable receipts are real.
+    git.write_text(f"""#!{sys.executable}
+import os, signal, sys
+from pathlib import Path
+state = Path({str(database / 'committed')!r})
+if 'branch' in sys.argv: print('poise/issue-7')
+elif 'get-url' in sys.argv: print('https://github.com/example/repo.git')
+elif 'rev-parse' in sys.argv: print({candidate!r} if state.exists() else {parent!r})
+elif 'status' in sys.argv: print(' M seed.txt')
+elif 'commit' in sys.argv: state.touch()
+elif 'push' in sys.argv:
+    print({private!r})
+    if {output!r} != 'git-empty':
+        sys.stderr.write('fatal: original push rejected\\n' + {token!r} + '\\n' + sys.argv[4] + '\\nCookie: session=private-cookie\\n' + 'x' * 200000 + '\\nfinal push cause\\n')
+    if {output!r} == 'git-signal': os.kill(os.getpid(), signal.SIGTERM)
+    sys.exit(128)
+""")
+    git.chmod(0o700)
+    unsafe = {
+        "unsafe": private,
+        "absent": "",
+        "malformed": "caller_diagnostic: {" + private,
+        "oversized": "caller_diagnostic: " + json.dumps({"version": 1, "source": "caller", "severity": "error",
+            "operation": "push", "stderr": private * 10000}),
+        "invalid-shape": "caller_diagnostic: " + json.dumps({"version": 1, "source": "caller", "severity": "error",
+            "operation": "push", "stderr": private, "filesystem": []}),
+        "cli-signal": private,
+    }
+    pull = {"number": 3, "state": "open", "head": {"ref": "poise/issue-7", "sha": parent,
+            "repo": {"full_name": "example/repo"}}, "user": {"login": "author"}, "body": "<!-- poise-chain example/repo#7 -->"}
+    graph = {"repository": {"ref": {"target": {"oid": parent, "message": "fix: parent"}},
+        "defaultBranchRef": {"target": {"oid": parent}},
+        "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+    cli = binaries / "github-interface"
+    cli.write_text(f"""#!{sys.executable}
+import os, signal, sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from github_interface import cli
+from github_interface.behaviors import issue_work
+from github_interface.atoms.review_identity import work_publication
+async def get(path):
+    if path == '/repos/example/repo': return {{'full_name': 'example/repo', 'default_branch': 'main'}}
+    return {pull!r} if path.endswith('/pulls/3') else {{'state': 'open'}}
+client = SimpleNamespace(token={token!r}, get=AsyncMock(side_effect=get),
+    paginate=AsyncMock(return_value=[{pull!r}]), graphql=AsyncMock(return_value={graph!r}),
+    post=AsyncMock(side_effect=AssertionError('no GitHub write may follow a failed push')))
+async def publish(payload):
+    if {output.startswith('git')!r}: return await issue_work.run(client, payload)
+    work_publication({candidate!r})
+    sys.stdout.write({private!r})
+    sys.stderr.write({unsafe.get(output, '')!r})
+    sys.stderr.flush()
+    if {output!r} == 'cli-signal': os.kill(os.getpid(), signal.SIGTERM)
+    raise SystemExit(53)
+cli.issue_work = publish
+cli.main()
+""")
+    cli.chmod(0o700)
+    monkeypatch.setenv("PATH", str(binaries) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("GITHUB_INTERFACE_CLI", str(cli))
+    monkeypatch.setenv("HOME", str(database))
+    original_interface, original_track = issue_review.interface, api.track
+    original_check, cleanup_seen = ownership.process_check, []
+
+    def track(*args, **kwargs):
+        with patch.object(api, "_native_cli", False):
+            return original_track(*args, **kwargs)
+
+    def interface(*args, **kwargs):
+        if args[0] == "--pr-review":
+            return {"review_threads": [{"root_comment_id": 17, "is_resolved": False}]}
+        if args[0] != "--issue-work":
+            return {}
+        mode = args[args.index("--mode") + 1]
+        if mode == "publish":
+            return original_interface(*args, **kwargs)
+        if mode == "prepare":
+            Path(args[args.index("--path") + 1]).mkdir()
+        return {"outcome": "prepared" if mode == "prepare" else "validated", "checkout_head": parent}
+
+    def worker(_lease, _args, **kwargs):
+        (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+            "commitMessage": "fix: seed", "title": "fix: seed", "body": "Concrete seed change",
+            "replies": [{"commentId": 17, "body": "Fixed the finding"}], "blocked": None}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def process_check(path, call_id, *, complete=False):
+        with api.db() as conn:
+            raw = conn.execute("select diagnostic from calls where id=?", (call_id,)).fetchone()[0]
+        if cleanup_error and raw and not cleanup_seen:
+            assert json.loads(raw)["operation"] == "push", "original cause must be committed before cleanup"
+            cleanup_seen.append(True)
+            raise RuntimeError("later cleanup " + private)
+        return original_check(path, call_id, complete=complete)
+
+    monkeypatch.setattr(api, "track", track)
+    monkeypatch.setattr(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _: SimpleNamespace(identity="fixture", provider="codex")))
+    monkeypatch.setattr(issue_review, "interface", interface)
+    monkeypatch.setattr(issue_review, "packet", lambda *args: {"issue": {"state": "open"}})
+    monkeypatch.setattr(issue_review, "command", lambda *args: (["fixture"], "", {}))
+    monkeypatch.setattr(issue_review, "stop_leftovers", lambda *args: None)
+    monkeypatch.setattr(issue_review, "_cwd_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(api.atomic_work.checkout_lock, "Lease", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(api.atomic_work.checkout_lock, "run_gated", worker)
+    monkeypatch.setattr(ownership, "process_check", process_check)
+    monkeypatch.setattr(api, "_main", lambda: api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
+        "original-native", "fixture", "poise/issue-7", pull=3, expected_head=parent))
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source",
+                                     "poise:behavior-chain", "--correlation-id", "original-native"])
+    with pytest.raises(RuntimeError, match="later cleanup" if cleanup_error else "during publishing"):
+        api.main()
+    stored, decoded = decode_failure()
+    evidence = stored["diagnostic"]
+    valid = output.startswith("git")
+    exit_code = 128 if valid and output != "git-signal" else 53 if output != "cli-signal" and not valid else None
+    term_signal = signal.SIGTERM if output in {"git-signal", "cli-signal"} else None
+    assert (evidence["operation"], evidence["phase"]) == ("push" if valid else "github-interface", "publishing")
+    assert (evidence["exit_code"], evidence["signal"]) == (exit_code, term_signal)
+    assert decoded["context"]["exit_code"] == exit_code and decoded["context"]["signal"] == term_signal
+    assert evidence["call_id"] == stored["id"] and evidence["correlation_id"] == "original-native"
+    assert "publishing" in stored["error"]
+    cli_code = 1 if valid else -signal.SIGTERM if output == "cli-signal" else 53
+    assert f"return code {cli_code}" in stored["error"]
+    if valid and output != "git-empty":
+        assert "original push rejected" in stored["error"] and "final push cause" in evidence["stderr"]
+        assert evidence["stderr_truncated"] is True
+    else:
+        assert "cause unavailable" in stored["error"] and evidence["stderr"] == ""
+    assert (stored["status"], stored["action"], stored["outcome"]) == ("failed", None, None)
+    assert stored["artifact"]["phase"] == "publishing" and stored["artifact"]["publication_head"] == candidate
+    assert stored["artifact"]["replies_started"] is False
+    assert stored["resources_settled_at"] and ownership.released(stored["resource_ownership"])
+    assert bool(cleanup_seen) == cleanup_error
+    event, = api.diagnostics()["events"]
+    assert event["diagnostic"] == evidence and event["error"] == stored["error"]
+    for secret in (private, token, "private-cookie", "Authorization: Basic"):
+        assert secret not in json.dumps(stored) + json.dumps(event)
+    repo = Path(__file__).resolve().parents[3]
+    with TemporaryDirectory(prefix="publication-failure-", dir=repo / "test-results") as work:
+        bundle, wire = Path(work) / "contract.mjs", Path(work) / "call.json"
+        wire.write_text(json.dumps([stored]))
+        built = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"), str(repo / "tests/fixtures/publication-recovery-contract.ts"),
+            "--bundle", "--platform=node", "--packages=external", "--format=esm", "--target=node22", f"--outfile={bundle}"],
+            cwd=repo, capture_output=True, text=True, timeout=30)
+        assert built.returncode == 0, built.stderr
+        consumed = subprocess.run(["node", str(bundle), str(wire), "merged-parent"], cwd=repo, capture_output=True, text=True, timeout=30)
         assert consumed.returncode == 0, consumed.stderr
 
 
