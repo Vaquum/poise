@@ -283,12 +283,42 @@ describe('signing in on a phone with the QR code in Settings', () => {
     expect((await overview()).phones).toEqual([])
   })
 
-  it('signs the phone in once', async () => {
-    const { binding } = await signInPhone()
-    const replay = await phone(h, '/auth/phone', binding)
-    expect(replay.status).toBe(410)
-    expect(replay.setCookie('poise_gw')).toBeUndefined()
+  it('gives a phone that retries the same sign-in within its window, and nothing after', async () => {
+    // The answer that carried the sign-in can be lost when the phone drops the request and retries.
+    const { binding, apex } = await signInPhone()
+    const again = await phone(h, '/auth/phone', binding)
+    expect(again.status).toBe(200)
+    expect(again.cookie('poise_gw')).toBe(apex)
+    const ticket = new URL(/<a class="button" href="([^"]+)"/.exec(again.body)?.[1].replaceAll('&amp;', '&') ?? '')
+    const session = await h.request({ host: ROOT, path: `${ticket.pathname}${ticket.search}`, headers: { cookie: again.cookie('poise_bind') } })
+    expect(session.status).toBe(302)
+    expect((await api(h, ROOT, session.cookie('poise_ws'), 'account')).json()).toMatchObject({ login: 'root' })
     expect((await overview()).phones).toHaveLength(1)
+    expect(events(h.logs, 'phone.signed_in')).toEqual(['phone.signed_in', 'phone.signed_in.again'])
+    h.advance(PHONE_FINISH_TTL_MS)
+    const late = await phone(h, '/auth/phone', binding)
+    expect(late.status).toBe(410)
+    expect(late.setCookie('poise_gw')).toBeUndefined()
+  })
+
+  it('gives a retrying phone its sign-in even after the computer that showed the code signed out', async () => {
+    const { binding, apex } = await signInPhone()
+    // Signing the computer out ends its apex session, and the codes it minted go with it.
+    const desktop = h.store.findSession(owner.split('=')[1])
+    h.store.deleteSession(desktop?.parentHash ?? '')
+    expect((await api(h, ROOT, owner, 'account')).status).toBe(401)
+    const again = await phone(h, '/auth/phone', binding)
+    expect(again.status).toBe(200)
+    expect(again.cookie('poise_gw')).toBe(apex)
+  })
+
+  it('gives a phone signed out in the meantime nothing again', async () => {
+    const { binding } = await signInPhone()
+    const [listed] = (await overview()).phones
+    expect((await api(h, ROOT, owner, `phone/revoke?grant=${listed.grant}`, { id: listed.id })).status).toBe(200)
+    const again = await phone(h, '/auth/phone', binding)
+    expect(again.status).toBe(410)
+    expect(again.setCookie('poise_gw')).toBeUndefined()
   })
 
   it('approves only with the grant of the device that is waiting', async () => {
