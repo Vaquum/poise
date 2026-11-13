@@ -63,10 +63,11 @@ it('reports a missing configured Codex once with its probe purpose and executabl
   expect(events()[0].context).toMatchObject({ code: 'ENOENT' })
 })
 
-it.each(['corrupt', 'unreadable', 'mistyped'])('does not infer unused Codex from a %s configuration record', async kind => {
+it.each(['corrupt', 'unreadable', 'mistyped', 'empty'])('does not infer unused Codex from a %s configuration record', async kind => {
   await rm(codex)
   if (kind === 'corrupt') setMeta('account_logins', 'not json')
   else if (kind === 'mistyped') setMeta('account_logins', JSON.stringify({ codex: 123 }))
+  else if (kind === 'empty') setMeta('account_logins', '')
   else vi.spyOn(logins, 'accountLoginsStrict').mockImplementationOnce(() => { throw new Error('provider record could not be read') })
   await probeAccount('codex', runFile)
   expectFailure('codex.version')

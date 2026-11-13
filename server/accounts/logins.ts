@@ -140,7 +140,7 @@ export function accountLogins(): AccountLogins {
  *  keeps the lenient read above. */
 export function accountLoginsStrict(): AccountLogins {
   const raw = getMeta(LOGINS_KEY)
-  if (!raw) return {}
+  if (raw === null) return {}
   let value: unknown
   try {
     value = JSON.parse(raw)
