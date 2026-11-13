@@ -76,7 +76,7 @@ elif sys.argv[1] == 'before':
     answer = health()
     assert answer['unsettledNativeCalls'] >= 1 and not answer['idle'], answer
     if mode == 'retained':
-        worker.stdin.write(b'X')
+        worker.stdin.write('X')
         worker.stdin.flush()
         worker.communicate(timeout=15)
         deadline = time.monotonic() + 20
