@@ -61,6 +61,42 @@ describe('rotation cursors', () => {
   })
 })
 
+describe('observation writes', () => {
+  it('commits an observation on the cursor connection, reading its own writes, and rolls it back on failure', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const { db, getMeta, setMeta, writeObservation } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    setMeta('datastore_stale:acme', 'before')
+    const main = vi.spyOn(db, 'prepare')
+    const read = writeObservation(() => {
+      setMeta('datastore_stale:acme', 'observed')
+      return getMeta('datastore_stale:acme')
+    })
+    expect(read).toBe('observed')
+    expect(main).not.toHaveBeenCalled()
+    main.mockRestore()
+    expect(getMeta('datastore_stale:acme')).toBe('observed')
+    expect(() => writeObservation(() => {
+      setMeta('datastore_stale:acme', 'lost')
+      throw new Error('probe failed')
+    })).toThrow('probe failed')
+    expect(getMeta('datastore_stale:acme')).toBe('observed')
+  })
+
+  it('writes an observation inside an open transaction as part of that transaction', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const { db, getMeta, setMeta, writeObservation } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    setMeta('datastore_stale:acme', 'before')
+    expect(() => db.transaction(() => {
+      writeObservation(() => setMeta('datastore_stale:acme', 'inside'))
+      expect(getMeta('datastore_stale:acme')).toBe('inside')
+      throw new Error('outer rolled back')
+    })()).toThrow('outer rolled back')
+    expect(getMeta('datastore_stale:acme')).toBe('before')
+    writeObservation(() => writeObservation(() => setMeta('datastore_stale:acme', 'nested')))
+    expect(getMeta('datastore_stale:acme')).toBe('nested')
+  })
+})
+
 describe('behavior database lifecycle', () => {
   it('migrates legacy cards once, preserves content, and purges retired credentials', async () => {
     tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
