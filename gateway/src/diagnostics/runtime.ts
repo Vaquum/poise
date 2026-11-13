@@ -34,6 +34,13 @@ export interface RuntimeOptions {
   report?: (line: string) => void
 }
 
+// With nothing queued, a flush only applies retention and rewrites coverage
+// and the journal, whose `writtenAt` readers call stale after 60 s
+// (query-worker, cli). So an idle flush does that work at most every
+// IDLE_FLUSH_MS, and at once whenever the journal's state changed or an
+// error or loss is pending, instead of every second.
+const IDLE_FLUSH_MS = 15_000
+
 /** Failure domains stay separate: bad queries cannot manufacture sink outages. */
 export class DiagnosticRuntime {
   private store: DiagnosticStore | null = null
@@ -53,6 +60,9 @@ export class DiagnosticRuntime {
   private lastRejected: string | null = null
   private lastSuccess: string | null = null
   private journalAt = 0
+  private idleFlushedAt = 0
+  // The journal's state, less its time, as last written.
+  private journaled: string | null = null
   private dropped = 0
   private droppedSince: string | null = null
   private stopped = false
@@ -328,6 +338,9 @@ export class DiagnosticRuntime {
 
   flush(): boolean {
     if (this.stopped || this.now() < this.retryAt) return false
+    if (!this.queue.length && this.now() - this.idleFlushedAt < IDLE_FLUSH_MS && !this.lossActive
+      && !this.sinkError && !this.coverageError && !this.journalError && !this.reportError
+      && this.journalState() === this.journaled) return false
     const lossSequence = this.lossSequence
     const batch = this.queue.slice(0, 100)
     let store: DiagnosticStore
@@ -362,6 +375,7 @@ export class DiagnosticRuntime {
     const recoveredLoss = this.lossActive && lossSequence === this.lossSequence && !this.queue.length && !this.coverageError && !this.reportError
     if (recoveredLoss) this.lossActive = false
     this.saveJournal(recoveredLoss)
+    this.idleFlushedAt = this.now()
     if (this.queue.length) this.schedule()
     return batch.length > 0
   }
@@ -400,17 +414,24 @@ export class DiagnosticRuntime {
     setImmediate(() => { this.scheduled = false; if (!this.stopped) this.flush() })
   }
 
+  /** What the journal records, less the time it was written. */
+  private journalState(): string {
+    return JSON.stringify([this.stopped, this.dropped, this.rejected, this.lossActive, this.droppedSince, this.sinkError,
+      this.coverageError, this.reportError, this.sinkSince, [...this.sources.values()].filter((source) => !this.externalSources.has(source.id))])
+  }
+
   private saveJournal(force = false): void {
     const path = this.journalPath()
     if (!path || (!force && this.now() - this.journalAt < 1000)) return
     try {
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+      const state = this.journalState()
       const journal: Journal = { version: 1, writtenAt: this.iso(), stopped: this.stopped, dropped: this.dropped, rejected: this.rejected, lossActive: this.lossActive, droppedSince: this.droppedSince,
         sinkError: this.sinkError, coverageError: this.coverageError, reportError: this.reportError, sinkSince: this.sinkSince, sources: [...this.sources.values()].filter((source) => !this.externalSources.has(source.id)) }
       const payload = JSON.stringify(journal)
       if (Buffer.byteLength(payload) > MAX_COVERAGE_JOURNAL_BYTES) throw new Error('Coverage journal exceeds 8 MiB')
       writeFileSync(path + '.tmp', payload, { mode: 0o600 }); renameSync(path + '.tmp', path)
-      this.journalAt = this.now(); this.journalError = null
+      this.journalAt = this.now(); this.journalError = null; this.journaled = state
     } catch (error) {
       const message = this.message(error)
       if (message !== this.journalError) this.notify('logging.journal.unavailable', message)
