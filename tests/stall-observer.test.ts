@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 import { expect, it } from 'vitest'
-import { installStallObserver, maskSql, stallSnapshot } from '../server/stall-observer'
+import { installStallObserver, maskSql, parseKeyed, parsePressure, stallSnapshot } from '../server/stall-observer'
 
 installStallObserver()
 
@@ -47,6 +47,25 @@ it('reports memory, the event loop and the file-I/O probe alongside', () => {
   expect(snapshot.memoryMb.heapLimit).toBeGreaterThan(0)
   expect(snapshot.eventLoop).toHaveProperty('maxMs')
   expect(snapshot.threadpoolProbe).toHaveProperty('maxMs')
+  // The container's contention: always the CPU count and load, and the
+  // kernel's counters where the system has them (Linux), null where not.
+  expect(snapshot.host.cpus).toBeGreaterThan(0)
+  expect(snapshot.host.loadAvg).toHaveLength(3)
+  expect(snapshot.host.process.userCpuMs).toBeGreaterThan(0)
+  if (process.platform === 'linux') expect(snapshot.host.mainThread?.ranMs).toBeGreaterThan(0)
+  else expect(snapshot.host.mainThread).toBeNull()
+})
+
+it('reads the cgroup CPU quota counters and pressure files as the kernel writes them', () => {
+  expect(parseKeyed('usage_usec 812345\nnr_periods 120\nnr_throttled 44\nthrottled_usec 9100000\n')).toEqual({
+    usage_usec: 812345, nr_periods: 120, nr_throttled: 44, throttled_usec: 9100000,
+  })
+  expect(parsePressure('some avg10=12.50 avg60=8.02 avg300=3.10 total=123456789\nfull avg10=0.00 avg60=0.10 avg300=0.00 total=2500')).toEqual({
+    some: { avg10: 12.5, avg60: 8.02, avg300: 3.1, totalMs: 123457 },
+    full: { avg10: 0, avg60: 0.1, avg300: 0, totalMs: 3 },
+  })
+  expect(parseKeyed(null)).toBeNull()
+  expect(parsePressure(null)).toBeNull()
 })
 
 it('times file I/O in its own thread, so a blocked main thread never counts as a file-I/O wait', async () => {

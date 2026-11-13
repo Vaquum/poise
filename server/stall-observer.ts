@@ -1,11 +1,14 @@
 // Where the server's main thread goes when it stalls: garbage collection
 // pauses, slow SQLite calls with the code that made them (statements,
 // including the BEGIN and COMMIT of every transaction, compiles and exec),
-// how long the file-I/O threads queue a trivial request, and the process's
-// memory. Always on and read-only: GET /api/health/stalls reads it, and
+// how long the file-I/O threads queue a trivial request, the process's
+// memory, and the contention its container reports (CPU quota, pressure).
+// Always on and read-only: GET /api/health/stalls reads it, and
 // nothing triggers, writes or exports a profile. Only calls of SLOW_MS or
 // more are kept, with SQL literals masked.
 import Database from 'better-sqlite3'
+import { readFileSync } from 'node:fs'
+import { availableParallelism, loadavg } from 'node:os'
 import { PerformanceObserver, constants, performance } from 'node:perf_hooks'
 import { getHeapStatistics } from 'node:v8'
 import { Worker } from 'node:worker_threads'
@@ -155,6 +158,72 @@ setInterval(async () => {
 
 const mb = (bytes: number) => Math.round(bytes / 1_048_576)
 
+function readKernel(path: string): string | null {
+  try { return readFileSync(path, 'utf8').trim() } catch { return null }
+}
+
+/** `key value` lines, as cgroup's cpu.stat writes them, as numbers. */
+export function parseKeyed(text: string | null): Record<string, number> | null {
+  if (text === null) return null
+  const out: Record<string, number> = {}
+  for (const line of text.split('\n')) {
+    const [key, value] = line.trim().split(/\s+/)
+    if (key && value !== undefined && Number.isFinite(Number(value))) out[key] = Number(value)
+  }
+  return out
+}
+
+/** A pressure (PSI) file: the share of recent time some, or all, tasks
+ *  waited for the resource, over 10, 60 and 300 seconds, and in total. */
+export function parsePressure(text: string | null) {
+  if (text === null) return null
+  const out: Record<string, { avg10: number, avg60: number, avg300: number, totalMs: number }> = {}
+  for (const line of text.split('\n')) {
+    const [scope, ...fields] = line.trim().split(/\s+/)
+    if (!scope) continue
+    const value = Object.fromEntries(fields.map((field) => field.split('=')).map(([k, v]) => [k, Number(v)]))
+    out[scope] = { avg10: value.avg10, avg60: value.avg60, avg300: value.avg300, totalMs: Math.round(value.total / 1000) }
+  }
+  return out
+}
+
+// Contention the server shares with everything else in its container, read
+// from the kernel at the moment of asking: whether the CPU quota froze the
+// container (cpu.stat's nr_throttled and throttled_usec), how much of recent
+// time tasks waited for CPU, memory and I/O (pressure), and how long the main
+// thread itself waited for a CPU (schedstat). Pseudo-files, so each read is a
+// small copy from the kernel; on a system without one, its field is null.
+function hostSnapshot() {
+  const usage = process.resourceUsage()
+  const sched = readKernel('/proc/self/schedstat')?.split(/\s+/).map(Number)
+  const memoryMax = readKernel('/sys/fs/cgroup/memory.max')
+  const memoryCurrent = readKernel('/sys/fs/cgroup/memory.current')
+  return {
+    cpus: availableParallelism(),
+    loadAvg: loadavg().map((load) => Math.round(load * 100) / 100),
+    cgroup: readKernel('/proc/self/cgroup'),
+    tasks: readKernel('/sys/fs/cgroup/pids.current'),
+    cpuMax: readKernel('/sys/fs/cgroup/cpu.max'),
+    cpuStat: parseKeyed(readKernel('/sys/fs/cgroup/cpu.stat')),
+    pressure: {
+      cpu: parsePressure(readKernel('/sys/fs/cgroup/cpu.pressure')),
+      memory: parsePressure(readKernel('/sys/fs/cgroup/memory.pressure')),
+      io: parsePressure(readKernel('/sys/fs/cgroup/io.pressure')),
+    },
+    memoryMb: {
+      current: memoryCurrent === null ? null : mb(Number(memoryCurrent)),
+      max: memoryMax === null || memoryMax === 'max' ? memoryMax : mb(Number(memoryMax)),
+    },
+    mainThread: sched && sched.length >= 3 ? { ranMs: Math.round(sched[0] / 1e6), waitedMs: Math.round(sched[1] / 1e6), slices: sched[2] } : null,
+    process: {
+      userCpuMs: Math.round(usage.userCPUTime / 1000),
+      systemCpuMs: Math.round(usage.systemCPUTime / 1000),
+      involuntarySwitches: usage.involuntaryContextSwitches,
+      majorFaults: usage.majorPageFault,
+    },
+  }
+}
+
 export function stallSnapshot() {
   const memory = process.memoryUsage()
   const heap = getHeapStatistics()
@@ -164,6 +233,7 @@ export function stallSnapshot() {
     eventLoop: eventLoopDelayStats(),
     threadpoolProbe: probe,
     memoryMb: { rss: mb(memory.rss), heapUsed: mb(memory.heapUsed), heapTotal: mb(memory.heapTotal), heapLimit: mb(heap.heap_size_limit), external: mb(memory.external), arrayBuffers: mb(memory.arrayBuffers) },
+    host: hostSnapshot(),
     totals: [...totals.values()].sort((a, b) => b.totalMs - a.totalMs).slice(0, 40)
       .map((total) => ({ ...total, totalMs: Math.round(total.totalMs), maxMs: Math.round(total.maxMs) })),
     recent: recent.slice(-50).reverse(),
