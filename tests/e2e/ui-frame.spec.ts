@@ -282,6 +282,32 @@ test('leaving Overview before it has mounted, the bell reads Answer here’s sou
   release()
 })
 
+test('away from Overview, the bell drops a put-away review thread until a checked reply brings it back (#1379)', async ({ page }) => {
+  let replies = 1
+  let checkedAt = '2026-11-12T09:30:00Z'
+  const thread = (id: string, messages: number) => ({ id, kind: 'thread', repo: 'acme/site', site: 'site', pr: 3, prUrl: 'https://github.com/acme/site/pull/3', resolved: false, canReply: true, canResolve: true,
+    messages: Array.from({ length: messages }, (_, i) => ({ author: 'ann', body: `note ${i}`, createdAt: `2026-11-12T09:0${i}:00Z` })) })
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
+  await page.route('**/api/behaviors', (route) => route.fulfill({ json: {} }))
+  await page.route('**/api/behavior-chains**', (route) => route.fulfill({ json: { chains: [], attention: [] } }))
+  await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [] } }))
+  await page.route('**/api/chat/switchboard', (route) => route.fulfill({ json: { revision: 1, items: [] } }))
+  await page.route('**/api/editor/reviews', (route) => route.fulfill({ json: { publications: [{ slug: 'notes', site: 'site', repo: 'acme/site', pr: 3, prUrl: '', checkedAt, active: true, stale: false, problems: [], openThreads: 2 }] } }))
+  await page.route('**/api/editor/doc/notes/reviews', (route) => route.fulfill({ json: { reviews: [thread('t1', replies), thread('t2', 1)] } }))
+  await page.route('**/api/answers/dismissals', (route) => route.fulfill({ json: { dismissals: [{ key: 'thread:notes:t1', revision: '1|2026-11-12T09:00:00Z', at: new Date().toISOString() }] } }))
+  await open(page, '/?view=board')
+  const bell = page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')
+  await expect(bell).toHaveText('1', { timeout: 10_000 })
+  // Someone replies; the next sweep checks it, and the next read counts it again.
+  replies = 2
+  checkedAt = '2026-11-12T09:45:00Z'
+  await page.clock.install()
+  await page.clock.fastForward(61_000)
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await page.clock.fastForward(3_000)
+  await expect(bell).toHaveText('2', { timeout: 10_000 })
+})
+
 test('the bell reads after the place it opens on, so the place’s own reads go first', async ({ page }) => {
   const at: Record<string, number> = {}
   const mark = (name: string) => { at[name] ??= Date.now() }

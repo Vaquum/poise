@@ -74,6 +74,9 @@ svg.flip-x { transform: rotate(180deg); }
 .nc-fail { color: var(--c-attention-on); }
 .nc-f { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-3); }
 .nc-f .lnk { font-size: var(--fs-micro); }
+/* Dismiss says what it does, quietly, beside it. */
+.nc-dis { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1); min-width: 0; }
+.nc-dis .t-gloss { font-size: var(--fs-micro); }
 .nc .life { display: flex; flex-wrap: wrap; }
 .nc-form { display: flex; flex-direction: column; gap: var(--sp-3); }
 .nc-q { display: flex; flex-direction: column; gap: var(--sp-1); border: 0; min-width: 0; }

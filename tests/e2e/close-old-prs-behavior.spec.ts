@@ -111,6 +111,7 @@ test('leaving Settings with invalid days keeps the error and the previous thresh
     if (url.pathname === '/api/chat/requests') return route.fulfill({ json: { revision: 1, complete: true, requests: [] } })
     if (url.pathname === '/api/chat/switchboard') return route.fulfill({ json: { revision: 1, status: 'live', items: [] } })
     if (url.pathname === '/api/editor/reviews') return route.fulfill({ json: { publications: [] } })
+    if (url.pathname === '/api/answers/dismissals') return route.fulfill({ json: { dismissals: [] } })
     if (url.pathname === '/api/behaviors/close-old-prs') {
       writes.push(body)
       if (typeof body.days === 'number') days = body.days
@@ -140,7 +141,7 @@ test('leaving Settings with invalid days keeps the error and the previous thresh
   const row = page.locator('tr[data-behavior="close-old-prs"]')
   await expect(row).toBeVisible()
   // Let the bell's away reads settle, so later bell changes come only from this test.
-  await expect.poll(() => ['/api/chat/requests', '/api/chat/switchboard', '/api/editor/reviews', '/api/behavior-chains']
+  await expect.poll(() => ['/api/chat/requests', '/api/chat/switchboard', '/api/editor/reviews', '/api/behavior-chains', '/api/answers/dismissals']
     .every((path) => requested.has(path))).toBe(true)
   const badge = page.locator('[data-bell]')
   await expect(badge).toHaveText('0')

@@ -35,6 +35,18 @@ interface Workspace {
   chatsFail?: boolean
   /** The runs read fails from the start. */
   runsFail?: boolean
+  /** The chain's attention rows. */
+  attention?: unknown[]
+  /** Put-away entries the server keeps, and what was posted to it. */
+  dismissals?: { key: string, revision: string, at: string }[]
+  dismissed?: unknown[]
+  /** Every POST that could act on the chain. */
+  chainActions?: unknown[]
+  /** Behaviors' agent log error, a diagnostic with no time of its own. */
+  agentLogsError?: string | null
+  /** Review publications and each document's threads; a reply appends to its thread. */
+  publications?: unknown[]
+  threads?: Record<string, { id: string, messages: { author: string, body: string, createdAt: string }[] }[]>
   /** The chat requests read waits for this first. */
   requestsLate?: Promise<void>
   /** What /api/behavior-metrics answers. */
@@ -77,9 +89,33 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       return json(route, workspace.answerDecision.body, workspace.answerDecision.status)
     }
     if (path === '/api/chat/sessions') return workspace.chatsFail ? json(route, { error: 'the chat service did not answer' }, 503) : json(route, { instance: 'poise-dev:test', sessions: [] })
-    if (path === '/api/editor/reviews') return json(route, { publications: [], sweep: { publications: 0, longestDelayMinutes: 15 } })
-    if (path === '/api/behavior-chains') return json(route, { chains: workspace.chains ?? [], attention: [] })
-    if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
+    if (path === '/api/editor/reviews') return json(route, { publications: workspace.publications ?? [], sweep: { publications: 0, longestDelayMinutes: 15 } })
+    const doc = /^\/api\/editor\/doc\/([^/]+)\/reviews(\/action)?$/.exec(path)
+    if (doc) {
+      const slug = decodeURIComponent(doc[1])
+      const rows = (workspace.threads ??= {})[slug] ??= []
+      if (doc[2] && method === 'POST') {
+        const body = route.request().postDataJSON() as { id: string, body: string }
+        rows.find((row) => row.id === body.id)?.messages.push({ author: 'me', body: body.body, createdAt: new Date().toISOString() })
+      }
+      const reviews = rows.map((row) => ({ ...row, kind: 'thread', repo: 'acme/site', site: 'site', pr: 3, prUrl: 'https://github.com/acme/site/pull/3', resolved: false, canReply: true, canResolve: true }))
+      return json(route, { reviews })
+    }
+    if (path === '/api/behavior-chains' && method === 'POST') { (workspace.chainActions ??= []).push(route.request().postDataJSON()); return json(route, {}) }
+    if (path === '/api/behavior-chains') return json(route, { chains: workspace.chains ?? [], attention: workspace.attention ?? [] })
+    if (path === '/api/answers/dismissals' && method === 'POST') {
+      const body = route.request().postDataJSON() as { key: string, revision: string }
+      ;(workspace.dismissed ??= []).push(body)
+      workspace.dismissals = [{ key: body.key, revision: body.revision, at: new Date().toISOString() }, ...(workspace.dismissals ?? []).filter((row) => row.key !== body.key)]
+      return json(route, { dismissals: workspace.dismissals })
+    }
+    if (path === '/api/answers/dismissals/forget' && method === 'POST') {
+      const { keys } = route.request().postDataJSON() as { keys: string[] }
+      workspace.dismissals = (workspace.dismissals ?? []).filter((row) => !keys.includes(row.key))
+      return json(route, { dismissals: workspace.dismissals })
+    }
+    if (path === '/api/answers/dismissals') return json(route, { dismissals: workspace.dismissals ?? [] })
+    if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: workspace.agentLogsError ?? null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
     if (path === '/api/settings' && method === 'GET') return json(route, { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
     if (path === '/api/analytics') return json(route, { window: { since: url.searchParams.get('since'), until: url.searchParams.get('until') }, agentAccount: 'bot', ...day, ...(url.searchParams.get('dailyBounds') ? { daily: Array.from({ length: 7 }, () => day) } : {}), errors: [] })
     if (path === '/api/analytics/history') {
@@ -176,7 +212,7 @@ test('an answer that fails shows the service’s reason, and keeps what was type
   }
   await open(page, workspace)
   const card = entry(page, 'decision:7')
-  await card.getByRole('button', { name: 'Something else…' }).click()
+  await card.getByRole('button', { name: 'Other' }).click()
   const box = card.getByRole('textbox')
   await box.fill('Keep both')
   await card.getByRole('button', { name: 'Send answer' }).click()
@@ -266,6 +302,95 @@ test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {
   await entry(page, 'notice:disk').getByRole('button', { name: 'Undo' }).click()
   await expect(entry(page, 'notice:disk').getByRole('button', { name: 'Dismiss' })).toBeVisible()
   expect(sent).toEqual([])
+})
+
+test('Answer here lists the newest first, and every card can be put away without acting on it (#1379)', async ({ page }) => {
+  const attention = (issue: number, minutes: number) => ({ id: `autonomio/poise#${issue}`, repository: 'autonomio/poise', issue, pullNumber: null, step: 'repair-pr: uncertain',
+    progressAt: NOW - minutes * 60_000, ageMs: minutes * 60_000, blocker: 'Original outcome requires reconciliation', evidence: { state: 'open', checkedAt: null, gates: [] },
+    nextAction: 'reconcile', retryAt: null, journal: `/api/behavior-chains?id=${encodeURIComponent(`autonomio/poise#${issue}`)}&after=3`,
+    reconciliation: { nextObservationAt: null, waitingForResourceRelease: false } })
+  const decision = { id: 9, kind: 'decision', text: 'Which repair goes first?', detail: null, createdAt: ago(1), source: { sessionId: 'm1', title: 'Manager', agent: 'claude', model: 'opus', exists: true }, sourceSeq: 2,
+    options: [{ id: 'a', label: 'The failing check', detail: null, recommended: true }], explanation: { state: 'none' } }
+  const workspace: Workspace = { notices: [], decisions: [decision], revision: 1, requests: [permission('p1', 's1', 'Run gh pr create')], attention: [attention(898, 4 * 1440), attention(1169, 60)] }
+  const socket = await open(page, workspace)
+  const ids = () => page.locator('[data-answers] [data-notice]').evaluateAll((cards) => cards.map((card) => (card as HTMLElement).dataset.notice))
+  // Newest first: the decision (1 min), the permission (3 min), then the chain cards by their last verified advance.
+  await expect.poll(ids).toEqual(['decision:9', 'request:p1', 'chain:autonomio/poise#1169', 'chain:autonomio/poise#898'])
+
+  // A Manager's prompt with options answers with them or Other, in your own words; it has no Dismiss.
+  await expect(entry(page, 'decision:9').getByRole('button', { name: 'Dismiss' })).toHaveCount(0)
+  await entry(page, 'decision:9').getByRole('button', { name: 'Other' }).click()
+  await expect(entry(page, 'decision:9').getByRole('textbox')).toBeFocused()
+  // Every other card says what Dismiss does.
+  await expect(entry(page, 'request:p1')).toContainText('the chat still waits for your answer in Chat')
+  await expect(entry(page, 'chain:autonomio/poise#898')).toContainText('hides it until the chain moves')
+
+  await entry(page, 'chain:autonomio/poise#1169').getByRole('button', { name: 'Dismiss' }).click()
+  await expect(entry(page, 'chain:autonomio/poise#1169')).toContainText('Dismissed')
+  await expect.poll(() => workspace.dismissed, { timeout: 12_000 }).toEqual([{ key: 'chain:autonomio/poise#1169',
+    revision: `${new Date(NOW - 60 * 60_000).toISOString()}|autonomio/poise#1169 · repair-pr: uncertain|Original outcome requires reconciliation`, title: 'autonomio/poise#1169 · repair-pr: uncertain' }])
+  await page.mouse.move(1000, 600)
+  await expect(entry(page, 'chain:autonomio/poise#1169')).toHaveCount(0)
+  await expect(page.locator('[data-ncount]')).toHaveText('3')
+  // Putting it away sent nothing to any chat and resumed nothing.
+  expect(socket.frames.map((frame) => frame.command.type).filter((type) => /respond|answer|resume|message|send|prompt/i.test(String(type)))).toEqual([])
+  expect(workspace.chainActions ?? []).toEqual([])
+})
+
+test('a put-away diagnostic with no time of its own shows again when it recurs after clearing (#1379)', async ({ page }) => {
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, agentLogsError: 'agent-interface --logs failed: database is locked' }
+  await open(page, workspace)
+  const card = answers(page).locator('[data-notice^="diagnostic:"]')
+  await expect(card).toHaveCount(1)
+  await card.getByRole('button', { name: 'Dismiss' }).click()
+  await expect.poll(() => workspace.dismissals?.length ?? 0, { timeout: 12_000 }).toBe(1)
+  await page.mouse.move(1000, 600)
+  await expect(card).toHaveCount(0)
+  const reread = () => page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  // It clears: its dismissal is forgotten.
+  workspace.agentLogsError = null
+  await reread()
+  await expect.poll(() => workspace.dismissals?.length ?? 0, { timeout: 15_000 }).toBe(0)
+  // It happens again, word for word: it shows again.
+  workspace.agentLogsError = 'agent-interface --logs failed: database is locked'
+  await reread()
+  await expect(card).toHaveCount(1, { timeout: 15_000 })
+})
+
+test('a review thread answered here stays settled though the reply changes what it reports (#1379)', async ({ page }) => {
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1,
+    publications: [{ slug: 'notes', site: 'site', repo: 'acme/site', pr: 3, prUrl: '', checkedAt: ago(2), active: true, stale: false, problems: [], openThreads: 1 }],
+    threads: { notes: [{ id: 't1', messages: [{ author: 'ann', body: 'Typo in the title', createdAt: ago(10) }] }] } }
+  await open(page, workspace)
+  const card = entry(page, 'thread:notes:t1')
+  await card.getByRole('button', { name: 'Reply…' }).click()
+  await card.getByRole('textbox').fill('Fixed, thanks')
+  await card.getByRole('button', { name: 'Send reply' }).click()
+  await expect(card).toContainText('Replied on GitHub, as you')
+  await expect(card.getByRole('button', { name: 'Reply…' })).toHaveCount(0)
+  await page.mouse.move(1000, 600)
+  await expect(card).toHaveCount(0)
+  expect(workspace.threads!.notes[0].messages).toHaveLength(2)
+})
+
+test('a chain card whose report changes while it is being put away comes back with the new report, and the old one is not sent (#1379)', async ({ page }) => {
+  const attention = (minutes: number) => ({ id: 'autonomio/poise#1169', repository: 'autonomio/poise', issue: 1169, pullNumber: null, step: 'repair-pr: uncertain',
+    progressAt: NOW - minutes * 60_000, ageMs: minutes * 60_000, blocker: 'Original outcome requires reconciliation', evidence: { state: 'open', checkedAt: null, gates: [] },
+    nextAction: 'reconcile', retryAt: null, journal: `/api/behavior-chains?id=${encodeURIComponent('autonomio/poise#1169')}&after=3`,
+    reconciliation: { nextObservationAt: null, waitingForResourceRelease: false } })
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], attention: [attention(60)] }
+  await open(page, workspace)
+  const card = entry(page, 'chain:autonomio/poise#1169')
+  await card.getByRole('button', { name: 'Dismiss' }).click()
+  await expect(card).toContainText('Dismissed')
+  // The chain advances during the eight seconds.
+  workspace.attention = [attention(2)]
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await expect(card.getByRole('button', { name: 'Dismiss' })).toBeVisible()
+  await expect(card).not.toContainText('Dismissed')
+  await page.waitForTimeout(9_000)
+  expect(workspace.dismissed ?? []).toEqual([])
+  await expect(card).toBeVisible()
 })
 
 test('the right-hand side has one day, one search and the organization; Behaviors follows the day (#1380)', async ({ page }) => {

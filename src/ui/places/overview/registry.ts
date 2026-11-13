@@ -40,7 +40,12 @@ export const OVERVIEW: Registry = {
   'ov.open': { name: 'Open', kind: 'Action', what: 'Opens the full context, the chat, the run, the card or the setting, with a route back here.' },
   'ov.diagnostic': { name: 'Open its diagnostic', kind: 'Action', what: 'Opens the exact diagnostic in Observe → Logging, with its interval, and a route back here.' },
   'ov.timeline': { name: 'Open its timeline', kind: 'Action', what: 'Opens the task in Observe → Tasks at the step this entry names, with a route back here.' },
-  'ov.dismiss': { name: 'Dismiss', kind: 'Action', what: 'Puts this notice away, or a decision whose chat no longer exists.', when: 'After eight seconds in this tab, which is its Undo; leaving the page sends it at once. It comes back if its condition changes.' },
+  'ov.dismiss': {
+    name: 'Dismiss', kind: 'Action', what: 'Puts this entry away. Every entry has it, except a Manager’s question or a decision that offers options: those always take Other, in your own words.',
+    does: 'Only hides the entry: it never resumes a chain, retries a run or tells a chat anything. The words beside it say what happens to the rest.',
+    when: 'After eight seconds in this tab, which is its Undo; leaving the page sends it at once. It comes back when what it reports changes: a notice when it happens again, a chain when it moves, a diagnostic when it recurs, a review thread when someone replies.',
+    scope: 'Every device and the bell: the server keeps it.',
+  },
   'ov.silence': { name: 'Silence reminders', kind: 'Action', what: 'Stops the reminders for this notice while it stays open.', when: 'After eight seconds in this tab, which is its Undo.', unchanged: 'The pull request or issue, and whether it can merge.' },
   'ov.undo': { name: 'Undo', kind: 'Action', what: 'Takes back a Dismiss or Silence in its first eight seconds. Until then it waits in this tab; leaving the page sends it at once.' },
   'ov.read': { name: 'Last read', kind: 'Display', what: 'Whether this part could be read, and when it last was. A failed read keeps what was read before, never a guessed state.', now: (el) => text(el) },

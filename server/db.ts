@@ -238,6 +238,14 @@ db.exec(`
     ref TEXT NOT NULL UNIQUE
   );
   CREATE INDEX IF NOT EXISTS handling_log_at ON handling_log(at);
+
+  -- Answer here's put-away cards that are not notices (server/answer-dismissals.ts):
+  -- one row per card key, with the revision of what it reported when put away.
+  CREATE TABLE IF NOT EXISTS answer_dismissals (
+    key TEXT PRIMARY KEY,
+    revision TEXT NOT NULL,
+    dismissed_at TEXT NOT NULL
+  );
 `)
 
 // One-time migrations: the kanban table has been renamed twice.
