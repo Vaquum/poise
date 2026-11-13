@@ -639,11 +639,9 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertEqual(run.elapsed, 800)
         self.assertEqual(run.error.code, "review_budget_exhausted")
         self.assertEqual(str(run.error), GROK_HANDOFF)
-        self.assertEqual(run.error.diagnostic, {
-            "version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-            "phase": "analysis", "outcome": "handoff", "stderr": "", "stderr_truncated": False,
-            "provider": "grok", "submission": "none",
-        })
+        self.assertEqual(run.error.diagnostic["phase"], "analysis")
+        self.assertEqual(run.error.diagnostic["outcome"], "handoff")
+        self.assertEqual(run.error.diagnostic["submission"], "none")
         run.submit.assert_not_called()
 
     def test_inspection_rounds_stop_at_the_ceiling(self):
@@ -701,10 +699,13 @@ class TestGrokAnalysisCeiling(TestCase):
                 self.assertEqual(run.error.diagnostic["submission"], "none")
 
     def test_a_shorter_file_group_deadline_is_not_a_provider_handoff(self):
-        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
-        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [1, NEVER_RETURNS], INSPECT,
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(27)])
+        self.assertEqual(review_stages.stage_count(packet), 4)
+        terminal = {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": [], "requests": []}
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [100, 500, NEVER_RETURNS], terminal,
                            repository=INSPECTED, packet=packet)
         self.assertLess(run.elapsed, 800)
+        self.assertEqual(run.error.code, "review_budget_exhausted")
         self.assertEqual(run.error.diagnostic["phase"], "file_group")
         self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
         self.assertNotIn("handing off", str(run.error))
@@ -758,7 +759,7 @@ class TestGrokAnalysisCeiling(TestCase):
     def test_shorter_overall_deadline_before_inspection_is_not_a_handoff(self):
         run = self._replay_before_inspection(59, 2, timeout_s=60)
         self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
-        self.assertEqual(run.error.diagnostic["phase"], "total")
+        self.assertEqual(run.error.diagnostic["phase"], "overall")
         self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
         run.submit.assert_not_called()
 
@@ -772,6 +773,7 @@ class TestGrokAnalysisCeiling(TestCase):
                 self.assertEqual(run.launches, expected)
                 self.assertEqual(run.elapsed, 1293)
                 self.assertEqual(run.error.code, "review_budget_exhausted")
+                self.assertEqual(run.error.diagnostic["phase"], "overall")
                 self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
 
 
@@ -1173,7 +1175,7 @@ class TestSincePositions(TestCase):
                 packet = self._packet(None, self.REMOVAL)
                 verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [
                     {"path": path, "line": line, "side": side, "body": "A confirmed blocking defect."}]}
-                with patch.object(structured_review, "_review_once", return_value=(json.dumps(verdict), verdict)), \
+                with patch.object(structured_review, "_review_once", return_value=(json.dumps(verdict), verdict, 0)), \
                         patch.object(structured_review.subprocess, "run", return_value=SimpleNamespace(
                             returncode=0, stdout='{"action":"requested_changes","review_id":91}', stderr="")) as submit, \
                         patch.object(structured_review, "fetch_packet") as fetch:

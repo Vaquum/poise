@@ -703,6 +703,27 @@ describe('managed organization synchronization', () => {
     expect(operations('init-org')).toHaveLength(0)
   })
 
+  it('records a completed sync as an observation, not on the connection that waits for the disk', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    mocks.runFile.mockClear()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0 WHERE managed = 1').run()
+    const synced = () => (database!.db.prepare('SELECT last_sync_at FROM organizations WHERE managed = 1').get() as { last_sync_at: number }).last_sync_at
+    const prepare = vi.spyOn(database!.db, 'prepare')
+    let prepared: string[] = []
+    try {
+      organizations!.startOrganizationsRuntime()
+      await vi.waitFor(() => expect(synced()).toBeGreaterThan(0))
+    } finally {
+      // Read before restoring: restoring a spy clears its calls.
+      prepared = prepare.mock.calls.map(([sql]) => String(sql).replace(/\s+/g, ' ').trim())
+      prepare.mockRestore()
+    }
+    expect(operations('health')).toHaveLength(1)
+    expect(prepared.filter((sql) => sql.startsWith('UPDATE organizations SET stage'))).toEqual([])
+    expect(organizations!.getOrganizations()[0]).toMatchObject({ stage: 'ready', error: null })
+  })
+
   it('rebuilds user projections after the selected identity changes before returning ready', async () => {
     organizations!.addOrganization('acme')
     await ready('acme')

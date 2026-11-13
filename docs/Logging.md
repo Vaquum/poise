@@ -444,10 +444,14 @@ unavailability is a collection Warning rather than an invented application cause
 
 Production shutdown retains one `process.shutdown` Error when cleanup rejects or
 reaches its ten-second deadline, including pending runtime/HTTP phases and known
-rejection causes. It commits through the same independent diagnostic store before
+rejection causes. `pendingPhases` also names unresolved runtime stops, such as
+`runtime_stop.agent_collaborator`, including the later ledger and Logging stops.
+It commits through the same independent diagnostic store before
 exit 1, including after runtime teardown has stopped Logging. The supervisor
 can also record a generic exit event for the same shutdown. Logging retains
-those events after a healthy successor starts. Clean update exits (75) stay quiet.
+those events after a healthy successor starts. The current supervisor provides
+no per-launch shutdown match: the same release and nearby timestamps alone never
+downgrade an exit Error. Clean update exits (75) stay quiet.
 
 Container discovery includes stopped containers and removes checkpoints only for absent container IDs; retained events survive that cleanup. Operator ingress deduplicates exact record replays, while separate records sharing a request ID retain distinct occurrence IDs. Bootstrap line capture keeps folded credential-header state across child output chunks before reporting or persistence.
 

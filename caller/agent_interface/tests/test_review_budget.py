@@ -542,7 +542,8 @@ class TestRecovery(TestCase):
         self.assertEqual(self.mod.run.call_count, 1)
         self.assertEqual(row['error_code'], 'review_budget_exhausted')
 
-    def _staged_review(self, files, *, publication='normal', stalled=False, inspection_loop=False):
+    def _staged_review(self, files, *, publication='normal', stalled=False, inspection_loop=False,
+                       slow_second=False, deadline=None, clean=False):
         from hashlib import sha256
 
         from agent_interface import pr_review, review_stages
@@ -565,7 +566,8 @@ class TestRecovery(TestCase):
                                     separators=(',', ':')).encode()).hexdigest()
         clock = SimpleNamespace(now=0.0)
         observed = SimpleNamespace(groups={}, inspected=set(), submissions=[], lookups=[], timeline=[],
-                                   threads={}, commands=[], guidance_reads=0, review_id=93 + len(api.logs()))
+                                   threads={}, commands=[], guidance_reads=0, delivered={}, entries={},
+                                   stall_inspection=False, review_id=93 + len(api.logs()))
         common = ['AGENTS.md', 'CLAUDE.md', 'AUTONOMIO_PR_GUIDELINE.md', 'POISE_REPO_SPECIFICS.md']
         published = []
 
@@ -578,7 +580,7 @@ class TestRecovery(TestCase):
         def command(argv, *, timeout, **kwargs):
             flag = argv[1]
             self.assertIn(flag, ('--review-activity-since', '--pr-review', '--checkout-review',
-                                 '--review-context', '--request-changes'))
+                                 '--review-context', '--request-changes', '--reviewed-clean'))
             if flag != '--review-context':
                 self.assertEqual(argv[argv.index('--token-user') + 1], 'bit-mis')
             if flag == '--review-activity-since':
@@ -589,7 +591,8 @@ class TestRecovery(TestCase):
                               username='bit-mis', review_context=context,
                               reviewer_reviews_since_items=list(published),
                               reviewer_reviews_since=len(published),
-                              reviewer_change_requests_since=len(published))
+                              reviewer_change_requests_since=0 if clean else len(published),
+                              reviewer_comments_since=len(published) if clean else 0)
             elif flag == '--pr-review':
                 spend('packet', 25, timeout)
                 self.assertEqual(argv[argv.index('--expected-head') + 1], HEAD)
@@ -603,6 +606,7 @@ class TestRecovery(TestCase):
             elif flag == '--review-context':
                 requests = json.loads(argv[argv.index('--requests-json') + 1])
                 spend('listing' if requests[0]['operation'] == 'list' else 'inspection',
+                      float('inf') if observed.stall_inspection else
                       10 if requests[0]['operation'] == 'list' else 0.4 if inspection_loop else 1, timeout)
                 observed.inspected.update(r['path'] for r in requests if r['path'] in paths)
                 observed.guidance_reads += sum(r['path'] == 'AGENTS.md' for r in requests)
@@ -616,11 +620,12 @@ class TestRecovery(TestCase):
                 self.assertEqual(response['head_sha'], HEAD)
                 self.assertEqual(response['context_sha'], context)
                 spend('publication', timeout - 1 if publication == 'slow' else 55, timeout)
-                published.append({'id': observed.review_id, 'state': 'CHANGES_REQUESTED', 'commit': HEAD,
+                published.append({'id': observed.review_id, 'state': 'COMMENTED' if clean else 'CHANGES_REQUESTED', 'commit': HEAD,
                                   'submitted_at': '2026-11-11T10:00:00Z'})
                 if publication == 'uncertain':
                     raise subprocess.TimeoutExpired(argv, timeout)
-                value = {'action': 'requested_changes', 'review_id': observed.review_id, 'head_sha': HEAD}
+                value = {'action': 'reviewed_clean' if clean else 'requested_changes',
+                         'review_id': observed.review_id, 'head_sha': HEAD}
             return SimpleNamespace(returncode=0, stdout=json.dumps(value), stderr='')
 
         def provider(argv, *, input, timeout, **kwargs):
@@ -641,38 +646,49 @@ class TestRecovery(TestCase):
                     history.common = True
                 else:
                     history.inspected.add(group)
+                    if kind == 'group':
+                        observed.delivered[group] = observed.delivered.get(group, 0) + 1
                 history.pending = None
             if 'PR packet:\n' in input:
                 history.stage, _ = json.JSONDecoder().raw_decode(input.split('PR packet:\n', 1)[1])
             stage = history.stage
-            group = int(re.search(r'file group (\d+) of', stage['review_scope'])[1])
+            group = int(re.search(r'file group (\d+) of', stage['review_scope'])[1]) if total > 1 else 1
+            observed.entries.setdefault(group, clock.now)
             self.assertEqual(stage['head_sha'], HEAD)
             self.assertEqual(stage['pull'], packet['pull'])
             self.assertEqual(stage['repository'], 'o/r')
-            if inspection_loop and 'PR packet:\n' in input:
+            if (inspection_loop or slow_second) and 'PR packet:\n' in input:
                 for earlier in range(1, group):
-                    self.assertIn(f'Blocking defect in file group {earlier}.', input)
+                    if not clean:
+                        self.assertIn(f'Blocking defect in file group {earlier}.', input)
                     self.assertIn(f'Pinned evidence for group {earlier}', input)
             observed.groups[group] = observed.groups.get(group, 0) + 1
             requests = []
             if not history.common:
-                seconds = 0 if publication == 'slow' else 225 if total == 16 else 400
+                seconds = 25 if slow_second else 0 if publication == 'slow' else 225 if total == 16 else 400
                 requests = [{'operation': 'read', 'path': path, 'query': '', 'start_line': 1} for path in common]
                 history.pending = ('common', group, requests)
             else:
-                seconds = 198 if publication == 'slow' else 25
+                seconds = (30 if group == 2 else 10) if slow_second else 198 if publication == 'slow' else 25
                 if group not in history.inspected:
                     requests = [{'operation': 'read', 'path': f['filename'], 'query': '', 'start_line': 1}
                                 for f in stage['files']]
                     history.pending = ('group', group, requests)
+                elif slow_second and group == 2 and observed.delivered[group] < 2:
+                    requests = [{'operation': 'search', 'path': stage['files'][0]['filename'],
+                                 'query': 'required-consumer', 'start_line': 1}]
+                    history.pending = ('group', group, requests)
             schema = json.loads(Path(argv[argv.index('--output-schema') + 1]).read_text())
+            if requests:
+                self.assertIn('inspect', schema['properties']['action']['enum'],
+                              'required inspection must remain available beyond the equal-share cutoff')
             if inspection_loop:
                 # #1161 Call 5fed3a4a entered group 5 at 1,284.8 s, with
                 # ~10 s left. Its final inspections took ~0.4 s, compared
                 # with 20/33 s provider turns. These bounded fixture costs
                 # reproduce that starvation; they are not a production trace.
                 seconds = 195 if not history.common else 61.75
-                if 'requests' not in schema['properties']:
+                if 'omit optional inspection' in input:
                     self.assertTrue(history.common)
                     self.assertIn(group, history.inspected)
                     requests = []
@@ -681,18 +697,28 @@ class TestRecovery(TestCase):
                     requests = [{'operation': 'search', 'path': '.', 'start_line': 1,
                                  'query': f'optional-consumer-{group}-{history.optional[group]}'}]
                     history.pending = ('optional', group, requests)
+            stopped_group = 2 if deadline in ('file_group', 'file_group_inspection', 'inspection') else total
+            if deadline and group == stopped_group and history.common:
+                if deadline.endswith('_inspection'):
+                    seconds = timeout - 5
+                    requests = [{'operation': 'read', 'path': stage['files'][0]['filename'],
+                                 'query': '', 'start_line': 1}]
+                    observed.stall_inspection = True
+                elif deadline == 'inspection':
+                    observed.stall_inspection = True
+                else:
+                    seconds = float('inf')
             spend('provider', float('inf') if stalled else seconds, timeout)
             finding = {'path': stage['files'][0]['filename'], 'line': 1, 'side': 'RIGHT',
                        'body': f'[p1] Blocking defect in file group {group}.'}
-            reply = {'action': 'inspect' if requests else 'request_changes', 'comments': [finding],
+            reply = {'action': 'inspect' if requests else 'reviewed_clean' if clean else 'request_changes',
+                     'comments': [] if clean else [finding],
                      'assessment': json.loads(APPROVAL)['assessment'], 'requests': requests}
-            if inspection_loop:
+            if inspection_loop or slow_second:
                 reply['assessment']['reviewed_context'] = '; '.join(
                     f'Pinned evidence for group {earlier}' for earlier in sorted(history.inspected))
                 if not history.inspected:
                     reply['assessment']['reviewed_context'] = 'Reading pinned guidance before the file groups.'
-                if 'requests' not in schema['properties']:
-                    del reply['requests']
             Path(argv[argv.index('--output-last-message') + 1]).write_text(json.dumps(reply))
             return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps(
                 {'type': 'thread.started', 'thread_id': thread_id}))
@@ -703,6 +729,8 @@ class TestRecovery(TestCase):
                 patch.object(structured_review, 'monotonic', lambda: clock.now), \
                 patch.object(structured_review, 'ReviewWatch', return_value=nullcontext(SimpleNamespace(run=provider))), \
                 patch.object(structured_review, 'codex_environment', return_value={}), \
+                (patch.dict(structured_review.PROVIDER_ANALYSIS_SECONDS, {'codex': 800})
+                 if deadline and deadline.startswith('provider_analysis') else nullcontext()), \
                 patch.object(subprocess, 'run', side_effect=command), \
                 patch.object(api, 'sleep'), redirect_stdout(io.StringIO()):
             try:
@@ -771,6 +799,91 @@ class TestRecovery(TestCase):
         self.assertLessEqual(run.elapsed, 1413)
         self.assertAlmostEqual(run.elapsed, 1382.8)
         self.assertAlmostEqual(row['progress']['budget']['used_seconds'], run.elapsed)
+
+    def test_large_packet_slow_second_group_borrows_time_for_required_inspection(self):
+        for files, total in ((158, 20), (171, 22)):
+            with self.subTest(files=files):
+                row, run = self._staged_review(files, slow_second=True)
+                self.assertEqual((row['status'], row['outcome'], row['review_id']),
+                                 ('completed', 'changes_requested', run.review_id), (row['error'], run.timeline))
+                self.assertEqual(run.total, total)
+                self.assertEqual(run.timeline[:4], [('preparation', 15, 60), ('packet', 25, 600),
+                                                   ('checkout', 45, 240), ('listing', 10, 30)])
+                old_share = (1293 - run.entries[2]) / (total - 1)
+                self.assertLess(old_share, 62)
+                self.assertEqual(run.entries[3] - run.entries[2], 92)
+                self.assertGreater(run.entries[3] - run.entries[2], old_share)
+                self.assertEqual(run.groups[2], 3)
+                self.assertEqual(run.delivered, {group: 2 if group == 2 else 1 for group in range(1, total + 1)})
+                self.assertEqual(run.inspected, set(run.paths))
+                self.assertEqual(run.guidance_reads, 1)
+                self.assertEqual(len(run.threads), 1)
+                self.assertEqual(run.lookups, [0, 1])
+                self.assertEqual(len(run.submissions), 1)
+                argv = run.submissions[0]
+                self.assertEqual(len(json.loads(argv[argv.index('--comments-json') + 1])), total)
+                assessment = json.loads(argv[argv.index('--assessment-json') + 1])
+                self.assertEqual(assessment['reviewed_context'], '; '.join(
+                    f'Pinned evidence for group {group}' for group in range(1, total + 1)))
+                self.assertEqual(row['expected_head'], HEAD)
+                self.assertEqual(row['head_sha'], HEAD)
+                self.assertIsNone(row['recovery_model'])
+                self.assertLess(run.elapsed, 1413)
+
+    def test_staged_deadlines_retain_the_limiting_cause_and_never_publish_partial_results(self):
+        for phase in ('file_group', 'overall', 'provider_analysis', 'inspection',
+                      'file_group_inspection', 'overall_inspection', 'provider_analysis_inspection'):
+            with self.subTest(phase=phase):
+                row, run = self._staged_review(171, slow_second=True, deadline=phase, clean=True)
+                limiting_phase = phase.removesuffix('_inspection') if phase != 'inspection' else phase
+                group = 2 if limiting_phase in ('file_group', 'inspection') else 22
+                self.assertEqual(row['status'], 'failed', row['error'])
+                self.assertEqual(row['error_code'], 'review_inspection_timeout' if phase == 'inspection'
+                                 else 'review_budget_exhausted', row['error'])
+                diagnostic = row['diagnostic']
+                handoff = limiting_phase == 'provider_analysis'
+                self.assertEqual(diagnostic['phase'], 'analysis' if handoff else limiting_phase)
+                self.assertEqual(diagnostic['outcome'], 'handoff' if handoff else 'timed_out')
+                self.assertEqual(diagnostic['submission'], 'none')
+                self.assertIn(f'file group {group} of 22', diagnostic['message'])
+                self.assertIn('Incomplete analysis', diagnostic['message'])
+                self.assertIn('remaining analysis', diagnostic['message'])
+                self.assertLessEqual(len(diagnostic['message']), 500)
+                self.assertGreaterEqual(diagnostic['elapsed_ms'], 0)
+                self.assertGreater(diagnostic['timeout_seconds'], 0)
+                self.assertEqual(diagnostic['expected_head'], HEAD)
+                self.assertEqual(diagnostic['call_id'], row['id'])
+                self.assertIsNone(row['review_id'])
+                self.assertIsNone(row['recovery_model'])
+                self.assertEqual(self.mod.run.call_count, 1)
+                self.assertEqual(run.submissions, [])
+                self.assertEqual(set(run.groups), set(range(1, group + 1)))
+                self.assertEqual(run.lookups, [0] if phase == 'inspection' else [0, 0])
+                analysis_end = run.elapsed if phase == 'inspection' else run.elapsed - 45
+                self.assertLessEqual(analysis_end, 1293)
+                self.assertLess(run.elapsed, 1413)
+                if limiting_phase == 'overall':
+                    self.assertEqual(analysis_end, 1293)
+                elif limiting_phase == 'provider_analysis':
+                    self.assertEqual(analysis_end, 95 + 800)
+                else:
+                    self.assertLess(analysis_end, 1293)
+                if phase == 'inspection' or phase.endswith('_inspection'):
+                    self.assertEqual(diagnostic['timeout_seconds'], 30 if phase == 'inspection' else 5)
+                with api.db() as connection:
+                    retained = json.loads(connection.execute('select diagnostic from calls where id=?', (row['id'],)).fetchone()[0])
+                self.assertEqual(retained, diagnostic)
+
+    def test_small_clean_review_uses_one_group_and_one_verified_verdict(self):
+        row, run = self._staged_review(1, clean=True)
+        self.assertEqual((row['status'], row['outcome'], row['review_id']),
+                         ('completed', 'clean', run.review_id), row['error'])
+        self.assertEqual(run.total, 1)
+        self.assertEqual(run.inspected, set(run.paths))
+        self.assertEqual(len(run.submissions), 1)
+        self.assertEqual(run.submissions[0][1], '--reviewed-clean')
+        self.assertEqual(run.lookups, [0, 1])
+        self.assertIsNone(row['recovery_model'])
 
     def test_staged_exhaustion_and_uncertain_publication_do_not_retry(self):
         for kwargs, code in (({'stalled': True}, 'review_budget_exhausted'),
