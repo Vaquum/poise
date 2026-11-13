@@ -90,7 +90,14 @@ test('List stays as you left it across a reload, and a link’s view is not reme
 })
 
 test('Today means changed today on Updated, and opened today on Opened', async ({ page }) => {
-  await board(page, { records: RECORDS })
+  // Fresh today stamps: RECORDS' 20–60m offsets are yesterday once the run crosses midnight.
+  const now = new Date().toISOString()
+  await board(page, { records: [
+    record('issue', 41, 'Old issue changed today', { created_at: iso(10 * 1440), updated_at: now }),
+    record('issue', 42, 'Opened today', { created_at: now, updated_at: now }),
+    record('issue', 43, 'Owned by Poise', { created_at: iso(5 * 1440), updated_at: iso(3 * 1440) }),
+    record('pr', 44, 'A pull request', { created_at: iso(2 * 1440), updated_at: iso(2 * 1440) }),
+  ] })
   await page.getByRole('group', { name: 'When' }).getByRole('button', { name: 'Today' }).click()
   await expect(card(page, 'Old issue changed today')).toBeVisible()
   await expect(card(page, 'Opened today')).toBeVisible()
