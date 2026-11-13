@@ -7,11 +7,15 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq
 apt-get install --yes -qq --no-install-recommends \
-  build-essential curl fuse-overlayfs git iptables jq less locales openssh-client procps ripgrep tini unzip xz-utils
+  build-essential curl fuse-overlayfs git iptables jq less locales openssh-client procps ripgrep shellcheck tini unzip xz-utils
 sed -i 's/^# *\(en_US.UTF-8 UTF-8\)$/\1/' /etc/locale.gen
 locale-gen
 
 curl -fsSL https://get.docker.com | sh
+
+# The workspace's Python, including python3 for children of offloaded npm scripts.
+curl -fsSL https://astral.sh/uv/0.12.22/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+UV_PYTHON_INSTALL_DIR=/opt/python UV_PYTHON_BIN_DIR=/usr/local/bin uv python install --default 3.13
 
 # The workspace's Node: a checkout's native modules are built for it, and it comes first on PATH.
 node=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | sed -n 's/.*  \(node-v22[^ ]*-linux-x64\.tar\.xz\)$/\1/p')
@@ -31,4 +35,5 @@ PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers npx --yes playwright@1.61.1 in
 chmod -R a-w,a+rX /opt/playwright-browsers
 
 node --version
+python3 --version
 docker --version

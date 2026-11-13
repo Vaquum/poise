@@ -1697,6 +1697,17 @@ describe('a job unpacking', () => {
 })
 
 describe('what a box starts from', () => {
+  it('provisions the workspace Python as the default interpreter for npm children', () => {
+    const runtime = readFileSync('deploy/runtime/Dockerfile', 'utf8')
+    const setup = readFileSync('gateway/src/test-box-setup.sh', 'utf8')
+    const uv = /ghcr.io\/astral-sh\/uv:([^ ]+)/.exec(runtime)?.[1]
+    const python = /RUN uv python install ([^ ]+)/.exec(runtime)?.[1]
+    const directory = /UV_PYTHON_INSTALL_DIR=([^ ]+)/.exec(runtime)?.[1]
+    expect(setup).toContain(`https://astral.sh/uv/${uv}/install.sh`)
+    expect(setup).toContain('UV_UNMANAGED_INSTALL=/usr/local/bin')
+    expect(setup).toContain(`UV_PYTHON_INSTALL_DIR=${directory} UV_PYTHON_BIN_DIR=/usr/local/bin uv python install --default ${python}`)
+  })
+
   it('has the Chromium this repository\'s Playwright expects', () => {
     const lock = JSON.parse(readFileSync('package-lock.json', 'utf8')) as { packages: Record<string, { version: string }> }
     expect(readFileSync('gateway/src/test-box-setup.sh', 'utf8')).toContain(`playwright@${lock.packages['node_modules/@playwright/test'].version} install`)

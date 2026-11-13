@@ -816,8 +816,11 @@ runs the suite as that image's user. So the image's own files stay as they are, 
 so does what its folders hold that this user may not write: a suite started with the
 workspace's own Python runs with the job image's copy of it, which can lag the
 workspace's for the few minutes Render takes to build that image again. A sandbox has Docker, running and open to the
-suite, and the tools of the workspace image at the same paths: Node 22, `git`, a
-build toolchain and the Chromium of this repository's Playwright.
+suite, and the tools of the workspace image at the same paths: Node 22, Python
+3.13 (also selected by `python3` in npm scripts), `git`, a build toolchain,
+ShellCheck and the Chromium of this repository's Playwright. Python uses the
+workspace image's pinned uv release and `/opt/python` installation directory;
+its default executables are installed in `/usr/local/bin`.
 `gateway/src/test-box-setup.sh` builds those once, in about a minute, and the
 gateway keeps the result as a Render snapshot named after that file's contents, so
 a change there builds a new one. Sandboxes live in a sandbox group of their own,
