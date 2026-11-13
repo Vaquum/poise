@@ -191,6 +191,10 @@ no reviewer action. Submission rejections, `no_review` no-ops, malformed or
 duplicate verdicts and duplicate GitHub reviews are contract violations and
 held. Uncertain submissions are reconciled from live receipts before any retry.
 A budget-exhausted run that proved it posted nothing can retry on backoff.
+Verified file-group deadlines (`review_budget_exhausted`, diagnostic phase
+`file_group`, outcome `timed_out`, submission `none`) count toward the target's
+retry stop without tripping the shared reviewer or clearing an existing provider
+trip. Older generic budget receipts still trigger shared backoff.
 After two distinct automatic timeouts for the same PR, head, behavior and model,
 the legacy runtime retains the failed launch and shows that automatic retries
 stopped, without another retry time. Provider recovery, restart, another slot

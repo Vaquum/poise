@@ -653,7 +653,7 @@ incomplete-reply error; `repair_execution_budget_exhausted` requires
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
 The reporter also accepts `review_budget_exhausted` and `review_inspection_timeout`,
-including a mixture of the two, for native `review-pr`
+including file-group deadlines and a mixture of the two codes, for native `review-pr`
 admissions by the reviewer account, pinned with `--expected-head`. Their basis
 includes `reviewContext` (base SHA, title and body), distinct from repair's
 `reviewRevision`. Each original receipt must retain the pre-submission `reviewing`
