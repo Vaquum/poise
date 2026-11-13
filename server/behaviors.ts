@@ -2982,6 +2982,7 @@ async function currentHeadSha(
   repo: string,
   number: number,
   actor: string,
+  reportFailure = true,
 ): Promise<string> {
   const [owner, name] = repo.split('/', 2)
   if (!owner || !name || !Number.isSafeInteger(number) || number < 1) {
@@ -2992,7 +2993,7 @@ async function currentHeadSha(
   const { stdout } = await runFile(
     GH_INTERFACE,
     ['--head-sha', `#${number}`, '--token-user', actor],
-    { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
+    { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure },
   )
   const data = objectValue(
     parseJson(stdout, 'github-interface --head-sha'),
@@ -3225,8 +3226,10 @@ async function prepareReviewTarget(
     return null
   }
   let prepared: PreparedReviewTarget | null = null
+  const identity = { correlationId: operationId, behavior: 'review-new-prs', repository: pr.repo,
+    target: `${pr.repo}#${pr.number}`, account: reviewer, phase: 'preparation' }
   try {
-    return await withNoticeDiagnosticIdentity({ correlationId: operationId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: reviewer }, async () => {
+    return await withNoticeDiagnosticIdentity(identity, async () => {
       // Recovery probe only: release a dead no-action launch so the claim
       // phase can reclaim this target. Its own writes are claim-guarded.
       await releaseFailedBehaviorIfNoAction('review-new-prs', pr.repo, pr.number, target)
@@ -3250,11 +3253,13 @@ async function prepareReviewTarget(
         captureBehaviorOutcome({ nativeId: operationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'preflight_failed' })
         throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
       }
-      const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)
+      const expectedHead = await withNoticeDiagnosticIdentity({ ...identity, progress: { slot, primitive: 'head-sha', expectedHead: null } },
+        () => currentHeadSha(pr.repo, pr.number, actor, false))
       if (!isEnabled('review-new-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('review-new-prs', pr, actor)) return null
       let changes: ChangesAddressedResult | null = null
       if (reviewer) {
-        changes = await checkChangesAddressed(pr.repo, pr.number, reviewer)
+        changes = await withNoticeDiagnosticIdentity({ ...identity, progress: { slot, primitive: 'requested-changes-addressed', expectedHead } },
+          () => checkChangesAddressed(pr.repo, pr.number, reviewer, false))
         if (!isEnabled('review-new-prs') || behaviorAborted()) return null
       }
       prepared = {
@@ -3264,6 +3269,21 @@ async function prepareReviewTarget(
       }
       return prepared
     })
+  } catch (error) {
+    const context = diagnosticIdentity(error)
+    const primitive = context?.progress?.primitive
+    if (typeof primitive !== 'string' || error instanceof BehaviorLogFeedError) throw error
+    if (behaviorAborted() && error instanceof Error && error.name === 'AbortError') return null
+    let retry: BehaviorFailureState | null = null
+    try {
+      if (!behaviorAborted()) {
+        recordBehaviorFailure('review-new-prs', 'operation', error, checkTarget, { actingAccount: reviewer })
+        retry = getBehaviorFailureState('review-new-prs', checkTarget)
+      }
+    } finally {
+      diagnosticFailure(`github-interface.${primitive}`, error, { ...context, ...context?.progress, timeoutMs: 30_000, retry })
+    }
+    return null
   } finally {
     if (!prepared) releasePrOperationOwned(operationId)
   }
@@ -3708,7 +3728,10 @@ async function tickReviewNewPrs(): Promise<void> {
     await underLifecycleSignal(() => forEachPool(claimed, REVIEW_PREPARE_CONCURRENCY, async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target } = bundle
       try {
-        const currentHead = await currentHeadSha(pr.repo, pr.number, bundle.actor)
+        const currentHead = await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs',
+          repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: bundle.actor, phase: 'revalidation',
+          progress: { slot, primitive: 'head-sha', expectedHead: bundle.expectedHead } },
+        () => currentHeadSha(pr.repo, pr.number, bundle.actor, false))
         if (currentHead !== bundle.expectedHead) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
@@ -3719,17 +3742,29 @@ async function tickReviewNewPrs(): Promise<void> {
         }
         verified.push({ prepared: bundle, claimId, setting })
       } catch (err) {
-        releaseOwnedClaim('review-new-prs', target, claimId)
-        releasePrOperationOwned(bundle.operationId)
-        if (behaviorAborted()) return
-        // The head read itself failed before anything provisioned: no
-        // worker stands behind the launch intent, so the ledger records
-        // the preflight end like a checkout failure.
-        captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
-          outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
-        if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
-        if (err instanceof BehaviorLogFeedError) failure ??= err
-        else recordBehaviorFailure('review-new-prs', 'operation', err, `${target}:check`, { actingAccount: bundle.actor })
+        let retry: BehaviorFailureState | null = null
+        try {
+          try {
+            if (behaviorAborted()) return
+            if (err instanceof BehaviorLogFeedError) failure ??= err
+            else {
+              recordBehaviorFailure('review-new-prs', 'operation', err, `${target}:check`, { actingAccount: bundle.actor })
+              retry = getBehaviorFailureState('review-new-prs', `${target}:check`)
+            }
+          } finally {
+            releaseOwnedClaim('review-new-prs', target, claimId)
+            releasePrOperationOwned(bundle.operationId)
+            if (!behaviorAborted()) captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
+              outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+          }
+        } finally {
+          if (!(err instanceof BehaviorLogFeedError) && !(behaviorAborted() && err instanceof Error && err.name === 'AbortError')) {
+            const context = diagnosticIdentity(err)
+            if (context?.phase === 'revalidation' && context.progress?.primitive === 'head-sha') {
+              diagnosticFailure('github-interface.head-sha', err, { ...context, ...context.progress, timeoutMs: 30_000, retry })
+            } else console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+          }
+        }
       }
     }))
     // Phase 3b — provision the checkout and spawn every verified target
@@ -4374,7 +4409,7 @@ async function releaseFailedBehaviorIfNoAction(
   return released
 }
 
-async function checkChangesAddressed(repo: string, number: number, reviewer: string): Promise<ChangesAddressedResult> {
+async function checkChangesAddressed(repo: string, number: number, reviewer: string, reportFailure = true): Promise<ChangesAddressedResult> {
   const [owner, name] = repo.split('/', 2)
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
@@ -4388,7 +4423,7 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
       '--token-user',
       reviewer,
     ],
-    { cwd, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() },
+    { cwd, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(), reportFailure },
   )
   return parseChangesAddressedResult(
     objectValue(

@@ -467,7 +467,7 @@ export function runFile(
       if (!processFailureObserver || options.reportFailure === false || options.signal?.aborted || args[0] === '--diagnostics') return
       try {
         processFailureObserver(error, { command, executable: resolveCommand(command),
-          operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
+          operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review', '--head-sha', '--requested-changes-addressed'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
           cwd: options.cwd ?? null, elapsedMs: Date.now() - startedAt, timeoutMs: timeout,
           stderrAllowed: !(command === 'gh' && args[0] === 'auth' && args[1] === 'token'),
           secrets: environmentSecrets(options.env ?? {}) })

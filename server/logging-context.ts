@@ -18,7 +18,7 @@ export async function withNoticeDiagnosticIdentity<T>(identity: NoticeDiagnostic
   return context.run(identity, async () => {
     try { return await work() }
     catch (error) {
-      if (error !== null && typeof error === 'object') failures.set(error, identity)
+      if (error !== null && typeof error === 'object' && !failures.has(error)) failures.set(error, identity)
       throw error
     }
   })

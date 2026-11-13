@@ -135,6 +135,26 @@ else { process.stderr.write(failure); process.exitCode = 1 }
     for (const value of ['private-output', 'private-argument']) expect(JSON.stringify(page)).not.toContain(value)
   })
 
+  it.each(['head-sha', 'requested-changes-addressed'])('retains the %s child identity through nested scheduler contexts', async (primitive) => {
+    start()
+    vi.stubEnv('CALLER_BIN_ROOT', directory)
+    writeFileSync(join(directory, 'github-interface'), `#!${process.execPath}\nprocess.stderr.write('precise probe failure');process.exit(1)`, { mode: 0o755 })
+    const outer = { correlationId: 'a'.repeat(32), behavior: 'review-new-prs', repository: 'acme/repo', target: 'acme/repo#17', account: 'bot', phase: 'sweep' }
+    const inner = { ...outer, phase: 'preparation', progress: { primitive, slot: 'secondary', expectedHead: 'b'.repeat(40) } }
+    try {
+      await withNoticeDiagnosticIdentity(outer, () => withNoticeDiagnosticIdentity(inner,
+        () => runFile('github-interface', [`--${primitive}`, '#17'])))
+      expect.fail('the child must fail')
+    } catch (error) { diagnosticFailure('scheduler.review', error) }
+    loggingRuntime()!.flush()
+    const events = diagnosticPage(null).events.filter((event) => [
+      `github-interface.${primitive}`, 'scheduler.review',
+    ].includes(event.operation))
+    expect(events).toHaveLength(2)
+    for (const event of events) expect(event).toMatchObject({ correlationId: outer.correlationId, phase: 'preparation',
+      target: outer.target, exitCode: 1, stderr: 'precise probe failure', context: { progress: inner.progress } })
+  })
+
   it('distinguishes a TimeoutError code from an actual subprocess exit with the same code', async () => {
     start()
     const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
