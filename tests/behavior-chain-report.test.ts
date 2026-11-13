@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
-import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { BehaviorChainRuntime, ReviewScopeIndexingError, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, setRepairReportRepositories } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
@@ -19,7 +19,8 @@ import type { Organization } from '../server/organizations'
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), settings: { enabled: true, seedMode: 'label', label: 'poise' },
   accounts: { me: 'author', agentAccount: 'reviewer' } }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn(), MAX_PROCESS_ARG_BYTES: 64 * 1024 }))
-vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? mocks.accounts.me : null }))
+vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? mocks.accounts.me : null,
+  writeObservation: (write: () => unknown) => write() }))
 vi.mock('../server/settings', () => ({ getSettings: () => mocks.accounts, getBehaviorChainSettings: () => mocks.settings,
   BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY: 'behavior_chain_integrity_hold' }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/fixture' }))
@@ -97,7 +98,8 @@ beforeEach(() => {
     if (command === 'github-datastore') {
       if (argv[0] === 'health') {
         if (stale) throw new Error('github-datastore freshness gate failed: stale review datastore')
-        return response({ healthy: true })
+        return response({ action: 'health', status: 'healthy', healthy: true, database: '/fixture/github.sqlite',
+          max_age_seconds: 120, age_seconds: 1, last_success_at: new Date().toISOString() })
       }
       if (argv[0] === 'view') return response(indexed ? remote.filter(row => row.state === 'open'
         && (mocks.settings.seedMode === 'all' || row.labels.some(label => label.name === mocks.settings.label)))
@@ -1004,6 +1006,119 @@ with tempfile.TemporaryDirectory() as root:
   await expect(repairReportReviewScope(db, chain, 24)).rejects.toThrow('awaits indexed PR closing references')
   await runtime.run()
   expect(posts()).toHaveLength(1)
+})
+
+it.each(['review-pr', 'approve-pr'] as const)('waits per PR for indexed scope before %s, retaining the first wait across restart', async behavior => {
+  const { db, journal } = setup()
+  let chain = openSeed(journal)
+  // A chain can already have several history pages before its PR is published.
+  for (let index = 0; index < 100; index++) chain = record(journal, chain, { type: 'chain.observed', observation: observation(22) })
+  const other = journal.append('acme/repo#8', 'seed:8', 0, { type: 'chain.admitted', repository: 'acme/repo', issue: 8,
+    branch: 'poise/issue-8', author: 'author', reviewer: 'reviewer' })
+  seedBody = `${REMEDIATION_SCOPE}\n\nInclude this exact paragraph in the linked PR review.`
+  let indexedPull: number | null = null
+  const existingRun = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    if (command === 'github-interface' && argv[0] === '--read-issue' && argv[1] === '8') {
+      return { stdout: JSON.stringify({ repository: 'acme/repo', issue_number: 8, issue: issue(8, 'Ordinary work') }), stderr: '' }
+    }
+    if (command === 'github-datastore' && argv[1] === 'pr-closing') {
+      expect(argv).toEqual(['view', 'pr-closing', '--repo', 'acme/repo', '--format', 'json', '--limit', '1', '--after-number', '21'])
+      return { stdout: JSON.stringify({ prs: indexedPull === null ? [] : [{ repo: 'acme/repo', number: indexedPull,
+        closes_via: 'closing-references', closing_truncated: false, closing: [{ repo: 'acme/repo', number: 7 }] }],
+      more: indexedPull === 24, truncated: indexedPull === 24 }), stderr: '' }
+    }
+    return existingRun(command, argv)
+  })
+  const native = nativeChainOperations({ login: 'acme' } as Organization, {
+    roster: async () => fresh, resolve: async () => reviewer, prepare: async () => ({}), borrow: () => null,
+    available: () => true, capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2',
+    received: () => {}, reviews: async () => '', existing: async () => new Set(), wake: () => {},
+    reviewScope: (target, pull) => repairReportReviewScope(db, target, pull.number),
+  })
+  const calls: LogEntry[] = []
+  const launch = vi.fn(async (invocation: BehaviorChain['invocations'][number]) => {
+    calls.push({ id: chainBasis(invocation.id).slice(0, 32), correlation_id: invocation.id, source: 'poise:behavior-chain',
+      actor: invocation.actor, repo: chain.repository, behavior: behavior === 'review-pr' ? 'pr_review' : 'pr_approve',
+      model: reviewer.model, pr_id: invocation.request.argv[1].split('/').at(-1)!, session_id: null, prompt: '',
+      started_at: new Date().toISOString(), time_elapsed: '1s', head_sha: null, expected_head: HEAD, response: null,
+      error: '', status: 'running', action: null, outcome: null, resources_settled_at: null,
+      resource_ownership: { version: 1, roots: [], errors: [] } })
+    return true
+  })
+  const ops = operations(db, journal, { discover: async () => [], available: () => true, permitted: () => true,
+    observe: async target => {
+      const observed = observation(target.issue === 7 ? 22 : 23)
+      observed.prReviewers = behavior === 'review-pr' ? [reviewer] : []
+      Object.assign(observed.pull!, { changesRequested: false, unresolved: 0 })
+      return observed
+    }, request: native.request, launch, readInvocations: async () => ({ entries: calls, quarantined: [] }) })
+  let runtime = new BehaviorChainRuntime(journal, ops)
+  await expect(runtime.run()).resolves.toBeUndefined()
+  const reason = 'Repair report review awaits indexed PR closing references for acme/repo#22'
+  expect(journal.read(chain.id)).toMatchObject({ waiting: reason, invocations: [], held: null })
+  expect(journal.read(other.id)!.invocations).toMatchObject([{ behavior, state: 'started' }])
+  expect(launch).toHaveBeenCalledTimes(1)
+
+  vi.setSystemTime(NOW + 30_000)
+  await runtime.run()
+  indexedPull = 24
+  vi.setSystemTime(NOW + 60_000)
+  journal.rebuild()
+  runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), ops)
+  await expect(runtime.run()).resolves.toBeUndefined()
+  const waits = db.prepare("SELECT at FROM behavior_chain_events WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.waiting'").all(chain.id)
+  expect(waits).toEqual([{ at: NOW }])
+  expect(journal.read(chain.id)!.invocations).toEqual([])
+
+  // Each health read reports a new successful sync; it cannot renew this PR's budget.
+  vi.setSystemTime(NOW + 120_001)
+  await expect(runtime.run()).rejects.toThrow(`${reason}; indexing delay exceeds 120 seconds`)
+  expect(journal.read(chain.id)!.invocations).toEqual([])
+  expect(launch).toHaveBeenCalledTimes(1)
+  indexedPull = 22
+  await runtime.run()
+  await expect(runtime.run()).resolves.toBeUndefined()
+  const admitted = journal.read(chain.id)!.invocations
+  expect(admitted).toMatchObject([{ behavior, state: 'started' }])
+  expect(admitted[0].request.argv[admitted[0].request.argv.indexOf('--review-scope') + 1]).toBe(REMEDIATION_SCOPE)
+  expect(journal.read(chain.id)!.waiting).toBeNull()
+  expect(launch).toHaveBeenCalledTimes(2)
+})
+
+it.each(['read failure', 'invalid health', 'malformed JSON', 'missing page', 'truncated page', 'invalid cursor',
+  'wrong repository', 'incomplete later row', 'malformed closing reference'])('keeps %s actionable instead of waiting for scope indexing', async kind => {
+  const { db, journal } = setup()
+  const chain = openSeed(journal)
+  seedBody = `${REMEDIATION_SCOPE}\n\nInclude this exact paragraph in the linked PR review.`
+  const row = { repo: 'acme/repo', number: 24, closes_via: 'closing-references', closing_truncated: false,
+    closing: [{ repo: 'acme/repo', number: 7 }] }
+  if (kind === 'invalid cursor') row.number = 21
+  if (kind === 'wrong repository') row.repo = 'other/repo'
+  if (kind === 'incomplete later row') row.closing_truncated = true
+  if (kind === 'malformed closing reference') row.closing[0].number = 0
+  const page = kind === 'missing page' ? {} : { prs: kind === 'truncated page' ? [] : [row],
+    more: false, truncated: kind === 'truncated page' || row.closing_truncated }
+  const existingRun = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    if (command === 'github-datastore') {
+      if (argv[0] === 'health' && kind === 'invalid health') return { stdout: '{"healthy":true}', stderr: '' }
+      if (argv[1] === 'pr-closing') {
+        if (kind === 'read failure') throw new Error('closing-reference store unavailable')
+        return { stdout: kind === 'malformed JSON' ? '{' : JSON.stringify(page), stderr: '' }
+      }
+    }
+    return existingRun(command, argv)
+  })
+  const failure = await repairReportReviewScope(db, chain, 22).then(() => null, (error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect(failure).not.toBeInstanceOf(ReviewScopeIndexingError)
+  if (kind === 'malformed JSON') expect(failure).toBeInstanceOf(SyntaxError)
+  else expect(failure).toMatchObject({ message: kind === 'read failure' ? 'closing-reference store unavailable'
+    : kind === 'invalid health' ? 'Repair report review lacks valid datastore freshness evidence'
+    : ['missing page', 'truncated page'].includes(kind) ? 'Repair report review lacks PR closing references'
+    : 'Repair report review has incomplete PR closing references' })
+  expect(journal.read(chain.id)).toMatchObject({ waiting: null, invocations: [] })
 })
 
 it('carries an explicitly marked seed scope to its closing PR without repair-report metadata', async () => {

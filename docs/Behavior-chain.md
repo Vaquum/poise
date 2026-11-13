@@ -723,12 +723,18 @@ All report bodies include the canonical clinical scope directive in the
 [report template](../server/behavior-chain-report.ts), followed by
 "Include this exact paragraph in the linked PR review." Native PR review and
 approval check closing references only when their chain's exact seed is a recorded
-report issue in that repository. The recorded issue number identifies the
+report issue in that repository or contains the canonical paragraph followed by
+that exact directive. The recorded issue number identifies the
 remediation ticket; the report's `pull` identifies the stalled source PR.
 The datastore must report complete `closing-references` that identify that exact
-seed; `body-keywords` cannot verify the relationship. Stale, missing or incomplete
-closing observations stop remediation review preparation. Unrelated seeds skip
-these additional datastore reads.
+seed; `body-keywords` cannot verify the relationship. A validated fresh page missing
+the exact PR (empty or starting at a later number) records a wait naming that PR
+before admission, while other chains continue. Its 120-second budget starts at
+the first timestamped journal wait for that repository/PR; rechecks, restarts and
+healthy syncs cannot reset it. Once the exact closing reference appears, review
+preparation resumes with the required scope. Stale, unreadable, incomplete or
+conflicting evidence, and an indexing delay beyond that budget, remain errors.
+Unrelated seeds skip these additional datastore reads.
 A `poise` label or copied report marker alone cannot qualify a PR.
 Poise passes the trusted paragraph through `--review-scope`, separately from the
 configurable `--note`, and includes it in the reviewer's instructions. A lookalike

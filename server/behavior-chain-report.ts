@@ -1,10 +1,11 @@
 import type { Database } from 'better-sqlite3'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal } from './behavior-chain-store'
+import { ReviewScopeIndexingError } from './behavior-chain-runtime'
 import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
-import { runDatastoreHealth } from './datastore-health'
+import { runDatastoreHealth, validatedHealth } from './datastore-health'
 import { handleGhBody, reconcileRepairReport } from './gh'
 import { HttpError } from './http'
 import { organizationArgs, organizationForRepository } from './organizations'
@@ -70,20 +71,28 @@ export async function repairReportReviewScope(db: Database, chain: Pick<Behavior
   if (!org) throw new Error('Repair report review requires its followed organization')
   // Episode-aware: a raw health gate would emit fresh process and runtime
   // faults on every retry for the same open stale episode.
-  const { stale } = await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['review-pr', 'approve-pr'])
+  const { stale, stdout: health } = await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['review-pr', 'approve-pr'])
   if (stale) throw stale
+  if (validatedHealth(health, org)?.status !== 'healthy') throw new Error('Repair report review lacks valid datastore freshness evidence')
   const { stdout } = await runFile('github-datastore', organizationArgs(org, ['view', 'pr-closing', '--repo', repository,
     '--format', 'json', '--limit', '1', ...(pull > 1 ? ['--after-number', String(pull - 1)] : [])]),
   { timeoutMs: 30_000, maxOutputBytes: 64 * 1024 })
   const page = JSON.parse(stdout) as { prs?: Array<{ repo: string, number: number, closes_via: string, closing_truncated: boolean,
-    closing: Array<{ repo: string, number: number }> }> }
-  if (!Array.isArray(page.prs) || page.prs.length > 1) throw new Error('Repair report review lacks PR closing references')
+    closing: Array<{ repo: string, number: number }> }>, more?: boolean, truncated?: boolean } | null
+  if (!page || !Array.isArray(page.prs) || page.prs.length > 1 || typeof page.more !== 'boolean'
+    || typeof page.truncated !== 'boolean' || (!page.prs.length && (page.more || page.truncated))) {
+    throw new Error('Repair report review lacks PR closing references')
+  }
   const pr = page.prs[0]
-  if (!pr || pr.number !== pull) throw new Error('Repair report review awaits indexed PR closing references')
-  if (pr.repo.toLowerCase() !== repository.toLowerCase() || pr.closes_via !== 'closing-references'
-    || pr.closing_truncated !== false || !Array.isArray(pr.closing)) {
+  if (pr !== undefined && (!pr || typeof pr.repo !== 'string' || pr.repo.toLowerCase() !== repository.toLowerCase()
+    || !Number.isSafeInteger(pr.number) || pr.number < pull || pr.closes_via !== 'closing-references'
+    || pr.closing_truncated !== false || !Array.isArray(pr.closing)
+    || pr.closing.some(ref => !ref || typeof ref.repo !== 'string' || !ref.repo.length
+      || !Number.isSafeInteger(ref.number) || ref.number < 1))) {
     throw new Error('Repair report review has incomplete PR closing references')
   }
+  if (page.truncated !== page.more) throw new Error('Repair report review has incomplete PR closing references')
+  if (!pr || pr.number !== pull) throw new ReviewScopeIndexingError(repository, pull)
   if (!pr.closing.some(ref => ref.repo.toLowerCase() === repository.toLowerCase() && ref.number === issue)) return ''
   return REMEDIATION_SCOPE
 }
