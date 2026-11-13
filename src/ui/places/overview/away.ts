@@ -7,7 +7,7 @@ import { getBehaviorDiagnostics, refreshState } from '../../../behaviors'
 import { chatClient } from '../../../chat-client'
 import { LOCAL_NOTICE_KINDS, noticeFeed } from '../../../notices'
 import { notificationItems, type ChainAttentionRow } from '../../../notification-items'
-import { decisionEntries, foldWaiting, itemEntries, requestEntries, requestsFrom, threadEntries, undismissed, type DecisionItem, type Entry, type OpenRequest, type Publication, type ThreadReview } from './entries'
+import { decisionEntries, foldWaiting, itemEntries, prStatusesFrom, requestEntries, requestsFrom, threadEntries, undismissed, type DecisionItem, type Entry, type OpenRequest, type Publication, type PrStatuses, type ThreadReview } from './entries'
 import type { Group } from './level'
 import { json, reason } from './util'
 
@@ -20,6 +20,8 @@ const threadsRead = new Map<string, { openThreads: number, checkedAt: string | n
 let dismissals = new Map<string, string>()
 let attention: ChainAttentionRow[] = []
 let chains: ReadonlyMap<string, { sequence: number, held: string | null }> = new Map()
+/** Who moves each open pull request next, which decides whom its notice waits on. */
+let prs: PrStatuses = new Map()
 
 /** A failed read under Overview's own source and words; Overview's reads and these replace each other. */
 const report = (source: string, title: string, error: string): void =>
@@ -32,7 +34,7 @@ export function awayGroups(): Group[] {
   const feed = noticeFeed.current
   const notices = feed.notices.filter((notice) => feed.enabled || (LOCAL_NOTICE_KINDS as readonly string[]).includes(notice.kind))
   const items = notificationItems(notices, getBehaviorDiagnostics(), Date.now(), attention)
-  const entries = undismissed(foldWaiting([...itemEntries(items, noRole, chains), ...requestEntries(requests, noRole), ...decisionEntries(decisions, noRole)]), dismissals)
+  const entries = undismissed(foldWaiting([...itemEntries(items, noRole, chains, prs, Date.now()), ...requestEntries(requests, noRole), ...decisionEntries(decisions, noRole)]), dismissals)
   // A document's open threads, as its sweep counts them, less those put away at
   // what they report now: a reply, or a thread its cache does not list, counts.
   const threads = publications.reduce((sum, publication) => {
@@ -58,13 +60,14 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     if (reading || !away() || document.visibilityState !== 'visible' || Date.now() - readAt < 60_000) return
     reading = true
     readAt = Date.now()
-    const [r, b, v, c, , d] = await Promise.allSettled([
+    const [r, b, v, c, , d, p] = await Promise.allSettled([
       json('/api/chat/requests'),
       chatClient.switchboard(),
       json<{ publications?: Publication[] }>('/api/editor/reviews'),
       json<{ chains?: { id: string, sequence: number, held: string | null }[], attention?: ChainAttentionRow[] }>('/api/behavior-chains?state=active'),
       refreshState(),
       json<{ dismissals?: { key: string, revision: string }[] }>('/api/answers/dismissals'),
+      json('/api/behavior-ledger/pr-status?limit=100'),
     ])
     reading = false
     const unread = 'the service answered with something this page cannot read'
@@ -101,6 +104,11 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     report('overview-reviews', 'Review threads could not be read', failed(v, Array.isArray(read)))
     report('overview-dismissals', 'Put-away entries could not be read', failed(d, Array.isArray(putAway)))
     report('overview-chains', 'Attention evidence unavailable', failed(c, !!chainsRead))
+    let prsError = p.status === 'rejected' ? reason(p.reason) : ''
+    if (p.status === 'fulfilled') {
+      try { prs = prStatusesFrom(p.value, prs) } catch (error) { prsError = reason(error) }
+    }
+    report('overview-prs', 'Pull requests’ status could not be read', prsError)
     changed()
   }
   const soon = (): void => {

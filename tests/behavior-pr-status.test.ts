@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseBehaviorLedgerArguments, runBehaviorLedgerCli } from '../server/behavior-ledger-cli'
 import { computePrBlocker, parsePrStatusRead, type BlockerInput } from '../server/behavior-pr-status'
 import { HEAD_SHA, NEXT_HEAD_SHA, arrangeCli, fixture, loadModules, mocks, pr, recordCompletedInitialReview } from './behaviors-runtime-fixture'
+import { prGroup } from '../src/ui/places/overview/entries'
 
 const HEAD = HEAD_SHA
 const NEXT = NEXT_HEAD_SHA
@@ -35,6 +36,30 @@ function baseInput(overrides: Partial<BlockerInput> = {}): BlockerInput {
     ...overrides,
   }
 }
+
+// Answer here reads who moves a pull request next from the blocker this
+// computes (src/ui/places/overview/entries.ts): these are its exact lines.
+describe('who moves a pull request next, as Answer here reads the blocker', () => {
+  const group = (input: Partial<BlockerInput>) => {
+    const computed = computePrBlocker(baseInput(input))
+    return prGroup({ repository: 'acme/site', number: 1, blocker: { id: computed.id, line: computed.line, since: '', sinceRestart: false, details: [] } })
+  }
+  it('is Poise while a behavior moves it, you when nothing will, and a fault when a behavior is held', () => {
+    expect(group({ queue: { state: 'queued', since: null, entryId: 'e1' } })).toBe('auto')
+    expect(group({ liveClaim: { key: 'review-new-prs', expectedHead: HEAD, others: [] } })).toBe('auto')
+    expect(group({ verdict: null, onCurrentHead: null })).toBe('auto')
+    expect(group({ verdict: null, onCurrentHead: null, roundsCompleted: 5 })).toBe('needs-you')
+    expect(group({ rollupState: 'FAILURE', greyPending: true })).toBe('auto')
+    expect(group({ rollupState: 'FAILURE' })).toBe('needs-you')
+    expect(group({ mergeState: 'BEHIND' })).toBe('auto')
+    expect(group({ mergeState: 'DIRTY' })).toBe('needs-you')
+    expect(group({})).toBe('auto')
+    expect(group({ mergePrsEnabled: false })).toBe('needs-you')
+    expect(group({ mergePrsPaused: true })).toBe('needs-you')
+    expect(group({ refusal: 'outside your configured GitHub account pair' })).toBe('needs-you')
+    expect(group({ held: [{ behavior: 'merge-prs', code: 'merge_failed', since: '2026-10-29T10:00:00Z' }] })).toBe('fault')
+  })
+})
 
 describe('computePrBlocker', () => {
   it('reports refusal verbatim as not_eligible', () => {

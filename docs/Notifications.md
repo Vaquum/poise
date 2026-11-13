@@ -9,29 +9,56 @@ When nothing needs you, the bell shows no count.
 
 ## The bell
 
-The count is what Answer here shows at its default level: what needs you, Poise
-faults and what is done for you to see. What Poise handles on its own is not
-counted. The badge is:
+The count is what Answer here shows at the level you chose: at its default,
+what waits on you and what is stuck. What Poise handles on its own is never
+counted, and what has finished is never listed. The badge is:
 
-- red while Poise has a fault;
-- amber while something needs you;
-- green when everything open is done for you to see.
+- red while something is stuck;
+- amber while something waits on you.
 
 ## Answer here
 
 Answer here lists everything that wants you, each entry with its answers on
-it: questions and permissions from chats, the Switchboard's decisions, review
-threads, sign-ins, merges and faults. Show sets how much it lists, each level
-including the ones before it:
+it, by who acts on it next. Show sets how much it lists, each level including
+the one before it:
 
-- **Only you:** what only you can do.
-- **+ Faults:** also what Poise itself needs repaired.
-- **+ Done:** also what has finished, for you to see. The default, and what the
-  bell counts.
-- **Everything:** also what Poise is handling on its own.
+- **Only you:** what stays put until you act. A chat's permission or question,
+  a Switchboard decision, a chat waiting for you, a sign-in, a review requested
+  of you, a review comment on your document, low storage, idle worker slots
+  with an empty backlog, an action of yours that failed, and a pull request of
+  yours that nothing else will move: changes
+  requested, a conflict, failing checks, unresolved conversations, a refusal,
+  a review cap reached, merging turned off, or no status read for it. Chain
+  work is never here.
+- **+ Faults:** also what is stuck. Chain work that is held or has not moved
+  for four hours, a behavior that gave up on a target, Poise's own failures
+  (a review outcome to verify, an unusable result, a failed command), a stalled
+  ledger, and anything automatic still open after four hours: a notice from
+  when it was raised, chain work from its last verified advance, a retried
+  Behaviors failure from when its run of failures began. The default, and what
+  the bell counts.
+- **Everything:** also what Poise is handling on its own: chain work that moved
+  in the last four hours, pull requests a behavior or the chain is moving
+  (reviewing, in the merge queue, checks running, a branch update), and
+  retries (rate limits, a busy model, the network, GitHub's quota, a stalled
+  sweep). This group folds to its count while anything else is listed.
 
-Each level shows how many entries it lists now, so a level that would add
-nothing says so before it is chosen.
+What has finished, a chat's turn or an action, is not listed; Handled today
+keeps what was settled here. A pull request's notice takes its group from the
+pull request's current blocker, read from
+`/api/behavior-ledger/pr-status`; the line under its title says that blocker.
+When that status cannot be read, the last read stays, an organization whose
+datastore could not be read keeps its earlier rows, and a pull request with no
+status read waits on you.
+The heading counts what the level shows, and each group heading counts its own.
+
+Each entry is a card as on Board: its title (a pull request's own title, a
+chain's first reason), one line on what it waits on, and its kind, place and
+age. Only what acts is a button on it: Merge, an answer's options and Other, a
+reply, Resolve. Its other actions show under the pointer, or with focus, at its
+lower right: open it where it lives, on GitHub, its timeline or diagnostic,
+More, Resume a held chain, Silence reminders, and Dismiss, whose tip says what
+putting it away does.
 
 Within each group the newest entry is on top: a notice by when it began, a
 request or decision by when it was asked, a review thread by its latest reply,

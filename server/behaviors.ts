@@ -451,6 +451,8 @@ type BehaviorFailureKind = 'operation' | 'worker'
 interface PersistedBehaviorFailure {
   kind: BehaviorFailureKind
   consecutiveFailures: number
+  /** When this run of failures began; a streak recorded before it was kept reads as its last failure. */
+  firstFailureAtMs?: number
   lastFailureAtMs: number
   nextRetryAtMs: number
   // What failed last, so the view can say why rather than only how often.
@@ -478,9 +480,11 @@ function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehavi
       || !Number.isFinite(value.nextRetryAtMs)
       || Number(value.nextRetryAtMs) < 0
       || Number(value.nextRetryAtMs) > 8.64e15) return null
+    const first = Number(value.firstFailureAtMs)
     return {
       kind: value.kind,
       consecutiveFailures: Math.min(Number(value.consecutiveFailures), 31),
+      ...(Number.isFinite(first) && first >= 0 && first <= Number(value.lastFailureAtMs) ? { firstFailureAtMs: first } : {}),
       lastFailureAtMs: Number(value.lastFailureAtMs),
       nextRetryAtMs: Number(value.nextRetryAtMs),
       ...(typeof value.error === 'string' && value.error ? { error: value.error.slice(0, 300) } : {}),
@@ -565,6 +569,7 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
   setMeta(failureKey(key, target), JSON.stringify({
     kind,
     consecutiveFailures,
+    firstFailureAtMs: previous ? previous.firstFailureAtMs ?? previous.lastFailureAtMs : now,
     lastFailureAtMs: now,
     nextRetryAtMs,
     ...(error ? { error } : {}),
@@ -8526,6 +8531,8 @@ export interface BehaviorsRuntimeHealth {
     target?: string
     kind: BehaviorFailureKind
     consecutiveFailures: number
+    /** When this run of failures began, for how long it has stood. */
+    failingSince: string
     lastFailureAt: string
     nextRetryAt: string
     error?: string
@@ -8608,6 +8615,7 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
         ...(target ? { target } : {}),
         kind: failure.kind,
         consecutiveFailures: failure.consecutiveFailures,
+        failingSince: new Date(failure.firstFailureAtMs ?? failure.lastFailureAtMs).toISOString(),
         lastFailureAt: new Date(failure.lastFailureAtMs).toISOString(),
         nextRetryAt: new Date(failure.nextRetryAtMs).toISOString(),
         ...(failure.error ? { error: failure.error } : {}),
@@ -8627,7 +8635,7 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
         || !isEnabled(behavior as BehaviorKey)
         || failures.some((failure) => failure.behavior === behavior && failure.correlationId === episode.id)) continue
       failures.push({ behavior: behavior as BehaviorKey, kind: 'operation', consecutiveFailures: 1,
-        lastFailureAt: episode.startedAt, nextRetryAt: '', error: staleMirrorMessage(episode),
+        failingSince: episode.startedAt, lastFailureAt: episode.startedAt, nextRetryAt: '', error: staleMirrorMessage(episode),
         diagnostic: diagnosticClassification('datastore_stale'), correlationId: episode.id })
     }
   }

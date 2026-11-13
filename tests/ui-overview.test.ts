@@ -4,7 +4,10 @@ import type { NotificationItem } from '../src/notification-items'
 import { bellTally, DEFAULT_LEVEL, LEVEL_KEY, noticeGroup, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from '../src/ui/places/overview/level'
 import { chatOpening, diagnosticHref, itemOf, journalStep, targetOpening, timelineHref } from '../src/ui/places/overview/targets'
 import { chatState, countStates, issueState, pullState, taskPhase, taskState, type ChainLike } from '../src/ui/places/overview/states'
-import { decisionEntries, foldWaiting, itemEntries, ordered, requestEntries, requestsFrom, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
+import { decisionEntries, diagnosticGroup, foldWaiting, itemEntries, ordered, prGroup, prStatusesFrom, requestEntries, requestsFrom, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
+import { STALLED_MESSAGE } from '../src/behavior-diagnostics'
+import type { ChainAttentionRow } from '../src/notification-items'
+import type { PrStatus } from '../src/ui/places/board/model'
 import { countPair, moveTile, tileOrder, workTypeRows } from '../src/ui/places/overview/day'
 import type { AnalyticsReport } from '../src/analytics-format'
 
@@ -30,8 +33,9 @@ const notice = (kind: Notice['kind'], extra: Partial<Notice> = {}): Notice => ({
 })
 
 describe('the level', () => {
-  it('opens on + Done, keeps a choice, and refuses what is not a level', () => {
+  it('opens on + Faults, keeps a choice, and refuses what is not a level', () => {
     expect(readLevel()).toBe(DEFAULT_LEVEL)
+    expect(DEFAULT_LEVEL).toBe(1)
     saveLevel(0)
     expect(readLevel()).toBe(0)
     memory.set(LEVEL_KEY, '7')
@@ -40,39 +44,45 @@ describe('the level', () => {
     expect(readLevel()).toBe(DEFAULT_LEVEL)
   })
 
+  it('carries a choice made among the four old levels to the three: + Done shows what + Faults shows now', () => {
+    for (const [old, now] of [['0', 0], ['1', 1], ['2', 1], ['3', 2]] as const) {
+      memory.clear()
+      memory.set('poise-overview-level', old)
+      expect(readLevel()).toBe(now)
+    }
+  })
+
   it('includes each group before it', () => {
     expect(shownAt('needs-you', 0)).toBe(true)
     expect(shownAt('fault', 0)).toBe(false)
     expect(shownAt('fault', 1)).toBe(true)
-    expect(shownAt('ready', 1)).toBe(false)
-    expect(shownAt('auto', 2)).toBe(false)
-    expect(shownAt('auto', 3)).toBe(true)
+    expect(shownAt('auto', 1)).toBe(false)
+    expect(shownAt('auto', 2)).toBe(true)
   })
 
   it('counts what the level shows, never what Poise handles on its own, in the most urgent colour', () => {
-    const groups = ['needs-you', 'fault', 'ready', 'auto', 'auto'] as const
+    const groups = ['needs-you', 'fault', 'auto', 'auto'] as const
     expect(tally(groups, 0)).toEqual({ count: 1, tone: 'needs-you' })
     expect(tally(groups, 1)).toEqual({ count: 2, tone: 'failed' })
-    expect(tally(groups, 2)).toEqual({ count: 3, tone: 'failed' })
-    expect(tally(groups, 3)).toEqual({ count: 3, tone: 'failed' })
-    expect(tally(['ready'], 2)).toEqual({ count: 1, tone: 'done' })
-    expect(tally(['ready'], 1)).toEqual({ count: 0, tone: '' })
-    expect(tally([], 3)).toEqual({ count: 0, tone: '' })
+    expect(tally(groups, 2)).toEqual({ count: 2, tone: 'failed' })
+    expect(tally(['auto'], 2)).toEqual({ count: 0, tone: '' })
+    expect(tally([], 2)).toEqual({ count: 0, tone: '' })
   })
 
-  it('groups every notice kind by who acts, as #556 maps them', () => {
-    for (const kind of [...NOTICE_KINDS, ...LOCAL_NOTICE_KINDS]) expect(['needs-you', 'fault', 'ready']).toContain(noticeGroup(kind))
-    expect(noticeGroup('pr_ready')).toBe('needs-you')
-    expect(noticeGroup('github_quota_warning')).toBe('needs-you')
-    expect(noticeGroup('github_quota_exhausted')).toBe('fault')
-    expect(noticeGroup('ledger_capture_loss')).toBe('fault')
-    expect(noticeGroup('read_failed')).toBe('fault')
-    expect(noticeGroup('chat_turn_finished')).toBe('ready')
+  // Only you is what stays put until you act; Poise's own work is a fault when
+  // stuck and automatic while it moves; finished work is not listed.
+  it('groups every notice kind by who acts', () => {
+    for (const kind of [...NOTICE_KINDS, ...LOCAL_NOTICE_KINDS]) expect(['needs-you', 'fault', 'auto', null]).toContain(noticeGroup(kind))
+    for (const kind of ['chat_waiting', 'sign_in_needed', 'review_requested', 'storage_low', 'action_needed', 'action_failed', 'pr_ready', 'pr_conflict', 'worker_idle'] as const) expect(noticeGroup(kind)).toBe('needs-you')
+    for (const kind of ['behavior_held', 'ledger_queue_stalled', 'ledger_capture_loss'] as const) expect(noticeGroup(kind)).toBe('fault')
+    for (const kind of ['datastore_sync_failing', 'github_quota_warning', 'github_quota_exhausted', 'read_failed'] as const) expect(noticeGroup(kind)).toBe('auto')
+    expect(noticeGroup('chat_turn_finished')).toBeNull()
+    expect(noticeGroup('action_finished')).toBeNull()
   })
 
   it('has the bell count what the level shows: the same sources elsewhere, Overview’s own entries while it is mounted', () => {
-    const away = () => [notice('pr_ready'), notice('chat_turn_finished'), notice('ledger_queue_stalled')].map((value) => noticeGroup(value.kind))
-    expect(bellTally(away)).toEqual({ count: 3, tone: 'failed' })
+    const away = () => [notice('pr_ready'), notice('chat_turn_finished'), notice('ledger_queue_stalled')].flatMap((value) => noticeGroup(value.kind) ?? [])
+    expect(bellTally(away)).toEqual({ count: 2, tone: 'failed' })
     saveLevel(0)
     expect(bellTally(away)).toEqual({ count: 1, tone: 'needs-you' })
     setAnswerGroups(() => ['needs-you', 'needs-you', 'needs-you'])
@@ -194,17 +204,103 @@ describe('Answer here’s entries', () => {
     expect(foldWaiting(itemEntries(items, role, new Map())).map((entry) => entry.id)).toEqual(['notice:n1'])
   })
 
-  it('offers Merge on a ready pull request, and groups by who acts', () => {
+  it('offers Merge on a ready pull request, groups by who acts, and lists nothing finished', () => {
     const items = (['pr_ready', 'ledger_queue_stalled', 'chat_turn_finished'] as const).map((kind) => ({
-      id: kind, group: 'needs', tone: 'amber', icon: 'merge', title: kind, body: '', source: 'GitHub', scope: null, when: null, meta: '', details: [], behaviors: [],
-      notice: notice(kind, { id: kind, target: kind === 'pr_ready' ? { pullRequest: 'https://github.com/acme/site/pull/14' } : null }),
+      id: kind, group: 'needs', tone: 'amber', icon: 'merge', title: kind, body: kind === 'pr_ready' ? 'Fix the login' : '', source: 'GitHub', scope: null, when: null, meta: '', details: [], behaviors: [],
+      notice: notice(kind, { id: kind, body: kind === 'pr_ready' ? 'Fix the login' : '', target: kind === 'pr_ready' ? { pullRequest: 'https://github.com/acme/site/pull/14' } : null }),
     }) as NotificationItem)
     const entries = itemEntries(items, role, new Map())
-    expect(entries.map((entry) => entry.group)).toEqual(['needs-you', 'fault', 'ready'])
+    expect(entries.map((entry) => entry.group)).toEqual(['needs-you', 'fault'])
     expect(entries[0].options).toEqual([{ key: 'merge', label: 'Merge', primary: true }])
     expect(entries[0].pull).toEqual({ repo: 'acme/site', number: 14, url: 'https://github.com/acme/site/pull/14' })
+    // The pull request's own title; its kind and where say the rest.
+    expect(entries[0]).toMatchObject({ title: 'Fix the login', where: 'acme/site #14', kind: 'Ready to merge' })
     expect(entries[1].state).toBe('failed')
-    expect(ordered([entries[2], entries[1], entries[0]]).map((entry) => entry.group)).toEqual(['needs-you', 'fault', 'ready'])
+    expect(ordered([entries[1], entries[0]]).map((entry) => entry.group)).toEqual(['needs-you', 'fault'])
+  })
+
+  const pullNotice = (kind: 'pr_ready' | 'pr_conflict', when: string | null = null) => ({
+    id: kind, group: 'needs', tone: 'amber', icon: 'merge', title: kind, body: 'Fix the login', source: 'GitHub', scope: null, when, meta: '', details: [], behaviors: [],
+    notice: notice(kind, { id: kind, target: { pullRequest: 'https://github.com/Acme/Site/pull/14' } }),
+  }) as NotificationItem
+  const status = (id: PrStatus['blocker']['id'], line: string = id, chainId?: string): PrStatus =>
+    ({ repository: 'acme/site', number: 14, blocker: { id, line, since: '2026-11-13T08:00:00Z', sinceRestart: false, details: [] }, ownership: chainId ? { engine: 'v2', chainId } : { engine: 'v1' } })
+  const byStatus = (row: PrStatus | null, kind: 'pr_ready' | 'pr_conflict' = 'pr_ready') =>
+    itemEntries([pullNotice(kind)], role, new Map(), new Map(row ? [['acme/site#14', row]] : []))[0]
+
+  it('puts a pull request’s notice with whoever moves the pull request next', () => {
+    // A behavior or the chain moves it: Poise handles it.
+    for (const id of ['review_running', 'awaiting_review', 'ci_pending', 'behind', 'approved_not_enqueued', 'in_queue'] as const) expect(byStatus(status(id)).group).toBe('auto')
+    expect(byStatus(status('conflicting', 'merge conflict on abc', 'acme/site#9')).group).toBe('auto')
+    expect(byStatus(status('ci_failing', 'CI failing on abc · grey rerun pending')).group).toBe('auto')
+    // Nothing will move it unless you do.
+    for (const id of ['awaiting_author', 'conflicting', 'unresolved_threads', 'blocked', 'not_eligible', 'unknown'] as const) expect(byStatus(status(id), 'pr_conflict').group).toBe('needs-you')
+    expect(byStatus(status('ci_failing', 'CI failing on abc')).group).toBe('needs-you')
+    expect(byStatus(status('awaiting_review', 'awaiting review of abc · cap 5/5 · cap reached')).group).toBe('needs-you')
+    expect(byStatus(status('approved_not_enqueued', 'approved, not enqueued: merge-prs disabled')).group).toBe('needs-you')
+    expect(byStatus(null).group).toBe('needs-you')
+    // A behavior held on it: stuck.
+    expect(byStatus(status('held', 'held: merge-prs merge_failed since 08:00')).group).toBe('fault')
+    // What moves it next is the line under its title.
+    expect(byStatus(status('awaiting_author', 'changes requested on abc need author action'), 'pr_conflict')).toMatchObject({ detail: 'changes requested on abc need author action', kind: 'Merge conflict' })
+    expect(prGroup(undefined)).toBe('needs-you')
+  })
+
+  it('makes automatic work that has not moved for four hours a fault', () => {
+    const now = Date.parse('2026-11-13T12:00:00Z')
+    const quota = (when: string) => itemEntries([{ ...pullNotice('pr_ready'), id: 'q', body: '', when, notice: notice('github_quota_exhausted', { id: 'q' }) } as NotificationItem], role, new Map(), new Map(), now)[0].group
+    expect(quota('2026-11-13T09:00:00Z')).toBe('auto')
+    expect(quota('2026-11-13T08:00:00Z')).toBe('fault')
+    const queued = itemEntries([pullNotice('pr_ready', '2026-11-13T07:30:00Z')], role, new Map(), new Map([['acme/site#14', status('in_queue')]]), now)[0]
+    expect(queued.group).toBe('fault')
+  })
+
+  it('never puts chain work on you: held or still for four hours it is a fault, moving it is automatic', () => {
+    const now = Date.parse('2026-11-13T12:00:00Z')
+    const row = (progressAt: string): ChainAttentionRow => ({ id: 'acme/site#7', repository: 'acme/site', issue: 7, pullNumber: 12, step: 'repair-pr: uncertain', progressAt: Date.parse(progressAt), ageMs: now - Date.parse(progressAt),
+      blocker: 'New invocations held by the person; Original pre-merge review evidence pending', evidence: { state: 'fresh', checkedAt: null, gates: [] }, nextAction: 'Resume', retryAt: null, journal: '/api/behavior-chains?id=acme%2Fsite%237&after=4',
+      reconciliation: { nextObservationAt: null, waitingForResourceRelease: false } })
+    const chain = (progressAt: string, held: string | null) => itemEntries([{ id: 'chain:acme/site#7', group: 'needs', tone: 'amber', icon: 'held', title: 'acme/site#7 · repair-pr: uncertain', body: row(progressAt).blocker,
+      source: 'Behavior chain', scope: null, when: progressAt, meta: '', details: [], behaviors: [], notice: null, chainJournal: row(progressAt).journal, chain: row(progressAt) } as NotificationItem], role,
+    new Map([['acme/site#7', { sequence: 5, held }]]), new Map(), now)[0]
+    expect(chain('2026-11-13T11:00:00Z', 'New invocations held by the person')).toMatchObject({ group: 'fault', kind: 'Chain held', title: 'New invocations held by the person', detail: 'repair-pr: uncertain',
+      where: 'acme/site #7 → #12', options: [], quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] })
+    expect(chain('2026-11-13T11:00:00Z', null)).toMatchObject({ group: 'auto', kind: 'Behavior chain', quiet: undefined })
+    expect(chain('2026-11-13T07:59:00Z', null)).toMatchObject({ group: 'fault', kind: 'Chain stuck' })
+  })
+
+  it('reads pull requests’ status as a failed read when Poise could not read them, keeping what an unread organization had', () => {
+    const before = prStatusesFrom({ health: { status: 'ok' }, rows: [status('in_queue')], datastore: { orgs: [{ org: 'acme', status: 'ready' }] } }, null)
+    expect([...before.keys()]).toEqual(['acme/site#14'])
+    // Unavailable is not "no pull requests": the last read stays.
+    expect(() => prStatusesFrom({ health: { status: 'unavailable' }, rows: [], datastore: { orgs: [] } }, before)).toThrow('could not read its pull requests')
+    expect(() => prStatusesFrom({ error: 'invalid_query' }, before)).toThrow('cannot read')
+    // An organization whose datastore could not be read keeps its rows; one read afresh does not.
+    const partial = prStatusesFrom({ health: { status: 'stale' }, rows: [], datastore: { orgs: [{ org: 'acme', status: 'unavailable' }] } }, before)
+    expect(partial.get('acme/site#14')?.blocker.id).toBe('in_queue')
+    expect(prStatusesFrom({ health: { status: 'ok' }, rows: [], datastore: { orgs: [{ org: 'acme', status: 'ready' }] } }, before).size).toBe(0)
+  })
+
+  it('makes a retry still failing four hours after it began a fault', () => {
+    const now = Date.parse('2026-11-13T12:00:00Z')
+    const retry = (began: string | null) => itemEntries([{ id: 'diagnostic:["rate_limit"]', group: 'auto', tone: 'slate', icon: 'retry', title: 'The service is limiting requests. Poise will try again.', body: '', source: 'Behaviors', scope: null,
+      when: '2026-11-13T11:59:00Z', meta: '', details: [], behaviors: [], notice: null, code: 'rate_limit', began } as NotificationItem], role, new Map(), new Map(), now)[0].group
+    expect(retry('2026-11-13T09:00:00Z')).toBe('auto')
+    expect(retry('2026-11-13T07:59:00Z')).toBe('fault')
+    expect(retry(null)).toBe('auto')
+  })
+
+  it('puts a Behaviors diagnostic with whoever clears it', () => {
+    expect(diagnosticGroup('authentication', 'x')).toBe('needs-you')
+    expect(diagnosticGroup('github_access', 'x')).toBe('needs-you')
+    for (const code of ['rate_limit', 'provider_capacity', 'network_interruption', 'upstream_unavailable', 'head_changed', 'approval_blocked_unresolved_conversations', 'datastore_stale', 'runtime_status_unknown']) expect(diagnosticGroup(code, 'x')).toBe('auto')
+    expect(diagnosticGroup('unknown', STALLED_MESSAGE)).toBe('auto')
+    for (const code of ['held_result', 'invalid_agent_result', 'runtime_unhealthy', 'review_contract_violation', 'review_budget_exhausted', 'unknown']) expect(diagnosticGroup(code, 'Command failed (1)')).toBe('fault')
+    expect(diagnosticGroup(undefined, 'x')).toBe('fault')
+    // A notice joined with a diagnostic takes the diagnostic's group.
+    const joined = itemEntries([{ ...pullNotice('pr_ready'), code: 'held_result', body: 'The review outcome needs verification before retry.',
+      details: [{ behavior: 'review-new-prs', target: 'acme/site#14', at: null, next: null, detail: 'held' }] } as NotificationItem], role, new Map())[0]
+    expect(joined.group).toBe('fault')
   })
 
   it('puts a decision’s recommendation first, with Other', () => {
@@ -239,7 +335,7 @@ describe('Answer here’s entries', () => {
       when: '2026-11-08T18:35:17.371Z', meta: 'No verified advance for 4d', details: [], behaviors: [], notice: null, chainJournal: '/api/behavior-chains?id=acme%2Fsite%237&after=4' } as NotificationItem], role,
     new Map([['acme/site#7', { sequence: 5, held: 'Original outcome requires reconciliation' }]]))[0]
     expect(chain).toMatchObject({ source: 'chain', dismissable: true, dismissWords: 'hides it until the chain moves; the chain stays held',
-      revision: '2026-11-08T18:35:17.371Z|acme/site#7 · repair-pr: uncertain|held', options: [{ key: 'resume', label: 'Resume' }] })
+      revision: '2026-11-08T18:35:17.371Z|acme/site#7 · repair-pr: uncertain|held', options: [], quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] })
     const diagnostic = itemEntries([{ id: 'diagnostic:["x"]', group: 'needs', tone: 'amber', icon: 'held', title: 'Reviews time out', body: '', source: 'Behaviors', scope: null,
       when: '2026-11-12T10:00:00Z', meta: '', details: [], behaviors: [], notice: null } as NotificationItem], role, new Map())[0]
     expect(diagnostic).toMatchObject({ dismissable: true, revision: '2026-11-12T10:00:00Z|Reviews time out' })

@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
+import { expect, test, type Locator, type Page, type Route, type WebSocketRoute } from '@playwright/test'
 import type { AnalyticsHealth } from '../../src/analytics-health-types'
 
 // Overview in the new interface (#556, PRD Support → Tests): Answer here with
@@ -55,6 +55,8 @@ interface Workspace {
   metricsAsked?: URLSearchParams[]
   /** The chain's tasks. */
   chains?: unknown[]
+  /** Each open pull request's blocker, as /api/behavior-ledger/pr-status answers. */
+  prs?: unknown[]
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -127,6 +129,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     if (path === '/api/behavior-estimates') return json(route, { estimates: [] })
     if (path === '/api/agent-logs') return workspace.runsFail ? json(route, { error: 'agent-interface did not answer' }, 503) : json(route, { logs: [] })
     if (path === '/api/gh') return json(route, { records: [], held: [], errors: [] })
+    if (path === '/api/behavior-ledger/pr-status') return json(route, { rows: workspace.prs ?? [] })
     if (path === '/api/claude-auth') return json(route, { status: 'authenticated', reason: null, checkedAt: null, verifiedAt: null, authMethod: null, subscriptionType: null, loginInProgress: false })
     return route.fallback()
   })
@@ -144,6 +147,17 @@ function announce(socket: Socket, workspace: Workspace): void {
 
 const entry = (page: Page, id: string) => page.locator(`[data-notice="${id}"]`)
 const answers = (page: Page) => page.getByRole('complementary', { name: 'Answer here' })
+/** A card's icons take a press once the pointer is on the card, as on Board's cards. */
+async function press(card: Locator, name: string, role: 'button' | 'link' = 'button'): Promise<void> {
+  await card.hover()
+  await card.getByRole(role, { name, exact: true }).click()
+}
+/** Unfolds what Poise handles on its own, folded while anything else is listed, once its entries have been read. */
+async function unfoldAuto(page: Page): Promise<void> {
+  const show = answers(page).locator('[data-key="g:auto"]').getByRole('button', { name: 'Show', exact: true })
+  await expect(show).toBeVisible()
+  await show.click()
+}
 
 test('several requests at once are separate entries, each answered through the chat by its own id', async ({ page }) => {
   const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [permission('p1', 's1', 'Run gh pr create'), permission('p2', 's2', 'Push the branch'), question('q1', 's3', { question: 'Which note stays?', options: ['The first', 'The repro'], freeText: false })] }
@@ -227,8 +241,7 @@ test('an answer that fails shows the service’s reason, and keeps what was type
 test('a notice links to its exact diagnostic, interval included, and the route back', async ({ page }) => {
   const notice = { id: 'held:grey', kind: 'behavior_held', title: 'Rerun Grey CI is held on acme/site#4', body: 'GitHub’s API limit.', since: ago(40), due: ago(40), silenceable: false, target: { swarm: 'call-1' }, subject: { behavior: 'rerun-grey-ci', target: 'acme/site#4' }, evidence: EVIDENCE }
   await open(page, { notices: [notice], requests: [], decisions: [], revision: 1 })
-  const link = entry(page, 'notice:held:grey').getByRole('link', { name: 'Open its diagnostic' })
-  await link.click()
+  await press(entry(page, 'notice:held:grey'), 'Open its diagnostic', 'link')
   const query = Object.fromEntries(new URL(page.url()).searchParams)
   expect(query).toEqual({ view: 'observe', part: 'logging', event: EVIDENCE.eventId, from: EVIDENCE.from, to: EVIDENCE.to, back: 'overview' })
   await expect(page.getByRole('navigation', { name: 'Poise' }).getByRole('link', { name: 'Observe' })).toHaveAttribute('aria-current', 'page')
@@ -261,7 +274,9 @@ test('the level decides what shows and what the bell counts, and is remembered',
   await open(page, { notices, requests: [], decisions: [], revision: 1 }, '/?view=overview&back=board#answer')
   await expect(page.getByRole('link', { name: 'Back to Board' })).toBeVisible()
   await expect.poll(() => page.evaluate(() => !!document.activeElement?.closest('[data-answers]'))).toBe(true)
-  await expect(page.locator('[data-bell]')).toHaveText('3')
+  // + Faults, the default: the ready pull request nothing else will merge, and the stalled ledger. Finished work is not listed.
+  await expect(page.locator('[data-bell]')).toHaveText('2')
+  await expect(entry(page, 'notice:turn')).toHaveCount(0)
   await expect(page.locator('[data-bell]')).toHaveAttribute('data-tone', 'failed')
   await expect(entry(page, 'notice:pr').getByRole('link', { name: 'Open its card on Board' })).toHaveAttribute('href', '?view=board&item=acme%2Fsite%239&back=overview')
 
@@ -276,20 +291,69 @@ test('the level decides what shows and what the bell counts, and is remembered',
 
 test('a level brings what it adds into view, or says there is none, and arrow keys keep moving it', async ({ page }) => {
   const ready = Array.from({ length: 30 }, (_, i) => ({ id: `pr${i}`, kind: 'pr_ready', title: `acme/site#${i} is ready to merge`, body: 'Checks pass.', since: ago(20 + i), due: ago(5), silenceable: true, target: { pullRequest: `https://github.com/acme/site/pull/${i}` } }))
-  const notices = [...ready, { id: 'turn', kind: 'chat_turn_finished', title: 'Codex finished', body: 'Done after 6 minutes.', since: ago(9), due: ago(9), silenceable: false, target: { chat: 's2' } }]
+  const notices = [...ready, { id: 'quota', kind: 'github_quota_warning', title: 'GitHub API quota is low', body: '900 of 5000 left.', since: ago(9), due: ago(9), silenceable: false, target: null }]
   await open(page, { notices, requests: [], decisions: [], revision: 1 })
   const level = (name: string) => answers(page).getByRole('radio', { name })
 
   await level('Only you').click()
   await level('+ Faults').click()
   await expect(page.locator('.toast')).toHaveText('Nothing more is open at this level.')
-  await level('+ Done').click()
-  await expect(entry(page, 'notice:turn')).toBeInViewport()
+  await level('Everything').click()
+  // What Poise handles on its own comes into view, folded to its count.
+  await expect(answers(page).locator('[data-key="g:auto"]')).toBeInViewport()
+  await unfoldAuto(page)
+  await expect(entry(page, 'notice:quota')).toBeVisible()
 
+  await level('Everything').focus()
   await page.keyboard.press('ArrowLeft')
   await page.keyboard.press('ArrowLeft')
   await expect(level('Only you')).toHaveAttribute('aria-checked', 'true')
   await expect(level('Only you')).toBeFocused()
+})
+
+test('a card shows only what acts; its other actions wait under the pointer, as on Board', async ({ page }) => {
+  const notices = [{ id: 'pr', kind: 'pr_ready', title: 'acme/site#9 is ready to merge', body: 'Fix the login', since: ago(20), due: ago(5), silenceable: true, target: { pullRequest: 'https://github.com/acme/site/pull/9' } }]
+  await open(page, { notices, requests: [], decisions: [], revision: 1, prs: [{ repository: 'acme/site', number: 9, blocker: { id: 'not_eligible', line: 'outside your configured GitHub account pair', since: ago(20), sinceRestart: false, details: [] } }] })
+  const card = entry(page, 'notice:pr')
+  // The pull request's own title, what moves it next, and its kind, place and age.
+  await expect(card.locator('.card-title')).toHaveText('Fix the login')
+  await expect(card.locator('.nc-d')).toHaveText('outside your configured GitHub account pair')
+  await expect(card.locator('.card-meta')).toContainText('Ready to merge')
+  await expect(card.locator('.card-meta')).toContainText('acme/site #9')
+  // One button: the one that acts.
+  await expect(card.locator('.nc-acts button')).toHaveText(['Merge'])
+  const acts = card.locator('.card-acts')
+  await page.mouse.move(1200, 700)
+  await expect.poll(() => acts.evaluate((el) => getComputedStyle(el).opacity)).toBe('0')
+  await card.hover()
+  await expect.poll(() => acts.evaluate((el) => getComputedStyle(el).opacity)).toBe('1')
+  await expect(acts.locator('.ib')).toHaveCount(5)
+  expect(await acts.locator('.ib').evaluateAll((els) => els.map((el) => el.getAttribute('aria-label')))).toEqual(['Open its card on Board', 'Open on GitHub', 'Show more', 'Silence reminders', 'Dismiss'])
+  await expect(acts.getByRole('button', { name: 'Dismiss' })).toHaveAttribute('data-words', 'puts it away until it happens again')
+})
+
+test('a question you answer here shows whole; a long title is cut short only where More shows it whole', async ({ page }) => {
+  const long = 'Which of the two release branches should carry the fix for the login timeout that customers reported on Tuesday, given that the hotfix window closes tonight and the other branch is frozen for the audit?'
+  const quota = { id: 'held', kind: 'storage_low', title: long, body: 'Free space is low.', since: ago(5), due: ago(5), silenceable: false, target: null }
+  await open(page, { notices: [quota], decisions: [], revision: 1, requests: [question('q1', 's1', { question: long, options: ['main', 'release'], freeText: true })] })
+  const clipped = (id: string) => entry(page, id).locator('.card-title').evaluate((el) => el.scrollHeight > el.clientHeight + 1)
+  expect(await clipped('request:q1')).toBe(false)
+  await expect(entry(page, 'request:q1')).not.toHaveClass(/is-clamped/)
+  expect(await clipped('notice:held')).toBe(true)
+  await press(entry(page, 'notice:held'), 'Show more')
+  expect(await clipped('notice:held')).toBe(false)
+})
+
+test('a pull request Poise is moving waits on nobody: it shows under Everything, not Only you', async ({ page }) => {
+  const notices = [{ id: 'pr', kind: 'pr_ready', title: 'acme/site#9 is ready to merge', body: 'Fix the login', since: ago(20), due: ago(5), silenceable: true, target: { pullRequest: 'https://github.com/acme/site/pull/9' } }]
+  await open(page, { notices, requests: [], decisions: [], revision: 1, prs: [{ repository: 'acme/site', number: 9, blocker: { id: 'in_queue', line: 'in merge queue since 12:12Z', since: ago(5), sinceRestart: false, details: [] } }] })
+  await answers(page).getByRole('radio', { name: 'Only you', exact: true }).click()
+  await expect(entry(page, 'notice:pr')).toHaveCount(0)
+  await expect(page.locator('[data-ncount]')).toHaveText('0')
+  await answers(page).getByRole('radio', { name: 'Everything', exact: true }).click()
+  // Alone in the list, what Poise handles is not folded.
+  await expect(answers(page).locator('[data-key="g:auto"]')).toContainText('Handled automatically')
+  await expect(entry(page, 'notice:pr').locator('.nc-d')).toHaveText('in merge queue since 12:12Z')
 })
 
 test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {
@@ -297,7 +361,7 @@ test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {
   const sent: string[] = []
   await page.route('**/api/notices/*/dismiss', (route) => { sent.push(route.request().url()); return json(route, { enabled: true, notices: [] }) })
   await open(page, { notices, requests: [], decisions: [], revision: 1 })
-  await entry(page, 'notice:disk').getByRole('button', { name: 'Dismiss' }).click()
+  await press(entry(page, 'notice:disk'), 'Dismiss')
   await expect(entry(page, 'notice:disk')).toContainText('Dismissed')
   await entry(page, 'notice:disk').getByRole('button', { name: 'Undo' }).click()
   await expect(entry(page, 'notice:disk').getByRole('button', { name: 'Dismiss' })).toBeVisible()
@@ -313,24 +377,28 @@ test('Answer here lists the newest first, and every card can be put away without
     options: [{ id: 'a', label: 'The failing check', detail: null, recommended: true }], explanation: { state: 'none' } }
   const workspace: Workspace = { notices: [], decisions: [decision], revision: 1, requests: [permission('p1', 's1', 'Run gh pr create')], attention: [attention(898, 4 * 1440), attention(1169, 60)] }
   const socket = await open(page, workspace)
+  await answers(page).getByRole('radio', { name: 'Everything' }).click()
+  await unfoldAuto(page)
   const ids = () => page.locator('[data-answers] [data-notice]').evaluateAll((cards) => cards.map((card) => (card as HTMLElement).dataset.notice))
-  // Newest first: the decision (1 min), the permission (3 min), then the chain cards by their last verified advance.
-  await expect.poll(ids).toEqual(['decision:9', 'request:p1', 'chain:autonomio/poise#1169', 'chain:autonomio/poise#898'])
+  // Newest first within who acts: the decision (1 min) and the permission (3 min) wait on you; the chain still for
+  // four days is stuck, a fault; the one that moved an hour ago is Poise's, handled automatically.
+  await expect.poll(ids).toEqual(['decision:9', 'request:p1', 'chain:autonomio/poise#898', 'chain:autonomio/poise#1169'])
 
   // A Manager's prompt with options answers with them or Other, in your own words; it has no Dismiss.
   await expect(entry(page, 'decision:9').getByRole('button', { name: 'Dismiss' })).toHaveCount(0)
   await entry(page, 'decision:9').getByRole('button', { name: 'Other' }).click()
   await expect(entry(page, 'decision:9').getByRole('textbox')).toBeFocused()
-  // Every other card says what Dismiss does.
-  await expect(entry(page, 'request:p1')).toContainText('the chat still waits for your answer in Chat')
-  await expect(entry(page, 'chain:autonomio/poise#898')).toContainText('hides it until the chain moves')
+  // Every other card's Dismiss says what it does, in its tip.
+  await expect(entry(page, 'request:p1').getByRole('button', { name: 'Dismiss' })).toHaveAttribute('data-words', 'hides it here; the chat still waits for your answer in Chat')
+  await expect(entry(page, 'chain:autonomio/poise#898').getByRole('button', { name: 'Dismiss' })).toHaveAttribute('data-words', /hides it until the chain moves/)
 
-  await entry(page, 'chain:autonomio/poise#1169').getByRole('button', { name: 'Dismiss' }).click()
+  await press(entry(page, 'chain:autonomio/poise#1169'), 'Dismiss')
   await expect(entry(page, 'chain:autonomio/poise#1169')).toContainText('Dismissed')
   await expect.poll(() => workspace.dismissed, { timeout: 12_000 }).toEqual([{ key: 'chain:autonomio/poise#1169',
-    revision: `${new Date(NOW - 60 * 60_000).toISOString()}|autonomio/poise#1169 · repair-pr: uncertain|Original outcome requires reconciliation`, title: 'autonomio/poise#1169 · repair-pr: uncertain' }])
+    revision: `${new Date(NOW - 60 * 60_000).toISOString()}|autonomio/poise#1169 · repair-pr: uncertain|Original outcome requires reconciliation`, title: 'autonomio/poise #1169 · Original outcome requires reconciliation' }])
   await page.mouse.move(1000, 600)
   await expect(entry(page, 'chain:autonomio/poise#1169')).toHaveCount(0)
+  // The heading counts what waits on you and what is stuck, never what Poise handles.
   await expect(page.locator('[data-ncount]')).toHaveText('3')
   // Putting it away sent nothing to any chat and resumed nothing.
   expect(socket.frames.map((frame) => frame.command.type).filter((type) => /respond|answer|resume|message|send|prompt/i.test(String(type)))).toEqual([])
@@ -342,7 +410,7 @@ test('a put-away diagnostic with no time of its own shows again when it recurs a
   await open(page, workspace)
   const card = answers(page).locator('[data-notice^="diagnostic:"]')
   await expect(card).toHaveCount(1)
-  await card.getByRole('button', { name: 'Dismiss' }).click()
+  await press(card, 'Dismiss')
   await expect.poll(() => workspace.dismissals?.length ?? 0, { timeout: 12_000 }).toBe(1)
   await page.mouse.move(1000, 600)
   await expect(card).toHaveCount(0)
@@ -378,10 +446,12 @@ test('a chain card whose report changes while it is being put away comes back wi
     progressAt: NOW - minutes * 60_000, ageMs: minutes * 60_000, blocker: 'Original outcome requires reconciliation', evidence: { state: 'open', checkedAt: null, gates: [] },
     nextAction: 'reconcile', retryAt: null, journal: `/api/behavior-chains?id=${encodeURIComponent('autonomio/poise#1169')}&after=3`,
     reconciliation: { nextObservationAt: null, waitingForResourceRelease: false } })
-  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], attention: [attention(60)] }
+  // Still for five hours it is stuck, a fault; once it moves it is Poise's, handled automatically: Everything shows both.
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], attention: [attention(300)] }
   await open(page, workspace)
+  await answers(page).getByRole('radio', { name: 'Everything', exact: true }).click()
   const card = entry(page, 'chain:autonomio/poise#1169')
-  await card.getByRole('button', { name: 'Dismiss' }).click()
+  await press(card, 'Dismiss')
   await expect(card).toContainText('Dismissed')
   // The chain advances during the eight seconds.
   workspace.attention = [attention(2)]
@@ -432,24 +502,33 @@ test('the right-hand side has one day, one search and the organization; Behavior
   await expect(page.locator('[data-ref="ov.h.blocked"]')).toBeVisible()
 })
 
-test('each Show level says how many entries it shows (#1380)', async ({ page }) => {
+test('Show has three levels, each visibly changing the list, and the heading counts what it shows', async ({ page }) => {
   const notice = (id: string, kind: string) => ({ id, kind, title: `${kind} title`, body: '', since: ago(5), due: ago(5), silenceable: false, target: null })
-  await open(page, { notices: [notice('n1', 'storage_low'), notice('n2', 'ledger_queue_stalled'), notice('n3', 'chat_turn_finished')], requests: [], decisions: [], revision: 1 })
-  const level = (name: string) => answers(page).getByRole('radio', { name: new RegExp(`^${name.replace('+', '\\+')},`) })
-  await expect(level('Only you')).toHaveAccessibleName('Only you, 1 entry')
-  await expect(level('+ Faults')).toHaveAccessibleName('+ Faults, 2 entries')
-  await expect(level('+ Done')).toHaveAccessibleName('+ Done, 3 entries')
-  await expect(level('Everything')).toHaveAccessibleName('Everything, 3 entries')
-  await expect(level('+ Faults')).toContainText('2')
+  await open(page, { notices: [notice('n1', 'storage_low'), notice('n2', 'ledger_queue_stalled'), notice('n3', 'chat_turn_finished'), notice('n4', 'github_quota_warning')], requests: [], decisions: [], revision: 1 })
+  const level = (name: string) => answers(page).getByRole('radio', { name, exact: true })
+  await expect(answers(page).getByRole('radio')).toHaveText(['Only you', '+ Faults', 'Everything'])
+  const listed = () => answers(page).locator('[data-notice]').evaluateAll((cards) => cards.map((card) => (card as HTMLElement).dataset.notice))
+  await level('Only you').click()
+  await expect.poll(listed).toEqual(['notice:n1'])
+  await expect(page.locator('[data-ncount]')).toHaveText('1')
+  await level('+ Faults').click()
+  await expect.poll(listed).toEqual(['notice:n1', 'notice:n2'])
+  await expect(page.locator('[data-ncount]')).toHaveText('2')
+  await level('Everything').click()
+  await unfoldAuto(page)
+  await expect.poll(listed).toEqual(['notice:n1', 'notice:n2', 'notice:n4'])
+  await expect(page.locator('[data-ncount]')).toHaveText('2')
+  // Finished work is never listed.
+  await expect(entry(page, 'notice:n3')).toHaveCount(0)
 })
 
 for (const width of [1440, 1000, 375]) {
-  test(`Show's levels fit Answer here's row at ${width} pixels, whatever their counts (#1439)`, async ({ page }) => {
+  test(`Show's three levels fit Answer here's row at ${width} pixels (#1439)`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 })
     const notice = (id: number) => ({ id: `n${id}`, kind: 'storage_low', title: `Disk ${id}`, body: '', since: ago(id), due: ago(id), silenceable: false, target: null })
     await open(page, { notices: Array.from({ length: 120 }, (_, i) => notice(i + 1)), requests: [], decisions: [], revision: 1 })
     const seg = answers(page).locator('.olevel')
-    await expect(seg.getByRole('radio', { name: /^Everything,/ })).toHaveAccessibleName('Everything, 120 entries')
+    await expect(seg.getByRole('radio', { name: 'Everything', exact: true })).toBeVisible()
     const fit = await seg.evaluate((el) => {
       const row = el.closest<HTMLElement>('.ova-level')!.getBoundingClientRect()
       const box = el.getBoundingClientRect()
@@ -465,11 +544,11 @@ test('the bell on Overview brings Answer here to its first entry with the focus 
   const bell = page.getByRole('button', { name: /^Notifications/ })
   await expect(bell).toHaveAccessibleName(/Brings Answer here to its first entry\.$/)
   // Its count is what Show lists.
-  const level = (name: string) => answers(page).getByRole('radio', { name: new RegExp(`^${name.replace('+', '\\+')},`) })
+  const level = (name: string) => answers(page).getByRole('radio', { name, exact: true })
   await level('Only you').click()
   await expect(bell.locator('[data-bell]')).toHaveText('1')
-  await level('+ Done').click()
-  await expect(bell.locator('[data-bell]')).toHaveText('3')
+  await level('Everything').click()
+  await expect(bell.locator('[data-bell]')).toHaveText('2')
   // Focus elsewhere, the list scrolled: a click brings the list to its top and focuses its first entry, ring and all.
   await page.locator('.ova-list').evaluate((el) => { el.scrollTop = el.scrollHeight })
   await page.getByRole('searchbox', { name: 'Filter this side' }).focus()
@@ -520,7 +599,7 @@ test('a decision whose chat is gone says so, and Dismiss puts it away', async ({
   await expect(entry(page, 'decision:8')).toContainText('The chat that asked no longer exists, so it can no longer be answered.')
   await expect(entry(page, 'decision:8').getByRole('button', { name: /Open the fix/ })).toHaveAttribute('aria-disabled', 'true')
 
-  await entry(page, 'decision:8').getByRole('button', { name: 'Dismiss' }).click()
+  await press(entry(page, 'decision:8'), 'Dismiss')
   await expect(entry(page, 'decision:8')).toContainText('Dismissed')
   await expect.poll(() => sent, { timeout: 12_000 }).toEqual(['/api/chat/switchboard/items/8/dismiss'])
   await page.mouse.move(1000, 600)

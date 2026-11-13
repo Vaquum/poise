@@ -6,6 +6,7 @@ export const ICONS: Record<string, string> = {
   tag: '<path d="M2.5 3.5v4.2l5.8 5.8a1 1 0 0 0 1.4 0l3.8-3.8a1 1 0 0 0 0-1.4L7.7 2.5H3.5a1 1 0 0 0-1 1z"/><circle cx="5.5" cy="5.5" r="1"/>',
   import: '<path d="M8 10V2.5M5 5.5 8 2.5l3 3M2.5 9.5V12a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V9.5"/>',
   bell: '<path d="M4 11V7a4 4 0 0 1 8 0v4l1 1.5H3zM6.5 14a1.6 1.6 0 0 0 3 0"/>',
+  mute: '<path d="M4 11V7a4 4 0 0 1 8 0v4l1 1.5H3zM6.5 14a1.6 1.6 0 0 0 3 0M2.5 2.5l11 11"/>',
   menu: '<path d="M3 5h10M3 8h10M3 11h10"/>',
   sliders: '<path d="M3 5h6M12 5h1M3 11h1M7 11h6"/><circle cx="10.5" cy="5" r="1.5"/><circle cx="5.5" cy="11" r="1.5"/>',
   cross: '<path d="m4 4 8 8M12 4l-8 8"/>',
