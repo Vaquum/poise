@@ -411,9 +411,12 @@ describe('readPrStatus', () => {
     expect(held.rows[0].blocker).toMatchObject({
       id: 'held', line: 'held: approve-prs upstream_unavailable since 15:30Z',
     })
-    expect(held.rows[0].blocker.details.slice(0, 2)).toEqual([
-      `review running: review-new-prs on ${NEXT.slice(0, 8)}`, detail,
-    ])
+    const heldDetails = held.rows[0].blocker.details
+    const runningLine = `review running: review-new-prs on ${NEXT.slice(0, 8)}`
+    expect(heldDetails).toContain(runningLine)
+    expect(heldDetails).toContain(detail)
+    expect(heldDetails.indexOf(runningLine)).toBeLessThan(heldDetails.indexOf(detail))
+    expect(heldDetails.indexOf(detail)).toBeLessThan(heldDetails.findIndex((entry) => entry.startsWith('past review:')))
   })
 
   it.each(['released', 'reused'] as const)('attributes an older timeout from its original Call after its headless launch is %s', async (launch) => {
