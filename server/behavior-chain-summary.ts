@@ -3,7 +3,7 @@ import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
 import { nativeBehavior } from './behavior-chain-runtime'
-import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent } from './behavior-chain-store'
+import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
 import type { ProcessDiagnostic } from './process-diagnostic'
 
@@ -237,6 +237,16 @@ function foldProgress(fold: ProgressFold, rows: Iterable<ProgressRow>, id: strin
   Object.assign(fold, { last, chain, at, sequence, previous, failureSequence, waitingSequence, waitingHead })
 }
 
+/** PR review/approval heads travel as `--expected-head` argv; other behaviors
+ * carry them in request context. */
+function invocationHead(invocation: ChainInvocation): string | null {
+  const contextHead = invocation.request.context?.head
+  if (typeof contextHead === 'string' && /^[a-f0-9]{40}$/i.test(contextHead)) return contextHead
+  const at = invocation.request.argv.indexOf('--expected-head')
+  const value = at >= 0 ? invocation.request.argv[at + 1] : null
+  return typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value : null
+}
+
 /** Read-only incident annotation, independent of attention's age/active filters. */
 export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: string | null, correlationId: string | null): LoggingWorkImpact | null {
   const match = journal.forInvocation(callId, correlationId)
@@ -254,7 +264,7 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
     && diagnostic?.operation === 'provider.review' && diagnostic.phase === 'analysis' && diagnostic.outcome === 'handoff'
   let successor: typeof invocation | undefined
   if (handoff) {
-    const head = invocation.request.context?.head
+    const head = invocationHead(invocation)
     const completedAt = invocation.evidence?.completedAt
     // Progress on another head, green CI and independent reviewer slots do
     // not discharge this Call's review obligation.
@@ -267,7 +277,7 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
       successor = chain.invocations.filter(item => item.admissionSequence > (progress.failureSequence ?? chain.sequence)
         && item.admittedAt >= completedAt && item.behavior === invocation.behavior && item.basis === invocation.basis
         && item.slot === invocation.slot && item.actor === invocation.actor
-        && item.request.context?.head === head && item.request.argv[1] === invocation.request.argv[1]).at(-1)
+        && invocationHead(item) === head && item.request.argv[1] === invocation.request.argv[1]).at(-1)
     }
     const observation = chain.observation as ChainObservation | null
     recovered = !!successor && successor.state === 'settled' && successor.evidence?.status === 'completed'

@@ -495,12 +495,20 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                         "preserving your substantive assessment and findings.")
             continue
         progress.stage("inspecting", "Inspecting pinned repository")
-        inspection_timeout = min(deadline - monotonic(), review_budget.timeout(
-            30, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS))
+        deadline_remaining = deadline - monotonic()
+        base_timeout = review_budget.timeout(
+            30, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
+        inspection_timeout = min(deadline_remaining, base_timeout)
+        inspection_limit = ("analysis"
+                            if deadline_remaining < base_timeout
+                            and PROVIDER_ANALYSIS_SECONDS.get(model.provider, timeout_s) < timeout_s
+                            else "total")
         if group_deadline is not None:
-            inspection_timeout = min(group_deadline - monotonic(), inspection_timeout)
+            group_remaining = group_deadline - monotonic()
+            if group_remaining <= inspection_timeout:
+                inspection_timeout, inspection_limit = group_remaining, "file_group"
         if inspection_timeout <= 0:
-            raise _time_limit_error(model.provider)
+            raise _time_limit_error(model.provider, inspection_limit)
         result = repository.inspect(requests, timeout_s=inspection_timeout)
         context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
         round_number += 1

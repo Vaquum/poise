@@ -710,6 +710,58 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertNotIn("handing off", str(run.error))
         run.submit.assert_not_called()
 
+    def _replay_before_inspection(self, seconds, validation_seconds, timeout_s=1413, budget_seconds=1413):
+        """Grok returns an inspection step, then validation consumes time before inspection starts."""
+        clock = SimpleNamespace(now=1000.0)
+        model = CATALOG.resolve("grok-4.6-xhigh")
+
+        def provider(args, *, timeout, **_kwargs):
+            if seconds >= timeout:
+                clock.now += timeout
+                raise subprocess.TimeoutExpired(args, timeout)
+            clock.now += seconds
+            return SimpleNamespace(returncode=0, stderr="",
+                                   stdout=json.dumps({**GROK_REPLY, "structuredOutput": INSPECT}))
+
+        original_validate = structured_review.validate_verdict
+
+        def validating(*args, **kwargs):
+            clock.now += validation_seconds
+            return original_validate(*args, **kwargs)
+
+        text = "policy\n\nPR packet:\n\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
+        error = None
+        with patch.object(structured_review, "monotonic", lambda: clock.now), \
+                patch.object(review_budget, "monotonic", lambda: clock.now), \
+                patch.object(ReviewWatch, "run", side_effect=provider), \
+                patch.object(structured_review, "validate_verdict", side_effect=validating), \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit, \
+                review_budget.ReviewBudget(budget_seconds):
+            try:
+                structured_review.run("/repo", "system", text, model, "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40,
+                                      timeout_s, repository=INSPECTED)
+            except review_budget.ReviewLimitError as failure:
+                error = failure
+        return SimpleNamespace(error=error, submit=submit)
+
+    def test_analysis_ceiling_expiring_before_inspection_is_a_handoff(self):
+        run = self._replay_before_inspection(799, 2)
+        self.assertEqual(str(run.error), GROK_HANDOFF)
+        self.assertEqual(run.error.diagnostic["phase"], "analysis")
+        self.assertEqual(run.error.diagnostic["outcome"], "handoff")
+        self.assertEqual(run.error.diagnostic["submission"], "none")
+        run.submit.assert_not_called()
+
+    def test_shorter_overall_deadline_before_inspection_is_not_a_handoff(self):
+        run = self._replay_before_inspection(59, 2, timeout_s=60)
+        self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
+        self.assertEqual(run.error.diagnostic["phase"], "total")
+        self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
+        run.submit.assert_not_called()
+
     def test_other_providers_keep_the_remaining_analysis_budget(self):
         for name, turns, reply, repository, expected in (
                 ("inspection rounds", repeat(531), INSPECT, INSPECTED, [1293, 762, 231]),

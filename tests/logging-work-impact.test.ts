@@ -146,22 +146,23 @@ function handoffFixture() {
     status: 'failed', error_code: 'review_budget_exhausted', expected_head: head,
     error: 'grok review reached its analysis time limit; handing off so the next model can run instead',
     completed_at: new Date(at + 5000).toISOString(), diagnostic }
+  // Production review-pr carries its head as `--expected-head` argv without request context.
   const original: ChainAdmission = { id, behavior: 'review-pr', basis: chainBasis(['pr', head, fixture.observation.pull!.reviewContext]),
     actor: 'reviewer', model: 'grok', slot: 'primary', admittedAt: at + 4000,
-    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: ['--pr-review', 'https://github.com/acme/repo/pull/107'],
-      context: { head, reviewRevision: 'review' } } }
+    request: { command: 'agent-interface', cwd: '/isolated/fixture',
+      argv: ['--pr-review', 'https://github.com/acme/repo/pull/107', '--expected-head', head] } }
   fixture.append({ type: 'invocation.admitted', invocation: original }, at + 4000)
   fixture.append({ type: 'invocation.settled', invocationId: id, callId, outcome: 'review_budget_exhausted',
     evidence: { status: 'failed', action: null, error_code: row.error_code, diagnostic: parseProcessDiagnostic(diagnostic), completedAt: at + 5000 } }, at + 5000)
   const event = normalize(callerDiagnostic(row, 'local')!, at + 5000)!
   const successor: ChainAdmission = { ...original, id: '6'.repeat(32), model: 'replacement', admittedAt: at + 6000 }
   const impact = () => behaviorChainWorkImpact(journal, callId, id)
-  return { ...fixture, journal, original, successor, row, event, impact }
+  return { ...fixture, journal, head, original, successor, row, event, impact }
 }
 
 it('shows only a confirmed same-obligation handoff as Warning through the Logging adapter without rewriting retained events', () => {
   const fixture = handoffFixture()
-  const { journal, original, successor, event, impact, append } = fixture
+  const { journal, successor, event, impact, append } = fixture
   const logs = new DiagnosticStore(':memory:')
   try {
     logs.append([event])
@@ -169,7 +170,7 @@ it('shows only a confirmed same-obligation handoff as Warning through the Loggin
     append({ type: 'invocation.admitted', invocation: successor }, at + 6000)
     expect(impact()).toMatchObject({ impact: 'retrying', recovered: false })
     expect(loggingSeverity(event, impact())).toBe('warning')
-    const response = { repository: 'acme/repo', pull_number: 107, head_sha: original.request.context!.head,
+    const response = { repository: 'acme/repo', pull_number: 107, head_sha: fixture.head,
       context_sha: fixture.observation.pull!.reviewContext, invocation_id: '7'.repeat(32), reviewer: successor.actor,
       model: successor.model, completed_at: at + 8000,
       assessment: { verdict: 'The changed validation has no remaining blocking defects.',
@@ -199,10 +200,12 @@ it.each(['head', 'CI', 'slot', 'context', 'target', 'earlier verdict'])('does no
   observation.checkedAt = at + 9000
   if (change === 'head') {
     observation.pull!.head = observation.publication.head_sha = 'b'.repeat(40)
-    successor.request = { ...successor.request, context: { ...successor.request.context!, head: observation.pull!.head } }
+    successor.request = { ...successor.request,
+      argv: ['--pr-review', 'https://github.com/acme/repo/pull/107', '--expected-head', observation.pull!.head] }
   } else if (change === 'slot') successor.slot = 'secondary'
   else if (change === 'context') successor.basis = 'another review context'
-  else if (change === 'target') successor.request = { ...successor.request, argv: ['--pr-review', 'https://github.com/acme/repo/pull/108'] }
+  else if (change === 'target') successor.request = { ...successor.request,
+    argv: ['--pr-review', 'https://github.com/acme/repo/pull/108', '--expected-head', fixture.head] }
   else if (change === 'CI') Object.assign(observation.pull!, { checksState: 'SUCCESS', pending: false, failing: [] })
   else {
     // An earlier or independent sibling's review cannot establish this Call's handoff.
