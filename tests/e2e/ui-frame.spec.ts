@@ -120,7 +120,9 @@ test('the reference names what the pointer rests on, and explains it in full on 
 
 test('a tooltip waits for the pointer to rest half a second; leaving or pressing cancels it', async ({ page }) => {
   await open(page)
+  // Paused: only runFor moves time, however slow the host is.
   await page.clock.install()
+  await page.clock.pauseAt(Date.now() + 1000)
   const heading = page.getByRole('heading', { name: 'Overview', exact: true })
   const tip = page.getByRole('tooltip')
   // Resting: nothing for the first moments, then the tooltip.
@@ -147,6 +149,17 @@ test('a tooltip waits for the pointer to rest half a second; leaving or pressing
   await heading.hover()
   await page.clock.runFor(600)
   await expect(tip).toContainText('Overview')
+
+  // A press keeps its element quiet only until the keyboard moves: Tab away and back explains it again.
+  const level = page.getByRole('radio', { name: 'Everything' })
+  await level.click()
+  await page.clock.runFor(1000)
+  await expect(tip).toHaveCount(0)
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Shift+Tab')
+  await expect(page.getByRole('radio', { name: 'Everything' })).toBeFocused()
+  await page.clock.runFor(600)
+  await expect(tip).toContainText('Show')
 })
 
 test('the reference is modal and fits a phone; a cancelled long press leaves the next tap alone', async ({ page }) => {

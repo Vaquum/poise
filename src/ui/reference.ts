@@ -306,6 +306,7 @@ export function installReference(): void {
   })
   addEventListener('scroll', () => { if (tip && !layer) hideTip() }, true)
   // Typing is not resting: it cancels a pending tooltip and hides a shown one.
-  document.addEventListener('keydown', (e) => { if (e.key !== '?' && !layer) clearTimeout(showTimer) }, true)
+  // Any key also ends a press's quiet, so focus the keyboard moves next explains itself.
+  document.addEventListener('keydown', (e) => { pressed = null; if (e.key !== '?' && !layer) clearTimeout(showTimer) }, true)
   document.addEventListener('input', () => { clearTimeout(showTimer); if (tip && !layer) hideTip() })
 }
