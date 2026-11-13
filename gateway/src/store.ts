@@ -772,15 +772,18 @@ export class Store {
     `).all(handle, this.now()).map(toPhone)
   }
 
-  /** Ends the owner's phone's session, and with it its workspace sessions; null when there is no such phone. */
-  signOutPhone(handle: string, id: string): Phone | null {
+  /**
+   * Ends the owner's phone's session, and with it its workspace sessions: the phone as it was and the apex
+   * session it had, or null when there is no such phone.
+   */
+  signOutPhone(handle: string, id: string): { phone: Phone; sessionHash: string } | null {
     return this.db.transaction(() => {
       const row = this.db.prepare<[string, string], PhoneRow & { session_hash: string }>(
         'SELECT * FROM phones WHERE id = ? AND handle = ?',
       ).get(id, handle)
       if (!row) return null
       this.db.prepare('DELETE FROM sessions WHERE id_hash = ?').run(row.session_hash)
-      return toPhone(row)
+      return { phone: toPhone(row), sessionHash: row.session_hash }
     })()
   }
 

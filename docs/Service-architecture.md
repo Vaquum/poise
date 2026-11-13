@@ -151,7 +151,9 @@ phone in to the owner's account with a QR code, without GitHub
   owner's session is never copied, and a code signs in once.
 - Settings lists these phones while their sessions live: 14 days, like any apex
   session. Signing one out there ends its apex session and every workspace
-  session made from it.
+  session made from it. It also cuts what the phone still holds open through
+  the gateway: a WebSocket such as Chat's, authenticated only at its upgrade,
+  and any answer still streaming.
 - Codes, secrets and grants are never logged. The log names the login and the
   device only.
 - **A login proxy in front**, such as Vaquum's Portal, must let `GET

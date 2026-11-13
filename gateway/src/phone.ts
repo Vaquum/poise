@@ -143,15 +143,19 @@ export function decidePhone(ctx: Context, principal: Principal, id: string, deci
   return codeView(decided, ctx.deps.now())
 }
 
-/** Signs one of the owner's phones out: its session ends, and with it its workspace sessions. */
+/**
+ * Signs one of the owner's phones out at once: its session ends, and with it its workspace sessions, and
+ * whatever it still holds open through the gateway, such as Chat's WebSocket, is cut.
+ */
 export function signOutPhone(ctx: Context, principal: Principal, id: string, grant: string | null): PhoneView[] {
   const { log, store } = ctx.deps
   const { handle, login } = principal.user
   const phone = store.listPhones(handle).find((candidate) => candidate.id === id)
   if (!phone) throw new HttpError(404, 'There is no such phone.')
   if (grant === null || !safeEqual(grant, phone.grant)) throw new HttpError(400, 'This sign-out does not name that phone.')
-  store.signOutPhone(handle, id)
-  log.info('phone.signed_out', { login, device: phone.device })
+  const ended = store.signOutPhone(handle, id)
+  const cut = ended ? ctx.endSessionTraffic(ended.sessionHash) : 0
+  log.info('phone.signed_out', { login, device: phone.device, cut })
   return store.listPhones(handle).map(phoneView)
 }
 

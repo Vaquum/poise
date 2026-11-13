@@ -44,6 +44,12 @@ export interface GatewayDeps {
   shutdownGraceMs?: number
 }
 
+/** A WebSocket or an answer in flight, which ends with `destroy()` and says so with 'close'. */
+export interface Closable {
+  destroy(): unknown
+  once(event: 'close', listener: () => void): unknown
+}
+
 export interface Principal {
   session: Session
   user: User
@@ -72,6 +78,8 @@ export class Context {
   readonly codeAttempts = new Map<string, number[]>()
   /** Recent opens of phone codes that do not exist, per client, for the /auth/phone rate limit. */
   readonly phoneMisses = new Map<string, number[]>()
+  /** What each apex session's browser holds open through this gateway right now: WebSockets and answers in flight. */
+  private readonly sessionTraffic = new Map<string, Set<Closable>>()
   /** The Link event streams open through this gateway, per paired device. */
   readonly linkStreams = new LinkStreams()
 
@@ -90,6 +98,29 @@ export class Context {
       // requests. same-origin still gives no other origin a Referer.
       'referrer-policy': 'same-origin',
     }
+  }
+
+  /** Keeps `stream` until it closes, under the apex session it was authenticated with. */
+  holdOpen(apexSessionHash: string, stream: Closable): void {
+    let open = this.sessionTraffic.get(apexSessionHash)
+    if (!open) this.sessionTraffic.set(apexSessionHash, (open = new Set()))
+    const held = open
+    held.add(stream)
+    stream.once('close', () => {
+      held.delete(stream)
+      if (held.size === 0 && this.sessionTraffic.get(apexSessionHash) === held) this.sessionTraffic.delete(apexSessionHash)
+    })
+  }
+
+  /**
+   * Cuts everything an ended apex session still holds open: a WebSocket authenticated once at its upgrade, or
+   * an answer still streaming, would otherwise outlive the sign-out. Returns how many were cut.
+   */
+  endSessionTraffic(apexSessionHash: string): number {
+    const open = this.sessionTraffic.get(apexSessionHash)
+    this.sessionTraffic.delete(apexSessionHash)
+    for (const stream of open ?? []) stream.destroy()
+    return open?.size ?? 0
   }
 
   workspaceOrigin(handle: string): string {

@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
+import http, { type IncomingMessage } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import WebSocket from 'ws'
 import { describeDevice, PHONE_CODE_TTL_MS, PHONE_DECISION_TTL_MS, PHONE_FINISH_TTL_MS } from '../src/phone.js'
 import { APEX, events, startHarness, workspaceHost, type Harness, type Reply } from './harness.js'
 
@@ -181,6 +183,41 @@ describe('signing in on a phone with the QR code in Settings', () => {
     // The owner is still signed in.
     expect((await api(h, ROOT, owner, 'account')).status).toBe(200)
     expect(events(h.logs, 'phone.signed_out')).toHaveLength(1)
+  })
+
+  it('cuts what a signed-out phone still holds open, and leaves the owner\'s alone', async () => {
+    const { workspace } = await signInPhone()
+    const open = (cookie: string) => new Promise<WebSocket>((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${h.port}/ws/chat`, { headers: { host: ROOT, cookie } })
+      socket.once('message', () => resolve(socket))
+      socket.once('error', reject)
+    })
+    const phoneSocket = await open(workspace)
+    const ownerSocket = await open(owner)
+    // An answer still streaming: the workspace echoes the body as it arrives, and the request never ends.
+    const stream = http.request({ host: '127.0.0.1', port: h.port, method: 'POST', path: '/stream', headers: { host: ROOT, cookie: workspace, 'transfer-encoding': 'chunked' } })
+    const streaming = new Promise<IncomingMessage>((resolve, reject) => {
+      stream.once('response', resolve)
+      stream.once('error', reject)
+    })
+    stream.write('first')
+    const answer = await streaming
+    await new Promise<void>((resolve) => answer.once('data', () => resolve()))
+    const streamEnded = new Promise<void>((resolve) => {
+      answer.once('close', () => resolve())
+      stream.once('error', () => resolve())
+    })
+    const phoneClosed = new Promise<void>((resolve) => phoneSocket.once('close', () => resolve()))
+
+    const [listed] = (await overview()).phones
+    expect((await api(h, ROOT, owner, `phone/revoke?grant=${listed.grant}`, { id: listed.id })).status).toBe(200)
+    await phoneClosed
+    await streamEnded
+    const echo = new Promise<string>((resolve) => ownerSocket.once('message', (data) => resolve(String(data))))
+    ownerSocket.send('still here')
+    expect(await echo).toBe('echo:still here')
+    ownerSocket.close()
+    expect(h.logs.find((entry) => entry.event === 'phone.signed_out')).toMatchObject({ cut: 2 })
   })
 
   it('binds the code to the first device that opens it', async () => {
