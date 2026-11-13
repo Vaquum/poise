@@ -1,7 +1,9 @@
 import { Readable } from 'node:stream'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createServer, get, type IncomingMessage, type ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { brotliDecompressSync, gunzipSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
-import { enforceApiRequest, HttpError, readJson, setApiHeaders } from '../server/http'
+import { acceptedEncoding, endJson, enforceApiRequest, HttpError, readJson, setApiHeaders } from '../server/http'
 
 function request(options: {
   body?: string
@@ -84,5 +86,60 @@ describe('local API boundary', () => {
       body: JSON.stringify({ value: 'x'.repeat(256) }),
       contentType: 'application/json',
     }), 64)).rejects.toMatchObject({ statusCode: 413 })
+  })
+})
+
+describe('JSON responses', () => {
+  it('reads which compressed encoding a request accepts', () => {
+    expect(acceptedEncoding('gzip, deflate, br, zstd')).toBe('br')
+    expect(acceptedEncoding('gzip;q=0.8, deflate')).toBe('gzip')
+    expect(acceptedEncoding('br;q=0, gzip')).toBe('gzip')
+    expect(acceptedEncoding('*')).toBe('br')
+    expect(acceptedEncoding('identity')).toBeNull()
+    expect(acceptedEncoding(undefined)).toBeNull()
+    expect(acceptedEncoding(['deflate', 'gzip'])).toBe('gzip')
+  })
+
+  it('compresses a large body the request accepts, and leaves the rest as they are', async () => {
+    const large = { rows: Array.from({ length: 400 }, (_, index) => ({ index, title: `Row ${index} of a large JSON body` })) }
+    const server = createServer((req, res) => {
+      res.statusCode = 200
+      res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/vary') res.setHeader('Vary', 'Origin')
+      endJson(res, JSON.stringify(req.url === '/small' ? { ok: true } : large))
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address() as AddressInfo
+    const read = (path: string, encoding?: string, method = 'GET') => new Promise<{ headers: IncomingMessage['headers'], body: Buffer }>((resolve, reject) => {
+      const req = get({ host: '127.0.0.1', port, path, method, headers: encoding ? { 'accept-encoding': encoding } : {} }, (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (chunk: Buffer) => chunks.push(chunk))
+        res.on('end', () => resolve({ headers: res.headers, body: Buffer.concat(chunks) }))
+      })
+      req.on('error', reject)
+    })
+    try {
+      const text = JSON.stringify(large)
+      const br = await read('/large', 'gzip, deflate, br')
+      expect(br.headers['content-encoding']).toBe('br')
+      expect(br.headers.vary).toBe('Accept-Encoding')
+      expect(Number(br.headers['content-length'])).toBe(br.body.length)
+      expect(br.body.length).toBeLessThan(text.length / 4)
+      expect(brotliDecompressSync(br.body).toString()).toBe(text)
+      const gzip = await read('/vary', 'gzip')
+      expect(gzip.headers['content-encoding']).toBe('gzip')
+      expect(gzip.headers.vary).toBe('Origin, Accept-Encoding')
+      expect(gunzipSync(gzip.body).toString()).toBe(text)
+      const plain = await read('/large')
+      expect(plain.headers['content-encoding']).toBeUndefined()
+      expect(plain.body.toString()).toBe(text)
+      const small = await read('/small', 'br')
+      expect(small.headers['content-encoding']).toBeUndefined()
+      expect(small.body.toString()).toBe('{"ok":true}')
+      const head = await read('/large', 'br', 'HEAD')
+      expect(head.headers['content-encoding']).toBeUndefined()
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
   })
 })

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { db } from '../db'
-import { HttpError, httpStatus, readJson } from '../http'
+import { HttpError, endJson, httpStatus, readJson } from '../http'
 import { releaseBackgroundPaused } from '../release-background'
 import * as inbox from './control-store'
 import type { ChatEnvelope, ChatEvent, SessionRecord, SwitchboardItem, SwitchboardKind, SwitchboardOption, SwitchboardState, TurnUsage } from './protocol'
@@ -115,7 +115,7 @@ function tokens(usage: TurnUsage | undefined): number | null {
 }
 function iso(ms: number | null | undefined): string | null { return ms ? new Date(ms).toISOString() : null }
 function json(res: ServerResponse, status: number, body: unknown): void {
-  res.statusCode = status; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(body))
+  res.statusCode = status; res.setHeader('Content-Type', 'application/json'); endJson(res, JSON.stringify(body))
 }
 
 interface TextEntry { seq: number, kind: 'prompt' | 'steer' | 'reply', text: string }

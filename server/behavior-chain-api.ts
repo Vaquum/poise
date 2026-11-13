@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { behaviorChainJournal } from './behavior-chain-journal'
-import { HttpError, httpStatus, readJson } from './http'
+import { HttpError, endJson, httpStatus, readJson } from './http'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { getBehaviorChainCapacity, getBehaviorChainRuntimeHealth } from './behaviors'
 import { behaviorCutoverBlockers } from './behavior-cutover'
@@ -10,7 +10,7 @@ import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact }
 import { nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 
 function reply(res: ServerResponse, status: number, value: unknown): void {
-  res.statusCode = status; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value))
+  res.statusCode = status; res.setHeader('Content-Type', 'application/json'); endJson(res, JSON.stringify(value))
 }
 
 // A list read computes a page of chain summaries and every active chain's

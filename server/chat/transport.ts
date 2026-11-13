@@ -23,7 +23,7 @@ import { STATUS_CODES, type IncomingMessage, type Server, type ServerResponse } 
 import type { Duplex } from 'node:stream'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, WebSocket } from 'ws'
-import { ATTACHMENT_MAX_BYTES, HttpError, enforceApiRequest, httpStatus, readBuffer, readJson, type ApiRequestPolicy, type RequestAuthority } from '../http'
+import { ATTACHMENT_MAX_BYTES, HttpError, endJson, enforceApiRequest, httpStatus, readBuffer, readJson, type ApiRequestPolicy, type RequestAuthority } from '../http'
 import { SELF_UPDATE_OFF, SERVICE_MODE_CODE } from '../service/turned-off'
 import { runFile } from '../process'
 import { handleGhBody } from '../gh'
@@ -46,7 +46,7 @@ const SOCKET_BUFFER_LIMIT = 8 * 1024 * 1024
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status
   res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify(body))
+  endJson(res, JSON.stringify(body))
 }
 
 function errorBody(error: unknown): { error: string, code?: string, manager?: { id: string } } {

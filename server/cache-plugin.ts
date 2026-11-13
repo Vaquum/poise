@@ -57,7 +57,7 @@ import { ProcessLockError } from './process-lock'
 import { retryFailedPrReviews, setBehaviorCheckSlots } from './behaviors'
 import { setWorkerChatReader } from './worker-capacity'
 import { bindings as workBindings } from './chat/control-store'
-import { enforceApiRequest, httpStatus, readJson, setApiHeaders, type RequestAuthority } from './http'
+import { endJson, enforceApiRequest, httpStatus, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { stallSnapshot } from './stall-observer'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
@@ -88,7 +88,7 @@ import type { Server } from 'node:http'
 function json(res: ServerResponse, status: number, body: unknown) {
   res.statusCode = status
   res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify(body))
+  endJson(res, JSON.stringify(body))
 }
 
 export interface CachePluginOptions {
