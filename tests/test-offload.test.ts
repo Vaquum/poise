@@ -459,6 +459,7 @@ describe('a suite on a test box', () => {
   let snapshots: Map<string, Snapshot>
   let groups: string[]
   let terminated: string[]
+  let pendingTerminations: ServerResponse[] | null
   let setups: number
   let setupExit: number
   let setupMs: number
@@ -603,7 +604,8 @@ describe('a suite on a test box', () => {
         terminated.push(box.id)
         box.status = 'terminated'
         box.child?.kill('SIGKILL')
-        res.writeHead(204).end()
+        if (pendingTerminations) pendingTerminations.push(res)
+        else res.writeHead(204).end()
       } else if (box && action === 'files' && operation === 'upload/token') json(res, 200, { uri: `${renderOrigin}/connect/upload/${box.id}?path=${encodeURIComponent(url.searchParams.get('path') ?? '')}`, method: 'PUT', token: 't' })
       else if (box && action === 'runs' && operation === 'stream/token') json(res, 200, { uri: `${renderOrigin}/connect/run/${box.id}`, method: 'POST', token: 't' })
       else if (box && action === 'snapshots') {
@@ -649,6 +651,7 @@ describe('a suite on a test box', () => {
     snapshots = new Map()
     groups = []
     terminated = []
+    pendingTerminations = null
     setups = 0
     setupExit = 0
     setupMs = 0
@@ -830,6 +833,10 @@ describe('a suite on a test box', () => {
     expect(box).toMatchObject({ plan: '1c-2g', timeoutSeconds: 3660, idleTimeoutSeconds: 0 })
     await until(() => terminated.includes(box.id), 'the box to be terminated')
     expect(relay.runs.size).toBe(0)
+    const finished = events.find(({ event, boxId }) => event === 'test_relay.run.finished' && boxId === box.id)
+    expect(finished).toMatchObject({ exit: 7 })
+    expect((await fetch(`${relayUrl}/runs/${finished!.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } })).status).toBe(204)
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   })
 
   it('runs the command exactly as it was typed, with nothing of this workspace\'s hooks', async () => {
@@ -1042,6 +1049,79 @@ describe('a suite on a test box', () => {
     const box = runBox()
     await until(() => terminated.includes(box.id), 'the box to be terminated')
     expect(relay.runs.size).toBe(0)
+  })
+
+  it.each([false, true])('accepts owner cleanup after output closes while termination is pending (termination failure: %s)', async (failed) => {
+    await startAll()
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
+    const { id } = await created.json() as { id: string }
+    const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: `Bearer ${KEY}` } })
+    await until(() => relay.runs.get(id)?.ready === true, 'the box to be ready')
+    const box = runBox()
+    pendingTerminations = []
+    await output.body!.cancel()
+    await until(() => relay.runs.size === 0 && pendingTerminations!.length > 0, 'retirement before termination answers', 3_000)
+    expect(pendingTerminations).toHaveLength(1)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id, error: 'the workspace went away' }))
+    for (let repeat = 0; repeat < 2; repeat += 1) {
+      expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } })).status).toBe(204)
+    }
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+    expect(terminated.filter((boxId) => boxId === box.id)).toHaveLength(1)
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.box.terminate', boxId: box.id }))
+    const [termination] = pendingTerminations
+    pendingTerminations = null
+    if (failed) termination.destroy()
+    else termination.writeHead(204).end()
+    await until(() => [...events, ...warnings].some(({ event, boxId }) => boxId === box.id && event === (failed ? 'test_relay.box.terminate.failed' : 'test_relay.box.terminate')), 'the termination diagnostic', 3_000)
+    if (failed) expect(warnings).toContainEqual({ event: 'test_relay.box.terminate.failed', boxId: box.id, error: 'fetch failed' })
+    else expect(events).toContainEqual({ event: 'test_relay.box.terminate', boxId: box.id, status: 204 })
+  })
+
+  it('keeps retirement evidence exclusive to the current owner’s cleanup DELETE and evicts it without occupying admission slots', async () => {
+    let allowed = true
+    await startAll({ maxRuns: 1, baseService: 'crn-test', isWorkspace: (handle) => handle === 'bob' || (handle === 'alice' && allowed) })
+    const headers = { authorization: `Bearer ${KEY}` }
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: '{"argv":["x"],"cwd":"/","env":{}}' })
+    const { id } = await created.json() as { id: string }
+    const token = relay.runs.get(id)!.token
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+
+    const forged = workspaceKey(generateKeyPairSync('ed25519').privateKey, 'alice')
+    for (const [method, path, key, status] of [
+      ['DELETE', `/runs/${id}`, '', 401],
+      ['DELETE', `/runs/${id}`, forged, 401],
+      ['DELETE', `/runs/${id}`, workspaceKey(privateKey, 'bob'), 410],
+      ['DELETE', `/runs/${'0'.repeat(32)}`, KEY, 410],
+      ['DELETE', `/runs/${id}/`, KEY, 410],
+      ['DELETE', `/runs/${id}/extra`, KEY, 410],
+      ['GET', `/runs/${id}/output`, KEY, 410],
+      ['POST', `/runs/${id}/lease`, KEY, 410],
+      ['POST', `/runs/${id}/output`, token, 410],
+    ] as const) {
+      const from = warnings.length
+      const response = await fetch(`${relayUrl}${path}`, { method, headers: { authorization: `Bearer ${key}` } })
+      expect(response.status).toBe(status)
+      await response.text()
+      expect(warnings.slice(from)).toContainEqual({ event: 'test_relay.request.failed', method, path: `${TEST_RELAY_PATH}${path}`, status,
+        error: status === 401 ? 'this key is not a workspace\'s' : 'this run is over' })
+    }
+    allowed = false
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(401)
+    allowed = true
+    let latest = id
+    for (let count = 0; count < 1024; count += 1) {
+      const response = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: '{"argv":["x"],"cwd":"/","env":{}}' })
+      expect(response.status).toBe(201)
+      latest = (await response.json() as { id: string }).id
+      expect((await fetch(`${relayUrl}/runs/${latest}`, { method: 'DELETE', headers })).status).toBe(204)
+    }
+    expect(relay.runs.size).toBe(0)
+    expect((await fetch(`${relayUrl}/runs/${latest}`, { method: 'DELETE', headers })).status).toBe(204)
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(410)
+    expect(warnings).toContainEqual({ event: 'test_relay.request.failed', method: 'DELETE', path: `${TEST_RELAY_PATH}/runs/${id}`, status: 410, error: 'this run is over' })
   })
 
   it('destroys the box when the agent’s side goes quiet with its connection open', async () => {
@@ -1466,6 +1546,8 @@ ${stderr}`
     expect(warning.error).toContain('this suite is too big for its test box: it ran out of memory')
     expect(warning.error).toContain('workspace alice')
     expect(warning.error).toContain('command node -e')
+    expect((await fetch(`${relayUrl}/runs/${warning.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } })).status).toBe(204)
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   })
 
   it('fails loud when the box dies without a word', async () => {
