@@ -180,9 +180,11 @@ V2 uses the decision path's two-minute observation-freshness bound. Missing or
 unrecognized check rollups stay unknown; an empty failing-check list is not
 proof of success. Held/uncertain ownership remains visible even when PR state
 is stale. A legitimately owned model invocation remains the current phase with
-its age while the runtime intentionally skips GitHub re-observation; those old
-facets remain unknown without falsely marking the collector stale. Missing
-observations remain distinct. Other stale chain evidence marks reply health
+its age. Running PR reviews refresh open PR evidence on the existing two-minute
+boundary, so queue admission can surface in work diagnostics before review settles.
+Other owned invocations skip GitHub re-observation; those old facets remain unknown
+without falsely marking the collector stale. Missing observations remain distinct.
+Other stale chain evidence marks reply health
 stale. Current phase switches/pauses, the chain admission pause and the release
 barrier remain meaningful; recorded holds and policy refusals are retained. A contradictory
 journal or ambiguous ownership fails the existing endpoint with 503 instead of
