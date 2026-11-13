@@ -1714,17 +1714,23 @@ function settleClosedTargetFirings(results: DeadLetterReconcileResult[]): void {
 // launch are read. A reopened PR skips. The incident's retirement stamp is
 // the stable completion time so repeats settle to the same record.
 function settleClosedTargetHistoricalFirings(closed: ReadonlySet<string>): void {
-  const rows = cachedStatement(db, `
+  // Read from each closed pull request's own launches (idx_behavior_seen_target)
+  // to their superseded dead letters (idx_behavior_dead_letters_superseded);
+  // CROSS JOIN keeps that order, which SQLite would otherwise reverse.
+  // Dead letters are kept forever, and reading all of them for every closed
+  // pull request took 80-160 ms on production.
+  const select = cachedStatement(db, `
     SELECT seen.key AS behavior, seen.target AS target,
       seen.launch_repo AS repo, seen.launch_pr AS pr,
       seen.launch_correlation_id AS correlation_id, seen.launch_call_id AS call_id,
       dead.resolution_evidence AS resolution_evidence, dead.retired_at AS retired_at
     FROM behavior_seen AS seen
-    JOIN behavior_dead_letters AS dead
+    CROSS JOIN behavior_dead_letters AS dead
       ON dead.behavior = seen.key AND dead.target = seen.target
       AND dead.correlation_id = seen.launch_correlation_id
       AND dead.call_id = seen.launch_call_id
-    WHERE seen.key IN ('review-new-prs', 'approve-prs')
+    WHERE seen.launch_repo = ? AND seen.launch_pr = ?
+      AND seen.key IN ('review-new-prs', 'approve-prs')
       AND seen.claim_id = ''
       AND seen.launch_error IS NOT NULL
       AND seen.launch_outcome IS NULL
@@ -1732,7 +1738,11 @@ function settleClosedTargetHistoricalFirings(closed: ReadonlySet<string>): void 
       AND dead.resolution = 'superseded'
       AND dead.resolution_evidence LIKE '%"open":false%'
     ORDER BY dead.retired_at ASC, dead.id ASC
-  `).all() as Array<{
+  `)
+  const rows = [...closed].flatMap((ref) => {
+    const match = /^(.+)#(\d+)$/.exec(ref)
+    return match ? select.all(match[1], Number(match[2])) : []
+  }) as Array<{
     behavior: string, target: string, repo: string | null, pr: number | null,
     correlation_id: string | null, call_id: string | null,
     resolution_evidence: string, retired_at: string,
