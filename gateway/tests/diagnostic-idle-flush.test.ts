@@ -46,3 +46,30 @@ it('writes the journal and store while idle only as often as staleness needs, an
     expect(runtime.query((db) => db.query({ workspace: 'alice', operator: false })).events.some((event) => event.message === 'delivered')).toBe(true)
   } finally { runtime.stop(); rmSync(root, { recursive: true, force: true }) }
 })
+
+it('writes a source change to the store at the next flush even when the change already wrote the journal', () => {
+  const root = mkdtempSync(join(tmpdir(), 'poise-idle-coverage-')), path = join(root, 'logging.db')
+  let now = Date.parse('2026-11-13T12:00:00.000Z')
+  const runtime = new DiagnosticRuntime({ path, now: () => now, report: () => undefined })
+  const stored = () => runtime.query((db) => db.readCoverage({ workspace: 'alice', operator: true })).find((source) => source.id === 'application')
+  try {
+    runtime.observe('application', 'poise', 'alice')
+    runtime.flush()
+    expect(stored()).toMatchObject({ status: 'connected' })
+
+    // observe() writes the journal itself; the store's copy waits for a flush.
+    now += 2_000
+    runtime.observe('application', 'poise', 'alice', 'source unreachable')
+    now += 1_000
+    runtime.flush()
+    expect(stored()).toMatchObject({ status: 'unavailable' })
+    // Recovery reads as partial (the outage is a gap in its history), in the store as in memory.
+    now += 2_000
+    runtime.observe('application', 'poise', 'alice')
+    now += 1_000
+    runtime.flush()
+    const live = runtime.health().sources.find((source) => source.id === 'application')
+    expect(live?.status).toBe('partial')
+    expect(stored()).toMatchObject({ status: live?.status, error: live?.error ?? null })
+  } finally { runtime.stop(); rmSync(root, { recursive: true, force: true }) }
+})

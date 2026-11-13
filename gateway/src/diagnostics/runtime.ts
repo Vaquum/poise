@@ -61,8 +61,10 @@ export class DiagnosticRuntime {
   private lastSuccess: string | null = null
   private journalAt = 0
   private idleFlushedAt = 0
-  // The journal's state, less its time, as last written.
+  // The journal's state, less its time, as last written to the journal, and
+  // the sources' coverage as last written to the store: each has its writer.
   private journaled: string | null = null
+  private persistedSources: string | null = null
   private dropped = 0
   private droppedSince: string | null = null
   private stopped = false
@@ -340,7 +342,7 @@ export class DiagnosticRuntime {
     if (this.stopped || this.now() < this.retryAt) return false
     if (!this.queue.length && this.now() - this.idleFlushedAt < IDLE_FLUSH_MS && !this.lossActive
       && !this.sinkError && !this.coverageError && !this.journalError && !this.reportError
-      && this.journalState() === this.journaled) return false
+      && this.journalState() === this.journaled && this.sourcesState() === this.persistedSources) return false
     const lossSequence = this.lossSequence
     const batch = this.queue.slice(0, 100)
     let store: DiagnosticStore
@@ -394,6 +396,7 @@ export class DiagnosticRuntime {
       // Record every committed source before a fallible coverage write can stop persistence.
       for (const source of this.sources.values()) if (!this.externalSources.has(source.id)) store.coverage(source)
       this.coverageError = null
+      this.persistedSources = this.sourcesState()
     } catch (error) {
       const message = this.message(error)
       if (message !== this.coverageError) this.notify('logging.coverage.unavailable', message)
@@ -414,10 +417,15 @@ export class DiagnosticRuntime {
     setImmediate(() => { this.scheduled = false; if (!this.stopped) this.flush() })
   }
 
+  /** The sources' coverage this runtime owns, as the store and journal record it. */
+  private sourcesState(): string {
+    return JSON.stringify([...this.sources.values()].filter((source) => !this.externalSources.has(source.id)))
+  }
+
   /** What the journal records, less the time it was written. */
   private journalState(): string {
     return JSON.stringify([this.stopped, this.dropped, this.rejected, this.lossActive, this.droppedSince, this.sinkError,
-      this.coverageError, this.reportError, this.sinkSince, [...this.sources.values()].filter((source) => !this.externalSources.has(source.id))])
+      this.coverageError, this.reportError, this.sinkSince, this.sourcesState()])
   }
 
   private saveJournal(force = false): void {
