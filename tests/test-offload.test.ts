@@ -368,6 +368,9 @@ process.exitCode = 125`)
 
   it('take a Python test runner out of this machine, from any interpreter, and it never runs here', () => {
     const { hooks } = hooked(true)
+    writeFileSync(join(hooks, 'run.mjs'), `console.log(JSON.stringify(process.argv.slice(2)))
+console.error('[poise] fixture sender: relay unavailable')
+process.exitCode = 125`)
     const repo = temp()
     execFileSync('git', ['init', '-q', repo])
     const marker = join(repo, 'ran-here')
@@ -375,7 +378,9 @@ process.exitCode = 125`)
     writeFileSync(join(repo, 'pytest', '__main__.py'), `open(${JSON.stringify(marker)}, 'w')`)
     const result = spawnSync('python3', ['-m', 'pytest', '-q'], { cwd: repo, encoding: 'utf8', env: { ...process.env, PYTHONPATH: hooks } })
     expect(result.status).toBe(125)
-    expect(result.stderr).toContain('[poise]')
+    const args = JSON.parse(result.stdout) as string[]
+    expect(args.slice(args.indexOf('--') + 1)).toEqual(['python3', '-m', 'pytest', '-q'])
+    expect(result.stderr).toContain('[poise] fixture sender: relay unavailable')
     expect(existsSync(marker)).toBe(false)
   })
 
