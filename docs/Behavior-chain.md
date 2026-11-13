@@ -60,6 +60,12 @@ never skips or fails it. Any other sweep error is reported in runtime health as 
 
 Settings → Behaviors → Issue to merge selects either issues bearing the configured label (default `poise`) or all open issues in followed organizations. Label intake includes old issues that acquire the label. Existing Chat bindings and linked open PRs prevent new ownership; active work is not migrated. The author and review account must be distinct and remain fixed for an admitted chain.
 
+Intake and the fresh pre-implementation ownership check include explicit closing
+keywords in open PR bodies in the issue's repository, including stacked PRs
+whose GitHub closing-reference connections are empty. The existing PR link and
+hold paths keep that ownership visible. Ordinary mentions do not claim ownership;
+body keywords supply no merge or prerequisite-delivery proof.
+
 Downstream reuse of this lifecycle for already-created PRs is decided separately: [Downstream-lifecycle.md](Downstream-lifecycle.md) records the scope decision, the exact existing routes and the contracts a follow-up must settle. There is no supported enrollment of an existing PR into a chain at this revision.
 
 The existing reviewer count, model slots, severity, behavior notes, switches, pauses and PR exclusions remain in effect. Implement Issues and Repair Pull Requests are rows in Behaviors with independent switches, notes, author identity, native activity, run metrics and pause/resume controls. Their switches default on within an enabled chain, preserving the existing execution semantics; they cannot enable the chain itself. Their model slots remain in Settings → Models. A chain can be held or resumed individually. Disabling invocations retains receipts and ownership and continues reconciling already admitted outcomes. Holding or pausing does not terminate an existing worker; its existing native Stop control still applies.

@@ -54,8 +54,8 @@ defines the evidence and freshness requirements.
 
 `pr-dependents` returns one pull request's closed issues and their open
 dependents: `found`, the PR `title`, `closed` with each issue's state,
-`closes_via` (`closing-references`, or `body-keywords` when the stored read
-predates dependency tracking), and `dependents` with `via` naming
+`closes_via` (`closing-references`, or `body-keywords` when closing references
+are missing or empty), and `dependents` with `via` naming
 `blocked-by`, `depends-on`, or both. A dependent is an open issue in the same
 repository that GitHub lists as blocked by a closed issue, or that lists it
 under a `Depends on:` header in its body, inline or as list items. At most 100
@@ -66,8 +66,8 @@ next sync; `Depends on:` works from long-synced bodies.
 
 `pr-closing` lists open pull requests with the issues each closes: `prs`
 with each PR's `repo`, `number`, `url`, `closing` refs, `closes_via`
-(`closing-references`, or `body-keywords` when the stored read predates
-dependency tracking), `closing_truncated`, and the head branch and its
+(`closing-references`, or `body-keywords` when closing references are missing
+or empty), `closing_truncated`, and the head branch and its
 repository as `head_ref`/`head_repo` (both null when the stored read
 predates head tracking), and `truncated` when a cap or a malformed stored
 connection hid entries. A pull request with `closing_truncated` carries an
@@ -80,6 +80,11 @@ pull requests follow: pass the last returned cursor back until it clears,
 the number as `--after-number` with the same `--repo`, or the pair as
 `--after-repo`/`--after-number` for an unscoped list. All reads are local
 rows; the sync owns freshness.
+
+An empty closing-reference connection can occur on a stacked PR. Its explicit
+closing keywords supply same-repository ownership links with `body-keywords`
+provenance. Ordinary mentions supply no link; body keywords do not prove merge
+or prerequisite delivery. Incomplete connections remain truncated.
 
 `github-datastore` and `python3 -m github_datastore` work from any directory on this host.
 Every command takes `--db PATH`; without it the database is

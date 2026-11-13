@@ -762,6 +762,45 @@ class RequestedReviewersTest(unittest.TestCase):
 
 
 class PrClosingTest(unittest.TestCase):
+    def test_empty_stacked_closing_connections_use_body_keywords_without_hiding_truncation(self) -> None:
+        for has_next_page in (False, True):
+            with self.subTest(has_next_page=has_next_page), tempfile.TemporaryDirectory() as tmp:
+                db_path = Path(tmp) / "db.sqlite"
+                conn = connect(db_path)
+                init_db(conn)
+                stacked = closing_pr_fixture(12, 112, "Closes #7", state="open",
+                                             head="stacked-fix", head_repo="Vaquum/Test")
+                stacked["pull"]["graphql"]["baseRefName"] = "parent-fix"
+                stacked["pull"]["graphql"]["closingIssuesReferences"]["pageInfo"]["hasNextPage"] = has_next_page
+                items = [stacked,
+                         closing_pr_fixture(13, 113, "Related to #7", state="open"),
+                         closing_pr_fixture(14, 114, "Closes #7", state="closed"),
+                         closing_pr_fixture(15, 115, "Closes other/repo#7", state="open"),
+                         closing_pr_fixture(16, 116, "Closes #99", closing=(7,), state="open")]
+                foreign = closing_pr_fixture(17, 117, "Closes Vaquum/Test#7", state="open")
+                foreign["repo"] = dict(foreign["repo"], id=11, node_id="R_11", name="Other", full_name="Vaquum/Other")
+                items.append(foreign)
+                with conn:
+                    upsert_repo(conn, stacked["repo"])
+                    upsert_repo(conn, foreign["repo"])
+                for item in items:
+                    store_expanded(conn, item)
+                conn.close()
+
+                listed = json.loads(views.pr_closing(db_path=db_path))
+                prs = {pr["number"]: pr for pr in listed["prs"]}
+                self.assertEqual(prs[12]["closing"], [{"repo": "vaquum/test", "number": 7}])
+                self.assertEqual(prs[12]["closes_via"], "body-keywords")
+                self.assertEqual(prs[12]["url"], "https://github.com/Vaquum/Test/pull/12")
+                self.assertEqual(prs[12]["closing_truncated"], has_next_page)
+                self.assertEqual(listed["truncated"], has_next_page)
+                self.assertEqual(prs[13]["closing"], [])
+                self.assertNotIn(14, prs)
+                self.assertEqual(prs[15]["closing"], [])
+                self.assertEqual(prs[16]["closing"], [{"repo": "vaquum/test", "number": 7}])
+                self.assertEqual(prs[16]["closes_via"], "closing-references")
+                self.assertEqual(prs[17]["closing"], [])
+
     def test_pr_closing_lists_open_prs_with_their_closing_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "db.sqlite"

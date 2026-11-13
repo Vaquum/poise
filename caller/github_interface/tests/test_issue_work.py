@@ -28,6 +28,88 @@ class PublicationScope(TestCase):
                 publication_body(body, "example/repo", 7)
 
 
+class IssueOwnership(IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.payload = {"repository": "example/repo", "token_user": "author", "issue": 7,
+                        "branch": "poise/issue-7", "mode": "inspect"}
+        self.candidate = {"number": 8, "state": "open", "body": "Closes #7",
+                          "html_url": "https://github.com/example/repo/pull/8",
+                          "head": {"ref": "stacked-fix", "repo": {"full_name": "example/repo"}},
+                          "base": {"ref": "parent-fix", "repo": {"full_name": "example/repo"}}}
+        self.graph = {"repository": {"ref": None, "defaultBranchRef": {"target": {"oid": "c" * 40}},
+                      "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+        self.client = AsyncMock()
+        self.client.get.return_value = {"full_name": "example/repo", "default_branch": "main"}
+        self.client.graphql.return_value = self.graph
+
+    async def test_stacked_owner_appearing_after_intake_is_found_on_a_later_page_before_prepare(self):
+        with patch('github_interface.client.get_token', return_value="test-token"):
+            client = GitHubClient("author")
+        open_pulls, pages = [], []
+
+        async def get(path, **kwargs):
+            if path == "/repos/example/repo":
+                return {"full_name": "example/repo", "default_branch": "main"}
+            self.assertEqual(path, "/repos/example/repo/pulls")
+            params = kwargs["params"]
+            if params["state"] == "all":
+                self.assertEqual(params["head"], "example:poise/issue-7")
+                return []
+            self.assertEqual(params["state"], "open")
+            pages.append(params["page"])
+            return open_pulls[(params["page"] - 1) * 100:params["page"] * 100]
+
+        client.get, client.graphql = AsyncMock(side_effect=get), AsyncMock(return_value=self.graph)
+        self.assertEqual((await run(client, self.payload))["existing_pulls"], [])
+        open_pulls.extend({**self.candidate, "number": number, "body": "Related to #7"} for number in range(100, 200))
+        open_pulls.append(self.candidate)
+        self.assertEqual((await run(client, self.payload))["existing_pulls"], [self.candidate["html_url"]])
+        self.assertEqual(pages, [1, 1, 2])
+        with patch('github_interface.behaviors.issue_work.checkout_repo') as checkout, \
+                patch('github_interface.behaviors.issue_work._run') as git, \
+                self.assertRaisesRegex(ValueError, "already has another open pull request"):
+            await run(client, {**self.payload, "mode": "prepare", "path": "/unused"})
+        checkout.assert_not_called()
+        git.assert_not_called()
+
+    async def test_body_ownership_requires_an_explicit_seed_reference_in_another_open_same_repository_pr(self):
+        for changed, expected in [({}, True), ({"body": "fIxEd EXAMPLE/REPO#7"}, True),
+                                  ({"body": "Resolves https://github.com/example/repo/issues/7"}, True),
+                                  ({"body": "Related to #7"}, False), ({"body": None}, False),
+                                  ({"body": "Closes #70"}, False), ({"body": "Closes other/repo#7"}, False),
+                                  ({"body": "Closes https://github.com/other/repo/issues/7"}, False),
+                                  ({"state": "closed"}, False),
+                                  ({"base": {"repo": {"full_name": "other/repo"}}}, False),
+                                  ({"head": {"ref": "poise/issue-7", "repo": {"full_name": "example/repo"}}}, False)]:
+            with self.subTest(changed=changed):
+                self.client.paginate.side_effect = [[], [{**self.candidate, **changed}]]
+                result = await run(self.client, self.payload)
+                self.assertEqual(result["existing_pulls"], [self.candidate["html_url"]] if expected else [])
+        self.client.post.assert_not_awaited()
+        self.client.patch.assert_not_awaited()
+
+    async def test_graphql_owners_are_preserved_and_incomplete_ownership_reads_fail(self):
+        linked = {"number": 8, "url": self.candidate["html_url"],
+                  "repository": {"nameWithOwner": "example/repo"}, "headRefName": "stacked-fix"}
+        connection = self.graph["repository"]["issue"]["closedByPullRequestsReferences"]
+        connection["nodes"] = [linked, {**linked, "headRefName": "poise/issue-7", "url": "own-pr"},
+                               {**linked, "url": "https://github.com/example/repo/pull/9"}]
+        self.client.paginate.side_effect = [[], [self.candidate]]
+        self.assertEqual((await run(self.client, self.payload))["existing_pulls"],
+                         [linked["url"], "https://github.com/example/repo/pull/9"])
+        connection["pageInfo"] = {"hasNextPage": True, "endCursor": None}
+        self.client.paginate.side_effect = None
+        self.client.paginate.return_value = []
+        with self.assertRaisesRegex(ValueError, "ownership pagination did not advance"):
+            await run(self.client, self.payload)
+        connection["pageInfo"] = {"hasNextPage": False}
+        self.client.paginate.side_effect = [[], RuntimeError("open PR page unavailable")]
+        with self.assertRaisesRegex(RuntimeError, "open PR page unavailable"), \
+                patch('github_interface.behaviors.issue_work.checkout_repo') as checkout:
+            await run(self.client, {**self.payload, "mode": "prepare", "path": "/unused"})
+        checkout.assert_not_called()
+
+
 class ReviewReplyReceipts(IsolatedAsyncioTestCase):
     async def test_successive_repairs_reuse_prior_receipts_and_inspect_the_full_plan_after_a_lost_response(self):
         with patch('github_interface.client.get_token', return_value="test-token"):
@@ -180,7 +262,7 @@ class ReviewReplyReceipts(IsolatedAsyncioTestCase):
         pull = {"number": 3, "state": "open", "head": {"ref": "poise/issue-7", "sha": head, "repo": {"full_name": "example/repo"}},
                 "user": {"login": "author"}, "body": "<!-- poise-chain example/repo#7 -->"}
         client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"}, {"state": "open"}]
-        client.paginate.side_effect = [[pull], [{"id": 17}]]
+        client.paginate.side_effect = [[pull], [], [{"id": 17}]]
         client.graphql.return_value = {"repository": {"ref": {"target": {"oid": head, "message": f"fix: repair\n\nPoise-Invocation: {CALL}"}},
             "defaultBranchRef": {"target": {"oid": "c" * 40}}, "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
         client.post.return_value = {"id": 18}

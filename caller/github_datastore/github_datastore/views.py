@@ -305,8 +305,7 @@ def parse_depends_on(body: str | None, default_repo: str) -> set[tuple[str, int]
 
 
 def parse_closes(body: str | None, default_repo: str) -> set[tuple[str, int]]:
-    """Refs one closing keyword directly introduces: the fallback for pull
-    requests last synced before closing references were tracked."""
+    """Refs one closing keyword directly introduces in a pull request body."""
     refs: set[tuple[str, int]] = set()
     if not body:
         return refs
@@ -406,15 +405,17 @@ def _head_ref(graphql: Any) -> tuple[str | None, str | None]:
 def _closing_refs(graphql: Any, body: str | None, repo: str) -> tuple[list[tuple[str, int, str | None]], str, bool]:
     """((repo, number, title) refs, provenance, truncated) for a pull request.
 
-    GitHub's closing references when the stored read tracked them, else the
-    body's closing keywords. A malformed stored connection falls back to the
-    body and marks the read truncated."""
+    GitHub's closing references when present. Empty connections also check
+    same-repository body keywords for stacked PR ownership. Missing or malformed
+    stored connections use body keywords; malformed reads remain truncated."""
     stored = graphql.get("closingIssuesReferences") if isinstance(graphql, dict) else None
     if stored is None:
         return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", False
     nodes, truncated = _connection_nodes(stored)
     if nodes is None:
         return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", True
+    if not nodes:
+        return [(r, n, None) for r, n in sorted(parse_closes(body, repo)) if r == repo.lower()], "body-keywords", truncated
     refs: list[tuple[str, int, str | None]] = []
     for node in nodes:
         ref = _node_ref(node)
@@ -553,8 +554,8 @@ def pr_closing(
 ) -> str:
     """Open pull requests and the issues each closes, as the datastore has
     them: local rows only, the sync owns freshness. Each entry carries
-    GitHub's closing references when the stored read tracked them, else the
-    body's closing keywords, the same provenance pr-dependents reports per
+    GitHub's closing references, or explicit body keywords when those references
+    are missing or empty, with the same provenance pr-dependents reports per
     pull request. `closing_truncated` marks a pull request whose own closing
     list is incomplete; matching on it would misbind, so consumers must skip
     it. `truncated` means a cap or a malformed stored connection hid entries;
