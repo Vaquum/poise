@@ -101,6 +101,22 @@ describe('progress clock', () => {
 })
 
 describe('authoritative behavior journal', () => {
+  it('reads a projection by its own text, one written another way the long way, and refuses any other state', () => {
+    const { db, journal, chain } = setup()
+    const next = record(journal, chain, { type: 'chain.held', reason: 'person stopped it' })
+    expect(journal.read(chain.id)).toEqual(next)
+    const stored = db.prepare('SELECT state FROM behavior_chain_current WHERE chain_id = ?').pluck().get(chain.id) as string
+    const write = (state: string) => db.prepare('UPDATE behavior_chain_current SET state = ? WHERE chain_id = ?').run(state, chain.id)
+    // The same state written with other spacing is still that state.
+    write(JSON.stringify(JSON.parse(stored), null, 2))
+    expect(journal.read(chain.id)).toEqual(next)
+    // Another state is refused, however it is written.
+    write(JSON.stringify({ ...JSON.parse(stored), held: 'someone else' }))
+    expect(() => journal.read(chain.id)).toThrow(/disagrees with the authoritative event journal/)
+    write(JSON.stringify({ ...JSON.parse(stored), held: 'someone else' }, null, 2))
+    expect(() => journal.read(chain.id)).toThrow(/disagrees with the authoritative event journal/)
+  })
+
   it('rebuilds every projection from immutable events and refuses corrupted authority', () => {
     const { db, journal, chain } = setup()
     const next = record(journal, chain, { type: 'chain.held', reason: 'person stopped it' })
