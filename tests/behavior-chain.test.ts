@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
@@ -67,6 +68,37 @@ function pull(obs: ChainObservation): void {
       response: reviewResponse(chainBasis(id).slice(0, 32)) })),
     reviewRevision: 'findings-1', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
 }
+
+describe('progress clock', () => {
+  it('continues a chain’s clock over its new events only, as a replay from the start reads it', () => {
+    const { journal, chain } = setup()
+    const observed = (change: (obs: ChainObservation) => void) => { const obs = observation(); pull(obs); change(obs); return obs }
+    let current = record(journal, chain, { type: 'chain.observed', observation: observed((obs) => { obs.pull!.pending = true; obs.pull!.checksState = 'PENDING' }) })
+    current = record(journal, current, { type: 'chain.observed', observation: observed((obs) => { obs.pull!.checksState = 'SUCCESS' }) })
+    const replay = () => chainProgressOf(journal.history(chain.id).map((row) => ({ sequence: row.sequence, at: row.at, event: JSON.parse(row.payload) as ChainEvent })), chain.id, undefined, true)
+    const first = chainProgress(journal, chain.id, undefined, true)
+    expect(first).toEqual(replay())
+    expect(first.advances.length).toBeGreaterThan(0)
+    const before = current.sequence
+    current = record(journal, current, { type: 'chain.observed', observation: observed((obs) => { obs.pull!.checksState = 'SUCCESS'; obs.pull!.approved = true }) })
+    current = record(journal, current, { type: 'chain.held', reason: 'person stopped it' })
+    current = record(journal, current, { type: 'chain.observed', observation: observed((obs) => {
+      obs.publication.head_sha = NEXT; obs.pull!.head = NEXT; obs.pull!.checksState = 'SUCCESS' }) })
+    const read = vi.spyOn(journal, 'history')
+    const next = chainProgress(journal, chain.id, undefined, true)
+    expect(read.mock.calls.map(([, after]) => after)).toEqual([before])
+    read.mockRestore()
+    expect(next).toEqual(replay())
+    expect(next.advances.length).toBeGreaterThan(first.advances.length)
+    // What a caller is handed is its own: changing it never changes the clock kept.
+    next.advances[0].at = 0
+    next.advances[0].sequence = 0
+    next.advances.length = 1
+    expect(chainProgress(journal, chain.id, undefined, true)).toEqual(replay())
+    // A failed invocation's view is still read from the start.
+    expect(chainProgress(journal, chain.id, 'missing')).toEqual(chainProgressOf(journal.history(chain.id).map((row) => ({ sequence: row.sequence, at: row.at, event: JSON.parse(row.payload) as ChainEvent })), chain.id, 'missing'))
+  })
+})
 
 describe('authoritative behavior journal', () => {
   it('rebuilds every projection from immutable events and refuses corrupted authority', () => {

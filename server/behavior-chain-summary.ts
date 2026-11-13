@@ -114,12 +114,49 @@ type ProgressRow = { sequence: number, at: number, event: ChainEvent }
 /** Derive the clock from immutable history, never the latest poll or attempt.
  * Replaying here leaves reducer state and historical hashes unchanged. */
 export function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocation?: string, trackAdvances = false) {
-  return chainProgressOf(journalEvents(journal, id), id, failedInvocation, trackAdvances)
+  // A failed invocation's view is folded afresh; the clock every reader shares
+  // continues from where it was folded, over the chain's new events only.
+  if (failedInvocation !== undefined) return chainProgressOf(journalEvents(journal, id), id, failedInvocation, trackAdvances)
+  let kept = progressFolds.get(journal)
+  if (!kept) { kept = new Map(); progressFolds.set(journal, kept) }
+  const key = `${id}\u0000${trackAdvances}`
+  const fold = kept.get(key) ?? startFold()
+  try {
+    foldProgress(fold, journalEvents(journal, id, fold.last), id, undefined, trackAdvances)
+  } catch (error) {
+    kept.delete(key)
+    throw error
+  }
+  kept.set(key, fold)
+  return progressOf(fold, id)
 }
 
-/** One chain's history, a page at a time, each event parsed once. */
-function* journalEvents(journal: BehaviorChainJournal, id: string): Generator<ProgressRow> {
-  let after = 0
+/** A chain's clock folded so far. History is immutable and only grows, so a
+ *  fold continues over later events exactly as a replay from the start would. */
+interface ProgressFold {
+  last: number
+  chain: BehaviorChain | null
+  at: number, sequence: number
+  previous: ChainObservation['pull']
+  verified: Set<string>
+  failureSequence: number | null
+  waitingSequence: number
+  waitingHead: string | null
+  advances: Array<{ at: number, sequence: number }>
+}
+const startFold = (): ProgressFold => ({ last: 0, chain: null, at: 0, sequence: 0, previous: null, verified: new Set(),
+  failureSequence: null, waitingSequence: 0, waitingHead: null, advances: [] })
+const progressFolds = new WeakMap<BehaviorChainJournal, Map<string, ProgressFold>>()
+
+function progressOf(fold: ProgressFold, id: string) {
+  if (!fold.chain) throw new Error(`behavior chain admission history is unavailable: ${id}`)
+  const { at, sequence, failureSequence, waitingSequence, waitingHead } = fold
+  return { at, sequence, failureSequence, waitingSequence, waitingHead, advances: fold.advances.map((point) => ({ ...point })) }
+}
+
+/** One chain's history after a sequence, a page at a time, each event parsed once. */
+function* journalEvents(journal: BehaviorChainJournal, id: string, from = 0): Generator<ProgressRow> {
+  let after = from
   for (;;) {
     const events = journal.history(id, after)
     for (const row of events) yield { sequence: row.sequence, at: row.at, event: JSON.parse(row.payload) as ChainEvent }
@@ -130,16 +167,17 @@ function* journalEvents(journal: BehaviorChainJournal, id: string): Generator<Pr
 
 /** The same clock from history already read and parsed, in sequence order. */
 export function chainProgressOf(rows: Iterable<ProgressRow>, id: string, failedInvocation?: string, trackAdvances = false) {
-  let chain: BehaviorChain | null = null
-  let at = 0, sequence = 0
-  let previous: ChainObservation['pull'] = null
-  const verified = new Set<string>()
-  let failureSequence: number | null = null
-  let waitingSequence = 0
-  let waitingHead: string | null = null
-  const advances: Array<{ at: number, sequence: number }> = []
+  const fold = startFold()
+  foldProgress(fold, rows, id, failedInvocation, trackAdvances)
+  return progressOf(fold, id)
+}
+
+function foldProgress(fold: ProgressFold, rows: Iterable<ProgressRow>, id: string, failedInvocation: string | undefined, trackAdvances: boolean): void {
+  let { last, chain, at, sequence, previous, failureSequence, waitingSequence, waitingHead } = fold
+  const { verified, advances } = fold
   for (const row of rows) {
     const event = row.event
+    last = row.sequence
     chain = reduceChain(chain, event, row.sequence, id)
     if (event.type === 'chain.waiting') {
       waitingSequence = row.sequence
@@ -195,8 +233,7 @@ export function chainProgressOf(rows: Iterable<ProgressRow>, id: string, failedI
       if (trackAdvances && event.type !== 'chain.admitted') advances.push({ at, sequence })
     }
   }
-  if (!chain) throw new Error(`behavior chain admission history is unavailable: ${id}`)
-  return { at, sequence, failureSequence, waitingSequence, waitingHead, advances }
+  Object.assign(fold, { last, chain, at, sequence, previous, failureSequence, waitingSequence, waitingHead })
 }
 
 /** Read-only incident annotation, independent of attention's age/active filters. */
