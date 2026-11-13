@@ -918,6 +918,15 @@ function isPreparationBudgetExhaustion(call: LogEntry): boolean {
       'preparing_provider', 'acquiring_checkout'].includes(phase))
 }
 
+// A staged group's deadline stays on its revision, even when it limits local
+// inspection. It still counts toward that target's retry stop.
+function isFileGroupBudgetExhaustion(call: LogEntry): boolean {
+  return call.error_code === 'review_budget_exhausted'
+    && (call.diagnostic?.operation === 'provider.review' || call.diagnostic?.operation === 'github-interface')
+    && call.diagnostic.phase === 'file_group' && call.diagnostic.outcome === 'timed_out'
+    && call.diagnostic.context.submission === 'none'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -947,7 +956,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // verdict, the next slot is strictly more useful than the same dead run.
   if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit') return 'provider'
   if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)
-    && !isPreparationBudgetExhaustion(call)) return 'budget'
+    && !isPreparationBudgetExhaustion(call) && !isFileGroupBudgetExhaustion(call)) return 'budget'
   return null
 }
 
@@ -4009,10 +4018,9 @@ function boundedReviewFailure(call: LogEntry): boolean {
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
 }
 
-// A budget-exhausted run that proved it posted nothing is a provider-side
-// failure, not an ambiguous side effect: Caller verifies against live
-// GitHub before failing this way, and says so when it cannot. It retries
-// the same head on backoff until two matching automatic timeouts. An
+// A budget-exhausted run that proved it posted nothing can retry on this head:
+// Caller verifies against live GitHub before failing this way, and says so
+// when it cannot. It retries on backoff until two matching automatic timeouts. An
 // uncertain submission or deterministic input exhaustion holds immediately.
 function budgetExhaustedProvenNoAction(call: LogEntry): boolean {
   return call.review_policy === REVIEW_POLICY
@@ -4035,7 +4043,7 @@ function prReviewRetryState(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call))
   const timeouts = calls.filter((call) => call.model === model && budgetExhaustedProvenNoAction(call)
-    && reviewerTripKind(call) === 'budget'
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
   const stopped = timeouts.length >= 2 || retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
     claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head
@@ -4092,7 +4100,7 @@ function ensureBudgetStopHold(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call)
     && call.model === model && budgetExhaustedProvenNoAction(call)
-    && reviewerTripKind(call) === 'budget'
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
     .sort((a, b) => Date.parse(agentCallStartedAt(b)) - Date.parse(agentCallStartedAt(a)))
   const latest = timeouts[0]

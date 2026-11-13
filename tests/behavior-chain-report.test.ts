@@ -43,7 +43,11 @@ const MIXED_REVIEW_FAILURES: Array<Pick<LogEntry, 'error' | 'error_code' | 'diag
       outcome: 'timed_out', stderr: 'private inspection output', stderr_truncated: false,
       context: { timeout_seconds: 30, cwd: '/private/work', message: '--requests-json private inspection arguments' },
       filesystem: { path: '/private/work' } } },
-  { callId: '188bcb47407849c6b97bd45d1e261a97', error_code: 'review_budget_exhausted', error: REVIEW_ERRORS[2] },
+  { callId: '188bcb47407849c6b97bd45d1e261a97', error_code: 'review_budget_exhausted',
+    error: 'Review file-group time limit reached; incomplete analysis; reduce the review scope',
+    diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'file_group',
+      outcome: 'timed_out', stderr: '', stderr_truncated: false,
+      context: { submission: 'none', timeout_seconds: 60 }, filesystem: null } },
 ]
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
 const databases: Database.Database[] = []
@@ -1009,7 +1013,8 @@ it('reports mixed native PR review timeouts after Resume once across observation
     expect(line).toContain(`Caller ${MIXED_REVIEW_FAILURES[index].callId}`)
     expect(line).toContain(`error_code=${MIXED_REVIEW_FAILURES[index].error_code}`)
     expect(line).toContain(index === 1 ? 'operation=github-interface; phase=inspection; timeout_seconds=30'
-      : 'operation=unknown; phase=unknown; timeout_seconds=unknown')
+      : index === 2 ? 'operation=provider.review; phase=file_group; timeout_seconds=60'
+        : 'operation=unknown; phase=unknown; timeout_seconds=unknown')
   }
   for (const invocation of earlier.invocations) expect(remote[0].body).not.toContain(invocation.id)
   for (const failure of MIXED_REVIEW_FAILURES) expect(remote[0].body).not.toContain(failure.error)
