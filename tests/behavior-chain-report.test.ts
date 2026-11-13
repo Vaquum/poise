@@ -208,12 +208,12 @@ function unpublished(): ChainObservation {
   return { ...observation(), pull: null,
     publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }
 }
-function blockedImplementation(journal: BehaviorChainJournal) {
+function blockedImplementation(journal: BehaviorChainJournal, invocationId?: string) {
   fresh = unpublished()
   let chain = journal.read('acme/repo#7') ?? journal.append('acme/repo#7', 'seed:7', 0,
     { type: 'chain.admitted', repository: 'acme/repo', issue: 7, branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' }, NOW - 600_000)
   chain = record(journal, chain, { type: 'chain.observed', observation: { ...fresh, checkedAt: NOW - 600_000 } })
-  const id = `implementation-${chain.resumedAfterSequence}`
+  const id = invocationId ?? `implementation-${chain.resumedAfterSequence}`
   chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id, behavior: 'implement-issue',
     basis: chainBasis(['issue', fresh.issue.revision]), actor: chain.author, slot: reviewer.slot, model: reviewer.model,
     admittedAt: NOW - 300_000, request: { command: 'agent-interface', cwd: '/fixture',
@@ -229,6 +229,14 @@ function blockedImplementation(journal: BehaviorChainJournal) {
     artifact: { phase: 'executing', prepared: { checkout_head: HEAD }, resource_root: '/private/work' },
     resources_settled_at: new Date(NOW - 100_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } }
   return { chain, call }
+}
+function uncertainImplementation(journal: BehaviorChainJournal) {
+  const fixture = blockedImplementation(journal, '104dbf93-4dfd-489e-90c4-a5f7447fa8bc')
+  Object.assign(fixture.call, { id: 'a0dc866e144840b2a7ea923306913c49', action: null, outcome: null,
+    error_code: 'atomic_work_failed', error: 'atomic behavior failed during publishing: private provider output /private/work',
+    artifact: { phase: 'publishing', plan_sha: 'd459b301124eef5631cadd755b4483f7fbf41671c8a2a9be28ba5d382c9c68be',
+      publication_head: '3c7c5e00c5fb75f53fac307e6a57f70bbc1015df' } })
+  return fixture
 }
 async function exhaustedReviews(journal: BehaviorChainJournal,
   failures: Array<Pick<LogEntry, 'error' | 'error_code' | 'diagnostic'> & { callId?: string }> = REVIEW_ERRORS.map(error => ({ error, error_code: 'review_budget_exhausted' }))) {
@@ -910,6 +918,123 @@ it.each(['operator hold', 'Resume'])('rechecks the implementation hold before re
   }, () => true)
   expect(posts()).toHaveLength(0)
   expect(reports(db)).toHaveLength(0)
+})
+
+it.each(['new report', 'lost acknowledgement', 'closed markerless link'])('reports an unheld uncertain implementation once across restart: %s', async mode => {
+  const root = mkdtempSync(join(tmpdir(), 'uncertain-implementation-report-')); roots.push(root)
+  const path = join(root, 'journal.sqlite')
+  const initial = setup(path)
+  const { chain, call } = uncertainImplementation(initial.journal)
+  expect(chain).toMatchObject({ held: null, invocations: [{ state: 'started', callId: null }] })
+  if (mode === 'closed markerless link') {
+    const existing = issue(98, `The #7 implementation remains uncertain after the original Call \`${call.id}\` (correlation \`${call.correlation_id}\`) failed during publication. The retained artifact names phase \`publishing\`. The Call has positive resource release, no action result and no publication receipt. Reconcile that original push outcome.`)
+    existing.state = 'closed'; existing.user.login = 'reviewer'; remote.push(existing)
+    sourceComments = [{ author: 'author', body: 'The original publication is fenced; see https://github.com/acme/repo/issues/98.' }]
+    searchVisible = false
+  }
+  loseCreation = mode === 'lost acknowledgement'
+  const launch = vi.fn(async () => { throw new Error('must not replace the original implementation') })
+  const resumePublication = vi.fn(async () => { throw new Error('must not repeat the original push') })
+  const overrides = { launch, resumePublication, observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  await new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal, overrides)).run()
+  expect(posts()).toHaveLength(mode === 'closed markerless link' ? 0 : 1)
+  if (mode !== 'closed markerless link') {
+    expect(remote[0].title).toBe('fix: uncertain implementation publication for #7')
+    for (const fact of ['https://github.com/acme/repo/issues/7', `Invocation ${call.correlation_id}`, `Caller ${call.id}`,
+      'implementation_publication_uncertain', 'atomic_work_failed', 'Missing original evidence:',
+      'pre-push no-write checkpoint or conclusive push result', 'GitHub absence alone cannot settle',
+      'authorizes neither replacement implementation nor a second push', REMEDIATION_SCOPE]) expect(remote[0].body).toContain(fact)
+    expect(remote[0].body).not.toMatch(/Resume|fresh implementation|private provider output|\/private\/work/)
+  }
+  const original = initial.journal.read(chain.id)!.invocations
+  expect(original).toMatchObject([{ id: call.correlation_id, state: 'uncertain', callId: null,
+    evidence: { callId: call.id, artifact: call.artifact, resource_ownership: call.resource_ownership } }])
+  initial.db.close(); databases.splice(databases.indexOf(initial.db), 1)
+  const { db, journal } = setup(path)
+  journal.rebuild()
+  searchVisible = false; sourceComments = []
+  for (let pass = 0; pass < 2; pass++) {
+    await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+    expect(journal.read(chain.id)!.waiting).toContain('pre-push no-write checkpoint or conclusive push result')
+    if (mode === 'lost acknowledgement') expect(journal.read(chain.id)!.waiting).toContain('creation is unconfirmed')
+  }
+  if (mode === 'lost acknowledgement') {
+    searchVisible = true; remote[0].state = 'closed'
+    await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  }
+  expect(posts()).toHaveLength(mode === 'closed markerless link' ? 0 : 1)
+  expect(reports(db).map(row => JSON.parse(row.value))).toMatchObject([{
+    key: chainBasis(['implementation_publication_uncertain', chain.id, call.correlation_id]),
+    source: chain.id, pull: null, head: null, holdSequence: null, heldAt: null,
+    attempts: [{ invocation: call.correlation_id, call: call.id }], issueNumber: mode === 'closed markerless link' ? 98 : 99,
+  }])
+  expect(journal.read(chain.id)).toMatchObject({ held: null, mergeSha: null, resumedAfterSequence: 0, invocations: original })
+  if (mode !== 'new report') expect(journal.read(chain.id)!.waiting).toContain('is closed; no replacement')
+  expect(launch).not.toHaveBeenCalled(); expect(resumePublication).not.toHaveBeenCalled()
+})
+
+it.each(['mere reference', 'different source', 'different invocation', 'different Call', 'different failure', 'untrusted author', 'PR', 'empty body'])('does not adopt an unrelated uncertain implementation report: %s', async change => {
+  const { db, journal } = setup()
+  const { call } = uncertainImplementation(journal)
+  let body = `The #7 implementation remains uncertain after Call ${call.id}, invocation ${call.correlation_id}; no conclusive push result or publication receipt is available.`
+  if (change === 'mere reference') body = `Reference #7, Call ${call.id}, invocation ${call.correlation_id}.`
+  if (change === 'different source') body = body.replace('#7', '#8')
+  if (change === 'different invocation') body = body.replace(call.correlation_id!, call.correlation_id! + '-other')
+  if (change === 'different Call') body = body.replace(call.id, 'f'.repeat(32))
+  if (change === 'different failure') body = `The #7 implementation remains uncertain after Call ${call.id}, invocation ${call.correlation_id}; test resources have not settled.`
+  const linked = issue(98, body)
+  linked.state = 'closed'
+  if (change === 'untrusted author') linked.user.login = 'stranger'
+  if (change === 'PR') Object.assign(linked, { pull_request: {}, html_url: 'https://github.com/acme/repo/pull/98' })
+  if (change === 'empty body') Object.assign(linked, { body: null })
+  remote.push(linked); searchVisible = false
+  sourceComments = [{ author: 'reviewer', body: 'See https://github.com/acme/repo/issues/98.' }]
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  expect(reports(db).map(row => JSON.parse(row.value).issueNumber)).toEqual([99])
+})
+
+it.each(['running Call', 'pending resources', 'missing ownership', 'missing Call', 'missing terminal time',
+  'closed source', 'closed native source', 'ineligible source', 'unknown eligibility', 'published original', 'published different Call',
+  'pre-push no-write result', 'conclusive receipt', 'not publishing', 'unavailable verification', 'disabled'])('defers uncertain implementation reporting for %s', async change => {
+  const { db, journal } = setup()
+  const { chain, call } = uncertainImplementation(journal)
+  if (change === 'running Call') { call.status = 'running'; call.completed_at = null; call.resources_settled_at = null }
+  if (change === 'pending resources') call.resources_settled_at = null
+  if (change === 'missing ownership') call.resource_ownership = null
+  if (change === 'missing terminal time') call.completed_at = null
+  if (change === 'closed source') fresh.issue.open = false
+  if (change === 'closed native source') seedState = 'closed'
+  if (change === 'ineligible source') fresh.issue.eligible = false
+  if (change === 'unknown eligibility') Reflect.deleteProperty(fresh.issue, 'eligible')
+  if (change === 'published original' || change === 'published different Call') {
+    fresh.publication = { ...observation().publication, head_invocation: change === 'published original' ? call.id : 'e'.repeat(32) }
+    fresh.pull = observation().pull
+  }
+  if (change === 'pre-push no-write result') { call.action = 'not_started'; call.outcome = 'preflight_failed' }
+  if (change === 'conclusive receipt') { call.action = 'published'; call.outcome = 'published'; call.head_sha = HEAD }
+  if (change === 'not publishing') call.artifact = { phase: 'executing' }
+  if (change === 'unavailable verification') stale = true
+  if (change === 'disabled') vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  await new BehaviorChainRuntime(journal, operations(db, journal, { discover: async () => [], observe: async () => fresh,
+    readInvocations: async () => ({ entries: change === 'missing Call' ? [] : [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(0); expect(reports(db)).toHaveLength(0)
+  expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+})
+
+it('rechecks the original uncertain implementation before reserving report intent', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = uncertainImplementation(journal)
+  await new BehaviorChainRuntime(journal, operations(db, journal, { reportHold: undefined, observe: async () => fresh,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  const source = journal.read(chain.id)!
+  await reportRepairExhaustion(db, journal, source, async () => {
+    record(journal, source, { type: 'invocation.reconciled', invocationId: call.correlation_id!, evidence: { head_sha: HEAD } })
+    return fresh
+  }, () => true)
+  expect(posts()).toHaveLength(0); expect(reports(db)).toHaveLength(0)
 })
 
 it.each([false, true])('reports an unheld uncertain merge through recovery without another submission (diagnostic=%s)', async diagnostic => {

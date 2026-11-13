@@ -155,6 +155,25 @@ else { process.stderr.write(failure); process.exitCode = 1 }
       target: outer.target, exitCode: 1, stderr: 'precise probe failure', context: { progress: inner.progress } })
   })
 
+  it('keeps the sweep identity when a target attached to the shared sweep TimeoutError', async () => {
+    start()
+    const outer = { correlationId: 'a'.repeat(32), behavior: 'review-new-prs', repository: null, target: null, account: null, phase: 'preparation' }
+    const inner = { ...outer, repository: 'acme/repo', target: 'acme/repo#17', account: 'bot',
+      progress: { primitive: 'head-sha', slot: 'primary', expectedHead: null } }
+    const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    try {
+      await withNoticeDiagnosticIdentity(outer, () => withNoticeDiagnosticIdentity(inner,
+        () => Promise.reject(timeout)))
+      expect.fail('the sweep must time out')
+    } catch (error) { diagnosticFailure('application.behaviors', error) }
+    loggingRuntime()!.flush()
+    const events = diagnosticPage(null).events.filter((event) => event.operation === 'application.behaviors')
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ correlationId: outer.correlationId, phase: 'preparation',
+      target: null, repository: null, account: null, context: { exceptionName: 'TimeoutError' } })
+    expect(events[0]!.context.progress).toBeUndefined()
+  })
+
   it('distinguishes a TimeoutError code from an actual subprocess exit with the same code', async () => {
     start()
     const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError')

@@ -74,15 +74,16 @@ describe('computePrBlocker', () => {
   it('prefers the strongest hold and keeps the others in details', () => {
     const computed = computePrBlocker(baseInput({
       held: [
-        { behavior: 'approve-prs', code: 'rate_limit', since: '2026-10-29T15:54:00Z', nextRetryAt: '2026-10-29T16:02:00Z' },
-        { behavior: 'review-new-prs', code: 'held_result', since: '2026-10-29T15:50:00Z' },
+        { behavior: 'approve-prs', code: 'rate_limit', detail: 'GitHub rate limit', since: '2026-10-29T15:54:00Z', nextRetryAt: '2026-10-29T16:02:00Z' },
+        { behavior: 'review-new-prs', code: 'held_result', detail: 'Pending publication', since: '2026-10-29T15:50:00Z' },
       ],
       liveClaim: { key: 'approve-prs', expectedHead: HEAD, others: [] },
     }))
     expect(computed.id).toBe('held')
     expect(computed.line).toBe('held: approve-prs rate_limit since 15:54Z, retry 16:02Z')
     expect(computed.details).toContain(`review running: approve-prs on ${SHORT}`)
-    expect(computed.details).toContain('also held: review-new-prs held_result since 15:50Z')
+    expect(computed.details).toContain('approve-prs: GitHub rate limit')
+    expect(computed.details).toContain('also held: review-new-prs held_result since 15:50Z: Pending publication')
   })
 
   it('shows a live claim with its head', () => {
@@ -358,7 +359,7 @@ describe('readPrStatus', () => {
     const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
     expect(reply.rows[0].blocker.id).toBe('held')
-    expect(reply.rows[0].blocker.details).toEqual([`review running: review-new-prs on ${NEXT.slice(0, 8)}`])
+    expect(reply.rows[0].blocker.details).toEqual([expect.stringMatching(/^review-new-prs: /), `review running: review-new-prs on ${NEXT.slice(0, 8)}`])
   })
 
   it('keeps a released launch held when its previously readable Caller history becomes unreadable', async () => {
@@ -375,7 +376,7 @@ describe('readPrStatus', () => {
     const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
     expect(reply.rows[0].blocker.id).toBe('held')
-    expect(reply.rows[0].blocker.details).toEqual([`review running: review-new-prs on ${NEXT.slice(0, 8)}`])
+    expect(reply.rows[0].blocker.details).toEqual(['review-new-prs: review failed: HTTP 503 Service Unavailable', `review running: review-new-prs on ${NEXT.slice(0, 8)}`])
   })
 
   it('keeps a same-head Grok stop primary and exposes the running Sol fallback', async () => {
@@ -393,7 +394,7 @@ describe('readPrStatus', () => {
 
     expect(reply.rows[0].blocker).toMatchObject({
       id: 'held', line: 'held: review-new-prs review_budget_exhausted since 14:43Z',
-      details: [`review running: review-new-prs on ${SHORT}`],
+      details: [`review-new-prs: ${REVIEW_BUDGET_STOPPED}`, `review running: review-new-prs on ${SHORT}`],
     })
   })
 
@@ -433,6 +434,7 @@ describe('readPrStatus', () => {
     expect(reply.rows[0].blocker).toMatchObject({
       id: 'held', line: 'held: approve-prs upstream_unavailable since 14:40Z',
       details: [
+        'approve-prs: review failed: HTTP 503 Service Unavailable',
         `review running: approve-prs on ${NEXT.slice(0, 8)}`,
         `past review: approve-prs upstream_unavailable on ${HEAD} since 2026-11-12T15:03:00Z`,
       ],
@@ -452,7 +454,7 @@ describe('readPrStatus', () => {
 
       const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [`review running: approve-prs on ${NEXT.slice(0, 8)}`] })
+      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: ['approve-prs: review failed: HTTP 503 Service Unavailable', `review running: approve-prs on ${NEXT.slice(0, 8)}`] })
     },
   )
 
@@ -468,7 +470,7 @@ describe('readPrStatus', () => {
 
       const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: ['approve-prs: review failed: HTTP 503 Service Unavailable'] })
     },
   )
 
@@ -480,7 +482,7 @@ describe('readPrStatus', () => {
 
     const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: ['approve-prs: review failed: HTTP 503 Service Unavailable'] })
   })
 
   it.each(['invalid_result', 'unreadable'] as const)('preserves PR-wide %s quarantine across head changes', async (quarantine) => {
@@ -494,7 +496,7 @@ describe('readPrStatus', () => {
 
     const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [`review running: approve-prs on ${NEXT.slice(0, 8)}`] })
+    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: ['approve-prs: review failed: HTTP 503 Service Unavailable', `review running: approve-prs on ${NEXT.slice(0, 8)}`] })
   })
 
   it('projects one approved green row with rounds from the cap counter', async () => {

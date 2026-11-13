@@ -180,7 +180,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     const open = expandedGroups.has(group.key)
     const n = group.entries.length
     const label = `${open ? 'Hide' : 'Show'} ${n - 1} identical earlier ${n === 2 ? 'run' : 'runs'}, ${n} in all`
-    return `<button type="button" class="grp-btn${open ? ' is-open' : ''}" data-act="sw-group" data-group-id="${esc(group.entries[0].id)}" aria-expanded="${open}" aria-label="${esc(label)}" title="${esc(label)}" data-ref="bh.group">${n}</button>`
+    return `<button type="button" class="grp-btn${open ? ' is-open' : ''}" data-act="sw-group" data-group-id="${esc(group.entries[0].id)}" aria-expanded="${open}" aria-label="${esc(label)}" data-help="${esc(label)}" data-ref="bh.group">${n}</button>`
   }
   function whereCells(e: LogEntry): string {
     const { owner, name } = repoParts(e)
@@ -194,8 +194,8 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     if (e.session_id) {
       const label = esc(targetText(e))
       return isChatTurn(e)
-        ? `<td class="c-org" colspan="2"><a class="sw-session" href="${esc(placeHref('chat', { chat: e.session_id, back: 'observe' }))}" title="Open this conversation in Chat" data-ref="bh.session">${icon('chat', 'sm')}${label}</a></td>`
-        : `<td class="c-org" colspan="2"><button type="button" class="sw-session" data-act="sw-session" data-session="${esc(e.session_id)}" title="Open this conversation — ${esc(e.session_id)}" data-ref="bh.session">${icon('chat', 'sm')}${label}</button></td>`
+        ? `<td class="c-org" colspan="2"><a class="sw-session" href="${esc(placeHref('chat', { chat: e.session_id, back: 'observe' }))}" data-help="Open this conversation in Chat" data-ref="bh.session">${icon('chat', 'sm')}${label}</a></td>`
+        : `<td class="c-org" colspan="2"><button type="button" class="sw-session" data-act="sw-session" data-session="${esc(e.session_id)}" data-help="Open this conversation — ${esc(e.session_id)}" data-ref="bh.session">${icon('chat', 'sm')}${label}</button></td>`
     }
     return '<td class="c-org"><span class="dim">—</span></td><td class="c-repo"><span class="dim">—</span></td>'
   }
@@ -205,31 +205,31 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     const word = s.state === 'running' || s.word === term(`state.${s.state}`) ? term(`state.${s.state}`) : `${term(`state.${s.state}`)} · ${s.word}`
     const est = estimateText(e, estimates.get(e.id))
     const row = rowNotes.get(e.id)
-    return `${capsule(s.state)}<span class="ow">${esc(word)}</span>${s.note ? `<span class="note${s.warn ? ' is-warn' : ''}" data-progress title="${esc(s.note)}">${esc(s.note)}</span>` : ''}${est ? `<span class="note${est.warn ? ' is-warn' : ''}" data-est data-ref="bh.est">${esc(est.text)}</span>` : ''}${row ? `<span class="note${row.warn ? ' is-warn' : ''}" data-row-note title="${esc(row.text)}">${esc(row.text)}</span>` : ''}`
+    return `${capsule(s.state)}<span class="ow">${esc(word)}</span>${s.note ? `<span class="note${s.warn ? ' is-warn' : ''}" data-progress data-help="${esc(s.note)}">${esc(s.note)}</span>` : ''}${est ? `<span class="note${est.warn ? ' is-warn' : ''}" data-est data-ref="bh.est">${esc(est.text)}</span>` : ''}${row ? `<span class="note${row.warn ? ' is-warn' : ''}" data-row-note data-help="${esc(row.text)}">${esc(row.text)}</span>` : ''}`
   }
   function stopHTML(e: LogEntry): string {
     if (!isRunning(e)) return '<span class="dim">—</span>'
     if (stopsInFlight.has(e.id) || stopping.has(e.id)) return '<span class="spin" aria-label="Stopping"></span>'
     const armed = armedStop?.id === e.id && armedStop.until > Date.now()
-    return `<button type="button" class="btn-ghost sw-stop${armed ? ' is-armed' : ''}" data-act="sw-stop" aria-label="${armed ? 'Confirm stopping this run' : 'Stop this run'}" title="${armed ? 'Sure? Press again to stop it' : 'Stop this run'}" data-ref="bh.stop">${armed ? 'Sure?' : icon('stop', 'sm')}</button>`
+    return `<button type="button" class="btn-ghost sw-stop${armed ? ' is-armed' : ''}" data-act="sw-stop" aria-label="${armed ? 'Confirm stopping this run' : 'Stop this run'}" data-help="${armed ? 'Sure? Press again to stop it' : 'Stop this run'}" data-ref="bh.stop">${armed ? 'Sure?' : icon('stop', 'sm')}</button>`
   }
   function replayHTML(e: LogEntry, repeat: boolean): string {
     if (!isReplayable(e) || repeat) return '<span class="dim">—</span>'
     if (replaysInFlight.has(e.id)) return '<span class="spin" aria-label="Replaying"></span>'
     const issue = e.behavior === 'issue_review'
-    return `<button type="button" class="ib" data-act="sw-replay" aria-label="${issue ? 'Review this revision again' : 'Replay this run'}" title="${issue ? 'Review this revision again' : 'Replay this run'}" data-ref="bh.replay">${icon('replay', 'sm')}</button>`
+    return `<button type="button" class="ib" data-act="sw-replay" aria-label="${issue ? 'Review this revision again' : 'Replay this run'}" data-help="${issue ? 'Review this revision again' : 'Replay this run'}" data-ref="bh.replay">${icon('replay', 'sm')}</button>`
   }
   function mainHTML(row: RunRow): string {
     const e = row.entry
     const open = expanded.has(e.id)
     const model = modelName(e)
-    const detail = hasDetail(e) ? `<button type="button" class="ib chev${open ? ' is-open' : ''}" data-act="sw-detail" aria-expanded="${open}" aria-label="${open ? 'Hide' : 'Show'} detail" title="${open ? 'Hide detail' : e.progress ? 'View activity' : e.response ? 'View response' : 'View error'}" data-ref="bh.detail">${icon('chev', 'sm')}</button>` : ''
+    const detail = hasDetail(e) ? `<button type="button" class="ib chev${open ? ' is-open' : ''}" data-act="sw-detail" aria-expanded="${open}" aria-label="${open ? 'Hide' : 'Show'} detail" data-help="${open ? 'Hide detail' : e.progress ? 'View activity' : e.response ? 'View response' : 'View error'}" data-ref="bh.detail">${icon('chev', 'sm')}</button>` : ''
     return `<td class="c-group">${row.repeat ? '' : groupButton(row.group)}</td>
-      <td class="c-model" title="${esc(model)}" data-ref="bh.model">${model ? esc(model) : '<span class="dim">—</span>'}</td>
-      <td class="c-behavior" title="${esc(e.behavior ?? '')}" data-ref="bh.behavior">${esc(behaviorName(e))}</td>
+      <td class="c-model" data-help="${esc(model)}" data-ref="bh.model">${model ? esc(model) : '<span class="dim">—</span>'}</td>
+      <td class="c-behavior" data-help="${esc(e.behavior ?? '')}" data-ref="bh.behavior">${esc(behaviorName(e))}</td>
       ${whereCells(e)}
       <td class="c-status" data-ref="bh.status"><span class="sw-st">${statusHTML(e)}</span></td>
-      <td class="c-started" data-ref="bh.started" data-started title="${esc(exactTime(startedAtMs(e)))}">${esc(relFromMs(startedAtMs(e)))}</td>
+      <td class="c-started" data-ref="bh.started" data-started data-help="${esc(exactTime(startedAtMs(e)))}">${esc(relFromMs(startedAtMs(e)))}</td>
       <td class="c-elapsed" data-ref="bh.elapsed" data-elapsed>${esc(elapsedText(e))}</td>
       <td class="c-act">${replayHTML(e, !!row.repeat)}</td>
       <td class="c-act">${stopHTML(e)}</td>
@@ -754,7 +754,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
       ctx.go(placeHref('chat', { chat: data.session.id, back: 'observe' }))
     } catch (error) {
       if (aborted(error)) return
-      button.setAttribute('title', `The conversation could not be found: ${message(error)}`)
+      button.setAttribute('data-help', `The conversation could not be found: ${message(error)}`)
       button.classList.add('is-warn')
     }
   }
@@ -937,7 +937,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
       if (isRunning(e) && !stopsInFlight.has(e.id) && !stopping.has(e.id)) {
         const progress = tr.querySelector<HTMLElement>('[data-progress]')
         const s = statusOf(e, now)
-        if (progress && progress.textContent !== s.note) { progress.textContent = s.note; progress.title = s.note; progress.classList.toggle('is-warn', s.warn) }
+        if (progress && progress.textContent !== s.note) { progress.textContent = s.note; progress.dataset.help = s.note; progress.classList.toggle('is-warn', s.warn) }
         const est = tr.querySelector<HTMLElement>('[data-est]')
         const x = estimateText(e, estimates.get(e.id), now)
         if (est && x && est.textContent !== x.text) { est.textContent = x.text; est.classList.toggle('is-warn', x.warn) }

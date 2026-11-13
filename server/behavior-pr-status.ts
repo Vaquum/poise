@@ -55,6 +55,7 @@ export type PrBlockerId = 'not_eligible' | 'held' | 'review_running' | 'awaiting
 export interface PrStatusHeld {
   behavior: string
   code: string
+  detail?: string
   /** Incident creation, ISO. */
   since: string
   nextRetryAt?: string
@@ -139,12 +140,13 @@ export function computePrBlocker(input: BlockerInput): ComputedBlocker {
 
   const [strongest, ...restHeld] = input.held
   if (strongest) {
+    if (strongest.detail) details.push(`${strongest.behavior}: ${strongest.detail}`)
     if (input.liveClaim && input.currentHead
       && input.liveClaim.expectedHead?.toLowerCase() === input.currentHead.toLowerCase()) {
       details.push(`review running: ${input.liveClaim.key} on ${shortHead(input.liveClaim.expectedHead)}`)
       for (const other of input.liveClaim.others) details.push(`also running: ${other}`)
     }
-    for (const other of restHeld) details.push(`also held: ${other.behavior} ${other.code} since ${shortTime(other.since)}`)
+    for (const other of restHeld) details.push(`also held: ${other.behavior} ${other.code} since ${shortTime(other.since)}${other.detail ? `: ${other.detail}` : ''}`)
     const retry = strongest.nextRetryAt ? `, retry ${shortTime(strongest.nextRetryAt)}` : ''
     return done('held', `held: ${strongest.behavior} ${strongest.code} since ${shortTime(strongest.since)}${retry}`,
       `held:${strongest.behavior}:${strongest.code}`)
@@ -628,6 +630,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       held.push({
         behavior: incident.behavior,
         code,
+        detail: incident.error,
         since: incident.createdAt,
         ...(incident.nextRetryAt ? { nextRetryAt: incident.nextRetryAt } : {}),
       })

@@ -14,7 +14,6 @@ import type { MountPlace } from '../router'
 import { initEditorView, stopEditorRefresh } from '../../views/editor-view'
 import { chatSidePane } from '../../views/chat-side-pane'
 import { placeSettings } from '../../config'
-import { installIconTooltips } from '../../icon-tooltips'
 
 let viewEl: HTMLElement | null = null
 let keep: HTMLElement | null = null
@@ -28,7 +27,6 @@ export const mount: MountPlace = async ({ root, address, query }) => {
     viewEl = document.createElement('section')
     viewEl.id = 'view-editor'
     viewEl.className = 'view'
-    installIconTooltips(viewEl)
   }
   $('main', root).append(viewEl)
   viewEl.hidden = false

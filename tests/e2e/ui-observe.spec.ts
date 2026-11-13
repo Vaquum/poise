@@ -198,6 +198,30 @@ test('a notice’s journal link opens the task’s timeline at its step, newest 
   expect(posts).toEqual([{ id: 'acme/site#501', sequence: 901, operation: 'resume' }])
 })
 
+test('a settlement link names original review completion and keeps the earlier merge and run links', async ({ page }) => {
+  await open(page, '/?view=observe&part=tasks')
+  const completed = chain(1564, { sequence: 21, mergeSha: 'd'.repeat(40), reviewPending: false, reviewStatus: 'complete' })
+  const events = [
+    { sequence: 20, at: NOW - 1324, type: 'chain.merged', callId: CALL, evidence: { review_complete: false } },
+    { sequence: 21, at: NOW - 1000, type: 'chain.merged', callId: CALL, evidence: { review_complete: true } },
+  ]
+  await page.route(url => url.pathname === '/api/behavior-chains' && url.searchParams.get('id') === completed.id, route => {
+    const after = Number(new URL(route.request().url()).searchParams.get('after') ?? 0)
+    return route.fulfill({ json: { chain: completed, events: events.filter(event => event.sequence > after), next: null } })
+  })
+  await page.goto('/?view=observe&part=tasks&chain=acme%2Fsite%231564&after=20')
+  const timeline = tasks(page).locator('[data-ref="side.timeline"]')
+  await expect(timeline.locator('li')).toHaveCount(1)
+  await expect(timeline.locator('[data-ref="tk.from"]')).toContainText('Original review evidence complete')
+  await expect(timeline.getByRole('link', { name: /^run cccccccc/ })).toHaveAttribute('href', `?view=observe&part=behaviors&call=${CALL}`)
+  await tasks(page).getByRole('button', { name: 'More events' }).click()
+  await expect(timeline.locator('li')).toHaveCount(2)
+  await expect(timeline.locator('li').first()).toContainText('Original review evidence complete')
+  await expect(timeline.locator('li').last()).toContainText('Event Merged')
+  await expect(timeline.getByRole('link', { name: /^run cccccccc/ })).toHaveCount(2)
+  await expect(tasks(page).locator('[data-tk-head]').getByRole('link', { name: '#1565', exact: true })).toHaveAttribute('href', 'https://github.com/acme/site/pull/1565')
+})
+
 test('a failed read keeps what was read, says when, and stops Hold and Resume until a read succeeds', async ({ page }) => {
   const served: Served = {}
   await open(page, '/?view=observe&part=tasks&chain=acme%2Fsite%23488', served)
@@ -261,6 +285,35 @@ test('Logging’s Work impact shows on the row and in the detail, and opens its 
   await page.getByRole('link', { name: 'Back to Overview' }).click()
   expect(query(page).view).toBe('overview')
   expect(JSON.parse(await page.evaluate(() => localStorage.getItem('poise-logging-filters') ?? '{}'))).toMatchObject({ time: 'week', severities: ['critical', 'error'] })
+})
+
+test('Logging shows confirmed handoffs as Warning while keeping an absent successor or current hold at Error', async ({ page }) => {
+  await open(page, '/?view=observe&part=logging')
+  const event = diagnostic('d', { source: 'caller', operation: 'provider.review.handoff', phase: 'analysis', callId: CALL,
+    behavior: 'pr_review', context: { errorCode: 'review_budget_exhausted', submission: 'none' },
+    message: 'Analysis time limit; handing off to the next model' })
+  let impact: 'unknown' | 'retrying' | 'recovered' | 'blocked' = 'unknown'
+  await page.route(url => url.pathname === '/api/logging', route => route.fulfill({ json: {
+    version: 1, countKind: 'events', total: 1, events: [event], coverage: [], bounds, policy, watermark: 'w1', nextCursor: null,
+  } }))
+  await page.route(url => url.pathname === '/api/behavior-chains', route => {
+    if (!new URL(route.request().url()).searchParams.has('batch')) return route.fallback()
+    return route.fulfill({ json: { impacts: [{ impact, recovered: impact === 'recovered' || impact === 'blocked',
+      invocationId: 'i495a', repository: 'acme/site', behavior: 'review-pr', callerBehavior: 'pr_review',
+      stage: 'review-pr: started', target: 'acme/site#496', progressAt: NOW - minutes(15), retryAt: null,
+      nextAction: impact === 'blocked' ? 'Resolve the hold: recovery exhausted' : 'Await the successor verdict',
+      journal: '/api/behavior-chains?id=acme%2Fsite%23493&after=159' }] } })
+  })
+  for (const state of ['unknown', 'retrying', 'recovered', 'blocked'] as const) {
+    impact = state
+    await page.reload()
+    const row = logging(page).locator(`tr[data-ev="${event.id}"]`)
+    await expect(row.locator('[data-ref="lg.severity"]')).toHaveText(state === 'retrying' || state === 'recovered' ? 'Warning' : 'Error')
+    await expect(row.locator('[data-ref="lg.impact"]')).toContainText(state)
+  }
+  await logging(page).locator(`tr[data-ev="${event.id}"]`).getByRole('button', { name: /evidence/i }).click()
+  await expect(logging(page).locator(`#lg-detail-${event.id}`)).toContainText('Resolve the hold: recovery exhausted')
+  await expect(logging(page).locator(`#lg-detail-${event.id} dt`).filter({ hasText: 'Source severity' }).locator('..')).toContainText('error')
 })
 
 test('a run link opens that run unfolded in Behaviors, and a chain’s own GitHub action names what it did with no model', async ({ page }) => {

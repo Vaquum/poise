@@ -554,6 +554,35 @@ class TestStagedReview(TestCase):
                       text_packet=staged_packet(["src/other.py"]))
         self.assertEqual(failure.exception.code, "review_contract_violation")
 
+    def test_first_retention_failure_holds_completed_review(self):
+        packet = staged_packet(["src/only.py"])
+        finding = {"path": "src/only.py", "line": 1, "side": "RIGHT", "body": "[p1] Blocking defect."}
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [finding]}
+        calls = []
+
+        def process(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}), stderr="")
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process), \
+                patch.object(structured_review.review_receipt, "retain_verdict",
+                             side_effect=OSError("simulated storage failure")):
+            with self.assertRaises(review_budget.ReviewLimitError) as failure:
+                structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis",
+                                      "a" * 40, 60, packet=packet)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("could not retain its findings", str(failure.exception))
+        self.assertNotIn("retained on the original Call", str(failure.exception))
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
+        self.assertEqual([args for args, _ in calls if args[0] == "github-interface"], [])
+
     def test_stages_keep_repository_inspection_with_one_combined_submission(self):
         request = {"operation": "read", "path": "src/old.py", "query": "", "start_line": 1}
         calls = []
@@ -639,7 +668,9 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertEqual(run.elapsed, 800)
         self.assertEqual(run.error.code, "review_budget_exhausted")
         self.assertEqual(str(run.error), GROK_HANDOFF)
-        self.assertEqual(run.error.diagnostic["phase"], "provider_analysis")
+        self.assertEqual(run.error.diagnostic["phase"], "analysis")
+        self.assertEqual(run.error.diagnostic["outcome"], "handoff")
+        self.assertEqual(run.error.diagnostic["submission"], "none")
         run.submit.assert_not_called()
 
     def test_inspection_rounds_stop_at_the_ceiling(self):
@@ -692,7 +723,123 @@ class TestGrokAnalysisCeiling(TestCase):
                                    repository=INSPECTED, **kwargs)
                 self.assertEqual(run.launches, expected)
                 self.assertEqual(run.error.code, "review_budget_exhausted")
-                self.assertEqual(run.error.diagnostic["phase"], "overall" if name == "whole budget" else "provider_analysis")
+                self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
+                self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
+                self.assertEqual(run.error.diagnostic["submission"], "none")
+
+    def test_a_shorter_file_group_deadline_is_not_a_provider_handoff(self):
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(27)])
+        self.assertEqual(review_stages.stage_count(packet), 4)
+        terminal = {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": [], "requests": []}
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [100, 500, NEVER_RETURNS], terminal,
+                           repository=INSPECTED, packet=packet)
+        self.assertLess(run.elapsed, 800)
+        self.assertEqual(run.error.code, "review_budget_exhausted")
+        self.assertEqual(run.error.diagnostic["phase"], "file_group")
+        self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
+        self.assertNotIn("handing off", str(run.error))
+        run.submit.assert_not_called()
+
+    def _replay_before_inspection(self, seconds, validation_seconds, timeout_s=1413, budget_seconds=1413):
+        """Grok returns an inspection step, then validation consumes time before inspection starts."""
+        clock = SimpleNamespace(now=1000.0)
+        model = CATALOG.resolve("grok-4.6-xhigh")
+
+        def provider(args, *, timeout, **_kwargs):
+            if seconds >= timeout:
+                clock.now += timeout
+                raise subprocess.TimeoutExpired(args, timeout)
+            clock.now += seconds
+            return SimpleNamespace(returncode=0, stderr="",
+                                   stdout=json.dumps({**GROK_REPLY, "structuredOutput": INSPECT}))
+
+        original_validate = structured_review.validate_verdict
+
+        def validating(*args, **kwargs):
+            clock.now += validation_seconds
+            return original_validate(*args, **kwargs)
+
+        text = "policy\n\nPR packet:\n\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
+        error = None
+        with patch.object(structured_review, "monotonic", lambda: clock.now), \
+                patch.object(review_budget, "monotonic", lambda: clock.now), \
+                patch.object(ReviewWatch, "run", side_effect=provider), \
+                patch.object(structured_review, "validate_verdict", side_effect=validating), \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit, \
+                review_budget.ReviewBudget(budget_seconds):
+            try:
+                structured_review.run("/repo", "system", text, model, "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40,
+                                      timeout_s, repository=INSPECTED)
+            except review_budget.ReviewLimitError as failure:
+                error = failure
+        return SimpleNamespace(error=error, submit=submit)
+
+    def test_analysis_ceiling_expiring_before_inspection_is_a_handoff(self):
+        run = self._replay_before_inspection(799, 2)
+        self.assertEqual(str(run.error), GROK_HANDOFF)
+        self.assertEqual(run.error.diagnostic["phase"], "analysis")
+        self.assertEqual(run.error.diagnostic["outcome"], "handoff")
+        self.assertEqual(run.error.diagnostic["submission"], "none")
+        run.submit.assert_not_called()
+
+    def test_analysis_ceiling_expiring_during_inspection_is_a_handoff(self):
+        from agent_interface.process_diagnostic import command_failure
+        clock = SimpleNamespace(now=1000.0)
+        model = CATALOG.resolve("grok-4.6-xhigh")
+
+        def provider(args, *, timeout, **_kwargs):
+            clock.now += 795
+            return SimpleNamespace(returncode=0, stderr="",
+                                   stdout=json.dumps({**GROK_REPLY, "structuredOutput": INSPECT}))
+
+        original_validate = structured_review.validate_verdict
+
+        def validating(*args, **kwargs):
+            clock.now += 1
+            return original_validate(*args, **kwargs)
+
+        def inspecting(requests, *, timeout_s):
+            clock.now += 10
+            diagnostic = command_failure(subprocess.TimeoutExpired("github-interface", timeout_s),
+                                         "inspection", "/tmp/review", timeout_s)
+            raise atoms.AgentPreflightError(
+                f"Local review repository inspection timed out after {timeout_s:g} seconds",
+                "review_inspection_timeout", diagnostic)
+
+        repository = SimpleNamespace(inspect=inspecting)
+        text = "policy\n\nPR packet:\n\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
+        error = None
+        with patch.object(structured_review, "monotonic", lambda: clock.now), \
+                patch.object(review_budget, "monotonic", lambda: clock.now), \
+                patch.object(ReviewWatch, "run", side_effect=provider), \
+                patch.object(structured_review, "validate_verdict", side_effect=validating), \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit, \
+                review_budget.ReviewBudget(1413):
+            try:
+                structured_review.run("/repo", "system", text, model, "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40,
+                                      1413, repository=repository)
+            except review_budget.ReviewLimitError as failure:
+                error = failure
+        self.assertEqual(str(error), GROK_HANDOFF)
+        self.assertEqual(error.code, "review_budget_exhausted")
+        self.assertEqual(error.diagnostic["operation"], "provider.review")
+        self.assertEqual(error.diagnostic["phase"], "analysis")
+        self.assertEqual(error.diagnostic["outcome"], "handoff")
+        self.assertEqual(error.diagnostic["submission"], "none")
+        submit.assert_not_called()
+
+    def test_shorter_overall_deadline_before_inspection_is_not_a_handoff(self):
+        run = self._replay_before_inspection(59, 2, timeout_s=60)
+        self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
+        self.assertEqual(run.error.diagnostic["phase"], "overall")
+        self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
+        run.submit.assert_not_called()
 
     def test_other_providers_keep_the_remaining_analysis_budget(self):
         for name, turns, reply, repository, expected in (
@@ -842,7 +989,7 @@ class TestSincePositions(TestCase):
                                          self._full(self.REMOVAL))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                      "a" * 40, "p2", since_head=None)
+                                      "a" * 40, "p2", since_head=None, reserve=120)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
@@ -929,7 +1076,7 @@ class TestSincePositions(TestCase):
         result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(full))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                      "a" * 40, "p2", since_head=None)
+                                      "a" * 40, "p2", since_head=None, reserve=120)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
@@ -1140,7 +1287,7 @@ class TestSincePositions(TestCase):
                 result, _, fetch = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
                 self.assertIn('"review_id": 91', result)
                 fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                              "a" * 40, priority, since_head=None)
+                                              "a" * 40, priority, since_head=None, reserve=120)
 
     def test_missing_priority_fails_closed_without_fetch_or_submit(self):
         verdict = {"assessment": ASSESSMENT, "action": "request_changes",
@@ -1182,7 +1329,7 @@ class TestSincePositions(TestCase):
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         full = self._full(self.REMOVAL)
 
-        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None):
+        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None, *, reserve=0):
             atoms._priority(p)
             return full
 

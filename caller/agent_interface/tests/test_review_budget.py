@@ -309,6 +309,18 @@ class TestRecovery(TestCase):
                 raise verdict_error()
             row = self.execute(exhausted, [facts(), facts()], model='gpt-6-astra-ultra')
         self.assertEqual(row['error_code'], 'review_budget_exhausted')
+        self.assertEqual((row['action'], row['outcome']), ('not_started', 'preflight_failed'))
+        self.assertIsNone(row['recovery_model'])
+        self.assertEqual(self.mod.run.call_count, 1)
+
+    def test_repeat_only_budget_exhaustion_settles_retryable_for_pr_review(self):
+        with patch.object(budget, 'monotonic', return_value=100) as clock:
+            def exhausted(*args, **kwargs):
+                clock.return_value = 1514
+                raise refusal_error()
+            row = self.execute(exhausted, [facts(), facts()], model='opus-5-high', behavior='pr_review')
+        self.assertEqual(row['error_code'], 'review_budget_exhausted')
+        self.assertEqual((row['action'], row['outcome']), ('not_started', 'preflight_failed'))
         self.assertIsNone(row['recovery_model'])
         self.assertEqual(self.mod.run.call_count, 1)
 
@@ -543,6 +555,7 @@ class TestRecovery(TestCase):
         self.assertEqual(row['error_code'], 'review_budget_exhausted')
 
     def _staged_review(self, files, *, publication='normal', stalled=False, inspection_loop=False,
+                       finding_counts=None, remapping=None, followup=None,
                        slow_second=False, deadline=None, clean=False):
         from hashlib import sha256
 
@@ -553,13 +566,16 @@ class TestRecovery(TestCase):
         # repeated inspection, then an interrupted provider, not submission.
         # Latencies are bounded fixture costs, not measured production timings.
         paths = [f'src/f{i:03d}.py' for i in range(files)]
+        lines = max(finding_counts) if finding_counts else 1
         packet = {'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD,
                   'merge_base_sha': 'b' * 40,
                   'pull': {'title': 'Pinned staged review', 'body': 'Review every group',
                            'base': {'sha': 'b' * 40}},
                   'files': [{'filename': path} for path in paths],
                   'diff': '\n'.join(f'diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n'
-                                    '@@ -1 +1 @@\n-old\n+new' for path in paths)}
+                                    f'@@ -1 +1,{lines} @@\n-old\n' + '\n'.join(['+new'] * lines) for path in paths)}
+        if remapping:
+            packet.update(since_head_sha='d' * 40, p='p2')
         packet_text = json.dumps(packet)
         total = review_stages.stage_count(packet_text)
         context = sha256(json.dumps(['b' * 40, packet['pull']['title'], packet['pull']['body']],
@@ -567,7 +583,8 @@ class TestRecovery(TestCase):
         clock = SimpleNamespace(now=0.0)
         observed = SimpleNamespace(groups={}, inspected=set(), submissions=[], lookups=[], timeline=[],
                                    threads={}, commands=[], guidance_reads=0, delivered={}, entries={},
-                                   stall_inspection=False, review_id=93 + len(api.logs()))
+                                   stall_inspection=False, review_id=93 + len(api.logs()),
+                                   packets=0, issues=[], findings=[], responses=[], workdirs=set())
         common = ['AGENTS.md', 'CLAUDE.md', 'AUTONOMIO_PR_GUIDELINE.md', 'POISE_REPO_SPECIFICS.md']
         published = []
 
@@ -580,7 +597,8 @@ class TestRecovery(TestCase):
         def command(argv, *, timeout, **kwargs):
             flag = argv[1]
             self.assertIn(flag, ('--review-activity-since', '--pr-review', '--checkout-review',
-                                 '--review-context', '--request-changes', '--reviewed-clean'))
+                                 '--review-context', '--request-changes', '--create-pr-linked-issue', '--approve-pr',
+                                 '--reviewed-clean'))
             if flag != '--review-context':
                 self.assertEqual(argv[argv.index('--token-user') + 1], 'bit-mis')
             if flag == '--review-activity-since':
@@ -591,10 +609,17 @@ class TestRecovery(TestCase):
                               username='bit-mis', review_context=context,
                               reviewer_reviews_since_items=list(published),
                               reviewer_reviews_since=len(published),
-                              reviewer_change_requests_since=0 if clean else len(published),
-                              reviewer_comments_since=len(published) if clean else 0)
+                              reviewer_change_requests_since=sum(r['state'] == 'CHANGES_REQUESTED' for r in published),
+                              reviewer_approvals_since=sum(r['state'] == 'APPROVED' for r in published),
+                              reviewer_comments_since=len(published) if clean else 0,
+                              reviewer_latest_commit=HEAD if published else 'd' * 40 if remapping else None)
             elif flag == '--pr-review':
-                spend('packet', 25, timeout)
+                observed.packets += 1
+                if observed.packets == 2:
+                    observed.responses.append(api.review_receipt.retained_response())
+                    spend('remapping', float('inf') if remapping == 'timeout' else timeout - 1, timeout)
+                else:
+                    spend('packet', 25, timeout)
                 self.assertEqual(argv[argv.index('--expected-head') + 1], HEAD)
                 value = packet
             elif flag == '--checkout-review':
@@ -613,23 +638,35 @@ class TestRecovery(TestCase):
                 value = {'action': 'review_context', 'head_sha': HEAD,
                          'results': [{'request': r, 'content': 'Pinned consumer and guidance evidence'}
                                      for r in requests]}
+            elif flag == '--create-pr-linked-issue':
+                observed.issues.append(argv)
+                observed.responses.append(api.review_receipt.retained_response())
+                spend('followup', float('inf') if followup == 'timeout' else timeout - 1, timeout)
+                if followup == 'lost':
+                    # The issue POST was accepted before its response was lost.
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                if followup == 'rejected':
+                    return SimpleNamespace(returncode=1, stdout='', stderr='error: GitHub 422: Issues are disabled')
+                value = {'action': 'created_pr_linked_issue', 'issue': {'number': 8, 'html_url': 'https://github.com/o/r/issues/8'}}
             else:
                 observed.submissions.append(argv)
                 self.assertEqual(argv[argv.index('--expected-head') + 1], HEAD)
                 response = api.review_receipt.retained_response()
                 self.assertEqual(response['head_sha'], HEAD)
                 self.assertEqual(response['context_sha'], context)
+                observed.responses.append(response)
                 spend('publication', timeout - 1 if publication == 'slow' else 55, timeout)
-                published.append({'id': observed.review_id, 'state': 'COMMENTED' if clean else 'CHANGES_REQUESTED', 'commit': HEAD,
+                published.append({'id': observed.review_id, 'state': 'APPROVED' if flag == '--approve-pr' else 'COMMENTED' if clean else 'CHANGES_REQUESTED', 'commit': HEAD,
                                   'submitted_at': '2026-11-11T10:00:00Z'})
                 if publication == 'uncertain':
                     raise subprocess.TimeoutExpired(argv, timeout)
-                value = {'action': 'reviewed_clean' if clean else 'requested_changes',
+                value = {'action': 'approved_pr' if flag == '--approve-pr' else 'reviewed_clean' if clean else 'requested_changes',
                          'review_id': observed.review_id, 'head_sha': HEAD}
             return SimpleNamespace(returncode=0, stdout=json.dumps(value), stderr='')
 
         def provider(argv, *, input, timeout, **kwargs):
             observed.commands.append(argv)
+            observed.workdirs.add(kwargs['cwd'])
             if 'resume' in argv:
                 thread_id = argv[-2]
                 history = observed.threads[thread_id]
@@ -679,6 +716,9 @@ class TestRecovery(TestCase):
                                  'query': 'required-consumer', 'start_line': 1}]
                     history.pending = ('group', group, requests)
             schema = json.loads(Path(argv[argv.index('--output-schema') + 1]).read_text())
+            if 'requests' not in schema['properties']:
+                requests = []
+                history.pending = None
             if requests:
                 self.assertIn('inspect', schema['properties']['action']['enum'],
                               'required inspection must remain available beyond the equal-share cutoff')
@@ -708,23 +748,31 @@ class TestRecovery(TestCase):
                     observed.stall_inspection = True
                 else:
                     seconds = float('inf')
-            spend('provider', float('inf') if stalled else seconds, timeout)
+            boundary = group == total and not requests and 'boundary' in (remapping, followup)
+            spend('provider', float('inf') if stalled else timeout if boundary else seconds, timeout)
             finding = {'path': stage['files'][0]['filename'], 'line': 1, 'side': 'RIGHT',
                        'body': f'[p1] Blocking defect in file group {group}.'}
+            findings = [] if clean else ([finding] if finding_counts is None else [
+                {**finding, 'line': line, 'body': finding['body'] + f' Finding {line}: ' + 'retained evidence ' * 90}
+                for line in range(1, finding_counts[group - 1] + 1)])
+            if not requests:
+                observed.findings.extend(findings)
             reply = {'action': 'inspect' if requests else 'reviewed_clean' if clean else 'request_changes',
-                     'comments': [] if clean else [finding],
+                     'comments': findings,
                      'assessment': json.loads(APPROVAL)['assessment'], 'requests': requests}
             if inspection_loop or slow_second:
                 reply['assessment']['reviewed_context'] = '; '.join(
                     f'Pinned evidence for group {earlier}' for earlier in sorted(history.inspected))
                 if not history.inspected:
                     reply['assessment']['reviewed_context'] = 'Reading pinned guidance before the file groups.'
+            if 'requests' not in schema['properties']:
+                del reply['requests']
             Path(argv[argv.index('--output-last-message') + 1]).write_text(json.dumps(reply))
             return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps(
                 {'type': 'thread.started', 'thread_id': thread_id}))
 
         self.mod.run.reset_mock()
-        self.mod.run.side_effect = pr_review.run
+        self.mod.run.side_effect = pr_approve.run if remapping or followup else pr_review.run
         with patch.object(budget, 'monotonic', lambda: clock.now), \
                 patch.object(structured_review, 'monotonic', lambda: clock.now), \
                 patch.object(structured_review, 'ReviewWatch', return_value=nullcontext(SimpleNamespace(run=provider))), \
@@ -734,9 +782,10 @@ class TestRecovery(TestCase):
                 patch.object(subprocess, 'run', side_effect=command), \
                 patch.object(api, 'sleep'), redirect_stdout(io.StringIO()):
             try:
-                api.run_governed_behavior(self.mod, 'pr_review', 'https://github.com/o/r/pull/1',
+                api.run_governed_behavior(self.mod, 'pr_approve' if remapping or followup else 'pr_review', 'https://github.com/o/r/pull/1',
                     'bit-mis', HEAD, 'poise:review-new-prs', uuid4().hex, pwd=self.directory.name,
-                    model='gpt-6-astra-ultra')
+                    model='gpt-6-astra-ultra', capped=bool(followup),
+                    review_round=5 if followup else None, review_cap=5 if followup else None)
             except SystemExit:
                 pass
         observed.elapsed = clock.now
@@ -841,8 +890,11 @@ class TestRecovery(TestCase):
                 self.assertEqual(row['error_code'], 'review_inspection_timeout' if phase == 'inspection'
                                  else 'review_budget_exhausted', row['error'])
                 diagnostic = row['diagnostic']
-                self.assertEqual(diagnostic['phase'], limiting_phase)
-                self.assertEqual(diagnostic['outcome'], 'timed_out')
+                handoff = limiting_phase == 'provider_analysis'
+                self.assertEqual(diagnostic['phase'], 'analysis' if handoff else limiting_phase)
+                self.assertEqual(diagnostic['outcome'], 'handoff' if handoff else 'timed_out')
+                if handoff:
+                    self.assertEqual(diagnostic['operation'], 'provider.review')
                 self.assertEqual(diagnostic['submission'], 'none')
                 self.assertIn(f'file group {group} of 22', diagnostic['message'])
                 self.assertIn('Incomplete analysis', diagnostic['message'])
@@ -895,6 +947,77 @@ class TestRecovery(TestCase):
                 self.assertEqual(self.mod.run.call_count, 1)
                 self.assertEqual(len(run.submissions), 0 if kwargs.get('stalled') else 1)
                 self.assertLess(run.elapsed, 1413)
+
+    def assert_retained_findings(self, row, run):
+        self.assertTrue(all(not Path(path).exists() for path in run.workdirs))
+        with redirect_stdout(io.StringIO()) as output:
+            api.read_response(row['id'][:8])
+        verdict, _ = json.JSONDecoder().raw_decode(output.getvalue())
+        self.assertEqual(verdict['comments'], run.findings)
+        self.assertEqual(verdict['action'], 'request_changes')
+        response = row['artifact']['review_response']
+        self.assertEqual(response['invocation_id'], row['id'])
+        self.assertEqual(response['model'], row['model'])
+        self.assertEqual(response['head_sha'], HEAD)
+        self.assertTrue(all(value == response for value in run.responses))
+        self.assertIsNone(row['recovery_model'])
+        self.assertEqual(self.mod.run.call_count, 1)
+
+    def test_101_aggregate_findings_are_retained_outside_the_artifact_and_held(self):
+        row, run = self._staged_review(9, finding_counts=(100, 1))
+        self.assertEqual((row['status'], row['error_code']), ('failed', 'review_contract_violation'), row['error'])
+        self.assertIn('101 findings', row['error'])
+        self.assertIn('single-review inline limit is 100', row['error'])
+        self.assertEqual(row['diagnostic']['submission'], 'none')
+        self.assertEqual(len(run.findings), 101)
+        self.assertGreater(len(json.dumps(run.findings).encode()), 128 * 1024)
+        self.assertLess(len(json.dumps(row['artifact']).encode()), 128 * 1024)
+        self.assertEqual(run.submissions, [])
+        self.assertIsNone(row['action'])
+        self.assertIsNone(row['outcome'])
+        self.assert_retained_findings(row, run)
+
+    def test_slow_remapping_and_capped_filing_leave_both_publication_reserves(self):
+        for kwargs in ({'remapping': 'slow'}, {'followup': 'slow'}):
+            with self.subTest(kwargs=kwargs):
+                row, run = self._staged_review(19, **kwargs)
+                expected = 'approved' if kwargs.get('followup') else 'changes_requested'
+                self.assertEqual((row['status'], row['outcome'], row['review_id']),
+                                 ('completed', expected, run.review_id), row['error'])
+                self.assertEqual(len(run.submissions), 1)
+                self.assertEqual(run.lookups[-1], 1)
+                self.assertLessEqual(run.elapsed, 1413)
+                self.assert_retained_findings(row, run)
+
+    def test_finalization_at_reserve_boundary_holds_completed_analysis(self):
+        for operation in ('remapping', 'followup'):
+            for mode in ('boundary', 'timeout'):
+                with self.subTest(operation=operation, mode=mode):
+                    row, run = self._staged_review(19, **{operation: mode})
+                    self.assertEqual((row['status'], row['error_code']),
+                                     ('failed', 'review_submission_failed' if operation == 'followup' and mode == 'timeout'
+                                      else 'review_contract_violation'), row['error'])
+                    self.assertEqual(run.submissions, [])
+                    self.assertEqual(len(run.issues), int(operation == 'followup' and mode == 'timeout'))
+                    self.assertIsNone(row['action'])
+                    self.assertIsNone(row['outcome'])
+                    self.assert_retained_findings(row, run)
+
+    def test_lost_post_responses_and_rejected_filing_retain_findings_without_replay(self):
+        for kwargs in ({'publication': 'uncertain'}, {'followup': 'lost'}, {'followup': 'rejected'}):
+            with self.subTest(kwargs=kwargs):
+                row, run = self._staged_review(19, **kwargs)
+                self.assertEqual((row['status'], row['error_code']),
+                                 ('failed', 'review_contract_violation' if kwargs.get('followup') == 'rejected'
+                                  else 'review_submission_failed'), row['error'])
+                self.assertEqual(len(run.submissions), int('publication' in kwargs))
+                self.assertEqual(len(run.issues), int('followup' in kwargs))
+                if kwargs.get('followup') == 'rejected':
+                    self.assertEqual(row['diagnostic']['submission'], 'rejected')
+                self.assertIsNone(row['action'])
+                self.assertIsNone(row['outcome'])
+                self.assertIsNone(row['review_id'])
+                self.assert_retained_findings(row, run)
 
     def test_failed_recovery_does_not_loop_or_claim_preflight(self):
         row = self.execute([budget.ReviewLimitError('output token maximum'), atoms.AgentPreflightError('codex failed')], [facts(), facts(), facts()])

@@ -110,6 +110,7 @@ export class BehaviorLedgerStore {
           source_at TEXT,native_override INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL,
           terminal INTEGER NOT NULL DEFAULT 0,no_write INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS ledger_parent ON ledger_instances(parent_id,creation_seq);
+        CREATE INDEX IF NOT EXISTS ledger_target ON ledger_instances(json_extract(payload,'$.target.repository') COLLATE NOCASE,json_extract(payload,'$.target.number'));
         CREATE INDEX IF NOT EXISTS ledger_updated ON ledger_instances(updated_at);
         CREATE INDEX IF NOT EXISTS ledger_retention ON ledger_instances(parent_id,updated_at);
         CREATE INDEX IF NOT EXISTS ledger_sourced ON ledger_instances(source_at);

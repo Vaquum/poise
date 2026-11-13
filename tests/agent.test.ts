@@ -105,9 +105,21 @@ describe('agent log compatibility', () => {
     const snapshot = await fetchAgentLogSnapshot()
     expect(mocks.observeSnapshot).toHaveBeenCalledExactlyOnceWith(snapshot)
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
-    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs'])
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--without-progress'])
     expect(mocks.captureAdmission).not.toHaveBeenCalled()
     expect(mocks.diagnostic).not.toHaveBeenCalled()
+  })
+
+  it('reads history without progress events, and whole from a Caller that does not know the flag', async () => {
+    mocks.runFile.mockRejectedValueOnce(Object.assign(new Error('Command failed (2): agent-interface'), {
+      stdout: '', stderr: 'usage: agent-interface BEHAVIOR ...',
+    })).mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    expect((await fetchAgentLogSnapshot()).entries).toHaveLength(1)
+    expect(mocks.runFile.mock.calls.map((call) => call[1])).toEqual([['--logs', '--without-progress'], ['--logs']])
+    // The older Caller is remembered: the next read asks for the whole history at once.
+    await fetchAgentLogSnapshot({ fresh: true })
+    expect(mocks.runFile.mock.calls.map((call) => call[1])).toEqual([['--logs', '--without-progress'], ['--logs'], ['--logs']])
+    expect(mocks.diagnosticFailure).not.toHaveBeenCalled()
   })
 
   it('decodes history above 32 MiB with a 128 MiB process output cap', async () => {
@@ -119,7 +131,7 @@ describe('agent log compatibility', () => {
     expect(snapshot.entries).toHaveLength(1)
     expect(snapshot.entries[0]!.prompt).toBe(prompt)
     expect(snapshot.quarantined).toEqual([])
-    expect(mocks.runFile).toHaveBeenCalledExactlyOnceWith('agent-interface', ['--logs'],
+    expect(mocks.runFile).toHaveBeenCalledExactlyOnceWith('agent-interface', ['--logs', '--without-progress'],
       expect.objectContaining({ maxOutputBytes: 134217728 }))
     expect(mocks.diagnostic).not.toHaveBeenCalled()
   })
@@ -213,7 +225,7 @@ describe('agent log compatibility', () => {
     expect(snapshot.entries).toMatchObject([{ status: 'failed', outcome: null, action: null,
       diagnostic: { outcome: null, stderr_truncated: null, context: { submission: diagnostic.submission } } }])
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
-    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs'])
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--without-progress'])
   })
 
   it('keeps a historical unqualified repository row readable', async () => {
