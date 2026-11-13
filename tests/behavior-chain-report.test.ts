@@ -520,6 +520,90 @@ it.each([false, true])('reports one verified implementation hold before a PR wit
   expect(posts()).toHaveLength(1)
 })
 
+it('shows the current blocked repair after its earlier implementation report closes, including after restart', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'repair-hold-report-')); roots.push(root)
+  const path = join(root, 'journal.sqlite')
+  let { db, journal } = setup(path)
+  const { chain, call } = blockedImplementation(journal)
+  let entries = [call]
+  const forbidden = vi.fn(async () => { throw new Error('must not repair, review or enqueue before Resume') })
+  const overrides = { discover: async () => [], available: () => true, permitted: () => true,
+    request: forbidden, launch: forbidden, perform: forbidden,
+    observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries, quarantined: [] }) }
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  const originalReport = structuredClone(remote[0])
+  const originalIntent = reports(db)
+
+  const reread = async (prefix: string) => {
+    const before = journal.read(chain.id)!
+    for (let pass = 0; pass < 3; pass++) {
+      if (pass === 1) journal.rebuild()
+      if (pass === 2) {
+        db.close(); databases.splice(databases.indexOf(db), 1)
+        ;({ db, journal } = setup(path))
+      }
+      vi.setSystemTime(Date.now() + 86_400_000)
+      await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+      expect(journal.read(chain.id)).toMatchObject({ held: before.held, invocations: before.invocations,
+        resumedAfterSequence: before.resumedAfterSequence, author: before.author, reviewer: before.reviewer, branch: before.branch })
+      expect(journal.read(chain.id)?.waiting?.startsWith(prefix)).toBe(true)
+      expect(reports(db)).toEqual(originalIntent)
+      expect(posts()).toHaveLength(1)
+      expect(forbidden).not.toHaveBeenCalled()
+    }
+  }
+  await reread('Implementation hold report ')
+
+  let current = record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  current = record(journal, current, { type: 'invocation.admitted', invocation: { id: 'published-implementation',
+    behavior: 'implement-issue', basis: chain.invocations[0].basis, actor: chain.author, slot: reviewer.slot,
+    model: reviewer.model, admittedAt: Date.now(), request: chain.invocations[0].request } })
+  const publicationCall = chainBasis('published-implementation').slice(0, 32)
+  current = record(journal, current, { type: 'invocation.settled', invocationId: 'published-implementation',
+    callId: publicationCall, outcome: 'published', evidence: { status: 'completed', action: 'published', head_sha: HEAD,
+      completedAt: Date.now(), resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  fresh = observation()
+  fresh.publication.head_invocation = publicationCall
+  fresh.prReviewers = [reviewer]
+  Object.assign(fresh.pull!, { changesRequested: false, unresolved: 0, approved: true, ready: true, checksState: 'SUCCESS' })
+  current = record(journal, current, { type: 'chain.observed', observation: fresh })
+  remote[0].state = 'closed'
+  current = record(journal, current, { type: 'invocation.admitted', invocation: { id: 'original-queue', behavior: 'merge-pr',
+    basis: chainBasis(['merge', HEAD]), actor: chain.reviewer, slot: null, model: null, admittedAt: Date.now(),
+    request: { command: 'github-interface', cwd: '/fixture', argv: ['--merge-if-ready', '21', '--expected-head', HEAD] } } })
+  current = record(journal, current, { type: 'invocation.settled', invocationId: 'original-queue', callId: 'c'.repeat(32),
+    outcome: 'enqueued', evidence: { status: 'completed', outcome: 'enqueued', head_sha: HEAD,
+      resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  current = record(journal, current, { type: 'chain.observed', observation: { ...fresh, pull: { ...fresh.pull!, queueEntry: 'queue-entry' } } })
+  fresh.pull!.queueRemoval = { id: 'queue-removal', reason: 'failed_checks', at: Date.now(), actor: null }
+  const decision = decideBehaviorChain(current, fresh, Date.now())
+  if (decision.kind !== 'invoke' || decision.behavior !== 'repair-pr') throw new Error('Fixture must need queue repair')
+  current = record(journal, current, { type: 'chain.observed', observation: fresh })
+  current = record(journal, current, { type: 'invocation.admitted', invocation: { id: 'blocked-repair', behavior: decision.behavior,
+    basis: decision.basis, actor: chain.author, slot: reviewer.slot, model: reviewer.model, admittedAt: Date.now(),
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--atomic-work', chain.id, '--pull-number', '21', '--expected-head', HEAD,
+      '--expected-issue-revision', fresh.issue.revision],
+    context: { head: HEAD, reviewRevision: fresh.pull!.reviewRevision, queueRemoval: 'queue-removal' } } } })
+  record(journal, current, { type: 'invocation.started', invocationId: 'blocked-repair' })
+  const repairCall: LogEntry = { ...call, id: chainBasis('blocked-repair').slice(0, 32), correlation_id: 'blocked-repair',
+    behavior: 'repair_pr', pr_id: '21', expected_head: HEAD,
+    error: 'atomic behavior blocked: midnight Board fixture failure tracked in #1330',
+    started_at: new Date().toISOString(), completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() }
+  entries = [call, repairCall]
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  const held = journal.read(chain.id)!
+  expect(held.held).toBe(repairCall.error)
+  expect(held.ciHold).toBeUndefined()
+  expect(held.invocations.at(-1)).toMatchObject({ behavior: 'repair-pr', state: 'settled', callId: repairCall.id,
+    evidence: { status: 'failed', error_code: 'atomic_work_blocked', action: 'not_started' } })
+  await reread(`Stage: repair-pr. Worker-reported blocker: ${repairCall.error}. Next action: inspect the repair Call, address the blocker, then explicitly Resume.`)
+  expect(journal.read(chain.id)?.waiting).toContain('Historical Implementation hold report https://github.com/acme/repo/issues/99 is closed; no replacement will be created')
+  expect(remote).toEqual([{ ...originalReport, state: 'closed' }])
+  current = record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  expect(decideBehaviorChain(current, { ...fresh, checkedAt: Date.now() }, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+})
+
 it.each(['unmatched', 'unavailable'])('files an eligible report once with %s optional work evidence', async mode => {
   const { db, journal } = setup()
   const { call } = blockedImplementation(journal)
