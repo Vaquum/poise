@@ -118,6 +118,37 @@ test('the reference names what the pointer rests on, and explains it in full on 
   expect(query(page).get('view')).toBe('overview')
 })
 
+test('a tooltip waits for the pointer to rest half a second; leaving or pressing cancels it', async ({ page }) => {
+  await open(page)
+  await page.clock.install()
+  const heading = page.getByRole('heading', { name: 'Overview', exact: true })
+  const tip = page.getByRole('tooltip')
+  // Resting: nothing for the first moments, then the tooltip.
+  await heading.hover()
+  await page.clock.runFor(400)
+  await expect(tip).toHaveCount(0)
+  await page.clock.runFor(200)
+  await expect(tip).toContainText('Overview')
+  // Pressing hides it, and the pressed element stays quiet while the pointer rests on it.
+  await page.mouse.down()
+  await expect(tip).toHaveCount(0)
+  await page.clock.runFor(1500)
+  await expect(tip).toHaveCount(0)
+  await page.mouse.up()
+  // Leaving before the half second cancels a pending one; coming back starts again.
+  const head = (await page.locator('.ova-head').boundingBox())!
+  const away = () => page.mouse.move(head.x + head.width / 2, head.y + head.height / 2)
+  await away()
+  await heading.hover()
+  await page.clock.runFor(300)
+  await away()
+  await page.clock.runFor(1000)
+  await expect(tip).toHaveCount(0)
+  await heading.hover()
+  await page.clock.runFor(600)
+  await expect(tip).toContainText('Overview')
+})
+
 test('the reference is modal and fits a phone; a cancelled long press leaves the next tap alone', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 760 })
   await open(page)
