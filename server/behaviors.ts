@@ -1589,15 +1589,19 @@ function markLaunchIntent(
   return true
 }
 
+// One commit for the claim's reason and both leases: each commit waits for
+// the disk on the server's thread (0.3–0.9 s on production).
 function retainClaimSafely(claim: BehaviorLaunchClaim, error: string): void {
-  if (!claim.launchQuarantine) setBehaviorLaunchErrorOwned(claim.key, claim.target, claim.claimId, error)
-  renewSeenOwned(
-    claim.key,
-    claim.target,
-    claim.claimId,
-    BEHAVIOR_CLAIM_RENEWAL_MS,
-  )
-  renewPrOperationOwned(claim.claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
+  db.transaction(() => {
+    if (!claim.launchQuarantine) setBehaviorLaunchErrorOwned(claim.key, claim.target, claim.claimId, error)
+    renewSeenOwned(
+      claim.key,
+      claim.target,
+      claim.claimId,
+      BEHAVIOR_CLAIM_RENEWAL_MS,
+    )
+    renewPrOperationOwned(claim.claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
+  })()
 }
 
 function completeClaimSafely(claim: BehaviorLaunchClaim, error: string | null = null): boolean {
