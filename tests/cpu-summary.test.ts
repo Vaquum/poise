@@ -32,4 +32,26 @@ describe('CPU summary', () => {
     expect(summary.samples).toBeGreaterThan(0)
     expect(summary.self.length + summary.idleMs).toBeGreaterThan(0)
   }, 10_000)
+
+  it('keeps two functions of one name and line in different files apart', () => {
+    const profile: Profile = { startTime: 0, endTime: 10_000, nodes: [
+      { id: 1, callFrame: { functionName: '(root)', url: '', lineNumber: -1 }, hitCount: 0, children: [2] },
+      { id: 2, callFrame: { functionName: 'work', url: 'file:///a/index.js', lineNumber: 9 }, hitCount: 4, children: [3] },
+      { id: 3, callFrame: { functionName: 'work', url: 'file:///b/index.js', lineNumber: 9 }, hitCount: 6 },
+    ] }
+    const summary = summariseProfile(profile)
+    expect(summary.self.map((entry) => entry.ms).sort()).toEqual([4, 6])
+    // A call from one to the other is not recursion: the caller's total includes the callee.
+    expect(summary.total.map((entry) => entry.ms).sort((a, b) => a - b)).toEqual([6, 10])
+  })
+
+  it('ends a capture early when its signal aborts, and refuses more than its limit', async () => {
+    const left = new AbortController()
+    const started = Date.now()
+    const capture = captureCpuSummary(8, left.signal)
+    setTimeout(() => left.abort(), 200)
+    await capture
+    expect(Date.now() - started).toBeLessThan(4_000)
+    await expect(captureCpuSummary(9)).rejects.toThrow('from 1 to 8')
+  }, 10_000)
 })

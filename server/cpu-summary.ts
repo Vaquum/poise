@@ -6,7 +6,7 @@ import { Session } from 'node:inspector'
 // host; this answers from the workspace itself, and returns no data, only
 // function names and times.
 
-interface ProfileNode { id: number, callFrame: { functionName: string, url: string, lineNumber: number }, hitCount?: number, children?: number[] }
+interface ProfileNode { id: number, callFrame: { functionName: string, url: string, lineNumber: number, columnNumber?: number }, hitCount?: number, children?: number[] }
 export interface Profile { nodes: ProfileNode[], startTime: number, endTime: number, samples?: number[] }
 interface Spent { fn: string, at: string, ms: number }
 export interface CpuSummary {
@@ -25,10 +25,14 @@ export interface CpuSummary {
 
 const SAMPLING_INTERVAL_US = 2_000
 const LISTED = 30
+/** Shorter than production's ten-second shutdown deadline, so a capture never holds a shutdown up. */
+export const CPU_SUMMARY_MAX_SECONDS = 8
 let capturing = false
 
-/** Samples this process for `seconds` and summarises where the time went. One at a time. */
-export async function captureCpuSummary(seconds: number): Promise<CpuSummary> {
+/** Samples this process for `seconds` (at most CPU_SUMMARY_MAX_SECONDS) and
+ *  summarises where the time went; `signal` ends it early. One at a time. */
+export async function captureCpuSummary(seconds: number, signal?: AbortSignal): Promise<CpuSummary> {
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > CPU_SUMMARY_MAX_SECONDS) throw new Error(`seconds must be an integer from 1 to ${CPU_SUMMARY_MAX_SECONDS}`)
   if (capturing) throw new Error('a CPU summary is already being taken')
   capturing = true
   const session = new Session()
@@ -40,11 +44,18 @@ export async function captureCpuSummary(seconds: number): Promise<CpuSummary> {
     await post('Profiler.enable')
     await post('Profiler.setSamplingInterval', { interval: SAMPLING_INTERVAL_US })
     await post('Profiler.start')
-    await new Promise((resolve) => setTimeout(resolve, seconds * 1_000))
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(done, seconds * 1_000)
+      function done() { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve() }
+      if (signal?.aborted) done()
+      else signal?.addEventListener('abort', done, { once: true })
+    })
     const { profile } = await post<{ profile: Profile }>('Profiler.stop')
     return summariseProfile(profile)
   } finally {
     capturing = false
+    // As the full capture does: nothing logged while profiling stays retained by the session.
+    try { await post('Runtime.discardConsoleEntries') } catch { /* not enabled */ }
     try { session.disconnect() } catch { /* already closed */ }
   }
 }
@@ -56,7 +67,8 @@ export function summariseProfile(profile: Profile): CpuSummary {
   const nodes = new Map(profile.nodes.map((node) => [node.id, node]))
   const fn = (node: ProfileNode) => node.callFrame.functionName || '(anonymous)'
   const at = (node: ProfileNode) => node.callFrame.url ? `${node.callFrame.url.split('/').pop()}:${node.callFrame.lineNumber + 1}` : ''
-  const key = (node: ProfileNode) => `${fn(node)} ${at(node)}`
+  // The full location keys a function: the same name and line in two files are two functions.
+  const key = (node: ProfileNode) => `${fn(node)}\u0000${node.callFrame.url}\u0000${node.callFrame.lineNumber}\u0000${node.callFrame.columnNumber ?? -1}`
   const add = (into: Map<string, Spent>, node: ProfileNode, ms: number) => {
     const entry = into.get(key(node)) ?? { fn: fn(node), at: at(node), ms: 0 }
     entry.ms += ms

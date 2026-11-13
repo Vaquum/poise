@@ -59,7 +59,7 @@ import { setWorkerChatReader } from './worker-capacity'
 import { bindings as workBindings } from './chat/control-store'
 import { endJson, enforceApiRequest, httpStatus, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { stallSnapshot } from './stall-observer'
-import { captureCpuSummary } from './cpu-summary'
+import { CPU_SUMMARY_MAX_SECONDS, captureCpuSummary } from './cpu-summary'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
 import { ChatSocketServer, handleChatApi, speaksForPerson } from './chat/transport'
@@ -411,12 +411,21 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // What the main thread spends its time on (server/cpu-summary.ts): a
         // short sampling profile, summarised; one at a time.
         if (path === '/api/health/cpu' && req.method === 'GET') {
-          const seconds = Number(new URLSearchParams(url.split('?')[1] || '').get('seconds') ?? 10)
-          if (!Number.isInteger(seconds) || seconds < 1 || seconds > 20) return json(res, 400, { error: 'seconds must be an integer from 1 to 20' })
+          const seconds = Number(new URLSearchParams(url.split('?')[1] || '').get('seconds') ?? CPU_SUMMARY_MAX_SECONDS)
+          if (!Number.isInteger(seconds) || seconds < 1 || seconds > CPU_SUMMARY_MAX_SECONDS) {
+            return json(res, 400, { error: `seconds must be an integer from 1 to ${CPU_SUMMARY_MAX_SECONDS}` })
+          }
+          // A client that leaves ends the capture.
+          const left = new AbortController()
+          const leave = () => left.abort()
+          res.once('close', leave)
           try {
-            return json(res, 200, await captureCpuSummary(seconds))
+            const summary = await captureCpuSummary(seconds, left.signal)
+            return res.destroyed ? undefined : json(res, 200, summary)
           } catch (error) {
-            return json(res, 409, { error: error instanceof Error ? error.message : String(error) })
+            return res.destroyed ? undefined : json(res, 409, { error: error instanceof Error ? error.message : String(error) })
+          } finally {
+            res.off('close', leave)
           }
         }
         if (path === CHAT_CONTROL_PATH) {
