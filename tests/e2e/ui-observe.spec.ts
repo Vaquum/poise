@@ -198,6 +198,30 @@ test('a notice’s journal link opens the task’s timeline at its step, newest 
   expect(posts).toEqual([{ id: 'acme/site#501', sequence: 901, operation: 'resume' }])
 })
 
+test('a settlement link names original review completion and keeps the earlier merge and run links', async ({ page }) => {
+  await open(page, '/?view=observe&part=tasks')
+  const completed = chain(1564, { sequence: 21, mergeSha: 'd'.repeat(40), reviewPending: false, reviewStatus: 'complete' })
+  const events = [
+    { sequence: 20, at: NOW - 1324, type: 'chain.merged', callId: CALL, evidence: { review_complete: false } },
+    { sequence: 21, at: NOW - 1000, type: 'chain.merged', callId: CALL, evidence: { review_complete: true } },
+  ]
+  await page.route(url => url.pathname === '/api/behavior-chains' && url.searchParams.get('id') === completed.id, route => {
+    const after = Number(new URL(route.request().url()).searchParams.get('after') ?? 0)
+    return route.fulfill({ json: { chain: completed, events: events.filter(event => event.sequence > after), next: null } })
+  })
+  await page.goto('/?view=observe&part=tasks&chain=acme%2Fsite%231564&after=20')
+  const timeline = tasks(page).locator('[data-ref="side.timeline"]')
+  await expect(timeline.locator('li')).toHaveCount(1)
+  await expect(timeline.locator('[data-ref="tk.from"]')).toContainText('Original review evidence complete')
+  await expect(timeline.getByRole('link', { name: /^run cccccccc/ })).toHaveAttribute('href', `?view=observe&part=behaviors&call=${CALL}`)
+  await tasks(page).getByRole('button', { name: 'More events' }).click()
+  await expect(timeline.locator('li')).toHaveCount(2)
+  await expect(timeline.locator('li').first()).toContainText('Original review evidence complete')
+  await expect(timeline.locator('li').last()).toContainText('Event Merged')
+  await expect(timeline.getByRole('link', { name: /^run cccccccc/ })).toHaveCount(2)
+  await expect(tasks(page).locator('[data-tk-head]').getByRole('link', { name: '#1565', exact: true })).toHaveAttribute('href', 'https://github.com/acme/site/pull/1565')
+})
+
 test('a failed read keeps what was read, says when, and stops Hold and Resume until a read succeeds', async ({ page }) => {
   const served: Served = {}
   await open(page, '/?view=observe&part=tasks&chain=acme%2Fsite%23488', served)
