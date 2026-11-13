@@ -515,6 +515,19 @@ describe('Answer here dismissals', () => {
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
+  it('clips a long title instead of refusing it, takes a long diagnostic key, and forgets cleared cards', async () => {
+    const question = 'Which of these should go first? '.repeat(40)
+    const diagnostic = `diagnostic:${JSON.stringify(['reviews_timed_out', null, 'x'.repeat(3000)])}`
+    expect((await call('POST', '/api/answers/dismissals', { key: 'request:q1', revision: 'open', title: question }, true)).status).toBe(200)
+    expect((await call('POST', '/api/answers/dismissals', { key: diagnostic, revision: 'null|Reviews time out', title: 'Reviews time out' }, true)).status).toBe(200)
+    const logged = (await call('GET', '/api/notices/handled')).body.handled.find((row: { title: string }) => row.title.startsWith('Which'))
+    expect(logged.title.length).toBeLessThanOrEqual(500)
+    expect((await call('POST', '/api/answers/dismissals/forget', { keys: [diagnostic] })).status).toBe(403)
+    expect((await call('POST', '/api/answers/dismissals/forget', { keys: ['notice:1'] }, true)).status).toBe(400)
+    const forgot = await call('POST', '/api/answers/dismissals/forget', { keys: [diagnostic] }, true)
+    expect(forgot.body.dismissals.map((row: { key: string }) => row.key)).toEqual(['request:q1'])
+  })
+
   it('forgets a dismissal after thirty days', async () => {
     database!.db.prepare('INSERT INTO answer_dismissals (key, revision, dismissed_at) VALUES (?, ?, ?)').run('thread:doc:t1', '1|x', new Date(Date.now() - 31 * 86_400_000).toISOString())
     expect((await call('GET', '/api/answers/dismissals')).body.dismissals).toEqual([])

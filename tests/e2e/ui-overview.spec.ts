@@ -40,6 +40,8 @@ interface Workspace {
   /** Put-away entries the server keeps, and what was posted to it. */
   dismissals?: { key: string, revision: string, at: string }[]
   dismissed?: unknown[]
+  /** Every POST that could act on the chain. */
+  chainActions?: unknown[]
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -75,6 +77,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     }
     if (path === '/api/chat/sessions') return workspace.chatsFail ? json(route, { error: 'the chat service did not answer' }, 503) : json(route, { instance: 'poise-dev:test', sessions: [] })
     if (path === '/api/editor/reviews') return json(route, { publications: [], sweep: { publications: 0, longestDelayMinutes: 15 } })
+    if (path === '/api/behavior-chains' && method === 'POST') { (workspace.chainActions ??= []).push(route.request().postDataJSON()); return json(route, {}) }
     if (path === '/api/behavior-chains') return json(route, { chains: [], attention: workspace.attention ?? [] })
     if (path === '/api/answers/dismissals' && method === 'POST') {
       const body = route.request().postDataJSON() as { key: string, revision: string }
@@ -302,6 +305,27 @@ test('Answer here lists the newest first, and every card can be put away without
   await expect(page.locator('[data-ncount]')).toHaveText('3')
   // Putting it away sent nothing to any chat and resumed nothing.
   expect(socket.frames.map((frame) => frame.command.type).filter((type) => /respond|answer|resume|message|send|prompt/i.test(String(type)))).toEqual([])
+  expect(workspace.chainActions ?? []).toEqual([])
+})
+
+test('a chain card whose report changes while it is being put away comes back with the new report, and the old one is not sent (#1379)', async ({ page }) => {
+  const attention = (minutes: number) => ({ id: 'autonomio/poise#1169', repository: 'autonomio/poise', issue: 1169, pullNumber: null, step: 'repair-pr: uncertain',
+    progressAt: NOW - minutes * 60_000, ageMs: minutes * 60_000, blocker: 'Original outcome requires reconciliation', evidence: { state: 'open', checkedAt: null, gates: [] },
+    nextAction: 'reconcile', retryAt: null, journal: `/api/behavior-chains?id=${encodeURIComponent('autonomio/poise#1169')}&after=3`,
+    reconciliation: { nextObservationAt: null, waitingForResourceRelease: false } })
+  const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], attention: [attention(60)] }
+  await open(page, workspace)
+  const card = entry(page, 'chain:autonomio/poise#1169')
+  await card.getByRole('button', { name: 'Dismiss' }).click()
+  await expect(card).toContainText('Dismissed')
+  // The chain advances during the eight seconds.
+  workspace.attention = [attention(2)]
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await expect(card.getByRole('button', { name: 'Dismiss' })).toBeVisible()
+  await expect(card).not.toContainText('Dismissed')
+  await page.waitForTimeout(9_000)
+  expect(workspace.dismissed ?? []).toEqual([])
+  await expect(card).toBeVisible()
 })
 
 test('a decision whose chat is gone says so, and Dismiss puts it away', async ({ page }) => {

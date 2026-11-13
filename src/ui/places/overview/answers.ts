@@ -5,7 +5,7 @@
 // counted, and nothing moves. Classic's rail (src/views/notification-rail.ts)
 // is where the joins and the reads it shares come from.
 import type { DiagnosticEvidence } from '../../../../gateway/src/diagnostics/evidence-contract'
-import { getBehaviorDiagnostics } from '../../../behaviors'
+import { getBehaviorDiagnostics, isBehaviorStateLoaded } from '../../../behaviors'
 import { chatClient, ChatCommandError } from '../../../chat-client'
 import { midnightInZone } from '../../../config'
 import { patchContent } from '../../../dom-patch'
@@ -42,7 +42,7 @@ interface Progress {
   undo?: boolean
 }
 
-interface HandledRow { title: string, note: string, at: number, undo?: string }
+interface HandledRow { title: string, note: string, at: number, undo?: string, /** What a put-away entry reported. */ revision?: string }
 interface ServerHandled { id: number, title: string, outcome: string, actor: string, at: string }
 
 const ACTORS: Record<string, string> = { person: 'by you', api: 'through the API', poise: 'by Poise', 'notices-service': 'by Poise', behaviors: 'by Behaviors', caller: 'by Caller', recovery: 'by recovery' }
@@ -66,7 +66,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   const requests: Read<RequestsRead> & { frame: number, asked: number, shown: number } = { ...unread<RequestsRead>(), frame: 0, asked: 0, shown: 0 }
   const board: Read<DecisionItem[]> & { revision: number } = { ...unread<DecisionItem[]>(), revision: -1 }
   const reviews: Read<Publication[]> = unread()
-  const threads = new Map<string, { reviews: ThreadReview[], openThreads: number, error: string }>()
+  const threads = new Map<string, { reviews: ThreadReview[], openThreads: number, checkedAt: string | null, error: string }>()
   const handled: Read<ServerHandled[]> = unread()
   /** Put-away entries that are not notices or decisions: key → the revision put away. */
   const dismissals: Read<Map<string, string>> = unread()
@@ -301,7 +301,14 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       else if (holding) holding = current.filter((value) => holding!.includes(value.id) || value.id === entry.id).map((value) => value.id)
     }
     for (const source of Object.keys(ready) as Entry['source'][]) if (ready[source]()) seeded.add(source)
-    for (const id of [...done.keys()]) if (!current.some((entry) => entry.id === id) && !progress.get(id)?.settled) done.delete(id)
+    for (const [id, row] of [...done]) {
+      const now = current.find((entry) => entry.id === id)
+      if (!now) { if (!progress.get(id)?.settled) done.delete(id); continue }
+      // What it reports changed while it was being put away: the new report shows,
+      // and only the old one is put away.
+      if (row.revision !== undefined && now.revision !== row.revision) forgetHold(id)
+    }
+    forgetCleared()
     const focused = document.activeElement instanceof HTMLElement && list.contains(document.activeElement) ? document.activeElement : null
     patchContent(list, listHTML())
     if (focused && !focused.isConnected) $(`[data-notice="${CSS.escape(focused.closest<HTMLElement>('[data-notice]')?.dataset.notice ?? '')}"]`, list)?.focus({ preventScroll: true })
@@ -351,7 +358,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   // ---------- Answering ----------
   function setProgress(id: string, next: Progress): void { progress.set(id, next); paint() }
   function settle(entry: Entry, label: string, words: string, extra: Partial<Progress> = {}): void {
-    const row: HandledRow = { title: entry.title, note: `${label} · ${words}`, at: Date.now(), ...(extra.undo ? { undo: entry.id } : {}) }
+    const row: HandledRow = { title: entry.title, note: `${label} · ${words}`, at: Date.now(), ...(extra.undo ? { undo: entry.id } : {}),
+      ...(KEPT_DISMISSALS.includes(entry.source) ? { revision: entry.revision } : {}) }
     done.set(entry.id, row)
     settledHere.unshift(row)
     setProgress(entry.id, { stage: 'Completed', label, words, at: Date.now(), settled: true, ...extra })
@@ -409,7 +417,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
           method: 'POST', body: JSON.stringify(key === 'resolve' ? { id: entry.thread.id, action: 'resolve' } : { id: entry.thread.id, action: 'reply', body: text }),
         })
         const before = threads.get(entry.thread.slug)
-        if (Array.isArray(result.reviews)) threads.set(entry.thread.slug, { reviews: result.reviews, openThreads: before?.openThreads ?? 0, error: '' })
+        if (Array.isArray(result.reviews)) threads.set(entry.thread.slug, { reviews: result.reviews, openThreads: before?.openThreads ?? 0, checkedAt: before?.checkedAt ?? null, error: '' })
         replyDrafts.delete(entry.id)
         settle(entry, label, key === 'resolve' ? 'Resolved on GitHub' : 'Replied on GitHub, as you')
       } else if (entry.chain) {
@@ -471,6 +479,30 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     holds.set(entry.id, { kind, notice: entry.notice, decision: entry.decision?.id, kept, timer })
     settle(entry, kind === 'dismiss' ? 'Dismissed' : 'Silenced', kind === 'dismiss' ? `Put away: ${entry.dismissWords}` : 'No more reminders while it stays open', { undo: true })
   }
+  /** An entry whose report changed mid-hold: its hold goes, its new report shows. */
+  function forgetHold(id: string): void {
+    const hold = holds.get(id)
+    if (hold) { window.clearTimeout(hold.timer); holds.delete(id) }
+    done.delete(id)
+    progress.delete(id)
+    const at = settledHere.findIndex((row) => row.undo === id)
+    if (at >= 0) settledHere.splice(at, 1)
+  }
+
+  // A diagnostic with no time of its own reports the same key and revision when
+  // it recurs: once a successful read no longer lists it, its dismissal goes.
+  const forgetting = new Set<string>()
+  function forgetCleared(): void {
+    if (!dismissals.data || !isBehaviorStateLoaded() || !getBehaviorDiagnostics()) return
+    const listed = new Set(current.filter((entry) => entry.source === 'diagnostic').map((entry) => entry.id))
+    const hidden = new Set(foldWaiting(itemEntries(notificationItems([], getBehaviorDiagnostics(), Date.now(), []), options.role, chains)).map((entry) => entry.id))
+    const keys = [...dismissals.data.keys()].filter((key) => key.startsWith('diagnostic:') && !listed.has(key) && !hidden.has(key) && !forgetting.has(key)).slice(0, 200)
+    if (!keys.length) return
+    for (const key of keys) forgetting.add(key)
+    void json<{ dismissals?: { key: string, revision: string }[] }>('/api/answers/dismissals/forget', { method: 'POST', body: JSON.stringify({ keys }) })
+      .then(acceptDismissals, () => undefined).finally(() => { for (const key of keys) forgetting.delete(key) })
+  }
+
   function undo(id: string): void {
     const hold = holds.get(id)
     if (!hold) return
@@ -658,12 +690,13 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       for (const publication of data.publications) {
         const before = threads.get(publication.slug)
         if (!publication.openThreads) { threads.delete(publication.slug); continue }
-        if (before && before.openThreads === publication.openThreads && !before.error) continue
+        // Read again when the sweep checked it since: a reply brings a put-away thread back.
+        if (before && before.openThreads === publication.openThreads && before.checkedAt === publication.checkedAt && !before.error) continue
         try {
           const cached = await json<{ reviews?: ThreadReview[] }>(`/api/editor/doc/${encodeURIComponent(publication.slug)}/reviews`)
-          threads.set(publication.slug, { reviews: Array.isArray(cached.reviews) ? cached.reviews : [], openThreads: publication.openThreads, error: '' })
+          threads.set(publication.slug, { reviews: Array.isArray(cached.reviews) ? cached.reviews : [], openThreads: publication.openThreads, checkedAt: publication.checkedAt, error: '' })
         } catch (error) {
-          threads.set(publication.slug, { reviews: before?.reviews ?? [], openThreads: publication.openThreads, error: reason(error) })
+          threads.set(publication.slug, { reviews: before?.reviews ?? [], openThreads: publication.openThreads, checkedAt: publication.checkedAt, error: reason(error) })
         }
       }
       reviews.data = data.publications

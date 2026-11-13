@@ -7,13 +7,15 @@ import { getBehaviorDiagnostics, refreshState } from '../../../behaviors'
 import { chatClient } from '../../../chat-client'
 import { LOCAL_NOTICE_KINDS, noticeFeed } from '../../../notices'
 import { notificationItems, type ChainAttentionRow } from '../../../notification-items'
-import { decisionEntries, foldWaiting, itemEntries, requestEntries, requestsFrom, undismissed, type DecisionItem, type OpenRequest } from './entries'
+import { decisionEntries, foldWaiting, itemEntries, requestEntries, requestsFrom, threadEntries, undismissed, type DecisionItem, type Entry, type OpenRequest, type Publication, type ThreadReview } from './entries'
 import type { Group } from './level'
 import { json, reason } from './util'
 
 let requests: readonly OpenRequest[] = []
 let decisions: readonly DecisionItem[] = []
-let publications: { slug: string, openThreads: number }[] = []
+let publications: Publication[] = []
+/** Each document's open threads as entries, read once per change of its count; null while unread. */
+const threadsRead = new Map<string, { openThreads: number, checkedAt: string | null, entries: Entry[] | null }>()
 /** Put-away entries Answer here keeps (server/answer-dismissals.ts): key → revision. */
 let dismissals = new Map<string, string>()
 let attention: ChainAttentionRow[] = []
@@ -31,9 +33,12 @@ export function awayGroups(): Group[] {
   const notices = feed.notices.filter((notice) => feed.enabled || (LOCAL_NOTICE_KINDS as readonly string[]).includes(notice.kind))
   const items = notificationItems(notices, getBehaviorDiagnostics(), Date.now(), attention)
   const entries = undismissed(foldWaiting([...itemEntries(items, noRole, chains), ...requestEntries(requests, noRole), ...decisionEntries(decisions, noRole)]), dismissals)
-  // Away, a document's threads are counted, not read: its put-away threads come off its count.
-  const putAway = (slug: string) => [...dismissals.keys()].filter((key) => key.startsWith(`thread:${slug}:`)).length
-  const threads = publications.reduce((sum, publication) => sum + Math.max(0, publication.openThreads - putAway(publication.slug)), 0)
+  // A document's threads count as Answer here lists them, put-away ones off; one
+  // whose threads could not be read counts every open thread.
+  const threads = publications.reduce((sum, publication) => {
+    const read = threadsRead.get(publication.slug)
+    return sum + (read?.entries ? undismissed(read.entries, dismissals).length : publication.openThreads)
+  }, 0)
   return [...entries.map((entry) => entry.group), ...Array<Group>(threads).fill('needs-you')]
 }
 
@@ -55,7 +60,7 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     const [r, b, v, c, , d] = await Promise.allSettled([
       json('/api/chat/requests'),
       chatClient.switchboard(),
-      json<{ publications?: { slug?: string, openThreads?: number }[] }>('/api/editor/reviews'),
+      json<{ publications?: Publication[] }>('/api/editor/reviews'),
       json<{ chains?: { id: string, sequence: number, held: string | null }[], attention?: ChainAttentionRow[] }>('/api/behavior-chains?state=active'),
       refreshState(),
       json<{ dismissals?: { key: string, revision: string }[] }>('/api/answers/dismissals'),
@@ -68,7 +73,21 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     const items = b.status === 'fulfilled' ? (b.value as { items?: unknown } | null)?.items : null
     if (Array.isArray(items)) decisions = items as DecisionItem[]
     const read = v.status === 'fulfilled' ? v.value.publications : null
-    if (Array.isArray(read)) publications = read.map((publication) => ({ slug: publication.slug ?? '', openThreads: publication.openThreads ?? 0 }))
+    if (Array.isArray(read)) {
+      publications = read.filter((publication) => typeof publication?.slug === 'string' && (publication.openThreads ?? 0) > 0)
+      for (const slug of threadsRead.keys()) if (!publications.some((publication) => publication.slug === slug)) threadsRead.delete(slug)
+      await Promise.all(publications.map(async (publication) => {
+        const before = threadsRead.get(publication.slug)
+        // Read again when the sweep checked it since: a reply brings a put-away thread back.
+        if (before?.entries && before.openThreads === publication.openThreads && before.checkedAt === publication.checkedAt) return
+        try {
+          const cached = await json<{ reviews?: ThreadReview[] }>(`/api/editor/doc/${encodeURIComponent(publication.slug)}/reviews`)
+          threadsRead.set(publication.slug, { openThreads: publication.openThreads, checkedAt: publication.checkedAt, entries: Array.isArray(cached.reviews) ? threadEntries(publication, cached.reviews, () => '') : null })
+        } catch {
+          threadsRead.set(publication.slug, { openThreads: publication.openThreads, checkedAt: publication.checkedAt, entries: null })
+        }
+      }))
+    }
     const putAway = d.status === 'fulfilled' ? d.value.dismissals : null
     if (Array.isArray(putAway)) dismissals = new Map(putAway.map((row) => [row.key, row.revision]))
     const chainsRead = c.status === 'fulfilled' && Array.isArray(c.value.chains) && Array.isArray(c.value.attention) ? c.value : null

@@ -62,7 +62,7 @@ import { stallSnapshot } from './stall-observer'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
 import { ChatSocketServer, handleChatApi, speaksForPerson } from './chat/transport'
-import { dismissAnswer, listAnswerDismissals } from './answer-dismissals'
+import { dismissAnswer, forgetAnswerDismissals, listAnswerDismissals } from './answer-dismissals'
 import { Switchboard } from './chat/switchboard'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
@@ -686,12 +686,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (path === '/api/answers/dismissals' && req.method === 'GET') {
           return json(res, 200, { dismissals: listAnswerDismissals() })
         }
-        if (path === '/api/answers/dismissals' && req.method === 'POST') {
+        if ((path === '/api/answers/dismissals' || path === '/api/answers/dismissals/forget') && req.method === 'POST') {
           if (!speaksForPerson(req, !!service, authority)) {
             return json(res, 403, { error: 'Putting a card away is the person\'s action, taken in the browser.', code: 'invalid' })
           }
           try {
-            return json(res, 200, { dismissals: dismissAnswer(await readJson<unknown>(req)) })
+            const body = await readJson<unknown>(req)
+            return json(res, 200, { dismissals: path.endsWith('/forget') ? forgetAnswerDismissals(body) : dismissAnswer(body) })
           } catch (error) {
             return json(res, httpStatus(error, 400), { error: (error as Error).message })
           }
