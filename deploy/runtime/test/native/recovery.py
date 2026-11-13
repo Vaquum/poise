@@ -16,6 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 signal.alarm(180)
 addresses = set()
@@ -37,15 +38,50 @@ os.environ['AGENT_INTERFACE_DATA_DIR'] = str(Path.home() / '.poise' / 'agent-int
 import agent_interface as api
 from agent_interface import checkout_lock, issue_review, native_cleanup, native_namespace, process_identity, resource_ownership, review_receipt
 
+
+def cleanup_state(call):
+    with api.db() as db:
+        row = db.execute('select status,resource_cleanup,resource_ownership,resources_settled_at from calls where id=?',
+                         (call,)).fetchone()
+    claim = json.loads(row['resource_cleanup'] or '{}')
+    return {'call': call, 'status': row['status'], 'resources_settled_at': row['resources_settled_at'],
+            'ownership': json.loads(row['resource_ownership']),
+            'claim': {name: value for name, value in claim.items() if name not in {'token', 'owner'}},
+            'owner_pid': json.loads(claim['owner'])['pid'] if claim.get('owner') else None}
+
+
 if sys.argv[1:2] == ['cleaner']:
+    call = sys.argv[2]
+    root = resource_ownership.call_directory(api.DB, call)
+    # Only this fixture Call is reserved from service maintenance. Keep that
+    # reservation after exit 91 so the parent can observe the unacknowledged unlink.
+    with api.db() as db:
+        db.execute('begin immediate')
+        row = db.execute('select pid,process_identity,resource_cleanup from calls where id=?', (call,)).fetchone()
+        assert process_identity.state(row['process_identity'], int(row['pid'])) == 'gone'
+        previous = json.loads(row['resource_cleanup'])
+        assert previous['next_attempt_at'] > time.time()
+        assert process_identity.state(previous['owner'], json.loads(previous['owner'])['pid']) == 'gone'
+        claim = {'token': uuid4().hex, 'owner': process_identity.capture(os.getpid()), 'attempt_at': time.time(),
+                 'next_attempt_at': previous['next_attempt_at'], 'failures': previous.get('failures', 0)}
+        db.execute('update calls set resource_cleanup=? where id=?', (json.dumps(claim), call))
+        entry = next(item for item in resource_ownership.read(db, call)['roots'] if item['path'] == str(root))
     original_remove = resource_ownership._remove_directory
 
-    def unlink_then_interrupt(*args, **kwargs):
-        original_remove(*args, **kwargs)
-        os._exit(91)
+    def unlink_then_interrupt(parent_fd, name, device, inode, **kwargs):
+        original_remove(parent_fd, name, device, inode, **kwargs)
+        parent = os.fstat(parent_fd)
+        if name == root.name and (str(device), str(inode), str(parent.st_dev), str(parent.st_ino)) == \
+                tuple(entry[key] for key in ('device', 'inode', 'parent_device', 'parent_inode')):
+            os._exit(91)
 
-    with patch.object(resource_ownership, '_remove_directory', side_effect=unlink_then_interrupt):
-        native_cleanup.recover(api.DB)
+    try:
+        with patch.object(resource_ownership, '_remove_directory', side_effect=unlink_then_interrupt):
+            native_cleanup._settle_process(api.DB, call)
+            resource_ownership.cleanup_remaining(api.DB, call, claim=claim['token'], deadline=time.monotonic() + 15)
+    finally:
+        print(json.dumps({'kind': 'cleaner-loss-miss', 'recovery': native_cleanup.recover(api.DB),
+                          'selected': cleanup_state(call)}), flush=True)
     raise AssertionError('cleanup interruption did not reach the real unlink window')
 
 variant = sys.argv[-1] if len(sys.argv) > 1 else 'parent-loss'
@@ -67,6 +103,10 @@ if sys.argv[1:2] == ['worker']:
             runpy.run_path('/contract/metadata_collision.py')['validate']()
         root = resource_ownership.allocate(api.DB, call, resource_ownership.call_directory(api.DB, call))
         (root / 'disposable-output').write_bytes(b'owned component output\n' * 4096)
+        if variant == 'cleaner-loss':
+            nested = root / root.name
+            nested.mkdir()
+            (nested / 'disposable-output').write_text('nested unlink must not interrupt the cleaner')
         if variant in {'native-coordination', 'native-coordination-replaced'}:
             checkout = root / 'repo'
             checkout.mkdir()
@@ -121,6 +161,19 @@ worker = subprocess.Popen([sys.executable, '-u', __file__, 'worker', variant], s
 try:
     ready = json.loads(worker.stdout.readline())
     assert ready['kind'] == 'allocation-ready', ready
+    if variant == 'cleaner-loss':
+        # Reproduce the live-owner deferral that made an immediate recovery
+        # pass miss this Call, then reserve it through the interruption check.
+        token, reason = native_cleanup._claim(api.DB, ready['call'])
+        selected = cleanup_state(ready['call'])
+        assert token is None and selected['claim']['last_error'] in {
+            'original cleanup worker still owns its claim', 'original Caller still owns its normal cleanup'}, selected
+        print(json.dumps({'kind': 'cleaner-loss-live-owner', 'reason': reason, 'selected': selected}), flush=True)
+        with api.db() as db:
+            db.execute('begin immediate')
+            claim = json.loads(db.execute('select resource_cleanup from calls where id=?', (ready['call'],)).fetchone()[0])
+            claim['next_attempt_at'] = time.time() + 180
+            db.execute('update calls set resource_cleanup=? where id=?', (json.dumps(claim), ready['call']))
     with api.db() as db:
         original = db.execute('select process_identity,namespace_control,resource_ownership from calls where id=?',
                               (ready['call'],)).fetchone()
@@ -170,9 +223,28 @@ try:
         positive = native_namespace.control_request(address, 'read-root', root=ready['root'], **key)
         assert positive['resource']['unlinked'] is True
     if variant == 'cleaner-loss':
+        report = native_cleanup.recover(api.DB)
+        selected = cleanup_state(ready['call'])
+        print(json.dumps({'kind': 'cleaner-loss-deferred', 'recovery': report, 'selected': selected}), flush=True)
+        assert ready['call'] not in report['released'] and all(item['callId'] != ready['call'] for item in report['held']), report
+        assert selected['resources_settled_at'] is None and original_root.is_dir(), selected
         cleaner = subprocess.run([sys.executable, '-u', __file__, 'cleaner', ready['call']], capture_output=True, text=True, timeout=20)
-        assert cleaner.returncode == 91 and not cleaner.stderr, cleaner
-        assert not original_root.exists()
+        assert cleaner.returncode == 91 and not cleaner.stderr, {'cleaner': cleaner, 'selected': cleanup_state(ready['call'])}
+        positive = native_namespace.control_request(address, 'read-root', root=ready['root'], **key)
+        assert positive['resource']['unlinked'] is True and positive['resource']['state'] == 'allocated', positive
+        with api.db() as db:
+            db.execute('begin immediate')
+            pending = resource_ownership.read(db, ready['call'])
+            assert next(item for item in pending['roots'] if item['path'] == ready['root']) == \
+                next(item for item in ownership['roots'] if item['path'] == ready['root']), pending
+            row = db.execute('select resources_settled_at,resource_cleanup from calls where id=?', (ready['call'],)).fetchone()
+            assert row['resources_settled_at'] is None, row['resources_settled_at']
+            claim = json.loads(row['resource_cleanup'])
+            assert claim.pop('next_attempt_at') > time.time()
+            db.execute('update calls set resource_cleanup=? where id=?', (json.dumps(claim), ready['call']))
+        print(json.dumps({'kind': 'cleaner-loss-unlinked-before-ack', 'call': ready['call'],
+                          'controller_unlinked': True, 'durable_root_state': 'allocated',
+                          'resources_settled_at': None}), flush=True)
     if variant == 'unknown-process-error':
         resource_ownership.failure(api.DB, ready['call'], 'resources_unknown')
         with api.db() as db:
