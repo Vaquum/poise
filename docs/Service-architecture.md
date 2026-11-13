@@ -479,7 +479,11 @@ its own instead of refusing with dirty_unowned.
   marked failed and never run again; the image's own release takes over.
   Production shutdown synchronously retains deadline and rejection evidence in
   the private Logging store before exit 1, even after Logging stops. The
-  supervisor records its own abnormal exit event. Clean exit 75 stays quiet.
+  supervisor supplies a fresh `POISE_SHUTDOWN_DIAGNOSTIC_ID` for every launch.
+  A read-only lookup of that launch's owner-scoped shutdown Error permits a
+  distinct `workspace.exit` Warning linked by `correlationId`, retaining the
+  actual exit code and signal. Missing, unavailable or mismatched evidence keeps
+  the independent exit Error. Clean exit 75 stays quiet.
   On Linux the same supervisor owns the private native-cleanup controller.
   Its uid-only Unix socket and random generation are passed to Poise and
   Caller as `POISE_NATIVE_CONTROL`; neither the address nor per-Call tokens
@@ -553,9 +557,13 @@ its own instead of refusing with dirty_unowned.
 - **Shutdown.** Active HTTP responses finish before their keep-alive sockets
   retire. Storage-pressure passes, including native Caller cleanup and receipt
   reconciliation, join the background barrier: a release switch waits for the
-  admitted pass before starting shutdown. Clean shutdown waits for runtime cleanup
+  admitted pass before starting shutdown. Collaborator reconciliation also joins
+  that barrier, retaining the admitted invitation's account confirmation before
+  the switch; new passes wait during a pending switch or drain.
+  Clean shutdown waits for runtime cleanup
   and HTTP closure, closes SQLite, then exits 75. The existing ten-second deadline
   still exits 1 with one structured Error naming pending shutdown phases and
+  unresolved runtime stops (including `runtime_stop.agent_collaborator`) and
   retaining known cleanup failure causes.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace

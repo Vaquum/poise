@@ -43,6 +43,15 @@ db.pragma('busy_timeout = 5000')
 // Deleted credential bytes must be overwritten rather than left on SQLite's
 // freelist. Set this before the migration that removes the retired PAT row.
 db.pragma('secure_delete = ON')
+/** How much of cache.db a connection maps: the most this SQLite build maps
+ *  (SQLITE_MAX_MMAP_SIZE, just under 2 GiB). */
+const MMAP_BYTES = 0x7fff0000
+// Pages are read through a mapping of the file instead of a read call each.
+// Another connection's commit resets this one's page cache, and a table larger
+// than the cache is read again on every scan; a read call per page is costly
+// under gVisor. Only SQLite shrinks cache.db, and its locks keep a checkpoint
+// from cutting a file another connection is reading.
+db.pragma(`mmap_size = ${MMAP_BYTES}`)
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS meta (
@@ -522,6 +531,7 @@ function cursorConnection(): Database.Database {
   cursorDb.pragma('synchronous = NORMAL')
   // Checkpoints stay with the main connection.
   cursorDb.pragma('wal_autocheckpoint = 0')
+  cursorDb.pragma(`mmap_size = ${MMAP_BYTES}`)
   return cursorDb
 }
 
@@ -554,7 +564,7 @@ export function writeObservation<T>(write: (connection: Database.Database) => T)
 
 export function setMeta(key: string, value: string): void {
   const connection = observing ?? (isRotationCursor(key) && !db.inTransaction ? cursorConnection() : db)
-  connection.prepare('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
+  cachedStatement(connection, 'INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
 }
 
 // ── Behavior dedupe (atomic across runtimes) ──────────────────────────
@@ -569,7 +579,7 @@ export function setMeta(key: string, value: string): void {
 // INSERT OR IGNORE statements, so out of N callers exactly ONE gets
 // `true` for any given (key, target).
 export function claimSeen(key: string, target: string): boolean {
-  const info = db.prepare(
+  const info = cachedStatement(db,
     'INSERT OR IGNORE INTO behavior_seen(key, target, seen_at) VALUES(?, ?, ?)'
   ).run(key, target, new Date().toISOString())
   return info.changes === 1
@@ -641,7 +651,7 @@ export function claimSeenOwnedAs(
     throw new Error('claimId must be a stable operation identifier')
   }
   const now = Date.now()
-  const info = db.prepare(
+  const info = cachedStatement(db,
     `INSERT INTO behavior_seen(key, target, seen_at, claim_id, lease_until)
      VALUES(?, ?, ?, ?, ?)
      ON CONFLICT(key, target) DO UPDATE SET
@@ -679,7 +689,7 @@ export function claimPrOperationOwned(target: string, leaseMs: number): string |
 
 export function renewPrOperationOwned(claimId: string, leaseMs: number): boolean {
   if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) throw new Error('leaseMs must be a positive integer')
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     UPDATE behavior_seen
     SET lease_until = ?
     WHERE key = 'pr-operation' AND claim_id = ? AND claim_id <> ''
@@ -688,7 +698,7 @@ export function renewPrOperationOwned(claimId: string, leaseMs: number): boolean
 }
 
 export function releasePrOperationOwned(claimId: string): boolean {
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     DELETE FROM behavior_seen
     WHERE key = 'pr-operation' AND claim_id = ? AND claim_id <> ''
   `).run(claimId)
@@ -744,7 +754,7 @@ export function markBehaviorLaunchIntentOwned(input: {
   // is dropped rather than failing the launch.
   const covers = [...new Set((input.covers ?? []).filter((issue) => ISSUE_REFERENCE_PATTERN.test(issue)))]
     .slice(0, MAX_LAUNCH_COVERS)
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     UPDATE behavior_seen
     SET claim_id = ?, launch_behavior = ?, launch_repo = ?, launch_pr = ?,
         launch_requested_at = ?, launch_call_id = NULL, launch_error = NULL, launch_quarantine = NULL,
@@ -855,7 +865,7 @@ export function getFailedBehaviorLaunch(
   key: string,
   target: string,
 ): BehaviorLaunchClaim | null {
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT key, target, seen_at, claim_id, lease_until, launch_behavior,
            launch_repo, launch_pr, launch_requested_at, launch_call_id, launch_error, launch_quarantine, launch_quarantine_may_run,
            launch_expected_head, launch_actor, launch_source, launch_correlation_id,
@@ -914,7 +924,7 @@ export function releaseFailedBehaviorLaunch(
   callId: string,
   expectedHead: string,
 ): boolean {
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     DELETE FROM behavior_seen
     WHERE key = ? AND target = ? AND claim_id = ''
       AND launch_call_id = ? AND launch_expected_head = ?
@@ -928,7 +938,7 @@ export function completeFailedBehaviorReplay(input: {
   callId: string, correlationId: string, startedAt: string, completedAt: string,
   action: BehaviorLaunchAction, outcome: BehaviorLaunchOutcome,
 }): boolean {
-  return db.prepare(`
+  return cachedStatement(db, `
     UPDATE behavior_seen
     SET seen_at = ?, launch_error = NULL, launch_call_id = ?,
         launch_source = 'poise:replay', launch_correlation_id = ?,
@@ -952,7 +962,7 @@ export function linkBehaviorLaunchCallOwned(
 ): boolean {
   if (!/^[0-9a-fA-F]{32}$/.test(callId)) throw new Error('invalid behavior launch call id')
   const normalizedCallId = callId.toLowerCase()
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     UPDATE behavior_seen
     SET launch_call_id = ?,
         launch_error = CASE WHEN launch_quarantine = 'invalid_result' THEN launch_error ELSE NULL END
@@ -972,7 +982,7 @@ export function quarantineBehaviorLaunchOwned(
   error: string,
   mayRun = true,
 ): boolean {
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     UPDATE behavior_seen
     SET launch_quarantine_may_run = CASE WHEN launch_quarantine IS NULL THEN ? ELSE MAX(launch_quarantine_may_run, ?) END,
         launch_quarantine = CASE WHEN launch_quarantine = 'invalid_result' THEN launch_quarantine ELSE ? END,
@@ -991,7 +1001,7 @@ export function clearUnreadableBehaviorLaunchOwned(
   claimId: string,
   callId: string,
 ): boolean {
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     UPDATE behavior_seen
     SET launch_quarantine = NULL, launch_error = NULL, launch_quarantine_may_run = 1
     WHERE key = ? AND target = ? AND claim_id = ? AND claim_id <> ''
@@ -1006,7 +1016,7 @@ export function setBehaviorLaunchErrorOwned(
   claimId: string,
   error: string | null,
 ): boolean {
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     UPDATE behavior_seen
     SET launch_error = CASE WHEN launch_quarantine = 'invalid_result' THEN launch_error ELSE ? END
     WHERE key = ? AND target = ? AND claim_id = ? AND claim_id <> ''
@@ -1021,7 +1031,7 @@ export function renewSeenOwned(
   leaseMs: number = DEFAULT_CLAIM_LEASE_MS,
 ): boolean {
   if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) throw new Error('leaseMs must be a positive integer')
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     UPDATE behavior_seen
     SET lease_until = ?
     WHERE key = ? AND target = ? AND claim_id = ? AND claim_id <> ''
@@ -1033,7 +1043,7 @@ export function renewSeenOwned(
 // the snapshot path where we just want to populate the ledger with
 // current state so subsequent ticks don't fire on existing items.
 export function recordSeen(key: string, target: string): void {
-  db.prepare(
+  cachedStatement(db,
     'INSERT OR IGNORE INTO behavior_seen(key, target, seen_at) VALUES(?, ?, ?)'
   ).run(key, target, new Date().toISOString())
 }
@@ -1041,12 +1051,12 @@ export function recordSeen(key: string, target: string): void {
 // Release a claim when its side effect could not be launched. The exact
 // target predicate prevents one failed worker from clearing another target.
 export function releaseSeen(key: string, target: string): void {
-  db.prepare('DELETE FROM behavior_seen WHERE key = ? AND target = ?').run(key, target)
+  cachedStatement(db, 'DELETE FROM behavior_seen WHERE key = ? AND target = ?').run(key, target)
 }
 
 export function releaseSeenOwned(key: string, target: string, claimId: string): boolean {
   return db.transaction(() => {
-    const info = db.prepare(
+    const info = cachedStatement(db,
       'DELETE FROM behavior_seen WHERE key = ? AND target = ? AND claim_id = ?'
     ).run(key, target, claimId)
     if (info.changes === 1) releasePrOperationOwned(claimId)
@@ -1058,7 +1068,7 @@ export function releaseSeenOwned(key: string, target: string, claimId: string): 
 // The owner predicate makes a late callback harmless after lease recovery.
 export function completeSeenOwned(key: string, target: string, claimId: string): boolean {
   return db.transaction(() => {
-    const info = db.prepare(
+    const info = cachedStatement(db,
       `UPDATE behavior_seen
        SET claim_id = '', lease_until = NULL, seen_at = ?
        WHERE key = ? AND target = ? AND claim_id = ?`
@@ -1096,7 +1106,7 @@ export function completeBehaviorLaunchOwned(input: {
     throw new Error('behavior completion action/outcome mismatch')
   }
   return db.transaction(() => {
-    const info = db.prepare(`
+    const info = cachedStatement(db, `
       UPDATE behavior_seen
       SET claim_id = '', lease_until = NULL, seen_at = ?, launch_error = NULL, launch_quarantine = NULL,
           launch_outcome = ?, launch_completed_at = ?, launch_head_sha = ?,
@@ -1131,7 +1141,7 @@ export interface CompletedBehaviorAction {
 // failed, never finished, or was superseded without posting did nothing on
 // GitHub. A superseded run that posted is quarantined, never counted.
 export function listCompletedBehaviorActions(): CompletedBehaviorAction[] {
-  return (db.prepare(`
+  return (cachedStatement(db, `
     SELECT launch_repo AS repo, launch_pr AS pr, launch_action AS action, launch_completed_at AS completedAt
     FROM behavior_seen
     WHERE launch_behavior IN ('pr_review', 'pr_approve')
@@ -1227,7 +1237,7 @@ export interface PrReviewClaim {
 }
 
 export function listLiveReviewClaims(): PrReviewClaim[] {
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     SELECT key, target, launch_repo AS repo, launch_pr AS pr,
       launch_expected_head AS expectedHead, launch_requested_at AS requestedAt,
       launch_actor AS actor, lease_until AS leaseUntil
@@ -1254,7 +1264,7 @@ export function listLiveReviewClaims(): PrReviewClaim[] {
 // Heads with an unconfirmed grey-CI rerun intent, as `repo:head` with the
 // repository lowercased the way the grey-ci tick stores it. Read-only.
 export function listGreyCiPendingHeads(): Set<string> {
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     SELECT DISTINCT launch_repo AS repo, launch_expected_head AS head
     FROM behavior_seen
     WHERE key = 'grey-ci-recovery' AND claim_id <> ''
@@ -1273,7 +1283,7 @@ export function completeIssueReviewLaunchOwned(input: {
   if (!Number.isFinite(Date.parse(input.completedAt))) {
     throw new Error('invalid issue review completion timestamp')
   }
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     UPDATE behavior_seen
     SET claim_id = '', lease_until = NULL, seen_at = ?, launch_error = NULL, launch_quarantine = NULL,
         launch_outcome = 'commented', launch_completed_at = ?, launch_head_sha = NULL,
@@ -1287,7 +1297,7 @@ export function completeIssueReviewLaunchOwned(input: {
 // A claim taken but never launched — its process died before recording the
 // launch — whose lease has run out, so a new claim may take the target over.
 export function hasExpiredPreLaunchClaim(key: string, target: string): boolean {
-  return !!db.prepare(`
+  return !!cachedStatement(db, `
     SELECT 1 FROM behavior_seen
     WHERE key = ? AND target = ? AND claim_id <> ''
       AND launch_requested_at IS NULL
@@ -1297,7 +1307,7 @@ export function hasExpiredPreLaunchClaim(key: string, target: string): boolean {
 
 // Count launch attempts, not multiple diagnostics about the same attempt.
 export function countBehaviorDeadLetters(behavior: string, target: string): number {
-  const row = db.prepare(
+  const row = cachedStatement(db,
     'SELECT COUNT(DISTINCT COALESCE(correlation_id, id)) AS n FROM behavior_dead_letters WHERE behavior = ? AND target = ?',
   ).get(behavior, target) as { n: number }
   return row.n
@@ -1345,7 +1355,7 @@ export function recordBehaviorDeadLetter(
 ): string {
   const id = randomUUID()
   const createdAt = new Date().toISOString()
-  db.prepare(`
+  cachedStatement(db, `
     INSERT INTO behavior_dead_letters(
       id, behavior, target, repo, pr, actor, source, correlation_id,
       call_id, error, created_at
@@ -1367,7 +1377,7 @@ export function recordBehaviorDeadLetter(
 }
 
 export function retireBehaviorDeadLettersForTarget(behavior: string, target: string): number {
-  return db.prepare(`
+  return cachedStatement(db, `
     UPDATE behavior_dead_letters
     SET retired_at = ?
     WHERE behavior = ? AND target = ? AND retired_at IS NULL
@@ -1375,7 +1385,7 @@ export function retireBehaviorDeadLettersForTarget(behavior: string, target: str
 }
 
 export function retireBehaviorDeadLetter(id: string): boolean {
-  return db.prepare(`
+  return cachedStatement(db, `
     UPDATE behavior_dead_letters
     SET retired_at = ?
     WHERE id = ? AND retired_at IS NULL
@@ -1390,7 +1400,7 @@ export function retireBehaviorDeadLettersForClosedPrs(
   organization?: string,
   unreadRepositories?: ReadonlySet<string>,
 ): number {
-  const rows = (db.prepare(`
+  const rows = (cachedStatement(db, `
     SELECT id, behavior, repo, pr
     FROM behavior_dead_letters AS dead INDEXED BY idx_behavior_dead_letters_open
     WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL
@@ -1398,7 +1408,7 @@ export function retireBehaviorDeadLettersForClosedPrs(
     .filter((row) => behaviors.includes(row.behavior)
       && !unreadRepositories?.has(row.repo)
       && (organization === undefined || row.repo.split('/')[0].toLowerCase() === organization.toLowerCase()))
-  const retire = db.prepare(`
+  const retire = cachedStatement(db, `
     UPDATE behavior_dead_letters SET retired_at = ?, resolution = 'superseded',
       resolution_evidence = ?, resolved_at = ?
     WHERE id = ? AND retired_at IS NULL
@@ -1474,7 +1484,7 @@ export function reconcileBehaviorDeadLetters(
     id: string, behavior: string, target: string, repo: string | null, pr: number | null,
     correlation_id: string | null, call_id: string | null, error: string, created_at: string,
   }>
-  const quarantined = db.prepare(`
+  const quarantined = cachedStatement(db, `
     SELECT 1 FROM behavior_seen AS held
     WHERE held.key = ? AND held.target = ? AND held.launch_quarantine IS NOT NULL
   `)
@@ -1482,7 +1492,7 @@ export function reconcileBehaviorDeadLetters(
   // pass retires exactly what that rule already hides, with the evidence
   // cited. For pull requests any completion on the PR settles the row —
   // whether a sibling slot's success may settle a required slot stays open.
-  const recovered = db.prepare(`
+  const recovered = cachedStatement(db, `
     SELECT launch_completed_at, launch_call_id
     FROM behavior_seen AS recovered
     WHERE recovered.key = ? AND recovered.launch_repo = ? AND recovered.launch_pr = ?
@@ -1495,7 +1505,7 @@ export function reconcileBehaviorDeadLetters(
   // Approval targets carry their request, so only the same request's own
   // completion resolves the row: another head's approval proves the request
   // was replaced, never that it succeeded.
-  const recoveredSameRequest = db.prepare(`
+  const recoveredSameRequest = cachedStatement(db, `
     SELECT launch_completed_at, launch_call_id
     FROM behavior_seen AS recovered
     WHERE recovered.key = ? AND recovered.target = ?
@@ -1508,7 +1518,7 @@ export function reconcileBehaviorDeadLetters(
   // request on a different target. The obsolete firing can never complete
   // — its input is gone — so the replacement settles it as superseded,
   // whether or not the replacement itself has finished.
-  const replacementRequest = db.prepare(`
+  const replacementRequest = cachedStatement(db, `
     SELECT target, launch_correlation_id, launch_expected_head, launch_requested_at,
       launch_call_id, launch_outcome, launch_completed_at, launch_head_sha
     FROM behavior_seen AS replacement
@@ -1519,17 +1529,17 @@ export function reconcileBehaviorDeadLetters(
     ORDER BY replacement.launch_requested_at DESC, replacement.target ASC
     LIMIT 1
   `)
-  const obsoleteRequestedAt = db.prepare(`
+  const obsoleteRequestedAt = cachedStatement(db, `
     SELECT launch_requested_at FROM behavior_seen
     WHERE key = ? AND target = ? AND claim_id = ''
       AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
   `)
-  const retire = db.prepare(`
+  const retire = cachedStatement(db, `
     UPDATE behavior_dead_letters
     SET retired_at = ?, resolution = ?, resolution_evidence = ?, resolved_at = ?
     WHERE id = ? AND retired_at IS NULL
   `)
-  const hold = db.prepare(`
+  const hold = cachedStatement(db, `
     UPDATE behavior_dead_letters
     SET resolution = 'held', resolution_evidence = ?, resolved_at = ?
     WHERE id = ? AND retired_at IS NULL
@@ -1606,7 +1616,7 @@ export const REPLAY_RESERVATION_MS = 10 * 60_000
 // this before launching, so a tick during replay preparation cannot start
 // a duplicate worker for the same target.
 export function replayReservationActive(repo: string, pr: number, behavior: string, nowMs = Date.now()): boolean {
-  return !!db.prepare(`
+  return !!cachedStatement(db, `
     SELECT 1 FROM behavior_replay_reservations
     WHERE repo = ? AND pr = ? AND behavior = ? AND expires_at >= ?
     LIMIT 1
@@ -1618,7 +1628,7 @@ export function replayReservationActive(repo: string, pr: number, behavior: stri
 export function reserveBehaviorReplay(repo: string, pr: number, behavior: string, nowMs = Date.now()): boolean {
   const now = new Date(nowMs).toISOString()
   const expires = new Date(nowMs + REPLAY_RESERVATION_MS).toISOString()
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     INSERT INTO behavior_replay_reservations(repo, pr, behavior, created_at, expires_at)
     VALUES(?, ?, ?, ?, ?)
     ON CONFLICT(repo, pr, behavior) DO UPDATE
@@ -1636,7 +1646,7 @@ export function releaseBehaviorReplay(
   behavior: string,
   createdAt: string,
 ): void {
-  db.prepare(`
+  cachedStatement(db, `
     DELETE FROM behavior_replay_reservations
     WHERE repo = ? AND pr = ? AND behavior = ? AND created_at = ?
   `).run(repo, pr, behavior, createdAt)
@@ -1654,12 +1664,12 @@ export function requestIssueReviewRevision(
 ): { correlationId: string, created: boolean, requestedAt: string } {
   const key = repo.toLowerCase()
   const now = new Date().toISOString()
-  const info = db.prepare(`
+  const info = cachedStatement(db, `
     INSERT OR IGNORE INTO issue_review_requests(repo, pr, revision, correlation_id, requested_at)
     VALUES(?, ?, ?, ?, ?)
   `).run(key, pr, revision, correlationId, now)
   if (info.changes === 1) return { correlationId, created: true, requestedAt: now }
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT correlation_id AS correlationId, requested_at AS requestedAt FROM issue_review_requests
     WHERE repo = ? AND pr = ? AND revision = ?
   `).get(key, pr, revision) as { correlationId: string, requestedAt: string }
@@ -1670,7 +1680,7 @@ export function requestIssueReviewRevision(
 // keeps one failed spawn from clearing another request; a run that started
 // is never released, however it ended.
 export function releaseIssueReviewRevision(repo: string, pr: number, revision: string, correlationId: string): void {
-  db.prepare(`
+  cachedStatement(db, `
     DELETE FROM issue_review_requests
     WHERE repo = ? AND pr = ? AND revision = ? AND correlation_id = ?
   `).run(repo.toLowerCase(), pr, revision, correlationId)
@@ -1776,27 +1786,27 @@ function readBehaviorDeadLetters(
 // (no rows yet → take snapshot, don't fire on first tick) from a
 // running behavior (rows exist → fire on net-new targets).
 export function hasSeenAny(key: string): boolean {
-  const row = db.prepare(
+  const row = cachedStatement(db,
     'SELECT 1 AS x FROM behavior_seen WHERE key = ? LIMIT 1'
   ).get(key) as { x: number } | undefined
   return !!row
 }
 
 export function hasSeen(key: string, target: string): boolean {
-  const row = db.prepare(
+  const row = cachedStatement(db,
     'SELECT 1 AS x FROM behavior_seen WHERE key = ? AND target = ?',
   ).get(key, target) as { x: number } | undefined
   return !!row
 }
 
 export function listSeenTargets(key: string): string[] {
-  return (db.prepare(
+  return (cachedStatement(db,
     'SELECT target FROM behavior_seen WHERE key = ? ORDER BY target',
   ).all(key) as Array<{ target: string }>).map((row) => row.target)
 }
 
 export function listSnapshotOnlySeen(key: string): Array<{ target: string, seenAt: string }> {
-  return (db.prepare(`
+  return (cachedStatement(db, `
     SELECT target, seen_at
     FROM behavior_seen
     WHERE key = ?
@@ -1820,7 +1830,7 @@ export function latestApprovalBasisLaunch(
   pr: number,
   actor?: string,
 ): CompletedApprovalBasisLaunch | null {
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT launch_call_id, launch_completed_at, launch_head_sha
     FROM behavior_seen
     WHERE claim_id = ''
@@ -1862,7 +1872,7 @@ export function latestCompletedChangeRequestLaunch(
   pr: number,
   actor: string,
 ): CompletedApprovalBasisLaunch | null {
-  const row = db.prepare(`
+  const row = cachedStatement(db, `
     SELECT launch_call_id AS callId, launch_completed_at AS completedAt, launch_head_sha AS headSha
     FROM behavior_seen
     WHERE claim_id = '' AND launch_error IS NULL AND launch_quarantine IS NULL
@@ -1886,14 +1896,14 @@ export function latestCompletedChangeRequestLaunch(
 // Wipe the ledger for a key — used when the user disables the
 // behavior. Re-enabling will trigger a fresh snapshot.
 export function clearSeen(key: string): void {
-  db.prepare('DELETE FROM behavior_seen WHERE key = ?').run(key)
+  cachedStatement(db, 'DELETE FROM behavior_seen WHERE key = ?').run(key)
 }
 
 // Disabling removes snapshots/skips but retains every accepted detached launch.
 // Otherwise disable/re-enable could duplicate completed work or erase the proof
 // that approval must wait for a successful initial review.
 export function clearSeenExceptLaunched(key: string, organization?: string): void {
-  db.prepare(`
+  cachedStatement(db, `
     DELETE FROM behavior_seen
     WHERE key = ?
       AND launch_requested_at IS NULL

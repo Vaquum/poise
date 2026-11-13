@@ -32,7 +32,7 @@ import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations
 import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { startAgentCollaboratorRuntime, stopAgentCollaboratorRuntime } from './agent-collaborator'
-import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
+import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob, RUNNING_SNAPSHOT_SERVED_MS } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
 import { readBehaviorEstimates } from './behavior-estimates'
 import { listCapabilities } from './capabilities'
@@ -307,17 +307,27 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   if (!linkApi) linkApi = new LinkApi({ service })
 }
 
+const pendingStops = new Set<string>()
+
+export function pendingRuntimeStops(): string[] { return [...pendingStops] }
+
 export async function stopPoiseRuntime(): Promise<void> {
-  const authStops = [...activeClaudeAuthRuntimes].map(([auth, unwatch]) => {
+  const stop = async (name: string, operation: () => void | Promise<void>) => {
+    pendingStops.add(name)
+    try { await operation() }
+    catch (cause) { throw new Error(`Runtime stop failed: ${name}`, { cause }) }
+    finally { pendingStops.delete(name) }
+  }
+  const authStops = [...activeClaudeAuthRuntimes].map(([auth, unwatch], index) => stop(`claude_auth_${index}`, () => {
     unwatch()
     return auth.stop()
-  })
+  }))
   activeClaudeAuthRuntimes.clear()
-  const chatStop = chatRuntime?.stop() ?? Promise.resolve()
-  const controlStop = chatControl?.stop(chatStop) ?? Promise.resolve()
-  const switchboardStop = chatSwitchboard?.stop() ?? Promise.resolve()
-  const socketStop = chatSockets?.close() ?? Promise.resolve()
-  const terminalStop = terminalSockets?.close() ?? Promise.resolve()
+  const chatStop = stop('chat', () => chatRuntime?.stop())
+  const controlStop = stop('chat_control', () => chatControl?.stop(chatStop))
+  const switchboardStop = stop('switchboard', () => chatSwitchboard?.stop())
+  const socketStop = stop('chat_sockets', () => chatSockets?.close())
+  const terminalStop = stop('terminal_sockets', () => terminalSockets?.close())
   stopAccountsCheck?.()
   stopAccountsCheck = null
   selfUpdate?.reset()
@@ -335,10 +345,18 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopAgentCollaboratorRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopPublicationReviewsRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
-  await stopBehaviorLedger()
-  await stopLoggingApi()
-  await stopLogging()
+  await Promise.all([
+    stop('organizations', stopOrganizationsRuntime), stop('agent_collaborator', stopAgentCollaboratorRuntime),
+    stop('behaviors', stopBehaviorsRuntime), stop('notices', stopNoticesRuntime),
+    stop('publication_reviews', stopPublicationReviewsRuntime), stop('github_quota', stopGithubQuotaRuntime),
+    stop('ledger_health', stopLedgerHealthRuntime), stop('temporary_storage', stopTemporaryStorageRuntime),
+    stop('review_checkout_pruning', stopReviewCheckoutPruning), stop('storage_maintenance', stopStorageMaintenanceRuntime),
+    stop('content_finalizer', stopContentFinalizer), stop('jev', stopJev),
+    controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops,
+  ])
+  await stop('behavior_ledger', stopBehaviorLedger)
+  await stop('logging_api', stopLoggingApi)
+  await stop('logging', stopLogging)
 }
 
 /** Connected accounts, read now or from the last few seconds, with their
@@ -887,7 +905,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // pages never queue it. Filtering stays here too, so the read
             // is exact even when Caller cannot pre-filter.
             if (status !== null) {
-              const snapshot = await fetchRunningAgentLogSnapshot()
+              const snapshot = await fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: RUNNING_SNAPSHOT_SERVED_MS })
               const selected = snapshot.entries.filter((entry) => belongs(entry.repo))
               const quarantined = snapshot.quarantined.filter((row) => !row.repo || belongs(row.repo)
                 || selected.some((entry) => row.id === entry.id
@@ -922,7 +940,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (path === '/api/behavior-estimates' && req.method === 'GET') {
           try {
             // The whole history only shapes the estimates: its last snapshot answers at once.
-            const [running, history] = await Promise.all([fetchRunningAgentLogSnapshot(), fetchAgentLogSnapshot({ lastObserved: true })])
+            const [running, history] = await Promise.all([
+              fetchRunningAgentLogSnapshot({ lastObserved: true, lastObservedMs: RUNNING_SNAPSHOT_SERVED_MS }),
+              fetchAgentLogSnapshot({ lastObserved: true }),
+            ])
             return json(res, 200, { estimates: readBehaviorEstimates(history.entries, running.entries) })
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })

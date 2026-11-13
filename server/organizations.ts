@@ -536,10 +536,12 @@ async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal
   }
   await checkHealth(path, me, env, signal)
   if (!publishAdmitted(row.login, generation)) return
-  db.prepare(`
+  // What this sync observed, committed without waiting for the disk: a power
+  // cut may lose it, and the next sync, due at once, records it again.
+  writeObservation((connection) => cachedStatement(connection, `
     UPDATE organizations SET stage = 'ready', error = NULL, last_sync_at = ?,
       last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0, sync_failing_since = 0 WHERE login = ?
-  `).run(Date.now(), reconcileComplete ? Date.now() : row.last_reconcile_at, me, row.login)
+  `).run(Date.now(), reconcileComplete ? Date.now() : row.last_reconcile_at, me, row.login))
   datastoreSyncRecovered(row.login)
 }
 

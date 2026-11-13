@@ -107,6 +107,14 @@ filter therefore does not hold other snapshots behind it. Each checkout keeps
 its own objects and remains usable after the mirror is refreshed or removed.
 Credentials are passed per command and never stored in either repository.
 
+Refresh, snapshot cloning and a missing-tree failure from the first working-tree
+reset share one recovery attempt within the invoking command's deadline. Recovery
+discards only the owned temporary snapshot and, under the same lock, its implicated
+mirror generation if it is still current. A concurrent replacement is reused;
+filter and other reset failures do not rebuild the mirror. A permanent missing
+tree fails with the existing redacted Git diagnostic before managed review
+preparation can publish a head checkout or start a review or approval worker.
+
 `github-interface --prune-mirrors ROOT --cap-bytes N --now-ms N
 [--fresh-ms N] [--dry-run]` is local maintenance and needs no GitHub account.
 It evicts whole bare mirrors only at `ROOT/owner/repo.git`, oldest first,

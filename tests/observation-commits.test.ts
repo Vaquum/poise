@@ -67,3 +67,12 @@ it('keeps a handled action recorded inside a transaction with that transaction',
   })()).toThrow('rolled back')
   expect(database.db.prepare("SELECT count(*) FROM handling_log WHERE ref = 'alert:test:rolled-back'").pluck().get()).toBe(0)
 })
+
+it('reads cache.db through a mapping of the file on both connections', () => {
+  expect(database.db.pragma('mmap_size', { simple: true })).toBeGreaterThan(0)
+  const mapped = database.writeObservation((connection) => {
+    expect(connection).not.toBe(database.db)
+    return connection.pragma('mmap_size', { simple: true })
+  })
+  expect(mapped).toBeGreaterThan(0)
+})

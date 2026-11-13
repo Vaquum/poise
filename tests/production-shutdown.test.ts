@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DiagnosticStore } from '../gateway/src/diagnostics/store'
+import { hasShutdownDiagnostic } from '../server/runtime-diagnostic'
 import { HANDLE, gatewayKeys, serviceEnvironment } from './service-fixture'
 
 const mocks = vi.hoisted(() => ({
@@ -33,6 +34,7 @@ vi.mock('../server/production-cpu-profile', () => ({
 vi.mock('../server/cache-plugin', () => ({
   createPoiseMiddleware: mocks.createPoiseMiddleware,
   stopPoiseRuntime: mocks.stopPoiseRuntime,
+  pendingRuntimeStops: () => [],
   attachChatSockets: mocks.attachChatSockets,
   stopDailyModelRefresh: mocks.stopDailyModelRefresh,
 }))
@@ -241,8 +243,10 @@ describe('production shutdown', () => {
     const events = failures()
     expect(events).toHaveLength(1)
     expect(events[0]).toMatchObject({ operation: 'process.shutdown', severity: 'error', exitCode: 1,
+      correlationId: 'a'.repeat(32),
       phase: rejected === 'both' ? 'shutdown_rejected' : 'shutdown_deadline',
       context: { requestedExitCode: 75, pendingPhases: rejected === 'both' ? [] : [rejected === 'runtime_stop' ? 'http_close' : 'runtime_stop'] } })
+    expect(hasShutdownDiagnostic('a'.repeat(32), process.env.POISE_RELEASE ?? null)).toBe(true)
     if (rejected !== 'http_close') expect(events[0].cause).toEqual(expect.arrayContaining(['runtime_stop: runtime cleanup refused', 'runtime_stop: original cleanup cause']))
     if (rejected !== 'runtime_stop') expect(events[0].cause).toContain('http_close: HTTP close refused')
     expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
@@ -256,7 +260,7 @@ describe('production shutdown', () => {
     const exits: number[] = []
     production.createProductionShutdown(production.createProductionServer(), (code) => { exits.push(code) })(75)
     await vi.waitFor(() => expect(exits).toEqual([1]))
-    expect(failures()).toEqual([expect.objectContaining({ phase: 'shutdown_rejected', cause: ['database_close: SQLite close refused'] })])
+    expect(failures()).toEqual([expect.objectContaining({ phase: 'shutdown_rejected', correlationId: null, cause: ['database_close: SQLite close refused'] })])
   })
 
   it('persists an HTTP-close deadline after Logging stops and process.exit(1) runs', async () => {
@@ -287,6 +291,7 @@ describe('production shutdown', () => {
             export const attachChatSockets = () => {};
             export const stopDailyModelRefresh = () => {};
             export const stopPoiseRuntime = () => stopLogging();
+            export const pendingRuntimeStops = () => [];
           ` }))
       } }],
       })

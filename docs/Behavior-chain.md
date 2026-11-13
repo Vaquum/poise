@@ -653,7 +653,7 @@ incomplete-reply error; `repair_execution_budget_exhausted` requires
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
 The reporter also accepts `review_budget_exhausted` and `review_inspection_timeout`,
-including a mixture of the two, for native `review-pr`
+including file-group deadlines and a mixture of the two codes, for native `review-pr`
 admissions by the reviewer account, pinned with `--expected-head`. Their basis
 includes `reviewContext` (base SHA, title and body), distinct from repair's
 `reviewRevision`. Each original receipt must retain the pre-submission `reviewing`
@@ -780,11 +780,16 @@ remediation issues cannot report any supported cause recursively, using their
 marker or the retained source-to-issue link; their ordinary holds and uncertainty
 remain visible.
 
-When a later repair hold reuses a closed implementation report, `waiting` leads
-with the current repair stage and worker-reported blocker, then directs the person
-to inspect the repair Call, address the blocker and explicitly Resume. The closed
-implementation report remains historical context; its body, intent and marker
-stay unchanged, and rereading either phase creates no replacement report.
+For implementation reports, `waiting` leads with the source's current implementation
+or repair stage and worker-reported blocker, then directs the person to inspect
+that Call, address the blocker and explicitly Resume. Report dispositions carry
+the time of successful report verification, not the status read or source observation;
+deferred or failed report reads cannot refresh that claim. Between ordinary
+rechecks, admission and remediation holds describe that dated observation, not
+live remediation. Once closure is verified, the report link remains historical
+context and the source blocker and next action remain. Its body, intent and marker
+stay unchanged; status reads and reconciliation create no replacement report or
+implementation attempt and do not change the quiescent cadence.
 
 `tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
 creation/restart, reconciliation, uncertain merge target suppression and normal

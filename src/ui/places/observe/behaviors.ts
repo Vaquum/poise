@@ -645,6 +645,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     }
   }
   async function loadResponse(id: string): Promise<void> {
+    const startedRunning = entries.some((entry) => entry.id === id && isRunning(entry))
     expanded.set(id, { body: null, loading: true, error: '', unavailable: '', running: false })
     render()
     let next: { body: string | null, loading: boolean, error: string, unavailable: string, running: boolean }
@@ -653,8 +654,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
       if (!response.ok) throw new Error(await failureOf(response))
       const data = await response.json() as { body?: unknown, disposition?: unknown, reason?: unknown }
       if (data.disposition === 'unavailable' && typeof data.reason === 'string' && data.reason) {
-        const entry = entries.find((e) => e.id === id)
-        next = { body: null, loading: false, error: '', unavailable: data.reason, running: entry ? isRunning(entry) : false }
+        next = { body: null, loading: false, error: '', unavailable: data.reason, running: startedRunning }
       } else {
         if (data.disposition !== undefined || typeof data.body !== 'string') throw new Error('the answer is incomplete')
         next = { body: data.body, loading: false, error: '', unavailable: '', running: false }
@@ -667,6 +667,10 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     if (!expanded.has(id)) return
     expanded.set(id, next)
     render()
+    if (next.unavailable !== '' && next.running) {
+      const current = entries.find((e) => e.id === id)
+      if (current && !isRunning(current)) void loadResponse(id)
+    }
   }
   async function loadReasoning(id: string): Promise<void> {
     const entry = entries.find((e) => e.id === id)

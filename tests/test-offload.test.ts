@@ -1427,11 +1427,13 @@ ${stderr}`
 
   it('leaves a failing suite\'s exit code alone, whatever it says about memory', async () => {
     await startAll()
+    // The background sweep can warn before the run fails.
+    warnings.push({ event: 'test_relay.sweep.failed', error: 'unrelated sweep failure' })
     const script = `console.log('cannot allocate memory: heap out of memory, as this test expected'); process.exit(7)`
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
     expect(code).toBe(7)
     expect(stderr).not.toContain('no test result')
-    expect(warnings).toEqual([])
+    expect(warnings.filter(({ event }) => event === 'test_relay.run.failed')).toEqual([])
   })
 
   it('tells a suite too big for its memory from one that failed, and sends the agent to CI', async () => {

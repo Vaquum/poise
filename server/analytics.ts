@@ -15,11 +15,11 @@
 // author submitted; its time runs from the pull request's opening.
 
 import { readAnalyticsInWorker } from './analytics-reader'
-import { inWindow } from './analytics-datastore'
+import { analyticsDatastorePath, inWindow, type AnalyticsDatastoreRecords } from './analytics-datastore'
 import { WORK_TYPES, workType, type WorkReviewAnalytics } from '../src/analytics-work-review'
 import { getMeta, listCompletedBehaviorActions, type BehaviorLaunchAction, type CompletedBehaviorAction } from './db'
 import { HttpError } from './http'
-import { involvementScopes, selectOrganizations, type DatastoreRecord, type OrganizationReadError } from './gh'
+import { involvementScopes, readKeptAcross, selectOrganizations, type DatastoreRecord, type KeptAcross, type OrganizationReadError } from './gh'
 import { agentAccount } from './settings'
 
 export interface AnalyticsWindow {
@@ -251,12 +251,26 @@ export function computeHistory(input: {
 
 export { prepareMergedDetails } from './analytics-datastore'
 
+/** The datastore records behind recent reports. A read starts a worker that
+ *  opens every account's datastore (seconds under load), while a datastore's
+ *  items rarely change between two reads: the records are kept until one
+ *  does, by the views' own rule (readKeptAcross). The report itself is
+ *  counted afresh each time. */
+const recordReads = new Map<string, KeptAcross<AnalyticsDatastoreRecords>>()
+
 async function readScoped(window: AnalyticsWindow, orgLogin?: string, signal?: AbortSignal) {
   const organizations = selectOrganizations(orgLogin)
   if (!organizations.length) throw new HttpError(409, 'No GitHub account is ready yet')
   const me = getMeta('me') || ''
-  return readAnalyticsInWorker({ organizations, me, window,
-    scopes: { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) } }, signal)
+  const scopes = { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) }
+  const key = JSON.stringify([window.since ?? null, window.until ?? null, me, scopes,
+    organizations.map((org) => [org.login, org.datastorePath, org.error ?? null])])
+  // An account whose read failed is read again next time: its failure (a
+  // busy datastore) may pass without any file changing. A sync failure is the
+  // account's own state, part of the key.
+  return readKeptAcross(organizations.map((org) => analyticsDatastorePath(org)), key, recordReads,
+    () => readAnalyticsInWorker({ organizations, me, window, scopes }, signal),
+    { keep: (records) => records.errors.every((error) => error.stale) })
 }
 
 export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string, dailyBounds?: string[], signal?: AbortSignal): Promise<AnalyticsReport> {
