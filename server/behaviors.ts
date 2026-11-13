@@ -5282,8 +5282,10 @@ async function tickApprovePrs(): Promise<void> {
           && org && readyOrganizations().some((ready) => ready.login === org.login && ready.datastorePath === org.datastorePath)
           ? nextTickAtMs : null
         context.progress = { ...progress, cursor: getMeta('behavior_approve_prs_cursor'), launches, ownershipError,
-          continuationAt, disposition: continuationAt !== null && launches.length > 0
-            && launches.length === progress.launched && launches.every((launch) => launch.ownership === 'owned')
+          continuationAt, disposition: continuationAt !== null && snapshot !== null
+            && launches.length === attemptedClaims.size && launches.length === progress.launched
+            && (launches.length > 0 || progress.launchesPending > 0)
+            && launches.every((launch) => launch.ownership === 'owned')
             ? 'deferred' : 'unresolved' }
       }
     }
