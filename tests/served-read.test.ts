@@ -85,7 +85,7 @@ describe('healthReadKey', () => {
     const two = [{ login: 'Alpha', status: 'ready' }, { login: 'beta', status: 'ready' }] as const
     expect(healthReadKey('', two)).toBe(healthReadKey('', [...two].reverse()))
     expect(healthReadKey('', two)).not.toBe(healthReadKey('', [two[0]]))
-    expect(healthReadKey('', two)).not.toBe(healthReadKey('', [two[0], { login: 'beta', status: 'syncing' }]))
+    expect(healthReadKey('', two)).not.toBe(healthReadKey('', [two[0], { login: 'beta', status: 'initializing' }]))
     expect(healthReadKey('alpha', [two[0]])).not.toBe(healthReadKey('', [two[0]]))
   })
 })
