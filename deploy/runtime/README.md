@@ -77,6 +77,10 @@ with native review and implementation Calls held live through activation, then
 checks those same Calls' publication receipts and resource release against a
 no-switch workload. Providers and GitHub responses in this check are stand-ins.
 `... IMAGE runc` separately checks refusal under Docker's default profile.
+Resource-growth fixtures hold the initialized allocation child on stdin until
+the independent observer asserts the complete tree starts below 256 MiB.
+Memory cases require an independently observed overrun before enforced success,
+alongside the existing termination, cleanup and live-neighbor checks.
 The Runtime image workflow installs a pinned runsc only on its disposable CI
 runner. Tests use isolated tmpfs and home-volume state, no network, no provider identities or
 GitHub actions. They are component proof; the frozen real-provider campaign
