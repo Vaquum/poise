@@ -51,4 +51,41 @@ describe('servedRead', () => {
     await expect(servedRead({ running: null, last: null }, async () => { throw new Error('journal unreadable') }, { waitMs: 5, servedMs: 500 }))
       .rejects.toThrow('journal unreadable')
   })
+
+  it('makes the next reader wait for the real outcome after a refresh fails, until one succeeds', async () => {
+    const state: ServedRead<string> = { running: null, last: { value: 'old', at: Date.now() } }
+    const failing = deferred<string>()
+    expect(await servedRead(state, () => failing.promise, { waitMs: 5, servedMs: 60_000 })).toBe('old')
+    failing.reject(new Error('journal unreadable'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    // The old figures are not served over a failure: the next reader gets the outcome.
+    await expect(servedRead(state, async () => { throw new Error('still unreadable') }, { waitMs: 5, servedMs: 60_000 }))
+      .rejects.toThrow('still unreadable')
+    expect(await servedRead(state, async () => 'recovered', { waitMs: 5, servedMs: 60_000 })).toBe('recovered')
+    const slow = deferred<string>()
+    expect(await servedRead(state, () => slow.promise, { waitMs: 5, servedMs: 60_000 })).toBe('recovered')
+    slow.resolve('later')
+  })
+
+  it('never serves a result that would pass its limit during the wait', async () => {
+    let now = 119_900
+    const state: ServedRead<string> = { running: null, last: { value: 'almost too old', at: 0 } }
+    const slow = deferred<string>()
+    const read = servedRead(state, () => slow.promise, { waitMs: 300, servedMs: 120_000, now: () => now })
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    now = 120_300
+    slow.resolve('fresh')
+    expect(await read).toBe('fresh')
+  })
+})
+
+describe('healthReadKey', () => {
+  it('keys a projection by its scope and by every account it reads and how ready each is', async () => {
+    const { healthReadKey } = await import('../server/analytics-health')
+    const two = [{ login: 'Alpha', status: 'ready' }, { login: 'beta', status: 'ready' }] as const
+    expect(healthReadKey('', two)).toBe(healthReadKey('', [...two].reverse()))
+    expect(healthReadKey('', two)).not.toBe(healthReadKey('', [two[0]]))
+    expect(healthReadKey('', two)).not.toBe(healthReadKey('', [two[0], { login: 'beta', status: 'syncing' }]))
+    expect(healthReadKey('alpha', [two[0]])).not.toBe(healthReadKey('', [two[0]]))
+  })
 })

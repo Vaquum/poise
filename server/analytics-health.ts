@@ -448,6 +448,12 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
   return result
 }
 
+/** The accounts read, and how far each is ready, key a projection with its
+ *  scope: another set of accounts never answers from this one's. */
+export function healthReadKey(scope: string, organizations: ReadonlyArray<Pick<Organization, 'login' | 'status'>>): string {
+  return JSON.stringify([scope.toLowerCase(), organizations.map(org => `${org.login.toLowerCase()}:${org.status}`).sort()])
+}
+
 /** A read waits this long for a fresh projection before it takes the last one. */
 const HEALTH_WAIT_MS = 300
 /** The last projection answers a read while it is younger than this. */
@@ -462,9 +468,13 @@ const healthReads = new Map<string, ServedRead<AnalyticsHealth>>()
 export function readAnalyticsHealth(scope = ''): Promise<AnalyticsHealth> {
   const organizations = getOrganizations().filter(org => !scope || org.login.toLowerCase() === scope.toLowerCase())
   if (scope && !organizations.length) throw new HttpError(400, 'GitHub account is not configured')
-  const key = scope.toLowerCase()
+  const key = healthReadKey(scope, organizations)
   let state = healthReads.get(key)
-  if (!state) healthReads.set(key, state = { running: null, last: null })
+  if (!state) {
+    healthReads.set(key, state = { running: null, last: null })
+    // Another account set is rare; the oldest are dropped past a few.
+    if (healthReads.size > 8) healthReads.delete(healthReads.keys().next().value!)
+  }
   return servedRead(state, async () => {
     const snapshot = dependencySnapshot()
     return projectAnalyticsHealth(behaviorChainJournal(), { now: Date.now(), scope, organizations,
