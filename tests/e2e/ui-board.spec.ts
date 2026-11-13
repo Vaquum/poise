@@ -394,6 +394,30 @@ test('another organization’s runs never stand for the one chosen', async ({ pa
   await expect(card(page, 'Beta’s own issue')).toHaveAttribute('data-state', '')
 })
 
+test('an organization the fresh settings no longer hold stops being read', async ({ page }) => {
+  let logins = ['acme', 'beta']
+  let hold = false
+  const held: Array<() => void> = []
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    if (hold) await new Promise<void>((resolve) => held.push(resolve))
+    const response = await route.fetch()
+    return route.fulfill({ response, json: { ...(await response.json()), organizations: logins.map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })) } })
+  })
+  await board(page, { records: RECORDS })
+  await page.locator('[data-menu="board-org-menu"]').click()
+  await page.locator('#board-org-menu [data-org="beta"]').click()
+  await expect(page.locator('[data-org-label]')).toHaveText('beta')
+  // beta is removed elsewhere; the reload opens on the remembered settings, then the fresh ones land.
+  logins = ['acme']
+  hold = true
+  await page.reload()
+  await expect(page.locator('[data-org-label]')).toHaveText('beta')
+  hold = false
+  held.forEach((resolve) => resolve())
+  await expect(page.locator('[data-org-label]')).toHaveText('All orgs')
+})
+
 /** Settings as the service answers them, with this GitHub user and these organizations. */
 async function settings(page: Page, as: () => { me: string, orgs?: string[] }): Promise<void> {
   await page.route('**/api/settings', async (route) => {
@@ -453,5 +477,29 @@ test('All orgs never stands for another set of organizations', async ({ page }) 
   await page.reload()
   await expect(page.locator('.lanes .lane')).toHaveCount(5)
   await page.waitForTimeout(500)
+  await expect(card(page, 'Opened today')).toHaveCount(0)
+})
+
+test('a read restored on remembered settings is dropped when the fresh ones name another GitHub user', async ({ page }) => {
+  let me = 'octocat'
+  let hold = false
+  const held: Array<() => void> = []
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    if (hold) await new Promise<void>((resolve) => held.push(resolve))
+    const response = await route.fetch()
+    return route.fulfill({ response, json: { ...(await response.json()), me } })
+  })
+  await board(page, { records: RECORDS })
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // Another GitHub user is named elsewhere; the reload opens on the remembered settings and the last read.
+  me = 'someone-else'
+  hold = true
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // The fresh settings land: the read restored for octocat goes.
+  hold = false
+  held.forEach((resolve) => resolve())
   await expect(card(page, 'Opened today')).toHaveCount(0)
 })

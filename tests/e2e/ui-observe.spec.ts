@@ -309,3 +309,21 @@ test('System health’s coverage link opens Logging with Data and collection ope
   await open(page, '/?view=observe&part=logging&data=1&back=overview')
   await expect(page.locator('#lg-data')).toBeVisible()
 })
+
+test('an organization the fresh settings no longer hold stops being read', async ({ page }) => {
+  await open(page, '/?view=observe&part=tasks')
+  await page.locator('[data-menu="obv-org-menu"]').click()
+  await page.locator('#obv-org-menu [data-org="umbrella"]').click()
+  await expect(page.locator('[data-org-label]')).toHaveText('umbrella')
+  // umbrella is removed elsewhere; the reload opens on the remembered settings, then the fresh ones land.
+  let release = () => {}
+  const fresh = new Promise<void>((resolve) => { release = resolve })
+  await page.route((url) => url.pathname === '/api/settings', async (route) => {
+    await fresh
+    return route.fulfill({ json: { org: 'acme', me: 'me', agentAccount: 'bot', timezone: 'UTC', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }] } })
+  })
+  await page.reload()
+  await expect(page.locator('[data-org-label]')).toHaveText('umbrella')
+  release()
+  await expect(page.locator('[data-org-label]')).toHaveText('All orgs')
+})

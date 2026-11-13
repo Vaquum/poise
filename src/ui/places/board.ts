@@ -1147,19 +1147,35 @@ export const mount: MountPlace = (ctx) => {
   void (async () => {
     await placeSettings().catch(() => undefined)
     if (signal.aborted) return
-    const scope = getOrganizations().some((o) => o.login === F.org && o.status === 'ready') ? F.org : ''
-    if (scope !== F.org) choose({ org: scope })
+    const held = () => getOrganizations().some((o) => o.login === F.org && o.status === 'ready')
+    if (F.org && !held()) choose({ org: '' })
     // A return or a reload paints Board's last read at once, for the same GitHub
     // user, organization and filters; the read below refreshes it.
     me = getSettings().me ?? ''
     const kept = lastRead
+    let restored: LastRead | null = null
     if (kept && !readOnce && me && kept.me === me && kept.orgs === readyOrgs() && kept.key === readKey()) {
       ({ cards, items, intake, capacity, chats, truncated } = kept)
       statusesRead = kept.statuses
       runsRead = kept.runs
       readOnce = liveRead = true
+      restored = kept
       render(false)
     }
+    // Opened on remembered settings: when the fresh ones no longer hold the
+    // organization, it is no longer read; when they name another GitHub user or
+    // other organizations, a read restored for the remembered ones is dropped.
+    window.addEventListener('poise:settings-read', () => {
+      if (F.org && !held()) { choose({ org: '' }); void load(true); return }
+      if (restored && (restored.me !== (getSettings().me ?? '') || restored.orgs !== readyOrgs())) {
+        restored = null
+        cards = []; items = []; intake = null; capacity = null; chats = new Map(); truncated = false
+        statusesRead = undefined; runsRead = undefined
+        readOnce = liveRead = false
+        render(false)
+        void load(true)
+      }
+    }, { signal })
     void readRepos(F.org).then((r) => { repos = r.repos; if (r.warning) failures.set('repos', r.warning); else failures.delete('repos') }).catch((error) => { failures.set('repos', `Could not load your repositories: ${(error as Error).message}.`) })
     await load(true)
     const item = address.item
