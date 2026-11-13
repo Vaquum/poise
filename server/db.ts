@@ -1193,8 +1193,7 @@ export interface PrReviewState {
   quarantine: string | null
 }
 
-export function listPrReviewStates(): PrReviewState[] {
-  return db.prepare(`
+const PR_REVIEW_STATES_SQL = `
     SELECT key, target, launch_repo AS repo, launch_pr AS pr, launch_action AS action,
       launch_outcome AS outcome, launch_head_sha AS headSha, launch_expected_head AS expectedHead,
       launch_requested_at AS requestedAt, launch_completed_at AS completedAt,
@@ -1202,8 +1201,15 @@ export function listPrReviewStates(): PrReviewState[] {
       claim_id AS claimId, lease_until AS leaseUntil, launch_quarantine AS quarantine
     FROM behavior_seen
     WHERE key IN ('review-new-prs', 'approve-prs')
-      AND launch_repo IS NOT NULL AND launch_pr IS NOT NULL
-  `).all() as PrReviewState[]
+      AND launch_repo IS NOT NULL AND launch_pr IS NOT NULL`
+
+/** Review and approval launches; with `numbers`, only those of pull requests
+ *  with these numbers. behavior_seen keeps every launch ever made, and a
+ *  status read needs only the pull requests it reports. */
+export function listPrReviewStates(numbers?: readonly number[]): PrReviewState[] {
+  if (numbers === undefined) return cachedStatement(db, PR_REVIEW_STATES_SQL).all() as PrReviewState[]
+  return cachedStatement(db, `${PR_REVIEW_STATES_SQL} AND launch_pr IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify([...new Set(numbers)])) as PrReviewState[]
 }
 
 // Live review claims, including pre-launch ones whose launch row is not
