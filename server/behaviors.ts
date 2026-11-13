@@ -102,7 +102,7 @@ import { classifyBehaviorDiagnostic, diagnosticClassification, isRepoAccessDenie
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { DATASTORE_MAX_AGE_SECONDS, datastoreFreshnessByOrganization, initialDatastoreFreshness, openStaleMirrors, recordStaleMirrorBlock, runDatastoreHealth, staleDatastoreFailure, staleMirrorMessage, type DatastoreFreshness, type StaleDatastoreError } from './datastore-health'
 import { resolveReviewCheckout } from './review-checkout'
-import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDetached } from './process'
+import { claudeSubscriptionEnvironment, isAbortError, processFailureEvidence, runFile, runningCallerLaunches, spawnDetached } from './process'
 import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type CheckSlotStats } from './check-semaphore'
 import { ProcessLockError, withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
@@ -396,9 +396,11 @@ const META_PREFIX = 'behavior_'
 function enabledKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_enabled' }
 function settingKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_setting' }
 
-export function isEnabled(key: BehaviorKey): boolean {
+/** Whether a behavior is switched on, here: in an account's scope, only while
+ *  that account is ready. `ready` passes accounts the caller already read. */
+export function isEnabled(key: BehaviorKey, ready?: readonly Organization[]): boolean {
   const org = behaviorOrganization.getStore()
-  if (org && !readyOrganizations().some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
+  if (org && !(ready ?? readyOrganizations()).some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
     && candidate.datastorePath === org.datastorePath)) return false
   const saved = getMeta(enabledKey(key))
   return saved === '1' || (saved === null && (key === 'implement-issues' || key === 'repair-prs'))
@@ -919,6 +921,15 @@ function isPreparationBudgetExhaustion(call: LogEntry): boolean {
       'preparing_provider', 'acquiring_checkout'].includes(phase))
 }
 
+// A staged group's deadline stays on its revision, even when it limits local
+// inspection. It still counts toward that target's retry stop.
+function isFileGroupBudgetExhaustion(call: LogEntry): boolean {
+  return call.error_code === 'review_budget_exhausted'
+    && (call.diagnostic?.operation === 'provider.review' || call.diagnostic?.operation === 'github-interface')
+    && call.diagnostic.phase === 'file_group' && call.diagnostic.outcome === 'timed_out'
+    && call.diagnostic.context.submission === 'none'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -948,7 +959,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // verdict, the next slot is strictly more useful than the same dead run.
   if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit') return 'provider'
   if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)
-    && !isPreparationBudgetExhaustion(call)) return 'budget'
+    && !isPreparationBudgetExhaustion(call) && !isFileGroupBudgetExhaustion(call)) return 'budget'
   return null
 }
 
@@ -1821,6 +1832,16 @@ function runningIssueReviewCount(): number {
 type AgentLogSnapshot = Awaited<ReturnType<typeof fetchAgentLogSnapshot>>
 
 class BehaviorLogFeedError extends Error {}
+
+/** One call's evidence, the same in the whole history as in the call's own
+ *  read. The whole history leaves out progress events (server/agent.ts), so
+ *  they are no part of the comparison. */
+function sameCallEvidence(history: AgentLogSnapshot['entries'][number] | undefined, call: AgentLogSnapshot['entries'][number]): boolean {
+  if (!history) return false
+  const { progress: _history, ...recorded } = history
+  const { progress: _call, ...read } = call
+  return isDeepStrictEqual(recorded, read)
+}
 
 async function readBehaviorLogSnapshot(fresh = false): Promise<AgentLogSnapshot> {
   try {
@@ -2984,6 +3005,7 @@ async function currentHeadSha(
   repo: string,
   number: number,
   actor: string,
+  reportFailure = true,
 ): Promise<string> {
   const [owner, name] = repo.split('/', 2)
   if (!owner || !name || !Number.isSafeInteger(number) || number < 1) {
@@ -2994,7 +3016,7 @@ async function currentHeadSha(
   const { stdout } = await runFile(
     GH_INTERFACE,
     ['--head-sha', `#${number}`, '--token-user', actor],
-    { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
+    { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure },
   )
   const data = objectValue(
     parseJson(stdout, 'github-interface --head-sha'),
@@ -3115,7 +3137,7 @@ function settleClaimAfterExit(
               claim.launchExpectedHead, claim.launchActor, call.model, target)
             retryable503 = isRunnable(behavior) && !!current && !current.launchQuarantine
               && (!current.launchCallId || current.launchCallId === call.id)
-              && isDeepStrictEqual(history.entries.find((entry) => entry.id === call.id), call)
+              && sameCallEvidence(history.entries.find((entry) => entry.id === call.id), call)
               && !logQuarantine(history, { repo: claim.launchRepo, prId: String(claim.launchPr), behavior: claim.launchBehavior })
               && !history.entries.some((entry) => entry.repo === claim.launchRepo && entry.pr_id === String(claim.launchPr)
                 && entry.behavior === claim.launchBehavior && !unambiguousAgentCall(history, entry))
@@ -3474,10 +3496,68 @@ async function recoverSnapshotReviews(
   setMeta(SNAPSHOT_RECOVERY_META, '1')
 }
 
+async function retainPrSweepProgress(
+  key: 'review-new-prs' | 'approve-prs',
+  progress: Record<string, string | number | null> & { launched: number },
+  attemptedClaims: Set<string>,
+  lifecycleSignal: AbortSignal | undefined,
+): Promise<void> {
+  const context = diagnosticIdentity()
+  if (!context) return
+  context.progress = progress
+  const reason = behaviorSignal()?.reason
+  if (reason instanceof DOMException && reason.name === 'TimeoutError') {
+    const claims = listBehaviorLaunchClaims(key).filter((claim) => attemptedClaims.has(claim.claimId))
+    let snapshot: AgentLogSnapshot | null = null
+    let ownershipError: string | null = null
+    try {
+      // The work deadline has expired, but Caller may have registered a
+      // launch since the last read. Observe it without admitting more work.
+      snapshot = await fetchAgentLogSnapshot({ fresh: true, signal: lifecycleSignal })
+    } catch (error) { ownershipError = behaviorErrorMessage(error) }
+    const launches = claims.map((claim) => {
+      const call = snapshot?.entries.find((row) => row.correlation_id === claim.launchCorrelationId)
+      const owned = snapshot && call && !claim.launchQuarantine && !claim.launchError
+        && unambiguousAgentCall(snapshot, call)
+        && claim.launchCorrelationId === claim.claimId
+        && (!claim.launchCallId || claim.launchCallId === call.id)
+        && claim.launchBehavior === upstreamBehavior(key) && call.behavior === claim.launchBehavior
+        && call.repo === claim.launchRepo && String(call.pr_id) === String(claim.launchPr)
+        && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
+        && claim.launchSource === `poise:${key}` && call.source === claim.launchSource
+        && call.expected_head === claim.launchExpectedHead
+        && Number.isFinite(Date.parse(claim.launchRequestedAt))
+        && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
+        && RUNNING_AGENT_STATUSES.has(call.status.toLowerCase())
+        && call.action == null && call.outcome == null && call.head_sha == null
+        && call.review_id == null && call.receipts == null && call.review_comments == null
+      return { target: claim.target, claimId: claim.claimId, correlationId: claim.launchCorrelationId,
+        expectedHead: claim.launchExpectedHead, callId: call?.id ?? claim.launchCallId,
+        status: call?.status ?? null, ownership: owned ? 'owned' : 'unresolved' }
+    })
+    const org = currentOrganization()
+    const continuationAt = tickerStarted && tickTimer && isRunnable(key)
+      && !releaseBackgroundPaused() && !releaseSwitchPending()
+      && org && readyOrganizations().some((ready) => ready.login === org.login && ready.datastorePath === org.datastorePath)
+      ? nextTickAtMs : null
+    context.progress = { ...progress, cursor: getMeta(key === 'review-new-prs' ? 'behavior_review_new_prs_prepare_cursor' : 'behavior_approve_prs_cursor'), launches, ownershipError,
+      continuationAt, disposition: continuationAt !== null && launches.length > 0
+        && launches.length === progress.launched && launches.every((launch) => launch.ownership === 'owned')
+        ? 'deferred' : 'unresolved' }
+  }
+}
+
 async function tickReviewNewPrs(): Promise<void> {
   if (!isEnabled('review-new-prs')) return
   const author = getMeta('me') || ''
   if (!author) return
+  const context = diagnosticIdentity()
+  const progress = { eligiblePrs: null as number | null, checksPending: null as number | null,
+    prepared: 0, launched: 0, publication: 'unverified' }
+  const attemptedClaims = new Set<string>()
+  const lifecycleSignal = behaviorAbortController?.signal
+  const sweepSignal = behaviorSignal()
+  if (context) context.progress = progress
   // Settle launch claims before any eligibility read in this tick. The
   // approve-prs tick runs concurrently and evaluates against settled
   // review state, so reconciliation keeps its historical tick-head
@@ -3498,6 +3578,7 @@ async function tickReviewNewPrs(): Promise<void> {
 
   if (await initializeReviewBaseline()) return
   try {
+    if (context && !sweepSignal?.aborted) context.phase = 'listing'
     const reviewerCount = getReviewers('review-new-prs')
     await retireStaleReviewerTrips()
     // Admission remembers the configured panel; only launches slide past
@@ -3511,6 +3592,7 @@ async function tickReviewNewPrs(): Promise<void> {
       : availableReviewSlots(await launchReviewPanel(reviewerCount, 'pr_review'))
     if (guard.length === 0) return
     const prs = await listEligiblePrs('review-new-prs', author)
+    progress.eligiblePrs = prs.length
     await recoverSnapshotReviews(prs)
     let failure: unknown
     const ordered = orderByCursor(prs, 'behavior_review_new_prs_prepare_cursor')
@@ -3550,6 +3632,8 @@ async function tickReviewNewPrs(): Promise<void> {
     // one process per candidate at once, and the cursor rotates coverage so
     // the next sweep prepares the rest.
     const prepared: PreparedReviewTarget[] = []
+    progress.checksPending = candidates.length
+    if (context && !sweepSignal?.aborted) context.phase = 'preparation'
     await forEachPool(candidates, REVIEW_PREPARE_CONCURRENCY, async ([pr, key, slot]) => {
       const target = reviewSlotTarget(key, slot)
       const checkTarget = `${target}:check`
@@ -3557,7 +3641,8 @@ async function tickReviewNewPrs(): Promise<void> {
       setMeta('behavior_review_new_prs_prepare_cursor', key)
       try {
         const bundle = await prepareReviewTarget(pr, key, slot)
-        if (bundle) prepared.push(bundle)
+        if (bundle) { prepared.push(bundle); progress.prepared++ }
+        if (!behaviorAborted()) progress.checksPending! -= 1
       } catch (err) {
         if (behaviorAborted()) return
         if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
@@ -3589,6 +3674,7 @@ async function tickReviewNewPrs(): Promise<void> {
       }
     }
     try {
+      if (context && !sweepSignal?.aborted) context.phase = 'claim'
       await underLifecycleSignal(() => withBehaviorProcessLock('review-new-prs', async () => {
         // Read the ceiling here, closest to the spawn: narrowing it in the
         // view must take effect on launches already being prepared.
@@ -3679,6 +3765,7 @@ async function tickReviewNewPrs(): Promise<void> {
               [...admittedSlots],
             )) { ownedClaimId = null; releaseLeases(claimId); continue }
             claimed.push({ prepared: bundle, claimId, setting })
+            attemptedClaims.add(claimId)
             ownedClaimId = null
           } catch (err) {
             if (behaviorAborted()) {
@@ -3707,6 +3794,7 @@ async function tickReviewNewPrs(): Promise<void> {
     // The next tick prepares fresh on the new head; Caller's exact-head
     // checks still backstop the remaining race.
     const verified: { prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting }[] = []
+    if (context && !sweepSignal?.aborted) context.phase = 'head-verification'
     await underLifecycleSignal(() => forEachPool(claimed, REVIEW_PREPARE_CONCURRENCY, async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target } = bundle
       try {
@@ -3738,6 +3826,7 @@ async function tickReviewNewPrs(): Promise<void> {
     // without the behavior lock: the atomic claim plus launch intent is the
     // ownership. The checkout runs here, under the lifecycle signal, so a
     // cold clone can't consume the sweep deadline.
+    if (context && !sweepSignal?.aborted) context.phase = 'launch'
     await underLifecycleSignal(() => Promise.all(verified.map(async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target, checkTarget } = bundle
       let checkoutReady = false
@@ -3774,6 +3863,7 @@ async function tickReviewNewPrs(): Promise<void> {
         }
         checkoutReady = true
         await spawnReviewLaunch(bundle, claimId, setting, pwd)
+        progress.launched++
         if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, bundle.actor)
         console.log(`[behaviors] review-new-prs fired for ${pr.repo}#${pr.number} (p=${setting}, ${slot})`)
       } catch (err) {
@@ -3795,8 +3885,10 @@ async function tickReviewNewPrs(): Promise<void> {
     })))
     if (failure) throw failure
   } catch (err) {
-    if (!(err instanceof BehaviorLogFeedError) && !staleDatastoreFailure(err)) console.error('[behaviors] tick failed:', err)
+    if (!behaviorAborted() && !(err instanceof BehaviorLogFeedError) && !staleDatastoreFailure(err)) console.error('[behaviors] tick failed:', err)
     throw err
+  } finally {
+    await retainPrSweepProgress('review-new-prs', progress, attemptedClaims, lifecycleSignal)
   }
 }
 
@@ -4014,10 +4106,9 @@ function boundedReviewFailure(call: LogEntry): boolean {
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
 }
 
-// A budget-exhausted run that proved it posted nothing is a provider-side
-// failure, not an ambiguous side effect: Caller verifies against live
-// GitHub before failing this way, and says so when it cannot. It retries
-// the same head on backoff until two matching automatic timeouts. An
+// A budget-exhausted run that proved it posted nothing can retry on this head:
+// Caller verifies against live GitHub before failing this way, and says so
+// when it cannot. It retries on backoff until two matching automatic timeouts. An
 // uncertain submission or deterministic input exhaustion holds immediately.
 function budgetExhaustedProvenNoAction(call: LogEntry): boolean {
   return call.review_policy === REVIEW_POLICY
@@ -4040,7 +4131,7 @@ function prReviewRetryState(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call))
   const timeouts = calls.filter((call) => call.model === model && budgetExhaustedProvenNoAction(call)
-    && reviewerTripKind(call) === 'budget'
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
   const stopped = timeouts.length >= 2 || retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
     claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head
@@ -4168,7 +4259,7 @@ function ensureBudgetStopHold(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call)
     && call.model === model && budgetExhaustedProvenNoAction(call)
-    && reviewerTripKind(call) === 'budget'
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
     .sort((a, b) => Date.parse(agentCallStartedAt(b)) - Date.parse(agentCallStartedAt(a)))
   const latest = timeouts[0]
@@ -4562,7 +4653,7 @@ async function readChangesAddressedBatch(
     '--requested-changes-addressed', '--requests-json',
     JSON.stringify(prs.map((pr) => ({ repository: pr.repo, number: pr.number }))),
     '--username', reviewer, '--token-user', reviewer,
-  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false })
   const packet = objectValue(
     parseJson(stdout, 'github-interface --requested-changes-addressed batch'),
     'github-interface --requested-changes-addressed batch',
@@ -4594,13 +4685,14 @@ async function readChangesAddressedBatch(
 async function readReviewActivityBatch(
   requests: { pr: DatastorePr, since: string }[],
   reviewer: string,
+  reportFailure = true,
 ): Promise<BatchRead<ReviewActivityResult>[]> {
   const { stdout } = await runFile(GH_INTERFACE, [
     '--review-activity-since', '--requests-json',
     JSON.stringify(requests.map(({ pr, since }) => ({ repository: pr.repo, number: pr.number,
       since: reviewer.toLowerCase() === (getMeta('me') || '').toLowerCase() ? '1970-01-01T00:00:00Z' : since }))),
     '--username', reviewer, '--token-user', reviewer,
-  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(), reportFailure })
   const packet = objectValue(
     parseJson(stdout, 'github-interface --review-activity-since batch'),
     'github-interface --review-activity-since batch',
@@ -4662,7 +4754,7 @@ async function fireApprove(
   admittedReviewer?: string,
   replacesFailedCallId?: string,
 ): Promise<boolean> {
-  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author) }, async () => {
+  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author), phase: 'launch', expectedHead }, async () => {
   if (!isRunnable('approve-prs')) return false
   const accounts = prAccounts()
   const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
@@ -4687,7 +4779,8 @@ async function fireApprove(
   // does not discard it. Only shutdown or disable discards prepared work.
   return underLifecycleSignal(async () => {
   try {
-  const currentHead = await currentHeadSha(pr.repo, pr.number, actor)
+  const currentHead = await withNoticeDiagnosticIdentity({ ...diagnosticIdentity()!, phase: 'head-check' },
+    () => currentHeadSha(pr.repo, pr.number, actor, false))
   // The head-SHA lookup above is a subprocess with a 30s timeout, so the user
   // has a real window to turn the behaviour off while it is out. Nothing
   // re-read the flag between it returning and the spawn below, so a toggle-off
@@ -4814,9 +4907,15 @@ async function fireApprove(
     // The sweep deadline may expire while a launch is in flight; tickApprovePrs
     // reads that as an abort and would drop a genuine failure silently, so log
     // and record it here, as review-new-prs phase 3 does.
-    if (behaviorAborted()) return false
-    if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
-    recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+    let retry: BehaviorFailureState | null = null
+    try {
+      if (behaviorAborted()) return false
+      recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+      retry = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+    } finally {
+      if (!(err instanceof BehaviorLogFeedError) && !isAbortError(err)) diagnosticFailure(
+        processFailureEvidence(err)?.operation ?? 'application.behaviors', err, { retry })
+    }
     return false
   }
   })
@@ -4999,11 +5098,22 @@ async function tickApprovePrs(): Promise<void> {
         progress.changeChecksRead += read
         progress.checksPending -= read
       } catch (err) {
-        if (behaviorAborted()) return
-        console.error('[behaviors] approve-prs batch check failed:', err)
-        for (const pr of batch) {
-          // One error for the whole batch: unattributable to any repository.
-          recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+        let retry: Array<{ target: string, consecutiveFailures: number | null, nextRetryAt: string | null }> | null = null
+        try {
+          if (behaviorAborted()) return
+          for (const pr of batch) {
+            // One error for the whole batch: unattributable to any repository.
+            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+          }
+          retry = batch.map((pr) => {
+            const state = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+            return { target: `${pr.repo}#${pr.number}`,
+              consecutiveFailures: state?.consecutiveFailures ?? null, nextRetryAt: state?.nextRetryAt ?? null }
+          })
+        } finally {
+          if (!isAbortError(err)) diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err, {
+            account: reviewer, phase: 'changes-addressed', targets: batch.map((pr) => ({ target: `${pr.repo}#${pr.number}` })), retry,
+          })
         }
         continue
       }
@@ -5088,16 +5198,28 @@ async function tickApprovePrs(): Promise<void> {
         let activityRecords: BatchRead<ReviewActivityResult>[]
         try {
           if (context) context.phase = 'review-activity'
-          activityRecords = await readReviewActivityBatch(activityBatch, reviewer)
+          activityRecords = await readReviewActivityBatch(activityBatch, reviewer, false)
           const activityRead = activityRecords.filter((record) => record.error === null).length
           progress.activityChecksRead += activityRead
           progress.checksPending -= activityRead
         } catch (err) {
-          if (behaviorAborted()) return
-          console.error('[behaviors] approve-prs batch activity check failed:', err)
-          for (const { pr } of activityBatch) {
-            // One error for the whole batch: unattributable to any repository.
-            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+          let retry: Array<{ target: string, consecutiveFailures: number | null, nextRetryAt: string | null }> | null = null
+          try {
+            if (behaviorAborted()) return
+            for (const { pr } of activityBatch) {
+              // One error for the whole batch: unattributable to any repository.
+              recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
+            }
+            retry = activityBatch.map(({ pr }) => {
+              const state = getBehaviorFailureState('approve-prs', `${pr.repo}#${pr.number}:check`)
+              return { target: `${pr.repo}#${pr.number}`,
+                consecutiveFailures: state?.consecutiveFailures ?? null, nextRetryAt: state?.nextRetryAt ?? null }
+            })
+          } finally {
+            if (!isAbortError(err)) diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err, {
+              account: reviewer, phase: 'review-activity',
+              targets: activityBatch.map(({ pr, check }) => ({ target: `${pr.repo}#${pr.number}`, expectedHead: check.headSha })), retry,
+            })
           }
           continue
         }
@@ -5275,49 +5397,7 @@ async function tickApprovePrs(): Promise<void> {
     }
     if (failure) throw failure
   } finally {
-    if (context) {
-      context.progress = progress
-      const reason = behaviorSignal()?.reason
-      if (reason instanceof DOMException && reason.name === 'TimeoutError') {
-        const claims = listBehaviorLaunchClaims('approve-prs').filter((claim) => attemptedClaims.has(claim.claimId))
-        let snapshot: AgentLogSnapshot | null = null
-        let ownershipError: string | null = null
-        try {
-          // The work deadline has expired, but Caller may have registered a
-          // launch since the last read. Observe it without admitting more work.
-          snapshot = await fetchAgentLogSnapshot({ fresh: true, signal: lifecycleSignal })
-        } catch (error) { ownershipError = behaviorErrorMessage(error) }
-        const launches = claims.map((claim) => {
-          const call = snapshot?.entries.find((row) => row.correlation_id === claim.launchCorrelationId)
-          const owned = snapshot && call && !claim.launchQuarantine && !claim.launchError
-            && unambiguousAgentCall(snapshot, call)
-            && claim.launchCorrelationId === claim.claimId
-            && (!claim.launchCallId || claim.launchCallId === call.id)
-            && claim.launchBehavior === 'pr_approve' && call.behavior === claim.launchBehavior
-            && call.repo === claim.launchRepo && String(call.pr_id) === String(claim.launchPr)
-            && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
-            && claim.launchSource === 'poise:approve-prs' && call.source === claim.launchSource
-            && call.expected_head === claim.launchExpectedHead
-            && Number.isFinite(Date.parse(claim.launchRequestedAt))
-            && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
-            && RUNNING_AGENT_STATUSES.has(call.status.toLowerCase())
-            && call.action == null && call.outcome == null && call.head_sha == null
-            && call.review_id == null && call.receipts == null && call.review_comments == null
-          return { target: claim.target, claimId: claim.claimId, correlationId: claim.launchCorrelationId,
-            expectedHead: claim.launchExpectedHead, callId: call?.id ?? claim.launchCallId,
-            status: call?.status ?? null, ownership: owned ? 'owned' : 'unresolved' }
-        })
-        const org = currentOrganization()
-        const continuationAt = tickerStarted && tickTimer && isRunnable('approve-prs')
-          && !releaseBackgroundPaused() && !releaseSwitchPending()
-          && org && readyOrganizations().some((ready) => ready.login === org.login && ready.datastorePath === org.datastorePath)
-          ? nextTickAtMs : null
-        context.progress = { ...progress, cursor: getMeta('behavior_approve_prs_cursor'), launches, ownershipError,
-          continuationAt, disposition: continuationAt !== null && launches.length > 0
-            && launches.length === progress.launched && launches.every((launch) => launch.ownership === 'owned')
-            ? 'deferred' : 'unresolved' }
-      }
-    }
+    await retainPrSweepProgress('approve-prs', progress, attemptedClaims, lifecycleSignal)
   }
 }
 
@@ -8033,7 +8113,7 @@ function serializeBehaviorOperation<T>(
     const lifecycle = behaviorAbortController?.signal
     const signal = lifecycle ? AbortSignal.any([lifecycle, deadline]) : deadline
     behaviorOperationDeadline.set(signal, clock)
-    const context = key === 'approve-prs' ? diagnosticIdentity() : undefined
+    const context = key === 'approve-prs' || key === 'review-new-prs' ? diagnosticIdentity() : undefined
     if (context) context.deadline = clock.expiresAt
     try {
       const result = await behaviorOperationSignal.run(signal, operation)
@@ -8347,7 +8427,12 @@ async function runBehaviorCycle(
     const lifecycle = behaviorAbortController?.signal
     if (readBehaviorFailure(key)?.kind === 'worker') clearBehaviorFailure(key)
     try {
-      const recovered = await serializeBehaviorOperation(key, operation)
+      const context = diagnosticIdentity()
+      const run = () => serializeBehaviorOperation(key, operation)
+      // A target can attach its identity to the shared deadline exception.
+      // Reattach the sweep identity before failure bookkeeping and capture.
+      const recovered = context && (key === 'approve-prs' || key === 'review-new-prs')
+        ? await withNoticeDiagnosticIdentity(context, run) : await run()
       if (recovered || readBehaviorFailure(key)?.kind === 'operation') {
         clearBehaviorFailure(key)
       }
@@ -8360,7 +8445,7 @@ async function runBehaviorCycle(
       if (lifecycle?.aborted !== true) {
         recordBehaviorFailure(key, 'operation', error)
         if (!(error instanceof BehaviorLogFeedError) && !staleDatastoreFailure(error)) {
-          const deferred = key === 'approve-prs' && error instanceof DOMException && error.name === 'TimeoutError'
+          const deferred = (key === 'approve-prs' || key === 'review-new-prs') && error instanceof DOMException && error.name === 'TimeoutError'
             && diagnosticIdentity()?.progress?.disposition === 'deferred'
           const report = deferred ? console.warn : console.error
           report(`[behaviors] ${key} operation failed:`, error)
@@ -8368,7 +8453,7 @@ async function runBehaviorCycle(
       }
     }
   }
-  return key === 'approve-prs' ? withNoticeDiagnosticIdentity({
+  return key === 'approve-prs' || key === 'review-new-prs' ? withNoticeDiagnosticIdentity({
     correlationId: randomUUID(), behavior: key, target: null, repository: null, account: null,
     organization: currentOrganization()?.login, phase: 'reconciliation',
   }, cycle) : cycle()
@@ -8644,6 +8729,15 @@ export interface BehaviorsRuntimeHealth {
 }
 
 function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): BehaviorsRuntimeHealth {
+  // Each behavior's switch, read once for this report: the checks below ask
+  // again and again, and each ask read every account afresh.
+  const ready = readyOrganizations()
+  const switches = new Map<BehaviorKey, boolean>()
+  const enabled = (key: BehaviorKey): boolean => {
+    let on = switches.get(key)
+    if (on === undefined) switches.set(key, on = isEnabled(key, ready))
+    return on
+  }
   const now = Date.now()
   const busyEntries = [...behaviorOperationStartedAt.entries()].filter(([key]) => key.startsWith(`${currentOrganization()?.login.toLowerCase() ?? 'legacy'}:`))
   const busy = busyEntries.map(([key, since]) => ({
@@ -8659,7 +8753,7 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
     .some(([key, startedAt]) => now > (behaviorOperationClocks.get(key)?.expiresAt ?? startedAt + BEHAVIOR_OPERATION_TIMEOUT_MS) + BEHAVIOR_HEALTH_GRACE_MS)
   const staleEpisodes = openStaleMirrors(currentOrganization())
   const failures = BEHAVIOR_KEYS.flatMap((behavior) => {
-    if (!isEnabled(behavior)) return []
+    if (!enabled(behavior)) return []
     return [undefined, ...behaviorFailureTargets(behavior)].flatMap((target) => {
       const failure = readBehaviorFailure(behavior, target)
       let recovered = false
@@ -8708,14 +8802,14 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
   for (const episode of staleEpisodes) {
     for (const behavior of episode.behaviors) {
       if (!(BEHAVIOR_KEYS as readonly string[]).includes(behavior)
-        || !isEnabled(behavior as BehaviorKey)
+        || !enabled(behavior as BehaviorKey)
         || failures.some((failure) => failure.behavior === behavior && failure.correlationId === episode.id)) continue
       failures.push({ behavior: behavior as BehaviorKey, kind: 'operation', consecutiveFailures: 1,
         failingSince: episode.startedAt, lastFailureAt: episode.startedAt, nextRetryAt: '', error: staleMirrorMessage(episode),
         diagnostic: diagnosticClassification('datastore_stale'), correlationId: episode.id })
     }
   }
-  const enabledForRuntime = (key: BehaviorKey) => isEnabled(key)
+  const enabledForRuntime = (key: BehaviorKey) => enabled(key)
     && (key !== 'implement-issues' && key !== 'repair-prs' || getBehaviorChainSettings().enabled)
   const anyEnabled = BEHAVIOR_KEYS.some(enabledForRuntime)
   let reviewer: string | null = null

@@ -255,6 +255,9 @@ existing resume event records `ciRecovery`. The normal decision path then
 rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
+Work impact and attention describe this automatic CI recheck instead of asking
+for Resume; attention retains the scheduled `reconciliation.nextObservationAt`.
+Unsettled original receipts and resources still require reconciliation first.
 
 Merged `merge-pr` and `resolve-threads` uncertainty uses original journal
 receipts only. A missing original response schedules no GitHub read; retaining
@@ -299,7 +302,7 @@ through the existing control after resolving the blocker.
 
 1. Each configured issue-review slot must finish successfully and its native receipt must identify an actually posted comment on the current issue revision. Before a new implementation, the fresh Caller mirror must expose complete explicit same-repository GitHub `blockedBy` evidence. A verified empty connection permits the ordinary path; absent or truncated capture waits visibly. Each recorded prerequisite waits by issue number until it is closed and a linked closing PR's merge commit is verified as an ancestor of the observed implementation base. Closing an issue, queueing a PR or merging only into another branch is insufficient. The ordinary chain sweep rechecks this dependency wait without admitting a worker, recording an execution failure or creating a remediation issue. Existing holds still require Resume. No elapsed review delay authorizes implementation.
 2. Implementation reads the actual issue and comments, makes real changes in a fresh checkout and runs the repository's checks. After the model ends, Caller's publication primitive commits, pushes and opens the linked PR. Commit trailers and the PR's chain marker preserve artifact identity across lost responses.
-3. Each current PR head receives the configured review invocations. Repairs use a fresh model invocation and the actual review packet, CI evidence and branch state. They publish code and substantive model-written replies to original findings. A new head requires fresh reviews and approval. An unchanged-code repair still requires independent approval verification.
+3. Fresh exact-head evidence of an actual branch conflict selects the existing scoped repair before PR review, after invocation, hold and queue guards. Clean or merely behind branches still receive the configured current-head reviews first. Repairs use a fresh model invocation and the actual review packet, CI evidence and branch state. They publish code and substantive model-written replies to original findings. A new head requires fresh reviews and approval. An unchanged-code repair still requires independent approval verification.
 4. Existing native primitives handle grey CI, approved nonblocking conversation resolution, strict readiness, merge and merge-queue admission. Conversation resolution also covers outdated threads, because GitHub's merge rule counts them, but only when readiness is blocked solely by `merge_state_not_clean` or `required_reviews_not_approved`, the blockers an open conversation can explain. A PR that readiness reports green goes to merge with its outdated threads left alone. Their repository policy leaves a merely behind branch to native queue integration; an actual conflict still requires repair. Completion requires the actual GitHub merge SHA. Queue admission, a finished turn, approval or CLOSED alone cannot complete a chain.
 5. A removed queue entry requires its actual GitHub removal event. Failed integration checks or conflicts lead to fresh repair; manual or unknown removal holds for a decision. A `merged` removal alongside an earlier open-PR read waits for confirmed merge evidence; that event alone neither completes nor holds the chain. An unchanged-head repair requires a new independent approval before another native queue attempt. Only that attempt's actual integration result can establish acceptance. Deliberate dismissal of a current-head managed approval is also held.
 
@@ -435,6 +438,18 @@ pre-push checkpoint or conclusive push result and retains the original fence.
 The plan contains metadata, not a replayable checkout. Closed-target
 reconciliation still forbids late publication and retains pending review evidence,
 including when a parent of an uncertain repair commit has merged.
+
+PR review and approval deadlines retain `failed` and their timeout code. Caller
+records `not_started` / `preflight_failed` only when the original durable phase
+is still `reviewing`, no publication receipt exists, and a successful recovery
+read validates the target/head and complete, unchanged reviewer inventory with
+no pending review. A diagnostic alone cannot supply that proof. Native
+settlement also matches the admitted PR/head, rejects contradictory receipts or
+submission phases, and waits for positive resource release. Ordinary backoff
+then permits at most three failed attempts before an explicit hold, retained
+across restart. Failed or incomplete recovery reads and an attempted POST keep
+the original effect fenced for receipt reconciliation; cleanup cannot promote
+them to no action.
 
 Durable model admissions use the existing semaphore's behavior-lane ceiling, including its interactive reserve. A fresh server process cannot fill that reserve with another background invocation merely because surviving workers hold no slots in its new in-memory semaphore. Existing work above a lowered ceiling finishes normally while new admissions wait. The journal's capacity check also precedes provider preparation, so waiting work cannot consume a provider recovery probe without launching; admission still rechecks capacity transactionally afterward.
 
@@ -621,7 +636,8 @@ Reporting is off by default. An operator can set
 `POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
 list of explicit `owner/repo` names, up to 8192 bytes so the workspace can echo
 it in health for gateway reconciliation. Enabled v2 chains check both new and existing
-repair holds, automatic implementation holds before a PR, and uncertain merge
+repair holds, automatic implementation holds before a PR, uncertain implementation
+publication, and uncertain merge
 submissions during their ordinary bounded reconciliation, including open `poise`
 seeds whose only PR closed unmerged; no Resume or extra poller is needed.
 Reporting preserves the source hold, uncertainty and ownership and does not
@@ -653,7 +669,7 @@ incomplete-reply error; `repair_execution_budget_exhausted` requires
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
 The reporter also accepts `review_budget_exhausted` and `review_inspection_timeout`,
-including a mixture of the two, for native `review-pr`
+including file-group deadlines and a mixture of the two codes, for native `review-pr`
 admissions by the reviewer account, pinned with `--expected-head`. Their basis
 includes `reviewContext` (base SHA, title and body), distinct from repair's
 `reviewRevision`. Each original receipt must retain the pre-submission `reviewing`
@@ -704,6 +720,23 @@ the bounded, redacted blocker as **worker-reported** and available structured Ca
 diagnostic facts. Caller's blocked result does not independently verify the worker's
 health-check, test-relay or other runner explanation. Its next action is to inspect
 the original Call, remedy the blocker and explicitly Resume for a fresh implementation.
+
+`implementation_publication_uncertain` qualifies an original `implement-issue`
+invocation that remains uncertain after recovery, including an unheld source.
+Its failed terminal Call is retained in `evidence.callId` while `invocation.callId`
+is still null. The original receipt must retain the `publishing` phase, completion
+time and positive resource-release proof without a conclusive publication result.
+Fresh reconciliation must still verify the same open, eligible source with no
+attributable pushed branch, bound PR or competing linked work. Reporting keeps
+the source fenced and names the original invocation, Call, bounded cause and
+missing pre-push no-write checkpoint or conclusive push result. It authorizes
+neither replacement implementation nor a second push. Its existing intent uses
+cause + source chain + original invocation. Before creation, source-body links
+and comments by configured accounts can identify an existing report, including a
+closed markerless issue by either configured account. Its body must verify the
+same source, invocation, Call and uncertain publication with missing original
+push evidence; an ordinary reference or another failure cannot qualify. Adoption
+retains that issue in the intent across restart without another POST or marker edit.
 
 `merge_submission_uncertain` separately qualifies the original pending `merge-pr`
 invocation after recovery rereads the journal, even without an explicit chain hold.
@@ -794,11 +827,16 @@ remediation issues cannot report any supported cause recursively, using their
 marker or the retained source-to-issue link; their ordinary holds and uncertainty
 remain visible.
 
-When a later repair hold reuses a closed implementation report, `waiting` leads
-with the current repair stage and worker-reported blocker, then directs the person
-to inspect the repair Call, address the blocker and explicitly Resume. The closed
-implementation report remains historical context; its body, intent and marker
-stay unchanged, and rereading either phase creates no replacement report.
+For implementation reports, `waiting` leads with the source's current implementation
+or repair stage and worker-reported blocker, then directs the person to inspect
+that Call, address the blocker and explicitly Resume. Report dispositions carry
+the time of successful report verification, not the status read or source observation;
+deferred or failed report reads cannot refresh that claim. Between ordinary
+rechecks, admission and remediation holds describe that dated observation, not
+live remediation. Once closure is verified, the report link remains historical
+context and the source blocker and next action remain. Its body, intent and marker
+stay unchanged; status reads and reconciliation create no replacement report or
+implementation attempt and do not change the quiescent cadence.
 
 `tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
 creation/restart, reconciliation, uncertain merge target suppression and normal

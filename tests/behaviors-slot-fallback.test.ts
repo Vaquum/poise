@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
 import type { LogEntry } from '../server/agent'
+import { parseAgentLogStdout } from '../server/agent-log-parse'
 import type { ReviewerTripKind } from '../server/behaviors'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, recordCompletedInitialReview, fixture } from './behaviors-runtime-fixture'
 
@@ -17,6 +18,8 @@ vi.mock('../server/agent', async (importOriginal) => {
 
 const RATE_LIMIT_ERROR = 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)'
 const GROK_ANALYSIS_LIMIT_ERROR = 'grok review reached its analysis time limit; handing off so the next model can run instead'
+const FILE_GROUP_DIAGNOSTIC = { version: 1, source: 'caller', severity: 'error', operation: 'provider.review',
+  phase: 'file_group', outcome: 'timed_out', stderr: '', stderr_truncated: false, timeout_seconds: 60, submission: 'none' } as const
 
 describe('terminal legacy timeout reporting', () => {
   afterEach(() => vi.unstubAllEnvs())
@@ -228,6 +231,24 @@ describe('reviewer trip classification', () => {
   it.each(holds)('does not trip on $name', async ({ error, code, diagnostic }) => {
     const { behaviors } = await loadModules()
     expect(behaviors.reviewerTripKind({ error, error_code: code, diagnostic } as LogEntry)).toBeNull()
+  })
+
+  it.each([
+    { name: 'provider group deadline', diagnostic: FILE_GROUP_DIAGNOSTIC, expected: null },
+    { name: 'inspection limited by group deadline', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, operation: 'github-interface' }, expected: null },
+    { name: 'older generic receipt', diagnostic: undefined, expected: 'budget' },
+    { name: 'provider analysis deadline', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, phase: 'provider_analysis' }, expected: 'budget' },
+    { name: 'overall deadline', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, phase: 'overall' }, expected: 'budget' },
+    { name: 'missing no-submission proof', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, submission: undefined }, expected: 'budget' },
+    { name: 'uncertain submission', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, submission: 'uncertain' }, expected: 'budget' },
+    { name: 'non-timeout failure', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, outcome: 'exit' }, expected: 'budget' },
+    { name: 'unrelated operation', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, operation: 'other.operation' }, expected: 'budget' },
+  ])('classifies decoded $name evidence', async ({ diagnostic, expected }) => {
+    const { behaviors } = await loadModules()
+    const snapshot = parseAgentLogStdout(JSON.stringify([agentLog({ status: 'failed', error_code: 'review_budget_exhausted',
+      error: 'Review reached its total time limit; needs attention', diagnostic })]), 'reviewer trip fixture')
+    expect(snapshot.quarantined).toEqual([])
+    expect(behaviors.reviewerTripKind(snapshot.entries[0])).toBe(expected)
   })
 
   it.each(['review_budget_exhausted', 'review_inspection_timeout', 'review_provider_error', 'review_provider_exit'])(
@@ -701,7 +722,101 @@ it.each(['initial review', 'approval', 'dismissed approval'] as const)(
 )
 
 it.each(['initial review', 'approval'] as const)(
-  'materializes an upgrade stop with no retained claim and keeps it retryable', async (lane) => {
+  'keeps file-group deadlines scoped to the %s target while preserving provider and submission holds', async lane => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-13T12:00:00Z'))
+    const initial = lane === 'initial review'
+    const behavior = initial ? 'review-new-prs' : 'approve-prs'
+    const launchBehavior = initial ? 'pr_review' : 'pr_approve'
+    const model = 'opus-5-xhigh'
+    const slots = { primary: model, secondary: model, tertiary: model }
+    let { db, runtime } = initial ? await startPrReviews(slots) : await startApprovals(slots)
+    const tick = async () => { await resetLogCache(); await runtime.runEnabledBehaviorsOnce() }
+    const expireBackoff = () => vi.setSystemTime(Date.now() + 3_600_001)
+    const other = (number: number) => ({ ...pr, number, url: `https://github.com/${pr.repo}/pull/${number}` })
+    let receiptId = 300
+    const receipt = (number = pr.number, overrides: Record<string, unknown> = {}) => {
+      const claim = db.listBehaviorLaunchClaims(behavior).find(row => row.launchPr === number)!
+      return agentLog({ id: (++receiptId).toString(16).padStart(32, '0'), behavior: launchBehavior,
+        repo: pr.repo, pr_id: String(number), model, status: 'failed',
+        started_at: claim.launchRequestedAt, started_at_precise: claim.launchRequestedAt,
+        completed_at: new Date().toISOString(), expected_head: claim.launchExpectedHead,
+        actor: claim.launchActor, source: claim.launchSource, correlation_id: claim.launchCorrelationId,
+        action: 'not_started', outcome: 'preflight_failed', review_policy: 'bounded-v1',
+        error_code: 'review_budget_exhausted', error: 'Review file-group time limit reached; incomplete analysis; reduce the review scope',
+        diagnostic: FILE_GROUP_DIAGNOSTIC, ...overrides })
+    }
+    const reviewerFailure = () => runtime.getBehaviorsRuntimeHealth().failures.find(row => row.target === `reviewer:${model}`)
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+    const target = db.listBehaviorLaunchClaims(behavior)[0].target
+    const first = receipt()
+    fixture.agentLogs.push(first)
+    await tick()
+    expect(db.getFailedBehaviorLaunch(behavior, target)?.launchCallId).toBe(first.id)
+    expect(reviewerFailure()).toBeUndefined()
+
+    // No backoff expiry: the same reviewer remains eligible on another PR.
+    fixture.listedPrs = [pr, other(18)]
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(mocks.spawnDetached.mock.calls[1][1]).toEqual(expect.arrayContaining(['#18', '--model', model]))
+    fixture.agentLogs.push(receipt(18, { status: 'completed', action: initial ? 'reviewed_clean' : 'approved',
+      outcome: initial ? 'clean' : 'approved', head_sha: first.expected_head, error: '', error_code: undefined, diagnostic: undefined }))
+    await tick()
+    fixture.listedPrs = [pr]
+    expireBackoff()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    const second = receipt(pr.number, { diagnostic: { ...FILE_GROUP_DIAGNOSTIC, operation: 'github-interface' } })
+    fixture.agentLogs.push(second)
+    await tick()
+    expect(db.getFailedBehaviorLaunch(behavior, target)?.launchError).toContain('Automatic retries stopped after two review timeouts')
+    expect(db.getFailedBehaviorLaunch(behavior, target)?.launchCallId).toBe(second.id)
+    expect(reviewerFailure()).toBeUndefined()
+    ;({ database: db, behaviors: runtime } = await restartModules())
+    runtime.startBehaviorsRuntime()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+
+    // The terminal stop is also target-only, including after a restart.
+    fixture.listedPrs = [pr, other(19), other(20)]
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(5)
+    for (const call of mocks.spawnDetached.mock.calls.slice(3)) expect(modelOf(call)).toBe(model)
+    const provider = receipt(19, { diagnostic: undefined, error: 'Review reached its total time limit; needs attention' })
+    fixture.agentLogs.push(provider)
+    await tick()
+    expect(reviewerFailure()?.callId).toBe(provider.id)
+    fixture.agentLogs.push(receipt(20))
+    await tick()
+    expect(reviewerFailure()?.callId).toBe(provider.id)
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(5)
+
+    // A new revision can run, but uncertain submission still fences its retry.
+    fixture.listedPrs = [pr]
+    arrangeCli(!initial, false, { headSha: NEXT_HEAD_SHA, reviewerReviewIdsSince: [], latestActivityAt: new Date().toISOString() },
+      { commits_after_request: 0, author_commits_after_request: 0, author_pr_comments_after_request: initial ? 0 : 1 })
+    expireBackoff()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
+    const uncertainTarget = db.listBehaviorLaunchClaims(behavior).find(row => row.launchPr === pr.number)!.target
+    const uncertain = receipt(pr.number, { error: 'Review file-group time limit reached; could not prove a safe recovery: a pending GitHub review requires reconciliation' })
+    fixture.agentLogs.push(uncertain)
+    await tick()
+    expireBackoff()
+    ;({ database: db, behaviors: runtime } = await restartModules())
+    runtime.startBehaviorsRuntime()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
+    const held = db.getFailedBehaviorLaunch(behavior, uncertainTarget)
+    expect(held?.launchCallId).toBe(uncertain.id)
+    expect(held?.launchError).toContain('could not prove a safe recovery')
+  },
+)
+
+it.each([['initial review', false], ['approval', false], ['initial review', true], ['approval', true]] as const)(
+  'materializes a %s upgrade stop with no retained claim and keeps it retryable (group deadline=%s)', async (lane, groupDeadline) => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-11-10T12:00:00Z'))
     const initial = lane === 'initial review'
@@ -736,7 +851,8 @@ it.each(['initial review', 'approval'] as const)(
       expected_head: HEAD_SHA, actor: 'review-bot', source: `poise:${behavior}`,
       correlation_id: correlation, action: 'not_started', outcome: 'preflight_failed',
       review_policy: 'bounded-v1', error_code: 'review_budget_exhausted',
-      error: 'Review reached its total time limit; needs attention' })
+      error: 'Review reached its total time limit; needs attention',
+      diagnostic: groupDeadline ? FILE_GROUP_DIAGNOSTIC : undefined })
     const firstId = 'a'.repeat(32)
     const secondId = 'b'.repeat(32)
     fixture.agentLogs.push(upgradeReceipt(firstId, 'upgrade-one'), upgradeReceipt(secondId, 'upgrade-two'))

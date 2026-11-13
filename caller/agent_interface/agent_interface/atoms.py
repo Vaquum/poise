@@ -186,12 +186,14 @@ def packet(
     head: str,
     p: str | None = None,
     since_head: str | None = None,
+    *,
+    reserve: float = 0,
 ) -> str:
     cache = review_budget.packet_cache()
     key = (pwd, pr, actor_name, head, p, since_head)
     if cache is not None and key in cache:
         return cache[key]
-    limit = review_budget.timeout(600)
+    limit = review_budget.timeout(600, reserve=reserve)
     progress.stage("preparing_packet", "Preparing PR packet", timeout=limit)
     args = [
         os.getenv("GITHUB_INTERFACE_CLI", "github-interface"),
@@ -211,7 +213,7 @@ def packet(
     except (OSError, subprocess.TimeoutExpired) as error:
         diagnostic = command_failure(error, "packet_acquisition", pwd, limit)
         try:
-            review_budget.timeout(1)
+            review_budget.timeout(1, reserve=reserve)
         except review_budget.ReviewLimitError as exhausted:
             exhausted.diagnostic = diagnostic
             raise

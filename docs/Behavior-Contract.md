@@ -191,6 +191,10 @@ no reviewer action. Submission rejections, `no_review` no-ops, malformed or
 duplicate verdicts and duplicate GitHub reviews are contract violations and
 held. Uncertain submissions are reconciled from live receipts before any retry.
 A budget-exhausted run that proved it posted nothing can retry on backoff.
+Verified file-group deadlines (`review_budget_exhausted`, diagnostic phase
+`file_group`, outcome `timed_out`, submission `none`) count toward the target's
+retry stop without tripping the shared reviewer or clearing an existing provider
+trip. Older generic budget receipts still trigger shared backoff.
 After two distinct automatic timeouts for the same PR, head, behavior and model,
 the legacy runtime retains the failed launch and shows that automatic retries
 stopped, without another retry time. Provider recovery, restart, another slot
@@ -289,14 +293,16 @@ the reviews it managed to prepare, and an `approve-prs` sweep still fires the
 approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
-An approval cycle failure retains its organization, last known phase, live
+Review and approval cycle failures retain their organization, last known phase, live
 effective deadline and observed check/launch counts in diagnostic context before
 clock cleanup, including a tick that returns on abort. Pending checks include
-unread or failed reads; prepared approvals still awaiting dispatch are counted
-separately. A deadline record retains the cursor, original launch claim,
+unfinished review preparation and unread or failed approval reads; prepared work
+is counted separately. A review timeout keeps the sweep identity even when a
+target attached its identity to the same exception. A deadline record retains
+the cursor, original launch claim,
 correlation, expected head and observed Call, plus the next scheduled tick.
 Only a proven deferral with matching, unambiguous running Call evidence and an
-available scheduled continuation is captured as Warning at the approval cycle.
+available scheduled continuation is captured as Warning at the sweep cycle.
 Missing or conflicting ownership, uncertain writes and unavailable continuation
 remain Errors. Read counts do not prove completed evaluation, and a launch does
 not prove publication: publication stays unverified until reconciliation proves
