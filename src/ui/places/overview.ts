@@ -19,6 +19,7 @@ import { mountDay } from './overview/day'
 import { mountHealth } from './overview/health'
 import { mountManager } from './overview/manager'
 import { mountMotion } from './overview/motion'
+import { rightFilter } from './overview/find'
 import { mountQuota } from './overview/quota'
 import type { ChainLike } from './overview/states'
 import { json, reason, whileVisible } from './overview/util'
@@ -41,12 +42,12 @@ function layoutHTML(): string {
       <header class="ova-head">
         <div class="ova-title"><h2 data-ref="nav.overview">Overview</h2><span class="t-gloss" data-when></span></div>
         <a class="back" href="#" data-back hidden data-ref="back"></a>
-        <div class="ova-ctl" data-dayctl></div>
+        <div class="ova-ctl" role="group" aria-label="Filters for this side" data-ref="ov.filters"><div data-dayctl></div><input class="search" type="search" placeholder="Filter…" aria-label="Filter this side" autocomplete="off" data-find data-ref="ov.find"><div data-orgctl></div></div>
       </header>
 
       <section class="ova-row" aria-label="Now">
         <div class="ocard ova-motion" data-ref="ov.motion">
-          <h3 class="ocard-h"><span class="t-micro">In motion</span><span class="t-gloss">Choose a state to list it</span></h3>
+          <h3 class="ocard-h"><span class="t-micro">In motion</span><span class="t-gloss" data-livenote="motion">live · choose a state to list it</span></h3>
           <div class="ova-counts"><span class="t-gloss">Chats and workers</span><div data-counts="people"></div><span class="t-gloss">Issues and pull requests</span><div data-counts="items"></div><span class="t-gloss">Tasks, by phase</span><div data-phases></div></div>
           <ul class="owork" data-worklist></ul>
           <div data-motionfail></div>
@@ -54,8 +55,8 @@ function layoutHTML(): string {
       </section>
 
       <section class="ova-sec" aria-labelledby="h-health" data-health>
-        <h3 class="ova-sh" id="h-health"><span class="t-micro">System health</span><span class="t-gloss">live · the last 24 hours of v2 chain work · each card opens its evidence</span></h3>
-        <div data-healthfail></div>
+        <h3 class="ova-sh" id="h-health"><span class="t-micro">System health</span><span class="t-gloss" data-livenote="health">live · the last 24 hours of v2 chain work · each card opens its evidence</span></h3>
+        <div data-healthfail></div><div data-healthnone></div>
         <div class="ohealths" data-ref="ov.health">
           ${health('ov.h.errors', placeHref('observe', { part: 'logging', back: 'overview' }), 'Errors per completed work item')}
           ${health('ov.h.blocked', placeHref('observe', { part: 'tasks', which: 'attention', back: 'overview' }), 'Work blocked')}
@@ -109,8 +110,10 @@ export const mount: MountPlace = async (ctx) => {
   routeBack($('[data-back]', root), address)
   const main: HTMLElement = $('.ova-main', root)
 
-  const motion = mountMotion(ctx, $('.ova-motion', root))
-  const behaviors = mountBehaviors(ctx, $('[data-behaviors]', root))
+  // One time filter (the day) and one search for everything on this side (#1380).
+  const find = rightFilter($('[data-find]', root) as HTMLInputElement, ctx.signal)
+  const motion = mountMotion(ctx, $('.ova-motion', root), find)
+  const behaviors = mountBehaviors(ctx, $('[data-behaviors]', root), find)
   const manager = mountManager(ctx, $('[data-mgrbox]', root), motion.sessions)
   const answers = mountAnswers(ctx, $('[data-answers]', root), {
     role: (chat) => motion.role(chat),
@@ -118,9 +121,17 @@ export const mount: MountPlace = async (ctx) => {
     chainsChanged: () => { void readChains() },
   })
   motion.onSessions(() => { manager.sessionsChanged(); answers.diagnosticsChanged() })
-  mountDay(ctx, main)
-  mountHealth(ctx, $('[data-health]', root))
-  mountQuota(ctx, $('[data-quota]', root))
+  // Live panels say when they are not for the chosen day.
+  const live: Record<string, string> = { motion: 'live · choose a state to list it', health: 'live · the last 24 hours of v2 chain work · each card opens its evidence' }
+  mountDay(ctx, main, find, (day) => {
+    behaviors.dayChanged(day)
+    for (const note of root.querySelectorAll<HTMLElement>('[data-livenote]')) {
+      const words = live[note.dataset.livenote ?? '']
+      note.textContent = day.isToday ? words : `${words.replace(/^live/, 'live now')} · not for ${day.label}`
+    }
+  })
+  mountHealth(ctx, $('[data-health]', root), find)
+  mountQuota(ctx, $('[data-quota]', root), find)
 
   // The chain's journal feeds Answer here (work that needs attention) and In motion (tasks).
   async function readChains(): Promise<void> {

@@ -5,7 +5,7 @@ import { bellTally, DEFAULT_LEVEL, LEVEL_KEY, noticeGroup, readLevel, saveLevel,
 import { chatOpening, diagnosticHref, itemOf, journalStep, targetOpening, timelineHref } from '../src/ui/places/overview/targets'
 import { chatState, countStates, issueState, pullState, taskPhase, taskState, type ChainLike } from '../src/ui/places/overview/states'
 import { decisionEntries, foldWaiting, itemEntries, ordered, requestEntries, requestsFrom, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
-import { countPair, moveTile, tileOrder } from '../src/ui/places/overview/day'
+import { countPair, moveTile, tileOrder, workTypeRows } from '../src/ui/places/overview/day'
 import type { AnalyticsReport } from '../src/analytics-format'
 
 // Overview's pure mappings (#556, PRD Support → Tests): the level, where a
@@ -261,6 +261,13 @@ describe('Answer here’s entries', () => {
 })
 
 describe('the day’s tiles', () => {
+  it('keeps the day’s own leading work type when a search narrows the rows (#1380)', () => {
+    const types = [{ type: 'feat', count: 8 }, { type: 'fix', count: 2 }, { type: 'docs', count: 0 }]
+    expect(workTypeRows(types, (type) => type.includes('fix'))).toEqual({ lead: { type: 'feat', count: 8 }, rows: [{ type: 'fix', count: 2 }] })
+    expect(workTypeRows(types, () => true).rows.map((row) => row.type)).toEqual(['feat', 'fix'])
+    expect(workTypeRows([], () => true)).toEqual({ lead: undefined, rows: [] })
+  })
+
   it('keeps the remembered order, and moves a tile within it', () => {
     const labels = ['A', 'B', 'C', 'D']
     expect(tileOrder(['C', 'gone', 'A'], labels)).toEqual(['C', 'A', 'B', 'D'])

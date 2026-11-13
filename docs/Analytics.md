@@ -18,14 +18,22 @@ existing chain journal evidence.
 
 - **Errors per completed work item** divides distinct work-error incidents over
   each completed item's lifetime by distinct seeds merged in the trailing 24
-  hours. The cohort uses original verified GitHub `mergedAt`, never observation
-  or later review-reconciliation time. Error-free completions count too.
+  hours. The cohort uses GitHub's own `mergedAt` for the chain's merge commit,
+  from any observation of the merged pull request: the chain's own publication,
+  or the existing pull request that closed the seed. Poise's copy of its
+  publication may lag a read behind; observation and later review-reconciliation
+  times are never used. Error-free completions count too.
   Execution failures include authentication and transport warnings; successful
   preparation warnings, ordinary review/CI feedback, stopped, superseded and
   closed-target no-effect outcomes do not count. Repeated incident observations
-  count once per item. Both known counts remain visible, but the rate is
-  unavailable for an empty or incomplete cohort, including missing lifetime
-  coverage before the trailing window.
+  count once per item. Errors come from the chain journal, which keeps every
+  settled run, so gaps in the observational ledger's coverage do not withhold
+  the rate. While a counted item still has a run admitted before its merge that
+  has not settled, the rate is shown as a lower bound (**at least**) with how
+  many items are still being reconciled. Both counts always show; the rate
+  itself says **None completed** when nothing merged in the window, and
+  **Unknown**, with the reason in words, when an account's GitHub evidence is
+  not ok or a merged chain's GitHub merge time is unknown.
 - **Work blocked** counts held, uncertain or overdue seeds, including those
   without a PR, with oldest verified progress age and the largest stage.
   Known healthy waits, including draft and queue waits older than 24 hours,
@@ -56,8 +64,18 @@ Five cards share one row where space permits and wrap on narrower screens.
 
 ## The day
 
-The control bar holds the day: previous day, the date, next day. Analytics
-opens on Today whenever Overview is entered; saving
+Overview's right-hand side has one set of filters, at its top right: the day
+(previous day, the date, next day), a search, and the organization. They apply
+to every panel on that side. The day is its only time filter: the day's
+numbers and the behaviors' runs, time and success follow it, and In motion,
+System health and the GitHub API quota, which are live, say *not for* the
+chosen day when it is not Today. The search shows in each panel only what
+matches its words, ignoring case: In motion lists every matching chat, issue,
+pull request or task whatever its state, with counts to match; the day's
+numbers, System health's cards, the behaviors and the API accounts show the
+matching ones. A panel with no match says so, and Escape clears the search.
+
+The day opens on Today whenever Overview is entered; saving
 settings while it shows keeps the chosen day. The arrows move one calendar
 day backward or forward; Next day is disabled on Today. Yesterday is named,
 and older days show a date including the year. Days start at midnight in the

@@ -279,8 +279,14 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     return off + groups + empty + coverage() + handledHTML
   }
 
-  function levelHTML(): string {
-    return `<div class="seg olevel" role="radiogroup" aria-label="How much to show" data-ref="ov.level">${LEVELS.map(([name, gloss], i) => `<button role="radio" aria-checked="${i === level}" aria-pressed="${i === level}" tabindex="${i === level ? 0 : -1}" data-level="${i}" title="${esc(gloss)}">${esc(name)}</button>`).join('')}</div>`
+  /** How many entries each level shows: choosing one visibly does what it says (#1380). */
+  const levelCounts = (): number[] => {
+    const open = openEntries()
+    return LEVELS.map((_, i) => open.filter((entry) => shownAt(entry.group, i)).length)
+  }
+  const levelName = (name: string, n: number) => `${name}, ${n} ${n === 1 ? 'entry' : 'entries'}`
+  function levelHTML(counts: number[]): string {
+    return `<div class="seg olevel" role="radiogroup" aria-label="How much to show" data-ref="ov.level">${LEVELS.map(([name, gloss], i) => `<button role="radio" aria-checked="${i === level}" aria-pressed="${i === level}" tabindex="${i === level ? 0 : -1}" data-level="${i}" title="${esc(gloss)}" aria-label="${esc(levelName(name, counts[i]))}">${esc(name)}<small data-level-n>${counts[i]}</small></button>`).join('')}</div>`
   }
 
   // A source's first read is the list loading, not an arrival: its entries
@@ -314,7 +320,16 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     if (focused && !focused.isConnected) $(`[data-notice="${CSS.escape(focused.closest<HTMLElement>('[data-notice]')?.dataset.notice ?? '')}"]`, list)?.focus({ preventScroll: true })
     paintTerms(list)
     const levelBox = $('[data-levelbox]', root)
-    if (levelBox && levelBox.dataset.shown !== String(level)) { levelBox.innerHTML = levelHTML(); levelBox.dataset.shown = String(level) }
+    const counts = levelCounts()
+    if (levelBox && levelBox.dataset.shown !== String(level)) { levelBox.innerHTML = levelHTML(counts); levelBox.dataset.shown = String(level) }
+    // Counts change in place, so focus on a level is never lost to a redraw.
+    else if (levelBox) {
+      const buttons = Array.from((levelBox as HTMLElement).querySelectorAll<HTMLElement>('[data-level]'))
+      buttons.forEach((button, i) => {
+        const n = button.querySelector('[data-level-n]')
+        if (n && n.textContent !== String(counts[i])) { n.textContent = String(counts[i]); button.setAttribute('aria-label', levelName(LEVELS[i][0], counts[i])) }
+      })
+    }
     const count = $('[data-ncount]', root)
     const t = tally(openEntries().map((entry) => entry.group), level)
     if (count) { count.textContent = String(t.count); if (t.tone) count.dataset.tone = t.tone; else delete count.dataset.tone }

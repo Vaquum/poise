@@ -44,6 +44,10 @@ interface Workspace {
   chainActions?: unknown[]
   /** What /api/behavior-metrics answers. */
   metrics?: unknown
+  /** The behavior-metrics reads asked, as their search parameters. */
+  metricsAsked?: URLSearchParams[]
+  /** The chain's tasks. */
+  chains?: unknown[]
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -80,7 +84,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     if (path === '/api/chat/sessions') return workspace.chatsFail ? json(route, { error: 'the chat service did not answer' }, 503) : json(route, { instance: 'poise-dev:test', sessions: [] })
     if (path === '/api/editor/reviews') return json(route, { publications: [], sweep: { publications: 0, longestDelayMinutes: 15 } })
     if (path === '/api/behavior-chains' && method === 'POST') { (workspace.chainActions ??= []).push(route.request().postDataJSON()); return json(route, {}) }
-    if (path === '/api/behavior-chains') return json(route, { chains: [], attention: workspace.attention ?? [] })
+    if (path === '/api/behavior-chains') return json(route, { chains: workspace.chains ?? [], attention: workspace.attention ?? [] })
     if (path === '/api/answers/dismissals' && method === 'POST') {
       const body = route.request().postDataJSON() as { key: string, revision: string }
       ;(workspace.dismissed ??= []).push(body)
@@ -96,7 +100,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       return json(route, { periods: bounds.slice(1).map((until, i) => ({ since: bounds[i], until, ...day })), errors: [] })
     }
     if (path === '/api/github-quota') return json(route, { accounts: [] })
-    if (path === '/api/behavior-metrics') return json(route, workspace.metrics ?? { behaviors: {}, error: null })
+    if (path === '/api/behavior-metrics') { (workspace.metricsAsked ??= []).push(url.searchParams); return json(route, workspace.metrics ?? { behaviors: {}, error: null }) }
     if (path === '/api/behavior-estimates') return json(route, { estimates: [] })
     if (path === '/api/agent-logs') return workspace.runsFail ? json(route, { error: 'agent-interface did not answer' }, 503) : json(route, { logs: [] })
     if (path === '/api/gh') return json(route, { records: [], held: [], errors: [] })
@@ -330,6 +334,56 @@ test('a chain card whose report changes while it is being put away comes back wi
   await expect(card).toBeVisible()
 })
 
+test('the right-hand side has one day, one search and the organization; Behaviors follows the day (#1380)', async ({ page }) => {
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, chains: [{ id: 'acme/site#7', sequence: 1, repository: 'acme/site', issue: 7, pullNumber: null,
+    held: null, waiting: null, mergeSha: null, supersession: null, reviewPending: null, invocations: [] }] }
+  await open(page, workspace)
+  const filters = page.locator('[data-ref="ov.filters"]')
+  await expect(filters.locator('[data-ref="ov.day"]')).toBeVisible()
+  await expect(filters.getByRole('searchbox', { name: 'Filter this side' })).toBeVisible()
+  // No time filter of its own in any panel.
+  await expect(page.locator('.ova-main [data-ref="ov.range"], .ova-main [data-range]')).toHaveCount(0)
+  await expect(page.locator('[data-ref="ov.behaviors.day"]')).toContainText('Today')
+  await expect.poll(() => workspace.metricsAsked?.at(-1)?.get('since') ?? null).not.toBeNull()
+  const today = workspace.metricsAsked!.at(-1)!
+
+  await filters.getByRole('button', { name: 'Previous day' }).click()
+  await expect(page.locator('[data-ref="ov.behaviors.day"]')).toContainText('Yesterday')
+  await expect.poll(() => workspace.metricsAsked!.at(-1)!.get('until')).toBe(today.get('since'))
+  await expect(page.locator('[data-livenote="motion"]')).toContainText('not for Yesterday')
+  await expect(page.locator('[data-livenote="health"]')).toContainText('not for Yesterday')
+  await filters.getByRole('button', { name: 'Next day' }).click()
+  await expect(page.locator('[data-livenote="motion"]')).not.toContainText('not for')
+
+  // One search narrows every panel and says so where nothing matches.
+  const search = filters.getByRole('searchbox', { name: 'Filter this side' })
+  await search.fill('merg')
+  await expect(page.locator('[data-tile="Pull requests merged"]')).toBeVisible()
+  await expect(page.locator('[data-tile="Pull requests opened"]')).toHaveCount(0)
+  await expect(page.locator('[data-beh]')).toHaveCount(1)
+  await expect(page.locator('[data-beh="merge-prs"]')).toBeVisible()
+  await expect(page.locator('[data-worklist]')).toContainText('Nothing here matches “merg”.')
+  await expect(page.locator('[data-ref="ov.h.blocked"]')).toBeHidden()
+  // Tasks the search hides are not tasks that are gone.
+  await expect(page.locator('[data-phases]')).toContainText('Nothing here matches “merg”.')
+  await search.press('Escape')
+  await expect(page.locator('[data-phases]')).toContainText('in intake')
+  await expect(page.locator('[data-tile="Pull requests opened"]')).toBeVisible()
+  await expect(page.locator('[data-beh]')).not.toHaveCount(1)
+  await expect(page.locator('[data-ref="ov.h.blocked"]')).toBeVisible()
+})
+
+test('each Show level says how many entries it shows (#1380)', async ({ page }) => {
+  const notice = (id: string, kind: string) => ({ id, kind, title: `${kind} title`, body: '', since: ago(5), due: ago(5), silenceable: false, target: null })
+  await open(page, { notices: [notice('n1', 'storage_low'), notice('n2', 'ledger_queue_stalled'), notice('n3', 'chat_turn_finished')], requests: [], decisions: [], revision: 1 })
+  const level = (name: string) => answers(page).getByRole('radio', { name: new RegExp(`^${name.replace('+', '\\+')},`) })
+  await expect(level('Only you')).toHaveAccessibleName('Only you, 1 entry')
+  await expect(level('+ Faults')).toHaveAccessibleName('+ Faults, 2 entries')
+  await expect(level('+ Done')).toHaveAccessibleName('+ Done, 3 entries')
+  await expect(level('Everything')).toHaveAccessibleName('Everything, 3 entries')
+  await expect(level('+ Faults')).toContainText('2')
+})
+
 test('a decision whose chat is gone says so, and Dismiss puts it away', async ({ page }) => {
   const decision = (id: number, exists: boolean) => ({ id, kind: 'decision', text: `Decision ${id}`, detail: null, createdAt: ago(4), source: { sessionId: `s${id}`, title: `Chat ${id}`, agent: 'claude', model: 'opus', exists }, sourceSeq: 2, options: [{ id: 'a', label: 'Open the fix', detail: null, recommended: true }], explanation: { state: 'none' } })
   const workspace: Workspace = { notices: [], requests: [], revision: 1, decisions: [decision(7, true), decision(8, false)] }
@@ -374,7 +428,7 @@ for (const width of [375, 768, 1000, 1280]) {
 
 test('System health reads its five cards live, and a failed read keeps them, with when', async ({ page }) => {
   let fail = false
-  let rate: AnalyticsHealth['rate'] = { completed: 6, errors: 3, perItem: 0.5, items: [] }
+  let rate: AnalyticsHealth['rate'] = { completed: 6, errors: 3, perItem: 0.5, unsettled: 0, withheld: null, items: [] }
   const now = Date.now()
   await page.route('**/api/analytics/system-health*', (route) => fail ? json(route, { error: 'evidence store unavailable' }, 503) : json(route, {
     readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
@@ -409,12 +463,16 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   await expect(page.locator('[data-healthfail]')).toContainText('Not read yet.')
 
   fail = false
-  for (const [completed, errors, perItem, value, note] of [
-    [0, 0, null, 'Unavailable', '0 errors across 0 items completed · rate requires a nonempty, complete lifetime cohort'],
-    [2, 2, null, 'Unavailable', '2 errors across 2 items completed · rate requires a nonempty, complete lifetime cohort'],
-    [2, 0, 0, '0.0 per item', '0 errors across 2 items completed'],
+  // Never a bare Unavailable (#1381): a rate, a lower bound, or why there is none, in words.
+  const unknownMerge = 'GitHub’s merge time for acme/site#7 is unknown, so it may belong to these 24 hours'
+  for (const [completed, errors, perItem, unsettled, withheld, value, note] of [
+    [0, 0, null, 0, 'no v2 work merged in the last 24 hours', 'None completed', '0 errors across 0 items completed · no v2 work merged in the last 24 hours'],
+    [2, 2, null, 0, unknownMerge, 'Unknown', `2 errors across 2 items completed · ${unknownMerge}`],
+    [0, 0, null, 0, unknownMerge, 'Unknown', `0 errors across 0 items completed · ${unknownMerge}`],
+    [2, 0, 0, 0, null, '0.0 per item', '0 errors across 2 items completed'],
+    [6, 3, 0.5, 2, null, 'at least 0.5 per item', '3 errors across 6 items completed · 2 still have runs being reconciled, so the rate may rise'],
   ] as const) {
-    rate = { completed, errors, perItem, items: [] }
+    rate = { completed, errors, perItem, unsettled, withheld, items: [] }
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await expect(card('ov.h.errors').locator('.osmall-v')).toHaveText(value)
     await expect(card('ov.h.errors').locator(':scope > .t-gloss')).toHaveText(note)
@@ -447,7 +505,7 @@ test('a reload paints System health’s last read at once while it reads again, 
   const now = Date.now()
   await page.route('**/api/analytics/system-health*', (route) => json(route, {
     readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
-    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    rate: { completed: 6, errors: 3, perItem: 0.5, unsettled: 0, withheld: null, items: [] },
     blocked: { count: 0, oldestProgressAt: null, largestStage: null, items: [] },
     recovery: { automatic: [], intervention: [], unknown: 0 },
     lastError: { error: null, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now }, coverage: [],
@@ -486,7 +544,7 @@ test('System health’s last read never stands once an organization that was not
   const beta = { login: 'beta', managed: false, status: 'initializing', stage: 'syncing', error: null, activatedAt: null }
   await page.route('**/api/analytics/system-health*', (route) => json(route, {
     readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
-    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    rate: { completed: 6, errors: 3, perItem: 0.5, unsettled: 0, withheld: null, items: [] },
     blocked: { count: 0, oldestProgressAt: null, largestStage: null, items: [] },
     recovery: { automatic: [], intervention: [], unknown: 0 },
     lastError: { error: null, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now }, coverage: [],

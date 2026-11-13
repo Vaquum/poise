@@ -113,6 +113,11 @@ svg.flip-x { transform: rotate(180deg); }
 .oday-t { min-width: calc(var(--sp-unit) * 24); text-align: center; font-size: var(--fs-row); font-weight: var(--fw-strong); color: var(--c-text); }
 .oorg select { appearance: none; height: var(--size-control-sm); padding: 0 var(--sp-3); border-radius: var(--r-pill); border: var(--line-hair) solid var(--c-edge); background: var(--c-canvas); color: var(--c-text-soft); font-size: var(--fs-micro); cursor: pointer; }
 .oorg select:hover { border-color: var(--c-edge-strong); color: var(--c-text); }
+/* One set of filters for the right-hand side: the day, the search, the organization. */
+.ova-ctl > [data-dayctl], .ova-ctl > [data-orgctl] { display: contents; }
+.ova-ctl .search { width: calc(var(--sp-unit) * 44); }
+/* Each Show level says how many entries it shows; on a phone the levels go under their label. */
+.ova-level { flex-wrap: wrap; }
 
 /* Tiles: the day's number, its pace and its year */
 .ova-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-3); }
@@ -271,5 +276,7 @@ svg.flip-x { transform: rotate(180deg); }
   .ohealths, .ova-small { grid-template-columns: minmax(0, 1fr); }
   .ova-main { padding-inline: var(--sp-3); }
   .ova-ctl { margin-left: 0; }
+  .ova-ctl .search { width: auto; flex: 1 1 calc(var(--sp-unit) * 32); min-width: 0; }
+  .olevel.seg button { padding-inline: var(--sp-2); }
   .ova-hint { display: none; }
 }

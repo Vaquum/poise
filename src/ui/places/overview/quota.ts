@@ -6,12 +6,13 @@ import { noticeFeed, type ReadFailure } from '../../../notices'
 import { placeHref } from '../../address'
 import { esc } from '../../dom'
 import { bar } from './charts'
+import type { RightFilter } from './find'
 import { clockAt, json, reason, readLine, unread, whileVisible, type Read, type PartContext } from './util'
 
 // Classic's yellow, orange and red, in the new interface's words.
 const TONE: Record<string, string> = { '': 'ok', yellow: 'low', orange: 'mid', red: 'high' }
 
-export function mountQuota(ctx: PartContext, box: HTMLElement): void {
+export function mountQuota(ctx: PartContext, box: HTMLElement, find: RightFilter): void {
   let quota: Read<GithubQuotaReport> = unread()
   const n = (value: number) => value.toLocaleString('en-US')
 
@@ -26,7 +27,9 @@ export function mountQuota(ctx: PartContext, box: HTMLElement): void {
       return
     }
     const stale = quota.error ? `<p class="onote is-warn" role="status" data-ref="ov.read">${esc(readLine('GitHub API quota', quota))}</p>` : ''
-    box.innerHTML = `${stale}<div class="oquota" data-ref="ov.quota">${quota.data.accounts.map((account) => `<div class="qa"><p class="qa-h"><span class="t-mono">${esc(account.login)}</span><span class="t-gloss">${esc(account.roles.map((role) => role === 'automation' ? 'automation account' : 'your account').join(' + '))}</span></p>
+    const accounts = quota.data.accounts.filter((account) => find.matches(account.login, 'GitHub API', ...account.roles.map((role) => role === 'automation' ? 'automation account' : 'your account')))
+    if (!accounts.length) { box.innerHTML = `${stale}<div class="oquota" data-ref="ov.quota"><p class="onote" role="status">${esc(find.none())}</p></div>`; return }
+    box.innerHTML = `${stale}<div class="oquota" data-ref="ov.quota">${accounts.map((account) => `<div class="qa"><p class="qa-h"><span class="t-mono">${esc(account.login)}</span><span class="t-gloss">${esc(account.roles.map((role) => role === 'automation' ? 'automation account' : 'your account').join(' + '))}</span></p>
       ${account.error ? `<p class="onote is-warn">Unavailable: ${esc(account.error)}${account.checkedAt ? ` Last read at ${clockAt(account.checkedAt)}.` : ''}</p>` : account.buckets.filter((bucket) => bucket.resource === 'core' || bucket.resource === 'graphql').map((bucket) => {
         const minutes = Math.max(0, (Date.parse(bucket.resetAt) - now) / 60_000)
         const risk = minutes > 0 ? bucket.riskPercent : null
@@ -57,5 +60,6 @@ export function mountQuota(ctx: PartContext, box: HTMLElement): void {
 
   paint()
   whileVisible(ctx, GITHUB_QUOTA_REFRESH_MS, () => { void read() })
+  find.onChange(paint)
   ctx.signal.addEventListener('abort', () => noticeFeed.reportReadErrors('overview-quota', []))
 }

@@ -1,12 +1,13 @@
 // System health in Overview (#1101, served since #1137): five live cards over
 // the last 24 hours of v2 chain work, each opening the evidence behind it.
 // Classic Analytics' read and figures (src/analytics-health.ts), in the mocks' words.
-import type { AnalyticsHealth, HealthSource } from '../../../analytics-health-types'
+import { EMPTY_COHORT, type AnalyticsHealth, type HealthSource } from '../../../analytics-health-types'
 import { formatCount, formatDuration, formatRate } from '../../../analytics-format'
 import { getOrganizations, getSettings } from '../../../config'
 import { getSelectedOrganization, organizationUrl } from '../../../organizations'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
+import type { RightFilter } from './find'
 import { clockAt, json, readLine, reason, reportRead, unread, whileVisible, type PartContext, type Read } from './util'
 
 const OK = ['ok', 'verified v2']
@@ -47,7 +48,7 @@ function sourceRow(source: HealthSource): string {
   return `<li>${name}<svg class="hbar" viewBox="0 0 100 6" preserveAspectRatio="none" role="img" aria-label="${esc(words)}"><title>${esc(words)}</title>${rects}</svg></li>`
 }
 
-export function mountHealth(ctx: PartContext, box: HTMLElement): void {
+export function mountHealth(ctx: PartContext, box: HTMLElement, find: RightFilter): void {
   const last = rememberedHealth(healthKey())
   let health: Read<AnalyticsHealth> = last ? { data: last.data, error: '', at: last.at } : unread()
   let generation = 0
@@ -58,7 +59,18 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
     el.querySelector(':scope > .t-gloss').textContent = note
   }
 
+  /** The search shows the cards whose name it finds, and says so when none. */
+  function filter(): void {
+    let shown = 0
+    for (const el of box.querySelectorAll<HTMLElement>('.ohealth')) {
+      el.hidden = !find.matches(el.querySelector('.otile-l')?.textContent, 'System health')
+      if (!el.hidden) shown++
+    }
+    $('[data-healthnone]', box).innerHTML = shown ? '' : `<p class="onote" role="status">${esc(find.none())}</p>`
+  }
+
   function paint(): void {
+    filter()
     // The last error's card opens that diagnostic in Logging, or Logging while there is none.
     $('[data-ref="ov.h.lasterror"]', box).setAttribute('href', placeHref('observe', { part: 'logging', incident: health.data?.lastError.error?.incident, back: 'overview' }))
     const line = readLine('System health', health)
@@ -71,7 +83,13 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
       return
     }
     const { rate, blocked, recovery, lastError: { error, lastObserved, coveredSince, coveredUntil } } = data
-    card('ov.h.errors', rate.perItem === null ? 'Unavailable' : `${esc(formatRate(rate.perItem))}<span class="t-gloss"> per item</span>`, `${formatCount(rate.errors)} errors across ${formatCount(rate.completed)} items completed${rate.perItem === null ? ' · rate requires a nonempty, complete lifetime cohort' : ''}`)
+    // A rate, a lower bound while a counted item's run is still being reconciled, or why there is none.
+    const counts = `${formatCount(rate.errors)} errors across ${formatCount(rate.completed)} items completed`
+    // Nothing completed is a fact only when the cohort is known: missing evidence makes it Unknown.
+    card('ov.h.errors', rate.perItem === null ? (rate.withheld === EMPTY_COHORT ? 'None completed' : 'Unknown')
+      : `${rate.unsettled ? '<span class="t-gloss">at least </span>' : ''}${esc(formatRate(rate.perItem))}<span class="t-gloss"> per item</span>`,
+    rate.perItem === null ? `${counts} · ${rate.withheld ?? 'the cohort is not known'}`
+      : rate.unsettled ? `${counts} · ${formatCount(rate.unsettled)} still ${rate.unsettled === 1 ? 'has a run' : 'have runs'} being reconciled, so the rate may rise` : counts)
     card('ov.h.blocked', esc(formatCount(blocked.count)), blocked.oldestProgressAt === null ? 'none without verified progress' : `oldest ${formatDuration(data.readAt - blocked.oldestProgressAt)} without verified progress${blocked.largestStage ? ` · ${blocked.largestStage}` : ''}`)
     card('ov.h.recovery', esc(formatCount(recovery.automatic.length)), `${formatCount(recovery.intervention.length)} needed outside help`)
     card('ov.h.lasterror', error ? esc(formatDuration(data.readAt - error.at)) : coveredSince !== null && coveredUntil !== null ? 'None' : 'Unavailable',
@@ -103,6 +121,7 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
 
   if (last) paint()
   whileVisible(ctx, 60_000, () => { void read() })
+  find.onChange(filter)
   // Another organization's figures never stand for this one's.
   window.addEventListener('poise:organization-filter-changed', () => { health = unread(); paint(); void read() }, { signal: ctx.signal })
 }

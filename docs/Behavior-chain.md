@@ -213,7 +213,15 @@ outcome without marking a recovered race as an organization failure. Other
 journal errors and unreadable native receipts still surface; concurrent exit
 evidence and original invocation correlations and uncertainty are preserved.
 
-A successful quiescent observation schedules its next read at `checkedAt +
+Held open PRs are rechecked every two minutes through that same scheduler,
+including after a head change. Fresh queue evidence without the required retained
+exact-head/context reviews surfaces a conflict in work diagnostics, naming the
+PR, head and queue entry. The next action directs removal from the queue and
+disabling auto-merge if enabled before reconciling the original review receipts;
+Resume alone cannot stop GitHub merging. Stale or incomplete observations do not
+emit this conflict. The hold and original receipts remain unchanged.
+
+Other successful quiescent observations schedule their next read at `checkedAt +
 min(24 hours, max(2 minutes, checkedAt - origin))`. Origin is the recorded actual
 merge time, otherwise the first native admission; a held chain with neither
 uses the one-day cap. The interval approximately doubles until the cap. These
@@ -632,24 +640,30 @@ Repair and PR review reporting requires at least three settled original Caller
 receipts for the same phase, current head, review basis and slot after the last
 Resume, each with positive resource release, `action=not_started`, retained
 `outcome=preflight_failed` and no
-publication plan or action receipts. All matching attempts must share one cause:
+publication plan or action receipts. All matching repair attempts must share one cause:
 `repair_incomplete_replies` requires `error_code=atomic_work_failed` and the specific
 incomplete-reply error; `repair_execution_budget_exhausted` requires
 `error_code=atomic_work_execution_budget_exhausted`.
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
-The reporter also accepts `review_budget_exhausted` for native `review-pr`
+The reporter also accepts `review_budget_exhausted` and `review_inspection_timeout`,
+including a mixture of the two, for native `review-pr`
 admissions by the reviewer account, pinned with `--expected-head`. Their basis
 includes `reviewContext` (base SHA, title and body), distinct from repair's
 `reviewRevision`. Each original receipt must retain the pre-submission `reviewing`
-phase and `error_code=review_budget_exhausted`; differing raw messages do not
-change that typed cause. `submitting_review` cannot prove no action even without
-a returned review ID.
+phase and one of those timeout codes; differing raw messages do not change their
+typed causes. Each report lists the original code for every attempt and bounded
+diagnostic operation, phase and timeout in seconds where retained. Missing step
+evidence stays unknown; raw errors, paths and inspection arguments are excluded.
+Both codes reuse the existing review report intent and marker. `submitting_review`
+cannot prove no action even without a returned review ID.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads or PR review contexts leave reporting pending,
 including title, body or base changes on an unchanged head. Other causes remain
-visible in their ordinary holds without an issue report; mixed repair or review causes cannot qualify.
+visible in their ordinary holds without an issue report; mixed repair causes or
+review causes outside these two timeouts cannot qualify. Closed or merged targets
+remain ineligible for a new review exhaustion report.
 Revoking repository scope during verification prevents publication and leaves the
 creation intent unconsumed, so re-enabling can still report once.
 
@@ -753,6 +767,12 @@ verified only when the normal datastore intake records the new chain. Generated
 remediation issues cannot report any supported cause recursively, using their
 marker or the retained source-to-issue link; their ordinary holds and uncertainty
 remain visible.
+
+When a later repair hold reuses a closed implementation report, `waiting` leads
+with the current repair stage and worker-reported blocker, then directs the person
+to inspect the repair Call, address the blocker and explicitly Resume. The closed
+implementation report remains historical context; its body, intent and marker
+stay unchanged, and rereading either phase creates no replacement report.
 
 `tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
 creation/restart, reconciliation, uncertain merge target suppression and normal
@@ -868,6 +888,16 @@ the merge and pending obligation; [Logging's Work impact](Logging.md#observe--lo
 directs reconciliation of that original evidence even while held, rather than
 recommending Resume on a merged chain. A GitHub approval alone cannot discharge
 the obligation or authorize a new post-merge review.
+
+For [#1270](https://github.com/autonomio/poise/pull/1270), the retained original
+chain and Caller records contain six failed `review-pr` Calls, no retained review
+response and no `merge-pr` invocation. The manual-action receipt table is empty.
+The unchanged-head and changed-head queue admissions and auto-merge enablement
+reported in [#1308](https://github.com/autonomio/poise/issues/1308) therefore have
+no attributable native submission receipt; `bit-mis` identifies the account,
+not the client. No Poise submission bypass is established. The existing native
+enqueue gate remains unchanged; held open PRs now receive the timely observation
+and actionable queue conflict described above.
 
 ## Seed observation batch
 

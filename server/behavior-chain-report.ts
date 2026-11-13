@@ -167,7 +167,9 @@ function qualifyingAttempts(chain: BehaviorChain, observation: ChainObservation,
       || typeof evidence.completedAt !== 'number' || !Number.isFinite(evidence.completedAt) || evidence.completedAt > now
       || !resourceReleaseProven(evidence, true)
   })) return null
-  const cause = review ? attempts.every(invocation => invocation.evidence?.error_code === 'review_budget_exhausted') ? 'review_budget_exhausted' : null
+  // Keep the existing review report identity across both pre-submission timeouts.
+  const cause = review ? attempts.every(invocation => invocation.evidence?.error_code === 'review_budget_exhausted'
+    || invocation.evidence?.error_code === 'review_inspection_timeout') ? 'review_budget_exhausted' : null
     : attempts.every(invocation => invocation.evidence?.error_code === 'atomic_work_execution_budget_exhausted')
     ? 'repair_execution_budget_exhausted'
     : attempts.every(invocation => invocation.evidence?.error_code === 'atomic_work_failed'
@@ -459,6 +461,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       if (!enabled(db, chain.repository)) return null
       if (!allowed()) return `${label} report creation is unconfirmed; admissions are paused`
       const review = cause === 'review_budget_exhausted'
+      const reviewCauses = review ? [...new Set(verified!.attempts.map(invocation => invocation.evidence!.error_code))].join(' or ') : null
       const budget = cause === 'repair_execution_budget_exhausted'
       const age = hold ? Math.max(0, Math.floor((Date.now() - hold.at) / 60_000)) : null
       const evidence = verifiedImplementation?.invocation.evidence ?? verifiedMerge?.invocation.evidence
@@ -490,12 +493,24 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           : 'Process diagnostic: not recorded in this historical Call receipt; the underlying process cause is unavailable.',
       ] : [
         `Poise is holding https://github.com/${chain.repository}/pull/${report.pull}.`, '',
-        `Stage: ${verified!.decision.behavior}. Cause: ${cause}. Held since ${new Date(hold!.at).toISOString()} (${age} minutes at reporting).`,
+        `Stage: ${verified!.decision.behavior}. Cause: ${reviewCauses ?? cause}. Held since ${new Date(hold!.at).toISOString()} (${age} minutes at reporting).`,
         `Source: ${chain.id}; hold event ${hold!.sequence}; head ${report.head}; basis ${report.basis}; slot ${report.slot}.`, '',
-        `Verified receipts: three or more settled Caller ${review ? 'PR reviews' : 'repairs'} on this basis after the last Resume. Each failed before ${review ? 'review submission' : 'publication'} with ${review ? 'review_budget_exhausted, action=not_started, outcome=preflight_failed' : budget ? 'atomic_work_execution_budget_exhausted, action=not_started, outcome=preflight_failed' : 'atomic_work_failed, action=not_started, outcome=preflight_failed and the incomplete-reply validation cause'}; resources were released.`,
+        `Verified receipts: three or more settled Caller ${review ? 'PR reviews' : 'repairs'} on this basis after the last Resume. Each failed before ${review ? 'review submission' : 'publication'} with ${review ? `${reviewCauses}, action=not_started, outcome=preflight_failed` : budget ? 'atomic_work_execution_budget_exhausted, action=not_started, outcome=preflight_failed' : 'atomic_work_failed, action=not_started, outcome=preflight_failed and the incomplete-reply validation cause'}; resources were released.`,
       ]
       const body = [marker, '', ...details,
-        ...report.attempts.map(attempt => `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}.`), '',
+        ...report.attempts.map((attempt, index) => {
+          const line = `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}`
+          if (!review) return `${line}.`
+          const evidence = verified!.attempts[index].evidence!
+          const diagnostic = evidence.diagnostic as ProcessDiagnostic | undefined
+          // Project only bounded identifiers and a numeric deadline, never CLI arguments or raw errors.
+          const step = (['operation', 'phase'] as const).map(field => {
+            const value = diagnostic?.[field]
+            return `${field}=${typeof value === 'string' && /^[a-zA-Z0-9_.-]{1,160}$/.test(value) ? value : 'unknown'}`
+          }).join('; ')
+          const timeout = diagnostic?.context?.timeout_seconds
+          return `${line}; error_code=${evidence.error_code}; ${step}; timeout_seconds=${typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 ? timeout : 'unknown'}.`
+        }), '',
         workSnapshot, '',
         cause === CLOSED_CAUSE
           ? 'Next action: implement the remaining source issue work through this continuation after inspecting the closed PR and original journal receipts. Original invocation and resource evidence remain retained; this report never authorizes replay, replacement publication or resource release from an unreadable or incomplete original receipt.'
@@ -503,14 +518,14 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           ? 'Next action: inspect the original Call and worker-reported blocker, address the cause, then explicitly Resume the source chain for a fresh implementation when appropriate. This report preserves its hold and ownership; it never relaunches implementation or relaxes review, resource, admission or merge gates.'
           : cause === MERGE_CAUSE
           ? `Next action: inspect the original Call diagnostics and reconcile the PR and merge queue at the pinned head before deciding whether to repair or replace the candidate. The external effect remains unconfirmed. This report retains the original invocation's uncertainty and chain ownership; it never retries the merge or relaxes any review, resource, admission or merge gate.`
-          : `Next action: inspect the ${review ? 'PR review budget' : budget ? 'repair execution budget' : 'repair reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover ${review ? 'review' : 'repair'} or relax any review, admission or merge gate.`,
+          : `Next action: inspect the ${review ? 'PR review timeouts' : budget ? 'repair execution budget' : 'repair reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover ${review ? 'review' : 'repair'} or relax any review, admission or merge gate.`,
         '', REMEDIATION_SCOPE, '', 'Include this exact paragraph in the linked PR review.',
       ].join('\n')
       const result = await handleGhBody({ operation: 'open_issue', repository_full_name: chain.repository,
         title: cause === CLOSED_CAUSE ? `fix: continue #${chain.issue} after closed unmerged PR #${report.pull}`
           : cause === IMPLEMENTATION_CAUSE ? `fix: blocked implementation for #${chain.issue}`
           : cause === MERGE_CAUSE ? `fix: uncertain merge submission for #${report.pull}`
-          : `fix: ${review ? 'PR review exhausted its budget' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
+          : `fix: ${review ? 'PR review exhausted its time limits' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
       const publication = result.body as { record?: { number?: unknown, url?: unknown }, error?: string }
       if (result.status !== 200 || !Number.isSafeInteger(publication.record?.number) || Number(publication.record?.number) < 1
         || publication.record?.url !== `https://github.com/${chain.repository}/issues/${publication.record?.number}`) {
@@ -524,7 +539,12 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   if (!issue) return `${label} report creation is unconfirmed; no matching issue is visible yet. Reconcile the same marker; do not create a replacement`
   if (report.issueNumber === null) { report.issueNumber = issue.number; save() }
   const link = `${label} report ${issue.url}`
-  if (issue.state === 'closed') return `${link} is closed; no replacement will be created`
+  if (issue.state === 'closed') {
+    const closedReport = `${link} is closed; no replacement will be created`
+    return cause === IMPLEMENTATION_CAUSE && chain.held && chain.invocations.at(-1)?.behavior === 'repair-pr'
+      ? `Stage: repair-pr. Worker-reported blocker: ${behaviorErrorMessage(chain.held, 500)}. Next action: inspect the repair Call, address the blocker, then explicitly Resume. Historical ${closedReport}`
+      : closedReport
+  }
   if (!issue.labels.some(label => label.toLowerCase() === 'poise') && enabled(db, chain.repository) && allowed()) {
     try { issue = (await reconcileRepairReport(chain.repository, marker, issue.number, true))! }
     catch (error) { return `${link}: poise label pending: ${error instanceof Error ? error.message : String(error)}` }

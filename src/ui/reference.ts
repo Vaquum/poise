@@ -4,11 +4,13 @@
 //  · the full reference: the page dims, the element stays lit and wired to a
 //    card that answers the brief's questions, without covering it.
 // Opening or closing never activates the element; closing restores focus and scroll.
+import { durationMs } from './css-duration'
 import { esc } from './dom'
 import { entry, term, type RefEntry, type RefText } from './registry'
 
 const root = document.documentElement
 const token = (name: string, fallback: number): number => parseFloat(getComputedStyle(root).getPropertyValue(name)) || fallback
+const duration = (name: string, fallback: number): number => durationMs(getComputedStyle(root).getPropertyValue(name), fallback)
 const defFor = (el: Element | null | undefined): RefEntry | undefined => entry((el as HTMLElement | null)?.dataset?.ref)
 // A value read from a live element; an element out of its usual place reads as unknown, not as an error.
 const call = (v: RefText | undefined, el: HTMLElement): string => { try { return (typeof v === 'function' ? v(el) : v) ?? '' } catch { return '' } }
@@ -18,6 +20,8 @@ let tip: HTMLElement | null = null
 let tipFor: HTMLElement | null = null
 let showTimer = 0, hideTimer = 0, touchTimer = 0
 let suppressClick = false
+/** The element last pressed: it shows no tooltip again until the pointer leaves it. */
+let pressed: HTMLElement | null = null
 /** The page behind the open reference, made inert while it is open. */
 let inerted: HTMLElement[] = []
 let layer: HTMLElement | null = null
@@ -77,10 +81,13 @@ function hideTip(): void {
   tip = null
   tipFor = null
 }
-function scheduleHide(): void { clearTimeout(hideTimer); hideTimer = window.setTimeout(() => hideTip(), token('--dur-tip-hide', 160)) }
-function scheduleShow(el: HTMLElement): void { clearTimeout(showTimer); showTimer = window.setTimeout(() => showTip(el), token('--dur-tip', 500)) }
+function scheduleHide(): void { clearTimeout(hideTimer); hideTimer = window.setTimeout(() => hideTip(), duration('--dur-tip-hide', 160)) }
+function scheduleShow(el: HTMLElement): void { clearTimeout(showTimer); showTimer = window.setTimeout(() => showTip(el), duration('--dur-tip', 500)) }
 
 const refOf = (target: EventTarget | null): HTMLElement | null => (target instanceof Element ? target.closest<HTMLElement>('[data-ref]') : null)
+// A press often redraws what was pressed: its successor, the same key and words, stays quiet too.
+const isPressed = (el: HTMLElement): boolean => !!pressed && (el === pressed
+  || (!pressed.isConnected && el.dataset.ref === pressed.dataset.ref && el.textContent === pressed.textContent))
 const inTip = (target: EventTarget | null): boolean => target instanceof Element && !!target.closest('.tip')
 
 // ---------- Full reference ----------
@@ -231,7 +238,7 @@ export function installReference(): void {
     if (e.pointerType === 'touch' || layer) return
     if (inTip(e.target)) { clearTimeout(hideTimer); return }
     const el = refOf(e.target)
-    if (!el) return
+    if (!el || isPressed(el)) return
     if (el === tipFor) { clearTimeout(hideTimer); return }
     scheduleShow(el)
   })
@@ -241,14 +248,23 @@ export function installReference(): void {
     if (!el) return
     const to = e.relatedTarget
     if (to instanceof Node && (el.contains(to) || inTip(to))) return
+    if (isPressed(el)) pressed = null
     clearTimeout(showTimer)
     if (tip) scheduleHide()
   })
+  // Pressing is acting, not resting: it cancels a pending tooltip and hides a
+  // shown one, and the pressed element stays quiet until the pointer leaves it.
+  document.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'touch' || layer || inTip(e.target)) return
+    clearTimeout(showTimer)
+    pressed = refOf(e.target)
+    if (tip) hideTip()
+  }, true)
   document.addEventListener('focusin', (e) => {
     if (layer || inTip(e.target)) return
     const el = refOf(e.target)
-    // Keyboard focus only: focus moved by a script after a click is not a request for help.
-    if (el && el !== tipFor && (e.target as Element).matches(':focus-visible')) scheduleShow(el)
+    // Keyboard focus only: focus moved by a script after a click, or by the press itself, is not a request for help.
+    if (el && el !== tipFor && !isPressed(el) && (e.target as Element).matches(':focus-visible')) scheduleShow(el)
   })
   document.addEventListener('focusout', (e) => {
     if (inTip(e.relatedTarget)) return
@@ -260,7 +276,7 @@ export function installReference(): void {
     if (e.pointerType !== 'touch') return
     const el = refOf(e.target)
     if (!el) return
-    touchTimer = window.setTimeout(() => { suppressClick = true; showTip(el) }, token('--dur-tip', 500))
+    touchTimer = window.setTimeout(() => { suppressClick = true; showTip(el) }, duration('--dur-tip', 500))
   })
   // A long press released gives one click to swallow, at once; a cancelled one gives none.
   document.addEventListener('pointerup', () => { clearTimeout(touchTimer); if (suppressClick) window.setTimeout(() => { suppressClick = false }) })
@@ -290,6 +306,7 @@ export function installReference(): void {
   })
   addEventListener('scroll', () => { if (tip && !layer) hideTip() }, true)
   // Typing is not resting: it cancels a pending tooltip and hides a shown one.
-  document.addEventListener('keydown', (e) => { if (e.key !== '?' && !layer) clearTimeout(showTimer) }, true)
+  // Any key also ends a press's quiet, so focus the keyboard moves next explains itself.
+  document.addEventListener('keydown', (e) => { pressed = null; if (e.key !== '?' && !layer) clearTimeout(showTimer) }, true)
   document.addEventListener('input', () => { clearTimeout(showTimer); if (tip && !layer) hideTip() })
 }

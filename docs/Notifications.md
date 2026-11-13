@@ -28,6 +28,9 @@ including the ones before it:
   bell counts.
 - **Everything:** also what Poise is handling on its own.
 
+Each level shows how many entries it lists now, so a level that would add
+nothing says so before it is chosen.
+
 Within each group the newest entry is on top: a notice by when it began, a
 request or decision by when it was asked, a review thread by its latest reply,
 chain work by its last verified advance. Each entry expands in place to its full

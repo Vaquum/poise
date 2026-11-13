@@ -1,5 +1,5 @@
 import { setImmediate } from 'node:timers/promises'
-import type { AnalyticsHealth, HealthInterval, WorkError, WorkRecovery } from '../src/analytics-health-types'
+import { EMPTY_COHORT, type AnalyticsHealth, type HealthInterval, type WorkError, type WorkRecovery } from '../src/analytics-health-types'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { normalize } from '../gateway/src/diagnostics/contract'
 import { behaviorChainJournal } from './behavior-chain-journal'
@@ -207,16 +207,23 @@ function chainFacts(journal: BehaviorChainJournal, chain: BehaviorChain, now: nu
     failureByError.set(error, row)
     from = Math.max(from, error.at)
   }
-  const merged = rows.find(row => row.event.type === 'chain.observed' && row.event.observation.pull
-    && (row.event.observation as ChainObservation).pull?.merged)
-  const observation = (merged?.event as Extract<ChainEvent, { type: 'chain.observed' }> | undefined)?.observation as ChainObservation | undefined
-  const pull = observation?.pull
-  const mergedAt = pull?.mergedAt
-  const known = !!chain.mergeSha && pull?.mergeSha === chain.mergeSha
-    && observation?.publication.pull_number === pull?.number && observation?.publication.merged === true
-    && observation.publication.merge_sha === chain.mergeSha && typeof mergedAt === 'number' && Number.isFinite(mergedAt)
-  const merge = known ? {
-    at: mergedAt!,
+  // GitHub's own merge facts verify the merge: the first observation whose pull
+  // request carries the chain's merge commit and its mergedAt, on the chain's own
+  // publication or, where an existing pull request closed the seed, on that one.
+  // GitHub's mergedAt is the same in every observation of the merged pull
+  // request; Poise's copy of its publication can lag a read behind it.
+  let mergedAt: number | undefined
+  for (const row of chain.mergeSha ? rows : []) {
+    if (row.event.type !== 'chain.observed') continue
+    const observation = row.event.observation as ChainObservation
+    const pull = observation.pull
+    if (!pull?.merged || pull.mergeSha !== chain.mergeSha || typeof pull.mergedAt !== 'number' || !Number.isFinite(pull.mergedAt)) continue
+    if (observation.publication.pull_number !== null && observation.publication.pull_number !== pull.number) continue
+    mergedAt = pull.mergedAt
+    break
+  }
+  const merge = mergedAt !== undefined ? {
+    at: mergedAt,
     // Delayed reconciliation can stamp a pre-merge failure after merging;
     // the admitted attempt still proves the incident belongs to the lifetime.
     incidents: new Set(errors.filter(error => {
@@ -314,11 +321,13 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
   const { now, scope, organizations, dependencies, history } = input
   const since = now - DAY
   const result: AnalyticsHealth = { readAt: now, window: { since, until: now }, scope, limits: [],
-    rate: { completed: 0, errors: 0, perItem: null, items: [] },
+    rate: { completed: 0, errors: 0, perItem: null, unsettled: 0, withheld: null, items: [] },
     blocked: { count: 0, oldestProgressAt: null, largestStage: null, items: [] },
     recovery: { automatic: [], intervention: [], unknown: 0 },
     lastError: { error: null, lastObserved: true, coveredSince: null, coveredUntil: null }, coverage: [] }
   let complete = true, lifetimeStart = since
+  // Why the rate cannot be known, in words; the first reason found stands.
+  const withhold = (reason: string) => { complete = false; result.rate.withheld ??= reason }
   const stages = new Map<string, number>()
   const addLimit = (value: string) => { if (!result.limits.includes(value)) result.limits.push(value) }
   const covered = (from: number, until: number) => healthIntervals(history, from, until).every(part => part.state === 'covered')
@@ -328,9 +337,9 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
     const dependency = dependencies.datastore.find(entry => entry.org?.toLowerCase() === org.login.toLowerCase())
     const status = org.status !== 'ready' ? org.status : dependency?.status ?? 'unknown'
     result.coverage.push({ name: 'GitHub', scope: org.login, status, lastReadAt: dependency?.lastSuccessAt ?? null, intervals: null })
-    if (status !== 'ok') { complete = false; addLimit(`${org.login}: GitHub evidence ${status}`) }
+    if (status !== 'ok') { withhold(`GitHub evidence for ${org.login} is ${status}, so merges may be missing`); addLimit(`${org.login}: GitHub evidence ${status}`) }
   }
-  if (!organizations.length) { complete = false; addLimit('No configured GitHub account is available') }
+  if (!organizations.length) { withhold('no GitHub account is configured'); addLimit('No configured GitHub account is available') }
   const accountsComplete = complete
   let memo = factsByJournal.get(journal)
   if (!memo) { memo = new Map(); factsByJournal.set(journal, memo) }
@@ -349,15 +358,22 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
       const { admittedAt, progress, errors, merge } = facts
       for (const error of errors) if (!result.lastError.error || error.at > result.lastError.error.at) result.lastError.error = error
       const verifiedMerge = !!merge && merge.at <= now
-      if (chain.mergeSha && !verifiedMerge) { complete = false; addLimit(`${chain.id}: original GitHub merge time unavailable`) }
+      if (chain.mergeSha && !verifiedMerge) {
+        withhold(`GitHub's merge time for ${chain.id} is unknown, so it may belong to these 24 hours`)
+        addLimit(`${chain.id}: original GitHub merge time unavailable`)
+      }
       if (verifiedMerge && merge.at >= since) {
         result.rate.completed++
         result.rate.errors += merge.incidents
         result.rate.items.push({ work: chain.id, journal: journalHref(chain.id), summary: `${merge.incidents} errors; merged ${new Date(merge.at).toISOString()}` })
         lifetimeStart = Math.min(lifetimeStart, admittedAt)
-        if (!covered(admittedAt, merge.at) || merge.incomplete) {
-          complete = false
-          addLimit(`${chain.id}: incomplete lifetime evidence ${new Date(admittedAt).toISOString()} – ${new Date(merge.at).toISOString()}`)
+        // Work errors come from the journal, which keeps every settled
+        // invocation: the observational ledger's coverage gaps cannot hide
+        // one. A run admitted before the merge that has not settled can
+        // still add one, so the rate is then a lower bound.
+        if (merge.incomplete) {
+          result.rate.unsettled++
+          addLimit(`${chain.id}: a run admitted before its merge is still unsettled`)
         }
       }
       if (!chain.supersession && !isConfirmedClosed(chain) && (!chain.mergeSha || chain.reviewPending)) {
@@ -412,7 +428,9 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
   }
   if (result.recovery.unknown) addLimit('Older, ambiguous or uncorrelated recovery origins remain unknown')
   result.blocked.largestStage = [...stages].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([stage, count]) => `${stage}: ${count}`)[0] ?? null
-  result.rate.perItem = complete && result.rate.completed > 0 ? result.rate.errors / result.rate.completed : null
+  if (!result.rate.completed) withhold(EMPTY_COHORT)
+  result.rate.perItem = complete ? result.rate.errors / result.rate.completed : null
+  if (result.rate.perItem !== null) result.rate.withheld = null
   const intervals = healthIntervals(history, lifetimeStart, now)
   result.coverage.unshift({ name: 'Chain journal', scope: scope || 'All configured accounts', status: 'verified v2', lastReadAt: new Date(now).toISOString(), intervals: null },
     { name: 'Caller receipts', scope: 'Instance-wide coverage history; selected v2 work', status: dependencies.ledger.status,
