@@ -41,6 +41,8 @@ class Client:
 
     async def paginate(self, path, params=None):
         if path == f"/repos/{TARGET}/pulls":
+            if params == {"state": "open"}:
+                return []
             assert params == {"state": "all", "head": f"example:{BRANCH}"}
             return [binding] if bound else []
         if path in {f"/repos/{TARGET}/issues/{ISSUE}/comments", f"/repos/{TARGET}/pulls/{CLOSING}/reviews",

@@ -172,6 +172,20 @@ async def run(client: GitHubClient, payload: dict) -> dict:
     result["existing_pulls"] = [reference["url"] for reference in references
                                 if reference["repository"]["nameWithOwner"].lower() != target.lower()
                                 or reference["headRefName"] != branch]
+    # GitHub can omit stacked PRs from both closing-reference connections.
+    closing = re.compile(
+        r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:"
+        rf"(?:{re.escape(target)})?#|https?://github\.com/{re.escape(target)}/issues/)"
+        rf"{issue_number}\b", re.IGNORECASE)
+    for candidate in await client.paginate(f"/repos/{target}/pulls", {"state": "open"}):
+        if candidate["state"] != "open":
+            continue
+        if candidate["head"]["ref"] == branch and (candidate["head"].get("repo") or {}).get("full_name", "").lower() == target.lower():
+            continue
+        if candidate["base"]["repo"]["full_name"].lower() != target.lower():
+            continue
+        if closing.search(candidate["body"] or "") and candidate["html_url"] not in result["existing_pulls"]:
+            result["existing_pulls"].append(candidate["html_url"])
     replies = json.loads(payload.get("replies_json") or "[]")
     if not isinstance(replies, list):
         raise ValueError("review replies must be an array")
