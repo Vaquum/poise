@@ -206,11 +206,19 @@ temporary-filesystem pressure retain measurements known at the source.
 Managed datastore failures are reported once by `datastore.sync` or
 `datastore.activate`, retaining the process exit code and stderr alongside retry
 and freshness context. Standalone datastore process failures are still reported.
+Legacy `resolve-unblocking` and `merge-prs` mutation commands (including branch
+updates) are reported once by their behavior handler after failure bookkeeping,
+with the primitive, target, phase, native attempt identity, original process
+result and recorded retry evidence. Cancellation or failed bookkeeping cannot
+erase that original failure; independent wrapper and invalid-output failures
+remain visible. Resolve uses Warning only for a confirmed no-action transient
+exit with a recorded safe retry. Uncertain outcomes, timeouts and policy
+refusals remain Errors. Separate attempts retain separate event IDs.
 JavaScript DOMException identity and numeric code are retained in context as
 `exceptionName` and `exceptionCode`, with no process `exitCode`. Actual subprocess
 exit codes remain process evidence, even when the same number names an exception.
 
-Untyped GitHub 5xx and transport failures from `github-interface`,
+Outside those owned mutation diagnostics, untyped GitHub 5xx and transport failures from `github-interface`,
 `github-datastore` and Caller completions retain Warning evidence. A bare exit
 code, access refusal or local failure still retains Error evidence; an explicit
 Caller diagnostic keeps its source severity. This classification never retries

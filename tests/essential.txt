@@ -46,6 +46,7 @@ tests/behaviors-approval.test.ts
 tests/behaviors-approve-stall.test.ts
 tests/behaviors-cutover.test.ts
 tests/behaviors-close-old-prs.test.ts
+tests/behaviors-command-diagnostics.test.ts
 tests/behaviors-merge.test.ts
 tests/behaviors-outcomes.test.ts
 tests/behaviors-worker-exit.test.ts

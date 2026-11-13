@@ -1,5 +1,5 @@
 import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
-import { diagnostic, loggingWorkspace } from './logging'
+import { diagnostic, diagnosticFailure, loggingWorkspace } from './logging'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { parseAgentLogList } from './agent-log-parse'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
@@ -5292,6 +5292,7 @@ function resolveFailureSideEffects(error: unknown): ResolveSideEffects {
 interface ResolveAttemptDetail {
   nativeId?: string
   sideEffects?: ResolveSideEffects
+  phase?: 'command' | 'validation' | 'bookkeeping'
   unresolvedBefore: number
   actor?: string
 }
@@ -5586,6 +5587,7 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
   try {
   return await withNoticeDiagnosticIdentity({ correlationId: nativeId, behavior: 'resolve-unblocking',
     repository: repo, target: `${repo}#${number}`, account: reviewer }, async () => {
+  detail.phase = 'command'
   const { stdout } = await runFile(
     GH_INTERFACE,
     [
@@ -5599,8 +5601,9 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
       reviewer,
     ],
     { cwd, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(),
-      env: reviewEnvironment },
+      env: reviewEnvironment, reportFailure: false },
   )
+  detail.phase = 'validation'
   const data = objectValue(
     parseJson(stdout, 'github-interface --resolve-nonblocking-conversations-if-ready'),
     'github-interface --resolve-nonblocking-conversations-if-ready',
@@ -5616,6 +5619,7 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
       || currentHeadSha === expectedHead) {
       throw new Error('github-interface resolution returned malformed supersession')
     }
+    detail.phase = 'bookkeeping'
     captureBehaviorOutcome({ nativeId, state: 'superseded', activity: 'settled', stateSource: 'native',
       outcome: 'superseded', head: currentHeadSha, completedAt: new Date().toISOString() })
     return {
@@ -5655,6 +5659,7 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
         || unresolvedCount !== 0))) {
     throw new Error('github-interface resolution returned malformed or unsafe state')
   }
+  detail.phase = 'bookkeeping'
   captureBehaviorOutcome({ nativeId, state: 'completed', activity: 'settled', stateSource: 'native',
     outcome: resolvedCount > 0 ? 'resolved' : unresolvedCount > 0 ? 'waiting' : 'no_op', head: headSha,
     completedAt: new Date().toISOString() })
@@ -5835,15 +5840,36 @@ async function tickResolveUnblocking(): Promise<void> {
         } catch (err) {
           checked = false
           const recordedAtMs = Date.now()
+          let recovery: ResolveRecovery | undefined
+          let safeRetry = false
           try {
-            if (!behaviorAborted() && (!detail.nativeId || readResolveRecovery(checkTarget)?.nativeId === detail.nativeId)) {
-              recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget, { actingAccount: reviewer })
+            try {
+              if (!behaviorAborted() && (!detail.nativeId || readResolveRecovery(checkTarget)?.nativeId === detail.nativeId)) {
+                recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget, { actingAccount: reviewer })
+              }
+            } finally {
+              runNote = retainResolveRecoveryFailure(checkTarget, detail, headSha, unresolvedBefore, recordedAtMs, err)
             }
+            const pending = readResolveRecovery(checkTarget)
+            recovery = pending ? resolveRecoveryAttempts(pending).find((attempt) => attempt.nativeId === detail.nativeId) : undefined
+            const result = err as { code?: unknown; killed?: unknown } | null
+            safeRetry = detail.phase === 'command' && recovery?.sideEffects === 'none'
+              && typeof result?.code === 'number' && result.code !== 0 && result.killed !== true
+              && !isTimeoutCause(behaviorFailureEvidence(err))
+              && ['rate_limit', 'upstream_unavailable', 'network_interruption'].includes(recovery.code)
+              && recovery.nextRetryAtMs > recordedAtMs && isRunnable('resolve-unblocking') && !behaviorAborted()
           } finally {
-            runNote = retainResolveRecoveryFailure(checkTarget, detail, headSha, unresolvedBefore, recordedAtMs, err)
+            // Bookkeeping and cancellation must not erase the original command result.
+            if (!(err instanceof BehaviorLogFeedError)) diagnosticFailure('github-interface.resolve-nonblocking-conversations-if-ready', err, {
+              behavior: 'resolve-unblocking', repository: pr.repo, target: key, account: reviewer,
+              correlationId: detail.nativeId ?? diagnosticIdentity(err)?.correlationId,
+              primitive: 'resolve-nonblocking-conversations-if-ready', nativeId: detail.nativeId ?? null,
+              phase: detail.phase ?? 'preflight', timeoutMs: 30_000, sideEffects: detail.sideEffects ?? null,
+              recovery: recovery ? { code: recovery.code, nextRetryAtMs: recovery.nextRetryAtMs, sideEffects: recovery.sideEffects } : null,
+              safeRetry,
+            }, { level: safeRetry ? 'warning' : 'error' })
           }
           if (behaviorAborted()) return
-          if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
         } finally {
           if (runId) finishDirectBehaviorRun(runId, false, null, runNote ?? undefined)
           if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
@@ -6142,6 +6168,8 @@ async function tickMergePrs(): Promise<void> {
       if (!operationId) continue
       let runId: string | null = null
       let runNote: string | null = null
+      let nativeId: string | null = null
+      let phase = 'preflight'
       try {
         const expectedHead = candidate.head!
         const [owner, name] = pr.repo.split('/', 2)
@@ -6157,14 +6185,17 @@ async function tickMergePrs(): Promise<void> {
         const response = call && unambiguousAgentCall(snapshot, call) && call.head_sha === expectedHead ? callReviewResponse(call, Date.now()) : null
         if (!response) continue
         runId = startDirectBehaviorRun('merge-prs')
+        nativeId = runId
         captureBehaviorAdmission({ admissionKey: runId, nativeId: runId, behavior: 'merge-prs',
           source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
           actor, repository: pr.repo, number: pr.number, head: expectedHead, startedAt: new Date().toISOString() })
+        phase = 'command'
         const { stdout } = await runFile(GH_INTERFACE, [
           '--merge-if-ready', `#${pr.number}`, '--expected-head', expectedHead,
           '--review-response-json', JSON.stringify({ ...response, review_id: call.review_id }),
           '--author', pr.author, '--token-user', actor,
-        ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() })
+        ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false })
+        phase = 'validation'
         const result = objectValue(parseJson(stdout, 'github-interface --merge-if-ready'), 'merge-if-ready')
         if (result.action !== 'merge_if_ready' || result.repository !== pr.repo
           || result.pull_number !== pr.number || result.head_sha !== expectedHead
@@ -6174,6 +6205,7 @@ async function tickMergePrs(): Promise<void> {
           || (result.outcome === 'merged' && (typeof result.merge_sha !== 'string' || !SHA_PATTERN.test(result.merge_sha)))) {
           throw new Error('github-interface --merge-if-ready returned malformed state')
         }
+        phase = 'bookkeeping'
         const disposition = result.outcome === 'enqueued' ? 'enqueued'
           : result.outcome === 'in_queue' ? 'waiting'
             : result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded'
@@ -6204,13 +6236,21 @@ async function tickMergePrs(): Promise<void> {
         }
         clearBehaviorFailure('merge-prs', target, actor)
       } catch (error) {
-        if (runId) {
-          captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
-          runNote = `target=${target} native=${runId} actor=${actor} head=${candidate.head ?? 'unknown'} op=merge-if-ready error=${behaviorErrorMessage(error)}`
+        let retry: BehaviorFailureState | null = null
+        try {
+          if (runId) {
+            captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+            runNote = `target=${target} native=${runId} actor=${actor} head=${candidate.head ?? 'unknown'} op=merge-if-ready error=${behaviorErrorMessage(error)}`
+          }
+          if (behaviorAborted()) return
+          recordBehaviorFailure('merge-prs', 'operation', error, target, { actingAccount: actor })
+          retry = getBehaviorFailureState('merge-prs', target)
+        } finally {
+          if (!(error instanceof BehaviorLogFeedError)) diagnosticFailure('github-interface.merge-if-ready', error, {
+            behavior: 'merge-prs', repository: pr.repo, target, account: actor, correlationId: nativeId,
+            primitive: 'merge-if-ready', nativeId, phase, timeoutMs: 30_000, retry,
+          })
         }
-        if (behaviorAborted()) return
-        recordBehaviorFailure('merge-prs', 'operation', error, target, { actingAccount: actor })
-        if (!(error instanceof BehaviorLogFeedError)) console.error(`[behaviors] merge-prs failed for ${target}:`, error)
       } finally {
         if (runId) finishDirectBehaviorRun(runId, false, null, runNote ?? undefined)
         releasePrOperationOwned(operationId)
@@ -6230,6 +6270,8 @@ async function tickMergePrs(): Promise<void> {
   if (!updateOperationId) return
   let updateRunId: string | null = null
   let updateRunNote: string | null = null
+  let updateNativeId: string | null = null
+  let updatePhase = 'preflight'
   try {
     const expectedHead = update.head!
     const [owner, name] = updatePr.repo.split('/', 2)
@@ -6238,19 +6280,23 @@ async function tickMergePrs(): Promise<void> {
     if (!isRunnable('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', updatePr)
       || configuredReviewer(updatePr.author) !== actor) return
     updateRunId = startDirectBehaviorRun('merge-prs')
+    updateNativeId = updateRunId
     captureBehaviorAdmission({ admissionKey: updateRunId, nativeId: updateRunId, behavior: 'merge-prs',
       source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
       actor, repository: updatePr.repo, number: updatePr.number, head: expectedHead, startedAt: new Date().toISOString() })
+    updatePhase = 'command'
     const { stdout } = await runFile(GH_INTERFACE, [
       '--update-branch-if-behind', `#${updatePr.number}`, '--expected-head', expectedHead,
       '--author', updatePr.author, '--token-user', actor,
-    ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() })
+    ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false })
+    updatePhase = 'validation'
     const result = objectValue(parseJson(stdout, 'github-interface --update-branch-if-behind'), 'update-branch-if-behind')
     if (result.action !== 'update_branch_if_behind' || result.repository !== updatePr.repo
       || result.pull_number !== updatePr.number || result.head_sha !== expectedHead
       || !['updated', 'not_ready', 'superseded'].includes(String(result.outcome))) {
       throw new Error('github-interface --update-branch-if-behind returned malformed state')
     }
+    updatePhase = 'bookkeeping'
     const updateDisposition = result.outcome as 'updated' | 'not_ready' | 'superseded'
     captureBehaviorOutcome({ nativeId: updateRunId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
       activity: 'settled', stateSource: 'native', outcome: updateDisposition,
@@ -6263,13 +6309,21 @@ async function tickMergePrs(): Promise<void> {
     }
     clearBehaviorFailure('merge-prs', updateTarget, actor)
   } catch (error) {
-    if (updateRunId) {
-      captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
-      updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${update.head ?? 'unknown'} op=update-branch-if-behind error=${behaviorErrorMessage(error)}`
+    let retry: BehaviorFailureState | null = null
+    try {
+      if (updateRunId) {
+        captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+        updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${update.head ?? 'unknown'} op=update-branch-if-behind error=${behaviorErrorMessage(error)}`
+      }
+      if (behaviorAborted()) return
+      recordBehaviorFailure('merge-prs', 'operation', error, updateTarget, { actingAccount: actor })
+      retry = getBehaviorFailureState('merge-prs', updateTarget)
+    } finally {
+      diagnosticFailure('github-interface.update-branch-if-behind', error, {
+        behavior: 'merge-prs', repository: updatePr.repo, target: updateTarget, account: actor, correlationId: updateNativeId,
+        primitive: 'update-branch-if-behind', nativeId: updateNativeId, phase: updatePhase, timeoutMs: 30_000, retry,
+      })
     }
-    if (behaviorAborted()) return
-    recordBehaviorFailure('merge-prs', 'operation', error, updateTarget, { actingAccount: actor })
-    console.error(`[behaviors] merge-prs failed for ${updateTarget}:`, error)
   } finally {
     if (updateRunId) finishDirectBehaviorRun(updateRunId, false, null, updateRunNote ?? undefined)
     releasePrOperationOwned(updateOperationId)
