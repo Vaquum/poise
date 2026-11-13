@@ -3,7 +3,7 @@ import { APEX_COOKIE, APEX_SESSION_TTL_MS, TICKET_TTL_MS, type Context, type Pri
 import { cookieValues } from './cookies.js'
 import { header, HttpError, redirect, safeEqual, sendHtml } from './http.js'
 import { messagePage, phoneSignedInPage, phoneWaitingPage } from './pages.js'
-import { hashSecret, newSecret, type Phone, type PhoneCode, type PhoneCodeState, type User } from './store.js'
+import { hashSecret, newSecret, type Phone, type PhoneCode, type PhoneCodeState, type Session, type User } from './store.js'
 
 // Signing in on a phone with a QR code that Settings shows (docs/Service-architecture.md, "Sign in on a
 // phone"). The code is a one-time token. The first device to open it gets a secret of its own, which binds
@@ -224,7 +224,10 @@ export function phonePage(ctx: Context, req: IncomingMessage, res: ServerRespons
     return page(ctx, res, 403, messagePage('Not allowed', 'This account may no longer sign in to this Poise.'), [clear])
   }
   const now = ctx.deps.now()
-  if (code.state === 'approved' && code.expiresAt > now) return finish(ctx, res, owner, binding, clear)
+  if (code.state === 'approved' && code.expiresAt > now) return finish(ctx, res, owner, binding, code.expiresAt, clear)
+  // Signed in already, yet the phone asks again: it dropped the request whose answer carried its sign-in
+  // and retried, or never received that answer. Within the window it gets the same sign-in again.
+  if (code.state === 'signed_in' && code.expiresAt > now) return finishAgain(ctx, res, owner, binding, clear)
   if (code.state === 'scanned' && code.expiresAt > now) {
     return page(ctx, res, 200, phoneWaitingPage({ device: code.device ?? 'This phone' }))
   }
@@ -284,18 +287,34 @@ function scan(ctx: Context, req: IncomingMessage, res: ServerResponse, token: st
  * The approved device's own sign-in: a new apex session and binding, then its workspace session through
  * the usual single-use ticket, which only this browser can redeem.
  */
-function finish(ctx: Context, res: ServerResponse, owner: User, binding: string, clear: string): void {
-  const { log, store } = ctx.deps
-  const done = store.finishPhoneCode(binding, APEX_SESSION_TTL_MS)
+function finish(ctx: Context, res: ServerResponse, owner: User, binding: string, until: number, clear: string): void {
+  const done = ctx.deps.store.finishPhoneCode(binding, APEX_SESSION_TTL_MS)
   if (!done) return page(ctx, res, 410, EXPIRED(), [clear])
+  const now = ctx.deps.now()
+  for (const [key, held] of ctx.phoneSignIns) if (held.until <= now) ctx.phoneSignIns.delete(key)
+  ctx.phoneSignIns.set(hashSecret(binding), { id: done.id, idHash: done.session.idHash, until })
+  ctx.deps.log.info('phone.signed_in', { login: owner.login, device: done.phone.device })
+  signedIn(ctx, res, owner, done.id, done.session, clear)
+}
+
+/** The same sign-in again for a phone that retried within its finish window, while that sign-in lives. */
+function finishAgain(ctx: Context, res: ServerResponse, owner: User, binding: string, clear: string): void {
+  const held = ctx.phoneSignIns.get(hashSecret(binding))
+  const session = held && held.until > ctx.deps.now() ? ctx.deps.store.sessionByHash(held.idHash) : null
+  if (!held || !session) return page(ctx, res, 410, EXPIRED(), [clear])
+  ctx.deps.log.info('phone.signed_in.again', { login: owner.login })
+  signedIn(ctx, res, owner, held.id, session, clear)
+}
+
+/** The phone's sign-in page, setting its apex session and a fresh binding, on to its workspace by a ticket. */
+function signedIn(ctx: Context, res: ServerResponse, owner: User, id: string, session: Session, clear: string): void {
   const bind = newSecret()
-  const ticket = store.createTicket(done.session, owner.handle, bind, TICKET_TTL_MS)
+  const ticket = ctx.deps.store.createTicket(session, owner.handle, bind, TICKET_TTL_MS)
   const target = new URL('/_poise/session', ctx.workspaceOrigin(owner.handle))
   target.searchParams.set('ticket', ticket)
   target.searchParams.set('next', '/')
-  log.info('phone.signed_in', { login: owner.login, device: done.phone.device })
   page(ctx, res, 200, phoneSignedInPage({ login: owner.login, href: target.href }), [
-    ctx.cookie(APEX_COOKIE, done.id, APEX_SESSION_TTL_MS / 1000),
+    ctx.cookie(APEX_COOKIE, id, APEX_SESSION_TTL_MS / 1000),
     ctx.bindCookie(bind),
     clear,
   ])

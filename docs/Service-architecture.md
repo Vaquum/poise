@@ -148,7 +148,12 @@ phone in to the owner's account with a QR code, without GitHub
 - Within 2 minutes of approval, the device's next `/auth/phone` gives it a new
   apex session and binding of its own (`poise_gw`, `poise_bind`) and clears
   `poise_phone`. Its page then goes on through a ticket to the workspace. The
-  owner's session is never copied, and a code signs in once.
+  owner's session is never copied, and a code signs in one device.
+- A phone can drop the request whose answer carried its sign-in and retry it,
+  for example when Safari resumes or reloads the page. So within that 2-minute
+  window the same device gets the same sign-in again, while it lives. A login
+  proxy in front should do the same for its own session, or the retried phone
+  meets the proxy's login.
 - Settings lists these phones while their sessions live: 14 days, like any apex
   session. Signing one out there ends its apex session and every workspace
   session made from it. It also cuts what the phone still holds open through
