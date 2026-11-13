@@ -167,6 +167,41 @@ describe('provider preparation and authentication', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
   })
 
+  it('finishes an admitted launch and retains its original claim while recurring ticks wait for a switch', async () => {
+    arrangeCli(false)
+    const entered = deferred<void>(), launched = deferred<void>()
+    mocks.spawnDetached.mockImplementationOnce(() => { entered.resolve(); return launched.promise })
+    const { database: db, behaviors: runtime } = await loadModules()
+    const background = await import('../server/release-background')
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+    const cycle = runtime.runEnabledBehaviorsOnce()
+    try {
+      await entered.promise
+      const [original] = db.listBehaviorLaunchClaims('review-new-prs')
+      expect(original).toBeDefined()
+      expect(background.releaseBackgroundBusy()).toBeGreaterThan(0)
+      background.markReleaseSwitch(true)
+      const calls = externalCalls().length
+      for (let tick = 0; tick < 3; tick++) await runtime.runEnabledBehaviorsOnce({ skipBusy: true, stagger: true })
+      expect(externalCalls()).toHaveLength(calls)
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      launched.resolve()
+      await cycle
+      expect(background.releaseBackgroundBusy()).toBe(0)
+      expect(db.listBehaviorLaunchClaims('review-new-prs')).toEqual([expect.objectContaining({ claimId: original.claimId })])
+      // Detached work still owns its original claim after withdrawal; it must
+      // not be launched again by the first resumed tick.
+      background.markReleaseSwitch(false)
+      await runtime.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      expect(db.listBehaviorLaunchClaims('review-new-prs')).toEqual([expect.objectContaining({ claimId: original.claimId })])
+    } finally { background.markReleaseSwitch(false); launched.resolve(); await cycle }
+  })
+
   it('pauses approval work and resumes it once authenticated', async () => {
     arrangeCli(true)
     mocks.spawnDetached.mockResolvedValue(undefined)

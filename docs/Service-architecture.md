@@ -439,7 +439,12 @@ its own instead of refusing with dirty_unowned.
   switch is pending, new Chat turns
   wait behind the update instead of starting — sent messages, queued
   messages and work-monitor wakes alike, nothing refused or dropped —
-  while launches and behavior ticks run as usual. A Poise implementation whose
+  while browser launches remain available. New behavior sweeps wait, and active
+  Chat work-monitor passes yield between targets, workspace scans and discovery
+  pages. An admitted unit finishes and persists its observations or receipts
+  before releasing the background barrier; detached agent calls keep running.
+  Withdrawal or a refused restart lets deferred work resume on the existing ticks.
+  A Poise implementation whose
   controller binding completes during this pause also waits durably, retaining
   its runbook, displayed request, switches and completion responsibility. It
   remains ahead of discussion in that change chat, including messages sent to

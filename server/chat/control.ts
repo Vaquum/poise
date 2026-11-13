@@ -1336,7 +1336,7 @@ export class ChatControl {
     if (now - this.lastDiscovery < DISCOVERY_INTERVAL) return
     const instance = this.runtime.instance
     const branches = await this.scanWorkspaceBranches()
-    if (this.stopped) return
+    if (!this.ciAdmitted()) return
     const orgs = new Map<string, Organization>()
     if (current.some(binding => store.workTarget(binding.target).kind === 'issues')) {
       for (const binding of current) {
@@ -1367,7 +1367,7 @@ export class ChatControl {
         // The listing is local reads per organization; give requests an I/O
         // turn between pages.
         await setImmediate()
-        if (this.stopped) return
+        if (!this.ciAdmitted()) return
         let listed: OpenPrClosingList | null
         try {
           listed = await read(org, after)
@@ -1486,7 +1486,7 @@ export class ChatControl {
       for (const session of this.runtime.list()) {
         // Local reads resolve fast; still give requests an I/O turn between chats.
         await setImmediate()
-        if (this.stopped) return null
+        if (!this.ciAdmitted()) return null
         if (session.status === 'closed') continue
         sessionId = session.id
         if (session.repo) add(session.repo, session.branch.name, session.id)
@@ -1501,6 +1501,7 @@ export class ChatControl {
             throw new Error('Workspace scan is incomplete')
           }
           for (const dir of found.dirs) {
+            if (!this.ciAdmitted()) return null
             for (const pushed of await pushedBranches(dir)) evidence.push(pushed)
           }
         }
@@ -1533,7 +1534,8 @@ export class ChatControl {
     for (const binding of current) {
       // Cached reads resolve in microtasks; give requests an I/O turn between targets.
       await setImmediate()
-      if (this.stopped) return
+      // Finish an admitted target, including its observations, before yielding.
+      if (!this.ciAdmitted()) return
       if (!store.bindingIsCurrent(instance, binding)) continue
       const now = (this.options.now ?? Date.now)()
       if (!this.runtime.ownsSession(binding.session)) { store.forgetSession(instance, binding.session, now); continue }
