@@ -511,9 +511,11 @@ describe('collection independence and Caller evidence', () => {
       action: 'not_started', outcome: 'preflight_failed', error: 'seed issue changed during review; no comments posted' }
     // This is also the metadata-only --diagnostics shape: absence is not the proof.
     expect(callerDiagnostic(row, 'alice')).toBeNull()
-    expect(callerDiagnostic({ ...row, receipts: null, artifact: { phase: 'reviewing', resource_root: '/owned' } }, 'alice')).toBeNull()
+    expect(callerDiagnostic({ ...row, receipts: null, resource_error: null,
+      artifact: { phase: 'reviewing', resource_root: '/owned' } }, 'alice')).toBeNull()
     for (const change of [{ behavior: 'pr_review' }, { status: 'error' }, { error_code: null }, { error_code: 'posting_failed' },
       { action: null }, { outcome: null }, { receipts: [] }, { receipts: [{ comment_id: 17 }] }, { review_id: 17 }, { head_sha: 'b'.repeat(40) },
+      { resource_error: 'cleanup_failed' }, { resource_error: 'invalid_artifact' },
       { artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } },
       { artifact: { phase: 'reviewing', plan_sha: 'b'.repeat(64) } }, { artifact: { phase: 'reviewing', resource_error: 'cleanup_failed' } }]) {
       expect(callerDiagnostic({ ...row, ...change }, 'alice'), JSON.stringify(change)).toMatchObject({ level: 'error', message: row.error })

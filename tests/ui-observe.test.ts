@@ -149,7 +149,8 @@ describe('runs in the seven state words', () => {
     const publication = { ...stale, id: 'b'.repeat(32), artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } }
     expect(groupRuns([stale, publication])).toHaveLength(2)
     for (const change of [{ behavior: 'pr_review' }, { status: 'error' }, { error_code: null }, { error_code: 'posting_failed' },
-      { action: null }, { outcome: null }, { receipts: [] }, { artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } }]) {
+      { action: null }, { outcome: null }, { receipts: [] }, { artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } },
+      { artifact: { phase: 'reviewing', resource_error: 'cleanup_failed' } }, { resource_error: 'cleanup_failed' }]) {
       expect(statusOf({ ...stale, ...change }).state, JSON.stringify(change)).toBe('failed')
     }
   })

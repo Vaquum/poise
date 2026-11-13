@@ -1133,13 +1133,16 @@ def diagnostics(after: int = 0, limit: int = 3) -> dict:
               and (coalesce(c.error,'') != '' or c.error_code is not null or c.diagnostic is not null))""").fetchone()[0]
         columns = ",".join(f"substr(c.{field},1,512) as {field}" for field in fields)
         rows = conn.execute(f"""select d.seq,{columns},c.started_at,c.ended_at,
-            substr(c.error,1,8192) as error,substr(c.diagnostic,1,65536) as diagnostic
+            substr(c.error,1,8192) as error,substr(c.diagnostic,1,65536) as diagnostic,
+            case when c.artifact is null then null when json_valid(c.artifact)
+            then substr(json_extract(c.artifact,'$.resource_error'),1,512) else 'invalid_artifact' end as resource_error
             from diagnostic_calls d join calls c on c.id=d.call_id
             where d.seq>? order by d.seq limit ?""", (after, limit + 1)).fetchall()
     events = []
     for row in rows[:limit]:
         entry = {field: row[field] for field in fields}
-        entry.update(seq=row["seq"], error=row["error"], started_at_precise=utc_stamp(row["started_at"]),
+        entry.update(seq=row["seq"], error=row["error"], resource_error=row["resource_error"],
+                     started_at_precise=utc_stamp(row["started_at"]),
                      completed_at=utc_stamp(row["ended_at"]) if row["ended_at"] else None)
         try:
             raw = row["diagnostic"]

@@ -342,6 +342,7 @@ class TestRevisionBoundReview(IssueReviewCase):
         self.assertFalse((issue_review.WORK_ROOT / row["id"]).exists())
         diagnostic, = agent_interface.diagnostics()["events"]
         self.assertEqual(diagnostic["id"], row["id"])
+        self.assertIsNone(diagnostic["resource_error"])
         for omitted in ("receipts", "artifact", "resource_ownership", "resources_settled_at"):
             self.assertNotIn(omitted, diagnostic)
         repo = Path(__file__).resolve().parents[3]
@@ -417,6 +418,35 @@ class TestRevisionBoundReview(IssueReviewCase):
         self.assertFalse([call for call in github.calls if call[0] == "--comment-issue"])
         self.assertIsNone(row["issue_revision"])
         self.assert_superseded_projection_and_replacement(row, github)
+
+    def test_a_revision_fence_with_cleanup_failure_stays_visible_in_logging(self):
+        github = FakeGitHub()
+        with patch.object(issue_review, "cleanup", return_value=False):
+            row, _ = self.run_review(github, agent_writes({"comments": [{"issue": "#452", "body": "One."}]}),
+                                     expect_exit=True, expected="0" * 64)
+        self.assertEqual((row["status"], row["error_code"], row["action"], row["outcome"]),
+                         ("failed", "issue_revision_changed", "not_started", "preflight_failed"))
+        self.assertEqual(json.loads(row["artifact"])["resource_error"], "cleanup_failed")
+        diagnostic, = agent_interface.diagnostics()["events"]
+        self.assertEqual(diagnostic["id"], row["id"])
+        self.assertEqual(diagnostic["resource_error"], "cleanup_failed")
+        self.assertNotIn("artifact", diagnostic)
+        repo = Path(__file__).resolve().parents[3]
+        output = repo / "test-results"
+        output.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="issue-revision-cleanup-", dir=output) as work:
+            root = Path(work)
+            environment = {"PATH": os.environ["PATH"], "HOME": self.work.name, "TMPDIR": work}
+            wire = root / "caller.json"
+            wire.write_text(json.dumps({"diagnostic": diagnostic}))
+            build = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"),
+                                    str(repo / "tests/fixtures/issue-review-cleanup-projection.ts"), "--bundle", "--platform=node",
+                                    "--packages=external", "--format=esm", "--target=node22", f"--outfile={root / 'contract.mjs'}"],
+                                   cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            projected = subprocess.run(["node", str(root / "contract.mjs"), str(wire)], cwd=repo,
+                                       env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(projected.returncode, 0, projected.stderr)
 
     def test_child_only_output_cannot_fulfill_a_revision_bound_request(self):
         expected = issue_review.revision({"title": "Issue 452", "body": "Body 452"})

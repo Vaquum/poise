@@ -174,8 +174,8 @@ When the exact typed result is `issue_review` / `failed` /
 `issue_revision_changed` / `not_started` / `preflight_failed`, Observe → Behaviors
 shows **Superseded — issue changed**. Caller keeps its original receipt and exact
 reviewed revision; resource release and review of the replacement revision follow
-the existing rules. Any posting receipts (even an empty list) or publication
-artifact contradict this classification and keep the failure visible.
+the existing rules. Any posting receipts (even an empty list), publication
+artifact or cleanup failure contradicts this classification and keeps the failure visible.
 
 - Failed before posting anything: Poise launches that reviewer once more, then
   holds it.
