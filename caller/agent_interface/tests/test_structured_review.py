@@ -756,6 +756,55 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertEqual(run.error.diagnostic["submission"], "none")
         run.submit.assert_not_called()
 
+    def test_analysis_ceiling_expiring_during_inspection_is_a_handoff(self):
+        from agent_interface.process_diagnostic import command_failure
+        clock = SimpleNamespace(now=1000.0)
+        model = CATALOG.resolve("grok-4.6-xhigh")
+
+        def provider(args, *, timeout, **_kwargs):
+            clock.now += 795
+            return SimpleNamespace(returncode=0, stderr="",
+                                   stdout=json.dumps({**GROK_REPLY, "structuredOutput": INSPECT}))
+
+        original_validate = structured_review.validate_verdict
+
+        def validating(*args, **kwargs):
+            clock.now += 1
+            return original_validate(*args, **kwargs)
+
+        def inspecting(requests, *, timeout_s):
+            clock.now += 10
+            diagnostic = command_failure(subprocess.TimeoutExpired("github-interface", timeout_s),
+                                         "inspection", "/tmp/review", timeout_s)
+            raise atoms.AgentPreflightError(
+                f"Local review repository inspection timed out after {timeout_s:g} seconds",
+                "review_inspection_timeout", diagnostic)
+
+        repository = SimpleNamespace(inspect=inspecting)
+        text = "policy\n\nPR packet:\n\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
+        error = None
+        with patch.object(structured_review, "monotonic", lambda: clock.now), \
+                patch.object(review_budget, "monotonic", lambda: clock.now), \
+                patch.object(ReviewWatch, "run", side_effect=provider), \
+                patch.object(structured_review, "validate_verdict", side_effect=validating), \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit, \
+                review_budget.ReviewBudget(1413):
+            try:
+                structured_review.run("/repo", "system", text, model, "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40,
+                                      1413, repository=repository)
+            except review_budget.ReviewLimitError as failure:
+                error = failure
+        self.assertEqual(str(error), GROK_HANDOFF)
+        self.assertEqual(error.code, "review_budget_exhausted")
+        self.assertEqual(error.diagnostic["operation"], "provider.review")
+        self.assertEqual(error.diagnostic["phase"], "analysis")
+        self.assertEqual(error.diagnostic["outcome"], "handoff")
+        self.assertEqual(error.diagnostic["submission"], "none")
+        submit.assert_not_called()
+
     def test_shorter_overall_deadline_before_inspection_is_not_a_handoff(self):
         run = self._replay_before_inspection(59, 2, timeout_s=60)
         self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")

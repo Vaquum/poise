@@ -844,6 +844,8 @@ class TestRecovery(TestCase):
                 handoff = limiting_phase == 'provider_analysis'
                 self.assertEqual(diagnostic['phase'], 'analysis' if handoff else limiting_phase)
                 self.assertEqual(diagnostic['outcome'], 'handoff' if handoff else 'timed_out')
+                if handoff:
+                    self.assertEqual(diagnostic['operation'], 'provider.review')
                 self.assertEqual(diagnostic['submission'], 'none')
                 self.assertIn(f'file group {group} of 22', diagnostic['message'])
                 self.assertIn('Incomplete analysis', diagnostic['message'])

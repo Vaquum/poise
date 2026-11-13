@@ -423,6 +423,9 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                       "phase": emitted_phase, "outcome": outcome, "message": message[:500],
                       "elapsed_ms": round((monotonic() - group_started) * 1000),
                       "timeout_seconds": max(0, timeout), "submission": "none"}
+        if handoff:
+            # An inspect timeout carries operation github-interface; handoffs are typed provider.review.
+            diagnostic["operation"] = "provider.review"
         return review_budget.ReviewLimitError(_time_limit_message(model.provider, phase),
                                              "review_inspection_timeout" if phase == "inspection" else "review_budget_exhausted",
                                              diagnostic)
