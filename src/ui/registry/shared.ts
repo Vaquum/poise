@@ -66,7 +66,8 @@ export const SHARED: Registry = {
     source: 'Poise’s connection to your workspace.'
   },
   bell: {
-    name: 'Notifications', kind: 'Display', what: 'What needs you, counted as Overview’s Answer here counts it. Opens Answer here, with a route back to where you were.',
+    name: 'Notifications', kind: 'Display', what: 'What needs you, counted as Overview’s Answer here counts it at its Show level. Opens Answer here, with a route back to where you were; on Overview it brings Answer here to its first entry.',
+    does: 'Moves focus to Answer here’s first entry, or to its empty state when nothing is open at the level.',
     now: (el: any) => el.querySelector('[data-bell]')?.hidden ? 'Nothing open.' : `${el.querySelector('[data-bell]')?.textContent || 0} open.`,
     source: 'Every chat, behavior and pull request in your workspace. Ready-to-merge reminders repeat every 15 minutes until merged or silenced.'
   },

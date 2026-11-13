@@ -294,6 +294,8 @@ test('the bell reads after the place it opens on, so the place’s own reads go 
   await page.route('**/api/current**', (route) => { mark('board'); return route.fallback() })
   await open(page, '/?view=board')
   await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('1', { timeout: 10_000 })
+  // Away from Overview the bell says it opens Answer here there (#1433).
+  await expect(page.getByRole('button', { name: /^Notifications/ })).toHaveAccessibleName(/Opens Answer here in Overview\.$/)
   expect(at.board).toBeTruthy()
   expect(at.bell - at.board).toBeGreaterThanOrEqual(2_000)
 })
