@@ -94,11 +94,10 @@ commit than a pass files nothing. A run cancelled as a whole reports nothing,
 because it was superseded or stopped by hand; a job that runs out of time still
 counts as failed.
 
-A fork has no queue evidence, so every push to its `main` runs the complete
-gates, and `deploy/actions/gate.sh` refuses a tip that failed. Broken code can
-therefore land on this repository's `main` but cannot reach a fork's server: it
-pauses that fork's deploys until it is fixed. `full-suite.yml` does nothing in a
-fork.
+A fork's `main` needs complete CI and Caller evidence for its exact commit.
+It can reuse complete upstream checks as described below. Otherwise it runs
+the complete gates locally. `deploy/actions/gate.sh` refuses a tip whose CI
+or Caller run failed. `full-suite.yml` does nothing in a fork.
 
 ### How CI runs them
 
@@ -121,12 +120,21 @@ image, with VERSION read from the locked `@playwright/test` package. Its browser
 and system libraries are already installed. A version/executable mismatch fails
 before tests. Browser isolation and every existing assertion are unchanged.
 
-A push to main that did not draw the full run first looks for the latest
+A push to upstream main that did not draw the full run looks for the latest
 merge-queue run of the same workflow for the **exact same commit**, repository
 and queue branch. A completed success is reused, with its URL recorded in the
 Actions summary. Missing, failed, cancelled or unfinished evidence runs the
-complete main gates; API errors fail visibly. A fork therefore validates every
-push to its main.
+complete main gates. API errors fail visibly.
+
+A GitHub.com fork push can reuse a successful upstream merge group, main
+push, or main dispatch on the exact same commit. The planner reads the
+public Actions API and checks the latest eligible runs and attempt-specific
+jobs. CI needs the full-suite verification step, lint and types, the
+production build, both unit shards, and all six Chromium shards. Caller
+needs its tests, Python parsing and CLI checks. A fork push that changes
+dependencies also needs a successful upstream dependency audit. Each
+workflow links the accepted attempt in its summary. Missing, incomplete,
+stale or unavailable evidence leaves the complete local checks to run.
 
 `Verify (Node 22)` and `Caller (Python 3.13)` retain their names and main-push
 workflow events. The aggregate accepts omitted application jobs only when the

@@ -53,6 +53,7 @@ export function selectBrowserTests(paths, browserFiles) {
 
 // A selected run's browser shards finish beside its unit tests: about 80 declared
 // tests (some two and a half minutes on CI) to a shard, up to a full run's six.
+const fullUnitShards = 2
 const fullBrowserShards = 6
 const shardList = count => Array.from({ length: count }, (_, index) => index + 1)
 export function browserShards(files, read) {
@@ -92,6 +93,79 @@ export function reusableRun(runs, { repository, sha, workflow }) {
     && run.head_branch?.startsWith('gh-readonly-queue/main/'))
   const latest = candidates.sort((a, b) => b.id - a.id)[0]
   return latest?.status === 'completed' && latest.conclusion === 'success' ? latest : null
+}
+
+const upstream = 'autonomio/poise'
+const upstreamJobs = {
+  'ci.yml': [
+    ['Select tests or reuse queue evidence'],
+    ['Lint, types & audit (Node 22)', 'Lint', 'Typecheck client, server and tests'],
+    ['Production build (Node 22)', 'Run npm run build'],
+    ...shardList(fullUnitShards).map(shard => [`Unit & integration (${shard})`, 'Run unit and integration shard with timings']),
+    ...shardList(fullBrowserShards).map(shard => [`Browser Chromium (${shard})`, 'Run browser shard against the production build']),
+    ['Verify (Node 22)', 'Verify the full CI suite'],
+  ],
+  'caller.yml': [['Caller (Python 3.13)', 'Run Caller tests', 'Parse every Python file', 'Check the CLI entry points']],
+}
+
+const passed = result => result?.status === 'completed' && result.conclusion === 'success'
+const positiveInteger = value => Number.isSafeInteger(value) && value > 0
+const successfulStep = (job, name) => job.steps?.some(step => step.name === name && passed(step))
+
+function forkDependenciesUnchanged(base) {
+  if (!/^[0-9a-f]{40}$/.test(base ?? '') || /^0+$/.test(base)) return false
+  if (spawnSync('git', ['cat-file', '-e', `${base}^{commit}`]).status !== 0
+    && spawnSync('git', ['fetch', '--no-tags', '--depth=1', 'origin', base], { stdio: 'inherit', timeout: 10_000 }).status !== 0) return false
+  return spawnSync('git', ['diff', '--quiet', base, 'HEAD', '--', 'package.json', 'package-lock.json']).status === 0
+}
+
+async function upstreamEvidence(workflow, sha) {
+  const api = process.env.GITHUB_API_URL ?? 'https://api.github.com'
+  const signal = AbortSignal.timeout(12_000)
+  async function read(path) {
+    const response = await fetch(`${api}/repos/${upstream}/actions/${path}`, {
+      headers: { Accept: 'application/vnd.github+json' }, signal,
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    return response.json()
+  }
+  const trusted = run => run.head_sha === sha && run.path === `.github/workflows/${workflow}`
+    && run.repository?.full_name === upstream && run.head_repository?.full_name === upstream
+    && positiveInteger(run.id) && positiveInteger(run.run_attempt)
+    && (run.event === 'merge_group' ? run.head_branch?.startsWith('gh-readonly-queue/main/')
+      : ['push', 'workflow_dispatch'].includes(run.event) && run.head_branch === 'main')
+  try {
+    const { total_count: count, workflow_runs: runs } = await read(`workflows/${workflow}/runs?head_sha=${sha}&per_page=100`)
+    if (!Array.isArray(runs) || count !== runs.length) throw new Error('incomplete workflow runs response')
+    const candidates = runs.filter(trusted).sort((a, b) => b.id - a.id)
+    const queue = candidates.find(run => run.event === 'merge_group')
+    for (const run of candidates) {
+      // A non-sampled upstream push normally only relays the already-green queue.
+      // Its startup should not delay reuse of the queue's full results.
+      if (run.event === 'push' && run.status !== 'completed' && passed(queue)
+        && (workflow === 'caller.yml' || !drawsFullRun(sha))) continue
+      if (!passed(run)) return ''
+      const path = `runs/${run.id}/attempts/${run.run_attempt}`
+      const { total_count: total, jobs } = await read(`${path}/jobs?per_page=100`)
+      if (!Array.isArray(jobs) || total !== jobs.length) throw new Error('incomplete workflow jobs response')
+      const byName = new Map(jobs.map(job => [job.name, job]))
+      if (byName.size !== jobs.length || !upstreamJobs[workflow].every(([name, ...steps]) => {
+        const job = byName.get(name)
+        return passed(job) && job.run_id === run.id && job.run_attempt === run.run_attempt
+          && job.head_sha === sha && job.head_branch === run.head_branch
+          && steps.every(step => successfulStep(job, step))
+      })) continue
+      // A coalesced fork push may include a dependency change before this merge group.
+      if (workflow === 'ci.yml' && !successfulStep(byName.get('Lint, types & audit (Node 22)'), 'Audit dependencies')
+        && !forkDependenciesUnchanged(process.env.PUSH_BASE)) return ''
+      const current = await read(`runs/${run.id}`)
+      if (!trusted(current) || !passed(current) || current.id !== run.id || current.run_attempt !== run.run_attempt) return ''
+      return `https://github.com/${upstream}/actions/${path}`
+    }
+  } catch (error) {
+    console.error(`Upstream ${workflow} evidence unavailable (${error.message}); running the complete fork checks.`)
+  }
+  return ''
 }
 
 export function verify(results) {
@@ -187,15 +261,19 @@ function essentialUnitTests(paths) {
 
 export async function plan(workflow) {
   if (!['ci.yml', 'caller.yml'].includes(workflow)) throw new Error('Expected CI or Caller workflow')
-  const { GITHUB_EVENT_NAME: event, GITHUB_SHA: sha, BASE: base } = process.env
+  const { GITHUB_EVENT_NAME: event, GITHUB_SHA: sha, BASE: base, GITHUB_REPOSITORY: repository } = process.env
   if (!['pull_request', 'merge_group', 'push', 'workflow_dispatch'].includes(event)) throw new Error(`Unsupported event: ${event}`)
-  let reused = null
-  const drawn = event === 'push' && workflow === 'ci.yml' && drawsFullRun(sha ?? '')
+  let reuseUrl = ''
+  const drawn = event === 'push' && repository === upstream && workflow === 'ci.yml' && drawsFullRun(sha ?? '')
   if (event === 'push' && !drawn) {
     if (!/^[a-f0-9]{40}$/.test(sha ?? '')) throw new Error('Missing reuse API configuration')
-    const data = await github(`actions/workflows/${workflow}/runs?event=merge_group&head_sha=${sha}&per_page=100`)
-    if (!Array.isArray(data.workflow_runs)) throw new Error('Invalid workflow-runs response')
-    reused = reusableRun(data.workflow_runs, { repository: process.env.GITHUB_REPOSITORY, sha, workflow })
+    if (repository === upstream) {
+      const data = await github(`actions/workflows/${workflow}/runs?event=merge_group&head_sha=${sha}&per_page=100`)
+      if (!Array.isArray(data.workflow_runs)) throw new Error('Invalid workflow-runs response')
+      reuseUrl = reusableRun(data.workflow_runs, { repository, sha, workflow })?.html_url ?? ''
+    } else if (process.env.GITHUB_SERVER_URL === 'https://github.com' && process.env.GITHUB_REF === 'refs/heads/main') {
+      reuseUrl = await upstreamEvidence(workflow, sha)
+    }
   }
   let paths = []
   if (event === 'pull_request' || (event === 'merge_group' && workflow === 'ci.yml')) {
@@ -203,21 +281,26 @@ export async function plan(workflow) {
     paths = git('diff', '--name-only', '--no-renames', '-z', base, 'HEAD').split('\0').filter(Boolean)
   }
   const selection = selectTests(event, paths, testFiles(browserSpec))
-  const mode = reused ? 'reuse' : selection.mode
+  const mode = reuseUrl ? 'reuse' : selection.mode
   const version = JSON.parse(readFileSync('package-lock.json', 'utf8')).packages['node_modules/@playwright/test'].version
   if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Expected a stable locked Playwright version')
   const values = {
     mode, browser_files: selection.browserFiles,
     unit_files: workflow === 'ci.yml' && selection.mode === 'essential' ? essentialUnitTests(paths) : [],
     browser_image: `mcr.microsoft.com/playwright:v${version}-noble`,
-    unit_shards: mode === 'full' ? [1, 2] : [1],
+    unit_shards: mode === 'full' ? shardList(fullUnitShards) : [1],
     browser_shards: mode === 'full' ? shardList(fullBrowserShards) : browserShards(selection.browserFiles, file => readFileSync(file, 'utf8')),
-    reuse_url: reused?.html_url ?? '',
-    run: !reused && (event !== 'pull_request' || callerAffected(paths)),
+    reuse_url: reuseUrl,
+    run: !reuseUrl && (event !== 'pull_request' || callerAffected(paths)),
   }
   output(values)
-  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY,
-    `CI mode: **${mode}**. ${reused ? `Reuses ${reused.html_url} for exact commit ${sha}.` : drawn ? `Commit ${sha} drew the full run.` : `Changed paths: ${paths.length}.`}\n`)
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    let detail = `Changed paths: ${paths.length}.`
+    if (reuseUrl) detail = `Reuses ${reuseUrl} for exact commit ${sha}.`
+    else if (drawn) detail = `Commit ${sha} drew the full run.`
+    else if (event === 'push' && repository !== upstream) detail = 'Running the complete fork checks.'
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, `CI mode: **${mode}**. ${detail}\n`)
+  }
 }
 
 function npmRun(args) {
@@ -237,7 +320,7 @@ function runTests(kind) {
   if (!['full', 'essential'].includes(mode)) throw new Error(`Cannot run tests in mode ${mode}`)
   const shard = Number(process.env.CI_TEST_SHARD)
   // A browser shard takes its run's shard count from the job matrix.
-  const shards = kind === 'unit' ? (mode === 'full' ? 2 : 1) : Number(process.env.CI_TEST_SHARDS ?? (mode === 'full' ? fullBrowserShards : 1))
+  const shards = kind === 'unit' ? (mode === 'full' ? fullUnitShards : 1) : Number(process.env.CI_TEST_SHARDS ?? (mode === 'full' ? fullBrowserShards : 1))
   if (![shard, shards].every(Number.isInteger) || shard < 1 || shard > shards || shards > fullBrowserShards) throw new Error('Invalid test shard')
   const args = kind === 'unit'
     ? ['test:full', '--', `--shard=${shard}/${shards}`, '--maxWorkers=1', '--reporter=default', '--reporter=json', '--outputFile=test-results/vitest.json']
