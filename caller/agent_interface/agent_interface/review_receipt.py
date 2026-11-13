@@ -146,10 +146,7 @@ def retain_verdict(verdict: dict, head: str) -> None:
         row = conn.execute("select status,artifact from calls where id=?", (call_id,)).fetchone()
         if not row or row[0] != "running" or json.loads(row[1])["phase"] != "reviewing":
             raise RuntimeError("review findings no longer own an unsubmitted native invocation")
-        with caller_store.response(Path(path), RESPONSES).open("w", encoding="utf-8") as output:
-            output.write(json.dumps(verdict, ensure_ascii=False))
-            output.flush()
-            os.fsync(output.fileno())
+        caller_store.write_response_text(Path(path), RESPONSES, json.dumps(verdict, ensure_ascii=False))
         conn.execute("update calls set response_path=? where id=?", (path, call_id))
 
 
