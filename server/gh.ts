@@ -19,6 +19,7 @@ import { mkdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ReviewSummary } from '../src/analytics-work-review'
+import type { OpenPrClosingList } from './chat/control'
 import { readDatastoreContent, readDatastoreView } from './datastore-reader'
 import { getMeta } from './db'
 import { HttpError } from './http'
@@ -252,7 +253,7 @@ export async function runCli(org: Organization, args: string[]): Promise<Datasto
   const key = JSON.stringify([org.login, org.datastorePath, args])
   let read = datastoreReads.get(key)
   if (!read) {
-    const started = readKept(org, args, key)
+    const started = readKept(args[0] === 'view' ? org.datastorePath : undefined, key, MARKED_VIEWS.has(args[1]), viewReads, () => readDatastore(org, args))
     datastoreReads.set(key, started)
     const settle = () => { if (datastoreReads.get(key) === started) datastoreReads.delete(key) }
     started.then(settle, settle)
@@ -270,33 +271,35 @@ export async function runCli(org: Organization, args: string[]): Promise<Datasto
  *  item: a view over items whose datastore still has the content mark it was
  *  read under answers alike too, for CONTENT_KEPT_MS. The mark is taken
  *  before the read, like the version. */
-async function readKept(org: Organization, args: string[], key: string): Promise<DatastoreRecord[]> {
-  const path = args[0] === 'view' ? org.datastorePath : undefined
+async function readKept<T>(path: string | undefined, key: string, marked: boolean, reads: Map<string, KeptRead<T>>, read: () => Promise<T>): Promise<T> {
   const version = path ? await datastoreVersion(path) : null
-  const kept = version ? viewReads.get(key) : undefined
-  if (kept && kept.version === version) return kept.rows
+  const kept = version ? reads.get(key) : undefined
+  if (kept && kept.version === version) return kept.value
   // A version the mark vouched for stands only as long as the mark may: a
   // change it cannot see shows within CONTENT_KEPT_MS, whether or not
   // anything is written after it.
   const vouching = kept !== undefined && Date.now() - kept.readAt < CONTENT_KEPT_MS
-  if (vouching && kept.vouched === version) return kept.rows
-  const content = path && version && MARKED_VIEWS.has(args[1]) ? await datastoreContent(path, version) : null
+  if (vouching && kept.vouched === version) return kept.value
+  const content = path && version && marked ? await datastoreContent(path, version) : null
   if (vouching && content !== null && kept.content === content) {
     kept.vouched = version
-    return kept.rows
+    return kept.value
   }
-  const rows = await readDatastore(org, args)
+  const value = await read()
   if (version) {
-    viewReads.delete(key)
-    viewReads.set(key, { version, content, vouched: null, readAt: Date.now(), rows })
-    if (viewReads.size > VIEW_READS_KEPT) viewReads.delete(viewReads.keys().next().value!)
+    reads.delete(key)
+    reads.set(key, { version, content, vouched: null, readAt: Date.now(), value })
+    if (reads.size > READS_KEPT) reads.delete(reads.keys().next().value!)
   }
-  return rows
+  return value
 }
 
-/** View reads kept with the datastore file version and content mark they were read at, the oldest dropped first. */
-const viewReads = new Map<string, { version: string, content: string | null, vouched: string | null, readAt: number, rows: DatastoreRecord[] }>()
-const VIEW_READS_KEPT = 200
+/** A read kept with the datastore file version and content mark it was read
+ *  at, and the later version the mark last vouched for. */
+interface KeptRead<T> { version: string, content: string | null, vouched: string | null, readAt: number, value: T }
+/** View reads, the oldest dropped first past READS_KEPT. */
+const viewReads = new Map<string, KeptRead<DatastoreRecord[]>>()
+const READS_KEPT = 200
 /** The views over items and their evidence, all the content mark watches. */
 const MARKED_VIEWS = new Set(['pr', 'issue', 'user'])
 /** How long an unchanged content mark vouches for a view: a change the mark
@@ -914,6 +917,21 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: 
   return { records: out, errors }
 }
 
+/** Board's intake shows which open pull requests close each issue. Each page
+ *  is a Caller process, which costs a second under load, and its answer
+ *  changes only with an item: between syncs that leave the content mark alone
+ *  a page answers from what it read. Only this display reads them kept; PR
+ *  ownership and binding read every page fresh. Null when unavailable, never kept. */
+const closingReads = new Map<string, KeptRead<OpenPrClosingList>>()
+function readClosingPage(org: Organization, after: { repo: string, number: number } | undefined, read: (org: Organization, after?: { repo: string, number: number }) => Promise<OpenPrClosingList | null>): Promise<OpenPrClosingList | null> {
+  const key = JSON.stringify([org.login, org.datastorePath, after ?? null])
+  return readKept(org.datastorePath, key, true, closingReads, async () => {
+    const page = await read(org, after)
+    if (!page) throw new Error('open pull request references are unavailable')
+    return page
+  }).catch(() => null)
+}
+
 // A list read runs a datastore process for every organization, kind and
 // scope, and Overview, Board and every open tab ask for the same lists. An
 // identical list read that arrives while one is running joins it; once it
@@ -1086,7 +1104,7 @@ async function handleGhOperation(body: any, op: unknown, me: string): Promise<{ 
         const closing: [string, { number: number, url: string }][] = []
         let after: { repo: string, number: number } | undefined
         for (;;) {
-          const page = await readOpenPrClosingRefs(org, after)
+          const page = await readClosingPage(org, after, readOpenPrClosingRefs)
           if (!page || (page.truncated && !page.more) || page.prs.some((pr) => pr.closingTruncated)) throw new Error('open pull request references are incomplete')
           for (const pr of page.prs) for (const ref of pr.closing) closing.push([`${ref.repo}#${ref.number}`.toLowerCase(), { number: pr.number, url: pr.url }])
           if (!page.more) break
