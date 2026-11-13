@@ -2,7 +2,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseBehaviorLedgerArguments, runBehaviorLedgerCli } from '../server/behavior-ledger-cli'
 import { computePrBlocker, parsePrStatusRead, type BlockerInput } from '../server/behavior-pr-status'
-import { HEAD_SHA, NEXT_HEAD_SHA, arrangeCli, fixture, loadModules, mocks, pr, recordCompletedInitialReview } from './behaviors-runtime-fixture'
+import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
+import { HEAD_SHA, NEXT_HEAD_SHA, agentLog, arrangeCli, fixture, loadModules, mocks, pr, recordCompletedInitialReview } from './behaviors-runtime-fixture'
 import { prGroup } from '../src/ui/places/overview/entries'
 
 const HEAD = HEAD_SHA
@@ -80,6 +81,7 @@ describe('computePrBlocker', () => {
     }))
     expect(computed.id).toBe('held')
     expect(computed.line).toBe('held: approve-prs rate_limit since 15:54Z, retry 16:02Z')
+    expect(computed.details).toContain(`review running: approve-prs on ${SHORT}`)
     expect(computed.details).toContain('also held: review-new-prs held_result since 15:50Z')
   })
 
@@ -277,7 +279,7 @@ describe('readPrStatus', () => {
 
   function seedReview(db: typeof import('../server/db'), options: {
     behavior?: 'review-new-prs' | 'approve-prs', target?: string, head?: string,
-    callId?: string, failureAt?: string,
+    callId?: string, failureAt?: string, error?: string,
   } = {}) {
     const { behavior = 'approve-prs', head = NEXT, callId = 'c'.repeat(32), failureAt } = options
     const target = options.target ?? `${pr.repo}#${pr.number}@head=${head}`
@@ -293,14 +295,107 @@ describe('readPrStatus', () => {
     if (failureAt) {
       const launch = db.listBehaviorLaunchClaims(behavior).find((row) => row.claimId === claimId)
       if (!launch) throw new Error('could not find review launch')
-      const error = 'review failed: HTTP 503 Service Unavailable'
+      const error = options.error ?? 'review failed: HTTP 503 Service Unavailable'
       const id = db.recordBehaviorDeadLetter(launch, error)
       db.db.prepare('UPDATE behavior_dead_letters SET created_at = ? WHERE id = ?').run(failureAt, id)
       db.setBehaviorLaunchErrorOwned(behavior, target, claimId, error)
       db.completeSeenOwned(behavior, target, claimId)
     }
-    return { behavior, target, claimId }
+    return { behavior, target, claimId, callId }
   }
+
+  async function retainTimeout(review: ReturnType<typeof seedReview>, overrides: Record<string, unknown> = {}) {
+    fixture.agentLogs = [agentLog({
+      id: review.callId, correlation_id: review.claimId, expected_head: HEAD,
+      behavior: review.behavior === 'review-new-prs' ? 'pr_review' : 'pr_approve',
+      source: `poise:${review.behavior}`, model: 'grok-4-20', status: 'failed',
+      started_at: '2026-11-12T14:00:00Z', started_at_precise: '2026-11-12T14:00:00Z',
+      completed_at: '2026-11-12T15:03:00Z', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'review_budget_exhausted', error: 'review failed: no verdict before the budget ran out',
+      ...overrides,
+    })]
+    await (await import('../server/agent')).fetchAgentLogSnapshot()
+  }
+
+  it.each(['released', 'reused'] as const)('attributes an older timeout from its original Call after its headless launch is %s', async (launch) => {
+    const { db, runtime, status } = await setup()
+    const target = `${pr.repo}#${pr.number}`
+    const old = seedReview(db, { behavior: 'review-new-prs', target, head: HEAD,
+      callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z',
+      error: 'review failed: no verdict before the budget ran out' })
+    expect(db.releaseFailedBehaviorLaunch(old.behavior, old.target, old.callId, HEAD)).toBe(true)
+    seedReview(db, { behavior: 'review-new-prs', target: launch === 'reused' ? target : `${target}@secondary` })
+    await retainTimeout(old)
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+    mocks.runFile.mockClear()
+    const before = db.db.prepare('SELECT * FROM behavior_dead_letters').all()
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker).toMatchObject({
+      id: 'review_running', line: `review running: review-new-prs on ${NEXT.slice(0, 8)}`,
+      details: [`past review: review-new-prs review_budget_exhausted on ${HEAD} since 2026-11-12T15:03:00Z`],
+    })
+    expect(db.db.prepare('SELECT * FROM behavior_dead_letters').all()).toEqual(before)
+    expect(mocks.runFile.mock.calls.every(([command]) => command === 'github-datastore')).toBe(true)
+  })
+
+  it.each([
+    ['Call ID', { id: 'b'.repeat(32) }], ['correlation', { correlation_id: 'other' }],
+    ['repository', { repo: 'other/repo' }], ['PR', { pr_id: '18' }],
+    ['behavior', { behavior: 'pr_approve' }], ['actor', { actor: 'other-bot' }], ['source', { source: 'poise:replay' }],
+    ['missing head', { expected_head: null }], ['unreadable row', { expected_head: 'invalid' }],
+    ['ambiguous publication', { action: null, outcome: null }], ['review receipt', { review_id: 123 }],
+  ] as const)('keeps the hold when the original Caller evidence has a mismatched or uncertain %s', async (_identity, overrides) => {
+    const { db, runtime, status } = await setup()
+    const old = seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}`, head: HEAD,
+      callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+    expect(db.releaseFailedBehaviorLaunch(old.behavior, old.target, old.callId, HEAD)).toBe(true)
+    seedReview(db, { behavior: 'review-new-prs', target: old.target })
+    await retainTimeout(old, overrides)
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker.id).toBe('held')
+    expect(reply.rows[0].blocker.details).toEqual([`review running: review-new-prs on ${NEXT.slice(0, 8)}`])
+  })
+
+  it('keeps a released launch held when its previously readable Caller history becomes unreadable', async () => {
+    const { db, runtime, status } = await setup()
+    const old = seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}`, head: HEAD,
+      callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+    expect(db.releaseFailedBehaviorLaunch(old.behavior, old.target, old.callId, HEAD)).toBe(true)
+    seedReview(db, { behavior: 'review-new-prs', target: old.target })
+    await retainTimeout(old)
+    mocks.runFile.mockRejectedValueOnce(new Error('Caller history unavailable'))
+    await expect((await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })).rejects.toThrow('Caller history unavailable')
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker.id).toBe('held')
+    expect(reply.rows[0].blocker.details).toEqual([`review running: review-new-prs on ${NEXT.slice(0, 8)}`])
+  })
+
+  it('keeps a same-head Grok stop primary and exposes the running Sol fallback', async () => {
+    const { db, runtime, status } = await setup()
+    const stopped = seedReview(db, { behavior: 'review-new-prs', head: HEAD, callId: 'a'.repeat(32),
+      failureAt: '2026-11-12T14:43:00Z', error: REVIEW_BUDGET_STOPPED })
+    const fallback = seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}@fallback`, head: HEAD })
+    await retainTimeout(stopped)
+    fixture.agentLogs.push(agentLog({ id: fallback.callId, correlation_id: fallback.claimId,
+      expected_head: HEAD, model: 'gpt-6.1-sol-max' }))
+    await (await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })
+    seedCache(runtime, '2026-11-12T15:31:00Z')
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker).toMatchObject({
+      id: 'held', line: 'held: review-new-prs review_budget_exhausted since 14:43Z',
+      details: [`review running: review-new-prs on ${SHORT}`],
+    })
+  })
 
   it('shows the current review alongside both retained past-revision failures', async () => {
     const { db, runtime, status } = await setup()
@@ -337,7 +432,10 @@ describe('readPrStatus', () => {
 
     expect(reply.rows[0].blocker).toMatchObject({
       id: 'held', line: 'held: approve-prs upstream_unavailable since 14:40Z',
-      details: [`past review: approve-prs upstream_unavailable on ${HEAD} since 2026-11-12T15:03:00Z`],
+      details: [
+        `review running: approve-prs on ${NEXT.slice(0, 8)}`,
+        `past review: approve-prs upstream_unavailable on ${HEAD} since 2026-11-12T15:03:00Z`,
+      ],
     })
   })
 
@@ -354,7 +452,7 @@ describe('readPrStatus', () => {
 
       const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [`review running: approve-prs on ${NEXT.slice(0, 8)}`] })
     },
   )
 
@@ -396,7 +494,7 @@ describe('readPrStatus', () => {
 
     const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [`review running: approve-prs on ${NEXT.slice(0, 8)}`] })
   })
 
   it('projects one approved green row with rounds from the cap counter', async () => {

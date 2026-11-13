@@ -144,6 +144,11 @@ export function resetAgentLogCache(): void {
   }
 }
 
+/** Retained history only: never starts a read or reuses evidence after a failed read. */
+export function getCachedAgentLogSnapshot(): AgentLogSnapshot | null {
+  return historyAgentLogLane.failed ? null : historyAgentLogLane.cached?.snapshot ?? null
+}
+
 // Shaped like runFile's own abort rejection, minus the child-kill fields:
 // the child may live on for the remaining waiters.
 function agentLogAbortError(signal: AbortSignal): Error {
