@@ -48,6 +48,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          PUSH_BASE: ${{ github.event.before }}
 
   static:
     needs: plan
@@ -200,7 +201,7 @@ jobs:
     timeout-minutes: 1
     steps:
       - uses: actions/checkout@v4
-      - name: Require every selected gate or exact-commit reuse to succeed
+      - name: ${{ needs.plan.outputs.mode == 'full' && 'Verify the full CI suite' || 'Verify selected or reused CI' }}
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: node .github/workflows/ci.mjs verify

@@ -403,8 +403,8 @@ async function github(routes) {
     let text = ''
     request.on('data', chunk => { text += chunk })
     request.on('end', () => {
-      const url = request.url.replace(/^\/repos\/[^/]+\/[^/]+\//, '')
-      requests.push({ method: request.method, url, body: text ? JSON.parse(text) : undefined, auth: request.headers.authorization })
+      const [, repository, url] = /^\/repos\/([^/]+\/[^/]+)\/(.*)$/.exec(request.url)
+      requests.push({ method: request.method, repository, url, body: text ? JSON.parse(text) : undefined, auth: request.headers.authorization })
       const route = Object.keys(routes).find(key => `${request.method} ${url}`.startsWith(key))
       response.statusCode = route ? 200 : 404
       response.end(JSON.stringify(route ? routes[route] : { message: `no route for ${request.method} ${url}` }))
@@ -472,12 +472,130 @@ describe('the plan each CI event gets', () => {
     expect(code).toBe(0)
     expect(outputs).toMatchObject({ mode: 'reuse', run: false })
   })
+})
 
-  it('runs everything on a fork\'s push, which has no queue evidence', async () => {
-    const api = await github({ 'GET actions/workflows/ci.yml/runs': { workflow_runs: [] } })
-    const { code, outputs } = await ci(repo.root, ['plan', 'ci.yml'], { GITHUB_EVENT_NAME: 'push', GITHUB_SHA: notDrawn, ...api.env, GITHUB_REPOSITORY: 'Vaquum/poise' })
-    expect(code).toBe(0)
-    expect(outputs.mode).toBe('full')
+describe('complete upstream evidence on a fork push', () => {
+  const repo = sharedCheckout()
+  const source = {
+    ...success, repository: { full_name: identity.repository }, head_sha: notDrawn, run_attempt: 1,
+  }
+  const push = { event: 'push', head_branch: 'main', id: 11 }
+  const complete = { status: 'completed', conclusion: 'success' }
+  const job = (run, name, ...steps) => ({
+    ...complete, run_id: run.id, run_attempt: run.run_attempt, head_sha: run.head_sha,
+    head_branch: run.head_branch, name, steps: steps.map(name => ({ ...complete, name })),
+  })
+  const fullCI = run => [
+    job(run, 'Select tests or reuse queue evidence'),
+    job(run, 'Lint, types & audit (Node 22)', 'Lint', 'Typecheck client, server and tests'),
+    job(run, 'Production build (Node 22)', 'Run npm run build'),
+    ...[1, 2].map(shard => job(run, `Unit & integration (${shard})`, 'Run unit and integration shard with timings')),
+    ...[1, 2, 3, 4, 5, 6].map(shard => job(run, `Browser Chromium (${shard})`, 'Run browser shard against the production build')),
+    job(run, 'Verify (Node 22)', 'Verify the full CI suite'),
+  ]
+  const jobsResponse = jobs => ({ total_count: jobs.length, jobs })
+  const runsResponse = (...runs) => ({ total_count: runs.length, workflow_runs: runs })
+  const fork = {
+    GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'Vaquum/poise', GITHUB_SHA: notDrawn,
+    GITHUB_SERVER_URL: 'https://github.com', GITHUB_REF: 'refs/heads/main',
+  }
+
+  async function forkPlan(api, { workflow = 'ci.yml', checkout = repo, env = {} } = {}) {
+    const { code, outputs, stderr } = await ci(checkout.root, ['plan', workflow], {
+      ...api.env, ...fork, PUSH_BASE: checkout.base, ...env,
+    })
+    expect(code, stderr).toBe(0)
+    return outputs
+  }
+
+  it.each(['merge_group', 'push', 'workflow_dispatch'])('reuses a complete %s on the exact SHA with an anonymous read', async (event) => {
+    const run = event === 'merge_group' ? source : { ...source, ...push, event }
+    const api = await github({
+      'GET actions/workflows/ci.yml/runs': runsResponse(run),
+      [`GET actions/runs/${run.id}/attempts/1/jobs`]: jobsResponse(fullCI(run)),
+      [`GET actions/runs/${run.id}`]: run,
+    })
+    expect(await forkPlan(api)).toMatchObject({
+      mode: 'reuse', reuse_url: `https://github.com/autonomio/poise/actions/runs/${run.id}/attempts/1`,
+    })
+    expect(api.requests).toHaveLength(3)
+    expect(api.requests[0].url).toContain(`head_sha=${notDrawn}`)
+    expect(api.requests.every(request => request.repository === identity.repository && request.auth === undefined)).toBe(true)
+  })
+
+  it('uses a full merge group while the non-sampled upstream push is relaying it', async () => {
+    const api = await github({
+      'GET actions/workflows/ci.yml/runs': runsResponse({ ...source, ...push, status: 'in_progress', conclusion: null }, source),
+      'GET actions/runs/10/attempts/1/jobs': jobsResponse(fullCI(source)),
+      'GET actions/runs/10': source,
+    })
+    expect(await forkPlan(api)).toMatchObject({ mode: 'reuse' })
+  })
+
+  it('keeps the full-coverage marker on the aggregate step for a full plan', () => {
+    const ci = parse(readFileSync('.github/workflows/ci.yml', 'utf8'))
+    expect(ci.jobs.verify.steps.find(step => step.run?.endsWith('ci.mjs verify')).name)
+      .toContain("needs.plan.outputs.mode == 'full' && 'Verify the full CI suite'")
+    expect(ci.jobs.plan.steps.find(step => step.id === 'plan').env.PUSH_BASE).toBe('${{ github.event.before }}')
+  })
+
+  it.each([
+    ['an unavailable API', null],
+    ['missing evidence', []],
+    ['another commit', [{ ...source, head_sha: drawn }]],
+    ['another workflow', [{ ...source, path: '.github/workflows/other.yml' }]],
+    ['another repository', [{ ...source, repository: { full_name: fork.GITHUB_REPOSITORY } }]],
+    ['a fork head', [{ ...source, head_repository: { full_name: fork.GITHUB_REPOSITORY } }]],
+    ['a pull request', [{ ...source, event: 'pull_request' }]],
+    ['a non-main push', [{ ...source, ...push, head_branch: 'other' }]],
+    ['a later failure', [source, { ...source, ...push, conclusion: 'failure' }]],
+    ['a later cancellation', [source, { ...source, id: 12, conclusion: 'cancelled' }]],
+  ])('runs the full fork suite for %s', async (_, runs) => {
+    const api = await github(runs ? { 'GET actions/workflows/ci.yml/runs': runsResponse(...runs) } : {})
+    expect(await forkPlan(api)).toMatchObject({ mode: 'full', unit_shards: [1, 2], browser_shards: [1, 2, 3, 4, 5, 6] })
+    expect(api.requests).toHaveLength(1)
+  })
+
+  it.each(['selected suite', 'unmarked coverage', 'skipped step', 'another attempt', 'superseded attempt'])('runs the full fork suite for a %s', async (missing) => {
+    let jobs = fullCI(source)
+    const second = jobs.find(job => job.name === 'Unit & integration (2)')
+    if (missing === 'selected suite') jobs = jobs.filter(job => job !== second)
+    if (missing === 'unmarked coverage') jobs.at(-1).steps[0].name = 'Require every selected gate or exact-commit reuse to succeed'
+    if (missing === 'skipped step') second.steps[0].conclusion = 'skipped'
+    if (missing === 'another attempt') second.run_attempt += 1
+    const api = await github({
+      'GET actions/workflows/ci.yml/runs': runsResponse(source),
+      'GET actions/runs/10/attempts/1/jobs': jobsResponse(jobs),
+      'GET actions/runs/10': missing === 'superseded attempt' ? { ...source, run_attempt: 2 } : source,
+    })
+    expect(await forkPlan(api)).toMatchObject({ mode: 'full', reuse_url: '' })
+  })
+
+  it('keeps the dependency audit when the fork has coalesced an earlier dependency change', async () => {
+    const changed = checkout()
+    write(changed.root, 'package.json', '{"name":"new-dependency"}')
+    changed.git('add', 'package.json')
+    changed.git('commit', '-qm', 'change dependencies')
+    const jobs = fullCI(source)
+    const api = await github({
+      'GET actions/workflows/ci.yml/runs': runsResponse(source),
+      'GET actions/runs/10/attempts/1/jobs': jobsResponse(jobs),
+      'GET actions/runs/10': source,
+    })
+    expect(await forkPlan(api, { checkout: changed })).toMatchObject({ mode: 'full' })
+    jobs.find(job => job.name.startsWith('Lint')).steps.push({ ...complete, name: 'Audit dependencies' })
+    expect(await forkPlan(api, { checkout: changed })).toMatchObject({ mode: 'reuse' })
+  })
+
+  it.each([true, false])('reuses Caller only if its tests and checks ran upstream (%s)', async (ran) => {
+    const run = { ...source, path: '.github/workflows/caller.yml' }
+    const steps = ran ? ['Run Caller tests', 'Parse every Python file', 'Check the CLI entry points'] : []
+    const api = await github({
+      'GET actions/workflows/caller.yml/runs': runsResponse(run),
+      'GET actions/runs/10/attempts/1/jobs': jobsResponse([job(run, 'Caller (Python 3.13)', ...steps)]),
+      'GET actions/runs/10': run,
+    })
+    expect(await forkPlan(api, { workflow: 'caller.yml' })).toMatchObject({ mode: ran ? 'reuse' : 'full', run: !ran })
   })
 })
 
