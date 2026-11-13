@@ -6,7 +6,7 @@ import { agentInterfaceCwd } from './models'
 import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import { chainCiDependency, chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { chainCiDependency, chainReviewResponse, implementationTestDependency, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { datastoreViewOrCli } from './datastore-reader'
@@ -147,12 +147,16 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // The chain's draws seed by its seed issue, so every observation
       // refresh re-reads the same roster instead of admitting new slots.
       const chainKey = `${chain.repository}#${chain.issue}`
+      const testHold = chain.testHold ?? (!chain.testRecovery?.admission ? chain.testRecovery?.hold : undefined)
+      const originalTest = chain.invocations.find(invocation => invocation.id === testHold?.invocationId)
+      const testProof = originalTest && implementationTestDependency(originalTest)
       // One process reads the seed issue, its comments and the publication
       // inspection together, reusing their existing projections. The output
       // cap is the sum of the three previous per-read caps, so no facet
       // loses budget; any facet failure still fails the whole observation.
       const [seed, roster] = await Promise.all([
-        github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch, ...actor], 3 * 2 * 1024 * 1024),
+        github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch,
+          ...(testProof ? ['--test-dependency-json', JSON.stringify(testProof)] : []), ...actor], 3 * 2 * 1024 * 1024),
         hooks.roster(chainKey),
       ])
       if (seed.issue_number !== chain.issue || seed.branch !== chain.branch
@@ -174,6 +178,16 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           state: typeof publication.state === 'string' ? publication.state : null, merged: publication.merged === true,
           merge_sha: publication.merge_sha === null ? null : sha(publication.merge_sha, 'publication') }, pull: null }
       if (seed.full_suite) observation.fullSuite = object(seed.full_suite, 'full-suite recovery')
+      if (testProof && originalTest) {
+        const proof = object(seed.test_dependency, 'implementation test dependency')
+        if (proof.verified === true && ['base', 'run', 'runAttempt', 'baselineRun', 'baselineAttempt', 'remediation', 'failures']
+          .some(key => chainBasis(proof[key]) !== chainBasis(testProof[key as keyof typeof testProof]))) throw new Error('original implementation test evidence changed')
+        const recovery = proof.recovered === true ? object(proof.recovery, 'implementation test recovery') : null
+        observation.testDependency = { invocationId: originalTest.id, verified: proof.verified === true, recovered: proof.recovered === true,
+          ...(typeof proof.reason === 'string' ? { reason: proof.reason } : {}),
+          ...(recovery ? { recovery: { merge: sha(recovery.merge, 'delivered test recovery'), base: sha(recovery.base, 'recovered implementation base'),
+            run: object(recovery.run, 'original-test validation run') } } : {}) }
+      }
       const pendingReview = chain.invocations.find((invocation) => invocation.state === 'uncertain' && invocation.behavior === 'review-issue')
       if (pendingReview && typeof pendingReview.evidence?.callId === 'string') {
         const artifact = object(pendingReview.evidence.artifact, 'issue review publication receipt')

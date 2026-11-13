@@ -261,6 +261,36 @@ Work impact and attention describe this automatic CI recheck instead of asking
 for Resume; attention retains the scheduled `reconciliation.nextObservationAt`.
 Unsettled original receipts and resources still require reconciliation first.
 
+A pre-PR implementation can recover through the same bounded observation even
+with failure reporting disabled. Its original Caller artifact must retain
+`test_dependency`: independently read CI assertion evidence tying the original
+producing run to `prepared.checkout_head`, plus a distinct failing run on that
+exact base. Both completed main CI runs must have complete full-suite artifacts,
+with every failing test and assertion cause matching. Mixed or non-test failures,
+missing artifacts, changed original run attempts and worker diagnosis alone keep
+the hold. This path supports CI artifacts; relay output or its captured checkout
+digest is not an authoritative base/run mapping. In particular, #1505 remains
+held when its original evidence is unavailable.
+
+The existing seed observation verifies the remediation issue's exact closing PR
+merge on main and its ancestry after the failed base. A successful full-suite CI
+run on the current implementation base must actually pass every original failing
+test. Closure or an unrelated passing job cannot authorize recovery. The same
+source revision and implementation slot must remain eligible, with the original
+failed/no-publication receipt and positive resource release. A fresh seed read
+must show no pushed branch, PR or competing work; this is checked again after
+provider preparation at admission.
+
+The automatic hold carries its original journal sequence. An operator Hold,
+including one with identical text, removes that recovery identity. The existing
+resume event retains the delivered recovery commit and original hold identity;
+normal invocation admission durably consumes one fresh implementation allowance
+before launch, even after three prior attempts. A restart between recovery and
+admission preserves it. Duplicate observations, newer main commits or passing
+reruns cannot replenish it after a failed replacement. Ordinary operator Resume
+retains its existing retry policy. Original review evidence, reports and receipts
+remain unchanged; resource, provider, review and publication gates still apply.
+
 Merged `merge-pr` and `resolve-threads` uncertainty uses original journal
 receipts only. A missing original response schedules no GitHub read; retaining
 that response makes its original settlement eligible without another mutation.

@@ -75,6 +75,18 @@ strings and confer no automatic recovery authority. The
 original no-publication receipt, resource release and fresh CI on the same head
 or a verified base-only update before resuming the remaining gates.
 
+A pre-PR implementation blocked solely by an observed main CI test failure may
+also return `testDependency: {base, run, baselineRun, remediation}` alongside its
+concrete blocked string. `base` must be `prepared.checkout_head`; `run` is the
+original producing CI run, `baselineRun` is a distinct run on that exact commit,
+and `remediation` is an existing same-repository issue URL. Caller reads both
+full-suite assertion artifacts and verifies every failing test and cause before
+retaining `artifact.test_dependency`. `github-interface --chain-seed ISSUE
+--branch BRANCH --test-dependency-json JSON --token-user USER` revalidates that
+proof and the delivered recovery on the current implementation base. See
+[pre-PR recovery](../docs/Behavior-chain.md#bounded-reconciliation) for admission
+and evidence limits. Relay prose and digests alone remain actionable holds.
+
 ## Accounts
 
 No GitHub account is fixed in Caller. Each `github-interface` behavior acts as

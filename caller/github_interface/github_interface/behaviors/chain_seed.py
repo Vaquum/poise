@@ -11,12 +11,13 @@ ownership. There is no partial envelope:
 a failed facet is an unavailable read, never an empty value.
 """
 import asyncio
+import json
 from typing import Any
 
 from github_interface.behaviors import issue_comments, issue_work, read_issue
 from github_interface.client import GitHubClient
 from github_interface.context import issue_number, repository, token_user
-from github_interface import full_suite_repair
+from github_interface import full_suite_repair, test_dependency
 from github_interface.atoms.pulls import get_pull
 
 REQUIRE_TOKEN_USER = True
@@ -45,6 +46,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "comments": comments["comments"],
         "publication": publication,
     }
+    if payload.get("test_dependency_json") is not None:
+        result["test_dependency"] = await test_dependency.inspect(client, target, json.loads(payload["test_dependency_json"]), publication["base_sha"])
     if read["issue"].get("state") == "closed" and (publication["pull_number"] is None
             or publication["state"] == "closed" and publication["merged"] is False):
         result["external_merge"] = await _external_merge(client, owner, repo, number)

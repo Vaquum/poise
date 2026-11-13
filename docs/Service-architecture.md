@@ -1512,6 +1512,12 @@ defines the cadence and timestamp units.
 The same reconciliation can release a CI-only hold after a proven clean base
 update, retaining the original Call, resource-release proof and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
+For a pre-PR implementation, the existing Caller artifact and seed read can
+instead verify an original CI assertion failure on its exact prepared base and
+the delivered main recovery with validation of the original failing tests.
+The journal admits one fresh implementation for that automatic hold and recovery
+commit, independently of report publishing. Missing original evidence and later
+operator holds retain their authority; no gateway route or new poller is added.
 
 The first `/api/behavior-chains` list page also includes read-only `attention`
 across all active chain pages. It joins durable progress age, holds, exact-head

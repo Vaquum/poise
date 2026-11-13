@@ -890,6 +890,32 @@ it('reads the seed issue, comments and publication inspection in one native proc
   expect(native[0][1]).toEqual(['--chain-seed', '#7', '--branch', 'poise/issue-7', '--token-user', 'author'])
 })
 
+it('revalidates the retained original test evidence in the bounded seed observation, independently of reporting', async () => {
+  const proof = { verified: true, base: HEAD, run: 1, runAttempt: 1, baselineRun: 2, baselineAttempt: 1,
+    remediation: 'https://github.com/example/repo/issues/1530', failures: [{ file: 'tests/test-relay.test.ts', test: 'warning array', cause: 'expected []' }] }
+  const held: BehaviorChain = { ...chain, held: 'original test failed', testHold: { invocationId: 'original', callId: 'a'.repeat(32), sequence: 4 },
+    invocations: [{ id: 'original', behavior: 'implement-issue', basis: 'seed', actor: chain.author, model: reviewer.model,
+      slot: reviewer.slot, admittedAt: Date.now() - 10_000, admissionSequence: 2, state: 'settled', callId: 'a'.repeat(32), outcome: 'preflight_failed',
+      request: { command: 'agent-interface', argv: [], cwd: '/fixture' }, evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+        error_code: 'atomic_work_blocked', artifact: { phase: 'executing', prepared: { checkout_head: HEAD }, test_dependency: proof } } }] }
+  const recovery = { merge: 'b'.repeat(40), base: 'c'.repeat(40), run: { id: 3 } }
+  let returned = { ...proof, recovered: true, recovery }
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    if (command === 'github-datastore') return { stdout: JSON.stringify({ repo: chain.repository, number: 7, found: true, complete: true, prerequisites: [] }) }
+    expect(argv[0]).toBe('--chain-seed')
+    expect(JSON.parse(argv[argv.indexOf('--test-dependency-json') + 1])).toEqual(proof)
+    return { stdout: JSON.stringify({ repository: chain.repository, issue_number: 7, actor: chain.author, branch: chain.branch,
+      issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+      publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null,
+        merged: false, merge_sha: null, base_sha: recovery.base }, test_dependency: returned }) }
+  })
+  const native = actionOperations()
+  expect(await native.observe(held)).toMatchObject({ testDependency: { invocationId: 'original', verified: true, recovered: true, recovery },
+    prerequisites: { wait: null, base: recovery.base } })
+  returned = { ...returned, runAttempt: 2 }
+  await expect(native.observe(held)).rejects.toThrow('original implementation test evidence changed')
+})
+
 it.each([
   { issue_number: 8 },
   { branch: 'poise/issue-8' },

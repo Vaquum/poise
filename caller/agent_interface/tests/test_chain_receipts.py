@@ -913,6 +913,50 @@ class AtomicWorkLimits(TestCase):
         self.assertEqual(json.loads(artifact)["ci_blocker"], ci)
         self.assertIsNone(plan)
 
+    def test_pre_pr_shared_test_block_retains_only_independently_verified_original_base_evidence(self):
+        dependency = {"base": HEAD, "run": 41, "baselineRun": 42,
+                      "remediation": "https://github.com/example/repo/issues/1530"}
+        proof = {**dependency, "verified": True, "runAttempt": 1, "baselineAttempt": 1,
+                 "failures": [{"file": "tests/test-relay.test.ts", "test": "warning array", "cause": "expected []"}]}
+        for index, mode in enumerate(("verified", "unverified", "wrong base", "unavailable")):
+            verified = mode == "verified"
+            with self.subTest(mode=mode):
+                commands = []
+
+                def interface(*args, **_kwargs):
+                    commands.append(args[0])
+                    if args[0] == "--issue-work":
+                        self.assertEqual(args[args.index("--mode") + 1], "prepare")
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+                    self.assertEqual(args[0], "--chain-seed")
+                    self.assertEqual(json.loads(args[args.index("--test-dependency-json") + 1]), dependency)
+                    if mode == "unavailable":
+                        raise RuntimeError("original CI artifacts could not be read")
+                    return {"test_dependency": {**proof, "verified": verified}}
+
+                def worker(_lease, _args, **kwargs):
+                    (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                        "blocked": "Original test failed on the implementation base",
+                        "testDependency": {**dependency, "base": "c" * 40} if mode == "wrong base" else dependency}))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                        patch.object(issue_review, "interface", side_effect=interface), \
+                        patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                        patch.object(issue_review, "_terminal_failure", return_value=None), \
+                        patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                        patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                        patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                        self.assertRaisesRegex(ValueError, "Original test failed"):
+                    self.run_behavior(correlation_id=f"00000000-0000-4000-8000-00000000000{index + 2}")
+                with sqlite3.connect(self.path) as conn:
+                    status, code, action, artifact, plan = conn.execute(
+                        "select status,error_code,action,artifact,action_plan from calls order by rowid desc limit 1").fetchone()
+                self.assertEqual(commands, ["--issue-work"] if mode == "wrong base" else ["--issue-work", "--chain-seed"])
+                self.assertEqual((status, code, action), ("failed", "atomic_work_blocked", "not_started"))
+                self.assertEqual(json.loads(artifact).get("test_dependency"), proof if verified else None)
+                self.assertIsNone(plan)
+
     def test_ci_only_blocker_drops_check_summaries_to_fit_the_receipt_limit(self):
         failing = [{"type": "check_run", "name": f"unit-{index}", "state": "completed", "conclusion": "failure",
                     "check_run_id": 41 + index, "log_id": 42 + index,
