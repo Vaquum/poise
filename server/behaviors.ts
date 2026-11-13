@@ -2902,8 +2902,11 @@ function reconcileClosedTargetIncidents(): Promise<void> {
     targets.set(`${issue}:${repo}#${number}`, { repo, number, issue })
   }
   for (const row of rows) add(row.behavior, row.repo, row.pr)
-  for (const behavior of behaviors) {
-    for (const target of behaviorFailureTargets(behavior)) {
+  // Read once for the pass: a closed target clears only its own failures,
+  // so no target's list changes with another's.
+  const failures = new Map(behaviors.map((behavior) => [behavior, behaviorFailureTargets(behavior)]))
+  for (const [behavior, failed] of failures) {
+    for (const target of failed) {
       const match = /^([^/#\s]+\/[^/#\s]+)#(\d+)/.exec(target)
       if (match) add(behavior, match[1]!, Number(match[2]))
     }
@@ -2915,6 +2918,7 @@ function reconcileClosedTargetIncidents(): Promise<void> {
   const release = trackReleaseBackground('behavior')
   const pass = behaviorOperationSignal.run(signal, async () => {
     await requireFreshDatastore()
+    let closedAny = false
     await forEachPool([...targets.values()], REVIEW_PREPARE_CONCURRENCY, async ({ repo, number, issue }) => {
       try {
         const target = issue ? await readIssue(repo, number) : await readPullRequest(repo, number)
@@ -2924,10 +2928,10 @@ function reconcileClosedTargetIncidents(): Promise<void> {
         if (target.status === 'closed' || target.status === 'merged') {
           const closed = new Set([ref])
           retireBehaviorDeadLettersForClosedPrs(closed, keys, currentOrganization()?.login)
-          retireClearedBehaviorAlerts()
+          closedAny = true
           if (!issue) settleClosedTargetHistoricalFirings(closed)
           for (const key of keys) {
-            for (const failureTarget of behaviorFailureTargets(key)) {
+            for (const failureTarget of failures.get(key) ?? []) {
               if (failureTarget.match(/^[^#]+#\d+/)?.[0] !== ref
                 || (key === 'resolve-unblocking' && getMeta(resolveRecoveryKey(failureTarget)))) continue
               clearBehaviorFailureKeepHold(key, failureTarget)
@@ -2948,6 +2952,9 @@ function reconcileClosedTargetIncidents(): Promise<void> {
         if (!behaviorAborted()) console.error(`[behaviors] target reconciliation unavailable for ${repo}#${number}:`, error)
       }
     })
+    // Once for the pass, not once per closed target: each call reads every
+    // standing incident to resolve the alerts that no longer have one.
+    if (closedAny) retireClearedBehaviorAlerts()
   }).catch((error: unknown) => {
     if (!signal.aborted && !staleDatastoreFailure(error)) console.error('[behaviors] closed-target reconciliation failed:', error)
   }).finally(() => {
