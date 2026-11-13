@@ -653,7 +653,18 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       mergePrsEnabled, mergePrsPaused, mergeRetryAt, greyPending,
       evidenceFresh: cacheUsable, evidenceWhy,
     })
-    computed.details = [...computed.details, ...historical].slice(0, 8)
+    const checkDetails = scoped(() => ([
+      ['review-new-prs', `${target}:check`],
+      ['review-new-prs', `${target}:secondary:check`],
+      ['review-new-prs', `${target}:tertiary:check`],
+      ['approve-prs', `${target}:check`],
+    ] as const).flatMap(([behavior, checkTarget]) => {
+      const failure = getBehaviorFailureState(behavior, checkTarget)
+      if (!failure) return []
+      const retry = Date.parse(failure.nextRetryAt) > now ? 'at' : 'due since'
+      return [`${behavior} check failed for ${checkTarget}: ${failure.error ?? 'cause unrecorded'}; revision unverified; retry ${retry} ${failure.nextRetryAt}`]
+    }))
+    computed.details = [...computed.details, ...checkDetails, ...historical].slice(0, 8)
 
     const tracked = trackBlocker(key, computed.id, computed.key, asOf)
 

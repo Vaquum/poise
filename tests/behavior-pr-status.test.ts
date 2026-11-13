@@ -318,6 +318,108 @@ describe('readPrStatus', () => {
     await (await import('../server/agent')).fetchAgentLogSnapshot()
   }
 
+  it.each([
+    ['review-new-prs', ''], ['review-new-prs', ':secondary'], ['review-new-prs', ':tertiary'], ['approve-prs', ''],
+  ] as const)('projects the scoped %s %s check retry before, at and after its due time until cleared', async (behavior, slot) => {
+    const { db, runtime, status } = await setup()
+    db.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES ('beta', '/datastores/beta.sqlite', 1, 'ready', 'ready', 'poise-user')`).run()
+    fixture.listedPrs = [pr, ...[18, 19].map((number) => ({
+      ...pr, repo: 'beta/site', number, url: `https://github.com/beta/site/pull/${number}`,
+    }))]
+    const now = Date.now()
+    seedReview(db, { behavior: 'review-new-prs', head: HEAD })
+    seedCache(runtime, new Date(now).toISOString())
+    const checkTarget = `beta/site#18${slot}:check`
+    const failureKey = `behavior_${behavior.replace(/-/g, '_')}_failure:${checkTarget}`
+    const retryAt = now + 60_000
+    const state = { kind: 'operation', consecutiveFailures: 3,
+      lastFailureAtMs: now - 60_000, nextRetryAtMs: retryAt, error: 'review preflight could not read PR state' }
+    const failure = JSON.stringify(state)
+    db.setMeta(`org:beta:${failureKey}`, failure)
+    db.setMeta(failureKey, JSON.stringify({ ...state, error: 'failure in another organization' }))
+    mocks.runFile.mockClear()
+
+    for (const [at, timing] of [[now, 'at'], [retryAt, 'due since'], [retryAt + 1, 'due since']] as const) {
+      const reply = await status.readPrStatus(50, at)
+      expect(reply.rows.find((row) => row.number === 18)?.blocker).toMatchObject({
+        id: 'awaiting_review',
+        details: [`${behavior} check failed for ${checkTarget}: review preflight could not read PR state; revision unverified; retry ${timing} ${new Date(retryAt).toISOString()}`],
+      })
+      expect(reply.rows.find((row) => row.number === 19)?.blocker).toMatchObject({ id: 'awaiting_review', details: [] })
+      expect(reply.rows.find((row) => row.number === 17)?.blocker).toMatchObject({
+        id: 'review_running', line: `review running: review-new-prs on ${SHORT}`, details: [],
+      })
+    }
+    expect(db.getMeta(`org:beta:${failureKey}`)).toBe(failure)
+    db.setMeta(`org:beta:${failureKey}`, '')
+    const recovered = await status.readPrStatus(50, retryAt + 2)
+    expect(recovered.rows.find((row) => row.number === 18)?.blocker.details).toEqual([])
+    expect(mocks.runFile.mock.calls.every(([command]) => command === 'github-datastore')).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('shows an approval check failure alongside changes requested and clears it after a successful no-op', async () => {
+    const { db, runtime, status } = await setup()
+    const now = Date.now()
+    recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: HEAD,
+      completedAt: new Date(now - 120_000).toISOString() })
+    seedCache(runtime, new Date(now).toISOString(), { reviewDecision: 'CHANGES_REQUESTED' })
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    const failureKey = `behavior_approve_prs_failure:${pr.repo}#${pr.number}:check`
+    db.setMeta(failureKey, JSON.stringify({ kind: 'operation', consecutiveFailures: 1,
+      lastFailureAtMs: now - 60_000, nextRetryAtMs: now - 1, error: 'approval preflight failed' }))
+
+    const failed = await status.readPrStatus(50, now)
+    expect(failed.rows[0].blocker).toMatchObject({
+      id: 'awaiting_author',
+      details: [`approve-prs check failed for ${pr.repo}#${pr.number}:check: approval preflight failed; revision unverified; retry due since ${new Date(now - 1).toISOString()}`],
+    })
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(db.getMeta(failureKey)).toBe('')
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    const recovered = await status.readPrStatus(50, Date.now())
+    expect(recovered.rows[0].blocker).toMatchObject({ id: 'awaiting_author', details: [] })
+  })
+
+  it('keeps a secondary check failure ahead of capped history without replacing a live review or explicit hold', async () => {
+    const { db, runtime, status } = await setup()
+    const target = `${pr.repo}#${pr.number}`
+    for (let index = 1; index <= 8; index++) {
+      seedReview(db, { target: `${target}@head=${HEAD}/history=${index}`, head: HEAD,
+        callId: String(index).repeat(32), failureAt: '2026-11-12T14:40:00Z' })
+    }
+    seedReview(db, { behavior: 'review-new-prs', head: NEXT })
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+    const now = Date.parse('2026-11-12T15:31:00Z')
+    db.setMeta(`behavior_review_new_prs_failure:${target}:secondary:check`, JSON.stringify({
+      kind: 'operation', consecutiveFailures: 1, lastFailureAtMs: now - 60_000,
+      nextRetryAtMs: now + 60_000, error: 'secondary preflight failed',
+    }))
+    const detail = `review-new-prs check failed for ${target}:secondary:check: secondary preflight failed; revision unverified; retry at 2026-11-12T15:32:00.000Z`
+
+    const running = await status.readPrStatus(50, now)
+    expect(running.rows[0].blocker).toMatchObject({
+      id: 'review_running', line: `review running: review-new-prs on ${NEXT.slice(0, 8)}`,
+    })
+    expect(running.rows[0].blocker.details).toHaveLength(8)
+    expect(running.rows[0].blocker.details[0]).toBe(detail)
+    expect(running.rows[0].blocker.details.slice(1).every((entry) => entry.startsWith('past review:'))).toBe(true)
+
+    seedReview(db, { head: NEXT, callId: 'f'.repeat(32), failureAt: '2026-11-12T15:30:00Z' })
+    const held = await status.readPrStatus(50, now)
+    expect(held.rows[0].blocker).toMatchObject({
+      id: 'held', line: 'held: approve-prs upstream_unavailable since 15:30Z',
+    })
+    const heldDetails = held.rows[0].blocker.details
+    const runningLine = `review running: review-new-prs on ${NEXT.slice(0, 8)}`
+    expect(heldDetails).toContain(runningLine)
+    expect(heldDetails).toContain(detail)
+    expect(heldDetails.indexOf(runningLine)).toBeLessThan(heldDetails.indexOf(detail))
+    expect(heldDetails.indexOf(detail)).toBeLessThan(heldDetails.findIndex((entry) => entry.startsWith('past review:')))
+  })
+
   it.each(['released', 'reused'] as const)('attributes an older timeout from its original Call after its headless launch is %s', async (launch) => {
     const { db, runtime, status } = await setup()
     const target = `${pr.repo}#${pr.number}`
@@ -744,6 +846,10 @@ describe('readPrStatus', () => {
     recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: HEAD, completedAt: '2026-10-29T09:00:00Z' })
     const now = Date.now()
     seedCache(runtime, new Date(now).toISOString())
+    db.setMeta(`behavior_review_new_prs_failure:${pr.repo}#${pr.number}:secondary:check`, JSON.stringify({
+      kind: 'operation', consecutiveFailures: 1, lastFailureAtMs: now,
+      nextRetryAtMs: now + 60_000, error: 'secondary preflight failed',
+    }))
     db.db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, error, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`).run('dl-3', 'approve-prs', `${pr.repo}#${pr.number}`,
       pr.repo, pr.number, 'review failed: provider busy', new Date(now).toISOString())

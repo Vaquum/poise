@@ -131,6 +131,12 @@ churn during integration never masquerades as the blocker. A vanished queue
 entry reads as a removal without inventing its cause. Flags are display
 only and never raise alerts or influence execution.
 
+Legacy rows also include live PR-scoped review and approval check failures in
+`blocker.details`, ahead of historical details, with their recorded target, lane,
+review slot, reason and retry time. Their revision is unverified. An uncleared
+retry reads as due at and after its timestamp; clearing the scheduler failure,
+including through a successful no-op, removes the detail without changing blocker precedence.
+
 For legacy PRs, a live review on the verified current head can move past-revision
 review failures into `blocker.details`, retaining their head, cause and time.
 Attribution uses full-SHA targets, matching launch evidence, or already-cached
