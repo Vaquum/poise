@@ -323,3 +323,20 @@ describe('the alert producers', () => {
     expect(errors).toHaveBeenCalledWith('[alerts] could not record the end of the Claude sign-in alert:', expect.any(Error))
   })
 })
+
+describe('open alert reads', () => {
+  it('reads open alerts through their own index, newest first, never the resolved ones', () => {
+    const insert = database.db.prepare('INSERT INTO alerts (kind, title, body, url, created_at, dedupe_key, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    const now = Date.now()
+    for (let index = 0; index < 50; index++) insert.run('behavior_held', 'Old', 'body', '/', new Date(now - DAY).toISOString(), `old:${index}`, new Date(now).toISOString())
+    insert.run('behavior_held', 'First', 'body', '/', new Date(now - HOUR).toISOString(), 'open:1', null)
+    insert.run('chat_turn_finished', 'Stale chat', 'body', '/', new Date(now - 40 * DAY).toISOString(), 'chat:old', null)
+    insert.run('worker_idle', 'Second', 'body', '/', new Date(now - HOUR).toISOString(), 'open:2', null)
+    expect(store.openAlerts({ now }).map((alert) => alert.title)).toEqual(['Second', 'First'])
+    expect(store.openAlerts({ kind: 'behavior_held', now }).map((alert) => alert.title)).toEqual(['First'])
+    const plan = database.db.prepare(`EXPLAIN QUERY PLAN SELECT id FROM alerts WHERE resolved_at IS NULL AND (kind != 'chat_turn_finished' OR created_at >= ?) AND (? IS NULL OR kind = ?) ORDER BY id DESC`)
+      .all(new Date(now).toISOString(), null, null) as Array<{ detail: string }>
+    expect(plan.map((row) => row.detail).join(' ')).toContain('idx_alerts_open')
+  })
+})
+

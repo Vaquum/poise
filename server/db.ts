@@ -436,6 +436,11 @@ const migrateSchema = db.transaction(() => {
       ON alerts(dedupe_key) WHERE resolved_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_alerts_created
       ON alerts(created_at);
+    -- Open alerts newest first (server/alerts/store.ts openAlerts): every
+    -- notice read and behavior tick asks, and without it each one scanned
+    -- the whole table, resolved alerts and their bodies included.
+    CREATE INDEX IF NOT EXISTS idx_alerts_open
+      ON alerts(id) WHERE resolved_at IS NULL;
   `)
   // Recovery may inspect agent-interface logs, but it must never claim calls
   // predating the feature installation. The first migration timestamp is a

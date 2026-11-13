@@ -10,6 +10,7 @@
 
 import { EventEmitter } from 'node:events'
 import { ALERT_ID_EPOCH_KEY, db, getMeta } from '../db'
+import { cachedStatement } from '../statements'
 import { recordHandling, type HandlingActor } from './handling'
 
 export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished', 'pr_ready', 'review_requested', 'pr_conflict', 'github_quota_warning', 'github_quota_exhausted', 'storage_low', 'ledger_queue_stalled', 'ledger_capture_loss', 'worker_idle'] as const
@@ -223,7 +224,7 @@ function storedTarget(raw: string | null): AlertTarget | null {
  *  `kind`, only those of that kind. */
 export function openAlerts(options: { kind?: AlertKind, now?: number } = {}): OpenAlert[] {
   const cutoff = new Date((options.now ?? Date.now()) - ALERT_RETENTION_MS).toISOString()
-  const rows = db.prepare(`
+  const rows = cachedStatement(db, `
     SELECT id, kind, title, body, cause, created_at, dedupe_key, target, dismissed_at, silenced_at FROM alerts
     WHERE resolved_at IS NULL AND (kind != 'chat_turn_finished' OR created_at >= ?) AND (? IS NULL OR kind = ?)
     ORDER BY id DESC
