@@ -146,6 +146,29 @@ describe('organization data aggregation', () => {
 })
 
 describe('the accounts GitHub is read as', () => {
+  it('answers a picker from the last repository list once it is old and reads it again behind; validation waits for a fresh one', async () => {
+    vi.useFakeTimers({ now: Date.parse('2026-11-13T05:00:00Z'), toFake: ['Date'] })
+    try {
+      let names = ['alpha/one']
+      mocks.runFile.mockImplementation(async () => ({ stdout: JSON.stringify({ repos: names.map((full_name) => ({ full_name })) }), stderr: '' }))
+      expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/one'])
+      // Past the list's five minutes: the picker has the last list at once, and it is read again behind.
+      names = ['alpha/one', 'alpha/two']
+      vi.setSystemTime(Date.parse('2026-11-13T05:06:00Z'))
+      expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/one'])
+      await vi.waitFor(() => expect(mocks.runFile).toHaveBeenCalledTimes(2))
+      await vi.waitFor(async () => expect((await listOrganizationsRepos('alpha', true)).repos).toEqual(['alpha/one', 'alpha/two']))
+      expect(mocks.runFile).toHaveBeenCalledTimes(2)
+      // Validation never takes a list past its time: it waits for the fresh one.
+      names = ['alpha/one', 'alpha/three', 'alpha/two']
+      vi.setSystemTime(Date.parse('2026-11-13T05:12:00Z'))
+      expect(await listOrgRepos('alpha')).toEqual(['alpha/one', 'alpha/three', 'alpha/two'])
+      expect(mocks.runFile).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('keys repository discovery by identity even when the owner stays unchanged', async () => {
     mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({
       stdout: JSON.stringify({ repos: [{ full_name: `${args[1]}/${args[3]}` }] }), stderr: '',

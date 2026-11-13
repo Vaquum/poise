@@ -359,32 +359,54 @@ export function invalidateRepoListCache(): void {
 }
 const REPO_LIST_TTL_MS = 5 * 60 * 1000
 
-async function discoverOrgRepos(org: Organization): Promise<string[]> {
+/** Repository reads under way, by generation and identity: one read at a time each. */
+const repoListReads = new Map<string, Promise<string[]>>()
+
+async function discoverOrgRepos(org: Organization, lastIsFine = false): Promise<string[]> {
   const me = getMeta('me') || ''
   if (!me) throw new Error('Set your GitHub account in Settings → General to list repositories')
   const key = `${me.toLowerCase()}:${org.login.toLowerCase()}`
-  const now = Date.now()
   const cached = repoListCache.get(key)
-  if (cached && cached.expiry > now) return cached.repos
-  const generation = repoCacheGeneration
-  // Repositories are listed as the person: what they can see.
-  const { stdout } = await runFile(GH_INTERFACE, ['--view-repos', org.login, '--token-user', me], {
-    timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024,
-  })
-  const data = JSON.parse(stdout)
-  if (!Array.isArray(data.repos)) throw new Error('repository discovery returned no repository list')
-  const repos: string[] = data.repos.map((r: any) => String(r.full_name || ''))
-  if (repos.some((repo) => !repo.includes('/') || !repoBelongsTo(repo, org.login))) {
-    throw new Error(`repository discovery returned repositories outside ${org.login}`)
+  if (cached && cached.expiry > Date.now()) return cached.repos
+  // A picker shows the last list at once and reads it again behind;
+  // validation waits for a fresh one.
+  if (cached && lastIsFine) {
+    readOrgRepos(org, me, key).catch(() => undefined)
+    return cached.repos
   }
-  const sorted = [...new Set(repos)].sort((a, b) => a.localeCompare(b))
-  if (generation === repoCacheGeneration) repoListCache.set(key, { repos: sorted, expiry: now + REPO_LIST_TTL_MS })
-  return sorted
+  return readOrgRepos(org, me, key)
 }
 
-export async function listOrganizationsRepos(login?: string): Promise<{ repos: string[], errors: OrganizationReadError[] }> {
+function readOrgRepos(org: Organization, me: string, key: string): Promise<string[]> {
+  const generation = repoCacheGeneration
+  const readKey = `${generation}:${key}`
+  const running = repoListReads.get(readKey)
+  if (running) return running
+  const read = (async () => {
+    // Repositories are listed as the person: what they can see.
+    const { stdout } = await runFile(GH_INTERFACE, ['--view-repos', org.login, '--token-user', me], {
+      timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024,
+    })
+    const data = JSON.parse(stdout)
+    if (!Array.isArray(data.repos)) throw new Error('repository discovery returned no repository list')
+    const repos: string[] = data.repos.map((r: any) => String(r.full_name || ''))
+    if (repos.some((repo) => !repo.includes('/') || !repoBelongsTo(repo, org.login))) {
+      throw new Error(`repository discovery returned repositories outside ${org.login}`)
+    }
+    const sorted = [...new Set(repos)].sort((a, b) => a.localeCompare(b))
+    if (generation === repoCacheGeneration) repoListCache.set(key, { repos: sorted, expiry: Date.now() + REPO_LIST_TTL_MS })
+    return sorted
+  })()
+  repoListReads.set(readKey, read)
+  const settle = () => { if (repoListReads.get(readKey) === read) repoListReads.delete(readKey) }
+  read.then(settle, settle)
+  return read
+}
+
+/** `lastIsFine`: a read-only picker may answer from a list past its time while it is read again. */
+export async function listOrganizationsRepos(login?: string, lastIsFine = false): Promise<{ repos: string[], errors: OrganizationReadError[] }> {
   const orgs = selectOrganizations(login)
-  const results = await Promise.allSettled(orgs.map(discoverOrgRepos))
+  const results = await Promise.allSettled(orgs.map((org) => discoverOrgRepos(org, lastIsFine)))
   const repos: string[] = []
   const errors: OrganizationReadError[] = []
   results.forEach((result, i) => {
