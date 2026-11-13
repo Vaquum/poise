@@ -547,8 +547,9 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   let issue = await reconcileRepairReport(chain.repository, marker, report.issueNumber)
   if (!issue) return `${label} report creation is unconfirmed; no matching issue is visible yet. Reconcile the same marker; do not create a replacement`
   if (report.issueNumber === null) { report.issueNumber = issue.number; save() }
-  const repair = chain.invocations.at(-1)?.behavior === 'repair-pr'
-  const source = cause === IMPLEMENTATION_CAUSE && chain.held
+  const last = chain.invocations.at(-1)?.behavior
+  const repair = last === 'repair-pr'
+  const source = cause === IMPLEMENTATION_CAUSE && chain.held && (repair || last === 'implement-issue')
     ? `Stage: ${repair ? 'repair-pr' : 'implement-issue'}. Worker-reported blocker: ${behaviorErrorMessage(chain.held, 500)}. Next action: inspect the ${repair ? 'repair' : 'implementation'} Call, address the blocker, then explicitly Resume. `
     : ''
   const link = `${source}${issue.state === 'closed' ? 'Historical ' : ''}${label} report ${issue.url} (last verified ${new Date().toISOString()}; not live status)`

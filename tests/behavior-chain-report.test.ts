@@ -690,6 +690,40 @@ it('shows the current blocked repair after its earlier implementation report clo
   expect(decideBehaviorChain(current, { ...fresh, checkedAt: Date.now() }, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
 })
 
+it('does not misreport a later review hold as an implementation hold when reusing its earlier implementation report', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedImplementation(journal)
+  const overrides = { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  expect(posts()).toHaveLength(1)
+  const intent = reports(db)
+  let current = record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  fresh = observation()
+  fresh.prReviewers = [reviewer]
+  current = record(journal, current, { type: 'chain.observed', observation: { ...fresh, checkedAt: Date.now() } })
+  const basis = chainBasis(['pr', HEAD, fresh.pull!.reviewContext])
+  current = record(journal, current, { type: 'invocation.admitted', invocation: { id: 'review-missing-receipt',
+    behavior: 'review-pr', basis, actor: current.reviewer, slot: reviewer.slot, model: reviewer.model,
+    admittedAt: Date.now(), request: { command: 'agent-interface', cwd: '/fixture', argv: ['--pr-review', '#7'] } } })
+  current = record(journal, current, { type: 'invocation.settled', invocationId: 'review-missing-receipt',
+    callId: 'b'.repeat(32), outcome: 'reviewed_clean', evidence: { status: 'completed', action: 'reviewed_clean',
+      head_sha: HEAD, review_id: 123, completedAt: Date.now(),
+      resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  const holdReason = 'PR review primary lacks its exact-head submission receipt'
+  expect(decideBehaviorChain(current, { ...fresh, checkedAt: Date.now() }, Date.now())).toMatchObject({ kind: 'hold', reason: holdReason })
+  current = record(journal, current, { type: 'chain.held', reason: holdReason })
+  const waiting = await operations(db, journal).reportHold!(journal.read(chain.id)!)
+  expect(waiting).not.toContain('Stage: implement-issue')
+  expect(waiting).not.toContain('inspect the implementation Call')
+  expect(waiting).not.toContain('Stage: repair-pr')
+  expect(waiting).toContain('Implementation hold report')
+  expect(waiting).toContain('(last verified ')
+  expect(journal.read(chain.id)).toMatchObject({ held: holdReason })
+  expect(reports(db)).toEqual(intent)
+  expect(posts()).toHaveLength(1)
+})
+
 it.each(['unmatched', 'unavailable'])('files an eligible report once with %s optional work evidence', async mode => {
   const { db, journal } = setup()
   const { call } = blockedImplementation(journal)
