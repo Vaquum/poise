@@ -161,9 +161,10 @@ describe('identity-scoped reads', () => {
     mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload()) }))
     const written: boolean[] = []
     const write = database.setMeta
-    const spy = vi.spyOn(database, 'setMeta').mockImplementation((key: string, value: string) => { written.push(database.db.inTransaction); return write(key, value) })
+    const spy = vi.spyOn(database, 'setMeta').mockImplementation((key: string, value: string) => { written.push(database.db.inTransaction || database.observationOpen()); return write(key, value) })
     try { await quota.readGithubQuota() } finally { spy.mockRestore() }
-    // The core and graphql histories, three resources' samples and their windows: all inside a transaction.
+    // The core and graphql histories, three resources' samples and their windows: all inside a transaction,
+    // the samples in an observation's on the cursor connection.
     expect(written.length).toBeGreaterThanOrEqual(5)
     expect(written.every(Boolean)).toBe(true)
   })
