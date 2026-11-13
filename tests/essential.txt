@@ -44,6 +44,7 @@ tests/behavior-chain-resources.test.ts
 tests/behavior-chain-supersession.test.ts
 tests/behaviors-approval.test.ts
 tests/behaviors-cutover.test.ts
+tests/behaviors-close-old-prs.test.ts
 tests/behaviors-merge.test.ts
 tests/behaviors-outcomes.test.ts
 tests/behaviors-worker-exit.test.ts

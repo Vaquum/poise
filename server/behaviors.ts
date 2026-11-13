@@ -93,6 +93,7 @@ import {
   type CompletedApprovalBasisLaunch,
   type DeadLetterReconcileResult,
 } from './db'
+import { cachedStatement } from './statements'
 import { HttpError } from './http'
 import { eventLoopDelayStats, type EventLoopDelayStats } from './event-loop-delay'
 import { behaviorErrorMessage, behaviorIncidentDiagnostics, REVIEW_BUDGET_STOPPED } from './behavior-diagnostics'
@@ -153,9 +154,9 @@ function organizationOwns(repoOrTarget: string): boolean {
 
 function isGlobalPreference(key: string): boolean {
   if (/^behavior_(?:implement_issues|repair_prs)_paused_(?:until|by)$/.test(key)) return true
-  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci|review_new_issues|implement_issues|repair_prs)_(?:enabled|setting|reviewers|review_cap|scratchpad)$/.test(key)
+  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci|close_old_prs|review_new_issues|implement_issues|repair_prs)_(?:enabled|setting|reviewers|review_cap|scratchpad|days)$/.test(key)
     || /^behavior_review_new_issues_(?:repos|authors|slot_since)$/.test(key)
-    || /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci)_skip_repos$/.test(key)
+    || /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci|close_old_prs)_skip_repos$/.test(key)
 }
 
 function scopedMetaKey(key: string): string {
@@ -1249,8 +1250,8 @@ function noteArgs(key: BehaviorKey): string[] {
 // new ones are — those opened since the baseline are reviewed, the backlog the
 // baseline recorded never is.
 
-export type SkippableBehavior = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci'
-export const SKIPPABLE_BEHAVIORS: readonly SkippableBehavior[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci']
+export type SkippableBehavior = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci' | 'close-old-prs'
+export const SKIPPABLE_BEHAVIORS: readonly SkippableBehavior[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci', 'close-old-prs']
 // "Select all" across large accounts produces long lists; this bound keeps a
 // list inside the API's request body limit.
 export const MAX_SKIPPED_REPOSITORIES = 5000
@@ -1260,6 +1261,7 @@ const SKIPPABLE_LABELS: Record<SkippableBehavior, string> = {
   'resolve-unblocking': 'Resolve Unblocking Conversations',
   'merge-prs': 'Merge Pull Requests',
   'rerun-grey-ci': 'Rerun Grey CI',
+  'close-old-prs': 'Close Old Pull Requests',
 }
 
 export function isSkippableBehavior(key: string): key is SkippableBehavior {
@@ -2009,8 +2011,8 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
 }
 
 function failedBehaviorLaunches(behavior: string): BehaviorLaunchClaim[] {
-  const rows = db.prepare(`
-    SELECT target FROM behavior_seen AS launch
+  const rows = cachedStatement(db, `
+    SELECT target FROM behavior_seen AS launch INDEXED BY idx_behavior_seen_failed_launches
     WHERE key = ? AND claim_id = '' AND launch_call_id IS NOT NULL
       AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
       AND (launch_quarantine IS NOT NULL OR EXISTS (
@@ -2855,7 +2857,7 @@ function reconcileClosedTargetIncidents(): Promise<void> {
   const scope = currentOrganization()?.login.toLowerCase() ?? 'legacy'
   const pending = closedTargetReconciliations.get(scope)
   if (pending) return pending
-  const behaviors: BehaviorKey[] = ['review-new-issues', 'review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci']
+  const behaviors: BehaviorKey[] = ['review-new-issues', 'review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci', 'close-old-prs']
   const rows = db.prepare(`
     SELECT DISTINCT dead.behavior, dead.target, dead.repo, dead.pr, dead.error
     FROM behavior_dead_letters AS dead
@@ -6413,6 +6415,116 @@ async function tickRerunGreyCi(): Promise<void> {
   setMeta('behavior_rerun_grey_ci_last_success', new Date().toISOString())
 }
 
+// ── Close old pull requests ────────────────────────────────────────────
+
+const DAY_MS = 86_400_000
+const CLOSE_OLD_PRS_DAYS_KEY = 'behavior_close_old_prs_days'
+const CLOSE_OLD_PRS_LAST_FIRED_KEY = 'behavior_close_old_prs_last_fired'
+
+export function isValidCloseOldPrsDays(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
+}
+
+export function getCloseOldPrsDays(): number | null {
+  const raw = getMeta(CLOSE_OLD_PRS_DAYS_KEY)
+  const days = raw === null || !raw.trim() ? null : Number(raw)
+  return isValidCloseOldPrsDays(days) ? days : null
+}
+
+export function setCloseOldPrsDays(days: number): void {
+  if (!isValidCloseOldPrsDays(days)) throw new Error('days must be a positive whole number')
+  setMeta(CLOSE_OLD_PRS_DAYS_KEY, String(days))
+}
+
+export function getCloseOldPrsLastFired(): { at: string, target: string, url: string } | null {
+  if (behaviorOrganization.getStore() === undefined) {
+    const events = readyOrganizations().map((org) => behaviorOrganization.run(org, getCloseOldPrsLastFired))
+      .filter((event): event is { at: string, target: string, url: string } => event !== null)
+    return events.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0] ?? null
+  }
+  const raw = getMeta(CLOSE_OLD_PRS_LAST_FIRED_KEY)
+  if (raw === null) return null
+  try {
+    const event = objectValue(parseJson(raw, CLOSE_OLD_PRS_LAST_FIRED_KEY), CLOSE_OLD_PRS_LAST_FIRED_KEY)
+    if (typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at))
+      || typeof event.target !== 'string' || !/^[^/\s]+\/[^#\s]+#[1-9]\d*$/.test(event.target)
+      || event.url !== `https://github.com/${event.target.replace('#', '/pull/')}`) {
+      throw new Error('close-old-prs last triggered is malformed')
+    }
+    return { at: event.at, target: event.target, url: String(event.url) }
+  } catch (error) {
+    console.error('[behaviors] close-old-prs last triggered could not be read:', error)
+    return null
+  }
+}
+
+async function tickCloseOldPrs(): Promise<void> {
+  const behavior = 'close-old-prs' as const
+  if (!isRunnable(behavior) || behaviorAborted()) return
+  const configurationError = 'Close Old Pull Requests requires a positive whole number of days'
+  if (getCloseOldPrsDays() === null) throw new Error(configurationError)
+  const accounts = prAccounts()
+  const prs = await listEligiblePrs(behavior, accounts.me)
+  for (const pr of orderByCursor(prs, 'behavior_close_old_prs_cursor')) {
+    if (!isRunnable(behavior) || behaviorAborted()) return
+    const target = `${pr.repo}#${pr.number}`
+    setMeta('behavior_close_old_prs_cursor', target)
+    if (!behaviorRetryDue(behavior, target) || !stillEligible(behavior, pr)) continue
+    const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
+    if (!operationId) continue
+    const actor = configuredReviewer(pr.author)
+    let runId: string | null = null
+    try {
+      const [owner, name] = pr.repo.split('/', 2)
+      const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
+      await mkdir(cwd, { recursive: true })
+      if (!isRunnable(behavior) || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible(behavior, pr, actor)) continue
+      const days = getCloseOldPrsDays()
+      if (days === null) throw new Error(configurationError)
+      const now = Date.now()
+      const created = pr.created_at === null ? NaN : Date.parse(pr.created_at)
+      if (!Number.isFinite(created) || created > now) throw new Error(`${target} has missing, invalid or future created_at; leaving it open`)
+      if (now - created < days * DAY_MS) continue
+      const cutoff = now - days * DAY_MS
+      runId = startDirectBehaviorRun(behavior)
+      captureBehaviorAdmission({ admissionKey: runId, nativeId: runId, behavior, source: 'poise:close-old-prs',
+        owner: currentOrganization()?.login ?? null, actor, repository: pr.repo, number: pr.number,
+        head: null, startedAt: new Date().toISOString() })
+      const { stdout } = await runFile(GH_INTERFACE, ['--close-old-pr-if-ready', `#${pr.number}`,
+        '--cutoff-ms', String(cutoff), '--author', pr.author, '--token-user', actor],
+      { cwd, timeoutMs: 30_000, maxOutputBytes: 1024 * 1024, signal: behaviorSignal() })
+      const result = objectValue(parseJson(stdout, 'close old PR'), 'close old PR')
+      if (result.action !== 'close_old_pr_if_ready' || result.repository !== pr.repo || result.pull_number !== pr.number
+        || result.cutoff_ms !== cutoff || !['closed', 'already_closed', 'not_ready'].includes(String(result.outcome))
+        || (result.outcome === 'closed' && (result.state !== 'closed' || result.merged !== false))) {
+        throw new Error('github-interface returned an unconfirmed PR close receipt')
+      }
+      const outcome = result.outcome as 'closed' | 'already_closed' | 'not_ready'
+      captureBehaviorOutcome({ nativeId: runId, state: 'completed', activity: 'settled', stateSource: 'native',
+        outcome, completedAt: new Date().toISOString() })
+      finishDirectBehaviorRun(runId, true, outcome, JSON.stringify({ target, actor, cutoff, ...result }))
+      runId = null
+      if (outcome === 'closed') setMeta(CLOSE_OLD_PRS_LAST_FIRED_KEY, JSON.stringify({ at: new Date().toISOString(), target, url: pr.url }))
+      clearBehaviorFailure(behavior, target, actor)
+    } catch (error) {
+      if (!runId && getCloseOldPrsDays() === null) throw error
+      const message = behaviorErrorMessage(error)
+      if (runId) {
+        captureBehaviorOutcome({ nativeId: runId, state: 'failed', activity: 'settled', stateSource: 'native', completedAt: new Date().toISOString() })
+        finishDirectBehaviorRun(runId, false, null, message)
+      }
+      recordBehaviorFailure(behavior, 'operation', error, target, { actingAccount: actor })
+      if (!readRepoAccessHold(pr.repo, actor)) {
+        db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, actor, source, correlation_id, error, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomUUID(), behavior, target, pr.repo, pr.number,
+          actor, 'poise:close-old-prs', runId, message, new Date().toISOString())
+      }
+    } finally {
+      releasePrOperationOwned(operationId)
+    }
+  }
+}
+
 // ── review-new-issues implementation ────────────────────────────────────
 //
 // Opt-in per repository. A new issue in a selected repository, opened by a
@@ -7581,6 +7693,9 @@ function failedReviewSlotWithoutOutcome(repo: string, pr: number, head: string, 
 const enabledChanges = new Map<BehaviorKey, number>()
 
 export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
+  if (key === 'close-old-prs' && enabled && getCloseOldPrsDays() === null) {
+    throw new Error('Close Old Pull Requests requires a positive whole number of days before enabling')
+  }
   const lifecycle = behaviorAbortController?.signal
   const change = (enabledChanges.get(key) ?? 0) + 1
   enabledChanges.set(key, change)
@@ -8195,6 +8310,13 @@ export async function runEnabledBehaviorsOnce(
           return true
         })
       }))
+    }
+    if (isEnabled('close-old-prs')
+      && (!options.skipBusy || !behaviorOperationTails.has(operationKey('close-old-prs')))) {
+      operations.push(runBehaviorCycle('close-old-prs', () => withBehaviorProcessLock('close-old-prs', async () => {
+        await tickCloseOldPrs()
+        return true
+      })))
     }
     await Promise.all(operations)
   })

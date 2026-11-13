@@ -248,6 +248,17 @@ so a different successful rerun cannot clear an unresolved hold. A `read_failed`
 receipt proves no write occurred: its intent is released and the visible read
 failure retries with backoff. Errors after the write begins remain held.
 
+`github-interface --close-old-pr-if-ready '#7' --cutoff-ms TIMESTAMP --author USER
+--token-user REVIEWER [--repository OWNER/REPO]` closes an old PR without a model.
+The cutoff is Unix milliseconds supplied by Poise from its current days setting.
+The configured GitHub author pair and opposite acting account are required. A live
+read must show an open, non-draft PR by the admitted author, with a known creation
+time at or before the cutoff. Missing, invalid or future `created_at` fails visibly.
+`closed` requires a response confirming `state: closed`, `merged: false` and the
+requested PR number. A lost write response is reconciled by one read; an
+unconfirmed close remains an error. `already_closed` (including merged PRs) and
+`not_ready` are no-ops. Poise owns repository scope, skips, holds and the PR lock.
+
 ## Review preparation diagnostics
 
 Governed Claude reviews forward their original invocation ID and receipt database

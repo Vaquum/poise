@@ -3,12 +3,36 @@
 // Classic Analytics' read and figures (src/analytics-health.ts), in the mocks' words.
 import type { AnalyticsHealth, HealthSource } from '../../../analytics-health-types'
 import { formatCount, formatDuration, formatRate } from '../../../analytics-format'
-import { organizationUrl } from '../../../organizations'
+import { getOrganizations, getSettings } from '../../../config'
+import { getSelectedOrganization, organizationUrl } from '../../../organizations'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
 import { clockAt, json, readLine, reason, reportRead, unread, whileVisible, type PartContext, type Read } from './util'
 
 const OK = ['ok', 'verified v2']
+
+/** The last read, kept across page loads: a reload paints it at once, then
+ *  reads again. It stands only for the GitHub user, the organization chosen
+ *  and the organizations configured, each with its status, it was read under:
+ *  All orgs counts every configured organization, ready or not. */
+interface LastHealth { key: string, data: AnalyticsHealth, at: number }
+const LAST_HEALTH_KEY = 'poise-overview-health'
+function healthKey(): string {
+  const me = getSettings().me ?? ''
+  const configured = getOrganizations().map((org) => `${org.login.toLowerCase()}:${org.status}`).sort().join(',')
+  return me ? `${me}|${getSelectedOrganization()}|${configured}` : ''
+}
+const readable = (data: AnalyticsHealth | null | undefined): data is AnalyticsHealth =>
+  !!data?.rate && !!data.blocked && !!data.recovery && !!data.lastError && Array.isArray(data.coverage)
+function rememberedHealth(key: string): LastHealth | null {
+  if (!key) return null
+  try {
+    const last = JSON.parse(localStorage.getItem(LAST_HEALTH_KEY) ?? 'null') as LastHealth | null
+    return last?.key === key && readable(last.data) && Number.isFinite(last.at) ? last : null
+  } catch {
+    return null
+  }
+}
 
 /** A source's row: its covered time, gaps and unknown time as a bar, or its status where it keeps no history. */
 function sourceRow(source: HealthSource): string {
@@ -24,7 +48,8 @@ function sourceRow(source: HealthSource): string {
 }
 
 export function mountHealth(ctx: PartContext, box: HTMLElement): void {
-  let health: Read<AnalyticsHealth> = unread()
+  const last = rememberedHealth(healthKey())
+  let health: Read<AnalyticsHealth> = last ? { data: last.data, error: '', at: last.at } : unread()
   let generation = 0
 
   function card(ref: string, value: string, note: string): void {
@@ -57,11 +82,16 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
 
   async function read(): Promise<void> {
     const mine = ++generation
+    const key = healthKey()
     try {
       const data = await json<AnalyticsHealth>(organizationUrl('/api/analytics/system-health'))
-      if (!data?.rate || !data.blocked || !data.recovery || !data.lastError || !Array.isArray(data.coverage)) throw new Error('the service answered with something this page cannot read')
+      if (!readable(data)) throw new Error('the service answered with something this page cannot read')
       if (mine !== generation) return
       health = { data, error: '', at: Date.now() }
+      // A place left, or settings changed while it read, keeps nothing.
+      if (key && !ctx.signal.aborted && key === healthKey()) {
+        try { localStorage.setItem(LAST_HEALTH_KEY, JSON.stringify({ key, data, at: health.at } satisfies LastHealth)) } catch { /* the next page reads it anew */ }
+      }
     } catch (error) {
       if (mine !== generation) return
       // A failed read keeps what was read, with when.
@@ -71,6 +101,7 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
     paint()
   }
 
+  if (last) paint()
   whileVisible(ctx, 60_000, () => { void read() })
   // Another organization's figures never stand for this one's.
   window.addEventListener('poise:organization-filter-changed', () => { health = unread(); paint(); void read() }, { signal: ctx.signal })

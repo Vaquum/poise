@@ -48,7 +48,7 @@ let greyRunRepos = new Set<string>()
 let batchEnvelopeFailure: Error | null = null
 
 function pull(repo: string, number: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', author: ME, draft: 0, updated_at: '2026-07-15T12:00:00Z', ...overrides }
+  return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', author: ME, draft: 0, created_at: '2020-01-01T00:00:00Z', updated_at: '2026-07-15T12:00:00Z', ...overrides }
 }
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -158,6 +158,11 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
                 event: 'pull_request', created_at: '2026-07-15T12:00:00Z' }]
               : [] }) })
     }
+    if (args[0] === '--close-old-pr-if-ready') {
+      if (deniedRepos.has(repository)) throw new Error('GitHub 404: Not Found')
+      return json({ action: 'close_old_pr_if_ready', repository, pull_number: number,
+        cutoff_ms: Number(flagValue(args, '--cutoff-ms')), outcome: 'closed', state: 'closed', merged: false })
+    }
     if (args[0] === '--rerun-grey-ci-if-ready') {
       // The preflight read the pull request, then its workflow run was gone.
       return json({ action: 'rerun_grey_ci_if_ready', repository, pull_number: number, head_sha: HEAD,
@@ -192,13 +197,14 @@ async function start() {
   return { db: database, runtime: behaviors }
 }
 
-type TestBehavior = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci'
+type TestBehavior = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci' | 'close-old-prs'
 
 function enable(db: typeof import('../server/db'), behavior: TestBehavior): void {
   if (behavior === 'review-new-prs') {
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
   }
+  if (behavior === 'close-old-prs') db.setMeta('behavior_close_old_prs_days', '30')
   if (behavior === 'approve-prs') changeRequested = true
   if (behavior === 'resolve-unblocking') unresolvedConversations = 1
   db.setMeta(`behavior_${behavior.replace(/-/g, '_')}_enabled`, '1')
@@ -211,9 +217,9 @@ function actedOn(behavior: TestBehavior): string[] {
       .filter(([command, args]) => command === 'github-interface' && args[0] === action)
       .map(([, args, options]) => `${githubRepository(args, options)}${args[1]}`)
   }
-  if (behavior === 'rerun-grey-ci') {
+  if (behavior === 'rerun-grey-ci' || behavior === 'close-old-prs') {
     return mocks.runFile.mock.calls
-      .filter(([command, args]) => command === 'github-interface' && args[0] === '--rerun-grey-ci-if-ready')
+      .filter(([command, args]) => command === 'github-interface' && args[0] === (behavior === 'close-old-prs' ? '--close-old-pr-if-ready' : '--rerun-grey-ci-if-ready'))
       .map(([, args, options]) => `${githubRepository(args, options)}${args[1]}`)
   }
   const flag = behavior === 'review-new-prs' ? '--pr-review' : '--pr-approve'
@@ -343,6 +349,20 @@ describe('Repository hold', () => {
     expect(githubCalls(WEB)).toEqual([])
     expect(holdsOf(runtime)).toHaveLength(1)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
+  it('close-old-prs holds a repository returning 404 and leaves it alone on later ticks', async () => {
+    const { runtime } = await start()
+    enable(database!, 'close-old-prs')
+    deniedRepos.add(WEB)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(holdsOf(runtime)).toEqual([expect.objectContaining({ repo: WEB })])
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(runtime.getCloseOldPrsLastFired()?.target).toBe(API + '#1')
+    mocks.runFile.mockClear()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(githubCalls(WEB)).toEqual([])
+    expect(holdsOf(runtime)).toHaveLength(1)
   })
 
   it('rerun-grey-ci holds a repository GraphQL cannot resolve', async () => {

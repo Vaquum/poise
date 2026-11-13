@@ -4,7 +4,7 @@
 // behavior chain's tasks by phase. Read here, not through another place.
 import type { SessionRecord } from '../../../../server/chat/protocol'
 import { chatClient } from '../../../chat-client'
-import { getSettings } from '../../../config'
+import { getOrganizations, getSettings } from '../../../config'
 import { getSelectedOrganization, organizationPayload, organizationUrl } from '../../../organizations'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
@@ -35,12 +35,16 @@ const key = (repo: string, number: number | string) => `${repo.toLowerCase()}#${
  *  paints them at once, then reads again. Chats and the chain's tasks are the
  *  workspace's; issues, pull requests and runs are one organization's. Another
  *  GitHub user's or organization's reads never stand for these. */
-interface LastMotion { me: string, org: string, sessions: Read<SessionRecord[]>, items: Read<GhRecord[]>, pulls: Read<GreenRead>, running: Read<RunningLog[]>, chains: Read<ChainLike[]> }
+interface LastMotion { me: string, org: string, orgs: string, sessions: Read<SessionRecord[]>, items: Read<GhRecord[]>, pulls: Read<GreenRead>, running: Read<RunningLog[]>, chains: Read<ChainLike[]> }
 const LAST_MOTION_KEY = 'poise-overview-motion'
+/** The organizations ready now: All orgs never stands for another set of them. */
+const readyOrgs = (): string => getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login.toLowerCase()).sort().join(',')
+/** Only a known GitHub user keeps or finds In motion's last reads. */
 function rememberedMotion(): LastMotion | null {
   try {
+    const me = getSettings().me ?? ''
     const last = JSON.parse(localStorage.getItem(LAST_MOTION_KEY) ?? 'null') as LastMotion | null
-    return last && last.me === (getSettings().me ?? '') ? last : null
+    return last && me && last.me === me ? last : null
   } catch {
     return null
   }
@@ -59,18 +63,19 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   // pull requests and runs it holds; a read overtaken by a later one is dropped.
   const me = getSettings().me ?? ''
   let itemsOrg = getSelectedOrganization()
+  let itemsOrgs = readyOrgs()
   let itemsRead = 0
   const last = rememberedMotion()
   if (last) {
     if (last.sessions.data) Object.assign(sessions, { data: new Map(last.sessions.data.map((session) => [session.id, session])), at: last.sessions.at })
     chains = last.chains
-    if (last.org === itemsOrg) ({ items, pulls, running } = last)
+    if (last.org === itemsOrg && (itemsOrg || last.orgs === itemsOrgs)) ({ items, pulls, running } = last)
   }
   function remember(): void {
     // A place left, or a GitHub user changed since it opened, keeps nothing.
-    if (signal.aborted || (getSettings().me ?? '') !== me) return
+    if (signal.aborted || !me || (getSettings().me ?? '') !== me) return
     const kept = <T>(read: Read<T>): Read<T> => ({ data: read.data, error: '', at: read.at })
-    const last: LastMotion = { me, org: itemsOrg, sessions: kept({ data: sessions.data ? [...sessions.data.values()] : null, error: '', at: sessions.at }),
+    const last: LastMotion = { me, org: itemsOrg, orgs: itemsOrgs, sessions: kept({ data: sessions.data ? [...sessions.data.values()] : null, error: '', at: sessions.at }),
       items: kept(items), pulls: kept(pulls), running: kept(running), chains: kept(chains) }
     try { localStorage.setItem(LAST_MOTION_KEY, JSON.stringify(last)) } catch { /* the next page reads them anew */ }
   }
@@ -174,7 +179,9 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   async function readItems(): Promise<void> {
     // Another organization's last reads never stand for this one's.
     const org = getSelectedOrganization()
-    if (org !== itemsOrg) { [items, pulls, running] = [unread(), unread(), unread()]; itemsOrg = org }
+    const orgs = readyOrgs()
+    if (org !== itemsOrg || (!org && orgs !== itemsOrgs)) { [items, pulls, running] = [unread(), unread(), unread()]; itemsOrg = org; paint() }
+    itemsOrgs = orgs
     const mine = ++itemsRead
     const gh = (body: Record<string, unknown>) => json<Record<string, unknown>>('/api/gh', { method: 'POST', body: JSON.stringify({ ...body, ...organizationPayload() }) })
     const settle = async <T>(target: Read<T>, read: () => Promise<T>): Promise<Read<T>> => {
@@ -204,6 +211,8 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   signal.addEventListener('abort', off)
   paint()
   whileVisible(ctx, 60_000, () => { void readSessions(); void readItems() })
+  // Fresh settings naming other organizations, or another one chosen: what was read for the last ones goes at once.
+  window.addEventListener('poise:organization-filter-changed', () => { void readItems() }, { signal })
 
   return {
     setChains(next, error, at) { chains = error ? { ...chains, error } : { data: next, error: '', at }; paint(); if (!error) remember() },

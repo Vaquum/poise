@@ -353,6 +353,72 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   }
 })
 
+test('a reload paints System health’s last read at once while it reads again, and never another GitHub user’s', async ({ page }) => {
+  const now = Date.now()
+  await page.route('**/api/analytics/system-health*', (route) => json(route, {
+    readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
+    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    blocked: { count: 0, oldestProgressAt: null, largestStage: null, items: [] },
+    recovery: { automatic: [], intervention: [], unknown: 0 },
+    lastError: { error: null, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now }, coverage: [],
+  }))
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const errors = page.locator('[data-ref="ov.health"] [data-ref="ov.h.errors"]')
+  await expect(errors).toContainText('0.5 per item')
+  // The reads are held; the reload paints the last one anyway, with nothing failed.
+  await page.route('**/api/analytics/system-health*', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(errors).toContainText('0.5 per item', { timeout: 2_000 })
+  await expect(page.locator('[data-healthfail]')).toBeEmpty()
+  // Settings now name another GitHub user and arrive late: the page opens on the
+  // remembered settings, and what was read for the first user goes once they arrive.
+  let release = () => {}
+  const late = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    await late
+    return json(route, { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'other', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
+  })
+  await page.reload()
+  await expect(errors).toContainText('0.5 per item', { timeout: 2_000 })
+  release()
+  await expect(errors).toContainText('Not read yet')
+  await expect(errors.locator('.osmall-v')).toHaveText('—')
+  // Nor does the next page open on it.
+  await page.reload()
+  await expect(errors).toContainText('Not read yet')
+})
+
+test('System health’s last read never stands once an organization that was not ready is removed', async ({ page }) => {
+  const now = Date.now()
+  const settings = (organizations: unknown[]) => ({ org: '', organizations, me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
+  const acme = { login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }
+  const beta = { login: 'beta', managed: false, status: 'initializing', stage: 'syncing', error: null, activatedAt: null }
+  await page.route('**/api/analytics/system-health*', (route) => json(route, {
+    readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
+    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    blocked: { count: 0, oldestProgressAt: null, largestStage: null, items: [] },
+    recovery: { automatic: [], intervention: [], unknown: 0 },
+    lastError: { error: null, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now }, coverage: [],
+  }))
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  // beta, still initializing, joins acme, and All orgs is read for both, from a fresh page.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, settings([acme, beta])))
+  await page.evaluate(() => localStorage.clear())
+  await page.reload()
+  const errors = page.locator('[data-ref="ov.health"] [data-ref="ov.h.errors"]')
+  await expect(errors).toContainText('0.5 per item')
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('poise-overview-health'))).not.toBeNull()
+  // beta is removed elsewhere; the reads are held. The first reload opens on the
+  // remembered settings, the next on the fresh ones.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, settings([acme])))
+  await page.route('**/api/analytics/system-health*', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(errors).toContainText('Not read yet')
+  await page.reload()
+  await expect(errors).toContainText('Not read yet')
+})
+
 test('In motion says what was never read, rather than zero or clear', async ({ page }) => {
   let ghReads = 0
   page.on('requestfinished', (request) => { if (new URL(request.url()).pathname === '/api/gh') ghReads++ })
@@ -363,6 +429,56 @@ test('In motion says what was never read, rather than zero or clear', async ({ p
   expect(ghReads).toBeGreaterThan(0)
   await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
   await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
+})
+
+test('a reload opens Overview on the settings this browser remembers, without waiting for the server’s', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+  // The server's settings answer is held; the reload opens the place anyway.
+  let answer: () => void = () => {}
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    await new Promise<void>((resolve) => { answer = resolve })
+    return route.fallback()
+  })
+  await page.reload()
+  await expect(page.getByRole('complementary', { name: 'Answer here' })).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('.ova-main')).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+  answer()
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+})
+
+const SETTINGS = { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }
+
+test('a failed fresh read of Settings shows on the Manager’s card, never the remembered controls', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-act="mgr-paused"]')).toBeVisible()
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, { error: 'settings store unavailable' }, 503))
+  await page.reload()
+  await expect(page.locator('[data-mgrbox]')).toContainText('Settings could not be read')
+  await expect(page.locator('[data-act="mgr-paused"]')).toHaveCount(0)
+})
+
+test('a focused Manager control shows the fresh settings when they land, so it acts on what it shows', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const pause = page.locator('[data-act="mgr-paused"]')
+  await expect(pause).toHaveAttribute('aria-pressed', 'false')
+  // New work was paused elsewhere; the reload opens on the remembered controls while the fresh ones are held.
+  let hold = true
+  const held: Array<() => void> = []
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    if (hold) await new Promise<void>((resolve) => held.push(resolve))
+    return json(route, { ...SETTINGS, manager: { ...SETTINGS.manager, paused: true, version: 2 } })
+  })
+  await page.reload()
+  await expect(pause).toHaveAttribute('aria-pressed', 'false')
+  await pause.focus()
+  hold = false
+  held.forEach((resolve) => resolve())
+  await expect(pause).toHaveAttribute('aria-pressed', 'true')
+  await expect(pause).toBeFocused()
 })
 
 test('a reload paints In motion’s last reads at once, while it reads them again', async ({ page }) => {
@@ -479,4 +595,62 @@ test('a reload reads the 30 days again when they failed, though the year was rea
   await page.locator('[data-tile]').first().click()
   await expect(page.getByText(/of 30 days known/)).toBeVisible()
   await expect(failed).toHaveCount(0)
+})
+
+/** Settings as the fixture serves them, with another GitHub user or other organizations. */
+const settingsAs = (as: { me?: string, logins?: string[] }) => ({ org: '', organizations: (as.logins ?? ['acme']).map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })),
+  me: as.me ?? 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
+const holdReads = async (page: Page) => {
+  await page.route(/\/api\/analytics(\?|\/history)/, async () => { await new Promise(() => {}) })
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+}
+
+test('the day and In motion keep nothing for an unknown GitHub user', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  // Settings name no GitHub user: what this load reads is kept for nobody.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, settingsAs({ me: '' })))
+  await page.reload()
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  await expect(page.locator('[data-counts="items"] b').first()).not.toHaveText('—')
+  await holdReads(page)
+  await page.reload()
+  await expect(page.getByText('Reading the day’s numbers…')).toBeVisible()
+  await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
+})
+
+test('All orgs’ last reads never stand for another set of organizations', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  await expect(page.locator('[data-counts="items"] b').first()).not.toHaveText('—')
+  // beta is added elsewhere; the day's and GitHub's reads are held.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, settingsAs({ logins: ['acme', 'beta'] })))
+  await holdReads(page)
+  await page.reload()
+  await expect(page.getByText('Reading the day’s numbers…')).toBeVisible()
+  await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
+  // The workspace's chats still stand.
+  await expect(page.locator('[data-counts="people"] b').first()).not.toHaveText('—')
+})
+
+test('a failed day refresh after the organizations changed never files the old numbers under the new ones', async ({ page }) => {
+  await page.clock.install()
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  // A save from the Manager's card answers with settings that now hold beta too, and the day's next refresh fails.
+  const withBeta = settingsAs({ logins: ['acme', 'beta'] })
+  await page.route('**/api/settings', (route) => route.request().method() === 'POST' ? json(route, { ...withBeta, manager: { ...withBeta.manager, rhythm: 6, version: 2 } }) : route.fallback())
+  await page.route(/\/api\/analytics(\?|\/history)/, (route) => json(route, { error: 'analytics unavailable' }, 503))
+  await page.locator('[data-act="rh-more"]').click()
+  await expect(page.locator('.rh-n')).toHaveText('6')
+  const failed = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/analytics' && response.status() === 503)
+  await page.clock.fastForward(61_000)
+  await failed
+  await page.waitForTimeout(500)
+  expect(await page.evaluate(() => localStorage.getItem('poise-overview-day') ?? '')).not.toContain('acme,beta')
+  // The next load reads beta too; the old organizations' numbers are not restored for it.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, withBeta))
+  await holdReads(page)
+  await page.reload()
+  await expect(page.getByText('Reading the day’s numbers…')).toBeVisible()
 })

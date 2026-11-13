@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { projectAnalyticsHealth, healthIntervals, workError, retryProven } from '../server/analytics-health'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { nativeActionReceipt } from '../server/behavior-chain-action'
@@ -53,7 +53,7 @@ function setup() {
     githubQuota: [], collectors: { status: 'ok', reason: null, since: null, queued: 0, queuedBytes: 0, dropped: 0, lastSuccessfulWriteAt: null, error: null } }
   const input: Parameters<typeof projectAnalyticsHealth>[1] = { now: NOW, scope: '', history, dependencies, organizations: [{ login: 'acme', managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: null, retryAt: null }] }
   const read = () => projectAnalyticsHealth(journal, input)
-  return { journal, seed, append, observe, fail, succeed, finish, merge, read, input }
+  return { db, journal, seed, append, observe, fail, succeed, finish, merge, read, input }
 }
 
 it('counts one incident per seed over completed lifetimes, including pre-window errors, with error-free items in the denominator', async () => {
@@ -739,4 +739,32 @@ it('anchors each recovery to its own failure when one invocation fails twice', a
   expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
   expect(report.recovery.intervention).toEqual([])
   expect(report.recovery.unknown).toBe(0)
+})
+
+it('replays only the chains whose journal changed, and reads as a fresh journal does wherever the clock moves', async () => {
+  const f = setup()
+  let recovered = f.observe(f.seed(1), NOW - 7 * HOUR)
+  recovered = f.fail(recovered, 'failure', NOW - 6 * HOUR)
+  recovered = f.succeed(recovered, 'retry', NOW - 5 * HOUR)
+  f.merge(f.observe(recovered, NOW - 5 * HOUR + 1000, null, [17]), NOW - 4 * HOUR)
+  f.merge(f.seed(2), NOW - 2 * HOUR)
+  f.fail(f.seed(3), 'active', NOW - HOUR)
+  const first = await f.read()
+  expect(first.rate).toMatchObject({ completed: 2, errors: 1 })
+  expect(first.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
+  expect(first.lastError.error).toMatchObject({ work: 'acme/repo#3', at: NOW - HOUR })
+  const replayed = vi.spyOn(f.journal, 'history')
+  expect(await f.read()).toEqual(first)
+  expect(replayed).not.toHaveBeenCalled()
+  f.observe(f.journal.read('acme/repo#3')!, NOW)
+  await f.read()
+  expect(new Set(replayed.mock.calls.map(([id]) => id))).toEqual(new Set(['acme/repo#3']))
+  // The window moves by the clock alone: a merge and a recovery leave it,
+  // and a clock before an error replays only the chain that error is in.
+  for (const [now, replays] of [[NOW + 5 * HOUR, []], [NOW + 30 * HOUR, []], [NOW - 2 * HOUR, ['acme/repo#3']]] as const) {
+    replayed.mockClear()
+    const read = await projectAnalyticsHealth(f.journal, { ...f.input, now })
+    expect(new Set(replayed.mock.calls.map(([id]) => id))).toEqual(new Set(replays))
+    expect(read).toEqual(await projectAnalyticsHealth(new BehaviorChainJournal(f.db), { ...f.input, now }))
+  }
 })

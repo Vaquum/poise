@@ -47,6 +47,7 @@ export const BEHAVIORS: BehaviorMeta[] = [
   { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewCap: false, hasReviewers: true,  hasMemory: true,  hasTriggers: false, hasSkips: true,  reviews: { place: 'PR review', item: 'pull request' } },
   { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewCap: true,  hasReviewers: false, hasMemory: true,  hasTriggers: false, hasSkips: true },
   { key: 'resolve-unblocking', label: 'Resolve Unblocking Conversations', hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'close-old-prs',     label: 'Close Old Pull Requests',        hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
   { key: 'rerun-grey-ci',      label: 'Rerun Grey CI',                hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
   { key: 'merge-prs',          label: 'Merge Pull Requests',           hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
   { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewCap: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  hasSkips: false, reviews: { place: 'Issue review', item: 'issue' } },
@@ -163,6 +164,12 @@ export function getSetting(key: BehaviorKey): BehaviorSetting {
 
 export function getReviewers(key: BehaviorKey): ReviewerCount {
   return reviewersByKey[key] || 1
+}
+
+const daysByKey: Partial<Record<BehaviorKey, number | null>> = {}
+export function getDays(key: BehaviorKey): number | null { return daysByKey[key] ?? null }
+export function isValidDays(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
 }
 
 // The review-round cap for Approve Pull Requests: null is off, otherwise the
@@ -310,6 +317,7 @@ export function setReviewers(key: BehaviorKey, reviewers: ReviewerCount): Promis
 // applies all of them or none.
 export interface SettingFields {
   setting?: BehaviorSetting
+  days?: number
   reviewCap?: number | null
   repos?: string[]
   authors?: string[]
@@ -323,7 +331,11 @@ const settingFieldsWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
 
 export function setSettingFields(key: BehaviorKey, fields: SettingFields): Promise<void> {
   const run = async () => {
-    const previous = { setting: settingByKey[key], reviewCap: reviewCapByKey[key], repos: reposByKey[key], authors: authorsByKey[key], skipRepos: skipReposByKey[key] }
+    const previous = { days: daysByKey[key], setting: settingByKey[key], reviewCap: reviewCapByKey[key], repos: reposByKey[key], authors: authorsByKey[key], skipRepos: skipReposByKey[key] }
+    if ('days' in fields) {
+      if (!isValidDays(fields.days)) throw new Error('days must be a positive whole number')
+      daysByKey[key] = fields.days
+    }
     if (fields.setting) settingByKey[key] = fields.setting
     if ('reviewCap' in fields) reviewCapByKey[key] = fields.reviewCap ?? null
     if (fields.repos) reposByKey[key] = [...fields.repos]
@@ -332,6 +344,7 @@ export function setSettingFields(key: BehaviorKey, fields: SettingFields): Promi
     beginWrite(key)
     try {
       const data = await postBehavior(key, fields)
+      if ('days' in fields && isValidDays(data.days)) daysByKey[key] = data.days
       if (fields.setting && data.setting) settingByKey[key] = data.setting
       if ('reviewCap' in fields && (data.reviewCap === null || isReviewCap(data.reviewCap))) {
         reviewCapByKey[key] = data.reviewCap
@@ -340,6 +353,7 @@ export function setSettingFields(key: BehaviorKey, fields: SettingFields): Promi
       authorsByKey[key] = stringList(data.authors) ?? authorsByKey[key]
       skipReposByKey[key] = stringList(data.skipRepos) ?? skipReposByKey[key]
     } catch (err) {
+      daysByKey[key] = previous.days
       settingByKey[key] = previous.setting
       reviewCapByKey[key] = previous.reviewCap
       reposByKey[key] = previous.repos
@@ -431,6 +445,7 @@ export async function refreshState(): Promise<void> {
       if (!readIsCurrentFor(k, seen.started, seen.busy)) continue
       pausedUntilByKey[k] = data[k]?.pausedUntil ?? null
       enabledByKey[k] = !!data[k]?.enabled
+      if (k === 'close-old-prs') daysByKey[k] = isValidDays(data[k]?.days) ? data[k].days : null
       if (data[k]?.setting) settingByKey[k] = data[k].setting
       if (data[k]?.reviewCap === null || isReviewCap(data[k]?.reviewCap)) reviewCapByKey[k] = data[k].reviewCap
       if (isReviewerCount(data[k]?.reviewers)) reviewersByKey[k] = data[k].reviewers

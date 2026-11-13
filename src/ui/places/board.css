@@ -194,7 +194,6 @@
 .cur.is-list .card-acts { position: static; grid-column: 4; grid-row: 1 / span 2; justify-content: flex-end; padding-left: 0; background: none; }
 .card-state .dwell { flex: none; color: var(--c-text-muted); white-space: nowrap; }
 .card-state .dwell .stuck { color: var(--c-text); font-weight: var(--fw-strong); }
-.card-state .card-assign { margin-left: auto; flex: none; height: var(--size-chip); padding-inline: var(--sp-2); }
 .card-meta .intake { flex: none; font-family: var(--font-mono); color: var(--c-agent-on); }
 .card-meta .intake.dim { color: var(--c-text-faint); font-family: var(--font-ui); }
 .card .note.is-warn { color: var(--c-attention-on); }
@@ -218,7 +217,5 @@
 .bside-tl .tl li { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: var(--sp-2); font-size: var(--fs-micro); line-height: var(--lh-body); color: var(--c-text-soft); }
 .bside-tl .tl time { font-family: var(--font-mono); color: var(--c-text-muted); }
 .bside-tl .tl .k { font-weight: var(--fw-strong); color: var(--c-text); }
-/* A card that offers Assign keeps its state row clear: its actions show at the top. */
-.card:has(.card-state .card-assign) .card-acts { bottom: auto; top: var(--sp-1); }
 /* A card's chat opens beside the board, on its right, as the mock's side pane does. */
 body:has([data-place-root][data-place="board"]) #chat-side-pane { left: auto; right: 0; height: calc(100vh - var(--size-topbar) - var(--foot-h)); border-right: 0; border-left: var(--line-hair) solid var(--c-edge); }
