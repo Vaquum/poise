@@ -4809,7 +4809,8 @@ async function tickApprovePrs(): Promise<void> {
   if (isPaused('approve-prs')) return
   const context = diagnosticIdentity()
   const progress = { eligiblePrs: null as number | null, checksPending: null as number | null,
-    changeChecksRead: 0, activityChecksRead: 0, launched: 0, publication: 'unverified' }
+    changeChecksRead: 0, activityChecksRead: 0, launchesPending: 0, launched: 0, publication: 'unverified' }
+  const attemptedClaims = new Set<string>()
   if (context) context.phase = 'listing'
   try {
     const prs = await listEligiblePrs('approve-prs', author)
@@ -5075,6 +5076,7 @@ async function tickApprovePrs(): Promise<void> {
       }
       // Launches run in a small pool: preparations overlap the way the
       // provider layer expects, while the sweep stays bounded.
+      progress.launchesPending += launches.length
       if (context) context.phase = 'launch'
       await forEachPool(launches, APPROVE_FIRE_CONCURRENCY, async (launch) => {
         if (!isRunnable('approve-prs') || behaviorAborted()) return
@@ -5129,6 +5131,7 @@ async function tickApprovePrs(): Promise<void> {
           }
           if (!claimId) return
           trackClaim('approve-prs', seenTarget, claimId)
+          attemptedClaims.add(claimId)
           try {
             const accepted = await fireApprove(pr, seenTarget, claimId, expectedHead, admittedReviewer, replacesFailedCallId)
             if (!accepted) {
@@ -5137,6 +5140,7 @@ async function tickApprovePrs(): Promise<void> {
             }
             launched = true
             progress.launched++
+            progress.launchesPending--
             checked = true
           } catch (err) {
             releaseOwnedClaim('approve-prs', seenTarget, claimId)
@@ -5158,7 +5162,49 @@ async function tickApprovePrs(): Promise<void> {
     }
     if (failure) throw failure
   } finally {
-    if (context) context.progress = progress
+    if (context) {
+      context.progress = progress
+      const reason = behaviorSignal()?.reason
+      if (reason instanceof DOMException && reason.name === 'TimeoutError') {
+        const claims = listBehaviorLaunchClaims('approve-prs').filter((claim) => attemptedClaims.has(claim.claimId))
+        let snapshot: AgentLogSnapshot | null = null
+        let ownershipError: string | null = null
+        try {
+          // The work deadline has expired, but Caller may have registered a
+          // launch since the last read. Observe it without admitting more work.
+          snapshot = await fetchAgentLogSnapshot({ fresh: true, signal: behaviorAbortController?.signal })
+        } catch (error) { ownershipError = behaviorErrorMessage(error) }
+        const launches = claims.map((claim) => {
+          const call = snapshot?.entries.find((row) => row.correlation_id === claim.launchCorrelationId)
+          const owned = snapshot && call && !claim.launchQuarantine && !claim.launchError
+            && unambiguousAgentCall(snapshot, call)
+            && claim.launchCorrelationId === claim.claimId
+            && (!claim.launchCallId || claim.launchCallId === call.id)
+            && claim.launchBehavior === 'pr_approve' && call.behavior === claim.launchBehavior
+            && call.repo === claim.launchRepo && String(call.pr_id) === String(claim.launchPr)
+            && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
+            && claim.launchSource === 'poise:approve-prs' && call.source === claim.launchSource
+            && call.expected_head === claim.launchExpectedHead
+            && Number.isFinite(Date.parse(claim.launchRequestedAt))
+            && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
+            && RUNNING_AGENT_STATUSES.has(call.status.toLowerCase())
+            && call.action == null && call.outcome == null && call.head_sha == null
+            && call.review_id == null && call.receipts == null && call.review_comments == null
+          return { target: claim.target, claimId: claim.claimId, correlationId: claim.launchCorrelationId,
+            expectedHead: claim.launchExpectedHead, callId: call?.id ?? claim.launchCallId,
+            status: call?.status ?? null, ownership: owned ? 'owned' : 'unresolved' }
+        })
+        const org = currentOrganization()
+        const continuationAt = tickerStarted && tickTimer && isRunnable('approve-prs')
+          && !releaseBackgroundPaused() && !releaseSwitchPending()
+          && org && readyOrganizations().some((ready) => ready.login === org.login && ready.datastorePath === org.datastorePath)
+          ? nextTickAtMs : null
+        context.progress = { ...progress, cursor: getMeta('behavior_approve_prs_cursor'), launches, ownershipError,
+          continuationAt, disposition: continuationAt !== null && launches.length > 0
+            && launches.length === progress.launched && launches.every((launch) => launch.ownership === 'owned')
+            ? 'deferred' : 'unresolved' }
+      }
+    }
   }
 }
 
@@ -7797,6 +7843,7 @@ export async function setPaused(key: BehaviorKey, pausedUntil: string | null, by
 // browser-only and not relevant to behavior cadence.
 let tickerStarted = false
 let tickTimer: ReturnType<typeof setTimeout> | null = null
+let nextTickAtMs: number | null = null
 let runtimeGeneration = 0
 export const BEHAVIOR_TICK_MS = 60_000
 
@@ -8155,7 +8202,12 @@ async function runBehaviorCycle(
       }
       if (lifecycle?.aborted !== true) {
         recordBehaviorFailure(key, 'operation', error)
-        if (!(error instanceof BehaviorLogFeedError) && !staleDatastoreFailure(error)) console.error(`[behaviors] ${key} operation failed:`, error)
+        if (!(error instanceof BehaviorLogFeedError) && !staleDatastoreFailure(error)) {
+          const deferred = key === 'approve-prs' && error instanceof DOMException && error.name === 'TimeoutError'
+            && diagnosticIdentity()?.progress?.disposition === 'deferred'
+          const report = deferred ? console.warn : console.error
+          report(`[behaviors] ${key} operation failed:`, error)
+        }
       }
     }
   }
@@ -8358,8 +8410,10 @@ function scheduleNextTick(generation: number) {
   if (tickTimer) clearTimeout(tickTimer)
   const now = Date.now()
   const nextBoundary = Math.ceil((now + 1) / BEHAVIOR_TICK_MS) * BEHAVIOR_TICK_MS
+  nextTickAtMs = nextBoundary
   tickTimer = setTimeout(() => {
     tickTimer = null
+    nextTickAtMs = null
     if (!tickerStarted || generation !== runtimeGeneration) return
     lastTickAtMs = Date.now()
     behaviorLedgerHeartbeat()
@@ -8684,6 +8738,7 @@ export async function stopBehaviorsRuntime(): Promise<void> {
   runtimeGeneration += 1
   if (tickTimer) clearTimeout(tickTimer)
   tickTimer = null
+  nextTickAtMs = null
   if (checkSlotRetryTimer) clearTimeout(checkSlotRetryTimer)
   checkSlotRetryTimer = null
   checkSlotRetryPending = false
