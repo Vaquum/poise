@@ -2392,7 +2392,9 @@ async function reconcileBehaviorLaunchClaims(
         ? new Map([['reviewed_clean', 'clean'], ['requested_changes', 'changes_requested']])
         : new Map([['approved', 'approved'], ['requested_changes', 'changes_requested']])
       const action = String(call.action || '')
-      const outcome = String(call.outcome || '')
+      const partialFindings = call.action === 'requested_changes' && call.outcome === 'incomplete'
+        && (call.artifact?.review_response as Record<string, unknown> | undefined)?.coverage === 'incomplete'
+      const outcome = partialFindings ? 'changes_requested' : String(call.outcome || '')
       const completedAt = String(call.completed_at || '')
       const headSha = String(call.head_sha || '').toLowerCase()
       if (expectedActions.get(action) !== outcome

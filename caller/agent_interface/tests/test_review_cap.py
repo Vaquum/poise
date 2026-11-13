@@ -21,6 +21,7 @@ REMOVED_FINDING = {"path": "src/old.py", "line": 9, "side": "LEFT", "body": "[p2
 BREAKING_FINDING = {**FINDING, "body": "[p0] Every save loses the existing document."}
 PACKET = json.dumps({
     "action": "read",
+    "coverage": "complete",
     "repository": "o/r",
     "pull_number": 12,
     "head_sha": HEAD,
@@ -53,6 +54,18 @@ def issue_reply(number=8):
 
 
 class TestCappedApprovalTools(TestCase):
+    def test_claude_cannot_defer_findings_or_approve_when_required_source_is_omitted(self):
+        packet = json.dumps({**json.loads(PACKET), "coverage": "incomplete",
+                             "omitted_files": [{"path": "src/z.py", "reason": "capacity"}]})
+        with patch.object(atoms, "packet", return_value=packet), \
+                patch.object(atoms, "last_reviewed_head", return_value=None), \
+                patch.object(atoms, "run_agent", return_value="submitted") as run:
+            pr_approve.run("/repo", "https://github.com/o/r/pull/12", "bit-mis", HEAD,
+                           model="opus-5-high", capped=True, review_round=5, review_cap=5)
+        self.assertFalse(run.call_args.kwargs["capped"])
+        self.assertEqual(run.call_args.args[3], pr_approve.allowed("12", "bit-mis", HEAD))
+        self.assertNotIn("file the findings as ONE follow-up issue", run.call_args.args[2])
+
     def test_uncapped_tools_are_unchanged(self):
         self.assertEqual(
             pr_approve.allowed("#12", "bit-mis", HEAD),

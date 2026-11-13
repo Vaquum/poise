@@ -24,7 +24,7 @@ export interface LogEntry {
   time_elapsed: string
   status: string
   progress?: ModelProgress | null
-  outcome: 'clean' | 'changes_requested' | 'approved' | 'superseded' | 'preflight_failed' | 'commented' | 'published' | 'no_changes' | 'target_closed' | 'native_action' | null
+  outcome: 'clean' | 'changes_requested' | 'approved' | 'incomplete' | 'superseded' | 'preflight_failed' | 'commented' | 'published' | 'no_changes' | 'target_closed' | 'native_action' | null
   head_sha: string | null
   expected_head: string | null
   source: string | null
@@ -267,6 +267,10 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
   const managedReview = behavior === 'pr_review' || behavior === 'pr_approve' || (source === 'poise:behavior-chain' && issueReview)
   if (artifact !== null && ((!atomicWork && !managedReview && !nativeAction) || typeof artifact !== 'object' || Array.isArray(artifact)
     || Buffer.byteLength(JSON.stringify(artifact)) > 128 * 1024)) throw new Error(`agent-interface log row ${index} has an invalid atomic artifact`)
+  const incompleteReview = (behavior === 'pr_review' || behavior === 'pr_approve') && headSha === expectedHead
+    && (status === 'failed' && action === null && errorCode === 'review_incomplete'
+      || status === 'completed' && action === 'requested_changes'
+        && ((artifact as Record<string, unknown> | null)?.review_response as Record<string, unknown> | undefined)?.coverage === 'incomplete')
   if (nativeAction && artifact !== null) {
     const value = artifact as Record<string, unknown>
     if (!['preparing_native_action', 'performing_native_action', 'received_native_action'].includes(String(value.phase))
@@ -305,7 +309,8 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     || !Number.isFinite(Date.parse(startedAt))
     || (startedAtPrecise !== null && !Number.isFinite(Date.parse(startedAtPrecise)))
     || (completedAt !== null && !Number.isFinite(Date.parse(completedAt)))
-    || !['clean', 'changes_requested', 'approved', 'superseded', 'preflight_failed', 'commented', 'published', 'no_changes', 'target_closed', 'native_action', null].includes(outcome)
+    || !['clean', 'changes_requested', 'approved', 'incomplete', 'superseded', 'preflight_failed', 'commented', 'published', 'no_changes', 'target_closed', 'native_action', null].includes(outcome)
+    || (outcome === 'incomplete' && !incompleteReview)
     || (outcome === 'target_closed' && !closedFence)
     || (headSha !== null && !/^[0-9a-f]{40}$/.test(headSha))
     || (expectedHead !== null && !/^[0-9a-f]{40}$/.test(expectedHead))

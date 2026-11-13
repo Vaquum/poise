@@ -134,6 +134,15 @@ async function heldBatch() {
 }
 
 describe('Merge Pull Requests', () => {
+  it.each(['incomplete', null, true, {}])('does not merge from incomplete or malformed coverage: %j', async (coverage) => {
+    const call = completedReviewCall(REPO, 7, HEAD, 'review-bot')
+    const review = call.artifact!.review_response as Record<string, unknown>
+    enable(); logOverrides = { artifact: { review_response: { ...review, coverage } } }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toEqual([])
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
   it.each([{ artifact: null }, { status: 'running', action: null, outcome: null, head_sha: null, completed_at: null },
     { expected_head: 'c'.repeat(40) }, { head_sha: 'c'.repeat(40) }])('retains the review obligation without a substantive completed final-head invocation: %j', async (overrides) => {
     enable(); logOverrides = overrides

@@ -94,7 +94,7 @@ class TestAtoms(TestCase):
         self.assertIsNone(caught.exception.code)
 
     def test_last_reviewed_head_reports_the_reviewers_latest_commit(self) -> None:
-        reply = {"action": "review_activity_since", "reviewer_latest_commit": "c" * 40}
+        reply = {"action": "review_activity_since", "reviewer_latest_complete_commit": "c" * 40}
         with patch.object(atoms.subprocess, "run",
                           return_value=SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")) as run:
             self.assertEqual(atoms.last_reviewed_head("/tmp", "#1", "bit-mis"), "c" * 40)
@@ -104,13 +104,13 @@ class TestAtoms(TestCase):
 
     def test_last_reviewed_head_is_none_without_a_prior_review(self) -> None:
         for commit in (None, ""):
-            reply = {"action": "review_activity_since", "reviewer_latest_commit": commit}
+            reply = {"action": "review_activity_since", "reviewer_latest_complete_commit": commit}
             with patch.object(atoms.subprocess, "run",
                               return_value=SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")):
                 self.assertIsNone(atoms.last_reviewed_head("/tmp", "#1", "bit-mis"))
 
     def test_last_reviewed_head_rejects_garbage_loudly(self) -> None:
-        reply = {"action": "review_activity_since", "reviewer_latest_commit": "not-a-sha"}
+        reply = {"action": "review_activity_since", "reviewer_latest_complete_commit": "not-a-sha"}
         with patch.object(atoms.subprocess, "run",
                           return_value=SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")), \
                 self.assertRaises(atoms.AgentPreflightError) as failure:

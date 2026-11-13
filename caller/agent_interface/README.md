@@ -511,6 +511,14 @@ leaving room for context and policy. Existing bulk-data compaction rules still
 apply. These byte limits do not guarantee that an input fits a provider's token
 window. Claude receives the whole packet in one call.
 
+The packet builder records `coverage` as `complete` or `incomplete`, separately
+from declared `excluded_files`. Capacity omissions in `omitted_files` leave
+coverage incomplete even when every retained file group finishes. Caller pins
+this disposition in the native response; model assessments cannot change it.
+Incomplete reviews can submit genuine change requests and retain their receipts,
+but cannot submit clean reviews or approvals, including capped approvals.
+Their outcome remains `incomplete`, and they cannot qualify for automated merge.
+
 A structured review whose packet exceeds one provider call's reliable size
 runs in file-group stages targeting at most 8 files or 200,000 diff bytes each.
 Individual files stay intact and can exceed the byte target. All groups share
@@ -528,12 +536,12 @@ still fails without submitting an incomplete review. Every stage's findings
 combine into the single verdict the harness submits; a packet that fits in one
 group needs no staging.
 A follow-up (`--pr-approve`) round reviews the diff since
-the reviewer's last submitted review instead of the whole PR again: new
+the reviewer's last proven complete review instead of the whole PR again: new
 findings on current lines stay on current-head lines, while a defect caused
 by a removal is commented on the removed line and validated against the full
-pull request diff before the single submission. An unfetchable last head, or
-a base that moved since the last review, widens the round to the full diff
-instead. Both full and follow-up reviews validate every inline location against
+pull request diff before the single submission. An unfetchable last head,
+a base that moved since the last review, or no proven complete baseline widens
+the round to the full diff instead. Both full and follow-up reviews validate every inline location against
 the retained PR diff before invoking the GitHub submission command. Any finding
 without a verified position fails the review before
 submission, including a capped round's follow-up issue and approval.

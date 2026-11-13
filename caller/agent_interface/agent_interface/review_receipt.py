@@ -39,6 +39,13 @@ _QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-rema
                   "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
 
 
+def coverage_disposition(packet: dict) -> str:
+    # Only the packet builder can attest to the complete required source set.
+    # Finishing every stage of an omitted prefix cannot upgrade that proof.
+    return "complete" if packet.get("coverage") == "complete" \
+        and isinstance(packet.get("files"), list) and packet.get("omitted_files", []) == [] else "incomplete"
+
+
 def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
     """Pin controller-owned context before invoking the configured reviewer."""
     from hashlib import sha256
@@ -57,7 +64,8 @@ def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
         conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?),'$.review_scope',?,"
                      "'$.verification_candidates',json(?)) where id=? and status='running'",
                      (json.dumps({"repository": value["repository"], "pull_number": value["pull_number"],
-                                  "head_sha": value["head_sha"], "context_sha": context, "model": model}),
+                                  "head_sha": value["head_sha"], "context_sha": context, "model": model,
+                                  "coverage": coverage_disposition(value)}),
                       review_scope or None, json.dumps(fixes), call_id))
 
 

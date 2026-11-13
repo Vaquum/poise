@@ -246,6 +246,7 @@ class TestBoundedCoverage(IsolatedAsyncioTestCase):
 
     async def test_oversized_diff_yields_bounded_packet_with_explicit_omitted_files(self):
         packet = await self._packet(['a.py', 'b.py', 'c.py', 'd.py', 'e.py', 'data.csv'], 1000, 2500)
+        self.assertEqual(packet['coverage'], 'incomplete')
         self.assertEqual(len(packet['diff']), 2000)
         self.assertEqual([entry['filename'] for entry in packet['files']],
                          ['a.py', 'b.py'])
@@ -280,6 +281,7 @@ class TestBoundedCoverage(IsolatedAsyncioTestCase):
 
     async def test_small_diff_carries_no_omitted_coverage_key(self):
         packet = await self._packet(['a.py', 'b.py'], 1000, rd.MAX_DIFF_BYTES)
+        self.assertEqual(packet['coverage'], 'complete')
         self.assertEqual(len(packet['diff']), 2000)
         self.assertNotIn('omitted_files', packet)
 

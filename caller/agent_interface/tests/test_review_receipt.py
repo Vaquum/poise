@@ -183,6 +183,7 @@ class TestReceiptRecording(TestCase):
             conn.execute("insert into calls (id, started_at, status, actor, behavior) values ('run', 0, 'running', 'bit-mis', 'pr_review')")
             conn.execute("update calls set artifact=? where id='run'", (json.dumps({'phase': 'reviewing'}),))
         review_receipt.prepare_response(json.dumps({"repository": "o/r", "pull_number": 12, "head_sha": HEAD,
+            "coverage": "complete", "files": [],
             "pull": {"base": {"sha": "b" * 40}, "title": "Review ordering", "body": "Retain assessment."}}), "fixture")
 
     def stored(self):
@@ -347,7 +348,8 @@ class TestReceiptRecording(TestCase):
                                    "structuredOutput": {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}}), stderr="")
         with patch.object(structured_review.subprocess, "run", side_effect=process), patch.object(ReviewWatch, "run", side_effect=process):
             structured_review.run("/repo", "system", "packet", CATALOG.resolve("grok-4.6-xhigh"), "pr_review",
-                                  "https://github.com/o/r/pull/12", "bit-mis", HEAD, 60)
+                                  "https://github.com/o/r/pull/12", "bit-mis", HEAD, 60,
+                                  packet=json.dumps({"coverage": "complete", "files": []}))
         self.assertEqual(review_receipt.get()["review_id"], 92)
         self.assertEqual(self.stored(), "92")
 
@@ -360,7 +362,8 @@ class TestReceiptRecording(TestCase):
         with patch.object(structured_review.subprocess, "run", side_effect=process), patch.object(ReviewWatch, "run", side_effect=process):
             with self.assertRaises(review_receipt.SubmissionError):
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("grok-4.6-xhigh"), "pr_review",
-                                      "https://github.com/o/r/pull/12", "bit-mis", HEAD, 60)
+                                      "https://github.com/o/r/pull/12", "bit-mis", HEAD, 60,
+                                      packet=json.dumps({"coverage": "complete", "files": []}))
         self.assertEqual(review_receipt.failure(), "error: GitHub 500:")
         self.assertIsNone(review_receipt.get())
         self.assertIsNone(self.stored())

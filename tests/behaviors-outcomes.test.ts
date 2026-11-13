@@ -3,6 +3,18 @@ import checkoutSuperseded from './fixtures/review-checkout-superseded.json'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture, datastoreHealthOutput } from './behaviors-runtime-fixture'
 
 describe('review outcome evidence and registration', () => {
+  it('settles a receipted partial change request without quarantining or clearing its coverage', async () => {
+    const launched = await launchReviewBeforeCrash()
+    fixture.agentLogs = [agentLog({ started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      actor: launched.actor, source: launched.source, correlation_id: launched.correlationId,
+      status: 'completed', action: 'requested_changes', outcome: 'incomplete', head_sha: launched.expectedHead,
+      review_id: 91, artifact: { review_response: { coverage: 'incomplete' } } })]
+    await resetLogCache()
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(launched.database.db.prepare('SELECT launch_action, launch_outcome, launch_quarantine FROM behavior_seen WHERE key = ? AND target = ?')
+      .get('review-new-prs', launched.target)).toMatchObject({ launch_action: 'requested_changes', launch_outcome: 'changes_requested', launch_quarantine: null })
+    expect(fixture.agentLogs[0]).toMatchObject({ outcome: 'incomplete', artifact: { review_response: { coverage: 'incomplete' } } })
+  })
 
   it.each((['review-new-issues', 'review-new-prs', 'approve-prs'] as const).flatMap((key) =>
     (['active', 'failed'] as const).map((state) => ({ key, state }))))(

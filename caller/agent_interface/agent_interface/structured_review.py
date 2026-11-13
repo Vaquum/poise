@@ -569,7 +569,14 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                   diagnostic) from error
 
     capped_note = ""
-    if capped and behavior == "pr_approve" and verdict["action"] == "request_changes" \
+    coverage = review_receipt.coverage_disposition(json.loads(packet)) if packet else "incomplete"
+    if coverage != "complete" and verdict["action"] != "request_changes":
+        review_receipt.complete_response(verdict["assessment"], head)
+        raise review_budget.ReviewLimitError(
+            "Review incomplete: required source coverage is not complete; no clearance submitted",
+            "review_incomplete", diagnostic_envelope(operation="provider.review", phase="validating",
+                                                    outcome="incomplete", submission="none"))
+    if coverage == "complete" and capped and behavior == "pr_approve" and verdict["action"] == "request_changes" \
             and all(re.match(r"\s*\[p[12]\]", comment["body"], re.IGNORECASE) for comment in verdict["comments"]):
         # Only explicitly nonbreaking findings may be deferred. Otherwise keep
         # the entire change request, even if a marked follow-up already exists.
