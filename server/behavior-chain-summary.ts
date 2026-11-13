@@ -3,8 +3,9 @@ import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
 import { nativeBehavior } from './behavior-chain-runtime'
-import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent } from './behavior-chain-store'
+import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
+import type { ProcessDiagnostic } from './process-diagnostic'
 
 export const CHAIN_ATTENTION_DELAY_MS = 24 * 60 * 60_000
 
@@ -236,18 +237,52 @@ function foldProgress(fold: ProgressFold, rows: Iterable<ProgressRow>, id: strin
   Object.assign(fold, { last, chain, at, sequence, previous, failureSequence, waitingSequence, waitingHead })
 }
 
+/** PR review/approval heads travel as `--expected-head` argv; other behaviors
+ * carry them in request context. */
+function invocationHead(invocation: ChainInvocation): string | null {
+  const contextHead = invocation.request.context?.head
+  if (typeof contextHead === 'string' && /^[a-f0-9]{40}$/i.test(contextHead)) return contextHead
+  const at = invocation.request.argv.indexOf('--expected-head')
+  const value = at >= 0 ? invocation.request.argv[at + 1] : null
+  return typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value : null
+}
+
 /** Read-only incident annotation, independent of attention's age/active filters. */
 export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: string | null, correlationId: string | null): LoggingWorkImpact | null {
   const match = journal.forInvocation(callId, correlationId)
   if (!match) return null
   const { chain, invocation } = match
   const progress = chainProgress(journal, chain.id, invocation.id)
-  const recovered = progress.failureSequence !== null && progress.sequence > progress.failureSequence
+  let recovered = progress.failureSequence !== null && progress.sequence > progress.failureSequence
   const active = chain.invocations.find(item => item.state !== 'settled')
   const last = chain.invocations.at(-1)
   const waiting = progress.waitingSequence > progress.sequence ? chain.waiting : null
   const contradicted = chain.invocations.some(item => !!item.evidence && resourceReleaseContradicted(item.evidence))
   const blocked = !!chain.held || chain.reviewPending === true || active?.state === 'uncertain' || contradicted
+  const diagnostic = invocation.evidence?.diagnostic as ProcessDiagnostic | null | undefined
+  const handoff = ['review-pr', 'approve-pr'].includes(invocation.behavior)
+    && diagnostic?.operation === 'provider.review' && diagnostic.phase === 'analysis' && diagnostic.outcome === 'handoff'
+  let successor: typeof invocation | undefined
+  if (handoff) {
+    const head = invocationHead(invocation)
+    const completedAt = invocation.evidence?.completedAt
+    // Progress on another head, green CI and independent reviewer slots do
+    // not discharge this Call's review obligation.
+    if (invocation.state === 'settled' && invocation.evidence?.status === 'failed'
+      && invocation.evidence.error_code === 'review_budget_exhausted' && invocation.evidence.review_id == null
+      && diagnostic?.context.submission === 'none' && diagnostic.context.call_id === invocation.callId
+      && diagnostic.context.correlation_id === invocation.id && diagnostic.context.expected_head === head
+      && typeof head === 'string' && /^[a-f0-9]{40}$/i.test(head)
+      && typeof completedAt === 'number' && Number.isFinite(completedAt) && invocation.request.argv[1]) {
+      successor = chain.invocations.filter(item => item.admissionSequence > (progress.failureSequence ?? chain.sequence)
+        && item.admittedAt >= completedAt && item.behavior === invocation.behavior && item.basis === invocation.basis
+        && item.slot === invocation.slot && item.actor === invocation.actor
+        && invocationHead(item) === head && item.request.argv[1] === invocation.request.argv[1]).at(-1)
+    }
+    const observation = chain.observation as ChainObservation | null
+    recovered = !!successor && successor.state === 'settled' && successor.evidence?.status === 'completed'
+      && !!observation && !!chainReviewResponse(chain, successor, observation, observation.checkedAt)
+  }
   let retryAt: number | null = null
   // A backoff outlives observation-only progress past its wait note (CI
   // turning green mid-backoff) but not a new head: match the preserved note
@@ -261,8 +296,10 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
     if (attempts.length > 0 && attempts.length < 3 && (last.evidence?.action === 'not_started' || last.evidence?.outcome === 'superseded')
       && Number.isFinite(last.evidence?.completedAt)) retryAt = Number(last.evidence!.completedAt) + 60_000 * 2 ** (attempts.length - 1)
   }
+  const retrying = handoff ? successor?.state === 'admitted' || successor?.state === 'started'
+    : active && active.admissionSequence > invocation.admissionSequence || retryAt !== null
   const impact: 'blocked' | 'recovered' | 'retrying' | 'unknown' = blocked ? 'blocked' : recovered ? 'recovered'
-    : active && active.admissionSequence > invocation.admissionSequence || retryAt !== null ? 'retrying' : 'unknown'
+    : retrying ? 'retrying' : 'unknown'
   const publication = chain.observation?.publication as { pull_number?: number | null } | undefined
   return { impact, recovered, invocationId: invocation.id, repository: chain.repository, behavior: invocation.behavior,
     callerBehavior: nativeBehavior(invocation.behavior),
