@@ -415,6 +415,11 @@ const migrateSchema = db.transaction(() => {
       ON behavior_seen(launch_repo, launch_pr);
     CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_created
       ON behavior_dead_letters(created_at DESC);
+    -- The open dead letters each behaviors tick checks against closed pull
+    -- requests: retired rows are kept forever, so a scan grew with history.
+    CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_open
+      ON behavior_dead_letters(behavior, repo, pr, id)
+      WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_one_unresolved
       ON alerts(dedupe_key) WHERE resolved_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_alerts_created
@@ -1300,7 +1305,7 @@ export function retireBehaviorDeadLettersForClosedPrs(
 ): number {
   const rows = (db.prepare(`
     SELECT id, behavior, repo, pr
-    FROM behavior_dead_letters AS dead
+    FROM behavior_dead_letters AS dead INDEXED BY idx_behavior_dead_letters_open
     WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL
   `).all() as Array<{ id: string, behavior: string, repo: string, pr: number }>)
     .filter((row) => behaviors.includes(row.behavior)
