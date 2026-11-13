@@ -6,6 +6,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { behaviorChainAttention } from '../server/behavior-chain-summary'
 import { nativeActionReceipt } from '../server/behavior-chain-action'
 import { completedReviewCall } from './review-response-fixture'
 import { parseAgentLogStdout, type LogEntry } from '../server/agent-log-parse'
@@ -339,6 +340,93 @@ it('preserves the person hold rather than replacing it with a merge-verification
   await new BehaviorChainRuntime(journal, operations()).run()
   expect(journal.read(chain.id)?.held).toBe('New invocations held by the person')
 })
+
+it.each(['missing review', 'changed head', 'changed context', 'missing response', 'missing reviewer', 'retained reviews'])(
+  'observes held queue admission before merge through ordinary scheduling: %s', async mode => {
+    const { db, journal } = setup()
+    vi.setSystemTime(NOW - 3 * 86400_000)
+    let chain = seed(journal)
+    const before = observation()
+    Object.assign(before.publication, { state: 'open', merged: false, merge_sha: null })
+    Object.assign(before.pull!, { state: 'open', merged: false, mergeSha: null, mergedAt: null,
+      approved: true, ready: true, checksState: 'SUCCESS', reviewIds: [99],
+      reviewReceipts: [{ id: 99, head: before.pull!.head, state: 'APPROVED', invocation: null }] })
+    before.prReviewers.push({ ...reviewer, slot: 'secondary' })
+    for (const [index, slot] of before.prReviewers.entries()) {
+      if ((mode === 'missing reviewer' || mode === 'missing review') && index === 1) break
+      const call = completedReviewCall(chain.repository, 17, before.pull!.head, chain.reviewer)
+      call.id = chainBasis(['retained-review', slot.slot]).slice(0, 32)
+      const response = { ...(call.artifact!.review_response as Record<string, unknown>), invocation_id: call.id }
+      const artifact = mode === 'missing response' && index === 1 ? {} : { review_response: response }
+      chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: slot.slot, behavior: 'review-pr',
+        actor: chain.reviewer, model: call.model, slot: slot.slot, basis: chainBasis(['pr', before.pull!.head, before.pull!.reviewContext]),
+        admittedAt: Date.parse(call.started_at), request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+      chain = record(journal, chain, { type: 'invocation.settled', invocationId: slot.slot, callId: call.id,
+        outcome: mode === 'missing review' ? 'preflight_failed' : 'clean', evidence: {
+          status: mode === 'missing review' ? 'failed' : 'completed',
+          action: mode === 'missing review' ? 'not_started' : 'reviewed_clean',
+          review_id: 91 + index, head_sha: before.pull!.head, artifact, completedAt: Date.parse(call.completed_at!),
+          resources_settled_at: call.completed_at, resource_ownership: { version: 1, roots: [], errors: [] } } })
+      if (mode !== 'missing review') {
+        before.pull!.reviewIds.push(91 + index)
+        before.pull!.reviewReceipts.push({ id: 91 + index, head: before.pull!.head, state: 'COMMENTED', invocation: call.id,
+          response, submittedAt: Date.now() })
+      }
+    }
+    vi.setSystemTime(NOW)
+    before.checkedAt = Date.now()
+    chain = record(journal, chain, { type: 'chain.observed', observation: before })
+    chain = record(journal, chain, { type: 'chain.held', reason: 'review hold requires an operator decision' })
+    const original = structuredClone(chain)
+    const history = journal.history(chain.id)
+    const queued = structuredClone(before)
+    queued.pull!.queueEntry = 'external-queue-entry'
+    if (mode === 'changed head') {
+      queued.pull!.head = queued.publication.head_sha = 'd'.repeat(40)
+      queued.pull!.reviewReceipts[0].head = queued.pull!.head
+      queued.pull!.reviewIds = [99]
+    }
+    if (mode === 'changed context') queued.pull!.reviewContext = 'e'.repeat(64)
+    const observe = vi.fn(async () => ({ ...queued, checkedAt: Date.now() }))
+    // Replacement rebuilds the existing reconciliation index from the same receipts.
+    const restarted = new BehaviorChainJournal(db)
+    restarted.rebuild()
+    const runtime = new BehaviorChainRuntime(restarted, operations({ observe, enabled: () => true,
+      available: () => true, permitted: () => true }))
+    expect(restarted.reconciliationAt(restarted.read(chain.id)!)).toBe(NOW + 120_000)
+    vi.setSystemTime(NOW + 119_999)
+    await runtime.run()
+    expect(observe).not.toHaveBeenCalled()
+    vi.setSystemTime(NOW + 120_000)
+    await runtime.run()
+    expect(observe).toHaveBeenCalledTimes(1)
+    const attention = behaviorChainAttention(restarted, Date.now())[0]
+    expect(attention.evidence).toMatchObject({ state: 'fresh', gates: expect.arrayContaining([
+      'Required CI passed', 'Current-head approval observed']) })
+    if (mode === 'retained reviews') expect(attention.nextAction).toBe('Resolve the durable hold, then explicitly resume the chain')
+    else {
+      expect(attention.evidence.gates).toContain('Queue admission conflicts with required retained Poise review evidence')
+      expect(attention.nextAction).toContain(`PR acme/repo#17 head ${queued.pull!.head}, queue entry external-queue-entry`)
+      expect(attention.nextAction).toContain('remove it from the merge queue and disable auto-merge if enabled')
+      expect(attention.nextAction).toContain('Resuming alone cannot stop GitHub merging')
+    }
+    for (const time of [Date.now() - 1, Date.now() + 120_001]) {
+      const unverified = behaviorChainAttention(restarted, time)[0]
+      expect(unverified.evidence.state).not.toBe('fresh')
+      expect(unverified.nextAction).not.toContain('remove it from the merge queue')
+      expect(unverified.evidence.gates).not.toContain('Queue admission conflicts with required retained Poise review evidence')
+    }
+    expect(restarted.read(chain.id)).toMatchObject({ held: original.held, mergeSha: null,
+      resumedAfterSequence: original.resumedAfterSequence, invocations: original.invocations })
+    expect(restarted.history(chain.id).slice(0, history.length)).toEqual(history)
+    vi.setSystemTime(NOW + 240_000)
+    Object.assign(queued.pull!, { state: 'closed', merged: true, mergeSha: MERGE, mergedAt: Date.now() - 1, queueEntry: null })
+    Object.assign(queued.publication, { state: 'closed', merged: true, merge_sha: MERGE })
+    await runtime.run()
+    expect(observe).toHaveBeenCalledTimes(2)
+    expect(restarted.read(chain.id)).toMatchObject({ held: original.held, mergeSha: MERGE,
+      reviewPending: mode !== 'retained reviews', invocations: original.invocations })
+  })
 
 it('records an external merge after exhausted repairs without retrying or erasing their no-publication receipts', async () => {
   const { journal } = setup()

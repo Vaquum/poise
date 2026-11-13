@@ -304,6 +304,11 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         || typeof observation.issue?.open !== 'boolean'
         ? 'incomplete' : now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS ? 'stale'
           : observation.pull && (!pull || !['SUCCESS', 'PENDING', 'EXPECTED', 'FAILURE', 'ERROR'].includes(pull.checksState ?? '')) ? 'incomplete' : 'fresh'
+      const queueReviewConflict = state === 'fresh' && observation && pull?.state === 'open' && !pull.merged && !chain.mergeSha
+        && pull.queueEntry && (needsPrReview(chain, observation, pull) || prReviewMissingArtifact(chain, observation, pull)
+          || !chain.invocations.some(invocation => invocation.state === 'settled' && invocation.evidence?.status === 'completed'
+            && ['reviewed_clean', 'approved'].includes(String(invocation.evidence.action))
+            && chainReviewResponse(chain, invocation, observation, now)))
       const gates = pull ? [
         `Head ${pull.head.slice(0, 12)}`,
         pull.failing?.length ? `CI failing: ${pull.failing.join(', ')}` : pull.pending ? 'Required CI pending'
@@ -315,6 +320,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         ...(pull.behind ? ['Native policy requires a base update'] : []),
         ...(pull.readinessBlockers ?? []),
         ...(pull.queueEntry ? ['Native queue owns the candidate; merge completion unverified'] : []),
+        ...(queueReviewConflict ? ['Queue admission conflicts with required retained Poise review evidence'] : []),
       ] : [observation?.pull ? 'Exact-head PR evidence incomplete; merge gates unverified'
         : 'No verified PR evidence; merge completion unverified']
       // Mirroring the runtime reconciliation fence and admitInvocation: a
@@ -454,7 +460,9 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       const mergeCompleted = !!pull && !!observation && !!mergeBasis
         && chain.invocations.some(invocation => invocation.behavior === 'merge-pr' && invocation.state === 'settled'
           && invocation.evidence?.status === 'completed' && invocation.basis === mergeBasis && invocation.slot === null)
-      let next = chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
+      let next = queueReviewConflict && pull
+        ? `PR ${chain.repository}#${pull.number} head ${pull.head}, queue entry ${pull.queueEntry}: remove it from the merge queue and disable auto-merge if enabled; reconcile the missing required retained Poise review evidence before resuming. Resuming alone cannot stop GitHub merging.`
+        : chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : resourceContradicted ? `Hold: Invocation ${resourceContradicted.id} has contradictory resource-release evidence; ownership remains held`
           : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'

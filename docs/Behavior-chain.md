@@ -213,7 +213,15 @@ outcome without marking a recovered race as an organization failure. Other
 journal errors and unreadable native receipts still surface; concurrent exit
 evidence and original invocation correlations and uncertainty are preserved.
 
-A successful quiescent observation schedules its next read at `checkedAt +
+Held open PRs are rechecked every two minutes through that same scheduler,
+including after a head change. Fresh queue evidence without the required retained
+exact-head/context reviews surfaces a conflict in work diagnostics, naming the
+PR, head and queue entry. The next action directs removal from the queue and
+disabling auto-merge if enabled before reconciling the original review receipts;
+Resume alone cannot stop GitHub merging. Stale or incomplete observations do not
+emit this conflict. The hold and original receipts remain unchanged.
+
+Other successful quiescent observations schedule their next read at `checkedAt +
 min(24 hours, max(2 minutes, checkedAt - origin))`. Origin is the recorded actual
 merge time, otherwise the first native admission; a held chain with neither
 uses the one-day cap. The interval approximately doubles until the cap. These
@@ -868,6 +876,16 @@ the merge and pending obligation; [Logging's Work impact](Logging.md#observe--lo
 directs reconciliation of that original evidence even while held, rather than
 recommending Resume on a merged chain. A GitHub approval alone cannot discharge
 the obligation or authorize a new post-merge review.
+
+For [#1270](https://github.com/autonomio/poise/pull/1270), the retained original
+chain and Caller records contain six failed `review-pr` Calls, no retained review
+response and no `merge-pr` invocation. The manual-action receipt table is empty.
+The unchanged-head and changed-head queue admissions and auto-merge enablement
+reported in [#1308](https://github.com/autonomio/poise/issues/1308) therefore have
+no attributable native submission receipt; `bit-mis` identifies the account,
+not the client. No Poise submission bypass is established. The existing native
+enqueue gate remains unchanged; held open PRs now receive the timely observation
+and actionable queue conflict described above.
 
 ## Seed observation batch
 
