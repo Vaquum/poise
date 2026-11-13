@@ -490,11 +490,12 @@ def test_original_publication_boundary_reconciles_without_repeating_work(databas
 
 
 @pytest.mark.parametrize("database", ["/dev/shm" if sys.platform == "linux" else None], indirect=True)
-@pytest.mark.parametrize("output,cleanup_error", [
-    ("git", False), ("git", True), ("git-signal", False), ("git-empty", False),
-    ("unsafe", False), ("absent", False), ("malformed", False), ("oversized", False), ("invalid-shape", False), ("cli-signal", False),
+@pytest.mark.parametrize("output,cleanup_error,lease_error", [
+    ("git", False, False), ("git", True, False), ("git", False, True), ("git-signal", False, False), ("git-empty", False, False),
+    ("unsafe", False, False), ("absent", False, False), ("malformed", False, False), ("oversized", False, False),
+    ("invalid-shape", False, False), ("cli-signal", False, False),
 ])
-def test_publication_process_failure_survives_caller_cleanup_and_logging(database, tmp_path, monkeypatch, decode_failure, output, cleanup_error):
+def test_publication_process_failure_survives_caller_cleanup_and_logging(database, tmp_path, monkeypatch, decode_failure, output, cleanup_error, lease_error):
     parent, candidate = "b" * 40, "c" * 40
     private = "private-publication-output"
     token = "test-private-token"
@@ -598,6 +599,14 @@ cli.main()
             raise RuntimeError("later cleanup " + private)
         return original_check(path, call_id, complete=complete)
 
+    def lease_factory(*args, **kwargs):
+        lease = MagicMock()
+        lease.held = True
+        if lease_error:
+            lease.release.side_effect = api.atomic_work.checkout_lock.WorkerOrphaned(
+                "native checkout settlement is unverified: idle check failed")
+        return lease
+
     monkeypatch.setattr(api, "track", track)
     monkeypatch.setattr(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _: SimpleNamespace(identity="fixture", provider="codex")))
     monkeypatch.setattr(issue_review, "interface", interface)
@@ -605,14 +614,15 @@ cli.main()
     monkeypatch.setattr(issue_review, "command", lambda *args: (["fixture"], "", {}))
     monkeypatch.setattr(issue_review, "stop_leftovers", lambda *args: None)
     monkeypatch.setattr(issue_review, "_cwd_pids", lambda *args, **kwargs: [])
-    monkeypatch.setattr(api.atomic_work.checkout_lock, "Lease", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(api.atomic_work.checkout_lock, "Lease", lease_factory)
     monkeypatch.setattr(api.atomic_work.checkout_lock, "run_gated", worker)
     monkeypatch.setattr(ownership, "process_check", process_check)
     monkeypatch.setattr(api, "_main", lambda: api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
         "original-native", "fixture", "poise/issue-7", pull=3, expected_head=parent))
     monkeypatch.setattr(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source",
                                      "poise:behavior-chain", "--correlation-id", "original-native"])
-    with pytest.raises(RuntimeError, match="later cleanup" if cleanup_error else "during publishing"):
+    expected = "later cleanup" if cleanup_error else "native checkout settlement" if lease_error else "during publishing"
+    with pytest.raises(RuntimeError, match=expected):
         api.main()
     stored, decoded = decode_failure()
     evidence = stored["diagnostic"]
@@ -632,9 +642,14 @@ cli.main()
     else:
         assert "cause unavailable" in stored["error"] and evidence["stderr"] == ""
     assert (stored["status"], stored["action"], stored["outcome"]) == ("failed", None, None)
-    assert stored["artifact"]["phase"] == "publishing" and stored["artifact"]["publication_head"] == candidate
+    expected_phase = "resources_unknown" if lease_error else "publishing"
+    assert stored["artifact"]["phase"] == expected_phase and stored["artifact"]["publication_head"] == candidate
     assert stored["artifact"]["replies_started"] is False
-    assert stored["resources_settled_at"] and ownership.released(stored["resource_ownership"])
+    if lease_error:
+        assert "native checkout settlement" in stored["error"] and "(original failure:" in stored["error"]
+        assert stored["resources_settled_at"] is None and not ownership.released(stored["resource_ownership"])
+    else:
+        assert stored["resources_settled_at"] and ownership.released(stored["resource_ownership"])
     assert bool(cleanup_seen) == cleanup_error
     event, = api.diagnostics()["events"]
     assert event["diagnostic"] == evidence and event["error"] == stored["error"]

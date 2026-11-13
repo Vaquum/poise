@@ -67,11 +67,13 @@ try {
   assert.equal(recovered.invocations.length, 1)
   assert.equal(recovered.invocations[0].state, noWrite ? 'settled' : 'uncertain')
   assert.equal(recovered.invocations[0].evidence?.artifact && chainBasis(recovered.invocations[0].evidence.artifact), chainBasis(call.artifact))
-  assert.equal(recovered.invocations[0].evidence?.resources_settled_at, call.resources_settled_at)
+  assert.equal(recovered.invocations[0].evidence?.resources_settled_at ?? null, call.resources_settled_at ?? null)
   if (!noWrite) {
-    assert.ok(recovered.waiting?.includes(call.id))
-    assert.ok(recovered.waiting?.includes('pre-push no-write checkpoint or a conclusive push result'))
     assert.equal(recovered.invocations[0].evidence?.action, null)
+    if (call.resources_settled_at) {
+      assert.ok(recovered.waiting?.includes(call.id))
+      assert.ok(recovered.waiting?.includes('pre-push no-write checkpoint or a conclusive push result'))
+    }
   } else if (!closed) {
     assert.equal(recovered.invocations[0].outcome, 'preflight_failed')
     assert.ok(recovered.waiting?.includes('native failure backoff'))
@@ -79,10 +81,14 @@ try {
     assert.equal(decideBehaviorChain(recovered, { ...observation, checkedAt: later }, later).kind, 'invoke')
   }
   if (closed) {
-    assert.equal(recovered.mergeSha, merge)
-    assert.equal(recovered.reviewPending, true)
-    assert.ok(recovered.held)
     assert.notEqual(recovered.invocations[0].outcome, 'published')
+    if (call.resources_settled_at) {
+      assert.equal(recovered.mergeSha, merge)
+      assert.equal(recovered.reviewPending, true)
+      assert.ok(recovered.held)
+    } else {
+      assert.equal(recovered.invocations[0].state, 'uncertain')
+    }
   }
   const effects = () => journal.history(chain.id).filter(row => JSON.parse(row.payload).type !== 'chain.observed')
   const history = effects()
