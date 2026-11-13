@@ -24,6 +24,13 @@ export function tileOrder(saved: unknown, labels: readonly string[]): string[] {
   return [...new Set([...kept, ...labels])]
 }
 
+/** The day's work types as listed under a search: the leader is always the
+ *  day's own, from every type, and only the rows narrow, scaled against it. */
+export function workTypeRows<T extends { type: string, count: number }>(types: readonly T[], matches: (type: string) => boolean): { lead: T | undefined, rows: T[] } {
+  const counted = types.filter((entry) => entry.count > 0)
+  return { lead: counted[0], rows: counted.filter((entry) => matches(entry.type)) }
+}
+
 /** Moves `label` by `step` places, within the list. */
 export function moveTile(order: readonly string[], label: string, step: number): string[] {
   const from = order.indexOf(label)
@@ -161,8 +168,7 @@ export function mountDay(ctx: PartContext, main: HTMLElement, find: RightFilter,
     const review = group('work-review')
     const type = review.find((tile) => tile.workTypes)
     const population = type?.population ?? 0
-    const types = (type?.workTypes ?? []).filter((entry) => entry.count > 0 && find.matches(entry.type, 'Work type'))
-    const lead = types[0]
+    const { lead, rows: types } = workTypeRows(type?.workTypes ?? [], (name) => find.matches(name, 'Work type'))
     work.innerHTML = `<h3 class="ocard-h"><span class="t-micro" data-ref="ov.worktype">Work type</span><span class="t-gloss">of ${population} merged</span></h3>
       ${lead && population ? `<p class="ova-lead"><b>${esc(lead.type)}</b> leads, ${Math.round((lead.count / population) * 100)}%</p>` : `<p class="onote">${esc(type?.note ?? 'No pull requests were merged.')}</p>`}
       ${types.length || !find.query() ? `<ul class="wtype">${types.map((entry) => `<li><span class="wt-k t-mono">${esc(entry.type)}</span><svg viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect class="wt-t" width="100" height="6"/><rect class="wt-v" width="${lead ? ((entry.count / lead.count) * 100).toFixed(1) : 0}" height="6"/></svg><span class="wt-n">${entry.count}</span></li>`).join('')}</ul>` : `<p class="onote" role="status">${esc(find.none())}</p>`}`

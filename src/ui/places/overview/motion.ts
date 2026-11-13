@@ -123,10 +123,12 @@ export function mountMotion(ctx: PartContext, card: HTMLElement, find: RightFilt
     }).join('')}</div>`
   }
 
-  function phasesHTML(list: Work[]): string {
+  function phasesHTML(list: Work[], hidden: boolean): string {
     const tasks = list.filter((entry) => entry.group === 'tasks')
     const order: Phase[] = [...PHASES, 'Merged']
     const phases = order.filter((phase) => tasks.some((task) => task.phase === phase))
+    // Tasks the search hides are not tasks that are gone.
+    if (!phases.length && hidden) return `<p class="onote">${esc(find.none())}</p>`
     if (!phases.length) return `<p class="onote">${chains.data ? 'No task is in motion.' : chains.error ? '' : 'Reading the chain…'}</p>`
     return `<div class="ocounts" role="group" data-ref="ov.phases">${phases.map((phase) => {
       const on = 'phase' in pick && pick.phase === phase
@@ -137,10 +139,11 @@ export function mountMotion(ctx: PartContext, card: HTMLElement, find: RightFilt
 
   function paint(): void {
     // The search narrows the counts too, and lists every match whatever its state.
-    const list = work().filter((entry) => find.matches(entry.title, entry.note))
+    const all = work()
+    const list = all.filter((entry) => find.matches(entry.title, entry.note))
     $('[data-counts="people"]', card).innerHTML = countsHTML(list, 'people')
     $('[data-counts="items"]', card).innerHTML = countsHTML(list, 'items')
-    $('[data-phases]', card).innerHTML = phasesHTML(list)
+    $('[data-phases]', card).innerHTML = phasesHTML(list, all.some((entry) => entry.group === 'tasks' && !list.includes(entry)))
     const chosen = pick
     const listed = find.query() ? list
       : 'phase' in chosen

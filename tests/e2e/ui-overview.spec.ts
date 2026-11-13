@@ -39,6 +39,8 @@ interface Workspace {
   metrics?: unknown
   /** The behavior-metrics reads asked, as their search parameters. */
   metricsAsked?: URLSearchParams[]
+  /** The chain's tasks. */
+  chains?: unknown[]
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -74,7 +76,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     }
     if (path === '/api/chat/sessions') return workspace.chatsFail ? json(route, { error: 'the chat service did not answer' }, 503) : json(route, { instance: 'poise-dev:test', sessions: [] })
     if (path === '/api/editor/reviews') return json(route, { publications: [], sweep: { publications: 0, longestDelayMinutes: 15 } })
-    if (path === '/api/behavior-chains') return json(route, { chains: [], attention: [] })
+    if (path === '/api/behavior-chains') return json(route, { chains: workspace.chains ?? [], attention: [] })
     if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
     if (path === '/api/settings' && method === 'GET') return json(route, { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
     if (path === '/api/analytics') return json(route, { window: { since: url.searchParams.get('since'), until: url.searchParams.get('until') }, agentAccount: 'bot', ...day, ...(url.searchParams.get('dailyBounds') ? { daily: Array.from({ length: 7 }, () => day) } : {}), errors: [] })
@@ -265,7 +267,8 @@ test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {
 })
 
 test('the right-hand side has one day, one search and the organization; Behaviors follows the day (#1380)', async ({ page }) => {
-  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1 }
+  const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, chains: [{ id: 'acme/site#7', sequence: 1, repository: 'acme/site', issue: 7, pullNumber: null,
+    held: null, waiting: null, mergeSha: null, supersession: null, reviewPending: null, invocations: [] }] }
   await open(page, workspace)
   const filters = page.locator('[data-ref="ov.filters"]')
   await expect(filters.locator('[data-ref="ov.day"]')).toBeVisible()
@@ -293,7 +296,10 @@ test('the right-hand side has one day, one search and the organization; Behavior
   await expect(page.locator('[data-beh="merge-prs"]')).toBeVisible()
   await expect(page.locator('[data-worklist]')).toContainText('Nothing here matches “merg”.')
   await expect(page.locator('[data-ref="ov.h.blocked"]')).toBeHidden()
+  // Tasks the search hides are not tasks that are gone.
+  await expect(page.locator('[data-phases]')).toContainText('Nothing here matches “merg”.')
   await search.press('Escape')
+  await expect(page.locator('[data-phases]')).toContainText('in intake')
   await expect(page.locator('[data-tile="Pull requests opened"]')).toBeVisible()
   await expect(page.locator('[data-beh]')).not.toHaveCount(1)
   await expect(page.locator('[data-ref="ov.h.blocked"]')).toBeVisible()
