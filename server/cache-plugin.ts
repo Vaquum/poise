@@ -1239,12 +1239,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         // ── /api/repos — every repo in the org with any PR/issue ──
-        // Cached 5 min server-side. Used by Current's repo selectors so
+        // Cached 5 min server-side, and past that answered from the last
+        // list while it is read again. Used by Current's repo selectors so
         // the user can pick from every repository of their accounts, not
         // just the ones they've personally touched.
         if (path === '/api/repos' && req.method === 'GET') {
           try {
-            return json(res, 200, await listOrganizationsRepos(selectedOrg))
+            return json(res, 200, await listOrganizationsRepos(selectedOrg, true))
           } catch (err: any) {
             return json(res, 502, { error: 'listOrgRepos failed: ' + (err.message || String(err)) })
           }
