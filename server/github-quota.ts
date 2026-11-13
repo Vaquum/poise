@@ -5,7 +5,7 @@ import { diagnostic, diagnosticFailure } from './logging'
 import { GH_STORED_ACCOUNTS_ENV } from './accounts/clis'
 import { quotaRiskKey as riskKey } from './quota-risk'
 import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails } from './alerts/store'
-import { db, getMeta, setMeta } from './db'
+import { db, getMeta, setMeta, writeObservation } from './db'
 import { runFile } from './process'
 import { getNotificationSettings, getSettings, knownTimeZone } from './settings'
 import { zonedTime } from '../src/clock'
@@ -72,7 +72,8 @@ export function quotaBuckets(value: unknown, login: string, now: number): Github
       riskPercent: limit === 0 || minutesLeft === 0 ? null : remaining === 0 ? 100 : perMinute === null ? null : exhaustionRisk(remaining, perMinute * minutesLeft) }]
   })
   // One commit for the read's histories: each write commits, and fsyncs, alone otherwise.
-  db.transaction(() => { for (const [key, value] of histories) setMeta(key, value) })()
+  // Samples of what GitHub reported: the next read records them again if a power cut loses them.
+  writeObservation(() => { for (const [key, value] of histories) setMeta(key, value) })
   return buckets
 }
 

@@ -11,9 +11,10 @@ import type { SshKey } from '../../../../server/ssh-keys'
 import { accountsHtml, fetchAccounts } from '../../../views/connected-accounts'
 import { fetchSshKeys, sshKeysHtml } from '../../../views/ssh-keys'
 import { googleAccountsSection } from '../../../views/google-accounts'
-import { fetchGatewayAccount } from '../../../gateway-client'
+import { fetchGatewayAccount, type GatewayAccount } from '../../../gateway-client'
 import type { TerminalPanel } from '../../../views/terminal-panel'
 import { poiseLinkSection, type PoiseLinkSection } from './classic/poise-link'
+import { phoneSection, type PhoneSection } from './phone'
 import type { Row } from './rows'
 import type { SectionDef } from './types'
 
@@ -26,9 +27,11 @@ let terminal: TerminalPanel | null = null
 let opening = false
 let google: { el: HTMLElement, section: { refresh(): Promise<void> } } | null = null
 let link: PoiseLinkSection | null = null
+let account: GatewayAccount | null = null
 
 /** The sections whose accounts were read: a row is built again for Find and the counts. */
 const read = new WeakSet<AbortSignal>()
+const phoneSections = new WeakMap<AbortSignal, PhoneSection>()
 const busy = (): boolean => opening || !!terminal?.running
 function terminalTitle(preset: TerminalPreset): string {
   if (preset === 'shell') return 'Login shell'
@@ -43,7 +46,7 @@ export const ACCOUNTS: SectionDef = {
   what: 'The sign-ins Poise acts with: the agent CLIs, GitHub and Google, and Poise Link on your computers.',
   load: async (ctx) => {
     if (ctx.service && !link) {
-      const account = await fetchGatewayAccount().catch(() => null)
+      account = await fetchGatewayAccount().catch(() => null)
       if (account) link = poiseLinkSection(account)
     }
   },
@@ -154,6 +157,24 @@ export const ACCOUNTS: SectionDef = {
         findText: () => 'poise link pair pairing code approve deny computers devices revoke install',
         control: () => '<div class="set-acc set-link" data-link></div>',
         mounted: (el) => { el.querySelector('[data-link]')?.append(section.element); void section.refresh() } })
+    }
+    if (account) {
+      const owner = account
+      rows.push({ key: 'phone', group: 'Your phone', label: 'Sign in on your phone', type: 'custom', wide: true, plain: true,
+        gloss: 'Scan a code with your phone’s camera to sign in there as you, with no password. You approve the phone here first; each code works once, for two minutes.',
+        findText: () => 'phone mobile qr code scan camera sign in login approve deny sign out signed-in phones',
+        control: () => '<div class="set-acc" data-phone></div>',
+        mounted: (el) => {
+          // One section a visit, drawn again in place: it stops reading and renewing codes when the section is left.
+          let section = phoneSections.get(ctx.signal)
+          if (!section) {
+            const created = phoneSection(owner)
+            phoneSections.set(ctx.signal, created)
+            ctx.signal.addEventListener('abort', () => created.dispose(), { once: true })
+            section = created
+          }
+          el.querySelector('[data-phone]')?.append(section.element)
+        } })
     }
     rows.push({ key: 'shell', ref: 'set.shell', group: 'Terminal', label: 'Terminal', type: 'custom', wide: true,
       gloss: 'A shell in your workspace for connections the buttons above do not cover. Two can run at once; an idle one closes after 15 minutes.',

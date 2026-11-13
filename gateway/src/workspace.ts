@@ -206,6 +206,7 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
   if (!req.url?.startsWith('/')) throw new HttpError(400, 'The request target must be a path.')
   const auth = authenticate(ctx, req, owner)
   if (auth.kind !== 'ok') return refuse(ctx, req, res, owner, auth)
+  if (auth.session) ctx.holdOpen(auth.session.parentHash ?? auth.session.idHash, res)
   const { log, orchestrator } = ctx.deps
   const readiness = await orchestrator.readiness(owner.handle, owner.login)
   if (!readiness.ready) return starting(ctx, req, res, owner, readiness.problem)
@@ -294,6 +295,8 @@ export async function workspaceUpgrade(ctx: Context, req: IncomingMessage, socke
     rejectUpgrade(socket, 403, { error: 'forbidden', message: auth.message })
     return
   }
+  // Authenticated once, here: signing the session out must still be able to close it.
+  if (auth.session) ctx.holdOpen(auth.session.parentHash ?? auth.session.idHash, socket)
   const { log, orchestrator } = ctx.deps
   const readiness = await orchestrator.readiness(owner.handle, owner.login)
   if (!readiness.ready) {

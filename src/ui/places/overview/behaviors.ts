@@ -4,7 +4,7 @@
 // src/views/behaviors-view.ts reads it, and /api/behavior-estimates for what
 // is running now.
 import { formatShortDuration } from '../../../analytics-format'
-import type { BehaviorMetricsReport } from '../../../behavior-metrics'
+import type { BehaviorMetrics, BehaviorMetricsReport } from '../../../behavior-metrics'
 import { BEHAVIORS, getLastTriggered, getPausedUntil, isBehaviorStateLoaded, isEnabled, setEnabled, type BehaviorKey } from '../../../behaviors'
 import { TIME_RANGES, timeRangeWindow, type TimeRange } from '../../../time-range'
 import { placeHref } from '../../address'
@@ -52,14 +52,28 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement): BehaviorsTab
     return counts.filter(([of]) => of.length).map(([of, word]) => `<a class="chip is-outline" href="#answer" data-act="to-answers" data-entry="${esc(of[0].id)}">${of.length} ${word}</a>`).join('')
   }
 
+  /** Runs, time and success, each a value or, where none can exist, why in words. */
+  function numbers(m: BehaviorMetrics | null | undefined): string {
+    if (m === undefined) {
+      const why = metrics.data ? 'not reported by the service' : metrics.error ? 'not read: see above' : 'reading…'
+      return `<td class="num" colspan="3"><span class="onote">${why}</span></td>`
+    }
+    if (m === null) return '<td class="num" colspan="3"><span class="onote is-warn" data-ref="ov.partial">unknown: some of its run records cannot be read</span></td>'
+    const minutes = m.durationMinutes ?? 0
+    const time = minutes === 0 ? '0s' : formatShortDuration(minutes * 60_000)
+    const untimed = m.untimedRuns ? `<span class="onote" data-ref="ov.untimed">+ ${m.untimedRuns.toLocaleString('en-US')} untimed</span>` : ''
+    const success = m.successRate !== null
+      ? `<span class="okbar">${bar(`okb${m.successRate < 90 ? ' is-low' : ''}`, m.successRate)}${(Math.round(m.successRate * 10) / 10).toLocaleString('en-US')}%</span>`
+      : `<span class="onote">${m.totalRuns ? 'none finished' : 'no runs'}</span>`
+    return `<td class="num">${m.totalRuns.toLocaleString('en-US')}</td><td class="num">${time}${untimed}</td><td class="num">${success}</td>`
+  }
+
   function row(key: BehaviorKey, label: string): string {
     const loaded = isBehaviorStateLoaded()
     const on = isEnabled(key)
     const paused = getPausedUntil(key)
     const last = getLastTriggered(key)
     const m = metrics.data?.behaviors[key]
-    const minutes = m?.durationMinutes
-    const duration = minutes == null ? '—' : minutes === 0 ? '0s' : formatShortDuration(minutes * 60_000)
     const running = runningWords(key)
     const why = !loaded ? 'Behaviors could not be read, so their switches are unknown.' : saving.has(key) ? 'Saving the last change.' : ''
     const lastRun = running
@@ -69,9 +83,7 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement): BehaviorsTab
       <td><button class="oswitch" aria-pressed="${loaded && on}" data-act="beh-toggle" aria-label="${esc(label)}: ${loaded ? (on ? 'on' : 'off') : 'unknown'}" data-ref="ov.behavior.switch"${why ? ` aria-disabled="true" data-why="${esc(why)}"` : ''}><span class="switch"></span></button></td>
       <th scope="row">${esc(label)}${paused && Date.parse(paused) > Date.now() ? `<span class="onote">paused until ${clockAt(paused)}</span>` : ''}${rowErrors.get(key) ? `<span class="onote is-warn" role="status">${esc(rowErrors.get(key)!)}</span>` : ''}</th>
       <td>${loaded && !on ? '<span class="onote">Off</span>' : lastRun}</td>
-      <td class="num">${m ? m.totalRuns.toLocaleString('en-US') : '—'}</td>
-      <td class="num">${duration}</td>
-      <td class="num">${m?.successRate == null ? '—' : `<span class="okbar">${bar(`okb${m.successRate < 90 ? ' is-low' : ''}`, m.successRate)}${(Math.round(m.successRate * 10) / 10).toLocaleString('en-US')}%</span>`}</td>
+      ${numbers(m)}
       <td class="chips">${chips(key)}</td></tr>`
   }
 

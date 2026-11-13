@@ -212,6 +212,20 @@
 .set-chain { padding-top: var(--sp-8); }
 .set-acc { width: 100%; }
 
+/* Sign in on your phone: the code or the phone's request, then the phones signed in */
+.ph { width: 100%; display: flex; flex-direction: column; gap: var(--sp-5); }
+.ph-pair { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); }
+.ph-line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.ph-lead { font-size: var(--fs-row); line-height: var(--lh-body); color: var(--c-text); }
+.ph-lead b, .ph .fsub b { font-weight: var(--fw-strong); color: var(--c-text); }
+.ph-code { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-4) var(--sp-6); }
+.ph-qr { flex: none; width: var(--size-qr); height: var(--size-qr); border-radius: var(--r-card); background: var(--c-qr-paper); color: var(--c-qr-ink); }
+.ph-qr svg { display: block; width: 100%; height: 100%; }
+.ph-steps { flex: 1; min-width: calc(var(--sp-unit) * 50); display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); }
+.ph-request { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); }
+.ph-head { font-size: var(--fs-row); font-weight: var(--fw-strong); color: var(--c-text-soft); }
+.ph-phones { display: flex; flex-direction: column; gap: var(--sp-1); }
+
 /* Classic's wide views (Behaviors, Extensions, Snippets) take the section's full width here, instead of the page's. */
 .set-col:has(> .set-body[data-section="behaviors"]), .set-col:has(> .set-body[data-section="extensions"]), .set-col:has(> .set-body[data-section="snippets"]) { max-width: none; }
 .set-body #view-behaviors main, .set-body #view-extensions main { margin-inline: 0; }

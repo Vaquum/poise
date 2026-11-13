@@ -337,6 +337,13 @@ than a redirect to its login page. Poise notices either: it says "Your
 sign-in has ended" and offers Sign in again, which reloads the page through
 the proxy's login.
 
+Such a proxy also stands between a phone and its sign-in by QR code (Settings
+→ Accounts → Sign in on your phone). It must let `GET /auth/phone` on the apex
+through without its own login. It must also give the phone the owner approved
+a session of its own, or the phone stops at the proxy's login.
+[Sign in on a phone](Service-architecture.md#sign-in-and-sessions) says how a
+proxy can recognise both the approval and the phone.
+
 With Caddy, for a gateway on `127.0.0.1:8080`:
 
 ```caddyfile

@@ -1,7 +1,8 @@
 // The gateway's own API on this workspace host (gateway/src/workspace-api.ts,
-// docs/Service-architecture.md): Poise Link pairing, the paired devices and,
-// for admins, who may sign in and every workspace. The gateway answers these
-// itself; Poise's server never sees them, and they exist only in service mode.
+// docs/Service-architecture.md): Poise Link pairing, the paired devices,
+// signing in on a phone and, for admins, who may sign in and every workspace.
+// The gateway answers these itself; Poise's server never sees them, and they
+// exist only in service mode.
 
 export interface GatewayAccount {
   login: string
@@ -22,6 +23,28 @@ export interface PairedDevice {
   state: 'active' | 'revoked' | 'expired'
   /** Its Poise Link holds the event stream open right now; paired alone does not mean running. */
   connected: boolean
+}
+
+/** A QR code for signing in on a phone, and how far the device that opened it got. */
+export interface PhoneCode {
+  id: string
+  state: 'waiting' | 'scanned' | 'approved' | 'denied' | 'signed_in' | 'expired'
+  /** The device that opened the code, by kind and browser, once one did. */
+  device: string | null
+  /** The bound device's grant, which approving it sends for a login proxy in front of the gateway. */
+  grant: string | null
+  createdAt: number
+  expiresAt: number
+  scannedAt: number | null
+  decidedAt: number | null
+  finishedAt: number | null
+}
+
+export interface SignedInPhone {
+  id: string
+  device: string
+  grant: string
+  createdAt: number
 }
 
 export interface AdminUser {
@@ -89,6 +112,26 @@ export function decidePairing(userCode: string, decision: 'approve' | 'deny'): P
 
 export async function revokeDevice(id: string): Promise<PairedDevice[]> {
   return (await call<{ devices: PairedDevice[] }>('devices/revoke', { id })).devices
+}
+
+/** The codes of the last quarter hour and the phones signed in with one. */
+export function fetchPhones(): Promise<{ codes: PhoneCode[], phones: SignedInPhone[] }> {
+  return call('phone')
+}
+
+export function startPhoneCode(): Promise<{ code: PhoneCode, url: string }> {
+  return call('phone/start', {})
+}
+
+// Approving and signing out name the phone's grant in the address, where a login proxy in front of the
+// gateway reads it on the way past (docs/Service-architecture.md, "Sign in on a phone").
+export async function decidePhone(code: PhoneCode, decision: 'approve' | 'deny'): Promise<PhoneCode> {
+  const path = decision === 'approve' ? `phone/approve?grant=${encodeURIComponent(code.grant ?? '')}` : 'phone/deny'
+  return (await call<{ code: PhoneCode }>(path, { id: code.id })).code
+}
+
+export async function signOutPhone(phone: SignedInPhone): Promise<SignedInPhone[]> {
+  return (await call<{ phones: SignedInPhone[] }>(`phone/revoke?grant=${encodeURIComponent(phone.grant)}`, { id: phone.id })).phones
 }
 
 export function fetchAdmin(): Promise<AdminOverview> {
