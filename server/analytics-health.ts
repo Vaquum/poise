@@ -3,7 +3,7 @@ import type { AnalyticsHealth, HealthInterval, WorkError, WorkRecovery } from '.
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { normalize } from '../gateway/src/diagnostics/contract'
 import { behaviorChainJournal } from './behavior-chain-journal'
-import { chainProgress } from './behavior-chain-summary'
+import { chainProgressOf } from './behavior-chain-summary'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { matchingNativeActionReceipt, nativeActionSettlement } from './behavior-chain-action'
 import { nativeBehavior } from './behavior-chain-runtime'
@@ -182,7 +182,8 @@ const factsByJournal = new WeakMap<BehaviorChainJournal, Map<string, ChainFacts>
 function chainFacts(journal: BehaviorChainJournal, chain: BehaviorChain, now: number): ChainFacts {
   const rows = historyRows(journal, chain.id)
   const admittedAt = rows[0]?.at
-  const progress = chainProgress(journal, chain.id, undefined, true)
+  // The rows just read stand for the clock too: each event is parsed once.
+  const progress = chainProgressOf(rows, chain.id, undefined, true)
   let from = -Infinity, until = Infinity
   // Reconciliation can replace the current outcome with a verified success.
   // Original failure receipts remain in the immutable journal, including

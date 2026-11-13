@@ -109,78 +109,91 @@ function exactPull(observation: ChainObservation | null) {
     && Number.isSafeInteger(pull.unresolved) ? pull : null
 }
 
+type ProgressRow = { sequence: number, at: number, event: ChainEvent }
+
 /** Derive the clock from immutable history, never the latest poll or attempt.
  * Replaying here leaves reducer state and historical hashes unchanged. */
 export function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocation?: string, trackAdvances = false) {
+  return chainProgressOf(journalEvents(journal, id), id, failedInvocation, trackAdvances)
+}
+
+/** One chain's history, a page at a time, each event parsed once. */
+function* journalEvents(journal: BehaviorChainJournal, id: string): Generator<ProgressRow> {
+  let after = 0
+  for (;;) {
+    const events = journal.history(id, after)
+    for (const row of events) yield { sequence: row.sequence, at: row.at, event: JSON.parse(row.payload) as ChainEvent }
+    if (events.length < 100) return
+    after = events.at(-1)!.sequence
+  }
+}
+
+/** The same clock from history already read and parsed, in sequence order. */
+export function chainProgressOf(rows: Iterable<ProgressRow>, id: string, failedInvocation?: string, trackAdvances = false) {
   let chain: BehaviorChain | null = null
-  let at = 0, sequence = 0, after = 0
+  let at = 0, sequence = 0
   let previous: ChainObservation['pull'] = null
   const verified = new Set<string>()
   let failureSequence: number | null = null
   let waitingSequence = 0
   let waitingHead: string | null = null
   const advances: Array<{ at: number, sequence: number }> = []
-  for (;;) {
-    const events = journal.history(id, after)
-    for (const row of events) {
-      const event = JSON.parse(row.payload) as ChainEvent
-      chain = reduceChain(chain, event, row.sequence, id)
-      if (event.type === 'chain.waiting') {
-        waitingSequence = row.sequence
-        waitingHead = exactPull(chain.observation as ChainObservation | null)?.head ?? null
-      }
-      if ((event.type === 'invocation.settled' || event.type === 'invocation.reconciled')
-        && event.invocationId === failedInvocation && event.evidence.status === 'failed' && failureSequence === null) failureSequence = row.sequence
-      let advanced = event.type === 'chain.admitted'
-      const record = (key: string) => { if (!verified.has(key)) { verified.add(key); advanced = true } }
-      if (event.type === 'chain.merged') record(`merge:${chain.mergeSha}:${chain.reviewPending}`)
-      if (event.type === 'invocation.settled' || event.type === 'invocation.reconciled') {
-        const invocation = chain.invocations.find(invocation => invocation.id === event.invocationId)!
-        const receipt = matchingNativeActionReceipt(chain, invocation)
-        if (receipt?.result.outcome === 'enqueued') record(`queue:${receipt.result.head_sha}:${receipt.result.queue_entry_id}`)
-      }
-      if (['chain.observed', 'invocation.settled', 'invocation.reconciled'].includes(event.type)) {
-        const observation = chain.observation as ChainObservation | null
-        if (observation && Number.isFinite(observation.checkedAt) && observation.checkedAt <= row.at
-          && row.at - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS) {
-          const pull = exactPull(observation)
-          if (pull) {
-            record(`head:${pull.number}:${pull.head}`)
-            if (pull.queueEntry) record(`queue:${pull.head}:${pull.queueEntry}`)
-            if (event.type === 'chain.observed') {
-              if (previous?.head === pull.head && (
-                (pull.checksState === 'SUCCESS' && !pull.pending && !pull.failing.length
-                  && (previous.checksState !== 'SUCCESS' || previous.pending || previous.failing.length > 0))
-                || (!previous.approved && pull.approved) || (previous.changesRequested && !pull.changesRequested)
-                || (blockingThreads(pull) < blockingThreads(previous)
-                  && ((pull.unresolved ?? 0) < (previous.unresolved ?? 0)
-                    || (pull.unresolvedOutdated ?? 0) < (previous.unresolvedOutdated ?? 0)))
-                || (previous.conflict && !pull.conflict) || (previous.behind && !pull.behind))) advanced = true
-              previous = pull
-            }
+  for (const row of rows) {
+    const event = row.event
+    chain = reduceChain(chain, event, row.sequence, id)
+    if (event.type === 'chain.waiting') {
+      waitingSequence = row.sequence
+      waitingHead = exactPull(chain.observation as ChainObservation | null)?.head ?? null
+    }
+    if ((event.type === 'invocation.settled' || event.type === 'invocation.reconciled')
+      && event.invocationId === failedInvocation && event.evidence.status === 'failed' && failureSequence === null) failureSequence = row.sequence
+    let advanced = event.type === 'chain.admitted'
+    const record = (key: string) => { if (!verified.has(key)) { verified.add(key); advanced = true } }
+    if (event.type === 'chain.merged') record(`merge:${chain.mergeSha}:${chain.reviewPending}`)
+    if (event.type === 'invocation.settled' || event.type === 'invocation.reconciled') {
+      const invocation = chain.invocations.find(invocation => invocation.id === event.invocationId)!
+      const receipt = matchingNativeActionReceipt(chain, invocation)
+      if (receipt?.result.outcome === 'enqueued') record(`queue:${receipt.result.head_sha}:${receipt.result.queue_entry_id}`)
+    }
+    if (['chain.observed', 'invocation.settled', 'invocation.reconciled'].includes(event.type)) {
+      const observation = chain.observation as ChainObservation | null
+      if (observation && Number.isFinite(observation.checkedAt) && observation.checkedAt <= row.at
+        && row.at - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS) {
+        const pull = exactPull(observation)
+        if (pull) {
+          record(`head:${pull.number}:${pull.head}`)
+          if (pull.queueEntry) record(`queue:${pull.head}:${pull.queueEntry}`)
+          if (event.type === 'chain.observed') {
+            if (previous?.head === pull.head && (
+              (pull.checksState === 'SUCCESS' && !pull.pending && !pull.failing.length
+                && (previous.checksState !== 'SUCCESS' || previous.pending || previous.failing.length > 0))
+              || (!previous.approved && pull.approved) || (previous.changesRequested && !pull.changesRequested)
+              || (blockingThreads(pull) < blockingThreads(previous)
+                && ((pull.unresolved ?? 0) < (previous.unresolved ?? 0)
+                  || (pull.unresolvedOutdated ?? 0) < (previous.unresolvedOutdated ?? 0)))
+              || (previous.conflict && !pull.conflict) || (previous.behind && !pull.behind))) advanced = true
+            previous = pull
           }
-          for (const invocation of chain.invocations) {
-            if (invocation.state !== 'settled' || invocation.evidence?.status !== 'completed') continue
-            if (pull && ['review-pr', 'approve-pr'].includes(invocation.behavior)
-              && chainReviewResponse(chain, invocation, observation, row.at)) record(`review:${invocation.evidence.review_id}`)
-            if (invocation.behavior === 'review-issue' && invocation.evidence.action === 'commented'
-              && invocation.evidence.issue_revision === observation.issue?.revision && Array.isArray(observation.issue?.commentIds)
-              && Array.isArray(invocation.evidence.receipts)) {
-              for (const receipt of invocation.evidence.receipts as Array<{ issue: string, author: string, comment_id: number }>) {
-                if (receipt.issue?.toLowerCase() === id.toLowerCase() && receipt.author?.toLowerCase() === chain.reviewer.toLowerCase()
-                  && observation.issue.commentIds.includes(receipt.comment_id)) record(`comment:${receipt.comment_id}`)
-              }
+        }
+        for (const invocation of chain.invocations) {
+          if (invocation.state !== 'settled' || invocation.evidence?.status !== 'completed') continue
+          if (pull && ['review-pr', 'approve-pr'].includes(invocation.behavior)
+            && chainReviewResponse(chain, invocation, observation, row.at)) record(`review:${invocation.evidence.review_id}`)
+          if (invocation.behavior === 'review-issue' && invocation.evidence.action === 'commented'
+            && invocation.evidence.issue_revision === observation.issue?.revision && Array.isArray(observation.issue?.commentIds)
+            && Array.isArray(invocation.evidence.receipts)) {
+            for (const receipt of invocation.evidence.receipts as Array<{ issue: string, author: string, comment_id: number }>) {
+              if (receipt.issue?.toLowerCase() === id.toLowerCase() && receipt.author?.toLowerCase() === chain.reviewer.toLowerCase()
+                && observation.issue.commentIds.includes(receipt.comment_id)) record(`comment:${receipt.comment_id}`)
             }
           }
         }
       }
-      if (advanced) {
-        at = row.at; sequence = row.sequence
-        if (trackAdvances && event.type !== 'chain.admitted') advances.push({ at, sequence })
-      }
     }
-    if (events.length < 100) break
-    after = events.at(-1)!.sequence
+    if (advanced) {
+      at = row.at; sequence = row.sequence
+      if (trackAdvances && event.type !== 'chain.admitted') advances.push({ at, sequence })
+    }
   }
   if (!chain) throw new Error(`behavior chain admission history is unavailable: ${id}`)
   return { at, sequence, failureSequence, waitingSequence, waitingHead, advances }
