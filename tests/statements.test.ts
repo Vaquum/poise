@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cachedStatement } from '../server/statements'
+import { cachedStatement, prefixRange } from '../server/statements'
 
 let tempRoot = ''
 let loaded: typeof import('../server/db') | null = null
@@ -61,5 +61,30 @@ describe('cached statements', () => {
     read()
     read()
     expect(prepare).toHaveBeenCalledTimes(compiled)
+  })
+})
+
+describe('prefixRange', () => {
+  it('selects exactly the keys a prefix comparison selects, through the key index', () => {
+    const db = new Database(':memory:')
+    db.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    const keys = ['behavior_repo_hold', 'behavior_repo_hold:', 'behavior_repo_hold:a/b:x', 'behavior_repo_hold:~', 'behavior_repo_hold:\u00e9',
+      'behavior_repo_hold;', 'behavior_repo_hold9', 'behavior_repo_holdz', 'org:alpha:behavior_repo_hold:a/b', 'datastore_stale:x']
+    const insert = db.prepare('INSERT INTO meta VALUES (?, ?)')
+    for (const key of keys) insert.run(key, 'v')
+    const prefix = 'behavior_repo_hold:'
+    const bySubstr = db.prepare('SELECT key FROM meta WHERE substr(key, 1, ?) = ? ORDER BY key').all(prefix.length, prefix)
+    const byRange = db.prepare('SELECT key FROM meta WHERE key >= ? AND key < ? ORDER BY key').all(...prefixRange(prefix))
+    expect(byRange).toEqual(bySubstr)
+    expect(byRange.map((row) => (row as { key: string }).key)).toEqual(['behavior_repo_hold:', 'behavior_repo_hold:a/b:x', 'behavior_repo_hold:~', 'behavior_repo_hold:\u00e9'])
+    const plan = db.prepare('EXPLAIN QUERY PLAN SELECT key FROM meta WHERE key >= ? AND key < ?').all(...prefixRange(prefix)) as Array<{ detail: string }>
+    expect(plan.map((row) => row.detail).join(' ')).toMatch(/SEARCH meta USING (COVERING )?INDEX/)
+    db.close()
+  })
+
+  it('refuses a prefix it cannot bound', () => {
+    expect(prefixRange('a:')).toEqual(['a:', 'a;'])
+    expect(() => prefixRange('')).toThrow('ASCII')
+    expect(() => prefixRange('caf\u00e9')).toThrow('ASCII')
   })
 })
