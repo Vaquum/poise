@@ -536,18 +536,19 @@ let observing: Database.Database | null = null
  *  quota samples): a power cut may lose its last commit, and the next
  *  observation records it again, so it need not wait for the disk on the
  *  server's thread. getMeta and setMeta inside it use that connection, and
- *  `write` must touch nothing else. Inside a transaction on the main
- *  connection it is simply part of that transaction. */
+ *  `write` runs any other statement on the connection it is given. Inside a
+ *  transaction on the main connection it is simply part of that transaction. */
 /** Whether an observation's transaction is open now. */
 export const observationOpen = (): boolean => observing !== null
 
-export function writeObservation<T>(write: () => T): T {
-  if (observing || db.inTransaction) return write()
+export function writeObservation<T>(write: (connection: Database.Database) => T): T {
+  if (observing) return write(observing)
+  if (db.inTransaction) return write(db)
   const connection = cursorConnection()
-  if (connection === db) return db.transaction(write).immediate()
+  if (connection === db) return db.transaction(() => write(db)).immediate()
   return connection.transaction(() => {
     observing = connection
-    try { return write() } finally { observing = null }
+    try { return write(connection) } finally { observing = null }
   }).immediate()
 }
 
