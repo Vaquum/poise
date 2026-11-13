@@ -15,7 +15,7 @@
 //
 // Reference: caller/github_datastore/CONSUMER_CONTRACT.md.
 
-import { mkdir } from 'node:fs/promises'
+import { mkdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ReviewSummary } from '../src/analytics-work-review'
@@ -252,13 +252,45 @@ export async function runCli(org: Organization, args: string[]): Promise<Datasto
   const key = JSON.stringify([org.login, org.datastorePath, args])
   let read = datastoreReads.get(key)
   if (!read) {
-    const started = readDatastore(org, args)
+    const started = readKept(org, args, key)
     datastoreReads.set(key, started)
     const settle = () => { if (datastoreReads.get(key) === started) datastoreReads.delete(key) }
     started.then(settle, settle)
     read = started
   }
   return (await read).slice()
+}
+
+/** A view only reads the file, which changes only when Caller syncs it: while
+ *  its version is the one a view was read at, that view answers alike. What is
+ *  read is kept under the version seen before the read began, so a sync while
+ *  it ran makes the next caller read again rather than trust it. */
+async function readKept(org: Organization, args: string[], key: string): Promise<DatastoreRecord[]> {
+  const version = args[0] === 'view' && org.datastorePath ? await datastoreVersion(org.datastorePath) : null
+  const kept = version ? viewReads.get(key) : undefined
+  if (kept && kept.version === version) return kept.rows
+  const rows = await readDatastore(org, args)
+  if (version) {
+    viewReads.delete(key)
+    viewReads.set(key, { version, rows })
+    if (viewReads.size > VIEW_READS_KEPT) viewReads.delete(viewReads.keys().next().value!)
+  }
+  return rows
+}
+
+/** View reads kept with the datastore file version they were read at, the oldest dropped first. */
+const viewReads = new Map<string, { version: string, rows: DatastoreRecord[] }>()
+const VIEW_READS_KEPT = 200
+
+/** The datastore file's version: its identity, size and time, and its write-ahead log's,
+ *  which every committed sync changes. Null when it cannot be read: then nothing is kept. */
+async function datastoreVersion(path: string): Promise<string | null> {
+  try {
+    const [main, wal] = await Promise.all([stat(path), stat(`${path}-wal`).catch(() => null)])
+    return `${main.dev}:${main.ino}:${main.size}:${main.mtimeMs}|${wal ? `${wal.ino}:${wal.size}:${wal.mtimeMs}` : '-'}`
+  } catch {
+    return null
+  }
 }
 
 // Reader failures already reported, so a persistent one is logged once.

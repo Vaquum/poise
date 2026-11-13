@@ -1,3 +1,6 @@
+import { appendFileSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -71,5 +74,38 @@ describe('runCli with the in-process datastore reader', () => {
     mocks.read.mockReturnValue(Promise.resolve(reader))
     await runCli(mocks.org as never, ARGS)
     expect(mocks.read).toHaveBeenCalledTimes(3)
+  })
+
+  it('answers a view again from what it read while the datastore file is unchanged, and reads again once a sync changes it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'poise-view-reads-'))
+    try {
+      const path = join(directory, 'alpha.sqlite')
+      writeFileSync(path, 'datastore')
+      const org = { ...mocks.org, datastorePath: path }
+      mocks.read.mockImplementation(() => Promise.resolve([row('alpha/one', 1)]))
+      expect(await runCli(org as never, ARGS)).toEqual([row('alpha/one', 1)])
+      expect(await runCli(org as never, ARGS)).toEqual([row('alpha/one', 1)])
+      expect(mocks.read).toHaveBeenCalledTimes(1)
+      // A sync commits to the write-ahead log: the view is read again.
+      mocks.read.mockImplementation(() => Promise.resolve([row('alpha/one', 1), row('alpha/two', 2)]))
+      writeFileSync(`${path}-wal`, 'frame')
+      expect(await runCli(org as never, ARGS)).toHaveLength(2)
+      expect(mocks.read).toHaveBeenCalledTimes(2)
+      appendFileSync(`${path}-wal`, 'another frame')
+      expect(await runCli(org as never, ARGS)).toHaveLength(2)
+      expect(mocks.read).toHaveBeenCalledTimes(3)
+      // A checkpoint rewrites the file itself.
+      utimesSync(path, new Date(), new Date(Date.now() + 1_000))
+      await runCli(org as never, ARGS)
+      expect(mocks.read).toHaveBeenCalledTimes(4)
+      // What is not a view always runs.
+      mocks.runFile.mockResolvedValue({ stdout: JSON.stringify(cli), stderr: '' })
+      mocks.read.mockReturnValue(null)
+      await runCli(org as never, ['health', '--format', 'json'])
+      await runCli(org as never, ['health', '--format', 'json'])
+      expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 })
