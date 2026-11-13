@@ -738,7 +738,7 @@ test('keeps a newly created passage annotation with an unsent private draft', as
   expect(state.sessions).toHaveLength(0)
 })
 
-test('shows completion and attention notices after navigating away from an open passage chat', async ({ page }) => {
+test('shows the attention notice, never the finished turn, after navigating away from an open passage chat', async ({ page }) => {
   const { sock } = await editor(page, [annotation({ id: 'ann-1' })])
   await openThreadForMark(page, 'ann-1')
   const id = await sendThreadMessage(page, sock, 'Keep working')
@@ -753,8 +753,9 @@ test('shows completion and attention notices after navigating away from an open 
   await page.mouse.move(0, 0)
   const held = page.getByRole('button', { name: 'Show now' })
   if (await held.isVisible().catch(() => false)) await held.click()
-  await expect(page.locator('[data-answers] [data-notice="notice:passage-finished"]')).toBeVisible()
   await expect(page.locator('[data-answers] [data-notice="notice:passage-waiting"]')).toBeVisible()
+  // A finished turn is done: Answer here never lists it (#1463).
+  await expect(page.locator('[data-answers] [data-notice="notice:passage-finished"]')).toHaveCount(0)
 })
 
 for (const leave of ['closing the pane', 'switching to the document chat'] as const) {
