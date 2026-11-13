@@ -307,7 +307,10 @@ describe('the hooks at work', () => {
   const attempt = (args: string[], env: NodeJS.ProcessEnv, cwd: string) => spawnSync(process.execPath, args, { env, cwd, encoding: 'utf8' })
 
   it('take a Node test runner out of this machine, however it is reached, and it never runs here', () => {
-    const { env } = hooked(true)
+    const { env, hooks } = hooked(true)
+    writeFileSync(join(hooks, 'run.mjs'), `console.log(JSON.stringify(process.argv.slice(2)))
+console.error('[poise] fixture sender: relay unavailable')
+process.exitCode = 125`)
     const repo = temp()
     execFileSync('git', ['init', '-q', repo])
     mkdirSync(join(repo, 'node_modules', '.bin'), { recursive: true })
@@ -315,7 +318,9 @@ describe('the hooks at work', () => {
     writeFileSync(join(repo, 'node_modules', '.bin', 'vitest'), `require('fs').writeFileSync(${JSON.stringify(marker)}, '')`)
     const result = attempt([join(repo, 'node_modules', '.bin', 'vitest'), 'run'], env, repo)
     expect(result.status).toBe(125)
-    expect(result.stderr).toContain('[poise]')
+    const args = JSON.parse(result.stdout) as string[]
+    expect(args.slice(args.indexOf('--') + 1)).toEqual([process.execPath, join(repo, 'node_modules', '.bin', 'vitest'), 'run'])
+    expect(result.stderr).toContain('[poise] fixture sender: relay unavailable')
     expect(existsSync(marker)).toBe(false)
   })
 
