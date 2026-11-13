@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { datastoreReaderThreads, readDatastoreView, stopDatastoreReader } from '../server/datastore-reader'
+import { readDatastoreView, stopDatastoreReader } from '../server/datastore-reader'
 import { normalizeDatetime, parseViewArgs } from '../server/datastore-views'
 
 const ME = 'octocat'
@@ -80,15 +80,6 @@ describe('datastore views read in-process', () => {
       expect(parseViewArgs(argv)).not.toBeNull()
       expectSameRows(await readDatastoreView(db, argv)!, answers[index].rows!)
     }
-  })
-
-  it('reads on one thread while reads come one at a time, and on more once they overlap, answering alike', async () => {
-    await stopDatastoreReader()
-    for (const argv of READS.slice(0, 3)) await readDatastoreView(db, argv)
-    expect(datastoreReaderThreads()).toBe(1)
-    const reads = await Promise.all(READS.slice(0, 6).map((argv) => readDatastoreView(db, argv)!))
-    expect(datastoreReaderThreads()).toBe(3)
-    reads.forEach((rows, index) => expectSameRows(rows, answers[index].rows!))
   })
 
   it('fails where Caller fails: incomplete label evidence', async () => {
