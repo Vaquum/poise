@@ -650,7 +650,8 @@ it.each([false, true])('does not defer original model/resource settlement, with 
   let chain = seed(journal)
   chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-model', behavior: 'review-pr',
     actor: 'reviewer', model: 'fixture', slot: 'primary', basis: 'review', admittedAt: NOW - 5000,
-    request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--pr-review', 'https://github.com/acme/repo/pull/17',
+      '--expected-head', 'a'.repeat(40)] } } })
   chain = record(journal, chain, { type: 'invocation.started', invocationId: 'original-model' })
   chain = record(journal, chain, { type: 'chain.observed', observation: observation() })
   chain = record(journal, chain, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: chain.repository,
@@ -671,7 +672,7 @@ it.each([false, true])('does not defer original model/resource settlement, with 
   expect(observe).not.toHaveBeenCalled()
   expect(journal.liveModelInvocationCount()).toBe(1)
   Object.assign(call, { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
-    completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() })
+    head_sha: null, artifact: { phase: 'reviewing' }, completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() })
   visible = true
   await runtime.run()
   expect(readInvocations).toHaveBeenCalledTimes(3)

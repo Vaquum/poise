@@ -10,6 +10,7 @@ import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainInvocat
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import type { Organization } from '../server/organizations'
 import type { NativeChainHooks } from '../server/behavior-chain-native'
+import type { ChainObservation } from '../server/behavior-chain-decision'
 import { completedReviewCall } from './review-response-fixture'
 import { behaviorChainAttention, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 
@@ -284,6 +285,157 @@ it('discovers a verified external merge for a closed held seed without binding o
     expect(effect).not.toHaveBeenCalled()
   } finally { db.close(); vi.useRealTimers() }
 }, 30_000)
+
+async function deadlineChain(behavior: 'review-pr' | 'approve-pr', mode = 'quiet') {
+  const root = directory = mkdtempSync(join(tmpdir(), 'poise-review-deadline-'))
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const path = join(directory, 'journal.sqlite')
+  let db = new Database(path)
+  let journal = new BehaviorChainJournal(db)
+  journal.append(chain.id, 'seed', 0, { type: 'chain.admitted', repository: chain.repository, issue: chain.issue,
+    branch: chain.branch, author: chain.author, reviewer: chain.reviewer })
+  const selected = { slot: 'primary', model: 'gpt-6-astra-ultra', recovery: 'gpt-6-astra-ultra' }
+  const observed: ChainObservation = { checkedAt: Date.now(), existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'seed', commentIds: [] }, issueReviewers: [],
+    prReviewers: behavior === 'review-pr' ? [selected] : [], implementer: selected, repairer: selected, approver: selected,
+    publication: { pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 21, head: HEAD, headSince: Date.now() - 1000, state: 'open', draft: false, merged: false,
+      mergeSha: null, queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false,
+      ready: false, reviewIds: [], reviewRevision: 'reviews', reviewContext: chainBasis(['b'.repeat(40), 'Candidate', '']),
+      reviewReceipts: [], greyRuns: [], pending: false, failing: [], conflict: false, behind: false } }
+  const results: Array<{ pending: LogEntry, released: LogEntry, posts: Array<NonNullable<ChainObservation['pull']>['reviewReceipts'][number] & { body: string }> }> = []
+  let released = false
+  const launch = vi.fn<ChainRuntimeOperations['launch']>(async invocation => {
+    expect(invocation.behavior).toBe(behavior)
+    // The admitted native argv is decoded by Caller's CLI. Only provider,
+    // GitHub transport and physical cleanup witnesses are stand-ins.
+    results.push(JSON.parse(execFileSync('python3', ['tests/fixtures/review-deadline.py'], {
+      input: JSON.stringify({ argv: invocation.request.argv, mode, now: Date.now() }), encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, PYTHONPATH: [resolve('caller/agent_interface'), process.env.PYTHONPATH].filter(Boolean).join(':') },
+    })))
+    vi.setSystemTime(Date.now() + 3000)
+    released = false
+    return true
+  })
+  const native = actionOperations({ resolve: async () => selected })
+  const operations: ChainRuntimeOperations = { ...native, discover: async () => [], permitted: () => true,
+    observe: async () => ({ ...observed, checkedAt: Date.now() }), launch,
+    readInvocations: async ids => parseAgentLogList(results.map(result => released ? result.released : result.pending)
+      .filter(call => ids.includes(call.correlation_id!))) }
+  return { results, launch, observed, operations,
+    get journal() { return journal },
+    run: () => new BehaviorChainRuntime(journal, operations).run(),
+    release: () => { released = true },
+    current: () => journal.read(chain.id)!,
+    restart: () => { db.close(); db = new Database(path); journal = new BehaviorChainJournal(db); journal.rebuild() },
+    close: () => { db.close(); rmSync(root, { recursive: true, force: true }) } }
+}
+
+it.each(['review-pr', 'approve-pr'] as const)('settles a proven %s deadline only after release, retries on backoff and holds the third failure across restart', async behavior => {
+  const run = await deadlineChain(behavior)
+  try {
+    await run.run()
+    expect(run.results[0].pending).toMatchObject({ status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'review_budget_exhausted', head_sha: null, review_id: null, resources_settled_at: null })
+    expect(parseAgentLogList([run.results[0].pending]).quarantined).toEqual([])
+    await run.run()
+    expect(run.current().invocations[0].state).toBe('uncertain')
+    expect(run.journal.liveModelInvocationCount()).toBe(1)
+    run.release()
+    await run.run()
+    expect(run.current().invocations[0]).toMatchObject({ state: 'settled', evidence: { status: 'failed', error_code: 'review_budget_exhausted' } })
+    expect(run.journal.liveModelInvocationCount()).toBe(0)
+    expect(run.current().waiting).toContain('backoff')
+    for (const attempt of [1, 2]) {
+      const next = Date.parse(run.results.at(-1)!.released.completed_at!) + 60_000 * 2 ** (attempt - 1)
+      vi.setSystemTime(next - 1)
+      await run.run()
+      expect(run.launch).toHaveBeenCalledTimes(attempt)
+      vi.setSystemTime(next)
+      await run.run()
+      expect(run.launch).toHaveBeenCalledTimes(attempt + 1)
+      run.release()
+      await run.run()
+    }
+    expect(run.current().held).toContain(`${behavior} failed before publication three times`)
+    run.restart()
+    vi.setSystemTime(Date.now() + 3600_000)
+    await run.run()
+    expect(run.current().held).toContain('three times')
+    expect(run.launch).toHaveBeenCalledTimes(3)
+    expect(run.results.flatMap(result => result.posts)).toEqual([])
+  } finally { run.close() }
+}, 30_000)
+
+it.each(['review-pr', 'approve-pr'] as const)('reconciles an original %s POST with a lost acknowledgement without another POST', async behavior => {
+  const run = await deadlineChain(behavior, 'lost_ack')
+  try {
+    await run.run()
+    const result = run.results[0]
+    expect(result.released).toMatchObject({ status: 'failed', action: null, error_code: 'review_submission_failed',
+      artifact: { phase: 'submitting_review' } })
+    expect(result.posts).toHaveLength(1)
+    expect(result.posts[0].body).toContain(`<!-- poise-invocation ${result.released.id} -->`)
+    run.release()
+    await run.run()
+    run.restart()
+    await run.run()
+    expect(run.current().invocations[0].state).toBe('uncertain')
+    run.observed.pull!.reviewReceipts = result.posts
+    run.observed.pull!.reviewIds = [91]
+    // Keep subsequent work disabled while testing read-only recovery.
+    run.operations.enabled = () => false
+    await run.run()
+    expect(run.current().invocations[0]).toMatchObject({ state: 'settled', callId: result.released.id,
+      evidence: { status: 'completed', review_id: 91, reconciliation: 'native invocation marker verified on the actual GitHub review' } })
+    await run.run()
+    expect(run.launch).toHaveBeenCalledTimes(1)
+    expect(run.results.flatMap(value => value.posts)).toHaveLength(1)
+  } finally { run.close() }
+})
+
+it.each(['pending', 'missing_inventory', 'changed_inventory', 'contradictory_counters', 'failed_read', 'wrong_target',
+  'missing_artifact', 'submitting'])('keeps %s deadline evidence fenced through Caller completion and native cleanup', async mode => {
+  for (const behavior of ['review-pr', 'approve-pr'] as const) {
+    const run = await deadlineChain(behavior, mode)
+    try {
+      await run.run()
+      expect(run.results[0].released).toMatchObject({ status: 'failed', action: null, outcome: null,
+        error_code: 'review_budget_exhausted' })
+      run.release()
+      await run.run()
+      run.restart()
+      vi.setSystemTime(Date.now() + 3600_000)
+      await run.run()
+      expect(run.current().invocations[0].state).toBe('uncertain')
+      expect(run.launch).toHaveBeenCalledTimes(1)
+    } finally { run.close() }
+  }
+})
+
+it.each(['correlation', 'target', 'head', 'review receipt', 'posting receipt', 'executed head', 'submitting', 'missing phase'])
+  ('rejects %s evidence alongside a real Caller not-started deadline result', async mismatch => {
+    const run = await deadlineChain('review-pr')
+    try {
+      await run.run()
+      const call = run.results[0].released
+      if (mismatch === 'correlation') call.correlation_id = 'another-invocation'
+      if (mismatch === 'target') call.pr_id = '22'
+      if (mismatch === 'head') call.expected_head = 'b'.repeat(40)
+      if (mismatch === 'review receipt') call.review_id = 91
+      if (mismatch === 'posting receipt') call.receipts = []
+      if (mismatch === 'executed head') call.head_sha = HEAD
+      if (mismatch === 'submitting') call.artifact!.phase = 'submitting_review'
+      if (mismatch === 'missing phase') call.artifact = null
+      run.release()
+      for (let pass = 0; pass < 2; pass++) {
+        if (mismatch === 'target' || mismatch === 'head') await expect(run.run()).rejects.toThrow('native review target conflicts')
+        else await run.run()
+        expect(run.current().invocations[0].state).not.toBe('settled')
+      }
+      expect(run.launch).toHaveBeenCalledTimes(1)
+    } finally { run.close() }
+  })
 
 it('retires an already-held closed binding after a different PR closes the seed, preserving its original receipts', async () => {
   const db = new Database(':memory:')

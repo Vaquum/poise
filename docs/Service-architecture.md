@@ -1545,6 +1545,10 @@ defines its reconciliation rules.
 Atomic publication also retains its original pre-write phase: a proven no-write
 failure settles through the existing Caller receipt after resource release;
 missing original push evidence stays visible in the chain wait with its fence intact.
+PR review and approval deadlines likewise carry validated no-publication results
+through Caller completion and native resource settlement under those same
+[recovery rules](Behavior-chain.md#authority-and-recovery); a diagnostic or
+cleanup alone cannot release an unknown publication effect.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;

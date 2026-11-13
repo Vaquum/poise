@@ -309,6 +309,18 @@ class TestRecovery(TestCase):
                 raise verdict_error()
             row = self.execute(exhausted, [facts(), facts()], model='gpt-6-astra-ultra')
         self.assertEqual(row['error_code'], 'review_budget_exhausted')
+        self.assertEqual((row['action'], row['outcome']), ('not_started', 'preflight_failed'))
+        self.assertIsNone(row['recovery_model'])
+        self.assertEqual(self.mod.run.call_count, 1)
+
+    def test_repeat_only_budget_exhaustion_settles_retryable_for_pr_review(self):
+        with patch.object(budget, 'monotonic', return_value=100) as clock:
+            def exhausted(*args, **kwargs):
+                clock.return_value = 1514
+                raise refusal_error()
+            row = self.execute(exhausted, [facts(), facts()], model='opus-5-high', behavior='pr_review')
+        self.assertEqual(row['error_code'], 'review_budget_exhausted')
+        self.assertEqual((row['action'], row['outcome']), ('not_started', 'preflight_failed'))
         self.assertIsNone(row['recovery_model'])
         self.assertEqual(self.mod.run.call_count, 1)
 
