@@ -6,6 +6,7 @@ export interface NoticeDiagnosticIdentity {
   correlationId: string; behavior: string; target: string | null; repository: string | null; account: string | null
   organization?: string
   phase?: string
+  expectedHead?: string
   deadline?: number
   progress?: Record<string, string | number | null | Array<Record<string, string | number | null>>>
 }
@@ -18,7 +19,11 @@ export async function withNoticeDiagnosticIdentity<T>(identity: NoticeDiagnostic
   return context.run(identity, async () => {
     try { return await work() }
     catch (error) {
-      if (error !== null && typeof error === 'object') failures.set(error, identity)
+      // A sweep TimeoutError is shared: the target attaches first, then the
+      // sweep reattaches its identity. Outer wins so the sweep keeps its
+      // progress. Child failures keep the inner precise identity.
+      const sweepTimeout = error instanceof DOMException && error.name === 'TimeoutError'
+      if (error !== null && typeof error === 'object' && (sweepTimeout || !failures.has(error))) failures.set(error, identity)
       throw error
     }
   })

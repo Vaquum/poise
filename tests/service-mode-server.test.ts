@@ -10,14 +10,15 @@ import { createRequire } from 'node:module'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import Database from 'better-sqlite3'
+import { DiagnosticStore } from '../gateway/src/diagnostics/store'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
 import { STATUS, assertFakeClis, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { fakePresetCommand } from './fixtures/accounts/fake-presets'
 import { CATALOG } from './model-catalog-fixture'
-import { OWNER, PUBLIC_HOST, PUBLIC_ORIGIN, gatewayKeys, serviceEnvironment, signAssertion } from './service-fixture'
+import { HANDLE, OWNER, PUBLIC_HOST, PUBLIC_ORIGIN, gatewayKeys, serviceEnvironment, signAssertion } from './service-fixture'
 
 const gateway = gatewayKeys()
 const auth = createAuthenticatedClaudeAuth()
@@ -755,5 +756,108 @@ describe('Poise in service mode', () => {
       await production.shutdownProductionServer(server)
       receipts.close()
     }
+  }, 20_000)
+})
+
+describe('collaborator reconciliation during release teardown', () => {
+  let candidate: typeof import('../server/production')
+  let runtime: typeof import('../server/cache-plugin')
+  let database: typeof import('../server/db')
+  let application: Server
+  let stateRoot: string
+  let finishInvite: () => void
+  let inviteStarted: boolean
+  const confirmationKey = 'agent_collaborator_confirmed:acme:agent-x'
+  const originalConfirmation = JSON.stringify([[101, 'acme/existing']])
+
+  beforeEach(async () => {
+    stateRoot = await mkdtemp(join(tmpdir(), 'poise-collaborator-stop-'))
+    vi.stubEnv('POISE_DB', join(stateRoot, 'cache.db'))
+    vi.stubEnv('AGENT_INTERFACE_DATA_DIR', join(stateRoot, 'caller'))
+    vi.resetModules()
+    database = await import('../server/db')
+    await import('../server/organizations')
+    database.setMeta('me', 'octocat')
+    database.setMeta('agentAccount', 'agent-x')
+    database.setMeta('notification_settings', JSON.stringify({ enabled: false }))
+    database.setMeta(confirmationKey, originalConfirmation)
+    database.db.prepare("INSERT INTO organizations (login, managed, status, stage) VALUES ('acme', 0, 'ready', 'ready')").run()
+    const processes = await import('../server/process')
+    const runFile = processes.runFile
+    inviteStarted = false
+    const invite = new Promise<void>((resolve) => { finishInvite = resolve })
+    vi.spyOn(processes, 'runFile').mockImplementation(async (command, args, options) => {
+      if (command === 'github-interface' && args[0] === '--view-repos') return { stdout: JSON.stringify({ repos: [
+        { full_name: 'acme/existing', id: 101 }, { full_name: 'acme/site', id: 102 },
+      ] }), stderr: '' }
+      if (command === 'gh' && args[0] === 'auth' && args[1] === 'token') return { stdout: 'fixture-token', stderr: '' }
+      if (command === 'gh' && args[0] === 'api') {
+        if (args[1] === 'repos/acme/site/collaborators/agent-x') {
+          inviteStarted = true
+          await invite
+          return { stdout: 'HTTP/2.0 201 Created\r\n\r\n{"id":7}', stderr: '' }
+        }
+        if (args[1]?.startsWith('user/repository_invitations?')) return { stdout: 'HTTP/2.0 200 OK\r\n\r\n[]', stderr: '' }
+      }
+      return runFile(command, args, options)
+    })
+    candidate = await import('../server/production')
+    runtime = await import('../server/cache-plugin')
+    application = candidate.createProductionServer({ claudeAuth: auth, terminalCommand: fakePresetCommand(bin) })
+    await new Promise<void>((resolve) => application.listen(0, '127.0.0.1', resolve))
+    await vi.waitFor(() => expect(inviteStarted).toBe(true))
+  })
+
+  afterEach(async () => {
+    vi.useRealTimers()
+    finishInvite()
+    await candidate.shutdownProductionServer(application).catch(() => undefined)
+    vi.restoreAllMocks()
+    await rm(stateRoot, { recursive: true, force: true })
+  })
+
+  it('identifies the actual unresolved collaborator stop in the durable deadline Error', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const exit = vi.fn()
+    candidate.createProductionShutdown(application, exit)(75)
+    await vi.waitFor(() => expect(runtime.pendingRuntimeStops()).toEqual(['agent_collaborator']))
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(exit).toHaveBeenCalledExactlyOnceWith(1)
+    const retained = new DiagnosticStore(join(stateRoot, 'logging.db'), undefined, Date.now, true)
+    try {
+      expect(retained.query({ workspace: HANDLE, operator: false }, { source: 'poise' }).events).toContainEqual(expect.objectContaining({
+        operation: 'process.shutdown', severity: 'error', phase: 'shutdown_deadline', exitCode: 1, timeoutMs: 10_000,
+        message: expect.stringContaining('runtime_stop.agent_collaborator'),
+        context: { requestedExitCode: 75, pendingPhases: ['runtime_stop', 'runtime_stop.agent_collaborator'] },
+      }))
+    } finally { retained.close() }
+  })
+
+  it('finishes the admitted invitation and its original account confirmation before switching with exit 75', async () => {
+    const { ServiceControl } = await import('../server/service/control')
+    const releases = join(stateRoot, 'releases')
+    await mkdir(join(releases, 'new'), { recursive: true })
+    await writeFile(join(releases, 'new', 'installed'), '')
+    await writeFile(join(releases, 'new', 'base'), 'same-base')
+    const confirmations = new Database(join(stateRoot, 'cache.db'), { readonly: true })
+    const readConfirmation = () => confirmations.prepare('SELECT value FROM meta WHERE key = ?').get(confirmationKey)
+    const exit = vi.fn()
+    const shutdown = candidate.createProductionShutdown(application, exit)
+    const service = new ServiceControl(runtime.getChatRuntime(), { releasesDir: releases, release: { name: 'old', base: 'same-base' },
+      drainTimeoutSeconds: 1800, canRestart: () => true, restart: () => { shutdown(75); return true } })
+    try {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+      service.switchRelease('new')
+      await vi.advanceTimersByTimeAsync(11_000)
+      expect(readConfirmation()).toEqual({ value: originalConfirmation })
+      expect(database.db.open).toBe(true)
+      expect(application.listening).toBe(true)
+      expect(exit).not.toHaveBeenCalled()
+
+      finishInvite()
+      await vi.waitFor(() => expect(exit).toHaveBeenCalledExactlyOnceWith(75), { timeout: 5_000 })
+      expect(readConfirmation()).toEqual({ value: JSON.stringify([[101, 'acme/existing'], [102, 'acme/site']]) })
+      expect(database.db.open).toBe(false)
+    } finally { service.reset(); confirmations.close() }
   }, 20_000)
 })

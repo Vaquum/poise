@@ -224,6 +224,7 @@ def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
         actor(actor_name),
         followup.render_title(repo, str(number), review_round),
         followup.render_body(repo, str(number), head, base_sha, review_round, review_cap, comments),
+        reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS,
     )
     return followup.issue_reference(issue)
 
@@ -323,7 +324,8 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
     # validates the format strictly; non-string values fail there.
     priority = level if isinstance(level, str) else str(level)
     try:
-        full = json.loads(fetch_packet(pwd, pr, actor_name, head, priority, since_head=None))
+        full = json.loads(fetch_packet(pwd, pr, actor_name, head, priority, since_head=None,
+                                       reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS))
         retained = [entry["filename"] for entry in full["files"]]
         sets = review_stages.diff_line_sets(full["diff"], retained)
         since_files = [entry["filename"] for entry in node.get("files", [])]
@@ -378,38 +380,90 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
     verdict["comments"][:] = kept
 
 
-def _time_limit_message(provider: str) -> str:
+def _time_limit_message(provider: str, phase: str) -> str:
     # Poise moves the PR on for review_budget_exhausted unless this text matches
     # its inspection-limit wording, and it reads any "rate limit" as a throttle.
-    if provider in PROVIDER_ANALYSIS_SECONDS:
+    if phase == "file_group":
+        return "Review file-group time limit reached; incomplete analysis; reduce the review scope"
+    if phase == "inspection":
+        return "Local review repository inspection timed out; incomplete analysis; needs attention"
+    if phase == "provider_analysis":
         return f"{provider} review reached its analysis time limit; handing off so the next model can run instead"
     return "Review reached its total time limit; needs attention"
 
 
 def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
                  timeout_s: int, deadline: float, repository, behavior: str, verify_fixes: bool = False,
-                 groups_remaining: int | None = None, initializing: bool = False) -> tuple[str, dict]:
+                 groups_remaining: int | None = None, initializing: bool = False,
+                 total_groups: int = 1, expected_group_seconds: float | None = None) -> tuple[str, dict, float]:
     schema = verdict_schema(behavior, inspection=repository is not None, verify_fixes=verify_fixes)
     (root / "verdict.schema.json").write_text(json.dumps(schema))
     context = ""
     round_number = 0
     correction_attempted = False
     group_deadline = None
-    verdict_reserve = 0
-    while round_number <= MAX_INSPECTION_ROUNDS:
-        timeout = review_budget.timeout(timeout_s, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
+    inspection_cutoff = None
+    group_started = monotonic()
+    group_number = total_groups - (groups_remaining or 1) + 1
+
+    def timed_out(phase, timeout, diagnostic=None):
+        try:
+            remaining = review_budget.timeout(timeout_s, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
+        except review_budget.ReviewLimitError:
+            remaining = 0
+        remaining = max(0, min(remaining, deadline - monotonic()))
+        # A provider-ceiling expiry hands the review to the next model: type it
+        # as an analysis handoff, not a terminal timeout.
+        handoff = phase == "provider_analysis"
+        emitted_phase = "analysis" if handoff else phase
+        outcome = "handoff" if handoff else "timed_out"
+        message = (f"Incomplete analysis in file group {group_number} of {total_groups}: {emitted_phase} deadline; "
+                   f"elapsed {monotonic() - group_started:.1f}s; remaining analysis {remaining:.1f}s. "
+                   "No review submitted; reduce the review scope if required coverage cannot fit.")
+        diagnostic = {**(diagnostic or diagnostic_envelope(operation="provider.review", phase=emitted_phase,
+                                                         outcome=outcome, provider=model.provider)),
+                      "phase": emitted_phase, "outcome": outcome, "message": message[:500],
+                      "elapsed_ms": round((monotonic() - group_started) * 1000),
+                      "timeout_seconds": max(0, timeout), "submission": "none"}
+        if handoff:
+            # An inspect timeout carries operation github-interface; handoffs are typed provider.review.
+            diagnostic["operation"] = "provider.review"
+        return review_budget.ReviewLimitError(_time_limit_message(model.provider, phase),
+                                             "review_inspection_timeout" if phase == "inspection" else "review_budget_exhausted",
+                                             diagnostic)
+
+    def wait_allowance(cap=None):
+        try:
+            overall = review_budget.timeout(timeout_s, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
+        except review_budget.ReviewLimitError as error:
+            raise timed_out("overall", 0) from error
+        limits = [(overall, "overall")]
         if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS or correction_attempted:
-            timeout = min(deadline - monotonic(), timeout)
-        if groups_remaining is not None and not initializing and group_deadline is None:
-            allowance = timeout / groups_remaining
-            group_deadline = monotonic() + allowance
-            # Stop offering further inspection once half the group's allowance
-            # is spent, leaving time for its terminal assessment.
-            verdict_reserve = allowance / 2
+            # The shared analysis deadline only hands off when the provider
+            # ceiling binds; a shorter grant is an overall timeout.
+            ceiling = PROVIDER_ANALYSIS_SECONDS.get(model.provider, timeout_s) < timeout_s
+            limits.append((deadline - monotonic(), "provider_analysis" if ceiling else "overall"))
         if group_deadline is not None:
-            timeout = min(group_deadline - monotonic(), timeout)
+            limits.append((group_deadline - monotonic(), "file_group"))
+        if cap is not None:
+            limits.append((cap, "inspection"))
+        timeout, phase = min(limits, key=lambda limit: limit[0])
         if timeout <= 0:
-            raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted")
+            raise timed_out(phase, timeout)
+        return timeout, phase
+
+    while round_number <= MAX_INSPECTION_ROUNDS:
+        timeout, phase = wait_allowance()
+        if groups_remaining is not None and repository is not None and not initializing and group_deadline is None:
+            share = timeout / groups_remaining
+            # Cap each later group's estimated reserve at half the equal share,
+            # leaving borrowing room even after an expensive early prefix.
+            allowance = timeout
+            if expected_group_seconds is not None:
+                allowance = max(share, timeout - min(expected_group_seconds, share / 2) * (groups_remaining - 1))
+            group_deadline = monotonic() + allowance
+            inspection_cutoff = monotonic() + share / 2
+            timeout, phase = wait_allowance()
         if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
             # Loop-driven growth, not #186's initial-packet overflow: keep
             # it out of the packet block so the head is not pinned.
@@ -418,31 +472,28 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                 "review_budget_exhausted",
                 diagnostic_envelope(operation="provider.review", phase="inspection_context",
                                     outcome="resource_failure", provider=model.provider))
-        # Last round decides on evidence already held: offer only the
-        # terminal verdict, never another inspection step.
-        terminal_only = round_number == MAX_INSPECTION_ROUNDS or (
-            group_deadline is not None and round_number > 0 and timeout <= verdict_reserve)
-        if repository is not None and terminal_only:
-            schema = verdict_schema(behavior, verify_fixes=verify_fixes)
-            (root / "verdict.schema.json").write_text(json.dumps(schema))
-        remaining = (f"\n\nInspection rounds remaining: {0 if terminal_only else MAX_INSPECTION_ROUNDS - round_number}. "
+        finish_soon = inspection_cutoff is not None and monotonic() >= inspection_cutoff
+        remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
                      f"Analysis time remaining: {int(timeout)} seconds. "
                      "Batch independent inspection requests in one step. "
                      "Return a terminal verdict as soon as the supplied evidence is sufficient. "
                      "Do not repeat completed reads or searches."
+                     + (" The equal-share inspection allowance is spent; omit optional inspection. "
+                        "If further inspection is required for a complete assessment, request it; "
+                        "never return a verdict on incomplete analysis." if finish_soon else "")
                      if repository is not None else "")
-        raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
+        try:
+            raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
+        except subprocess.TimeoutExpired as error:
+            raise timed_out(phase, timeout) from error
+        if initializing:
+            group_started = monotonic()
         initializing = False
         progress.stage("validating", "Validating review result")
         try:
             if repository is None:
-                return raw, validate_verdict(raw, behavior)
+                return raw, validate_verdict(raw, behavior), monotonic() - group_started
             step = _loads_no_duplicates(raw)
-            if terminal_only and isinstance(step, dict) \
-                    and set(step) == {"action", "comments", "assessment"}:
-                # The final round offers the terminal-only verdict schema,
-                # which has no requests property at all.
-                return raw, validate_verdict(raw, behavior)
             if not isinstance(step, dict) or set(step) != {"action", "comments", "assessment", "requests"}:
                 raise InvalidVerdict("review step must contain action, comments, assessment and requests")
             requests = step["requests"]
@@ -451,14 +502,17 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             if step["action"] != "inspect":
                 if requests:
                     raise InvalidVerdict("terminal verdict must not request repository inspection")
-                return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments", "assessment")}), behavior)
-            if terminal_only:
+                return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments", "assessment")}), behavior), monotonic() - group_started
+            if round_number == MAX_INSPECTION_ROUNDS:
                 raise review_budget.ReviewLimitError(
-                    "Repository inspection limit reached; needs attention",
+                    "Repository inspection limit reached; incomplete analysis; needs attention",
                     "review_budget_exhausted",
                     diagnostic_envelope(operation="provider.review", phase="inspection_rounds",
                                         outcome="resource_failure", provider=model.provider,
-                                        context={"rounds": MAX_INSPECTION_ROUNDS}))
+                                        message=f"Incomplete analysis in file group {group_number} of {total_groups}; "
+                                                f"{MAX_INSPECTION_ROUNDS} inspection rounds used; remaining allowance {timeout:.1f}s",
+                                        elapsed_ms=round((monotonic() - group_started) * 1000),
+                                        timeout_seconds=timeout, submission="none"))
             if not 1 <= len(requests) <= 8:
                 raise InvalidVerdict("invalid repository inspection request count")
             # Validate provisional findings without submitting anything.
@@ -479,13 +533,21 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                         "preserving your substantive assessment and findings.")
             continue
         progress.stage("inspecting", "Inspecting pinned repository")
-        inspection_timeout = min(deadline - monotonic(), review_budget.timeout(
-            30, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS))
-        if group_deadline is not None:
-            inspection_timeout = min(group_deadline - monotonic(), inspection_timeout)
-        if inspection_timeout <= 0:
-            raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted")
-        result = repository.inspect(requests, timeout_s=inspection_timeout)
+        inspection_timeout, phase = wait_allowance(30)
+        try:
+            result = repository.inspect(requests, timeout_s=inspection_timeout)
+        except AgentPreflightError as error:
+            if error.code != "review_inspection_timeout":
+                raise
+            actual_timeout = (error.diagnostic or {}).get("timeout_seconds")
+            failure = timed_out(phase, actual_timeout if isinstance(actual_timeout, (int, float)) else inspection_timeout,
+                                error.diagnostic)
+            if phase == "inspection":
+                error.diagnostic = failure.diagnostic
+                raise
+            raise failure from error
+        except subprocess.TimeoutExpired as error:
+            raise timed_out(phase, inspection_timeout) from error
         context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
         round_number += 1
     raise AssertionError("review rounds did not return a verdict")
@@ -507,6 +569,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     ask = ASK.get(model.provider)
     if ask is None:
         raise AgentPreflightError(f"{model.provider} cannot return a structured review verdict")
+    capped_note = ""
     try:
         total = review_stages.stage_count(packet) if packet else 1
         staged = total > 1
@@ -518,6 +581,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             deadline = monotonic() + min(timeout_s, PROVIDER_ANALYSIS_SECONDS.get(model.provider, timeout_s))
             prior: list[dict] = []
             assessment: dict | None = None
+            expected_group_seconds = None
             for index, stage_text in enumerate(_stage_texts(text, packet)):
                 _admit(stage_text)
                 if staged:
@@ -531,10 +595,12 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                        "must cover every group reviewed so far and remain within the schema bounds.")
                 # Charge common-context initialization once before sharing the
                 # remaining analysis time across file groups.
-                raw, verdict = _review_once(root, ask, model, system, stage_text, watch,
+                raw, verdict, group_seconds = _review_once(root, ask, model, system, stage_text, watch,
                                              timeout_s, deadline, repository, behavior, bool(candidates),
-                                             groups_remaining=total - index if staged and repository is not None else None,
-                                             initializing=staged and index == 0)
+                                             groups_remaining=total - index if staged else None,
+                                             initializing=staged and index == 0, total_groups=total,
+                                             expected_group_seconds=expected_group_seconds)
+                expected_group_seconds = ((expected_group_seconds or 0) * index + group_seconds) / (index + 1)
                 prior.extend(verdict["comments"])
                 assessment = verdict["assessment"]
                 verified.update(review_receipt.verified_fix_ids(assessment))
@@ -544,10 +610,50 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
                 if verified:
                     verdict["assessment"]["verified_fixes"] = sorted(verified)
-                verdict = validate_verdict(json.dumps(
-                    {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}), behavior)
-                raw = json.dumps(verdict)
-            _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
+                # Each group was validated against the bounded provider schema.
+                # The aggregate's capacity is a publication constraint.
+                verdict = {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}
+            watch.check_closed()
+            try:
+                review_receipt.retain_verdict(verdict, head)
+            except OSError as error:
+                cause = bounded_cause(str(error))
+                raise review_budget.ReviewLimitError(
+                    f"Completed review could not retain its findings: {cause}; no review submitted",
+                    "review_contract_violation",
+                    diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
+                                        stderr=cause, provider=model.provider, submission="none")) from error
+            if len(verdict["comments"]) > 100:
+                raise review_budget.ReviewLimitError(
+                    f"Completed review has {len(verdict['comments'])} findings; the single-review inline limit is 100; "
+                    "complete findings retained on the original Call; no review submitted",
+                    "review_contract_violation",
+                    diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
+                                        provider=model.provider, submission="none"))
+            try:
+                _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
+                review_receipt.retain_verdict(verdict, head)
+                raw = json.dumps(verdict, ensure_ascii=False)
+                if capped and behavior == "pr_approve" and verdict["action"] == "request_changes" \
+                        and all(re.match(r"\s*\[p[12]\]", comment["body"], re.IGNORECASE) for comment in verdict["comments"]):
+                    # Only explicitly nonbreaking findings may be deferred.
+                    if review_round is None or review_cap is None:
+                        raise review_budget.ReviewLimitError(
+                            "a capped approval round needs its round and cap numbers", "review_contract_violation")
+                    reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
+                                                      verdict["comments"], pwd)
+                    verdict = {**verdict, "action": "approve", "comments": []}
+                    capped_note = (f"\nReview cap reached (round {review_round} of {review_cap}); "
+                                   f"findings filed as {reference}.")
+            except (review_budget.ReviewLimitError, AgentPreflightError, OSError) as error:
+                if isinstance(error, review_budget.ReviewLimitError) and error.code != "review_budget_exhausted":
+                    raise
+                cause = bounded_cause(str(error))
+                raise review_budget.ReviewLimitError(
+                    f"Completed review could not finalize: {cause}; complete findings retained on the original Call; "
+                    "no review submitted", "review_contract_violation",
+                    diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
+                                        stderr=cause, provider=model.provider, submission="none")) from error
     except review_stages.StageError as error:
         cause = bounded_cause(str(error) or "invalid review packet stages")
         diagnostic = diagnostic_envelope(operation="provider.review", phase="staging",
@@ -555,8 +661,6 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                          provider=model.provider, submission="none")
         raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {cause}",
                                   "review_contract_violation", diagnostic) from error
-    except subprocess.TimeoutExpired as error:
-        raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted") from error
     except (ValueError, OSError) as error:
         code = ("review_packet_too_large" if "Input exceeds the maximum length" in str(error)
                 else "review_contract_violation" if isinstance(error, (InvalidVerdict, json.JSONDecodeError))
@@ -568,20 +672,6 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {cause}", code,
                                   diagnostic) from error
 
-    capped_note = ""
-    if capped and behavior == "pr_approve" and verdict["action"] == "request_changes" \
-            and all(re.match(r"\s*\[p[12]\]", comment["body"], re.IGNORECASE) for comment in verdict["comments"]):
-        # Only explicitly nonbreaking findings may be deferred. Otherwise keep
-        # the entire change request, even if a marked follow-up already exists.
-        if review_round is None or review_cap is None:
-            raise review_budget.ReviewLimitError(
-                "a capped approval round needs its round and cap numbers", "review_contract_violation")
-        reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
-                                          verdict["comments"], pwd)
-        verdict = {**verdict, "action": "approve", "comments": []}
-        capped_note = (f"\nReview cap reached (round {review_round} of {review_cap}); "
-                       f"findings filed as {reference}.")
-
     flag = {"request_changes": "--request-changes", "reviewed_clean": "--reviewed-clean",
             "approve": "--approve-pr"}[verdict["action"]]
     args = [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), flag, ref]
@@ -589,14 +679,21 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         args.extend(["--comments-json", json.dumps(verdict["comments"])])
     review_receipt.complete_response(verdict["assessment"], head)
     args.extend(["--assessment-json", json.dumps(verdict["assessment"], ensure_ascii=False)])
-    limit = review_budget.timeout(600, reserve=VERIFICATION_RESERVE_SECONDS)
-    progress.stage("submitting", "Submitting GitHub review", timeout=limit)
     try:
+        limit = review_budget.timeout(600, reserve=VERIFICATION_RESERVE_SECONDS)
+        progress.stage("submitting", "Submitting GitHub review", timeout=limit)
         done = subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=limit)
     except subprocess.TimeoutExpired as error:
         # The POST may have gone out before the timeout killed the child.
         raise review_receipt.SubmissionError(
             "review submission timed out; publication uncertain, reconcile before retry") from error
+    except (review_budget.ReviewLimitError, OSError) as error:
+        cause = bounded_cause(str(error))
+        raise review_budget.ReviewLimitError(
+            f"Completed review could not start submission: {cause}; complete findings retained on the original Call; "
+            "no review submitted", "review_contract_violation",
+            diagnostic_envelope(operation="provider.review", phase="submitting", outcome="resource_failure",
+                                stderr=cause, provider=model.provider, submission="none")) from error
     if done.returncode:
         transient = review_receipt.record_failure(done.stderr or done.stdout)
         if transient is not None:
@@ -730,7 +827,7 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
         output.unlink(missing_ok=True)
         remaining = timeout if len(fragments) == 1 else deadline - monotonic()
         if remaining <= 0:
-            raise review_budget.ReviewLimitError("Review reached its total time limit", "review_budget_exhausted")
+            raise subprocess.TimeoutExpired("codex review input", timeout)
         done = watch.run(command, input=part, cwd=str(root), timeout=remaining, env=env, provider="codex")
         if done.returncode:
             code, sig = (None, -done.returncode) if done.returncode < 0 else (done.returncode, None)

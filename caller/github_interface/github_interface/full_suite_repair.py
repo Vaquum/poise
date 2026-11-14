@@ -18,7 +18,7 @@ TITLE = "fix: the full test suite fails on main"
 BOT = "github-actions[bot]"
 
 
-async def test_results(client: GitHubClient, target: str, run: dict) -> dict:
+async def test_results(client: GitHubClient, target: str, run: dict, *, causes: bool = False) -> dict:
     inventory = await client.get(f"/repos/{target}/actions/runs/{run['id']}/artifacts", params={"per_page": 100})
     artifacts = inventory["artifacts"]
     if len(artifacts) != inventory["total_count"]:
@@ -33,13 +33,32 @@ async def test_results(client: GitHubClient, target: str, run: dict) -> dict:
             if archive.namelist() != ["vitest.json"] or archive.getinfo("vitest.json").file_size > 16 * 1024 * 1024:
                 raise ValueError("full-suite test artifact is incomplete or oversized")
             report = json.loads(archive.read("vitest.json"))
+        failed = 0
         for file in report["testResults"]:
+            if causes and (file.get("status") not in {"passed", "failed"} or file.get("message")):
+                raise ValueError("test artifact contains a suite failure without assertion evidence")
             path = file["name"].split(f"/{target.split('/')[-1]}/", 1)[-1]
             # Runner paths can contain the repository name twice.
             path = path[path.index("tests/"):] if "tests/" in path else path
             for test in file["assertionResults"]:
                 key = (path, test["fullName"])
-                results.setdefault(key, []).append(test["status"])
+                status = test["status"]
+                if causes:
+                    messages = test.get("failureMessages")
+                    if status not in {"passed", "failed", "pending", "todo", "skipped"} \
+                            or not isinstance(messages, list) or any(not isinstance(message, str) for message in messages) \
+                            or status == "failed" and not any(message.strip() for message in messages):
+                        raise ValueError("test artifact lacks a concrete assertion result/cause")
+                    failed += status == "failed"
+                    results.setdefault(key, []).append({"status": status, "cause": "\n".join(messages)})
+                else:
+                    results.setdefault(key, []).append(status)
+            if causes and file.get("status") == "failed" and not any(test["status"] == "failed" for test in file["assertionResults"]):
+                raise ValueError("test suite failed without complete assertion evidence")
+        if causes and (report.get("numFailedTests") != failed
+                       or report.get("numTotalTests") != sum(len(file["assertionResults"]) for file in report["testResults"])
+                       or run["unit_conclusions"][artifact["name"]] != ("failure" if failed else "success")):
+            raise ValueError("test artifact contains unaccounted failures")
     return results
 
 

@@ -6,7 +6,7 @@ import { agentInterfaceCwd } from './models'
 import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import { chainCiDependency, chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { chainCiDependency, chainReviewResponse, implementationTestDependency, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { datastoreViewOrCli } from './datastore-reader'
@@ -32,7 +32,7 @@ export async function readNativeInvocations(ids: string[], mode: 'strict' | 'res
 }
 export interface NativeChainHooks {
   roster(chainKey: string): Promise<Roster>
-  resolve(decision: Invoke, chainKey: string): Promise<ChainReviewer | null>
+  resolve(decision: Invoke, chainKey: string, chain: BehaviorChain, observation: ChainObservation): Promise<ChainReviewer | null>
   prepare(identities: string[]): Promise<NodeJS.ProcessEnv>
   borrow(): (() => void) | null
   available(): boolean
@@ -147,12 +147,16 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // The chain's draws seed by its seed issue, so every observation
       // refresh re-reads the same roster instead of admitting new slots.
       const chainKey = `${chain.repository}#${chain.issue}`
+      const testHold = chain.testHold ?? (!chain.testRecovery?.admission ? chain.testRecovery?.hold : undefined)
+      const originalTest = chain.invocations.find(invocation => invocation.id === testHold?.invocationId)
+      const testProof = originalTest && implementationTestDependency(originalTest)
       // One process reads the seed issue, its comments and the publication
       // inspection together, reusing their existing projections. The output
       // cap is the sum of the three previous per-read caps, so no facet
       // loses budget; any facet failure still fails the whole observation.
       const [seed, roster] = await Promise.all([
-        github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch, ...actor], 3 * 2 * 1024 * 1024),
+        github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch,
+          ...(testProof ? ['--test-dependency-json', JSON.stringify(testProof)] : []), ...actor], 3 * 2 * 1024 * 1024),
         hooks.roster(chainKey),
       ])
       if (seed.issue_number !== chain.issue || seed.branch !== chain.branch
@@ -174,6 +178,17 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           state: typeof publication.state === 'string' ? publication.state : null, merged: publication.merged === true,
           merge_sha: publication.merge_sha === null ? null : sha(publication.merge_sha, 'publication') }, pull: null }
       if (seed.full_suite) observation.fullSuite = object(seed.full_suite, 'full-suite recovery')
+      if (seed.remediation) observation.remediation = object(seed.remediation, 'redundant remediation')
+      if (testProof && originalTest) {
+        const proof = object(seed.test_dependency, 'implementation test dependency')
+        if (proof.verified === true && ['base', 'run', 'runAttempt', 'baselineRun', 'baselineAttempt', 'remediation', 'failures']
+          .some(key => chainBasis(proof[key]) !== chainBasis(testProof[key as keyof typeof testProof]))) throw new Error('original implementation test evidence changed')
+        const recovery = proof.recovered === true ? object(proof.recovery, 'implementation test recovery') : null
+        observation.testDependency = { invocationId: originalTest.id, verified: proof.verified === true, recovered: proof.recovered === true,
+          ...(typeof proof.reason === 'string' ? { reason: proof.reason } : {}),
+          ...(recovery ? { recovery: { merge: sha(recovery.merge, 'delivered test recovery'), base: sha(recovery.base, 'recovered implementation base'),
+            run: object(recovery.run, 'original-test validation run') } } : {}) }
+      }
       const pendingReview = chain.invocations.find((invocation) => invocation.state === 'uncertain' && invocation.behavior === 'review-issue')
       if (pendingReview && typeof pendingReview.evidence?.callId === 'string') {
         const artifact = object(pendingReview.evidence.artifact, 'issue review publication receipt')
@@ -211,10 +226,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       let number = observation.publication.pull_number
       if (number === null && observation.issue.open && !observation.publication.head_sha) {
         await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['implement-issue'])
-        const { stdout } = await runFile('github-datastore', organizationArgs(org,
-          ['view', 'issue-dependencies', '--repo', chain.repository, '--number', String(chain.issue), '--format', 'json']),
-        { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
-        const dependencies = object(JSON.parse(stdout), 'issue prerequisites')
+        const dependencies = object(publication.prerequisites ?? {}, 'live issue prerequisites')
         const base = typeof publication.base_sha === 'string' && /^[0-9a-f]{40}$/.test(publication.base_sha) ? publication.base_sha : null
         const prerequisites: NonNullable<ChainObservation['prerequisites']> = { wait: null, base, evidence: [dependencies] }
         observation.prerequisites = prerequisites
@@ -407,7 +419,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const note = [await hooks.note(decision.behavior, chain, pull), decision.reason,
         dependency ? `Retained shared baseline CI dependency; keep candidate repairs scoped and do not duplicate its remediation: ${JSON.stringify(dependency.dependency)}` : ''].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
-        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`)
+        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`, chain, observation)
         if (!selected) return null
         const model = ['--model', selected.model, '--recovery-model', selected.recovery]
         if (decision.behavior === 'review-issue') return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: ['--issue-review', `${chain.repository}#${chain.issue}`,
@@ -439,7 +451,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const fixed = ['--expected-head', pull.head, '--token-user', decision.actor]
       if (decision.behavior === 'retire-pr') return { command: 'github-interface', cwd, nativeResources: 2,
         argv: ['--issue-work', String(chain.issue), '--mode', 'retire', '--branch', chain.branch, '--pull-number', String(pull.number),
-          '--coverage-json', JSON.stringify(observation.fullSuite), ...fixed] }
+          '--coverage-json', JSON.stringify(observation.fullSuite ?? observation.remediation), ...fixed] }
       if (decision.behavior === 'resolve-threads') return { command: 'github-interface', cwd, nativeResources: 2, argv: ['--resolve-nonblocking-conversations-if-ready', String(pull.number), '--username', chain.reviewer, ...fixed] }
       if (decision.behavior === 'rerun-grey-ci') {
         const run = pull.greyRuns[0]
@@ -539,7 +551,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         throw new Error('native action response differs from its immutable request')
       }
       const { stdout } = await runFile('agent-interface', ['--read-response', call.id],
-        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 256 * 1024 })
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 256 * 1024,
+          callId: call.id, readerPurpose: 'native-action-receipt' })
       // Caller prints the retained bytes plus one newline. Hash those bytes,
       // not a JavaScript reserialization (Python's 1.0 is JavaScript's 1).
       if (!stdout.endsWith('\n') || createHash('sha256').update(stdout.slice(0, -1)).digest('hex') !== call.artifact.response_sha) {

@@ -140,6 +140,14 @@ describe('cached article review synchronization', () => {
     expect((await request('/action', { id: 'thread-1', action: 'resolve' })).status).toBe(404)
   })
 
+  it('keeps its copy of GitHub\'s answer off the main connection, whose commits wait for the disk', async () => {
+    const mainChanges = () => database.db.prepare('SELECT total_changes()').pluck().get() as number
+    const before = mainChanges()
+    await request('/sync', {})
+    expect((await request()).body.reviews).toHaveLength(3)
+    expect(mainChanges()).toBe(before)
+  })
+
   it('coalesces readers, preserves provenance and reads immutable sources once', async () => {
     const responses = await Promise.all([request('/sync', {}), request('/sync', {}), request('/sync', {})])
     expect(mocks.query).toHaveBeenCalledTimes(1)

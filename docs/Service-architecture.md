@@ -368,6 +368,15 @@ children with the hooks while `relay` exists
 ([Agents' test suites](Operating.md#agents-test-suites)). The settings travel this
 way because only a new container would take an environment variable.
 
+The relay retains the last 1,024 retired run IDs, their workspace owners and, for
+jobs, SHA-256 runner-token digests in memory, outside active admission slots.
+After the signed-key and current-access
+checks, the owner's exact `DELETE /runs/:id` returns 204 even while box termination
+is pending. An exact `POST /runs/:id/output` with a constant-time digest match
+returns 410 without processing output or logging a redundant request warning.
+Unknown, evicted and foreign IDs, invalid tokens and other requests retain their
+failure warnings. Run-stop, missing-result and box-termination diagnostics remain independent.
+
 The relay's run admission advertises `dependencyCache: true`. The authenticated
 workspace can send `POST /runs/:id/dependency?sha256=…` between checkout parts
 to insert one cached gzip member in order. An empty request looks up the
@@ -479,7 +488,11 @@ its own instead of refusing with dirty_unowned.
   marked failed and never run again; the image's own release takes over.
   Production shutdown synchronously retains deadline and rejection evidence in
   the private Logging store before exit 1, even after Logging stops. The
-  supervisor records its own abnormal exit event. Clean exit 75 stays quiet.
+  supervisor supplies a fresh `POISE_SHUTDOWN_DIAGNOSTIC_ID` for every launch.
+  A read-only lookup of that launch's owner-scoped shutdown Error permits a
+  distinct `workspace.exit` Warning linked by `correlationId`, retaining the
+  actual exit code and signal. Missing, unavailable or mismatched evidence keeps
+  the independent exit Error. Clean exit 75 stays quiet.
   On Linux the same supervisor owns the private native-cleanup controller.
   Its uid-only Unix socket and random generation are passed to Poise and
   Caller as `POISE_NATIVE_CONTROL`; neither the address nor per-Call tokens
@@ -553,9 +566,13 @@ its own instead of refusing with dirty_unowned.
 - **Shutdown.** Active HTTP responses finish before their keep-alive sockets
   retire. Storage-pressure passes, including native Caller cleanup and receipt
   reconciliation, join the background barrier: a release switch waits for the
-  admitted pass before starting shutdown. Clean shutdown waits for runtime cleanup
+  admitted pass before starting shutdown. Collaborator reconciliation also joins
+  that barrier, retaining the admitted invitation's account confirmation before
+  the switch; new passes wait during a pending switch or drain.
+  Clean shutdown waits for runtime cleanup
   and HTTP closure, closes SQLite, then exits 75. The existing ten-second deadline
   still exits 1 with one structured Error naming pending shutdown phases and
+  unresolved runtime stops (including `runtime_stop.agent_collaborator`) and
   retaining known cleanup failure causes.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
@@ -573,6 +590,12 @@ its own instead of refusing with dirty_unowned.
   with `x-poise-updating: 1`: "Updating to the latest version" for a page, 503
   `workspace_updating` for anything else. Poise dims the open page with the
   same notice and reloads it once Poise answers again (`src/updating.ts`).
+  A GET/HEAD connection reset before response headers uses this same response
+  only for a known switch whose fresh health probe cannot reach the workspace
+  or finds it healthy on the requested release. A healthy old release keeps
+  the ordinary 502. The reset invalidates cached readiness, so recovery freshly
+  verifies `/api/service/health` on the requested release. `proxy.failed` retains
+  its Error with request and requested-release evidence; no request is replayed.
 - **Everything else.** An image of another base, a workspace started without
   the supervisor, or a changed container setting still gets a new container,
   drained first ([Deployment](#deployment)). The gateway makes the new image's
@@ -1276,6 +1299,16 @@ whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
 its own, keeping its volume and respecting the native settlement barrier.
 The reporting allowlist is reconciled separately through trusted service
 configuration without replacing a compatible running container.
+Replacement pins stop and removal to the inspected container ID. If stopping
+fails, the gateway inspects that ID and the current workspace name separately.
+It continues only for the same owned container with an explicit stopped state;
+an absent, unreadable or malformed target cannot authorize removal. An already
+serving successor is left alone and observed only after the old container is
+confirmed stopped or absent and its own ownership, image, settings and health
+(including the intended release) match. Otherwise the upgrade retains an Error
+with the stop cause and safe old/current identity and inspection evidence.
+Abandoning replacement releases a drain only while the original container still
+owns the workspace name.
 The operator scripts retain an exact-release rollout receipt beyond their
 bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
 receipt through the existing workspace health/image proof without initiating
@@ -1356,6 +1389,11 @@ at its last confirmed time; restart remains initializing until a fresh scan.
 Canonical host selection and redaction run on the edge before transmission,
 then attribution and normalization run again at the gateway. See the
 [external reader installation contract](../deploy/ingress/README.md).
+The host deployment verifier also sends bounded observations through that
+private operator socket. The gateway retains rollout/workspace deadline and
+recovery diagnostics using the existing v1 envelope/store, without a public
+ingestion route or a release/replacement control change; [Logging](Logging.md#collection-and-operation)
+defines the budget, deduplication and recovery contract.
 The edge also derives the fixed `/api/link/events` route label before removing
 the URI. All ingress paths apply the narrow native cancellation exception and
 retain other redacted causes as defined in [Logging](Logging.md#collection-and-operation).
@@ -1416,9 +1454,11 @@ reconnect/provider-verification evidence; these optional fields do not change
 reducer state or old event hashes. Ambiguous older events stay unknown. See
 [System health](Analytics.md#system-health).
 
-New implementation admission also consumes Caller's captured forward GitHub
+New implementation admission also consumes Caller's complete live forward GitHub
 prerequisites and verified delivery on the implementation base through the
-existing chain sweep. [Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
+existing chain sweep, including a final observation after awaited request
+preparation. The mirror health gate remains required.
+[Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
 dependency wait; no gateway route, journal event or poller is added.
 
 The workspace's existing `/api/behavior-chains` controls also expose an explicit
@@ -1496,8 +1536,16 @@ declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 The same reconciliation can release a CI-only hold after a proven clean base
-update, retaining the original Call, resource-release proof and remaining gates
+update, or admit the existing scoped repair when a fresh conflict on the retained
+failed head blocks that update, retaining the original Call, resource-release
+proof, repair retry bound and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
+For a pre-PR implementation, the existing Caller artifact and seed read can
+instead verify an original CI assertion failure on its exact prepared base and
+the delivered main recovery with validation of the original failing tests.
+The journal admits one fresh implementation for that automatic hold and recovery
+commit, independently of report publishing. Missing original evidence and later
+operator holds retain their authority; no gateway route or new poller is added.
 
 The first `/api/behavior-chains` list page also includes read-only `attention`
 across all active chain pages. It joins durable progress age, holds, exact-head
@@ -1519,6 +1567,12 @@ This uses the existing owner workspace boundary and canonical journal, including
 completed chains. Ambiguous or missing matches remain unknown, as does a failed
 workspace read; central Logging queries and retained evidence remain independent.
 No gateway read, scope, ingestion or execution authority is added.
+Typed provider analysis handoffs use the existing v1 diagnostic envelope and
+positive no-submission evidence. The same work-impact read confirms only later
+same-PR/head/basis/slot successor admissions or attributed review verdicts for
+Warning display; current blockers retain Error. Source events and their IDs
+remain immutable, including historical unproven handoffs. The exact display and
+source-filter distinction is defined in [Logging](Logging.md#observe--logging).
 Initial remediation report bodies retain a dated snapshot of this projection;
 later recovery does not rewrite it. Optional annotation failure leaves impact
 unknown and does not consume the report's creation attempt.
@@ -1531,12 +1585,21 @@ defines its reconciliation rules.
 Atomic publication also retains its original pre-write phase: a proven no-write
 failure settles through the existing Caller receipt after resource release;
 missing original push evidence stays visible in the chain wait with its fence intact.
+PR review and approval deadlines likewise carry validated no-publication results
+through Caller completion and native resource settlement under those same
+[recovery rules](Behavior-chain.md#authority-and-recovery); a diagnostic or
+cleanup alone cannot release an unknown publication effect.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
 started originals without a Call remain uncertain without a retry or synthetic
 no-effect receipt, since partial recovery can lose the original unique correlation.
-Unreadable snapshots retain that hold in the existing journal. Existing Calls and uncertain
+Unreadable snapshots retain that hold in the existing journal.
+The existing in-flight review/approval poll also observes same-head closure.
+It waits for active submission and retains completed-turn results while preventing
+further analysis. Unattempted rounds use `review_target_closed`; attempted writes
+retain the original publication fence and receipt.
+Existing Calls and uncertain
 resources are never released by closure alone. Merged-chain Hold/Resume writes
 return 409 and the GUI retains History and read-only reconciliation. No new
 endpoint, signal or journal event type is added; the Caller contract is in
@@ -1663,6 +1726,14 @@ empty queue cannot authorize another enqueue. See
 Conversation-resolution summaries also expose the original Call's validated
 per-thread progress; partial progress retains the original action's uncertainty.
 
+History response details distinguish typed ordinary Caller absence from a
+promised response that is missing or unreadable. `/api/agent-response/CALL_ID`
+returns `{id, disposition: "unavailable", reason}` for ordinary absence, keeping
+it out of process Error; actual failures remain 502 and retain the exact Call ID
+and reader purpose. Required content and native-action reads still reject absent
+results, preserving receipt digests and publication/retry fences. The CLI's
+response-read contract is in [agent_interface](../caller/agent_interface/README.md#reading-a-response).
+
 Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
 code and existing v1 diagnostic into chain receipts and History. The unchanged
 no-publication shape and retry requirements are defined in
@@ -1671,7 +1742,11 @@ no-publication shape and retry requirements are defined in
 Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
 opt-in enables verified repair incomplete-reply, repair execution-budget
-or PR review timeout exhaustion, verified automatic implementation holds before a PR,
+or PR review timeout exhaustion, including retained legacy review/approval stops
+from their existing reconciliation independently of model readiness or v2 mode,
+verified automatic implementation holds before a PR and terminal repair holds
+before publication,
+terminal uncertain implementation publication,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
 sources without an explicit hold, supplied by trusted service configuration or the
@@ -1683,6 +1758,14 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Terminal repair reports require the matching automatic hold, settled original Call,
+positive release and unchanged open PR head and repair basis, without possible
+publication effects. They preserve repair ownership and exclude CI-only recovery holds.
+Uncertain implementation reports instead require the original failed `publishing`
+Call, verified resource release and fresh open-source eligibility and publication
+reconciliation. They preserve its missing-push-evidence action and execution fence,
+reusing verified matching linked reports even when closed and markerless; they
+authorize neither replacement implementation nor a second push.
 Durable creation intent prevents another POST after an uncertain result; the source state,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. Closed-PR continuations verify existing source/PR

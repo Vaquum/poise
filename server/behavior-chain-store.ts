@@ -46,6 +46,8 @@ export interface BehaviorChain {
   sequence: number
   held: string | null
   ciHold?: { invocationId: string, callId: string, head: string }
+  testHold?: { invocationId: string, callId: string, sequence: number }
+  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string }
   waiting: string | null
   resumedAfterSequence: number
   mergeSha: string | null
@@ -64,9 +66,9 @@ export interface ChainRecoveryOrigin {
 export type ChainEvent =
   | { type: 'chain.admitted', repository: string, issue: number, branch: string, author: string, reviewer: string }
   | { type: 'chain.observed', observation: Record<string, unknown> }
-  | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'] }
+  | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'], testHold?: Omit<NonNullable<BehaviorChain['testHold']>, 'sequence'> }
   | { type: 'chain.waiting', reason: string }
-  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], recovery?: ChainRecoveryOrigin }
+  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'], recovery?: ChainRecoveryOrigin }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
@@ -118,7 +120,7 @@ const RECHECK_AT_SQL = `CASE
     AND json_extract(state, '$.invocations[#-1].behavior') IN ('merge-pr', 'resolve-threads') THEN
       CASE WHEN json_type(state, '$.invocations[#-1].evidence.nativeActionReceipt') IS NULL THEN NULL ELSE 0 END
   WHEN json_extract(state, '$.observation.checkedAt') IS NULL THEN 0
-  WHEN json_extract(state, '$.ciHold') IS NOT NULL
+  WHEN json_extract(state, '$.ciHold') IS NOT NULL OR json_extract(state, '$.testHold') IS NOT NULL
     OR (json_extract(state, '$.held') IS NOT NULL AND json_extract(state, '$.mergeSha') IS NULL
       AND json_extract(state, '$.observation.pull.state') = 'open') THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,
@@ -148,10 +150,19 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     next.held = event.reason
     if (event.ciHold) next.ciHold = event.ciHold
     else delete next.ciHold
+    if (event.testHold) next.testHold = { ...event.testHold, sequence }
+    else delete next.testHold
   } else if (event.type === 'chain.resumed') {
+    if (event.testRecovery) {
+      if (!next.held || !next.testHold || next.testRecovery || event.testRecovery.admission
+        || chainBasis(event.testRecovery.hold) !== chainBasis(next.testHold)
+        || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
+      next.testRecovery = event.testRecovery
+    } else if (!event.ciRecovery) delete next.testRecovery
     next.held = null
-    if (!event.ciRecovery) next.resumedAfterSequence = sequence
+    if (!event.ciRecovery && !event.testRecovery) next.resumedAfterSequence = sequence
     delete next.ciHold
+    delete next.testHold
   }
   else if (event.type === 'chain.merged') {
     if (!SHA.test(event.mergeSha) || event.evidence.merged !== true || event.evidence.merge_sha !== event.mergeSha
@@ -176,6 +187,12 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
   } else if (event.type === 'invocation.admitted') {
     if (next.held || next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
     const invocation = event.invocation
+    if (invocation.behavior === 'implement-issue' && next.testRecovery) {
+      const original = next.invocations.find(item => item.id === next.testRecovery!.hold.invocationId)
+      if (next.testRecovery.admission || !original || original.basis !== invocation.basis || original.slot !== invocation.slot
+        || original.actor !== invocation.actor) throw new Error('verified test recovery admits one fresh original implementation')
+      next.testRecovery = { ...next.testRecovery, admission: invocation.id }
+    }
     if (!invocation.id || !invocation.basis || !invocation.actor || !Number.isSafeInteger(invocation.admittedAt)
       || invocation.admittedAt < 0 || next.invocations.some((prior) => prior.id === invocation.id)
       || next.invocations.some((prior) => prior.state !== 'settled')) throw new Error('behavior chain already owns an invocation or admission is invalid')
@@ -394,6 +411,16 @@ export class BehaviorChainJournal {
     return rows.map(row => this.read(row.chain_id)!)
   }
 
+  capacityWaiters(): BehaviorChain[] {
+    const rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current WHERE merged = 0
+      AND json_extract(state, '$.held') IS NULL
+      AND json_extract(state, '$.waiting') IN (?, ?)
+      AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i
+        WHERE json_extract(i.value, '$.state') != 'settled')`)
+      .all('shared native invocation capacity is occupied', 'waiting for the shared native behavior capacity') as Array<{ chain_id: string }>
+    return rows.map(row => this.read(row.chain_id)!)
+  }
+
   /** Ownership pages stay unchanged. Quiescent history cannot consume the
    * normal-work page, including when its scheduled recheck becomes due. */
   reconcilable(after: string, now: number, deferred: boolean, limit = 100): BehaviorChain[] {
@@ -606,7 +633,12 @@ export class BehaviorChainJournal {
   }
 
   capacitySnapshot() {
-    return this.db.transaction(() => ({ modelInvocations: this.liveModelInvocationCount(), reservations: this.reservedResources() }))()
+    return this.db.transaction(() => {
+      const retained = cachedStatement(this.db, `SELECT count(*) AS count FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+        WHERE c.resource_pending = 1 AND json_extract(i.value, '$.model') IS NOT NULL
+          AND json_extract(i.value, '$.state') = 'uncertain' AND behavior_native_resources_pending(i.value) = 1`).get() as { count: number }
+      return { modelInvocations: this.liveModelInvocationCount(), retainedModelInvocations: retained.count, reservations: this.reservedResources() }
+    })()
   }
 
   /** Resource allowances held by live native invocations, over the same

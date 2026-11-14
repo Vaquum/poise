@@ -68,6 +68,9 @@ export interface RunFileOptions {
   /** Declare this call a probe: a matching exit rejects with `expected: true`
    *  and is not reported to the process-failure observer. */
   expected?: ExpectedFailure
+  /** Identity for a response read; argv and response bodies stay excluded. */
+  callId?: string
+  readerPurpose?: string
 }
 
 /** True when the runFile rejection was a declared expected probe outcome. */
@@ -429,6 +432,13 @@ export interface ProcessFailureEvidence {
   timeoutMs: number
   stderrAllowed: boolean
   secrets: string[]
+  callId?: string
+  readerPurpose?: string
+}
+const processFailures = new WeakMap<Error, ProcessFailureEvidence>()
+/** Original child evidence, including when its handler owns reporting. */
+export function processFailureEvidence(error: unknown): ProcessFailureEvidence | undefined {
+  return error instanceof Error ? processFailures.get(error) : undefined
 }
 let processFailureObserver: ((error: Error, evidence: ProcessFailureEvidence) => void) | null = null
 export function setProcessFailureObserver(observer: typeof processFailureObserver): void { processFailureObserver = observer }
@@ -464,13 +474,17 @@ export function runFile(
   return new Promise((resolve, reject) => {
     const startedAt = Date.now()
     const observe = (error: Error) => {
+      const evidence = { command, executable: resolveCommand(command),
+        operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review',
+          '--requested-changes-addressed', '--review-activity-since', '--head-sha', '--local-checkout-path', '--checkout-repo'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
+        cwd: options.cwd ?? null, elapsedMs: Date.now() - startedAt, timeoutMs: timeout,
+        callId: options.callId, readerPurpose: options.readerPurpose,
+        stderrAllowed: !(command === 'gh' && args[0] === 'auth' && args[1] === 'token'),
+        secrets: environmentSecrets(options.env ?? {}) }
+      processFailures.set(error, evidence)
       if (!processFailureObserver || options.reportFailure === false || options.signal?.aborted || args[0] === '--diagnostics') return
       try {
-        processFailureObserver(error, { command, executable: resolveCommand(command),
-          operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
-          cwd: options.cwd ?? null, elapsedMs: Date.now() - startedAt, timeoutMs: timeout,
-          stderrAllowed: !(command === 'gh' && args[0] === 'auth' && args[1] === 'token'),
-          secrets: environmentSecrets(options.env ?? {}) })
+        processFailureObserver(error, evidence)
       } catch (failure) {
         process.stderr.write(JSON.stringify({ level: 'error', event: 'logging.process_observer.failed', message: failure instanceof Error ? failure.message : 'observer failure' }) + '\n')
       }

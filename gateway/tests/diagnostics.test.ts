@@ -94,6 +94,53 @@ describe('one diagnostic contract', () => {
     expect(normalize(input, NOW)).toMatchObject({ severity: 'warning', source: 'caller', operation: 'provider.cli_update' })
   })
 
+  it.each([
+    { phase: 'overall', nested: true, group: 1, elapsed: 1144.8, remaining: 0, timeout: 0,
+      error: 'Review reached its total time limit; needs attention' },
+    { phase: 'file_group', nested: false, group: 2, elapsed: 60, remaining: 78.4, timeout: 60,
+      error: 'Review file-group time limit reached; incomplete analysis; reduce the review scope' },
+  ])('retains the $phase review deadline cause through delivery and replay', ({ phase, nested, group, elapsed, remaining, timeout, error }) => {
+    const detail = `Incomplete analysis in file group ${group} of 4: ${phase} deadline; elapsed ${elapsed.toFixed(1)}s; remaining analysis ${remaining.toFixed(1)}s.`
+    const context = { message: detail + '\nAuthorization: Bearer private-review-credential', timeout_seconds: timeout }
+    const row = { id: 'c'.repeat(32), completed_at: new Date(NOW).toISOString(), status: 'failed', behavior: 'pr_review',
+      error, error_code: 'review_budget_exhausted', diagnostic: { version: 1, severity: 'error', operation: 'provider.review',
+        phase, stderr: '', ...(nested ? { context } : context) } }
+    const input = callerDiagnostic(row, 'alice')!
+    const original = normalize(input, NOW)!
+    const generic = normalize({ ...input, cause: [] }, NOW)!
+    expect(original.id).toBe(generic.id)
+    expect(original.incidentId).not.toBe(generic.incidentId)
+    const local = store(); local.append([original])
+    const delivery = local.delivery(alice)
+    expect(delivery.events).toHaveLength(1)
+    const central = store()
+    const delivered = workspaceEnvelope(JSON.parse(JSON.stringify(delivery.events[0])), 'alice', NOW, [])
+    expect(central.append([delivered])).toBe(1)
+    expect(central.append([workspaceEnvelope(delivery.events[0], 'alice', NOW + 1000, [])])).toBe(0)
+    const expected = { id: original.id, incidentId: original.incidentId, severity: 'error', phase, message: error,
+      cause: [detail + '\n[redacted header]'], stderr: '', timeoutMs: timeout * 1000, callId: row.id }
+    expect(central.query(alice, { source: 'caller', callId: row.id })).toMatchObject({ total: 1, events: [{ ...expected, occurrences: 1 }] })
+    expect(central.lookup(alice, original.id)).toMatchObject({ status: 'found', event: expected })
+    expect(JSON.stringify(central.lookup(alice, original.id))).not.toContain('private-review-credential')
+  })
+
+  it.each([null, {}, { message: '' }, { message: '   ' }, { message: 'Generic review deadline' }])(
+    'does not invent or duplicate a Caller cause for %j', (diagnostic) => {
+      const original = normalize(callerDiagnostic({ id: 'b'.repeat(32), status: 'failed', error: 'Generic review deadline',
+        diagnostic: diagnostic && { version: 1, severity: 'error', ...diagnostic } }, 'alice')!, NOW)!
+      const db = store(); db.append([workspaceEnvelope(original, 'alice', NOW, [])])
+      expect(db.lookup(alice, original.id)).toMatchObject({ status: 'found', event: { message: 'Generic review deadline', cause: [] } })
+    })
+
+  it('keeps a standalone Caller detail as the summary and bounds additional cause text', () => {
+    const row = { id: 'b'.repeat(32), diagnostic: { version: 1, severity: 'error', message: '障'.repeat(500) } }
+    expect(normalize(callerDiagnostic(row, 'alice')!, NOW)).toMatchObject({ message: row.diagnostic.message, cause: [] })
+    const record = normalize(callerDiagnostic({ ...row, error: 'Generic review deadline' }, 'alice')!, NOW)!
+    expect(record.cause).toHaveLength(1)
+    expect(Buffer.byteLength(record.cause[0])).toBeLessThanOrEqual(512)
+    expect(record.truncated).toBe(true)
+  })
+
   it('keeps a later Call failure separate from its earlier preparation warning', () => {
     const warning = { version: 1, severity: 'warning', operation: 'provider.cli_update', phase: 'launcher_verification',
       stderr: 'Retained launcher warning' }
@@ -103,6 +150,23 @@ describe('one diagnostic contract', () => {
       message: 'Provider ended without a result', stderr: null, context: { priorWarning: warning, evidenceIncomplete: true } })
     expect(JSON.stringify(input)).not.toContain('private prompt')
     expect(JSON.stringify(input)).not.toContain('private argument')
+  })
+
+  it.each(['error', 'warning'])('retains a typed no-submission handoff at Error pending successor evidence (source %s)', severity => {
+    const row = { id: 'a'.repeat(32), status: 'failed', behavior: 'pr_review', error_code: 'review_budget_exhausted',
+      error: 'analysis time limit; handing off', expected_head: 'b'.repeat(40),
+      diagnostic: { version: 1, source: 'caller', severity, operation: 'provider.review', phase: 'analysis',
+        outcome: 'handoff', submission: 'none', stderr: '', stderr_truncated: false } }
+    const event = workspaceEnvelope(normalize(callerDiagnostic(row, 'alice')!, NOW)!, 'alice', NOW, [])
+    expect(event).toMatchObject({ severity: 'error', operation: 'provider.review.handoff', phase: 'analysis',
+      context: { submission: 'none', errorCode: row.error_code, expectedHead: row.expected_head } })
+    expect(event.context).not.toHaveProperty('priorWarning')
+    for (const diagnostic of [null, { ...row.diagnostic, submission: null },
+      { ...row.diagnostic, phase: 'submitting', submission: 'uncertain' }, { ...row.diagnostic, outcome: 'timed_out' }]) {
+      const input = callerDiagnostic({ ...row, diagnostic }, 'alice')!
+      expect(input.level).toBe('error')
+      expect(input.operation).not.toBe('provider.review.handoff')
+    }
   })
 
   it.each([
@@ -504,6 +568,26 @@ describe('collection independence and Caller evidence', () => {
     expect(callerDiagnostic({ ...row, outcome: 'superseded' }, 'alice')).toBeNull()
     expect(callerDiagnostic({ ...row, error_code: 'stopped' }, 'alice')).toBeNull()
     expect(callerDiagnostic({ ...row, diagnostic: null, outcome: 'changes_requested' }, 'alice')).toMatchObject({ level: 'error', message: row.error })
+  })
+
+  it('excludes only the typed issue revision fence, with contradictory publication evidence kept visible', () => {
+    const row = { id: 'a'.repeat(32), behavior: 'issue_review', status: 'failed', error_code: 'issue_revision_changed',
+      action: 'not_started', outcome: 'preflight_failed', error: 'seed issue changed during review; no comments posted' }
+    // This is also the metadata-only --diagnostics shape: absence is not the proof.
+    expect(callerDiagnostic(row, 'alice')).toBeNull()
+    expect(callerDiagnostic({ ...row, receipts: null, resource_error: null, ownership_error: null,
+      artifact: { phase: 'reviewing', resource_root: '/owned' },
+      resource_ownership: { version: 1, roots: [], errors: [] } }, 'alice')).toBeNull()
+    for (const change of [{ behavior: 'pr_review' }, { status: 'error' }, { error_code: null }, { error_code: 'posting_failed' },
+      { action: null }, { outcome: null }, { receipts: [] }, { receipts: [{ comment_id: 17 }] }, { review_id: 17 }, { head_sha: 'b'.repeat(40) },
+      { resource_error: 'cleanup_failed' }, { resource_error: 'invalid_artifact' },
+      { ownership_error: 'ownership_failed' }, { ownership_error: 'invalid_ownership' },
+      { resource_ownership: { version: 1, roots: [], errors: [{ cause: 'cleanup failed', path: null, at: 1 }] } },
+      { resource_ownership: { version: 1, roots: [], errors: 'oops' } },
+      { artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } },
+      { artifact: { phase: 'reviewing', plan_sha: 'b'.repeat(64) } }, { artifact: { phase: 'reviewing', resource_error: 'cleanup_failed' } }]) {
+      expect(callerDiagnostic({ ...row, ...change }, 'alice'), JSON.stringify(change)).toMatchObject({ level: 'error', message: row.error })
+    }
   })
 
   it.each(['changes_requested', 'clean', 'approved'])('retains a failed Caller operation despite its %s verdict and missing structured evidence', (outcome) => {

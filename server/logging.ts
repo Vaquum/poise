@@ -8,7 +8,7 @@ import { environmentSecrets, normalize, type DiagnosticInput } from '../gateway/
 import { DiagnosticRuntime } from '../gateway/src/diagnostics/runtime'
 import { diagnosticDeliveryPage } from '../gateway/src/diagnostics/workspace-delivery'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
-import { runFile, setProcessFailureObserver } from './process'
+import { processFailureEvidence, runFile, setProcessFailureObserver } from './process'
 import { behaviorErrorMessage } from './behavior-diagnostics'
 import { classifyBehaviorDiagnostic } from '../src/behavior-failure-cause'
 
@@ -69,6 +69,8 @@ export function diagnostic(input: Omit<DiagnosticInput, 'source' | 'workspace'> 
 }
 
 export function diagnosticFailure(operation: string, error: unknown, context: Record<string, unknown> = {}, options: { level?: 'error' | 'warning'; secrets?: readonly string[]; stderr?: boolean; condition?: string } = {}): string | null {
+  if (!active) return null
+  const processEvidence = processFailureEvidence(error)
   const value = error instanceof Error ? error : new Error(typeof error === 'string' ? error : 'Operation failed without an Error')
   const exception = value instanceof DOMException
   const fields = error as { stderr?: unknown; code?: unknown; signal?: unknown; errno?: unknown; killed?: unknown } | null
@@ -76,17 +78,19 @@ export function diagnosticFailure(operation: string, error: unknown, context: Re
   const seen = new Set<Error>([value])
   let underlying: unknown = value.cause
   while (underlying instanceof Error && !seen.has(underlying) && cause.length < 8) { seen.add(underlying); cause.push(underlying.message); underlying = underlying.cause }
-  context = { ...diagnosticIdentity(error), ...context }
+  context = { ...diagnosticIdentity(error),
+    ...(processEvidence ? { executable: processEvidence.executable, configuredCommand: processEvidence.command,
+      cwd: processEvidence.cwd, elapsedMs: processEvidence.elapsedMs, timeoutMs: processEvidence.timeoutMs } : {}), ...context }
   const identity = (key: string) => typeof context[key] === 'string' ? context[key] as string : null
   return diagnostic({ level: options.level ?? 'error', operation, condition: options.condition, cause, truncated: underlying instanceof Error, account: identity('account'), repository: identity('repository'),
     callId: identity('callId'), correlationId: identity('correlationId'), requestId: identity('requestId'), behavior: identity('behavior'), target: identity('target'), phase: identity('phase'),
     timeoutMs: typeof context.timeoutMs === 'number' ? context.timeoutMs : null, message: value.message, stack: value.stack,
-    stderr: options.stderr === false ? null : typeof fields?.stderr === 'string' ? fields.stderr : null,
+    stderr: (options.stderr ?? processEvidence?.stderrAllowed) === false ? null : typeof fields?.stderr === 'string' ? fields.stderr : null,
     exitCode: !exception && typeof fields?.code === 'number' ? fields.code : null,
     signal: typeof fields?.signal === 'string' ? fields.signal : null,
     errno: typeof fields?.errno === 'string' || typeof fields?.errno === 'number' ? fields.errno : null,
     context: { ...context, ...(exception ? { exceptionName: value.name, exceptionCode: value.code } : {}),
-      code: typeof fields?.code === 'string' ? fields.code : null, killed: fields?.killed === true } }, options.secrets)
+      code: typeof fields?.code === 'string' ? fields.code : null, killed: fields?.killed === true } }, [...(processEvidence?.secrets ?? []), ...(options.secrets ?? [])])
 }
 
 function saveCallerCheckpoint(): void {
@@ -164,7 +168,8 @@ export function startLogging(options: { captureFatal?: boolean } = {}): void {
   setProcessFailureObserver((error, evidence) => {
     const code = ['github-interface', 'github-datastore'].includes(evidence.command)
       ? classifyBehaviorDiagnostic(behaviorErrorMessage(error, Infinity)).code : null
-    diagnosticFailure(evidence.operation, error, { executable: evidence.executable, configuredCommand: evidence.command, cwd: evidence.cwd, elapsedMs: evidence.elapsedMs, timeoutMs: evidence.timeoutMs },
+    diagnosticFailure(evidence.operation, error, { executable: evidence.executable, configuredCommand: evidence.command, cwd: evidence.cwd, elapsedMs: evidence.elapsedMs, timeoutMs: evidence.timeoutMs,
+      callId: evidence.callId, readerPurpose: evidence.readerPurpose },
       { level: code === 'upstream_unavailable' || code === 'network_interruption' ? 'warning' : 'error', secrets: evidence.secrets, stderr: evidence.stderrAllowed })
   })
   active.observe('application', 'poise', workspace)

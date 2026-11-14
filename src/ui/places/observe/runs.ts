@@ -5,6 +5,7 @@
 // new is the status in the seven state words, then the outcome (#556, Design →
 // Vocabulary), and the behaviors' own names.
 import { PHASE_LABELS, type ModelProgress } from '../../../agent-progress'
+import { issueReviewSuperseded } from '../../../../gateway/src/diagnostics/caller-outcome'
 import type { StateKey } from './chains'
 
 export interface LogEntry {
@@ -106,6 +107,7 @@ export function groupRuns(list: readonly LogEntry[]): RunGroup[] {
         entry.status, entry.outcome, entry.error, entry.error_code ?? null,
         entry.head_sha ?? null, entry.expected_head ?? null, entry.action ?? null,
         entry.review_policy ?? null, entry.review_id ?? null, entry.receipts ?? null, entry.runner ?? null,
+        issueReviewSuperseded(entry),
       ])
     const group = groups.get(key)
     if (group) group.entries.push(entry)
@@ -227,6 +229,7 @@ export function statusOf(e: LogEntry, now = Date.now()): { state: StateKey, word
   const status = (e.status || '').toLowerCase()
   if (isRunning(e)) { const p = progressText(e, now); return { state: 'running', word: 'Running', note: p.text, warn: p.warn } }
   const failure = firstLine(e.error)
+  if (issueReviewSuperseded(e)) return { state: 'idle', word: 'Superseded', note: 'Issue changed', warn: false }
   if (e.outcome === 'approved') return { state: 'done', word: 'Approved', note: reviewNote(e), warn: false }
   if (e.outcome === 'clean') return { state: 'done', word: 'No comments', note: '', warn: false }
   if (e.outcome === 'changes_requested') return { state: 'done', word: 'Changes requested', note: reviewNote(e), warn: false }

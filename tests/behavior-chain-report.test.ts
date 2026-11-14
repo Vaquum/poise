@@ -8,10 +8,10 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, ReviewScopeIndexingError, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
-import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, setRepairReportRepositories } from '../server/behavior-chain-report'
+import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, setRepairReportRepositories } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
 import { nativeRequestSha } from '../server/behavior-chain-action'
-import { behaviorChainWorkImpact } from '../server/behavior-chain-summary'
+import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
 import type { LogEntry } from '../server/agent-log-parse'
 import type { Organization } from '../server/organizations'
@@ -43,7 +43,11 @@ const MIXED_REVIEW_FAILURES: Array<Pick<LogEntry, 'error' | 'error_code' | 'diag
       outcome: 'timed_out', stderr: 'private inspection output', stderr_truncated: false,
       context: { timeout_seconds: 30, cwd: '/private/work', message: '--requests-json private inspection arguments' },
       filesystem: { path: '/private/work' } } },
-  { callId: '188bcb47407849c6b97bd45d1e261a97', error_code: 'review_budget_exhausted', error: REVIEW_ERRORS[2] },
+  { callId: '188bcb47407849c6b97bd45d1e261a97', error_code: 'review_budget_exhausted',
+    error: 'Review file-group time limit reached; incomplete analysis; reduce the review scope',
+    diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'file_group',
+      outcome: 'timed_out', stderr: '', stderr_truncated: false,
+      context: { submission: 'none', timeout_seconds: 60 }, filesystem: null } },
 ]
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
 const databases: Database.Database[] = []
@@ -119,7 +123,7 @@ beforeEach(() => {
     if (argv[0] === 'auth') return { stdout: 'fixture-token', stderr: '' }
     if (argv[1] === 'search/issues') return response({ incomplete_results: false, total_count: searchVisible ? remote.length : 0, items: searchVisible ? remote : [] })
     if (argv[1] === 'repos/acme/repo/issues' && argv.some(arg => arg.startsWith('title='))) {
-      const row = issue(99, argv.find(arg => arg.startsWith('body='))!.slice(5))
+      const row = issue(Math.max(98, ...remote.map(row => row.number)) + 1, argv.find(arg => arg.startsWith('body='))!.slice(5))
       row.title = argv.find(arg => arg.startsWith('title='))!.slice(6)
       if (!dropLabels) row.labels = [{ name: 'poise' }]
       remote.push(row)
@@ -204,12 +208,12 @@ function unpublished(): ChainObservation {
   return { ...observation(), pull: null,
     publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }
 }
-function blockedImplementation(journal: BehaviorChainJournal) {
+function blockedImplementation(journal: BehaviorChainJournal, invocationId?: string) {
   fresh = unpublished()
   let chain = journal.read('acme/repo#7') ?? journal.append('acme/repo#7', 'seed:7', 0,
     { type: 'chain.admitted', repository: 'acme/repo', issue: 7, branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' }, NOW - 600_000)
   chain = record(journal, chain, { type: 'chain.observed', observation: { ...fresh, checkedAt: NOW - 600_000 } })
-  const id = `implementation-${chain.resumedAfterSequence}`
+  const id = invocationId ?? `implementation-${chain.resumedAfterSequence}`
   chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id, behavior: 'implement-issue',
     basis: chainBasis(['issue', fresh.issue.revision]), actor: chain.author, slot: reviewer.slot, model: reviewer.model,
     admittedAt: NOW - 300_000, request: { command: 'agent-interface', cwd: '/fixture',
@@ -222,6 +226,39 @@ function blockedImplementation(journal: BehaviorChainJournal) {
     action: 'not_started', outcome: 'preflight_failed', error_code: 'atomic_work_blocked',
     error: 'atomic behavior blocked: Caller health validation failed; test relay unavailable',
     head_sha: null, expected_head: null, response: null, receipts: null, review_id: null,
+    artifact: { phase: 'executing', prepared: { checkout_head: HEAD }, resource_root: '/private/work' },
+    resources_settled_at: new Date(NOW - 100_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } }
+  return { chain, call }
+}
+function uncertainImplementation(journal: BehaviorChainJournal) {
+  const fixture = blockedImplementation(journal, '104dbf93-4dfd-489e-90c4-a5f7447fa8bc')
+  Object.assign(fixture.call, { id: 'a0dc866e144840b2a7ea923306913c49', action: null, outcome: null,
+    error_code: 'atomic_work_failed', error: 'atomic behavior failed during publishing: private provider output /private/work',
+    artifact: { phase: 'publishing', plan_sha: 'd459b301124eef5631cadd755b4483f7fbf41671c8a2a9be28ba5d382c9c68be',
+      publication_head: '3c7c5e00c5fb75f53fac307e6a57f70bbc1015df' } })
+  return fixture
+}
+function blockedRepair(journal: BehaviorChainJournal) {
+  fresh = observation()
+  let chain = openSeed(journal)
+  chain = record(journal, chain, { type: 'chain.observed', observation: fresh })
+  const decision = decideBehaviorChain(chain, fresh, NOW)
+  if (decision.kind !== 'invoke' || decision.behavior !== 'repair-pr') throw new Error('Fixture must need repair')
+  const id = 'original-blocked-repair'
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id, behavior: decision.behavior,
+    basis: decision.basis, actor: chain.author, slot: reviewer.slot, model: reviewer.model,
+    admittedAt: NOW - 300_000, request: { command: 'agent-interface', cwd: '/fixture',
+      argv: ['--atomic-work', chain.id, '--pull-number', '21', '--expected-head', HEAD,
+        '--expected-issue-revision', fresh.issue.revision],
+      context: { head: HEAD, reviewRevision: fresh.pull!.reviewRevision } } } })
+  chain = record(journal, chain, { type: 'invocation.started', invocationId: id })
+  const call: LogEntry = { id: '09bfede268214c4caa6e0237f99e5f17', correlation_id: id, model: reviewer.model,
+    behavior: 'repair_pr', source: 'poise:behavior-chain', actor: chain.author, repo: chain.repository, pr_id: '21',
+    session_id: null, prompt: '', started_at: new Date(NOW - 300_000).toISOString(),
+    completed_at: new Date(NOW - 120_000).toISOString(), time_elapsed: '3m', status: 'failed',
+    action: 'not_started', outcome: 'preflight_failed', error_code: 'atomic_work_blocked',
+    error: 'atomic behavior blocked: Caller suite completed with failures; assertion details unavailable',
+    head_sha: null, expected_head: HEAD, response: null, receipts: null, review_id: null,
     artifact: { phase: 'executing', prepared: { checkout_head: HEAD }, resource_root: '/private/work' },
     resources_settled_at: new Date(NOW - 100_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } }
   return { chain, call }
@@ -464,6 +501,28 @@ it('keeps a verified report under another cause when its source PR closes unmerg
   expect(posts()).toHaveLength(1)
 })
 
+it('keeps a legacy PR-scoped report when its source PR closes unmerged under a v2 chain', async () => {
+  const { db, journal } = setup()
+  const source = record(journal, await exhaustedReviews(journal), { type: 'chain.observed', observation: fresh })
+  await operations(db, journal).reportHold!(source)
+  expect(posts()).toHaveLength(1)
+  // The stored report predates the v2 chain: PR-scoped legacy source.
+  const stored = reports(db)[0]
+  const report = JSON.parse(stored.value)
+  db.prepare('DELETE FROM meta WHERE key = ?').run(`behavior_chain_repair_report:${report.key}`)
+  report.source = 'acme/repo#21'
+  report.key = chainBasis(['review_budget_exhausted', report.source, 21])
+  remote[0].body = remote[0].body.replace(/<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/,
+    `<!-- poise-repair-exhaustion:${report.key} -->`)
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run(`behavior_chain_repair_report:${report.key}`, JSON.stringify(report))
+  fresh = closedObservation()
+  vi.setSystemTime(NOW + 86_400_000); fresh.checkedAt = Date.now()
+  journal.rebuild()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(posts()).toHaveLength(1)
+  expect(reports(db)).toHaveLength(1)
+})
+
 it.each([false, true])('reports one verified implementation hold before a PR without relaunching it (diagnostic=%s)', async diagnostic => {
   const { db, journal } = setup()
   const { chain, call } = blockedImplementation(journal)
@@ -534,7 +593,162 @@ it.each([false, true])('reports one verified implementation hold before a PR wit
   expect(posts()).toHaveLength(1)
 })
 
-it('shows the current blocked repair after its earlier implementation report closes, including after restart', async () => {
+it.each([false, true])('reports the #1664 terminal repair sequence once without recovery (lost acknowledgement=%s)', async lost => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedRepair(journal)
+  vi.stubEnv('FIXTURE_ACCESS_TOKEN', 'fixture-private-credential')
+  call.error += ' ghp_secretfixture fixture-private-credential ' + 'detail '.repeat(100)
+  call.diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'provider.atomic_work',
+    phase: 'validating', outcome: 'blocked', stderr: '/private/work raw provider output', stderr_truncated: false,
+    context: { message: call.error, submission: 'none' }, filesystem: null }
+  loseCreation = lost
+  const forbidden = vi.fn(async () => { throw new Error('must not repair, review or enqueue before Resume') })
+  const overrides = { discover: async () => [], available: () => true, permitted: () => true,
+    request: forbidden, launch: forbidden, perform: forbidden,
+    observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0]).toMatchObject({ title: 'fix: blocked repair for #21', labels: [{ name: 'poise' }] })
+  for (const fact of [`<!-- poise-repair-exhaustion:${chainBasis(['atomic_work_blocked', chain.id, 21])} -->`,
+    'https://github.com/acme/repo/pull/21', 'https://github.com/acme/repo/issues/7',
+    'Stage: repair-pr. Cause: atomic_work_blocked.', `head ${HEAD}; basis ${chain.invocations[0].basis}; slot primary`,
+    'one settled original Caller repair', 'status=failed; action=not_started; outcome=preflight_failed',
+    'the repair ended before publication', `Invocation ${call.correlation_id}`, `Caller ${call.id}`,
+    call.resources_settled_at!, 'Worker-reported blocker: atomic behavior blocked: Caller suite completed with failures; assertion details unavailable',
+    'worker-reported explanation is not independently verified', 'fresh repair', 'preserves its hold and ownership', REMEDIATION_SCOPE]) {
+    expect(remote[0].body).toContain(fact)
+  }
+  expect(remote[0].body).not.toMatch(/ghp_secretfixture|fixture-private-credential|\/private\/work|raw provider output/)
+  expect(remote[0].body).toContain('[redacted]')
+  expect(remote[0].body.split('\n').find(line => line.startsWith('Worker-reported blocker: '))!.length)
+    .toBeLessThanOrEqual('Worker-reported blocker: '.length + 500)
+  const original = journal.read(chain.id)!
+  for (let pass = 0; pass < 3; pass++) {
+    journal.rebuild()
+    vi.setSystemTime(Date.now() + 86_400_000)
+    await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+    expect(journal.read(chain.id)).toMatchObject({ held: call.error, invocations: original.invocations,
+      resumedAfterSequence: 0, author: chain.author, reviewer: chain.reviewer, branch: chain.branch, mergeSha: null })
+    expect(journal.read('acme/repo#99')).toBeNull()
+  }
+  expect(reports(db).map(row => JSON.parse(row.value))).toMatchObject([{ source: chain.id, pull: 21, head: HEAD,
+    attempts: [{ invocation: call.correlation_id, call: call.id }], issueNumber: 99 }])
+  expect(posts()).toHaveLength(1)
+  expect(forbidden).not.toHaveBeenCalled()
+})
+
+it.each(['operator hold', 'pre-Resume receipt', 'CI-only hold', 'pending resources', 'missing ownership', 'uncertain receipt',
+  'publication plan', 'publication result', 'publication receipt', 'publication resume', 'changed head', 'changed repair basis',
+  'closed PR', 'closed source', 'generated marker', 'generated issue link', 'disabled repository'])(
+  'does not report a terminal repair with %s', async change => {
+    const { db, journal } = setup()
+    const { chain, call } = blockedRepair(journal)
+    await new BehaviorChainRuntime(journal, operations(db, journal, { reportHold: undefined,
+      observe: async () => fresh, readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+    let source = journal.read(chain.id)!
+    if (change === 'operator hold' || change === 'pre-Resume receipt') {
+      if (change === 'pre-Resume receipt') source = record(journal, source, { type: 'chain.resumed' })
+      source = record(journal, source, { type: 'chain.held', reason: change === 'operator hold' ? 'New invocations held by the person' : call.error })
+    }
+    source = structuredClone(source)
+    const evidence = source.invocations[0].evidence!
+    const artifact = evidence.artifact as Record<string, unknown>
+    if (change === 'CI-only hold') source.ciHold = { invocationId: call.correlation_id!, callId: call.id, head: HEAD }
+    if (change === 'pending resources') evidence.resource_ownership = { version: 1, roots: [], errors: [], process_pending: true }
+    if (change === 'missing ownership') evidence.resource_ownership = null
+    if (change === 'uncertain receipt') source.invocations[0].state = 'uncertain'
+    if (change === 'publication plan') artifact.plan_sha = chainBasis('plan')
+    if (change === 'publication result') artifact.result = { outcome: 'published' }
+    if (change === 'publication receipt') evidence.receipts = []
+    if (change === 'publication resume') evidence.publicationResume = { correlation: 'original-publication' }
+    if (change === 'changed head') fresh.pull!.head = 'b'.repeat(40)
+    if (change === 'changed repair basis') fresh.pull!.reviewRevision = chainBasis('new findings')
+    if (change === 'closed PR') fresh.pull!.state = 'closed'
+    if (change === 'closed source') fresh.issue.open = false
+    if (change === 'generated marker') seedBody = `<!-- poise-repair-exhaustion:${chainBasis('original report')} -->`
+    if (change === 'generated issue link') db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)')
+      .run('behavior_chain_repair_report:original', JSON.stringify({ source: 'acme/repo#6', issueNumber: 7 }))
+    if (change === 'disabled repository') vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+    const intents = reports(db)
+    await operations(db, journal).reportHold!(source)
+    expect(posts()).toHaveLength(0)
+    expect(reports(db)).toEqual(intents)
+    expect(journal.read(chain.id)).toMatchObject({ held: source.held, invocations: [{ state: 'settled', callId: call.id }] })
+  })
+
+it('keeps the implementation blocker and dated report disposition between ordinary rechecks and after closure', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedImplementation(journal)
+  const forbidden = vi.fn(async () => { throw new Error('must not start work before Resume') })
+  const observe = vi.fn(async () => ({ ...fresh, checkedAt: Date.now() }))
+  const runtime = new BehaviorChainRuntime(journal, operations(db, journal, {
+    observe, available: () => true, permitted: source => source.id === chain.id, request: forbidden, launch: forbidden, perform: forbidden,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }),
+  }))
+  await runtime.run()
+  const original = journal.read(chain.id)!
+  const intent = reports(db)
+  const report = structuredClone(remote[0])
+  const prefix = `Stage: implement-issue. Worker-reported blocker: ${call.error}. Next action: inspect the implementation Call, address the blocker, then explicitly Resume. `
+  const status = () => {
+    const current = journal.read(chain.id)!
+    expect(current).toMatchObject({ held: original.held, invocations: original.invocations,
+      resumedAfterSequence: original.resumedAfterSequence, author: original.author, reviewer: original.reviewer, branch: original.branch })
+    const summary = behaviorChainSummary(current, { at: journal.reconciliationAt(current) })
+    expect(summary.waiting?.startsWith(prefix)).toBe(true)
+    expect(reports(db)).toEqual(intent)
+    expect(posts()).toHaveLength(1)
+    expect(forbidden).not.toHaveBeenCalled()
+    return summary
+  }
+  status()
+  indexed = true
+  vi.setSystemTime(journal.reconciliationAt(journal.read(chain.id)!)!)
+  await runtime.run()
+  const remediation = journal.read('acme/repo#99')!
+  record(journal, remediation, { type: 'chain.held', reason: 'remediation needs an operator' })
+  status()
+
+  vi.setSystemTime(journal.reconciliationAt(journal.read(chain.id)!)!)
+  const read = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation(async (command: string, argv: string[], ...rest: unknown[]) => {
+    const result = await read(command, argv, ...rest)
+    if (command === 'gh' && argv[1] === 'repos/acme/repo/issues/99') vi.setSystemTime(Date.now() + 1000)
+    return result
+  })
+  await runtime.run()
+  mocks.runFile.mockImplementation(read)
+  const verifiedAt = Date.now()
+  const admitted = status()
+  expect(admitted.waiting).toContain(`last verified ${new Date(verifiedAt).toISOString()}; not live status`)
+  expect(journal.read(chain.id)!.observation!.checkedAt).toBeLessThan(verifiedAt)
+  expect(admitted.waiting).toContain('admitted as acme/repo#99; remediation is held: remediation needs an operator')
+  remote[0].state = 'closed'
+  const next = admitted.reconciliation!.nextObservationAt!
+  const history = journal.history(chain.id)
+  const reads = mocks.runFile.mock.calls.length
+  for (const now of [verifiedAt + 1000, next - 1]) {
+    vi.setSystemTime(now)
+    journal.rebuild()
+    expect(status()).toEqual(admitted)
+    expect(journal.history(chain.id)).toEqual(history)
+    expect(mocks.runFile.mock.calls).toHaveLength(reads)
+  }
+  const observations = observe.mock.calls.length
+  await runtime.run()
+  expect(observe.mock.calls).toHaveLength(observations)
+  expect(status()).toEqual(admitted)
+  vi.setSystemTime(next)
+  await runtime.run()
+  const closed = status()
+  expect(closed.waiting).toContain(`Historical Implementation hold report ${report.html_url} (last verified ${new Date(next).toISOString()}; not live status) is closed; no replacement will be created`)
+  expect(closed.waiting).not.toContain('admitted as')
+  expect(closed.waiting).not.toContain('remediation is held')
+  expect(remote).toEqual([{ ...report, state: 'closed' }])
+})
+
+it('reports a terminal repair separately from a closed implementation report, including after restart', async () => {
   const root = mkdtempSync(join(tmpdir(), 'repair-hold-report-')); roots.push(root)
   const path = join(root, 'journal.sqlite')
   let { db, journal } = setup(path)
@@ -551,6 +765,8 @@ it('shows the current blocked repair after its earlier implementation report clo
 
   const reread = async (prefix: string) => {
     const before = journal.read(chain.id)!
+    const expectedIntents = reports(db)
+    const expectedPosts = posts().length
     for (let pass = 0; pass < 3; pass++) {
       if (pass === 1) journal.rebuild()
       if (pass === 2) {
@@ -562,12 +778,12 @@ it('shows the current blocked repair after its earlier implementation report clo
       expect(journal.read(chain.id)).toMatchObject({ held: before.held, invocations: before.invocations,
         resumedAfterSequence: before.resumedAfterSequence, author: before.author, reviewer: before.reviewer, branch: before.branch })
       expect(journal.read(chain.id)?.waiting?.startsWith(prefix)).toBe(true)
-      expect(reports(db)).toEqual(originalIntent)
-      expect(posts()).toHaveLength(1)
+      expect(reports(db)).toEqual(expectedIntents)
+      expect(posts()).toHaveLength(expectedPosts)
       expect(forbidden).not.toHaveBeenCalled()
     }
   }
-  await reread('Implementation hold report ')
+  await reread(`Stage: implement-issue. Worker-reported blocker: ${call.error}. Next action: inspect the implementation Call, address the blocker, then explicitly Resume.`)
 
   let current = record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
   current = record(journal, current, { type: 'invocation.admitted', invocation: { id: 'published-implementation',
@@ -612,10 +828,52 @@ it('shows the current blocked repair after its earlier implementation report clo
   expect(held.invocations.at(-1)).toMatchObject({ behavior: 'repair-pr', state: 'settled', callId: repairCall.id,
     evidence: { status: 'failed', error_code: 'atomic_work_blocked', action: 'not_started' } })
   await reread(`Stage: repair-pr. Worker-reported blocker: ${repairCall.error}. Next action: inspect the repair Call, address the blocker, then explicitly Resume.`)
-  expect(journal.read(chain.id)?.waiting).toContain('Historical Implementation hold report https://github.com/acme/repo/issues/99 is closed; no replacement will be created')
-  expect(remote).toEqual([{ ...originalReport, state: 'closed' }])
+  expect(journal.read(chain.id)?.waiting).toContain('Repair hold report https://github.com/acme/repo/issues/100 (last verified ')
+  expect(reports(db)[0]).toEqual(originalIntent[0])
+  expect(reports(db).map(row => JSON.parse(row.value))).toMatchObject([
+    { source: chain.id, pull: null, issueNumber: 99 },
+    { key: chainBasis(['atomic_work_blocked', chain.id, 21]), source: chain.id, pull: 21, head: HEAD,
+      basis: decision.basis, attempts: [{ invocation: repairCall.correlation_id, call: repairCall.id }], issueNumber: 100 },
+  ])
+  expect(posts()).toHaveLength(2)
+  expect(remote[0]).toEqual({ ...originalReport, state: 'closed' })
+  expect(remote[1]).toMatchObject({ title: 'fix: blocked repair for #21', labels: [{ name: 'poise' }] })
   current = record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
   expect(decideBehaviorChain(current, { ...fresh, checkedAt: Date.now() }, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+})
+
+it('does not misreport a later review hold as an implementation hold when reusing its earlier implementation report', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedImplementation(journal)
+  const overrides = { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  expect(posts()).toHaveLength(1)
+  const intent = reports(db)
+  let current = record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  fresh = observation()
+  fresh.prReviewers = [reviewer]
+  current = record(journal, current, { type: 'chain.observed', observation: { ...fresh, checkedAt: Date.now() } })
+  const basis = chainBasis(['pr', HEAD, fresh.pull!.reviewContext])
+  current = record(journal, current, { type: 'invocation.admitted', invocation: { id: 'review-missing-receipt',
+    behavior: 'review-pr', basis, actor: current.reviewer, slot: reviewer.slot, model: reviewer.model,
+    admittedAt: Date.now(), request: { command: 'agent-interface', cwd: '/fixture', argv: ['--pr-review', '#7'] } } })
+  current = record(journal, current, { type: 'invocation.settled', invocationId: 'review-missing-receipt',
+    callId: 'b'.repeat(32), outcome: 'reviewed_clean', evidence: { status: 'completed', action: 'reviewed_clean',
+      head_sha: HEAD, review_id: 123, completedAt: Date.now(),
+      resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  const holdReason = 'PR review primary lacks its exact-head submission receipt'
+  expect(decideBehaviorChain(current, { ...fresh, checkedAt: Date.now() }, Date.now())).toMatchObject({ kind: 'hold', reason: holdReason })
+  current = record(journal, current, { type: 'chain.held', reason: holdReason })
+  const waiting = await operations(db, journal).reportHold!(journal.read(chain.id)!)
+  expect(waiting).not.toContain('Stage: implement-issue')
+  expect(waiting).not.toContain('inspect the implementation Call')
+  expect(waiting).not.toContain('Stage: repair-pr')
+  expect(waiting).toContain('Implementation hold report')
+  expect(waiting).toContain('(last verified ')
+  expect(journal.read(chain.id)).toMatchObject({ held: holdReason })
+  expect(reports(db)).toEqual(intent)
+  expect(posts()).toHaveLength(1)
 })
 
 it.each(['unmatched', 'unavailable'])('files an eligible report once with %s optional work evidence', async mode => {
@@ -802,6 +1060,123 @@ it.each(['operator hold', 'Resume'])('rechecks the implementation hold before re
   expect(reports(db)).toHaveLength(0)
 })
 
+it.each(['new report', 'lost acknowledgement', 'closed markerless link'])('reports an unheld uncertain implementation once across restart: %s', async mode => {
+  const root = mkdtempSync(join(tmpdir(), 'uncertain-implementation-report-')); roots.push(root)
+  const path = join(root, 'journal.sqlite')
+  const initial = setup(path)
+  const { chain, call } = uncertainImplementation(initial.journal)
+  expect(chain).toMatchObject({ held: null, invocations: [{ state: 'started', callId: null }] })
+  if (mode === 'closed markerless link') {
+    const existing = issue(98, `The #7 implementation remains uncertain after the original Call \`${call.id}\` (correlation \`${call.correlation_id}\`) failed during publication. The retained artifact names phase \`publishing\`. The Call has positive resource release, no action result and no publication receipt. Reconcile that original push outcome.`)
+    existing.state = 'closed'; existing.user.login = 'reviewer'; remote.push(existing)
+    sourceComments = [{ author: 'author', body: 'The original publication is fenced; see https://github.com/acme/repo/issues/98.' }]
+    searchVisible = false
+  }
+  loseCreation = mode === 'lost acknowledgement'
+  const launch = vi.fn(async () => { throw new Error('must not replace the original implementation') })
+  const resumePublication = vi.fn(async () => { throw new Error('must not repeat the original push') })
+  const overrides = { launch, resumePublication, observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  await new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal, overrides)).run()
+  expect(posts()).toHaveLength(mode === 'closed markerless link' ? 0 : 1)
+  if (mode !== 'closed markerless link') {
+    expect(remote[0].title).toBe('fix: uncertain implementation publication for #7')
+    for (const fact of ['https://github.com/acme/repo/issues/7', `Invocation ${call.correlation_id}`, `Caller ${call.id}`,
+      'implementation_publication_uncertain', 'atomic_work_failed', 'Missing original evidence:',
+      'pre-push no-write checkpoint or conclusive push result', 'GitHub absence alone cannot settle',
+      'authorizes neither replacement implementation nor a second push', REMEDIATION_SCOPE]) expect(remote[0].body).toContain(fact)
+    expect(remote[0].body).not.toMatch(/Resume|fresh implementation|private provider output|\/private\/work/)
+  }
+  const original = initial.journal.read(chain.id)!.invocations
+  expect(original).toMatchObject([{ id: call.correlation_id, state: 'uncertain', callId: null,
+    evidence: { callId: call.id, artifact: call.artifact, resource_ownership: call.resource_ownership } }])
+  initial.db.close(); databases.splice(databases.indexOf(initial.db), 1)
+  const { db, journal } = setup(path)
+  journal.rebuild()
+  searchVisible = false; sourceComments = []
+  for (let pass = 0; pass < 2; pass++) {
+    await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+    expect(journal.read(chain.id)!.waiting).toContain('pre-push no-write checkpoint or conclusive push result')
+    if (mode === 'lost acknowledgement') expect(journal.read(chain.id)!.waiting).toContain('creation is unconfirmed')
+  }
+  if (mode === 'lost acknowledgement') {
+    searchVisible = true; remote[0].state = 'closed'
+    await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  }
+  expect(posts()).toHaveLength(mode === 'closed markerless link' ? 0 : 1)
+  expect(reports(db).map(row => JSON.parse(row.value))).toMatchObject([{
+    key: chainBasis(['implementation_publication_uncertain', chain.id, call.correlation_id]),
+    source: chain.id, pull: null, head: null, holdSequence: null, heldAt: null,
+    attempts: [{ invocation: call.correlation_id, call: call.id }], issueNumber: mode === 'closed markerless link' ? 98 : 99,
+  }])
+  expect(journal.read(chain.id)).toMatchObject({ held: null, mergeSha: null, resumedAfterSequence: 0, invocations: original })
+  if (mode !== 'new report') expect(journal.read(chain.id)!.waiting).toContain('is closed; no replacement')
+  expect(launch).not.toHaveBeenCalled(); expect(resumePublication).not.toHaveBeenCalled()
+})
+
+it.each(['mere reference', 'different source', 'different invocation', 'different Call', 'different failure', 'untrusted author', 'PR', 'empty body'])('does not adopt an unrelated uncertain implementation report: %s', async change => {
+  const { db, journal } = setup()
+  const { call } = uncertainImplementation(journal)
+  let body = `The #7 implementation remains uncertain after Call ${call.id}, invocation ${call.correlation_id}; no conclusive push result or publication receipt is available.`
+  if (change === 'mere reference') body = `Reference #7, Call ${call.id}, invocation ${call.correlation_id}.`
+  if (change === 'different source') body = body.replace('#7', '#8')
+  if (change === 'different invocation') body = body.replace(call.correlation_id!, call.correlation_id! + '-other')
+  if (change === 'different Call') body = body.replace(call.id, 'f'.repeat(32))
+  if (change === 'different failure') body = `The #7 implementation remains uncertain after Call ${call.id}, invocation ${call.correlation_id}; test resources have not settled.`
+  const linked = issue(98, body)
+  linked.state = 'closed'
+  if (change === 'untrusted author') linked.user.login = 'stranger'
+  if (change === 'PR') Object.assign(linked, { pull_request: {}, html_url: 'https://github.com/acme/repo/pull/98' })
+  if (change === 'empty body') Object.assign(linked, { body: null })
+  remote.push(linked); searchVisible = false
+  sourceComments = [{ author: 'reviewer', body: 'See https://github.com/acme/repo/issues/98.' }]
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  expect(reports(db).map(row => JSON.parse(row.value).issueNumber)).toEqual([99])
+})
+
+it.each(['running Call', 'pending resources', 'missing ownership', 'missing Call', 'missing terminal time',
+  'closed source', 'closed native source', 'ineligible source', 'unknown eligibility', 'published original', 'published different Call',
+  'pre-push no-write result', 'conclusive receipt', 'not publishing', 'unavailable verification', 'disabled'])('defers uncertain implementation reporting for %s', async change => {
+  const { db, journal } = setup()
+  const { chain, call } = uncertainImplementation(journal)
+  if (change === 'running Call') { call.status = 'running'; call.completed_at = null; call.resources_settled_at = null }
+  if (change === 'pending resources') call.resources_settled_at = null
+  if (change === 'missing ownership') call.resource_ownership = null
+  if (change === 'missing terminal time') call.completed_at = null
+  if (change === 'closed source') fresh.issue.open = false
+  if (change === 'closed native source') seedState = 'closed'
+  if (change === 'ineligible source') fresh.issue.eligible = false
+  if (change === 'unknown eligibility') Reflect.deleteProperty(fresh.issue, 'eligible')
+  if (change === 'published original' || change === 'published different Call') {
+    fresh.publication = { ...observation().publication, head_invocation: change === 'published original' ? call.id : 'e'.repeat(32) }
+    fresh.pull = observation().pull
+  }
+  if (change === 'pre-push no-write result') { call.action = 'not_started'; call.outcome = 'preflight_failed' }
+  if (change === 'conclusive receipt') { call.action = 'published'; call.outcome = 'published'; call.head_sha = HEAD }
+  if (change === 'not publishing') call.artifact = { phase: 'executing' }
+  if (change === 'unavailable verification') stale = true
+  if (change === 'disabled') vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  await new BehaviorChainRuntime(journal, operations(db, journal, { discover: async () => [], observe: async () => fresh,
+    readInvocations: async () => ({ entries: change === 'missing Call' ? [] : [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(0); expect(reports(db)).toHaveLength(0)
+  expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+})
+
+it('rechecks the original uncertain implementation before reserving report intent', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = uncertainImplementation(journal)
+  await new BehaviorChainRuntime(journal, operations(db, journal, { reportHold: undefined, observe: async () => fresh,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  const source = journal.read(chain.id)!
+  await reportRepairExhaustion(db, journal, source, async () => {
+    record(journal, source, { type: 'invocation.reconciled', invocationId: call.correlation_id!, evidence: { head_sha: HEAD } })
+    return fresh
+  }, () => true)
+  expect(posts()).toHaveLength(0); expect(reports(db)).toHaveLength(0)
+})
+
 it.each([false, true])('reports an unheld uncertain merge through recovery without another submission (diagnostic=%s)', async diagnostic => {
   const { db, journal } = setup()
   const { chain, call } = uncertainMerge(journal)
@@ -981,6 +1356,33 @@ it('reports three native PR review budget failures once and preserves the source
   expect(journal.read(source.id)).toMatchObject({ held: source.held, resumedAfterSequence: 0, invocations: source.invocations })
 })
 
+it('shares an existing review report between legacy and v2 owners', async () => {
+  const { db, journal } = setup()
+  const source = record(journal, await exhaustedReviews(journal), { type: 'chain.observed', observation: fresh })
+  await operations(db, journal).reportHold!(source)
+  expect(posts()).toHaveLength(1)
+  const hold = journal.read(source.id)
+  const legacy = { repository: source.repository, pull: 21, author: source.author, reviewer: source.reviewer,
+    behavior: 'review-new-prs' as const, target: 'acme/repo#21', head: HEAD, slot: 'primary', heldAt: NOW, attempts: [] }
+  expect(await reportLegacyReviewTimeout(db, journal, legacy, async () => false, () => true))
+    .toContain('https://github.com/acme/repo/issues/99')
+  // A report created by legacy has the PR identity rather than the chain seed.
+  const stored = reports(db)[0]
+  const report = JSON.parse(stored.value)
+  db.prepare('DELETE FROM meta WHERE key = ?').run(`behavior_chain_repair_report:${report.key}`)
+  report.source = 'acme/repo#21'
+  report.key = chainBasis(['review_budget_exhausted', report.source, 21])
+  remote[0].body = remote[0].body.replace(/<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/,
+    `<!-- poise-repair-exhaustion:${report.key} -->`)
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run(`behavior_chain_repair_report:${report.key}`, JSON.stringify(report))
+  await operations(db, journal).reportHold!(source)
+  journal.rebuild()
+  await operations(db, journal).reportHold!(journal.read(source.id)!)
+  expect(posts()).toHaveLength(1)
+  expect(reports(db)).toHaveLength(1)
+  expect(journal.read(source.id)).toEqual(hold)
+})
+
 it('reports mixed native PR review timeouts after Resume once across observations and restart', async () => {
   const root = mkdtempSync(join(tmpdir(), 'review-report-')); roots.push(root)
   const path = join(root, 'journal.sqlite')
@@ -1009,7 +1411,8 @@ it('reports mixed native PR review timeouts after Resume once across observation
     expect(line).toContain(`Caller ${MIXED_REVIEW_FAILURES[index].callId}`)
     expect(line).toContain(`error_code=${MIXED_REVIEW_FAILURES[index].error_code}`)
     expect(line).toContain(index === 1 ? 'operation=github-interface; phase=inspection; timeout_seconds=30'
-      : 'operation=unknown; phase=unknown; timeout_seconds=unknown')
+      : index === 2 ? 'operation=provider.review; phase=file_group; timeout_seconds=60'
+        : 'operation=unknown; phase=unknown; timeout_seconds=unknown')
   }
   for (const invocation of earlier.invocations) expect(remote[0].body).not.toContain(invocation.id)
   for (const failure of MIXED_REVIEW_FAILURES) expect(remote[0].body).not.toContain(failure.error)

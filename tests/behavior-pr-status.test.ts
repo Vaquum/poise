@@ -2,7 +2,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseBehaviorLedgerArguments, runBehaviorLedgerCli } from '../server/behavior-ledger-cli'
 import { computePrBlocker, parsePrStatusRead, type BlockerInput } from '../server/behavior-pr-status'
-import { HEAD_SHA, NEXT_HEAD_SHA, arrangeCli, fixture, loadModules, mocks, pr, recordCompletedInitialReview } from './behaviors-runtime-fixture'
+import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
+import { HEAD_SHA, NEXT_HEAD_SHA, agentLog, arrangeCli, fixture, loadModules, mocks, pr, recordCompletedInitialReview } from './behaviors-runtime-fixture'
 import { prGroup } from '../src/ui/places/overview/entries'
 
 const HEAD = HEAD_SHA
@@ -73,14 +74,16 @@ describe('computePrBlocker', () => {
   it('prefers the strongest hold and keeps the others in details', () => {
     const computed = computePrBlocker(baseInput({
       held: [
-        { behavior: 'approve-prs', code: 'rate_limit', since: '2026-10-29T15:54:00Z', nextRetryAt: '2026-10-29T16:02:00Z' },
-        { behavior: 'review-new-prs', code: 'held_result', since: '2026-10-29T15:50:00Z' },
+        { behavior: 'approve-prs', code: 'rate_limit', detail: 'GitHub rate limit', since: '2026-10-29T15:54:00Z', nextRetryAt: '2026-10-29T16:02:00Z' },
+        { behavior: 'review-new-prs', code: 'held_result', detail: 'Pending publication', since: '2026-10-29T15:50:00Z' },
       ],
       liveClaim: { key: 'approve-prs', expectedHead: HEAD, others: [] },
     }))
     expect(computed.id).toBe('held')
     expect(computed.line).toBe('held: approve-prs rate_limit since 15:54Z, retry 16:02Z')
-    expect(computed.details).toContain('also held: review-new-prs held_result since 15:50Z')
+    expect(computed.details).toContain(`review running: approve-prs on ${SHORT}`)
+    expect(computed.details).toContain('approve-prs: GitHub rate limit')
+    expect(computed.details).toContain('also held: review-new-prs held_result since 15:50Z: Pending publication')
   })
 
   it('shows a live claim with its head', () => {
@@ -277,7 +280,7 @@ describe('readPrStatus', () => {
 
   function seedReview(db: typeof import('../server/db'), options: {
     behavior?: 'review-new-prs' | 'approve-prs', target?: string, head?: string,
-    callId?: string, failureAt?: string,
+    callId?: string, failureAt?: string, error?: string,
   } = {}) {
     const { behavior = 'approve-prs', head = NEXT, callId = 'c'.repeat(32), failureAt } = options
     const target = options.target ?? `${pr.repo}#${pr.number}@head=${head}`
@@ -293,14 +296,272 @@ describe('readPrStatus', () => {
     if (failureAt) {
       const launch = db.listBehaviorLaunchClaims(behavior).find((row) => row.claimId === claimId)
       if (!launch) throw new Error('could not find review launch')
-      const error = 'review failed: HTTP 503 Service Unavailable'
+      const error = options.error ?? 'review failed: HTTP 503 Service Unavailable'
       const id = db.recordBehaviorDeadLetter(launch, error)
       db.db.prepare('UPDATE behavior_dead_letters SET created_at = ? WHERE id = ?').run(failureAt, id)
       db.setBehaviorLaunchErrorOwned(behavior, target, claimId, error)
       db.completeSeenOwned(behavior, target, claimId)
     }
-    return { behavior, target, claimId }
+    return { behavior, target, claimId, callId }
   }
+
+  async function retainTimeout(review: ReturnType<typeof seedReview>, overrides: Record<string, unknown> = {}) {
+    fixture.agentLogs = [agentLog({
+      id: review.callId, correlation_id: review.claimId, expected_head: HEAD,
+      behavior: review.behavior === 'review-new-prs' ? 'pr_review' : 'pr_approve',
+      source: `poise:${review.behavior}`, model: 'grok-4-20', status: 'failed',
+      started_at: '2026-11-12T14:00:00Z', started_at_precise: '2026-11-12T14:00:00Z',
+      completed_at: '2026-11-12T15:03:00Z', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'review_budget_exhausted', error: 'review failed: no verdict before the budget ran out',
+      ...overrides,
+    })]
+    await (await import('../server/agent')).fetchAgentLogSnapshot()
+  }
+
+  it.each([
+    ['review-new-prs', ''], ['review-new-prs', ':secondary'], ['review-new-prs', ':tertiary'], ['approve-prs', ''],
+  ] as const)('projects the scoped %s %s check retry before, at and after its due time until cleared', async (behavior, slot) => {
+    const { db, runtime, status } = await setup()
+    db.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES ('beta', '/datastores/beta.sqlite', 1, 'ready', 'ready', 'poise-user')`).run()
+    fixture.listedPrs = [pr, ...[18, 19].map((number) => ({
+      ...pr, repo: 'beta/site', number, url: `https://github.com/beta/site/pull/${number}`,
+    }))]
+    const now = Date.now()
+    seedReview(db, { behavior: 'review-new-prs', head: HEAD })
+    seedCache(runtime, new Date(now).toISOString())
+    const checkTarget = `beta/site#18${slot}:check`
+    const failureKey = `behavior_${behavior.replace(/-/g, '_')}_failure:${checkTarget}`
+    const retryAt = now + 60_000
+    const state = { kind: 'operation', consecutiveFailures: 3,
+      lastFailureAtMs: now - 60_000, nextRetryAtMs: retryAt, error: 'review preflight could not read PR state' }
+    const failure = JSON.stringify(state)
+    db.setMeta(`org:beta:${failureKey}`, failure)
+    db.setMeta(failureKey, JSON.stringify({ ...state, error: 'failure in another organization' }))
+    mocks.runFile.mockClear()
+
+    for (const [at, timing] of [[now, 'at'], [retryAt, 'due since'], [retryAt + 1, 'due since']] as const) {
+      const reply = await status.readPrStatus(50, at)
+      expect(reply.rows.find((row) => row.number === 18)?.blocker).toMatchObject({
+        id: 'awaiting_review',
+        details: [`${behavior} check failed for ${checkTarget}: review preflight could not read PR state; revision unverified; retry ${timing} ${new Date(retryAt).toISOString()}`],
+      })
+      expect(reply.rows.find((row) => row.number === 19)?.blocker).toMatchObject({ id: 'awaiting_review', details: [] })
+      expect(reply.rows.find((row) => row.number === 17)?.blocker).toMatchObject({
+        id: 'review_running', line: `review running: review-new-prs on ${SHORT}`, details: [],
+      })
+    }
+    expect(db.getMeta(`org:beta:${failureKey}`)).toBe(failure)
+    db.setMeta(`org:beta:${failureKey}`, '')
+    const recovered = await status.readPrStatus(50, retryAt + 2)
+    expect(recovered.rows.find((row) => row.number === 18)?.blocker.details).toEqual([])
+    expect(mocks.runFile.mock.calls.every(([command]) => command === 'github-datastore')).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('shows an approval check failure alongside changes requested and clears it after a successful no-op', async () => {
+    const { db, runtime, status } = await setup()
+    const now = Date.now()
+    recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: HEAD,
+      completedAt: new Date(now - 120_000).toISOString() })
+    seedCache(runtime, new Date(now).toISOString(), { reviewDecision: 'CHANGES_REQUESTED' })
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    const failureKey = `behavior_approve_prs_failure:${pr.repo}#${pr.number}:check`
+    db.setMeta(failureKey, JSON.stringify({ kind: 'operation', consecutiveFailures: 1,
+      lastFailureAtMs: now - 60_000, nextRetryAtMs: now - 1, error: 'approval preflight failed' }))
+
+    const failed = await status.readPrStatus(50, now)
+    expect(failed.rows[0].blocker).toMatchObject({
+      id: 'awaiting_author',
+      details: [`approve-prs check failed for ${pr.repo}#${pr.number}:check: approval preflight failed; revision unverified; retry due since ${new Date(now - 1).toISOString()}`],
+    })
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(db.getMeta(failureKey)).toBe('')
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    const recovered = await status.readPrStatus(50, Date.now())
+    expect(recovered.rows[0].blocker).toMatchObject({ id: 'awaiting_author', details: [] })
+  })
+
+  it('keeps a secondary check failure ahead of capped history without replacing a live review or explicit hold', async () => {
+    const { db, runtime, status } = await setup()
+    const target = `${pr.repo}#${pr.number}`
+    for (let index = 1; index <= 8; index++) {
+      seedReview(db, { target: `${target}@head=${HEAD}/history=${index}`, head: HEAD,
+        callId: String(index).repeat(32), failureAt: '2026-11-12T14:40:00Z' })
+    }
+    seedReview(db, { behavior: 'review-new-prs', head: NEXT })
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+    const now = Date.parse('2026-11-12T15:31:00Z')
+    db.setMeta(`behavior_review_new_prs_failure:${target}:secondary:check`, JSON.stringify({
+      kind: 'operation', consecutiveFailures: 1, lastFailureAtMs: now - 60_000,
+      nextRetryAtMs: now + 60_000, error: 'secondary preflight failed',
+    }))
+    const detail = `review-new-prs check failed for ${target}:secondary:check: secondary preflight failed; revision unverified; retry at 2026-11-12T15:32:00.000Z`
+
+    const running = await status.readPrStatus(50, now)
+    expect(running.rows[0].blocker).toMatchObject({
+      id: 'review_running', line: `review running: review-new-prs on ${NEXT.slice(0, 8)}`,
+    })
+    expect(running.rows[0].blocker.details).toHaveLength(8)
+    expect(running.rows[0].blocker.details[0]).toBe(detail)
+    expect(running.rows[0].blocker.details.slice(1).every((entry) => entry.startsWith('past review:'))).toBe(true)
+
+    seedReview(db, { head: NEXT, callId: 'f'.repeat(32), failureAt: '2026-11-12T15:30:00Z' })
+    const held = await status.readPrStatus(50, now)
+    expect(held.rows[0].blocker).toMatchObject({
+      id: 'held', line: 'held: approve-prs upstream_unavailable since 15:30Z',
+    })
+    const heldDetails = held.rows[0].blocker.details
+    const runningLine = `review running: review-new-prs on ${NEXT.slice(0, 8)}`
+    expect(heldDetails).toContain(runningLine)
+    expect(heldDetails).toContain(detail)
+    expect(heldDetails.indexOf(runningLine)).toBeLessThan(heldDetails.indexOf(detail))
+    expect(heldDetails.indexOf(detail)).toBeLessThan(heldDetails.findIndex((entry) => entry.startsWith('past review:')))
+  })
+
+  it.each(['released', 'reused'] as const)('attributes an older timeout from its original Call after its headless launch is %s', async (launch) => {
+    const { db, runtime, status } = await setup()
+    const target = `${pr.repo}#${pr.number}`
+    const old = seedReview(db, { behavior: 'review-new-prs', target, head: HEAD,
+      callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z',
+      error: 'review failed: no verdict before the budget ran out' })
+    expect(db.releaseFailedBehaviorLaunch(old.behavior, old.target, old.callId, HEAD)).toBe(true)
+    seedReview(db, { behavior: 'review-new-prs', target: launch === 'reused' ? target : `${target}@secondary` })
+    await retainTimeout(old)
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+    mocks.runFile.mockClear()
+    const before = db.db.prepare('SELECT * FROM behavior_dead_letters').all()
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker).toMatchObject({
+      id: 'review_running', line: `review running: review-new-prs on ${NEXT.slice(0, 8)}`,
+      details: [`past review: review-new-prs review_budget_exhausted on ${HEAD} since 2026-11-12T15:03:00Z`],
+    })
+    expect(db.db.prepare('SELECT * FROM behavior_dead_letters').all()).toEqual(before)
+    expect(mocks.runFile.mock.calls.every(([command]) => command === 'github-datastore')).toBe(true)
+  })
+
+  it.each([
+    ['Call ID', { id: 'b'.repeat(32) }], ['correlation', { correlation_id: 'other' }],
+    ['repository', { repo: 'other/repo' }], ['PR', { pr_id: '18' }],
+    ['behavior', { behavior: 'pr_approve' }], ['actor', { actor: 'other-bot' }], ['source', { source: 'poise:replay' }],
+    ['missing head', { expected_head: null }], ['unreadable row', { expected_head: 'invalid' }],
+    ['ambiguous publication', { action: null, outcome: null }], ['review receipt', { review_id: 123 }],
+  ] as const)('keeps the hold when the original Caller evidence has a mismatched or uncertain %s', async (_identity, overrides) => {
+    const { db, runtime, status } = await setup()
+    const old = seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}`, head: HEAD,
+      callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+    expect(db.releaseFailedBehaviorLaunch(old.behavior, old.target, old.callId, HEAD)).toBe(true)
+    seedReview(db, { behavior: 'review-new-prs', target: old.target })
+    await retainTimeout(old, overrides)
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker.id).toBe('held')
+    expect(reply.rows[0].blocker.details).toEqual([expect.stringMatching(/^review-new-prs: /), `review running: review-new-prs on ${NEXT.slice(0, 8)}`])
+  })
+
+  it('keeps a released launch held when its previously readable Caller history becomes unreadable', async () => {
+    const { db, runtime, status } = await setup()
+    const old = seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}`, head: HEAD,
+      callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+    expect(db.releaseFailedBehaviorLaunch(old.behavior, old.target, old.callId, HEAD)).toBe(true)
+    seedReview(db, { behavior: 'review-new-prs', target: old.target })
+    await retainTimeout(old)
+    mocks.runFile.mockRejectedValueOnce(new Error('Caller history unavailable'))
+    await expect((await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })).rejects.toThrow('Caller history unavailable')
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker.id).toBe('held')
+    expect(reply.rows[0].blocker.details).toEqual(['review-new-prs: review failed: HTTP 503 Service Unavailable', `review running: review-new-prs on ${NEXT.slice(0, 8)}`])
+  })
+
+  it.each(['expired', 'future'] as const)('keeps an interrupted review held without advertising its %s failure timer', async (timer) => {
+    const { db, runtime, status } = await setup()
+    const now = Date.parse('2026-11-12T15:31:00Z')
+    const error = 'review interrupted; publication disposition unknown'
+    const old = seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}`, head: HEAD,
+      callId: 'a'.repeat(32), failureAt: '2026-11-12T15:14:00Z', error })
+    const live = seedReview(db, { behavior: 'review-new-prs', head: NEXT })
+    const refusalKey = `behavior_review_recovery:${old.behavior}:${old.target}:${old.callId}:${old.claimId}`
+    const refusal = `Legacy review retry held for Call ${old.callId} (correlation ${old.claimId}); original head ${HEAD}; observed head ${NEXT}; reviewer review-bot. Unclaimed publication: 1 reviews not attributed to this Call. Observed reviews: 91 APPROVED on ${HEAD}. Observed reviews are not this Call's receipt.`
+    db.setMeta(refusalKey, refusal)
+    db.setMeta(`behavior_review_new_prs_failure:${old.target}`, JSON.stringify({ kind: 'worker', consecutiveFailures: 1,
+      firstFailureAtMs: Date.parse('2026-11-12T15:14:00Z'), lastFailureAtMs: Date.parse('2026-11-12T15:14:00Z'),
+      nextRetryAtMs: Date.parse(timer === 'expired' ? '2026-11-12T15:15:00Z' : '2026-11-12T15:32:00Z'),
+      error, callId: old.callId, diagnostic: { severity: 'warning', code: 'held_result' } }))
+    db.reconcileBehaviorDeadLetters(new Set([`${pr.repo}#${pr.number}`]), undefined, undefined, undefined, 200, now)
+    fixture.agentLogs = [
+      agentLog({ id: old.callId, correlation_id: old.claimId, status: 'interrupted', expected_head: HEAD,
+        started_at: '2026-11-12T15:14:00Z', started_at_precise: '2026-11-12T15:14:00Z',
+        completed_at: '2026-11-12T15:14:41Z', error }),
+      agentLog({ id: live.callId, correlation_id: live.claimId, expected_head: NEXT,
+        started_at: '2026-11-12T15:30:00Z', started_at_precise: '2026-11-12T15:30:00Z' }),
+    ]
+    const snapshot = await (await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })
+    seedCache(runtime, new Date(now).toISOString(), { head: NEXT })
+    mocks.runFile.mockClear()
+    const dump = () => ({
+      seen: db.db.prepare('SELECT * FROM behavior_seen ORDER BY key, target').all(),
+      meta: db.db.prepare('SELECT key, value FROM meta ORDER BY key').all(),
+      letters: db.db.prepare('SELECT * FROM behavior_dead_letters ORDER BY id').all(),
+      calls: structuredClone(fixture.agentLogs),
+    })
+    const before = dump()
+
+    for (const evidence of [snapshot, null]) {
+      const incident = runtime.getBehaviorDiagnosticIncidents(evidence).find((row) => row.callId === old.callId)!
+      expect(incident).toMatchObject({ error: `${error} ${refusal}`, createdAt: '2026-11-12T15:14:00Z',
+        resolution: 'held', resolvedAt: new Date(now).toISOString() })
+      expect(incident.nextRetryAt).toBeUndefined()
+    }
+    const reply = await status.readPrStatus(50, now)
+    expect(reply.rows[0].blocker).toMatchObject({
+      id: 'held', line: 'held: review-new-prs held_result since 15:14Z',
+      details: [`review-new-prs: ${error} ${refusal}`, `review running: review-new-prs on ${NEXT.slice(0, 8)}`],
+    })
+    expect(dump()).toEqual(before)
+
+    // An unprobed interruption also needs publication verification, not a timer.
+    db.setMeta(refusalKey, '')
+    const unprobed = dump()
+    const pending = await status.readPrStatus(50, now)
+    expect(pending.rows[0].blocker.line).toBe('held: review-new-prs held_result since 15:14Z')
+    expect(pending.rows[0].blocker.details[0]).toBe(`review-new-prs: ${error} Publication disposition unverified for Call ${old.callId}. Inspect the original Call and reconcile publication before retrying.`)
+    expect(dump()).toEqual(unprobed)
+    expect(mocks.runFile.mock.calls.every(([command]) => command === 'github-datastore')).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('keeps a same-head Grok stop primary and exposes the running Sol fallback', async () => {
+    const { db, runtime, status } = await setup()
+    const stopped = seedReview(db, { behavior: 'review-new-prs', head: HEAD, callId: 'a'.repeat(32),
+      failureAt: '2026-11-12T14:43:00Z', error: REVIEW_BUDGET_STOPPED })
+    const fallback = seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}@fallback`, head: HEAD })
+    await retainTimeout(stopped)
+    fixture.agentLogs.push(agentLog({ id: fallback.callId, correlation_id: fallback.claimId,
+      expected_head: HEAD, model: 'gpt-6.1-sol-max' }))
+    await (await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })
+    seedCache(runtime, '2026-11-12T15:31:00Z')
+    db.setMeta(`behavior_review_new_prs_failure:${stopped.target}`, JSON.stringify({ kind: 'worker', consecutiveFailures: 2,
+      lastFailureAtMs: Date.parse('2026-11-12T14:43:00Z'), nextRetryAtMs: Date.parse('2026-11-12T15:32:00Z'),
+      error: REVIEW_BUDGET_STOPPED, callId: stopped.callId }))
+    const before = db.db.prepare('SELECT * FROM behavior_dead_letters').all()
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker).toMatchObject({
+      id: 'held', line: 'held: review-new-prs review_budget_exhausted since 14:43Z',
+      details: [`review-new-prs: ${REVIEW_BUDGET_STOPPED}`, `review running: review-new-prs on ${SHORT}`],
+    })
+    expect(runtime.getBehaviorDiagnosticIncidents(null).find((row) => row.callId === stopped.callId)?.nextRetryAt).toBeUndefined()
+    expect(db.db.prepare('SELECT * FROM behavior_dead_letters').all()).toEqual(before)
+  })
 
   it('shows the current review alongside both retained past-revision failures', async () => {
     const { db, runtime, status } = await setup()
@@ -337,7 +598,11 @@ describe('readPrStatus', () => {
 
     expect(reply.rows[0].blocker).toMatchObject({
       id: 'held', line: 'held: approve-prs upstream_unavailable since 14:40Z',
-      details: [`past review: approve-prs upstream_unavailable on ${HEAD} since 2026-11-12T15:03:00Z`],
+      details: [
+        'approve-prs: review failed: HTTP 503 Service Unavailable',
+        `review running: approve-prs on ${NEXT.slice(0, 8)}`,
+        `past review: approve-prs upstream_unavailable on ${HEAD} since 2026-11-12T15:03:00Z`,
+      ],
     })
   })
 
@@ -354,7 +619,7 @@ describe('readPrStatus', () => {
 
       const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: ['approve-prs: review failed: HTTP 503 Service Unavailable', `review running: approve-prs on ${NEXT.slice(0, 8)}`] })
     },
   )
 
@@ -370,7 +635,7 @@ describe('readPrStatus', () => {
 
       const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: ['approve-prs: review failed: HTTP 503 Service Unavailable'] })
     },
   )
 
@@ -382,7 +647,7 @@ describe('readPrStatus', () => {
 
     const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: ['approve-prs: review failed: HTTP 503 Service Unavailable'] })
   })
 
   it.each(['invalid_result', 'unreadable'] as const)('preserves PR-wide %s quarantine across head changes', async (quarantine) => {
@@ -396,7 +661,7 @@ describe('readPrStatus', () => {
 
     const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
 
-    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: ['approve-prs: review failed: HTTP 503 Service Unavailable', `review running: approve-prs on ${NEXT.slice(0, 8)}`] })
   })
 
   it('projects one approved green row with rounds from the cap counter', async () => {
@@ -450,17 +715,22 @@ describe('readPrStatus', () => {
     expect(reply.rows).toEqual([])
   })
 
-  it('renders a 429 hold with its retry time', async () => {
+  it('renders an eligible no-action 429 preflight failure with its retry time', async () => {
     const { db, status } = await setup()
     const target = `${pr.repo}#${pr.number}@req=2026-10-29T15:00:00Z/r=2/head=${HEAD}`
     db.db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, actor, source, correlation_id, call_id, error, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('dl-1', 'approve-prs', target, pr.repo, pr.number,
       'review-bot', 'poise:approve-prs', 'c'.repeat(32), 'd'.repeat(32),
-      'review failed: API error (status 429 Too Many Requests)', '2026-10-29T15:54:00Z')
+      'review failed: GitHub 429 Too Many Requests', '2026-10-29T15:54:00Z')
     db.setMeta(`behavior_approve_prs_failure:${target}`, JSON.stringify({ kind: 'worker', consecutiveFailures: 2,
       lastFailureAtMs: Date.parse('2026-10-29T15:54:00Z'), nextRetryAtMs: Date.parse('2026-10-29T16:02:00Z'),
-      error: 'review failed: API error (status 429 Too Many Requests)', callId: 'd'.repeat(32),
+      error: 'review failed: GitHub 429 Too Many Requests', callId: 'd'.repeat(32),
       diagnostic: { severity: 'warning', code: 'rate_limit' } }))
+    fixture.agentLogs = [agentLog({ id: 'd'.repeat(32), behavior: 'pr_approve', correlation_id: 'c'.repeat(32),
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', expected_head: HEAD,
+      started_at: '2026-10-29T15:53:00Z', started_at_precise: '2026-10-29T15:53:00Z',
+      completed_at: '2026-10-29T15:54:00Z', error: 'review failed: GitHub 429 Too Many Requests' })]
+    await (await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })
     const reply = await status.readPrStatus(50, Date.parse('2026-10-29T16:00:00Z'))
     expect(reply.rows).toHaveLength(1)
     expect(reply.rows[0].blocker.id).toBe('held')
@@ -483,7 +753,7 @@ describe('readPrStatus', () => {
       nextRetryAtMs: Date.parse('2026-10-29T16:54:00Z'), callId: 'e'.repeat(32),
       diagnostic: { severity: 'warning', code: 'review_budget_exhausted' } }))
     const budget = await status.readPrStatus(50, Date.parse('2026-10-29T16:00:00Z'))
-    expect(budget.rows[0].blocker.line).toBe('held: approve-prs review_budget_exhausted since 15:54Z, retry 16:54Z')
+    expect(budget.rows[0].blocker.line).toBe('held: approve-prs review_budget_exhausted since 15:54Z')
   })
 
   it('flags age past 60 minutes at the exact boundary', async () => {
@@ -644,6 +914,10 @@ describe('readPrStatus', () => {
     recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: HEAD, completedAt: '2026-10-29T09:00:00Z' })
     const now = Date.now()
     seedCache(runtime, new Date(now).toISOString())
+    db.setMeta(`behavior_review_new_prs_failure:${pr.repo}#${pr.number}:secondary:check`, JSON.stringify({
+      kind: 'operation', consecutiveFailures: 1, lastFailureAtMs: now,
+      nextRetryAtMs: now + 60_000, error: 'secondary preflight failed',
+    }))
     db.db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, error, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`).run('dl-3', 'approve-prs', `${pr.repo}#${pr.number}`,
       pr.repo, pr.number, 'review failed: provider busy', new Date(now).toISOString())

@@ -38,6 +38,9 @@ vi.mock('../server/process', async (importOriginal) => {
   mocks.realRunFile = actual.runFile
   return {
     setProcessFailureObserver: actual.setProcessFailureObserver,
+    MAX_PROCESS_ARG_BYTES: actual.MAX_PROCESS_ARG_BYTES,
+    processFailureEvidence: actual.processFailureEvidence,
+    isAbortError: actual.isAbortError,
     CLAUDE_SUBSCRIPTION_CLI: '/poise/claude-subscription',
     runFile: mocks.runFile,
     spawnDetached: mocks.spawnDetached,
@@ -369,7 +372,10 @@ function arrangeCli(
           body: 'An ordinary unmarked seed', state: 'open', labels: [{ name: 'poise' }] } }), stderr: '' }
     }
     if (command === 'agent-interface' && args[0] === '--logs') {
-      return { stdout: JSON.stringify(agentLogs), stderr: '' }
+      // As Caller answers it: the whole history leaves out progress events.
+      const rows = args.includes('--without-progress')
+        ? agentLogs.map(({ progress: _progress, ...row }) => row) : agentLogs
+      return { stdout: JSON.stringify(rows), stderr: '' }
     }
     throw new Error(`unexpected CLI call: ${command} ${args.join(' ')}`)
   })

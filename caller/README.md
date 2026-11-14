@@ -34,8 +34,12 @@ whose immutable plan, pushed head, unattempted replies and released worker
 resources are proven. It starts no model and cannot replace that plan.
 Shared baseline CI dependencies use that same atomic repair artifact and the
 existing chain tick ([dependency evidence and recovery](../docs/Behavior-chain.md)).
-Before new implementation, Poise reads `github-datastore view issue-dependencies`
-under the existing freshness gate. For each explicit same-repository prerequisite,
+Before new implementation, Poise reads live `blockedBy` evidence in the existing
+authenticated `--chain-seed` / `--issue-work` GraphQL preflight, bounded to 100
+nodes with a matching total count and complete page. The mirror health gate
+remains required. After awaited request preparation, the same observation and
+decision run again before implementation admission; missing or truncated live
+evidence waits. For each explicit same-repository prerequisite,
 `github-interface --read-issue ISSUE --delivery-base SHA --token-user USER`
 reads its state and linked closing PRs, including closed PRs. It returns
 `verified: true` only for a closed issue with a linked closing PR's merge commit
@@ -65,6 +69,11 @@ work and rechecks the owned head immediately before closing. It returns `closed`
 them. The chain invokes it only through the original native action/resource
 path after settling prior writes and native ownership. See
 [full-suite reconciliation](../docs/Behavior-chain.md#bounded-reconciliation).
+The same retirement action accepts verified empty-integration coverage for
+Poise-generated pre-PR failure remediations, including queued PRs with open
+seeds. `--chain-seed` retains the pinned Git trees and distinct covering merge;
+the close action rechecks the current head and base. Independent work and
+unverified coverage retain ordinary processing. The source issue is untouched.
 
 An atomic repair blocked solely by the supplied head's failed CI can return
 `blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains
@@ -74,6 +83,18 @@ strings and confer no automatic recovery authority. The
 [chain reconciler](../docs/Behavior-chain.md#bounded-reconciliation) checks the
 original no-publication receipt, resource release and fresh CI on the same head
 or a verified base-only update before resuming the remaining gates.
+
+A pre-PR implementation blocked solely by an observed main CI test failure may
+also return `testDependency: {base, run, baselineRun, remediation}` alongside its
+concrete blocked string. `base` must be `prepared.checkout_head`; `run` is the
+original producing CI run, `baselineRun` is a distinct run on that exact commit,
+and `remediation` is an existing same-repository issue URL. Caller reads both
+full-suite assertion artifacts and verifies every failing test and cause before
+retaining `artifact.test_dependency`. `github-interface --chain-seed ISSUE
+--branch BRANCH --test-dependency-json JSON --token-user USER` revalidates that
+proof and the delivered recovery on the current implementation base. See
+[pre-PR recovery](../docs/Behavior-chain.md#bounded-reconciliation) for admission
+and evidence limits. Relay prose and digests alone remain actionable holds.
 
 ## Accounts
 
@@ -106,6 +127,14 @@ working-tree files are materialized after it is released. A slow checkout or
 filter therefore does not hold other snapshots behind it. Each checkout keeps
 its own objects and remains usable after the mirror is refreshed or removed.
 Credentials are passed per command and never stored in either repository.
+
+Refresh, snapshot cloning and a missing-tree failure from the first working-tree
+reset share one recovery attempt within the invoking command's deadline. Recovery
+discards only the owned temporary snapshot and, under the same lock, its implicated
+mirror generation if it is still current. A concurrent replacement is reused;
+filter and other reset failures do not rebuild the mirror. A permanent missing
+tree fails with the existing redacted Git diagnostic before managed review
+preparation can publish a head checkout or start a review or approval worker.
 
 `github-interface --prune-mirrors ROOT --cap-bytes N --now-ms N
 [--fresh-ms N] [--dry-run]` is local maintenance and needs no GitHub account.

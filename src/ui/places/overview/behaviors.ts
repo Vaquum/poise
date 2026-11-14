@@ -133,7 +133,7 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement, find: RightFi
       : !loaded ? 'Behaviors could not be read, so their switches are unknown.' : saving.has(key) ? 'Saving the last change.' : ''
     const lastRun = running
       ? `<span class="st" data-state="running"><span data-term="state.running">Running</span></span><span class="onote">${esc(running)}</span>`
-      : last ? `<span class="onote"><a class="lnk" href="${esc(placeHref('observe', { part: 'behaviors', pr: /^[\w.-]+\/[\w.-]+#\d+$/.test(last.target) ? last.target : null, back: 'overview' }))}" title="See its runs in Observe">${clockAt(last.at)} · ${esc(last.target)}</a></span>` : '<span class="onote">No run recorded</span>'
+      : last ? `<span class="onote"><a class="lnk" href="${esc(placeHref('observe', { part: 'behaviors', pr: /^[\w.-]+\/[\w.-]+#\d+$/.test(last.target) ? last.target : null, back: 'overview' }))}" data-help="See its runs in Observe">${clockAt(last.at)} · ${esc(last.target)}</a></span>` : '<span class="onote">No run recorded</span>'
     return `<tr data-beh="${key}" data-ref="ov.behavior">
       <td><button class="oswitch" aria-pressed="${loaded && on}" data-act="beh-toggle" aria-label="${esc(label)}: ${loaded ? (on ? 'on' : 'off') : 'unknown'}" data-ref="ov.behavior.switch"${why ? ` aria-disabled="true" data-why="${esc(why)}"` : ''}><span class="switch"></span></button></td>
       <th scope="row">${esc(label)}${paused && Date.parse(paused) > Date.now() ? `<span class="onote">paused until ${clockAt(paused)}</span>` : ''}${rowErrors.get(key) ? `<span class="onote is-warn" role="status">${esc(rowErrors.get(key)!)}</span>` : ''}</th>

@@ -300,6 +300,11 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "For a new finding, changed reviewer input or a materially changed answer, write a fresh substantive answer without a native marker. Missing or uncertain prior reply proof cannot count as verified coverage. "
         "Do not reply to replies, invent comment ids, or use generic acknowledgements. For initial implementation replies must be empty. "
         "If unable to finish, set blocked to the concrete reason; do not claim the work complete. "
+        "For a pre-PR block caused solely by an observed failing main CI test run, you may also supply "
+        "testDependency: {base: prepared.checkout_head, run: original producing CI run ID, baselineRun: a distinct CI run ID "
+        "on that exact base, remediation: existing repository GitHub issue URL}. Caller independently reads the complete "
+        "assertion artifacts and requires every original failure/cause on the exact base. Keep blocked as the concrete string. "
+        "Do not use this for candidate-specific failures, other blockers, or relay output without authoritative original CI evidence. "
         'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
         "Use a string for every other blocker, including missing evidence, a product decision or uncertain publication. "
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
@@ -348,6 +353,21 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                 raise AtomicWorkFailed("atomic behavior blocked: invalid output")
             if publication.get("blocked") is not None:
                 blocked = publication["blocked"]
+                if pull is None and publication.get("testDependency") is not None and isinstance(blocked, str) and blocked.strip():
+                    dependency = publication["testDependency"]
+                    if not isinstance(dependency, dict) or dependency.get("base") != prepared.get("checkout_head") \
+                            or dependency.get("remediation") == f"https://github.com/{repo}/issues/{number}":
+                        raise AtomicWorkBlocked(f"{blocked}; test dependency does not identify the original checkout base and external remediation")
+                    try:
+                        verified = issue_review.interface("--chain-seed", f"#{number}", "--repository", repo, "--branch", branch,
+                                                          "--token-user", actor, "--test-dependency-json", json.dumps(dependency))
+                    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+                        raise AtomicWorkBlocked(f"{blocked}; authoritative test evidence is unavailable: {error}") from error
+                    proof = verified.get("test_dependency")
+                    if isinstance(proof, dict) and proof.get("verified") is True and proof.get("base") == prepared["checkout_head"]:
+                        # The original Call retains this independently read proof
+                        # even when report publication is disabled.
+                        record({"phase": "executing", "prepared": prepared, "test_dependency": proof})
                 if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
                         and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
                     record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})

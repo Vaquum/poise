@@ -1,11 +1,14 @@
 import Database from 'better-sqlite3'
 import { afterAll, afterEach, expect, it } from 'vitest'
-import { BehaviorChainJournal } from '../server/behavior-chain-store'
+import { BehaviorChainJournal, chainBasis, type ChainAdmission } from '../server/behavior-chain-store'
 import { behaviorChainAttention, behaviorChainWorkImpact, behaviorChainWorkImpacts } from '../server/behavior-chain-summary'
 import { decideBehaviorChain } from '../server/behavior-chain-decision'
 import { normalize } from '../gateway/src/diagnostics/contract'
 import { DiagnosticStore } from '../gateway/src/diagnostics/store'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
+import { parseProcessDiagnostic } from '../server/process-diagnostic'
+import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
+import { loggingSeverity } from '../src/logging'
 
 const at = Date.parse('2026-11-10T17:00:00Z')
 const call = '1'.repeat(32), correlation = '11111111-2222-3333-4444-555555555555'
@@ -200,4 +203,100 @@ it('keeps a current backoff retry time when progress advances past its wait note
   expect(behaviorChainWorkImpact(journal, call, correlation)).toMatchObject({ impact: 'recovered', recovered: true,
     callerBehavior: 'repair_pr', retryAt: at + 63_000,
     nextAction: 'Automatic retry eligible after backoff, subject to existing admission gates' })
+})
+
+function handoffFixture() {
+  const journal = new BehaviorChainJournal(db)
+  const fixture = loggingWorkFixture(journal, 'acme/repo', 7, correlation, call, at)
+  const id = '4'.repeat(32), callId = '5'.repeat(32), head = fixture.observation.pull!.head
+  const diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'analysis',
+    outcome: 'handoff', submission: 'none', stderr: '', stderr_truncated: false,
+    expected_head: head, call_id: callId, correlation_id: id }
+  const row = { id: callId, correlation_id: id, repo: 'acme/repo', pr_id: '107', actor: 'reviewer', behavior: 'pr_review',
+    status: 'failed', error_code: 'review_budget_exhausted', expected_head: head,
+    error: 'grok review reached its analysis time limit; handing off so the next model can run instead',
+    completed_at: new Date(at + 5000).toISOString(), diagnostic }
+  // Production review-pr carries its head as `--expected-head` argv without request context.
+  const original: ChainAdmission = { id, behavior: 'review-pr', basis: chainBasis(['pr', head, fixture.observation.pull!.reviewContext]),
+    actor: 'reviewer', model: 'grok', slot: 'primary', admittedAt: at + 4000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture',
+      argv: ['--pr-review', 'https://github.com/acme/repo/pull/107', '--expected-head', head] } }
+  fixture.append({ type: 'invocation.admitted', invocation: original }, at + 4000)
+  fixture.append({ type: 'invocation.settled', invocationId: id, callId, outcome: 'review_budget_exhausted',
+    evidence: { status: 'failed', action: null, error_code: row.error_code, diagnostic: parseProcessDiagnostic(diagnostic), completedAt: at + 5000 } }, at + 5000)
+  const event = normalize(callerDiagnostic(row, 'local')!, at + 5000)!
+  const successor: ChainAdmission = { ...original, id: '6'.repeat(32), model: 'replacement', admittedAt: at + 6000 }
+  const impact = () => behaviorChainWorkImpact(journal, callId, id)
+  return { ...fixture, journal, head, original, successor, row, event, impact }
+}
+
+it('shows only a confirmed same-obligation handoff as Warning through the Logging adapter without rewriting retained events', () => {
+  const fixture = handoffFixture()
+  const { journal, successor, event, impact, append } = fixture
+  const logs = new DiagnosticStore(':memory:')
+  try {
+    logs.append([event])
+    expect(loggingSeverity(event, impact())).toBe('error') // Intent alone has no successor.
+    append({ type: 'invocation.admitted', invocation: successor }, at + 6000)
+    expect(impact()).toMatchObject({ impact: 'retrying', recovered: false })
+    expect(loggingSeverity(event, impact())).toBe('warning')
+    const response = { repository: 'acme/repo', pull_number: 107, head_sha: fixture.head,
+      context_sha: fixture.observation.pull!.reviewContext, invocation_id: '7'.repeat(32), reviewer: successor.actor,
+      model: successor.model, completed_at: at + 8000,
+      assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+        reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
+    append({ type: 'invocation.settled', invocationId: successor.id, callId: response.invocation_id, outcome: 'reviewed_clean',
+      evidence: { status: 'completed', action: 'reviewed_clean', head_sha: response.head_sha, review_id: 91,
+        artifact: { review_response: response }, completedAt: at + 8000 } }, at + 8000)
+    append({ type: 'chain.observed', observation: { ...fixture.observation, checkedAt: at + 9000,
+      pull: { ...fixture.observation.pull!, reviewIds: [91], reviewReceipts: [{ id: 91, head: response.head_sha,
+        invocation: response.invocation_id, state: 'COMMENTED', response, submittedAt: at + 8000 }] } } }, at + 9000)
+    expect(impact()).toMatchObject({ impact: 'recovered', recovered: true })
+    expect(loggingSeverity(event, impact())).toBe('warning')
+    append({ type: 'chain.held', reason: 'current recovery is exhausted' }, at + 10_000)
+    expect(impact()).toMatchObject({ impact: 'blocked', recovered: true, nextAction: expect.stringContaining('current recovery is exhausted') })
+    expect(loggingSeverity(event, impact())).toBe('error')
+    const before = journal.history(fixture.chain.id)
+    journal.rebuild()
+    expect(journal.history(fixture.chain.id)).toEqual(before)
+    expect(logs.query({ workspace: 'local', operator: false }, {}).events).toMatchObject([{ ...event, severity: 'error' }])
+  } finally { logs.close() }
+})
+
+it.each(['head', 'CI', 'slot', 'context', 'target', 'earlier verdict'])('does not mistake unrelated %s progress for a confirmed handoff', change => {
+  const fixture = handoffFixture()
+  const { successor, event, impact, append } = fixture
+  const observation = structuredClone(fixture.observation)
+  observation.checkedAt = at + 9000
+  if (change === 'head') {
+    observation.pull!.head = observation.publication.head_sha = 'b'.repeat(40)
+    successor.request = { ...successor.request,
+      argv: ['--pr-review', 'https://github.com/acme/repo/pull/107', '--expected-head', observation.pull!.head] }
+  } else if (change === 'slot') successor.slot = 'secondary'
+  else if (change === 'context') successor.basis = 'another review context'
+  else if (change === 'target') successor.request = { ...successor.request,
+    argv: ['--pr-review', 'https://github.com/acme/repo/pull/108', '--expected-head', fixture.head] }
+  else if (change === 'CI') Object.assign(observation.pull!, { checksState: 'SUCCESS', pending: false, failing: [] })
+  else {
+    // An earlier or independent sibling's review cannot establish this Call's handoff.
+    observation.pull!.reviewIds = [91]
+    observation.pull!.reviewReceipts = [{ id: 91, head: observation.pull!.head, state: 'COMMENTED', invocation: '8'.repeat(32), submittedAt: at + 3000 }]
+  }
+  if (!['CI', 'earlier verdict'].includes(change)) append({ type: 'invocation.admitted', invocation: successor }, at + 6000)
+  append({ type: 'chain.observed', observation }, at + 9000)
+  expect(impact()).toMatchObject({ impact: 'unknown', recovered: false })
+  expect(loggingSeverity(event, impact())).toBe('error')
+})
+
+it('retains Error for failed recovery and publication-uncertain timeouts despite a successor admission', () => {
+  const { row, event, successor, impact, append } = handoffFixture()
+  append({ type: 'invocation.admitted', invocation: successor }, at + 6000)
+  const uncertain = normalize(callerDiagnostic({ ...row, error_code: 'review_submission_failed',
+    error: 'review submission timed out; publication uncertain, reconcile before retry',
+    diagnostic: { ...row.diagnostic, phase: 'submitting', outcome: 'timed_out', submission: 'uncertain' } }, 'local')!, at + 7000)!
+  expect(loggingSeverity(uncertain, impact())).toBe('error')
+  append({ type: 'invocation.settled', invocationId: successor.id, callId: '7'.repeat(32), outcome: 'review_recovery_failed',
+    evidence: { status: 'failed', error_code: 'review_recovery_failed', action: 'not_started', completedAt: at + 8000 } }, at + 8000)
+  expect(loggingSeverity(event, impact())).toBe('error')
+  expect(impact()).toMatchObject({ impact: 'unknown', recovered: false })
 })

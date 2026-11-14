@@ -201,7 +201,7 @@
   --shadow-dialog: 0 12px 24px color-mix(in srgb, var(--p-black) 55%, transparent), 0 4px 8px color-mix(in srgb, var(--p-black) 35%, transparent);
   --dur-feedback: calc(var(--flow-feedback, 100ms) * var(--ctl-motion));
   --dur-settle: calc(var(--flow-settle, 664ms) * var(--ctl-motion));
-  --dur-tip: 500ms;             /* reference delay: a reading aid, not motion */
+  --dur-tip: 500ms;             /* tooltip delay: a reading aid, not motion */
   --dur-tip-hide: 160ms;
   --ease-spring: var(--p-spring);
   --ease-out: ease-out;
@@ -214,6 +214,7 @@
   --z-dialog: 50;
   --z-tip: 55;
   --z-ref: 60;
+  --z-icon-tip: 1000;
 
   /* Layout widths */
   --w-sidebar: 268px;

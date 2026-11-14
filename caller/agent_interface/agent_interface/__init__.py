@@ -130,6 +130,26 @@ def init_db():
                      "and (resources_settled_at is null or resource_cleanup is not null)")
         conn.execute("create index if not exists calls_native_resource_pending on calls(id) "
                      "where source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)")
+        # Each insert and update gives its call the next change number, so a
+        # reader asks only for calls changed since the last one it saw
+        # (logs_changed). The triggers live in the file, so every writer, an
+        # older release included, numbers its changes.
+        if "change_seq" not in cols:
+            try:
+                conn.execute("alter table calls add column change_seq integer")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e):
+                    raise
+        conn.execute("create index if not exists calls_change_seq on calls(change_seq)")
+        if conn.execute("select 1 from calls where change_seq is null limit 1").fetchone():
+            conn.execute("update calls set change_seq = rowid where change_seq is null")
+        conn.execute("create trigger if not exists calls_change_insert after insert on calls begin "
+                     "update calls set change_seq = (select coalesce(max(change_seq), 0) + 1 from calls) "
+                     "where rowid = new.rowid; end")
+        conn.execute("create trigger if not exists calls_change_update after update on calls "
+                     "when new.change_seq is old.change_seq begin "
+                     "update calls set change_seq = (select coalesce(max(change_seq), 0) + 1 from calls) "
+                     "where rowid = new.rowid; end")
         duplicates = conn.execute(
             """select correlation_id, count(*) as uses
                from calls
@@ -660,9 +680,15 @@ def finish(
             error = "Stopped by user" if error_code == "stopped" else prior_cause["error"]
             action, outcome = None, None
         persisted = False
+        previous_path = None
         if response:
             prior = conn.execute("select behavior,artifact,response_path from calls where id=?", (id_,)).fetchone()
             artifact = json.loads(prior["artifact"] or "{}") if prior else {}
+            previous_path = prior["response_path"] if prior else None
+            if prior and prior["behavior"] in {"pr_review", "pr_approve"} and prior["response_path"]:
+                retained = caller_store.response(Path(prior["response_path"]), RESPONSES).read_text()
+                if not response.startswith(retained):
+                    response = retained + "\n" + response
             if prior and prior["behavior"] in {"native_action", "native_publication"} \
                     and prior["response_path"] == path and artifact.get("response_sha") == hashlib.sha256(response.encode()).hexdigest():
                 if caller_store.response(Path(path), RESPONSES).read_text() != response:
@@ -679,15 +705,23 @@ def finish(
                 return float(row["ended_at"])
     if response and changed == 1 and not persisted:
         try:
-            caller_store.response(Path(path), RESPONSES).write_text(response)
+            caller_store.write_response_text(Path(path), RESPONSES, response)
         except OSError as persist_error:
             # The row is terminal; a response persistence failure must not
-            # reopen it. Clear the dangling path and retain the cause.
+            # reopen it. Keep an already-retained response readable and retain
+            # the cause, keeping an earlier diagnostic nested so neither failure is lost.
+            envelope = diagnostic_envelope(operation="call.finalize", phase="response_persist",
+                                           outcome="persist_failed",
+                                           stderr=str(persist_error)[:500], call_id=id_)
             with db() as conn:
-                conn.execute("update calls set response_path=null, diagnostic=coalesce(diagnostic, ?) where id=?",
-                             (json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
-                                                             outcome="persist_failed",
-                                                             stderr=str(persist_error)[:500], call_id=id_)), id_))
+                prior = conn.execute("select diagnostic from calls where id=?", (id_,)).fetchone()
+                if prior is not None and prior["diagnostic"] is not None:
+                    try:
+                        envelope["prior"] = json.loads(prior["diagnostic"])
+                    except ValueError:
+                        pass
+                conn.execute("update calls set response_path=?, diagnostic=? where id=?",
+                             (previous_path, json.dumps(envelope), id_))
     return ended_at
 
 
@@ -834,12 +868,14 @@ def _decode_history_text(value: bytes) -> object:
         return _UNREADABLE_LOG_TEXT
 
 
-def logs(status: str | None = None):
+def logs(status: str | None = None, without_progress: bool = False):
     """Every retained call, oldest first; with status, only the running ones.
 
     The running-only read is indexed on (status, started_at), so retained
     history does not raise its cost. Full history quarantines unreadable rows.
-    Use logs_page for bounded history."""
+    Use logs_page for bounded history. Without progress, full history leaves
+    out each call's progress events, the largest field, which only a call's
+    own view shows (its page, its id or the running read)."""
     if status is not None and status != "running":
         raise ValueError("logs status filter must be running")
     reap_interrupted()
@@ -852,10 +888,55 @@ def logs(status: str | None = None):
         ).fetchall()
     if status:
         return [{**_log_row(row), "history_rowid": str(row["rowid"])} for row in rows]
-    return [_full_history_log_row(row) for row in rows]
+    history = [_full_history_log_row(row) for row in rows]
+    if without_progress:
+        for entry in history:
+            entry.pop("progress", None)
+    return history
 
 
 LOGS_PAGE_LIMIT_MAX = 1000
+LOGS_CHANGED_LIMIT_MAX = 5000
+
+
+def logs_changed(after: int, limit: int, without_progress: bool = False) -> dict:
+    """The calls changed after change number `after`, in change order: each
+    with its rowid and change number, and its row exactly as the whole history
+    (logs) prints it. Every page also carries the whole history's order, every
+    call's rowid as logs sorts them, and the newest change number, read in the
+    same snapshot as its rows: a reader that holds each call's latest row puts
+    them in that order and has the whole history, without reading the
+    unchanged calls again. A newest number below what the reader saw means
+    the database was replaced, and it reads from 0. A running call's row
+    changes with the clock alone (its elapsed time), so every page also
+    carries every running call as it reads now."""
+    if type(after) is not int or after < 0:
+        raise ValueError("changed logs need a change number of 0 or more")
+    if type(limit) is not int or not 1 <= limit <= LOGS_CHANGED_LIMIT_MAX:
+        raise ValueError(f"changed logs limit must be 1..{LOGS_CHANGED_LIMIT_MAX}")
+    reap_interrupted()
+    with db() as conn:
+        conn.text_factory = _decode_history_text
+        conn.execute("begin")
+        rows = conn.execute(
+            f"select calls.rowid, calls.change_seq, {LOG_ROW_COLUMNS} from calls"
+            " where change_seq > ? order by change_seq limit ?", (after, limit + 1)).fetchall()
+        order = [row[0] for row in conn.execute("select rowid from calls order by started_at, rowid")]
+        newest = conn.execute("select coalesce(max(change_seq), 0) from calls").fetchone()[0]
+        running = conn.execute(
+            f"select calls.rowid, calls.change_seq, {LOG_ROW_COLUMNS} from calls where status='running'").fetchall()
+    more = len(rows) > limit
+    rows = rows[:limit]
+
+    def item(row) -> dict:
+        entry = _full_history_log_row(row)
+        if without_progress:
+            entry.pop("progress", None)
+        return {"rowid": row["rowid"], "seq": row["change_seq"], "row": entry}
+    changed = [item(row) for row in rows]
+    return {"rows": changed, "cursor": changed[-1]["seq"] if changed else after, "more": more, "order": order,
+            "newest": newest, "running": [item(row) for row in running]}
+
 LOGS_LATEST_QUERY = f"""select {LOG_ROW_COLUMNS} from calls
     where behavior=? and source=? and {LOG_OWNER_SQL}=?
       and repo is not null and repo != '' and pr_id is not null and pr_id != ''
@@ -940,6 +1021,15 @@ LOGS_SEARCH_SQL = """lower(
     || ' ' || coalesce(repo,'') || '#' || coalesce(pr_id,'')
     || ' ' || '#' || coalesce(pr_id,'')
     || ' ' || coalesce(session_id,'') || ' ' || coalesce(outcome,'') || ' ' || coalesce(error,'')
+    || ' ' || case when behavior='issue_review' and status='failed' and error_code='issue_revision_changed'
+      and action='not_started' and outcome='preflight_failed'
+      and receipts is null and head_sha is null and review_id is null and review_comments is null
+      and (artifact is null or (json_valid(artifact)
+        and json_extract(artifact,'$.phase')='reviewing'
+        and json_extract(artifact,'$.resource_error') is null))
+      and (resource_ownership is null or (json_valid(resource_ownership)
+        and json_array_length(resource_ownership,'$.errors')=0))
+      then 'superseded issue changed' else '' end
 ) like '%' || ? || '%' escape '\\'"""
 
 
@@ -1133,13 +1223,21 @@ def diagnostics(after: int = 0, limit: int = 3) -> dict:
               and (coalesce(c.error,'') != '' or c.error_code is not null or c.diagnostic is not null))""").fetchone()[0]
         columns = ",".join(f"substr(c.{field},1,512) as {field}" for field in fields)
         rows = conn.execute(f"""select d.seq,{columns},c.started_at,c.ended_at,
-            substr(c.error,1,8192) as error,substr(c.diagnostic,1,65536) as diagnostic
+            substr(c.error,1,8192) as error,substr(c.diagnostic,1,65536) as diagnostic,
+            case when c.artifact is null then null when json_valid(c.artifact)
+            then substr(json_extract(c.artifact,'$.resource_error'),1,512) else 'invalid_artifact' end as resource_error,
+            case when c.resource_ownership is null then null when json_valid(c.resource_ownership)
+            then case when json_array_length(c.resource_ownership,'$.errors') is null then 'invalid_ownership'
+            when json_array_length(c.resource_ownership,'$.errors') > 0 then 'ownership_failed' else null end
+            else 'invalid_ownership' end as ownership_error
             from diagnostic_calls d join calls c on c.id=d.call_id
             where d.seq>? order by d.seq limit ?""", (after, limit + 1)).fetchall()
     events = []
     for row in rows[:limit]:
         entry = {field: row[field] for field in fields}
-        entry.update(seq=row["seq"], error=row["error"], started_at_precise=utc_stamp(row["started_at"]),
+        entry.update(seq=row["seq"], error=row["error"], resource_error=row["resource_error"],
+                     ownership_error=row["ownership_error"],
+                     started_at_precise=utc_stamp(row["started_at"]),
                      completed_at=utc_stamp(row["ended_at"]) if row["ended_at"] else None)
         try:
             raw = row["diagnostic"]
@@ -1173,12 +1271,38 @@ def _receipts(raw: str | None) -> list | None:
 
 
 def read_response(short: str):
-    with db() as conn:
-        rows = conn.execute("select response_path from calls where response_path is not null and id like ?", (short + "%",)).fetchall()
-    if len(rows) != 1:
-        raise SystemExit(f"response hash matched {len(rows)} rows")
-    path = Path(rows[0]["response_path"])
-    print(caller_store.response(path if path.is_absolute() else DATA_DIR.parent / path, RESPONSES).read_text())
+    try:
+        if not re.fullmatch(r"[0-9a-fA-F]{1,32}", short):
+            raise ValueError("invalid Call ID")
+        with db() as conn:
+            rows = conn.execute("select id,response_path,status,behavior,artifact,diagnostic from calls where id like ?",
+                                (short + "%",)).fetchall()
+        if len(rows) > 1:
+            raise ValueError(f"Call ID matched {len(rows)} rows")
+        reason = "The Call is unknown"
+        if rows:
+            row = rows[0]
+            short = row["id"]
+            if row["response_path"] is not None:
+                path = Path(row["response_path"])
+                print(caller_store.response(path if path.is_absolute() else DATA_DIR.parent / path, RESPONSES).read_text())
+                return
+            diagnostic = json.loads(row["diagnostic"]) if row["diagnostic"] is not None else {}
+            artifact = json.loads(row["artifact"]) if row["artifact"] is not None else {}
+            if not isinstance(diagnostic, dict) or not isinstance(artifact, dict):
+                raise ValueError("invalid response evidence")
+            if diagnostic.get("phase") == "response_persist" and diagnostic.get("outcome") == "persist_failed":
+                raise ValueError("response persistence failed")
+            if artifact.get("response_sha") is not None or (row["status"] == "completed"
+                    and row["behavior"] in {"native_action", "native_publication"}):
+                raise ValueError("required response receipt is missing")
+            if row["status"] not in {"running", "completed", "failed", "cancelled", "superseded"}:
+                raise ValueError("invalid Call status")
+            reason = "The Call is still running" if row["status"] == "running" else "The Call ended without a response"
+        print(json.dumps({"id": short.lower(), "disposition": "unavailable", "reason": reason}))
+        raise SystemExit(3)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+        raise SystemExit(f"Response read failed for Call {short}: {error}") from error
 
 
 def run_pr_review(
@@ -1216,11 +1340,13 @@ def run_pr_review(
 def record_cleanup_failure(call_id: str) -> None:
     """A run directory that survived deletion keeps its resources unsettled:
     the failure is durable and visible. A legacy sweep cannot retry deletion
-    without original ownership and process-termination proof."""
+    without original ownership and process-termination proof. The diagnostic
+    entry is requeued so a poll that already passed still sees the failure."""
     try:
         with db() as conn:
             conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.resource_error','cleanup_failed') where id=?",
                          (call_id,))
+            conn.execute("delete from diagnostic_calls where call_id=?", (call_id,))
     except Exception as error:
         print(f"call {call_id} cleanup failed and its record could not be updated: {error}", file=sys.stderr)
 
@@ -1657,8 +1783,10 @@ def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
     # These durable phases precede the controlled GitHub publication path.
     # An admitted/submitting request is deliberately excluded even when its
     # response was lost. Resource settlement is an independent prerequisite.
+    # PR deadlines keep the governed completion's inventory-validated result.
     conn.execute("update calls set action='not_started', outcome='preflight_failed', head_sha=null "
                  "where id=? and source='poise:behavior-chain' and status='failed' and resources_settled_at is not null and "
+                 "(behavior not in ('pr_review','pr_approve') or coalesce(error_code,'') != 'review_budget_exhausted') and "
                  "coalesce(error_code,'') not in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable') and "
                  "json_valid(artifact) and (json_extract(artifact,'$.phase') in ('preparing','prepared','executing','reviewing','preparing_publication') "
                  "or (action_plan is null and behavior in ('issue_review','implement_issue','repair_pr')))",
@@ -1994,11 +2122,24 @@ def run_governed_behavior(
                 if prior:
                     response = f"{response}; prior: {prior}"
                 cancelled_receipt = review_receipt.get()
-                if cancelled_receipt is None:
+                unattempted_closure = False
+                if cancelled.closed_target is not None:
+                    with db() as conn:
+                        artifact = json.loads(conn.execute("select artifact from calls where id=?", (id_,)).fetchone()[0] or "{}")
+                    unattempted_closure = (cancelled_receipt is None and not cancelled.submission_attempted
+                                           and not review_receipt.failure() and artifact.get("phase") == "reviewing")
+                if unattempted_closure:
+                    result = _closed_target_result(
+                        facts=cancelled.closed_target,
+                        evidence="no submission attempted; original native receipt phase=reviewing; provider turn settled",
+                        attribution="target closed during provider analysis",
+                        prior_error=prior,
+                    )
+                elif cancelled_receipt is None and cancelled.closed_target is None:
                     result = {"action": None, "outcome": "superseded", "head_sha": cancelled.head_sha}
                 else:
-                    # The provider submitted before the cancellation landed:
-                    # verify the posted review instead of retracting it.
+                    # Idle/uncertain or sealed gates do not prove no write.
+                    # Reconcile the original publication, preserving its receipt.
                     progress.stage("verifying", "Verifying GitHub outcome after cancellation")
                     result = behavior_outcome(mod, behavior, pr, pwd, actor, expected_head, before,
                                               receipt=cancelled_receipt, call_id=id_, prior_error=response)
@@ -2143,6 +2284,23 @@ def _repeat_only_refusal(failure: BaseException) -> bool:
             and diagnostic.get("refusal") == "repeat_only")
 
 
+def _pre_post_no_action_proof(call_id: str, failure: review_budget.ReviewLimitError, receipt: dict | None,
+                              capped: bool) -> bool:
+    # Capped approvals can also file an issue outside this inventory.
+    if failure.code != "review_budget_exhausted" or receipt is not None or capped:
+        return False
+    with db() as conn:
+        original = conn.execute("select artifact,review_id,receipts,head_sha from calls where id=?",
+                                (call_id,)).fetchone()
+    # The durable pre-POST phase, not a diagnostic alone, proves
+    # that this invocation never attempted publication.
+    return (original is not None
+            and json.loads(original["artifact"] or "{}").get("phase") == "reviewing"
+            and all(original[key] is None for key in ("review_id", "receipts", "head_sha"))
+            and not review_receipt.failure() and not review_receipt.conflict()
+            and (failure.diagnostic or {}).get("submission") in {None, "none"})
+
+
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
                               capped=False, review_round=None, review_cap=None, review_scope=""):
     # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
@@ -2172,7 +2330,9 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         try:
             facts = review_facts(mod, pr, pwd, actor, head, 0)
             receipt = review_receipt.get()
-            proven = receipt is None and _proven_no_action(failure)
+            deadline_no_action = _pre_post_no_action_proof(call_id, failure, receipt, capped)
+            proven = receipt is None and (deadline_no_action if failure.code == "review_budget_exhausted"
+                                         else _proven_no_action(failure))
             # A re-verdict submits anew: even proven no-action needs the
             # quiet-inventory proof so recovery cannot create a duplicate.
             # Adoption stays skipped — nothing found can be this run's.
@@ -2183,7 +2343,7 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                 return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
                                                        receipt=receipt, call_id=call_id, prior_error=str(failure),
                                                        prior_code=failure.code, proven_no_action=proven)
-            if not proven or reverdict:
+            if not proven or reverdict or deadline_no_action:
                 own = own_reviews(before, facts, receipt, call_id, proven_no_action=proven)
                 if not proven:
                     if own is None:
@@ -2205,6 +2365,17 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                 if own is None and (_count(facts, "reviewer_reviews_since") != _count(before, "reviewer_reviews_since")
                         or facts.get("reviewer_latest_any_review_id") != before.get("reviewer_latest_any_review_id")):
                     raise RuntimeError("review activity changed without matching counters")
+                if deadline_no_action:
+                    earlier, later = _review_items(before), _review_items(facts)
+                    counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
+                    if (earlier is None or later is None or earlier != later
+                            or any(_count(snapshot, "reviewer_reviews_since") != len(items)
+                                   or len({item["id"] for item in items}) != len(items)
+                                   for snapshot, items in ((before, earlier), (facts, later)))
+                            or any(_count(facts, key) != _count(before, key) for key in counts)
+                            or "reviewer_latest_any_review_id" not in before or "reviewer_latest_any_review_id" not in facts
+                            or facts["reviewer_latest_any_review_id"] != before["reviewer_latest_any_review_id"]):
+                        raise RuntimeError("review deadline requires complete, quiet publication inventory")
             # A proven no-action run posted nothing: a later review is another
             # request's, never this run's recovery. The failure stands verbatim.
         except review_budget.ReviewLimitError as typed:
@@ -2218,6 +2389,8 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         except Exception as verification:
             raise review_budget.ReviewLimitError(
                 f"{failure}; could not prove a safe recovery: {verification}", failure.code, failure.diagnostic) from verification
+        if deadline_no_action:
+            raise atoms.AgentPreflightError(str(failure), failure.code, failure.diagnostic) from failure
         # Invalid approval verdicts get one fresh attempt by the admitted
         # model. Other recoverable failures retain their different-model path.
         # None of these replay an uncertain write.
@@ -2229,6 +2402,11 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         try:
             review_budget.timeout(seconds, reserve=review_budget.FINAL_CHECK_SECONDS)
         except review_budget.ReviewLimitError as exhausted:
+            # Quiet verification already authorized a retry; a budget
+            # exhaustion then defers it to backoff instead of recovery.
+            if _pre_post_no_action_proof(call_id, exhausted, receipt, capped):
+                message = f"{exhausted}; prior: {failure}" if verdict_failure else str(exhausted)
+                raise atoms.AgentPreflightError(message, exhausted.code, exhausted.diagnostic) from exhausted
             if verdict_failure:
                 raise review_budget.ReviewLimitError(
                     f"{exhausted}; prior: {failure}", exhausted.code, exhausted.diagnostic) from exhausted
@@ -2275,7 +2453,8 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             message = f"{recovery.identity} recovery failed; needs attention: {recovery_error}"
             if reverdict:
                 message = f"{message}; prior: {failure}"
-            raise review_budget.ReviewLimitError(message, "review_recovery_failed") from recovery_error
+            raise review_budget.ReviewLimitError(
+                message, "review_recovery_failed", getattr(recovery_error, "diagnostic", None)) from recovery_error
 
 
 # A sibling that submitted a moment ago may not have recorded its review id
@@ -2803,6 +2982,8 @@ behaviors:
   --logs --id CALL_ID
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
+  --logs --without-progress
+  --logs [--without-progress] --changed-after SEQ --limit 1..5000
   --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
   --diagnostics [after-sequence] [limit-1..10]
   --stop CALL_ID
@@ -3052,6 +3233,19 @@ def _main():
             except ValueError as error:
                 usage(error=str(error))
             print(json.dumps(selected, separators=(",", ":")))
+            return
+        rest = [arg for arg in sys.argv[2:] if arg != "--without-progress"]
+        if rest[:1] == ["--changed-after"]:
+            if len(rest) != 4 or rest[2] != "--limit" or len(sys.argv[2:]) - len(rest) > 1:
+                usage(error="changed logs take --changed-after SEQ --limit N, and --without-progress")
+            try:
+                payload = logs_changed(int(rest[1]), int(rest[3]), "--without-progress" in sys.argv[2:])
+            except ValueError as error:
+                usage(error=str(error))
+            print(json.dumps(payload, separators=(",", ":")))
+            return
+        if sys.argv[2:] == ["--without-progress"]:
+            print(json.dumps(logs(without_progress=True), separators=(",", ":")))
             return
         if len(sys.argv) == 4 and sys.argv[2] == "--select":
             try:

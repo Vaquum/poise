@@ -33,12 +33,26 @@ Call has `not_started` / `preflight_failed`, no executed head, and either
 failure evidence remains authoritative. This classification changes neither
 Caller status nor publication, retry or hold rules.
 
+The typed pre-publication [issue revision fence](Issue-review.md#when-a-reviewer-fails)
+is routine supersession and creates no new Logging event or work-error count.
+The metadata-only diagnostic feed carries that invariant without receipts,
+publication artifacts or ownership, but with artifact and ownership cleanup
+failures; omitted fields alone never prove that nothing was posted. A cleanup
+failure recorded after the terminal result requeues its diagnostic, so a poll
+that already passed still sees it. This correction applies to future collection.
+Retained events are immutable, so an Error already stored for a stale review keeps
+its original classification.
+
 Credentials, encoded Git authentication, authorization/cookie headers and
 credential-bearing URLs are redacted before persistence. Context excludes
 prompts, content, responses, stdout, arguments, environment and conversation
 fields recursively. Strings and nested context are bounded; truncation is
 explicit. The source adapters select Caller metadata without reading prompt or
 response fields, and preserve its exact process evidence when available.
+For newly captured Caller completions, a nonempty diagnostic context message
+distinct from the summary is retained in the cause chain. Review deadlines keep
+their recorded phase, file-group position and remaining budget in the same
+event detail. Missing causes remain absent; stored events are not rewritten.
 
 ## Observe → Logging
 
@@ -54,7 +68,7 @@ ownership, capacity, active/held work, sequence-checked Hold/Resume and
 paginated journal history. Notifications' Journal evidence action opens its
 recorded journal cursor there, including after reload. These are reads of the
 canonical chain journal, separate from Logging's diagnostics and their Work impact;
-they create no new Logging events or severity mapping. General keeps only chain
+they create no new Logging events. General keeps only chain
 preferences and guarded cutover controls.
 
 Column headers own the severity, time, source and exact identity filters. Columns selects optional workspace/account/repository/call/correlation/incident fields; an active filter keeps its field visible until cleared. Search and the event count remain in the native toolbar. Filters stay usable after a failed query.
@@ -89,6 +103,16 @@ unreadable associations show unknown. A failed workspace read leaves retained
 Logging evidence usable, including in service mode. Source severity and Count
 (retained event/occurrence count) keep their separate meanings. This annotation
 neither starts work nor changes execution or holds.
+For a new typed analysis handoff with positive no-submission evidence, the
+displayed severity is Warning only after a later admission for that original
+Call's same PR, head, review basis and slot, or its attributed substantive
+successor verdict. A changed head, green CI, an earlier or independent sibling
+review, or generic work progress cannot confirm the handoff. No successor,
+failed recovery, a current hold, uncertain publication or unavailable evidence
+keeps Error. The active blocker and next action remain visible. The retained
+source event stays Error: severity filters, counts and exports continue to use
+that immutable source severity. Refresh replaces the displayed work assessment;
+historical rows without typed no-submission proof remain unproven.
 For a verified merge with a pending native review obligation, the next action is
 to reconcile original pre-merge review evidence, including when a durable hold
 is retained. Resume cannot start a new review after merge.
@@ -218,6 +242,16 @@ erase that original failure; independent wrapper and invalid-output failures
 remain visible. Resolve uses Warning only for a confirmed no-action transient
 exit with a recorded safe retry. Uncertain outcomes, timeouts and policy
 refusals remain Errors. Separate attempts retain separate event IDs.
+Legacy approval batch reads, the final head check and checkout preparation retain one Error
+per failed child after recording the scheduler consequence. The fixed primitive,
+phase, checked targets, available expected heads, correlation, original process
+timing/result and recorded retry state travel together. Two failed children
+remain separate even within one sweep correlation; cancellation or failed retry
+bookkeeping cannot erase either cause. These diagnostics do not change backoff,
+launch progress or the exact-head publication checks.
+Checkout failures use phase `checkout` and fixed operations
+`github-interface.local-checkout-path` or `github-interface.checkout-repo`;
+other checkout callers retain default process reporting.
 JavaScript DOMException identity and numeric code are retained in context as
 `exceptionName` and `exceptionCode`, with no process `exitCode`. Actual subprocess
 exit codes remain process evidence, even when the same number names an exception.
@@ -261,6 +295,12 @@ is retained again. This recognition changes neither readiness nor retry policy.
 The gateway retains its separate central `logging.db` in `poise-gateway-data`.
 Existing volume backup/restore snapshots it with the other SQLite databases.
 Gateway warnings/errors are redacted before Docker stdout and retained directly.
+New `disk.workspace.over_budget` Warnings retain measured usage as `context.bytes`
+and the configured threshold as `context.budget`, in bytes, in the existing
+expanded detail. Each count is independently validated as a non-negative safe
+integer; zero is kept, while missing or invalid counts remain unknown without
+coercion. Previously retained entries cannot recover discarded fields.
+Recovery remains `disk.workspace.within_budget` at Info and is not retained.
 Every 15 seconds the independent collector reads bounded Docker logs/lifecycle
 windows for managed workspaces, Poise Compose services and release-install
 tasks. Only validated structured workspace envelopes enter private history;
@@ -299,6 +339,22 @@ The command requires a request host inside `POISE_DOMAIN`, bounds input to
 only after persistence. The operator owns delivery/retry and must not forward
 unrelated business-service logs. No public or workspace ingestion endpoint is
 added. Unconfigured external ingress coverage remains unknown, not healthy.
+
+The deployment verifier uses the same private socket through the operator
+`deployment` command, with a bounded health snapshot. An observed replacement
+drain that exhausts its positive verification budget (normally 600 seconds)
+retains one `workspace.deployment.pause` Error per full rollout ID and workspace.
+Zero-second receipt reads and routine waits create no Error. The requested
+revision comes from the receipt; health's desired release and switch age remain
+context, with unavailable blocker/retry evidence unknown. The first accepted
+snapshot retains the exhausted budget, elapsed seconds, serving revision and
+admission state unchanged across verifier processes. Durable observation state
+prevents delayed evidence from reopening a recovered pause. A Warning in the
+same incident records observed restored admissions or the same rollout's exact
+completion proof; missing health, supersession and another rollout's completion
+cannot establish recovery. The rollout stays pending until its existing release
+and build/image verification gates pass. Diagnostic delivery failure is visible
+on stderr and does not change those gates.
 
 External Caddy installations can instead run the bounded continuous
 [operator reader](../deploy/ingress/README.md). A dedicated forced-command SSH
@@ -438,10 +494,18 @@ unavailability is a collection Warning rather than an invented application cause
 
 Production shutdown retains one `process.shutdown` Error when cleanup rejects or
 reaches its ten-second deadline, including pending runtime/HTTP phases and known
-rejection causes. It commits through the same independent diagnostic store before
-exit 1, including after runtime teardown has stopped Logging. The supervisor
-can also record a generic exit event for the same shutdown. Logging retains
-those events after a healthy successor starts. Clean update exits (75) stay quiet.
+rejection causes. `pendingPhases` also names unresolved runtime stops, such as
+`runtime_stop.agent_collaborator`, including the later ledger and Logging stops.
+It commits through the same independent diagnostic store before
+exit 1, including after runtime teardown has stopped Logging. Each supervisor
+spawn overrides `POISE_SHUTDOWN_DIAGNOSTIC_ID` with a fresh launch ID. Only a
+read-only lookup confirming that exact normalized event ID, owner, release and
+shutdown Error permits a distinct `workspace.exit` Warning. Both records use
+the launch ID as `correlationId`; the Error retains the shutdown cause and the
+Warning retains the supervisor's actual exit code and signal. Missing,
+unavailable or mismatched records leave an independent exit Error, and lookup
+failure does not change supervision. Logging retains those events after a
+healthy successor starts. Clean update exits (75) stay quiet.
 
 Container discovery includes stopped containers and removes checkpoints only for absent container IDs; retained events survive that cleanup. Operator ingress deduplicates exact record replays, while separate records sharing a request ID retain distinct occurrence IDs. Bootstrap line capture keeps folded credential-header state across child output chunks before reporting or persistence.
 

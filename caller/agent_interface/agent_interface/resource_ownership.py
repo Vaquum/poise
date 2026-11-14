@@ -283,6 +283,15 @@ def failure(database: Path, call_id: str, cause: str, root: Path | None = None) 
             previous["at"] = time()
             previous.pop("recovered_at", None)
         _write(conn, call_id, value)
+        # A failure recorded after the terminal result requeues its diagnostic
+        # so a poll that already passed still sees it. Running calls have no
+        # entry yet, so this is a no-op until they finish. Minimal receipt-only
+        # databases have no diagnostic queue at all.
+        try:
+            conn.execute("delete from diagnostic_calls where call_id=?", (call_id,))
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error):
+                raise
 
 
 def released(value: dict | None) -> bool:

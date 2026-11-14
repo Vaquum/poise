@@ -593,7 +593,35 @@ release controls intact. If the host cannot be read, the summary reports the
 unavailable condition/age and leaves the host's episode untouched. GitHub must
 keep the scheduled workflow enabled for observation to run.
 
-The token is required because GitHub never lets a workflow's own token change
+To opt into issue intake for stalled replacement drains, set the fork's Actions
+variable `POISE_RELEASE_REPORT_REPOSITORY` to the authorized `owner/repo` with
+Issues enabled and a `poise` label. Set `POISE_RELEASE_REPORT_TOKEN` to a
+dedicated fine-grained token restricted to **that repository only**, with
+**Issues: read and write** and no contents, workflows or other write permissions.
+The observer's workflow token remains read-only; the issue credential stays in
+Actions and is never sent to the deployment host. An unset destination disables
+publication; an opted-in destination without its credential fails visibly.
+
+Publication requires a successful SHA-named host apply and that same job's
+failed verifier, whose timestamped log identifies the exact retained rollout,
+image and exhausted 600-second wait, plus fresh healthy workspace evidence with
+`draining=true`. A generic failed workflow, stale-release warning or pending
+switch is insufficient; replacement drains need no pending-switch fields.
+The report includes requested/serving releases, workspace admission state,
+available blocker details and counters, last retained observation, next action
+and verification/observation links. Missing progress or blocker details stay
+explicit. The condition marker reconciles closed as well as open issues.
+Warning delivery does not consume publication. A creation intent in the existing
+diagnostic file prevents another POST after an ambiguous result; subsequent Sync
+observations retry lookup. Failed lookups cannot authorize creation, and explicit
+HTTP rejections leave creation retryable. Publication failures fail the observation
+step with their cause in its summary, within the existing bounded job.
+New candidates keep one report during a continuous pause. Fresh health proving
+all expected workspaces resumed rearms reporting even if release lag remains;
+a later drain needs its own verifier exhaustion after that boundary. Recovery
+leaves filed remediation issues open and never changes native safety gates.
+
+`POISE_SYNC_TOKEN` is required because GitHub never lets a workflow's own token change
 a workflow file, anything under `.github/workflows/`. autonomio/poise changes
 its workflows from time to time. Without the token, the first such change
 stops the sync, and the fork stays on the commit before it until someone
@@ -816,8 +844,11 @@ runs the suite as that image's user. So the image's own files stay as they are, 
 so does what its folders hold that this user may not write: a suite started with the
 workspace's own Python runs with the job image's copy of it, which can lag the
 workspace's for the few minutes Render takes to build that image again. A sandbox has Docker, running and open to the
-suite, and the tools of the workspace image at the same paths: Node 22, `git`, a
-build toolchain and the Chromium of this repository's Playwright.
+suite, and the tools of the workspace image at the same paths: Node 22, Python
+3.13 (also selected by `python3` in npm scripts), `git`, a build toolchain,
+ShellCheck and the Chromium of this repository's Playwright. Python uses the
+workspace image's pinned uv release and `/opt/python` installation directory;
+its default executables are installed in `/usr/local/bin`.
 `gateway/src/test-box-setup.sh` builds those once, in about a minute, and the
 gateway keeps the result as a Render snapshot named after that file's contents, so
 a change there builds a new one. Sandboxes live in a sandbox group of their own,
@@ -868,14 +899,19 @@ why there is no test result, that this says nothing about its code, and to skip
 local tests for this work: not to retry or run parts of it, but to push and let CI
 run the tests. It exits with 125, or 124 at the time limit, and never falls back to
 running in the workspace. Each that the gateway can see also reaches its diagnostics
-as `test_relay.run.failed`, naming the workspace, the command and the reason; every
-run is logged with its command, exit code and duration as `test_relay.run.finished`.
+as `test_relay.run.failed`, naming the relay run ID, workspace, a bounded executable
+basename or recognized npm suite, and the reason. Relay lifecycle logs exclude
+argument values and shell/interpreter command bodies. Every run is logged with
+that safe command label, exit code and duration as `test_relay.run.finished`.
 The runner prints the captured-candidate digest and suite, then the existing run ID
 at each admission, so observed failures can name the attempt that produced them.
 An explicit gateway-restart failure is the one exception: the active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated
-run handshake and retries the whole suite once. Both attempts use one captured
+run handshake and retries the whole suite once. The authenticated
+`GET /api/link/test-relay/runs/probe/output` handshake returns 410 with
+`this run is over` without a request-failure warning. Other relay failures
+retain their warnings. Both attempts use one captured
 checkout archive, command, cwd and environment, including uncommitted edits.
 Capture, provisioning, upload, waiting and the complete rerun share a nine-minute
 command budget, capped by a shorter inherited `BASH_DEFAULT_TIMEOUT_MS`.
@@ -1008,7 +1044,10 @@ command exits nonzero. Invoke it again later to observe activation. A different
 Deployment-enabled forks recheck pending host-applied rollouts on the Sync
 schedule. The proof uses the exact active release and build and requires no
 pending switch. The recheck performs only inventory and health reads and
-updates the retained receipt. Check a legacy receipt by its rollout ID.
+updates the retained receipt and its [deployment pause diagnostics](Logging.md#collection-and-operation).
+Check a legacy receipt by its rollout ID. An observed replacement drain still
+active at the verifier's positive deadline retains an Error in Logging while
+the rollout remains pending; receipt-only zero-second waits do not raise it.
 
 The outcome becomes `complete` only after every expected workspace passes the
 proof. A supervisor `failed` marker for the exact target release establishes

@@ -59,6 +59,7 @@ if [ "$runtime" = runsc ]; then
   docker exec "$container" gcc -O0 -pthread /contract/thread-leader.c -o /tmp/native-fixtures/thread-leader
   docker exec "$container" /opt/caller/venv/bin/python /contract/kernel.py
   docker exec "$container" /opt/caller/venv/bin/python /contract/receipt.py
+  docker exec "$container" /opt/caller/venv/bin/python /contract/publication.py
   docker exec "$container" /opt/caller/venv/bin/python /contract/receipt.py slow
   for failure in exit23 exit137 sigkill; do
     docker exec "$container" /opt/caller/venv/bin/python /contract/receipt.py "$failure"

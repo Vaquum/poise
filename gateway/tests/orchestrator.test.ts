@@ -1,6 +1,9 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
+import { gatewayDiagnostic } from '../src/diagnostics/collectors.js'
+import { normalize } from '../src/diagnostics/contract.js'
+import { DiagnosticStore } from '../src/diagnostics/store.js'
 import {
   CURRENT_IMAGE_ID, events, GATEWAY_DATA_SOURCE, OLD_IMAGE_ID, startHarness, verifyAssertion, workspaceHost,
   type Harness, type HarnessOptions,
@@ -18,6 +21,16 @@ const BEHAVIOR_LIMITS = {
 
 function dockerCalls(h: Harness): string[] {
   return h.docker.calls.map((call) => `${call.method} ${call.path.split('?')[0]}`)
+}
+
+function retainedUpgradeFailure(h: Harness) {
+  const failure = h.logs.find(entry => entry.event === 'workspace.upgrade.failed')
+  expect(failure).toMatchObject({ level: 'error', handle: 'alice' })
+  const db = new DiagnosticStore(':memory:')
+  try {
+    db.append([normalize(gatewayDiagnostic('error', String(failure!.event), failure!))!])
+    return db.query({ workspace: 'alice', operator: false }).events[0]!
+  } finally { db.close() }
 }
 
 interface WorkspaceContainerOptions {
@@ -412,6 +425,7 @@ describe('lazy start', () => {
 
 describe('image upgrades', () => {
   let h: Harness
+  const stop500 = { status: 500, body: { message: 'cannot stop container: container PID 123 is zombie and can not be killed' } }
   const start = async (options?: HarnessOptions) => {
     h = await startHarness(options)
     await h.openWorkspace('Alice')
@@ -464,8 +478,8 @@ describe('image upgrades', () => {
       'GET /containers/poise-gateway/json',
       'GET /containers/poise-ws-alice/json',
       'GET /containers/poise-ws-alice/json',
-      'POST /containers/poise-ws-alice/stop',
-      'DELETE /containers/poise-ws-alice',
+      `POST /containers/${aliceId}/stop`,
+      `DELETE /containers/${aliceId}`,
       'POST /containers/create',
       'POST /containers/poise-ws-alice/start',
       `GET /containers/${bobId}/json`,
@@ -486,6 +500,173 @@ describe('image upgrades', () => {
       'workspace.container.started',
       'workspace.upgrade.finished',
     ])
+  })
+
+  it('reconciles a stop 500 only after the exact owned container is positively stopped', async () => {
+    await start()
+    const old = h.docker.containers.get('poise-ws-alice')!
+    h.docker.onCall = call => {
+      if (call.method === 'POST' && call.path.endsWith('/stop')) {
+        old.running = false
+        return stop500
+      }
+      return undefined
+    }
+    await h.orchestrator.upgradePass()
+    expect(dockerCalls(h).filter(call => call.endsWith('/stop'))).toEqual([`POST /containers/${old.id}/stop`])
+    expect(dockerCalls(h)).toContain(`DELETE /containers/${old.id}`)
+    expect(dockerCalls(h)).not.toContain('DELETE /containers/poise-ws-alice')
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+    expect(h.docker.containers.get('poise-ws-alice')?.id).not.toBe(old.id)
+    expect(h.docker.volumes.has('poise-home-alice')).toBe(true)
+    expect(h.docker.containers.get('poise-ws-alice')?.spec.HostConfig).toMatchObject({
+      Mounts: [{ Type: 'volume', Source: 'poise-home-alice', Target: '/home/poise' }],
+    })
+    expect(events(h.logs, 'workspace.upgrade.stop.reconciled')).toHaveLength(1)
+    expect(events(h.logs, 'workspace.upgrade.finished')).toHaveLength(1)
+    expect(events(h.logs, 'workspace.upgrade.failed')).toHaveLength(0)
+    expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/resume')).toBe(false)
+  })
+
+  it.each([
+    ['running', 'status=running, running=true'],
+    ['absent', 'absent (Docker 404)'],
+    ['old inspection failure', 'inspection failed: Docker Engine GET'],
+    ['name inspection failure', 'inspection failed: Docker Engine GET'],
+    ['malformed old state', 'status=unknown, running=false'],
+    ['malformed name state', 'status=unknown, running=false'],
+    ['ownership lost', 'owned=false'],
+  ])('retains the stop 500 and safe inspection evidence for %s', async (state, evidence) => {
+    await start()
+    const old = h.docker.containers.get('poise-ws-alice')!
+    old.spec.Env = [...(old.spec.Env as string[]), 'PRIVATE_INSPECTION=never-retain-this-value']
+    let stopped = false
+    h.docker.onCall = call => {
+      if (call.method === 'POST' && call.path.endsWith('/stop')) {
+        stopped = true
+        old.running = state === 'running'
+        if (state === 'absent') h.docker.containers.delete(old.name)
+        if (state === 'ownership lost') old.labels['poise.workspace'] = 'bob'
+        return stop500
+      }
+      if (stopped && call.method === 'GET') {
+        const reference = state.includes('old') ? old.id : old.name
+        if (call.path === `/containers/${reference}/json`) {
+          if (state.includes('inspection failure')) return { status: 500, body: { message: 'inspection unavailable' } }
+          if (state.startsWith('malformed')) return { status: 200,
+            body: { Id: old.id, Config: { Labels: old.labels }, State: { Running: false } } }
+        }
+      }
+      return undefined
+    }
+    await h.orchestrator.upgradePass()
+    expect(dockerCalls(h).filter(call => call.endsWith('/stop'))).toEqual([`POST /containers/${old.id}/stop`])
+    expect(dockerCalls(h).filter(call => call.startsWith('DELETE /containers/'))).toEqual([])
+    expect(h.docker.containers.get(old.name)?.id).toBe(state === 'absent' ? undefined : old.id)
+    expect(h.docker.volumes.has('poise-home-alice')).toBe(true)
+    expect(events(h.logs, 'workspace.upgrade.finished')).toHaveLength(0)
+    const retained = retainedUpgradeFailure(h)
+    expect(retained).toMatchObject({ severity: 'error', operation: 'workspace.upgrade.failed', context: { container: old.id } })
+    expect(retained.message).toContain(`POST /containers/${old.id}/stop failed with HTTP 500: ${stop500.body.message}`)
+    expect(retained.message).toContain('poise-ws-alice:')
+    expect(retained.message).toContain(evidence)
+    expect(JSON.stringify(retained)).not.toContain('never-retain-this-value')
+    if (state.includes('inspection failure')) expect(retained.message).toContain('inspection unavailable')
+    const resume = !['absent', 'ownership lost', 'name inspection failure'].includes(state)
+    expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/resume')).toBe(resume)
+    expect(h.workspace.health.draining).toBe(!resume)
+  })
+
+  it.each(['stopped', 'absent', 'running', 'unreadable old', 'malformed current', 'wrong image', 'wrong settings', 'wrong owner', 'wrong release', 'unhealthy'])
+    ('observes a successor without mutating it or releasing its drain (old/target: %s)', async state => {
+      await start()
+      h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'target-release', 'poise.base': 'new-base' })
+      const old = h.docker.containers.get('poise-ws-alice')!
+      let successorId = ''
+      h.docker.onCall = call => {
+        if (call.method === 'POST' && call.path.endsWith('/stop')) {
+          h.docker.containers.delete(old.name)
+          old.name = 'retired-alice'
+          old.running = state === 'running'
+          if (state !== 'absent') h.docker.containers.set(old.name, old)
+          addWorkspaceContainer(h, 'alice', state === 'wrong image' ? OLD_IMAGE_ID : CURRENT_IMAGE_ID, true)
+          const successor = h.docker.containers.get('poise-ws-alice')!
+          successorId = successor.id
+          if (state === 'wrong settings') successor.spec.Env = ['POISE_DRAIN_TIMEOUT=1']
+          if (state === 'wrong owner') successor.labels['poise.workspace'] = 'bob'
+          h.workspace.health.release = state === 'wrong release' ? 'old-release' : 'target-release'
+          h.workspace.health.ok = state !== 'unhealthy'
+          return stop500
+        }
+        if (successorId && call.method === 'GET') {
+          if (state === 'unreadable old' && call.path === `/containers/${old.id}/json`) {
+            return { status: 500, body: { message: 'old inspection unavailable' } }
+          }
+          if (state === 'malformed current' && call.path === '/containers/poise-ws-alice/json') {
+            return { status: 200, body: { Id: successorId, State: { Running: true }, Config: { Labels: old.labels } } }
+          }
+        }
+        return undefined
+      }
+      await h.orchestrator.upgradePass()
+      expect(dockerCalls(h).filter(call => call.endsWith('/stop'))).toEqual([`POST /containers/${old.id}/stop`])
+      for (const reference of [old.id, 'poise-ws-alice', successorId]) {
+        expect(dockerCalls(h)).not.toContain(`DELETE /containers/${reference}`)
+      }
+      expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ id: successorId, running: true })
+      expect(h.docker.volumes.has('poise-home-alice')).toBe(true)
+      expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/resume')).toBe(false)
+      expect(h.workspace.health.draining).toBe(true)
+      expect(events(h.logs, 'workspace.upgrade.finished')).toHaveLength(0)
+      if (state === 'stopped' || state === 'absent') {
+        expect(h.logs.find(entry => entry.event === 'workspace.upgrade.skipped')).toMatchObject({
+          container: successorId, release: 'target-release', reason: 'a replacement is already serving the intended image and settings',
+        })
+        expect(events(h.logs, 'workspace.upgrade.failed')).toHaveLength(0)
+      } else {
+        const retained = retainedUpgradeFailure(h)
+        expect(retained.message).toContain(stop500.body.message)
+        expect(retained.message).toContain(old.id)
+        expect(retained.message).toContain(successorId)
+        if (state === 'unreadable old') expect(retained.message).toContain('old inspection unavailable')
+        if (state === 'wrong release' || state === 'unhealthy') expect(retained.message).toContain('has not confirmed the intended release target-release')
+      }
+    })
+
+  it('keeps stop and removal pinned when the workspace name is reused just before Docker stops it', async () => {
+    await start()
+    const old = h.docker.containers.get('poise-ws-alice')!
+    let successorId = ''
+    h.docker.onCall = call => {
+      if (call.method === 'POST' && call.path.endsWith('/stop')) {
+        h.docker.containers.delete(old.name)
+        old.name = 'retired-alice'
+        h.docker.containers.set(old.name, old)
+        addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, true)
+        successorId = h.docker.containers.get('poise-ws-alice')!.id
+      }
+      return undefined
+    }
+    await h.orchestrator.upgradePass()
+    expect(dockerCalls(h).filter(call => call.endsWith('/stop'))).toEqual([`POST /containers/${old.id}/stop`])
+    expect(dockerCalls(h).filter(call => call.startsWith('DELETE /containers/'))).toEqual([`DELETE /containers/${old.id}`])
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ id: successorId, running: true })
+    expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/resume')).toBe(false)
+  })
+
+  it('leaves a successor drain alone when replacement is skipped after the first drain', async () => {
+    await start()
+    const oldId = h.docker.containers.get('poise-ws-alice')!.id
+    h.workspace.onServiceRequest = request => {
+      if (request.url === '/api/service/drain') addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, true)
+    }
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')?.id).not.toBe(oldId)
+    expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
+    expect(dockerCalls(h).filter(call => call.endsWith('/stop') || call.startsWith('DELETE /containers/'))).toEqual([])
+    expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/resume')).toBe(false)
+    expect(h.workspace.health.draining).toBe(true)
+    expect(h.logs.find(entry => entry.event === 'workspace.upgrade.skipped')).toMatchObject({ reason: 'the drained container was replaced' })
   })
 
   it('keeps waiting while background work runs, even with no Chat turns or Caller calls', async () => {
@@ -544,8 +725,8 @@ describe('image upgrades', () => {
     h.workspace.health.unsettledNativeCalls = pending
     await h.orchestrator.upgradePass()
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(before)
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
-    expect(dockerCalls(h)).not.toContain('DELETE /containers/poise-ws-alice')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^DELETE \/containers\/(?:poise-ws-alice|[a-f0-9]+)$/))
     expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
     expect(h.workspace.health.draining).toBe(false)
     // The same upgrade proceeds once the original owner confirms release and retires its claim.
@@ -564,7 +745,7 @@ describe('image upgrades', () => {
     h.workspace.health.backgroundWork = 1
     await h.orchestrator.upgradePass()
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(before)
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(h.logs.find(entry => entry.event === 'workspace.upgrade.native-pending' && entry.handle === 'alice')).toBeDefined()
     expect(h.workspace.health.draining).toBe(false)
     h.workspace.health.unsettledNativeCalls = 0
@@ -728,7 +909,7 @@ describe('image upgrades', () => {
     await h.orchestrator.upgradePass()
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(events(h.logs, 'workspace.drain.unconfirmed').length).toBeGreaterThanOrEqual(1)
     expect(h.logs.find((entry) => entry.event === 'workspace.drain.unconfirmed')).toMatchObject({ handle: 'alice', draining: false })
     expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
@@ -752,7 +933,7 @@ describe('image upgrades', () => {
     await h.orchestrator.upgradePass()
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
     h.workspace.healthStatus = 200
     await h.orchestrator.upgradePass()
@@ -771,7 +952,7 @@ describe('image upgrades', () => {
     await upgrade
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
     h.workspace.healthStatus = 200
     await h.orchestrator.upgradePass()
@@ -787,7 +968,7 @@ describe('image upgrades', () => {
     await h.orchestrator.upgradePass()
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
     expect(h.logs.find((entry) => entry.event === 'workspace.drain.timeout')).toMatchObject({
       activeChatTurns: null, runningCallerCalls: null, backgroundWork: null,
@@ -811,7 +992,7 @@ describe('image upgrades', () => {
     await upgrade
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
   })
 
@@ -840,7 +1021,7 @@ describe('image upgrades', () => {
     // Still the old container, still running, work untouched while the drain waits.
     expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
     expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     h.workspace.health.activeChatTurns = 0
     h.workspace.health.runningCallerCalls = 0
     await upgrade
@@ -1032,6 +1213,92 @@ describe('updates in place', () => {
     expect(call.json()).toMatchObject({ error: 'workspace_updating' })
   })
 
+  it.each(['GET', 'HEAD', 'navigation', 'recovered'])(
+    'returns the update response for a pre-response reset during a switch (%s), then freshly verifies recovery', async kind => {
+      await start()
+      const { workspaceCookie } = await h.openWorkspace('Alice')
+      const headers = { cookie: workspaceCookie, ...(kind === 'navigation' ? NAVIGATE : {}) }
+      const before = containerId()
+      // Cache readiness before accepting the switch: only the reset may invalidate it.
+      expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+      await h.orchestrator.upgradePass()
+      expect(h.orchestrator.updatingTo('alice')).toBe('new-release')
+      h.workspace.onRequest = request => {
+        if (request.url !== '/reset') return
+        if (kind === 'recovered') h.workspace.health.release = 'new-release'
+        else h.workspace.reachable = false
+      }
+
+      const method = kind === 'HEAD' ? 'HEAD' : 'GET'
+      const reset = await h.request({ host: ALICE, path: '/reset', method, headers })
+      expect(reset.status).toBe(503)
+      expect(reset.headers['x-poise-updating']).toBe('1')
+      expect(reset.headers['retry-after']).toBe('2')
+      if (kind === 'navigation') expect(reset.body).toContain('Updating to the latest version')
+      else if (kind === 'HEAD') expect(reset.body).toBe('')
+      else expect(reset.json()).toMatchObject({ error: 'workspace_updating' })
+      expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({
+        level: 'error', handle: 'alice', errno: 'ECONNRESET', release: 'new-release', method, route: '/',
+        requestId: expect.any(String), upstream: `127.0.0.1:${h.workspace.port}`, durationMs: expect.any(Number),
+      })
+      expect(events(h.logs, 'workspace.update.finished')).toHaveLength(0)
+
+      h.workspace.reachable = true
+      h.workspace.health.release = 'new-release'
+      h.workspace.health.switching = null
+      const probes = h.workspace.serviceRequests.length
+      expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+      expect(h.workspace.serviceRequests.slice(probes).map(request => request.url)).toEqual(['/api/service/health'])
+      expect(h.orchestrator.updatingTo('alice')).toBeNull()
+      expect(h.logs.find(entry => entry.event === 'workspace.update.finished')).toMatchObject({ release: 'new-release' })
+      expect(h.workspace.requests.filter(request => request.url === '/reset')).toHaveLength(1)
+      expect(h.workspace.switches).toEqual(['new-release'])
+      expect(containerId()).toBe(before)
+    })
+
+  it.each(['no update', 'healthy old release', 'unhealthy', 'refused health'])(
+    'keeps a reset actionable without proof of a restart (%s)', async kind => {
+      await start()
+      const { workspaceCookie } = await h.openWorkspace('Alice')
+      const headers = { cookie: workspaceCookie }
+      expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+      if (kind !== 'no update') await h.orchestrator.upgradePass()
+      if (kind === 'unhealthy') h.workspace.health.ok = false
+      if (kind === 'refused health') h.workspace.healthStatus = 503
+      const probes = h.workspace.serviceRequests.length
+
+      const reset = await h.request({ host: ALICE, path: '/reset', headers })
+      expect(reset.status).toBe(502)
+      expect(reset.json()).toMatchObject({ error: 'bad_gateway' })
+      expect(reset.headers['x-poise-updating']).toBeUndefined()
+      expect(h.workspace.serviceRequests.slice(probes).map(request => request.url))
+        .toEqual(kind === 'no update' ? [] : ['/api/service/health'])
+      expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({ level: 'error', errno: 'ECONNRESET' })
+      expect(events(h.logs, 'workspace.update.finished')).toHaveLength(0)
+      expect(h.workspace.requests.filter(request => request.url === '/reset')).toHaveLength(1)
+    })
+
+  it.each(['POST', 'DELETE'])('keeps an interrupted %s actionable during a switch without replaying its effect', async method => {
+    await start()
+    const { workspaceCookie } = await h.openWorkspace('Alice')
+    const headers = { cookie: workspaceCookie, 'content-type': 'application/json' }
+    expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+    await h.orchestrator.upgradePass()
+    h.workspace.onRequest = request => {
+      if (request.url === '/reset') h.workspace.reachable = false
+    }
+    const body = method === 'POST' ? '{"effect":"applied before reset"}' : ''
+    const reset = await h.request({ host: ALICE, path: '/reset', method, headers, body })
+    expect(reset.status).toBe(502)
+    expect(reset.headers['x-poise-updating']).toBeUndefined()
+    // The fixture records the received mutation before dropping its answer; its outcome is ambiguous to the client.
+    expect(h.workspace.requests.filter(request => request.url === '/reset')).toMatchObject([{ method, body }])
+    expect(h.workspace.requestLines.filter(line => line === `${method} /reset`)).toHaveLength(1)
+    expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({
+      level: 'error', method, errno: 'ECONNRESET', release: 'new-release',
+    })
+  })
+
   it('recreates the container when the new image has another base, its release made current first', async () => {
     await start({ oldBase: 'base-0', release: 'new-release' })
     const before = containerId()
@@ -1039,7 +1306,7 @@ describe('updates in place', () => {
     expect(h.workspace.switches).toEqual([])
     expect(releaseTasks().map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
     const calls = dockerCalls(h)
-    expect(calls.indexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(calls.indexOf('POST /containers/poise-ws-alice/stop'))
+    expect(calls.indexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(calls.indexOf(`POST /containers/${before}/stop`))
     expect(containerId()).not.toBe(before)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
@@ -1059,7 +1326,7 @@ describe('updates in place', () => {
     // Activated again once idle, and only then stopped.
     expect(releaseTasks().map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate'], ['--activate']])
     const docker = dockerCalls(h)
-    expect(docker.lastIndexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(docker.indexOf('POST /containers/poise-ws-alice/stop'))
+    expect(docker.lastIndexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(docker.findIndex(call => /^POST \/containers\/[^/]+\/stop$/.test(call)))
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
@@ -1077,7 +1344,7 @@ describe('updates in place', () => {
     expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
     expect(containerId()).toBe(before)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     // The next pass admits and upgrades.
     h.workspace.drainApplies = true
     await h.orchestrator.upgradePass()
@@ -1095,7 +1362,7 @@ describe('updates in place', () => {
     }
     await h.orchestrator.upgradePass()
     expect(containerId()).toBe(before)
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
   })
 
@@ -1123,7 +1390,7 @@ describe('updates in place', () => {
     expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
     expect(containerId()).toBe(before)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     // The next pass admits and upgrades once answers resume.
     h.workspace.answerDelayMs = 0
     h.workspace.healthStatus = 200
@@ -1146,7 +1413,7 @@ describe('updates in place', () => {
     expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
     expect(containerId()).toBe(before)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     // The next pass admits and upgrades once the work settles.
     h.workspace.drainApplies = true
     h.workspace.health.runningCallerCalls = 0
@@ -1361,7 +1628,7 @@ describe('updates in place', () => {
     h.advance(11 * 60_000)
     await h.orchestrator.upgradePass()
     expect(containerId()).toBe(before)
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
     expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
@@ -1403,8 +1670,8 @@ describe('updates in place', () => {
       if (reply === 'health poll') expect(requests.slice(2, -1)).toContainEqual(expect.objectContaining({ method: 'GET', url: '/api/service/health' }))
       expect(containerId()).toBe(before)
       expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
-      expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
-      expect(dockerCalls(h)).not.toContain('DELETE /containers/poise-ws-alice')
+      expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
+      expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^DELETE \/containers\/(?:poise-ws-alice|[a-f0-9]+)$/))
       expect(releaseTasks().map(task => (task.spec as { Cmd: string[] }).Cmd)).toEqual([[]])
       expect(h.orchestrator.updatingTo('alice')).toBeNull()
       expect(events(h.logs, 'workspace.drain.timeout')).toHaveLength(0)
@@ -1435,8 +1702,8 @@ describe('updates in place', () => {
       expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
       expect(h.logs.some(entry => entry.event === 'workspace.drain.released' && entry.reason === 'the workspace recovered on the target release')).toBe(false)
       expect(containerId()).toBe(before)
-      expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
-      expect(dockerCalls(h)).not.toContain('DELETE /containers/poise-ws-alice')
+      expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
+      expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^DELETE \/containers\/(?:poise-ws-alice|[a-f0-9]+)$/))
     },
   )
 
@@ -1479,7 +1746,7 @@ describe('updates in place', () => {
     h.advance(11 * 60_000)
     await h.orchestrator.upgradePass()
     expect(containerId()).toBe(before)
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
     expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
@@ -1499,7 +1766,7 @@ describe('updates in place', () => {
     h.advance(11 * 60_000)
     await h.orchestrator.upgradePass()
     expect(containerId()).toBe(before)
-    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContainEqual(expect.stringMatching(/^POST \/containers\/[^/]+\/stop$/))
     expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
 

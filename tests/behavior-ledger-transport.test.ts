@@ -2,14 +2,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { randomBytes } from 'node:crypto'
 import { Worker } from 'node:worker_threads'
+import { statSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { BehaviorLedgerObserver, captureBehaviorAdmission, startBehaviorLedger, stopBehaviorLedger } from '../server/behavior-ledger'
+import { BehaviorLedgerObserver, captureBehaviorAdmission, captureBehaviorOutcome, readBehaviorLedger, startBehaviorLedger, stopBehaviorLedger } from '../server/behavior-ledger'
+import { handleBehaviorLedger } from '../server/behavior-ledger-http'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import * as logging from '../server/logging'
 import type { LogEntry } from '../server/agent'
-import type { LedgerAdmission, LedgerHealth, LedgerRecord } from '../server/behavior-ledger-contract'
+import { DEFAULT_LEDGER_POLICY, type LedgerAdmission, type LedgerHealth, type LedgerRecord, type LedgerReply } from '../server/behavior-ledger-contract'
 
 const health: LedgerHealth = {
   status: 'ok', unavailableReason: null, coverageStart: '2026-10-19T00:00:00.000Z', observedAt: '2026-10-19T00:00:00.000Z',
@@ -632,7 +635,7 @@ describe('bounded behavior ledger transport', () => {
     expect((await observer.read({ operation: 'health' })).body.health.status).toBe('unavailable')
   })
 
-  it('answers list reads within budget with settled data at the retention caps', async () => {
+  it('upgrades a populated store and serves sparse target HTTP reads under writes at the retention caps', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-caps-'))
     directories.push(directory)
     const path = join(directory, 'ledger.db')
@@ -642,6 +645,8 @@ describe('bounded behavior ledger transport', () => {
     // mirrors the store; the store suite pins that formula.
     const setup = new BehaviorLedgerStore(path)
     setup.close()
+    // Longest supported repository identity also bounds the new index's keys.
+    const repository = `${'A'.repeat(39)}/${'P'.repeat(100)}`
     const load = new Database(path)
     try {
       const now = new Date().toISOString()
@@ -653,7 +658,7 @@ describe('bounded behavior ledger transport', () => {
       load.transaction(() => {
         for (let index = 0; index < 5000; index++) {
           const root: LedgerRecord = { id: randomBytes(32).toString('hex'), kind: 'firing', parentId: null, behavior: 'review-new-prs',
-            source: 'poise:review-new-prs', owner: 'acme', actor: 'review-bot', target: { repository: 'acme/project', number: index + 1 },
+            source: 'poise:review-new-prs', owner: 'acme', actor: 'review-bot', target: { repository, number: index + 1 },
             head, slot: null, plannedSlots: ['primary'], state: 'completed', stateSource: 'native', activity: 'settled', outcome: 'clean',
             createdAt: now, startedAt: now, completedAt: now, observedAt: now, revision: 1, refs: [], replayOf: null, omittedAttempts: 0 }
           const attempt: LedgerRecord = { ...root, id: randomBytes(32).toString('hex'), kind: 'attempt', parentId: root.id,
@@ -673,20 +678,105 @@ describe('bounded behavior ledger transport', () => {
         }
       })()
     } finally { load.close() }
-    const observer = new BehaviorLedgerObserver({ path })
-    observers.push(observer)
-    await observer.start()
-    const health = (await observer.read({ operation: 'health' })).body.health
-    expect(health).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
-    expect(health.instances).toBeGreaterThan(9000)
-    expect(health.instances).toBeLessThanOrEqual(10000)
-    expect(health.changes).toBeGreaterThan(25000)
-    expect(health.changes).toBeLessThanOrEqual(30000)
-    const startedAt = performance.now()
-    const page = await observer.read({ operation: 'list', limit: 50 })
-    expect(performance.now() - startedAt).toBeLessThan(1000)
-    expect(page.status).toBe(200)
-    expect(page.body.records).toHaveLength(50)
+    const legacy = new BehaviorLedgerStore(path)
+    const before = new Database(path)
+    let target: LedgerReply
+    let listing: LedgerReply
+    let coverage: LedgerHealth
+    let identities: { creation_seq: number; id: string; payload: string }[]
+    let metadata: { key: string; value: string }[]
+    try {
+      // An existing store has already issued these cursors without the index.
+      before.exec('DROP INDEX IF EXISTS ledger_target')
+      before.exec('VACUUM')
+      expect(before.prepare("SELECT 1 FROM sqlite_master WHERE name='ledger_target'").get()).toBeUndefined()
+      legacy.capture({ type: 'loss', count: 3 })
+      target = legacy.read({ operation: 'list', repository: repository.toLowerCase(), number: 2500, limit: 1 }).body
+      listing = legacy.read({ operation: 'list', limit: 1 }).body
+      coverage = legacy.health()
+      identities = before.prepare<unknown[], { creation_seq: number; id: string; payload: string }>(
+        'SELECT creation_seq,id,payload FROM ledger_instances WHERE creation_seq>64 ORDER BY creation_seq').all()
+      metadata = before.prepare<unknown[], { key: string; value: string }>(
+        "SELECT key,value FROM ledger_meta WHERE key IN ('version','generation','cursor_key') ORDER BY key").all()
+    } finally { before.close(); legacy.close() }
+    expect(target.nextCursor).toEqual(expect.any(String))
+    expect(listing.nextCursor).toEqual(expect.any(String))
+    const originalBytes = statSync(path).size
+    let peakJournalBytes = 0
+    const monitor = setInterval(() => {
+      peakJournalBytes = Math.max(peakJournalBytes, statSync(path + '-journal', { throwIfNoEntry: false })?.size ?? 0)
+    }, 1)
+    const server = createServer((req, res) => { void handleBehaviorLedger(req, res, req.url!) })
+    try {
+      const starting = startBehaviorLedger({ path })
+      // Captures queued during index creation must drain without new loss.
+      for (let index = 0; index < 32; index++) {
+        const nativeId = `during-upgrade-${index}`
+        captureBehaviorAdmission({ ...admission, admissionKey: nativeId, nativeId, repository, number: 6000 + index })
+        captureBehaviorOutcome({ nativeId, state: 'completed', activity: 'settled', outcome: 'clean', completedAt: new Date().toISOString() })
+      }
+      await starting
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Ledger HTTP fixture did not bind')
+      const durations: number[] = []
+      const read = async (query: string): Promise<LedgerReply> => {
+        const startedAt = performance.now()
+        const response = await fetch(`http://127.0.0.1:${address.port}/api/behavior-ledger?${query}`, { signal: AbortSignal.timeout(2000) })
+        const body = await response.json() as LedgerReply
+        durations.push(performance.now() - startedAt)
+        expect(response.status).toBe(200)
+        expect(durations.at(-1)).toBeLessThan(2000)
+        return body
+      }
+      const selector = `repository=${encodeURIComponent(repository.toLowerCase())}`
+      const page = await read(`${selector}&number=2500&limit=2`)
+      expect(page.records).toHaveLength(2)
+      expect(page.records![0]).toEqual(target.records![0])
+      expect(page.nextCursor).toBeNull()
+      for (const query of [`${selector}&number=9999&limit=2`, 'repository=missing/project&number=2500&limit=2']) {
+        expect((await read(query)).records).toEqual([])
+      }
+      expect((await read(`${selector}&number=2500&cursor=${encodeURIComponent(target.nextCursor!)}&limit=2`)).records)
+        .toEqual(page.records!.slice(1))
+      expect((await read(`${selector}&number=2500&parent=${target.records![0].id}`)).records).toEqual(page.records!.slice(1))
+      expect((await read(`cursor=${encodeURIComponent(listing.nextCursor!)}&limit=50`)).records!.map(record => record.id))
+        .toEqual(identities.slice(0, 50).map(record => record.id))
+      await vi.waitFor(async () => {
+        expect((await readBehaviorLedger({ operation: 'health' })).body.health.pending).toBe(0)
+      }, { timeout: 5000 })
+      const health = (await readBehaviorLedger({ operation: 'health' })).body.health
+      expect(health).toMatchObject({ status: 'incomplete', pending: 0, dropped: coverage.dropped, gaps: coverage.gaps,
+        coverageStart: coverage.coverageStart, generation: coverage.generation, detailFloor: coverage.detailFloor })
+      expect(health.instances).toBe(10000)
+      expect(health.changes).toBe(30000)
+      for (const number of [6000, 6031]) {
+        const captured = await read(`${selector}&number=${number}&limit=2`)
+        expect(captured.records).toHaveLength(2)
+        expect(captured.records!.every(record => record.state === 'completed' && record.activity === 'settled')).toBe(true)
+      }
+      const check = new Database(path, { readonly: true })
+      try {
+        expect(check.prepare('SELECT creation_seq,id,payload FROM ledger_instances WHERE creation_seq>64 AND creation_seq<=10000 ORDER BY creation_seq').all()).toEqual(identities)
+        expect(check.prepare("SELECT key,value FROM ledger_meta WHERE key IN ('version','generation','cursor_key') ORDER BY key").all()).toEqual(metadata)
+        expect(check.prepare("SELECT 1 FROM sqlite_master WHERE name='ledger_target'").get()).toBeDefined()
+        expect(check.pragma('journal_mode', { simple: true })).toBe('delete')
+      } finally { check.close() }
+      const databaseBytes = statSync(path).size
+      expect(databaseBytes).toBeLessThanOrEqual(DEFAULT_LEDGER_POLICY.maxPagesBytes)
+      expect(databaseBytes).toBeGreaterThan(originalBytes)
+      expect(databaseBytes - originalBytes).toBeLessThan(4 * 1024 * 1024)
+      expect(peakJournalBytes).toBeGreaterThan(0)
+      expect(peakJournalBytes).toBeLessThanOrEqual(65 * 1024 * 1024)
+      expect(statSync(path + '-journal', { throwIfNoEntry: false })).toBeUndefined()
+      expect(statSync(path + '-wal', { throwIfNoEntry: false })).toBeUndefined()
+      expect(statSync(path + '.coverage.json').size).toBeLessThanOrEqual(8192)
+      console.info('ledger retention-cap upgrade', { databaseBytes, databaseGrowthBytes: databaseBytes - originalBytes, peakJournalBytes, httpMs: durations })
+    } finally {
+      clearInterval(monitor)
+      await stopBehaviorLedger()
+      if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()))
+    }
   }, 60000)
 
   it('accepts late readiness after the startup budget without losing queued capture', async () => {
