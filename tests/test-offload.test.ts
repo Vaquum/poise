@@ -469,6 +469,7 @@ describe('a suite on a test box', () => {
   let groups: string[]
   let terminated: string[]
   let pendingTerminations: ServerResponse[] | null
+  let pendingCancellations: ServerResponse[] | null
   let setups: number
   let setupExit: number
   let setupMs: number
@@ -586,7 +587,8 @@ describe('a suite on a test box', () => {
           job.status = 'canceled'
           job.child?.kill('SIGKILL')
         }
-        res.writeHead(job ? 200 : 404).end()
+        if (pendingCancellations) pendingCancellations.push(res)
+        else res.writeHead(job ? 200 : 404).end()
         return
       }
       const [, id, action, operation] = /^\/v1\/sandboxes\/([^/]+)\/?([^/]*)\/?(.*)$/.exec(path) ?? []
@@ -661,6 +663,7 @@ describe('a suite on a test box', () => {
     groups = []
     terminated = []
     pendingTerminations = null
+    pendingCancellations = null
     setups = 0
     setupExit = 0
     setupMs = 0
@@ -1087,7 +1090,41 @@ describe('a suite on a test box', () => {
     else expect(events).toContainEqual({ event: 'test_relay.box.terminate', boxId: box.id, status: 204 })
   })
 
-  it('keeps retirement evidence exclusive to the current owner’s cleanup DELETE and evicts it without occupying admission slots', async () => {
+  it.each([false, true])('discards authenticated late output while job cancellation is pending (cancellation failure: %s)', async (failed) => {
+    runJobs = false
+    await startAll({ baseService: 'crn-test' })
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
+    const { id } = await created.json() as { id: string }
+    const run = relay.runs.get(id)!
+    const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: `Bearer ${KEY}` } })
+    await until(() => run.boxId !== null, 'the job to be created')
+    pendingCancellations = []
+    await output.body!.cancel()
+    await until(() => relay.runs.size === 0 && pendingCancellations!.length > 0, 'retirement before cancellation answers', 3_000)
+    expect(pendingCancellations).toHaveLength(1)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id, error: 'the workspace went away' }))
+    const write = vi.spyOn(run.output!, 'write')
+    const body = Buffer.concat([Buffer.from([1, 0, 0, 0, 4]), Buffer.from('late')])
+    const response = await fetch(`${relayUrl}/runs/${id}/output?seq=1&end=1&exit=0`, {
+      method: 'POST', headers: { authorization: `Bearer ${run.token}` }, body: new Uint8Array(body),
+    })
+    expect(response.status).toBe(410)
+    expect(await response.text()).toBe('this run is over')
+    expect(write).not.toHaveBeenCalled()
+    expect(run.received).toBe(0)
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', id }))
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.job.cancel', jobId: run.boxId }))
+    const [cancellation] = pendingCancellations
+    pendingCancellations = null
+    if (failed) cancellation.destroy()
+    else cancellation.writeHead(200).end()
+    await until(() => [...events, ...warnings].some(({ event, jobId }) => jobId === run.boxId && event === (failed ? 'test_relay.job.cancel.failed' : 'test_relay.job.cancel')), 'the cancellation diagnostic', 3_000)
+    if (failed) expect(warnings).toContainEqual({ event: 'test_relay.job.cancel.failed', jobId: run.boxId, error: 'fetch failed' })
+    else expect(events).toContainEqual({ event: 'test_relay.job.cancel', jobId: run.boxId, status: 200 })
+  })
+
+  it('limits retirement evidence to owner cleanup and authenticated late output, and evicts it without occupying admission slots', async () => {
     let allowed = true
     await startAll({ maxRuns: 1, baseService: 'crn-test', isWorkspace: (handle) => handle === 'bob' || (handle === 'alice' && allowed) })
     const headers = { authorization: `Bearer ${KEY}` }
@@ -1096,6 +1133,14 @@ describe('a suite on a test box', () => {
     const token = relay.runs.get(id)!.token
     expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
     expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+
+    const otherHeaders = { authorization: `Bearer ${workspaceKey(privateKey, 'bob')}` }
+    const otherCreated = await fetch(`${relayUrl}/runs`, { method: 'POST', headers: otherHeaders, body: '{"argv":["x"],"cwd":"/","env":{}}' })
+    const otherId = (await otherCreated.json() as { id: string }).id
+    const otherToken = relay.runs.get(otherId)!.token
+    expect((await fetch(`${relayUrl}/runs/${otherId}`, { method: 'DELETE', headers: otherHeaders })).status).toBe(204)
+    expect((await fetch(`${relayUrl}/runs/${id}/output`, { method: 'POST', headers: { authorization: `Bearer ${token}` } })).status).toBe(410)
     expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
 
     const forged = workspaceKey(generateKeyPairSync('ed25519').privateKey, 'alice')
@@ -1108,7 +1153,16 @@ describe('a suite on a test box', () => {
       ['DELETE', `/runs/${id}/extra`, KEY, 410],
       ['GET', `/runs/${id}/output`, KEY, 410],
       ['POST', `/runs/${id}/lease`, KEY, 410],
-      ['POST', `/runs/${id}/output`, token, 410],
+      ['POST', `/runs/${id}/output`, '', 410],
+      ['POST', `/runs/${id}/output`, 'wrong-token', 410],
+      ['POST', `/runs/${id}/output`, KEY, 410],
+      ['POST', `/runs/${id}/output`, otherToken, 410],
+      ['POST', `/runs/${'0'.repeat(32)}/output`, token, 410],
+      ['POST', `/runs/${id}/output/`, token, 410],
+      ['POST', `/runs/${id}/output/extra`, token, 410],
+      ['GET', `/runs/${id}/spec`, token, 410],
+      ['GET', `/runs/${id}/tree`, token, 410],
+      ['POST', `/runs/${id}/docker`, token, 410],
     ] as const) {
       const from = warnings.length
       const response = await fetch(`${relayUrl}${path}`, { method, headers: { authorization: `Bearer ${key}` } })
@@ -1131,6 +1185,8 @@ describe('a suite on a test box', () => {
     expect((await fetch(`${relayUrl}/runs/${latest}`, { method: 'DELETE', headers })).status).toBe(204)
     expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(410)
     expect(warnings).toContainEqual({ event: 'test_relay.request.failed', method: 'DELETE', path: `${TEST_RELAY_PATH}/runs/${id}`, status: 410, error: 'this run is over' })
+    expect((await fetch(`${relayUrl}/runs/${id}/output`, { method: 'POST', headers: { authorization: `Bearer ${token}` } })).status).toBe(410)
+    expect(warnings).toContainEqual({ event: 'test_relay.request.failed', method: 'POST', path: `${TEST_RELAY_PATH}/runs/${id}/output`, status: 410, error: 'this run is over' })
   })
 
   it('destroys the box when the agent’s side goes quiet with its connection open', async () => {
