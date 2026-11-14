@@ -486,7 +486,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         if (await handleJevApi(req, res, url)) return
-        if (path === '/api/behavior-chains') return handleBehaviorChains(req, res, url)
+        if (path === '/api/behavior-chains') return handleBehaviorChains(req, res, url, chatRuntime?.instance)
 
         if (url === '/api/health' && req.method === 'GET') {
           const scheduler = getBehaviorsRuntimeHealth()

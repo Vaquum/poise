@@ -137,15 +137,21 @@ polls, admission/start, failed attempts, holds and Resume do not reset it. Resta
 and projection rebuild derive the same clock without changing journal events.
 Fresh, stale, incomplete and unavailable evidence remain labelled. A known native
 failure backoff shows retry eligibility under existing admission gates; an unknown
-provider backoff has no invented deadline. Scheduled evidence rechecks never retry
-held work. CI or approval recovery cannot clear a hold or missing original receipt,
-and a queue entry cannot establish merge completion. Verified progress can remove
-a delayed entry; a durable hold remains until explicitly resumed, and a merged
-review obligation remains until its original evidence is verified. The first list
+provider backoff has no invented deadline. A scheduled evidence recheck is a read.
+The normal runtime can clear a hold when its specific recovery rule accepts new
+evidence. A merged review obligation remains until its original evidence is verified.
+A queue entry cannot establish merge completion. Verified progress can remove
+a delayed entry. The first list
 page's optional `attention` projection is independent of the ordinary chain-list
 cursor/filter; later list pages retain the existing pagination contract. Failed
 refreshes label retained attention entries stale. These are read-only summaries
 on the existing refresh clock, with no new observation or execution authority.
+In Observe → Tasks → Needs attention, a recovery nudge names the verified next
+condition or shows that it is unknown. A fresh linked PR or current Chat binding
+provides a link to existing work. Missing or conflicting ownership evidence stays
+unverified. A fresh prerequisite wait shares its root's row when the root is also
+in Needs attention. The affected chains remain available by search and direct
+link. Repeated refreshes preserve the original progress clock.
 Unchanged attention reads reuse the history-derived progress clock after
 validating the chain's current journal revision. A new event invalidates only
 that chain's cached clock; restart reconstructs it from the original history.
