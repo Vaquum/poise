@@ -8,7 +8,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server } from 'node:http'
 import { createRequire } from 'node:module'
 import { connect } from 'node:net'
-import { tmpdir } from 'node:os'
+import { availableParallelism, tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -428,10 +428,13 @@ describe('Poise in service mode', () => {
     vi.spyOn(h.context.deps.docker, 'diagnosticRead').mockResolvedValue(Buffer.alloc(0))
     const collector = new EnvironmentCollectors(central, h.context.deps.docker, context)
     const workers: Worker[] = []
-    const heartbeats = new Int32Array(new SharedArrayBuffer(8 * Int32Array.BYTES_PER_ELEMENT))
+    // Concurrent CLI/test processes compete for CPU with the workspace event loop.
+    // Capped to host capacity, reserving a core for the event loop, so the
+    // spinners contend without starving the delivery they measure.
+    const spinners = Math.max(1, Math.min(8, availableParallelism() - 1))
+    const heartbeats = new Int32Array(new SharedArrayBuffer(spinners * Int32Array.BYTES_PER_ELEMENT))
     try {
-      // Concurrent CLI/test processes compete for CPU with the workspace event loop.
-      await Promise.all(Array.from({ length: 8 }, (_, index) => new Promise<void>((resolve, reject) => {
+      await Promise.all(Array.from({ length: spinners }, (_, index) => new Promise<void>((resolve, reject) => {
         const worker = new Worker(`const { parentPort, workerData } = require('node:worker_threads');
           const beats = new Int32Array(workerData.beats); parentPort.postMessage('ready');
           parentPort.once('message', () => { parentPort.postMessage('running');
