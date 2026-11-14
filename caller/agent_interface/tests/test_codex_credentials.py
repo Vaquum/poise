@@ -1,17 +1,17 @@
-"""Rotated Codex credentials survive isolated Caller runs.
+"""Rotated Codex credentials survive one isolated Caller run.
 
-Covers autonomio/poise#1797: a later file group, inspection round or Call
-must never overwrite a refreshed credential with the older copy, and a
-rotation propagates back to the originating sign-in without clobbering a
-newer external sign-in. Every credential here is a canary in an isolated
-temporary home; the developer's real ~/.codex is never touched.
+Covers autonomio/poise#1797 (intra-run scope): a later file group,
+inspection round or fragment must never overwrite this run's refreshed
+credential with the older copy. Caller never writes the isolated file
+back: it is worker-writable and same-account forged JSON is
+indistinguishable from a genuine rotation, so cross-Call persistence
+stays explicitly unresolved. Every credential here is a canary in an
+isolated temporary home; the developer's real ~/.codex is never touched.
 """
-import fcntl
 import json
 import os
 import sys
 import tempfile
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -25,8 +25,8 @@ CANARY_A = ('{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refr
             '"account_id":"codex-canary-acct-1","login_owner_id":"codex-canary-login-1"}}')
 CANARY_B = ('{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-B",'
             '"account_id":"codex-canary-acct-1","login_owner_id":"codex-canary-login-1"}}')
-CANARY_C = ('{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-C",'
-            '"account_id":"codex-canary-acct-2","login_owner_id":"codex-canary-login-2"}}')
+CANARY_FORGED = ('{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-FORGED",'
+                 '"account_id":"codex-canary-acct-1","login_owner_id":"codex-canary-login-1"}}')
 THREAD = "01234567-89ab-4cde-8123-456789abcdef"
 REUSE_MESSAGE = ("Your access token could not be refreshed because your refresh "
                  "token was already used. Please log out and sign in again.")
@@ -123,258 +123,51 @@ class TestCodexCredentialPreservation(TestCase):
             self.assertIn('"review_id": 91', result)
             self.assertEqual(calls[-1][1], "--reviewed-clean")
             self.assertEqual(log.read_text().split(), ["saw:A", "saw:B"])
-            self.assertEqual((original / "auth.json").read_text(), CANARY_B)
+            # The run keeps its rotation; the originating sign-in is never
+            # written back (cross-Call persistence is explicitly unresolved).
+            self.assertEqual((original / "auth.json").read_text(), CANARY_A)
             self.assertEqual((original / "auth.json").stat().st_mode & 0o777, 0o600)
             self.assertNotIn("codex-canary", result)
 
-    def test_sequential_calls_converge_on_the_propagated_credential(self):
-        packet = json.dumps({"coverage": "complete", "files": [{"filename": "src/main.py"}],
-                             "diff": "diff --git a/src/main.py b/src/main.py\n--- a/src/main.py\n+++ b/src/main.py\n@@ -4 +4 @@\n-old\n+new\n"})
+    def test_same_account_forged_isolated_output_never_touches_the_sign_in(self):
         with tempfile.TemporaryDirectory() as directory:
             tmp = Path(directory)
             original = tmp / "home" / ".codex"
             original.mkdir(parents=True)
             (original / "auth.json").write_text(CANARY_A)
-            log = tmp / "sightings.log"
-            with patch.dict(os.environ, self.fake_env(original, write_fake_codex(tmp), log)):
-                first, _ = self.run_review(tmp, packet)
-                second, _ = self.run_review(tmp, packet)
-            self.assertIn('"review_id": 91', first)
-            self.assertIn('"review_id": 91', second)
-            self.assertEqual(log.read_text().split(), ["saw:A", "saw:B"])
-            self.assertEqual((original / "auth.json").read_text(), CANARY_B)
-            self.assertNotIn("codex-canary", second)
-
-    def test_concurrent_winner_propagates_while_loser_raises_without_overwriting(self):
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            original = tmp / "home" / ".codex"
-            original.mkdir(parents=True)
-            (original / "auth.json").write_text(CANARY_A)
-            server = tmp / "server"
-            server.write_text(CANARY_A)
-            barrier = threading.Barrier(2)
-
-            def fake_run(command, *, input, cwd, timeout, env, provider):
-                barrier.wait(timeout=30)
-                home = Path(env["CODEX_HOME"])
-                with open(server, "r+") as handle:
-                    fcntl.flock(handle, fcntl.LOCK_EX)
-                    try:
-                        current = handle.read()
-                        seen = (home / "auth.json").read_text()
-                        if seen != current:
-                            return SimpleNamespace(
-                                returncode=1,
-                                stdout=json.dumps({"type": "turn.failed", "message": REUSE_MESSAGE}),
-                                stderr=REUSE_MESSAGE + "\n")
-                        (home / "auth.json").write_text(CANARY_B)
-                        handle.seek(0)
-                        handle.write(CANARY_B)
-                        handle.truncate()
-                    finally:
-                        fcntl.flock(handle, fcntl.LOCK_UN)
-                out = Path(command[command.index("--output-last-message") + 1])
-                out.write_text('{"ok":true}')
-                return SimpleNamespace(
-                    returncode=0,
-                    stdout=json.dumps({"type": "thread.started", "thread_id": THREAD}),
-                    stderr="")
-
-            watch = SimpleNamespace(run=fake_run)
-            model = CATALOG.resolve("gpt-6-astra-max")
-            roots = [tmp / "run-first", tmp / "run-second"]
-            for root in roots:
-                root.mkdir()
-            results = {}
-
-            def attempt(name, root):
-                try:
-                    results[name] = ("ok", structured_review.ask_codex(
-                        root, model, "system", "packet", {}, watch, 60))
-                except Exception as error:
-                    # The race loser lands here; the assertions below tell a
-                    # reuse rejection from an unexpected thread failure.
-                    results[name] = ("error", error)
-                finally:
-                    # _review_once does this after every provider run.
-                    structured_review.codex_propagate(root)
-
-            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
-                threads = [threading.Thread(target=attempt, args=(name, root))
-                           for name, root in zip(("first", "second"), roots)]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join(timeout=60)
-                    self.assertFalse(thread.is_alive())
-            self.assertEqual(set(results), {"first", "second"})
-            kinds = sorted(kind for kind, _ in results.values())
-            self.assertEqual(kinds, ["error", "ok"])
-            ok = next(value for kind, value in results.values() if kind == "ok")
-            error = next(value for kind, value in results.values() if kind == "error")
-            self.assertEqual(ok, '{"ok":true}')
-            self.assertIn("already used", str(error))
-            self.assertNotIn("codex-canary", str(error))
-            self.assertEqual((original / "auth.json").read_text(), CANARY_B)
-
-    def test_newer_external_sign_in_is_never_overwritten(self):
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            original = tmp / "home" / ".codex"
-            original.mkdir(parents=True)
-            (original / "auth.json").write_text(CANARY_A)
-            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
-                root = tmp / "review"
-                root.mkdir()
-                structured_review.codex_environment(root)
-                (original / "auth.json").write_text(CANARY_C)
-                (original / "auth.json").chmod(0o600)
-                (root / "codex-home" / "auth.json").write_text(CANARY_B)
-                structured_review.codex_propagate(root)
-                self.assertEqual((original / "auth.json").read_text(), CANARY_C)
-                self.assertEqual((original / "auth.json").stat().st_mode & 0o777, 0o600)
-                followup = tmp / "followup"
-                followup.mkdir()
-                structured_review.codex_environment(followup)
-                self.assertEqual((followup / "codex-home" / "auth.json").read_text(), CANARY_C)
-
-    def test_propagation_leaves_fresh_state_alone(self):
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            original = tmp / "home" / ".codex"
-            original.mkdir(parents=True)
-            (original / "auth.json").write_text(CANARY_A)
-            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
-                # No rotation: nothing is written and no lock is even taken.
-                root = tmp / "fresh"
-                root.mkdir()
-                structured_review.codex_environment(root)
-                before = (original / "auth.json").read_bytes()
-                structured_review.codex_propagate(root)
-                self.assertEqual((original / "auth.json").read_bytes(), before)
-                self.assertFalse((original / "auth.json.lock").exists())
-                # Nothing was copied in: no-op, no error.
-                bare = tmp / "bare"
-                bare.mkdir()
-                structured_review.codex_propagate(bare)
-
-    def test_propagation_skips_symlinked_and_deleted_originals(self):
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            original = tmp / "home" / ".codex"
-            original.mkdir(parents=True)
-            (original / "auth.json").write_text(CANARY_A)
-            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
-                # A managed symlink is never severed by the atomic rename.
-                linked = tmp / "linked"
-                linked.mkdir()
-                structured_review.codex_environment(linked)
-                managed = tmp / "managed.json"
-                managed.write_text(CANARY_C)
-                (original / "auth.json").unlink()
-                (original / "auth.json").symlink_to(managed)
-                (linked / "codex-home" / "auth.json").write_text(CANARY_B)
-                structured_review.codex_propagate(linked)
-                self.assertTrue((original / "auth.json").is_symlink())
-                self.assertEqual(managed.read_text(), CANARY_C)
-                # A deleted original is a logout, not an invitation to resurrect.
-                (original / "auth.json").unlink()
-                (original / "auth.json").write_text(CANARY_A)
-                gone = tmp / "gone"
-                gone.mkdir()
-                structured_review.codex_environment(gone)
-                (original / "auth.json").unlink()
-                (gone / "codex-home" / "auth.json").write_text(CANARY_B)
-                structured_review.codex_propagate(gone)
-                self.assertFalse((original / "auth.json").exists())
-
-    def test_propagation_skips_when_the_commit_lock_is_held(self):
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            original = tmp / "home" / ".codex"
-            original.mkdir(parents=True)
-            (original / "auth.json").write_text(CANARY_A)
-            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
-                root = tmp / "review"
-                root.mkdir()
-                structured_review.codex_environment(root)
-                (root / "codex-home" / "auth.json").write_text(CANARY_B)
-                with open(original / "auth.json.lock", "w") as held:
-                    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    try:
-                        with patch.object(structured_review, "CODEX_COMMIT_WAIT_SECONDS", 0.2):
-                            structured_review.codex_propagate(root)
-                    finally:
-                        fcntl.flock(held, fcntl.LOCK_UN)
-                self.assertEqual((original / "auth.json").read_text(), CANARY_A)
-
-    def test_invalid_isolated_output_never_replaces_the_sign_in(self):
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            original = tmp / "home" / ".codex"
-            original.mkdir(parents=True)
-            (original / "auth.json").write_text(CANARY_A)
-            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
-                for isolated in ("not-json-at-all",
-                                 '{"auth_mode":"chatgpt"}',
-                                 '{"auth_mode":"chatgpt","tokens":{"refresh_token":""}}',
-                                 '{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-X"}}',
-                                 '{"auth_mode":"apikey","tokens":{"refresh_token":"x"}}'):
-                    root = tmp / f"run-{abs(hash(isolated)) % 100000}"
-                    root.mkdir(exist_ok=True)
-                    structured_review.codex_environment(root)
-                    (root / "codex-home" / "auth.json").write_text(isolated)
-                    structured_review.codex_propagate(root)
-                    self.assertEqual((original / "auth.json").read_text(), CANARY_A)
-
-    def test_substituted_account_never_replaces_the_sign_in(self):
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            original = tmp / "home" / ".codex"
-            original.mkdir(parents=True)
-            (original / "auth.json").write_text(CANARY_A)
-            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
-                root = tmp / "review"
-                root.mkdir()
-                structured_review.codex_environment(root)
-                (root / "codex-home" / "auth.json").write_text(CANARY_C)
-                structured_review.codex_propagate(root)
-                self.assertEqual((original / "auth.json").read_text(), CANARY_A)
-
-    def test_issue_review_propagates_an_ephemeral_rotation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            original = tmp / "home" / ".codex"
-            original.mkdir(parents=True)
-            (original / "auth.json").write_text(CANARY_A)
+            (original / "auth.json").chmod(0o600)
             work = tmp / "work"
             data = {"issue": {"issue": "o/r#7", "state": "open"}, "sub_issues": []}
 
             def checkout(*args, **kwargs):
                 return {"branch": "main", "head_sha": "b" * 40}
 
-            def rotated_provider(args, *, input, cwd, timeout, env, provider, cleanup_root=None):
-                (Path(env["CODEX_HOME"]) / "auth.json").write_text(CANARY_B)
+            def forged_provider(args, *, input, cwd, timeout, env, provider, cleanup_root=None):
+                # A danger-full-access worker writing same-account forged
+                # JSON: valid shape, same login identifiers, forged tokens.
+                (Path(env["CODEX_HOME"]) / "auth.json").write_text(CANARY_FORGED)
                 (work / "review.json").write_text(json.dumps(
                     {"comments": [{"issue": "o/r#7", "body": "fine"}]}))
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with patch.dict(os.environ, {"CODEX_HOME": str(original)}), \
                     patch.object(issue_review, "interface", side_effect=checkout), \
-                    patch.object(issue_review, "supervise", side_effect=rotated_provider):
+                    patch.object(issue_review, "supervise", side_effect=forged_provider):
                 posts, ignored = issue_review.review(
                     CATALOG.resolve("gpt-6-astra-max"), "o/r", 7, data, "bit-mis", "", work)
             self.assertEqual(posts, [{"issue": "o/r#7", "body": "fine"}])
             self.assertEqual(ignored, [])
-            self.assertEqual((original / "auth.json").read_text(), CANARY_B)
+            self.assertEqual((work / "codex-home" / "auth.json").read_text(), CANARY_FORGED)
+            self.assertEqual((original / "auth.json").read_text(), CANARY_A)
+            self.assertEqual((original / "auth.json").stat().st_mode & 0o777, 0o600)
 
-    def test_atomic_work_propagates_an_ephemeral_rotation(self):
+    def test_atomic_work_leaves_the_sign_in_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
             tmp = Path(directory)
             original = tmp / "home" / ".codex"
             original.mkdir(parents=True)
             (original / "auth.json").write_text(CANARY_A)
+            (original / "auth.json").chmod(0o600)
             work = tmp / "work"
             work.mkdir()
             publication = {"commitMessage": "fix: rotate", "title": "fix: rotate",
@@ -389,8 +182,8 @@ class TestCodexCredentialPreservation(TestCase):
                     return {"outcome": "validated"}
                 return {"outcome": "published"}
 
-            def rotated_provider(lease, args, *, input, cwd, timeout, env, provider):
-                (Path(env["CODEX_HOME"]) / "auth.json").write_text(CANARY_B)
+            def forged_provider(lease, args, *, input, cwd, timeout, env, provider):
+                (Path(env["CODEX_HOME"]) / "auth.json").write_text(CANARY_FORGED)
                 (work / "publication.json").write_text(json.dumps(publication))
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -399,9 +192,11 @@ class TestCodexCredentialPreservation(TestCase):
                                  lambda *args: {"issue": {"state": "open"}}), \
                     patch.object(atomic_work.issue_review, "interface", side_effect=interface), \
                     patch.object(atomic_work.issue_review, "_cwd_pids", lambda *args, **kwargs: []), \
-                    patch.object(atomic_work.checkout_lock, "run_gated", side_effect=rotated_provider):
+                    patch.object(atomic_work.checkout_lock, "run_gated", side_effect=forged_provider):
                 result = atomic_work.run(CATALOG.resolve("gpt-6-astra-max"), "example/repo", 7,
                                          "fix/rotation", "author", work, "c" * 32,
                                          lambda receipt: None)
             self.assertEqual(result, {"outcome": "published"})
-            self.assertEqual((original / "auth.json").read_text(), CANARY_B)
+            self.assertEqual((work / "codex-home" / "auth.json").read_text(), CANARY_FORGED)
+            self.assertEqual((original / "auth.json").read_text(), CANARY_A)
+            self.assertEqual((original / "auth.json").stat().st_mode & 0o777, 0o600)

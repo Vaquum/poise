@@ -411,11 +411,6 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if bound is not None:
                 resource_ownership.process_check(*bound, complete=True)
             record({"phase": "executing", "prepared": prepared})
-            if model.provider == "codex":
-                # After the release proof: leftover writers are gone, so the
-                # isolated credential read here is the run's final state.
-                from .structured_review import codex_propagate
-                codex_propagate(work)
             progress.stage("validating_provider_result", "Checking the atomic provider result")
             terminal = issue_review._terminal_failure(model.provider, done.stdout)
             if done.returncode or terminal:

@@ -622,10 +622,6 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
             diagnostic_envelope(operation="provider.review", phase="provider_execution",
                                 outcome="timed_out", provider=model.provider,
                                 artifact=status, submission="none")) from error
-    finally:
-        if model.provider == "codex":
-            from .structured_review import codex_propagate
-            codex_propagate(work)
     terminal = _terminal_failure(model.provider, done.stdout)
     if done.returncode or terminal:
         # Claude's own result or stream diagnostics; a launch the subscription
