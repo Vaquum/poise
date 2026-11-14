@@ -30,6 +30,7 @@ export interface ChainInvocation {
   admittedAt: number
   admissionSequence: number
   request: { command: 'agent-interface' | 'github-interface', argv: string[], cwd: string, nativeResources?: 2, resourceLimits?: BehaviorExecutionLimits,
+    implementationSource?: { id: string, sequence: number },
     context?: { head: string, reviewRevision: string, queueRemoval?: string } }
   state: 'admitted' | 'started' | 'uncertain' | 'settled'
   callId: string | null
@@ -226,6 +227,9 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (!invocation.id || !invocation.basis || !invocation.actor || !Number.isSafeInteger(invocation.admittedAt)
       || invocation.admittedAt < 0 || next.invocations.some((prior) => prior.id === invocation.id)
       || next.invocations.some((prior) => prior.state !== 'settled')) throw new Error('behavior chain already owns an invocation or admission is invalid')
+    const source = invocation.request.implementationSource
+    if (source && (invocation.behavior !== 'implement-issue' || !source.id || source.id === next.id
+      || !Number.isSafeInteger(source.sequence) || source.sequence < 1)) throw new Error('invalid implementation report source precondition')
     const reservation = invocation.reservation ?? null
     if (reservation !== null && (!Number.isSafeInteger(reservation.memoryBytes) || reservation.memoryBytes < 0
       || !Number.isSafeInteger(reservation.diskBytes) || reservation.diskBytes < 0)) throw new Error('behavior invocation carries an invalid resource reservation')
@@ -621,6 +625,8 @@ export class BehaviorChainJournal {
     this.durable()
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('native invocation capacity must be positive')
     return this.db.transaction(() => {
+      const source = invocation.request.implementationSource
+      if (source && this.read(source.id)?.sequence !== source.sequence) throw new BehaviorChainRevisionConflict('implementation report source changed before admission')
       if (this.cutover().mode === 'draining') return null
       if (chain.invocations.some(prior => nativeResourcesPending({ ...prior }))) return null
       if (invocation.model !== null && !this.modelCapacityAvailable(capacity)) return null
