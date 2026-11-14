@@ -98,6 +98,35 @@ it('selects an oldest unpublished admission beyond page one and applies the exac
     step: 'Issue admission', evidence: { state: 'unavailable' } })
 })
 
+it('carries each attention row’s hold, sequence and merge evidence past the first page', () => {
+  const journal = new BehaviorChainJournal(db)
+  for (let issue = 1000; issue < 1101; issue++) admit(journal, issue, now)
+  let held = admit(journal, 999, now)
+  held = append(journal, held, { type: 'chain.held', reason: 'New invocations held by the person' }, now)
+  let merged = admit(journal, 998, now)
+  merged = append(journal, merged, { type: 'chain.held', reason: 'qualifying original pre-merge review evidence is missing' }, now)
+  const mergeSha = 'c'.repeat(40)
+  merged = append(journal, merged, { type: 'chain.merged', mergeSha,
+    evidence: { repository: 'autonomio/poise', pull_number: 998, merged: true, merge_sha: mergeSha, review_complete: false } }, now)
+  let uncertain = admit(journal, 997, now)
+  uncertain = append(journal, uncertain, { type: 'invocation.admitted', invocation: { id: 'original', behavior: 'implement-issue',
+    actor: 'author', model: 'fixture', slot: 'primary', basis: 'original', admittedAt: now,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, now)
+  uncertain = append(journal, uncertain, { type: 'invocation.uncertain', invocationId: 'original', reason: 'original receipt unverified' }, now)
+  const first = journal.active().map(chain => chain.id)
+  expect(first).toHaveLength(100)
+  expect(first).not.toContain(held.id)
+  expect(first).not.toContain(merged.id)
+  expect(first).not.toContain(uncertain.id)
+  const entries = behaviorChainAttention(journal, now)
+  expect(entries.map(entry => entry.issue).sort((a, b) => a - b)).toEqual([997, 998, 999])
+  expect(entries.find(entry => entry.id === held.id)).toMatchObject({ held: 'New invocations held by the person',
+    sequence: held.sequence, mergeSha: null, progressAt: now })
+  expect(entries.find(entry => entry.id === merged.id)).toMatchObject({
+    held: 'qualifying original pre-merge review evidence is missing', sequence: merged.sequence, mergeSha })
+  expect(entries.find(entry => entry.id === uncertain.id)).toMatchObject({ held: null, sequence: uncertain.sequence, mergeSha: null })
+})
+
 it('advances the age when blocking outdated conversations resolve while live threads stay zero', () => {
   const journal = new BehaviorChainJournal(db)
   const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
