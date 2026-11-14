@@ -110,13 +110,15 @@ function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, no
   if (pull.head === hold.head && pull.conflict) {
     // Release only for the ordinary scoped repair, including its retry bound.
     // The failed CI receipt remains evidence; admission does not resolve it.
+    // Otherwise fall through to the green-CI recovery below.
     const resumed = { ...chain, held: null }
     const decision = decideBehaviorChain(resumed, observation, now)
-    if (decision.kind !== 'invoke' || decision.behavior !== 'repair-pr'
-      || closedChainTarget(chain, observation, decision.behavior) || !operations.enabled()) return false
-    const accounts = operations.accounts()
-    return accounts.author.toLowerCase() === chain.author.toLowerCase()
-      && accounts.reviewer.toLowerCase() === chain.reviewer.toLowerCase() && operations.permitted(resumed, decision)
+    if (decision.kind === 'invoke' && decision.behavior === 'repair-pr'
+      && !closedChainTarget(chain, observation, decision.behavior) && operations.enabled()) {
+      const accounts = operations.accounts()
+      if (accounts.author.toLowerCase() === chain.author.toLowerCase()
+        && accounts.reviewer.toLowerCase() === chain.reviewer.toLowerCase() && operations.permitted(resumed, decision)) return true
+    }
   }
   return (pull.head === hold.head || observation.ciBaseUpdate?.from === hold.head && observation.ciBaseUpdate.head === pull.head
       && observation.publication.pull_number === pull.number && observation.publication.head_sha === pull.head)
