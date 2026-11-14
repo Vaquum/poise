@@ -247,6 +247,8 @@ async function main(args) {
   const directory = mkdtempSync(join(tmpdir(), 'poise-test-input-'))
   const boundaries = dependencyBoundaries(selection)
   const archive = join(directory, boundaries ? 'tree.tar' : 'tree.tgz')
+  const specification = join(directory, 'spec.json')
+  writeFileSync(specification, spec, { mode: 0o600 })
   let dependencyRange
   process.once('exit', () => rmSync(directory, { recursive: true, force: true }))
   const capture = async () => {
@@ -453,7 +455,22 @@ async function main(args) {
       }
       if (failure) die(failure.message, failure.code)
       else if (exitCode === null) die('the connection to the test relay ended before the suite did')
-      else finish(exitCode)
+      else {
+        // The suite has its result; its budget must not replace it during source capture.
+        clearTimeout(deadline)
+        if (exitCode > 0 && process.env.AGENT_INTERFACE_FAILED_SOURCE_CALL) {
+          // Read the archive that was actually sent, while it still exists. A later
+          // edit under the same HEAD must never replace this validation's source.
+          const retained = spawn('agent-interface', ['--capture-failed-source', archive, specification, candidate, id, String(exitCode)],
+            { stdio: 'ignore', signal: lifetime.signal })
+          const saved = await new Promise((done) => {
+            retained.once('error', () => done(false))
+            retained.once('close', (code) => done(code === 0))
+          })
+          if (!saved) say('failed source capture unavailable; remediation requires a fresh reproduction')
+        }
+        finish(exitCode)
+      }
       return
     }
   } catch (error) {

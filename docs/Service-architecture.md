@@ -1808,6 +1808,12 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+The existing linked remediation also exposes bounded private source evidence
+from the original failed validation capture, retained through normal checkout
+cleanup under the workspace's incident-artifact lifecycle. Only its availability
+and capture identity enter receipts and reports; source bytes stay in the owning
+workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
+defines binding, access, limits and expiry without granting recovery authority.
 Terminal repair reports require the matching automatic hold, settled original Call,
 positive release and unchanged open PR head and repair basis, without possible
 publication effects. They preserve repair ownership and exclude CI-only recovery holds.

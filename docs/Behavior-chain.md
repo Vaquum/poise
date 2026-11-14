@@ -897,6 +897,10 @@ the bounded, redacted blocker as **worker-reported** and available structured Ca
 diagnostic facts. Caller's blocked result does not independently verify the worker's
 health-check, test-relay or other runner explanation. Its next action is to inspect
 the original Call, remedy the blocker and explicitly Resume for a fresh implementation.
+The same report exposes [private validation-time source evidence](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
+when retained, or explicit unavailability requiring a fresh reproduction. This
+inspection preserves the earlier failed capture independently of later untested
+edits and grants no publication, retry or approval authority.
 
 For `repair-pr`, `atomic_work_blocked` also qualifies one settled original Call
 under its matching active automatic hold after the last Resume. The same
