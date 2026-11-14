@@ -192,7 +192,8 @@ verdict can be submitted. Ordinary messages are unchanged. The bounds and
 failure rules are in [Caller PR review models](../caller/agent_interface/README.md#pr-review-models).
 A structured provider exit or error terminal keeps `not_started` /
 `preflight_failed` with a typed `review_provider_exit` / `review_provider_error`
-cause and no receipt; Poise retries it only after live GitHub evidence proves
+cause (a Codex credential rejection is typed `authentication_failed`) and no
+receipt; Poise retries it only after live GitHub evidence proves
 no reviewer action. Submission rejections, `no_review` no-ops, malformed or
 duplicate verdicts and duplicate GitHub reviews are contract violations and
 held. Uncertain submissions are reconciled from live receipts before any retry.
