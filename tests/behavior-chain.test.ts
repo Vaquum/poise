@@ -296,22 +296,56 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'native merge queue owns entry repaired-queue-entry' })
   })
 
+  it('repairs a completed exact-head CI failure before spending review slots, then requires fresh reviews on the repaired head', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    Object.assign(obs.pull!, { failing: ['unit:failure'], reviewIds: [], reviewReceipts: [] })
+    const repair = decideBehaviorChain(current, obs, NOW)
+    expect(repair).toMatchObject({ kind: 'invoke', behavior: 'repair-pr', actor: 'author', reviewer: REVIEWER,
+      basis: chainBasis(['repair', HEAD, ['unit:failure'], false, false, false, 0, obs.pull!.reviewRevision, obs.issue.revision]) })
+    if (repair.kind !== 'invoke') throw new Error('expected CI-failure repair')
+    current = finish(journal, current, 'ci-repair', 'repair-pr', repair.basis,
+      { status: 'completed', action: 'published', outcome: 'published', head_sha: NEXT })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('repair-pr finished') })
+    obs.publication.head_sha = NEXT; obs.publication.head_invocation = 'ci-repair'
+    Object.assign(obs.pull!, { head: NEXT, failing: [], reviewRevision: 'repaired-findings', reviewIds: [], reviewReceipts: [] })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr',
+      basis: chainBasis(['pr', NEXT, CONTEXT]) })
+  })
+
+  it('leaves completed grey CI to the existing grey recovery instead of the pre-review CI repair', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    Object.assign(obs.pull!, { failing: ['grey-check:cancelled'], greyRuns: [{ id: 99, attempt: 2 }], reviewIds: [], reviewReceipts: [] })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    obs.pull!.reviewIds.push(27)
+    obs.pull!.reviewReceipts.push({ id: 27, head: HEAD, state: 'COMMENTED', invocation: chainBasis('pr-review').slice(0, 32),
+      submittedAt: NOW, response: reviewResponse(chainBasis('pr-review').slice(0, 32), HEAD) })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'rerun-grey-ci' })
+  })
+
   it.each([
     ['started', 'review-pr is started'], ['uncertain', 'review-pr is uncertain'],
     ['held', 'operator hold'], ['queue', 'native merge queue owns'], ['stale', 'observations need refreshing'],
-  ])('preserves the %s guard before conflict repair or PR review', (guard, reason) => {
-    const { journal, chain } = setup(); const obs = observation(); pull(obs)
-    let current = reviewed(journal, chain, obs)
-    Object.assign(obs.pull!, { conflict: true, reviewIds: [], reviewReceipts: [] })
-    if (guard === 'started' || guard === 'uncertain') {
-      current = record(journal, current, { type: 'invocation.admitted', invocation: invocation('owned-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT])) })
-      current = record(journal, current, { type: 'invocation.started', invocationId: 'owned-review' })
-      if (guard === 'uncertain') current = record(journal, current, { type: 'invocation.uncertain', invocationId: 'owned-review', reason: 'verdict unavailable' })
+  ])('preserves the %s guard before conflict or CI-failure repair or PR review', (guard, reason) => {
+    for (const defect of ['conflict', 'failing'] as const) {
+      const { journal, chain } = setup(); const obs = observation(); pull(obs)
+      let current = reviewed(journal, chain, obs)
+      Object.assign(obs.pull!, defect === 'conflict'
+        ? { conflict: true, failing: [], reviewIds: [], reviewReceipts: [] }
+        : { conflict: false, failing: ['unit:failure'], reviewIds: [], reviewReceipts: [] })
+      if (guard === 'started' || guard === 'uncertain') {
+        current = record(journal, current, { type: 'invocation.admitted', invocation: invocation('owned-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT])) })
+        current = record(journal, current, { type: 'invocation.started', invocationId: 'owned-review' })
+        if (guard === 'uncertain') current = record(journal, current, { type: 'invocation.uncertain', invocationId: 'owned-review', reason: 'verdict unavailable' })
+      }
+      if (guard === 'held') current = record(journal, current, { type: 'chain.held', reason: 'operator hold' })
+      if (guard === 'queue') obs.pull!.queueEntry = 'existing-entry'
+      if (guard === 'stale') obs.checkedAt = NOW - 120_001
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining(reason) })
     }
-    if (guard === 'held') current = record(journal, current, { type: 'chain.held', reason: 'operator hold' })
-    if (guard === 'queue') obs.pull!.queueEntry = 'existing-entry'
-    if (guard === 'stale') obs.checkedAt = NOW - 120_001
-    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining(reason) })
   })
 
   it('merges a ready pull request without making its outdated threads a prerequisite', () => {
