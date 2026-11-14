@@ -290,7 +290,8 @@ Every attempt ends with one durable terminal state: a validated result with its
 authoritative `review_id` receipt, or a typed failure carrying provider, phase,
 bounded redacted cause and known (`none`, `rejected`, `noop`, `blocked`) or
 unknown submission state. Structured provider exits and signals are `review_provider_exit`,
-provider-reported error terminals are `review_provider_error`; both keep
+provider-reported error terminals are `review_provider_error`, except a Codex
+credential rejection, which is `authentication_failed`; all three keep
 `not_started` / `preflight_failed` with no receipt, so Poise can safely retry
 after proving no reviewer action. On a nonzero Codex exit, the cause prefers the
 last usable `error` / `turn.failed` message, then a recognizable stderr failure;

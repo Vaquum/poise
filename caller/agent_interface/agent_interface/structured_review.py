@@ -21,7 +21,7 @@ from uuid import UUID
 from pathlib import Path
 from time import monotonic
 
-from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, ReviewVerdictError, actor, bounded_cause, expected_head, pr_ref, provider_blocked
+from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, ReviewVerdictError, actor, bounded_cause, credential_rejected, expected_head, pr_ref, provider_blocked
 from .atoms import packet as fetch_packet
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
@@ -65,14 +65,18 @@ def provider_failure(message: str, *, provider: str = "provider", phase: str = "
         bounded = bounded_cause(cause or f"{provider} refused the review")
         raise AgentPreflightError(bounded, "review_provider_blocked",
                                   _diagnostic(provider, phase, exit_code=exit_code, signal=signal, cause=bounded))
+    # Classify the provider's own cause before credential redaction can
+    # hide natural-language words such as "token was".
+    code = "authentication_failed" if provider == "codex" and credential_rejected(cause) else "review_provider_exit"
     bounded = bounded_cause(cause or f"{provider} exited {exit_code}")
-    raise AgentPreflightError(f"{provider} review failed: {bounded}", "review_provider_exit",
+    raise AgentPreflightError(f"{provider} review failed: {bounded}", code,
                               _diagnostic(provider, phase, exit_code=exit_code, signal=signal, cause=bounded))
 
 
 def provider_error(provider: str, message: str, *, phase: str = "provider_execution") -> None:
+    code = "authentication_failed" if provider == "codex" and credential_rejected(message) else "review_provider_error"
     bounded = bounded_cause(message)
-    raise AgentPreflightError(f"{provider} review failed: {bounded}", "review_provider_error",
+    raise AgentPreflightError(f"{provider} review failed: {bounded}", code,
                               _diagnostic(provider, phase, cause=bounded))
 
 
@@ -868,7 +872,12 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
         completed_turns = 0
         for event in events(done.stdout):
             if event.get("type") in {"error", "turn.failed"}:
-                provider_error("codex", event.get("message") or "Codex review did not complete successfully")
+                error = event.get("error")
+                messages = (error.get("message") if isinstance(error, dict) else error, event.get("message"))
+                cause = next((message.strip() for message in messages
+                              if isinstance(message, str) and message.strip()),
+                             "Codex review did not complete successfully")
+                provider_error("codex", cause)
             if event.get("type") == "turn.completed":
                 completed_turns += 1
                 if completed_turns > 1:
