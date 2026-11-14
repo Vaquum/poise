@@ -16,6 +16,7 @@ import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, t
 import { createLogger } from '../gateway/src/log'
 import { gatewayDiagnostic } from '../gateway/src/diagnostics/collectors'
 import { normalize } from '../gateway/src/diagnostics/contract'
+import { startHarness, workspaceHost } from '../gateway/tests/harness'
 import { filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
 import { BehaviorChainJournal, chainBasis, type ChainEvent } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
@@ -277,7 +278,7 @@ describe('installing it into a home volume', () => {
     const home = temp()
     install(home, { POISE_TEST_RELAY_URL: 'https://alice.example/api/link/test-relay', POISE_TEST_RELAY_KEY: 'alice.signed' })
     const hooks = join(home, '.poise', 'test-offload')
-    expect(readFileSync(join(hooks, 'relay'), 'utf8')).toBe('https://alice.example/api/link/test-relay\nalice.signed\n')
+    expect(readFileSync(join(hooks, 'relay'), 'utf8')).toBe('https://alice.example/api/link/test-relay\nalice.signed\n540\n')
     expect(statSync(join(hooks, 'relay')).mode & 0o777).toBe(0o600)
     for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
     expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'relay', 'run.mjs', 'sitecustomize.py'])
@@ -428,11 +429,14 @@ process.stdout.write(JSON.stringify(status ? { loggedIn: true, authMethod: 'clau
   }
 
   it('passes the hooks on, so that agents on Claude get them', () => {
-    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000' })
+    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000',
+      POISE_TEST_BINDING: '{"call":"original"}', POISE_TEST_EVIDENCE_DIR: '/original/evidence' })
     expect(seen.PYTHONPATH).toMatch(/\.poise\/test-offload:src$/)
     expect(seen.NODE_OPTIONS).toMatch(/--require ".*\.poise\/test-offload\/hook\.cjs"$/)
     expect(seen.BASH_DEFAULT_TIMEOUT_MS).toBe('600000')
     expect(seen.BASH_MAX_TIMEOUT_MS).toBe('3600000')
+    expect(seen.POISE_TEST_BINDING).toBe('{"call":"original"}')
+    expect(seen.POISE_TEST_EVIDENCE_DIR).toBe('/original/evidence')
   })
 
   it('still keeps out what those variables carry without the hooks', () => {
@@ -462,6 +466,26 @@ describe('Poise', () => {
     vi.stubEnv('HOME', temp())
     const env = scrubbedChildEnvironment('agent-interface')
     for (const name of ['PYTHONPATH', 'NODE_OPTIONS', 'BASH_DEFAULT_TIMEOUT_MS', 'BASH_MAX_TIMEOUT_MS']) expect(env[name]).toBeUndefined()
+  })
+
+  it.each(['900', '3540'])('derives the shell deadline from the installed %s-second limit', (limit) => {
+    const home = temp()
+    vi.stubEnv('HOME', home)
+    execFileSync('sh', [join(SOURCE, 'install.sh')], {
+      env: { PATH: process.env.PATH, HOME: home, POISE_TEST_RELAY_URL: 'https://relay.example.com', POISE_TEST_RELAY_KEY: 'key', POISE_TEST_LIMIT_SECONDS: limit },
+    })
+    const env = scrubbedChildEnvironment('agent-interface')
+    expect(env.BASH_DEFAULT_TIMEOUT_MS).toBe(String((Number(limit) + 60) * 1000))
+    expect(env.BASH_MAX_TIMEOUT_MS).toBe('3600000')
+  })
+
+  it.each(['0', '1.5', '3541', '9007199254740991'])('refuses an invalid installed limit: %s', (limit) => {
+    const home = temp()
+    vi.stubEnv('HOME', home)
+    const hooks = join(home, '.poise', 'test-offload')
+    mkdirSync(hooks, { recursive: true })
+    writeFileSync(join(hooks, 'relay'), `https://relay.example.com\nkey\n${limit}\n`)
+    expect(() => scrubbedChildEnvironment('agent-interface')).toThrow('POISE_TEST_LIMIT_SECONDS must be a whole number from 1 to 3540')
   })
 })
 
@@ -701,7 +725,7 @@ describe('a suite on a test box', () => {
     }
   })
 
-  function suite(cwd: string, args: string[], env: Record<string, string> = {}): { child: ChildProcess; done: Promise<{ code: number | null; stdout: string; stderr: string }> } {
+  function suite(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): { child: ChildProcess; done: Promise<{ code: number | null; stdout: string; stderr: string }> } {
     const child = spawn(process.execPath, [join(hooks, 'run.mjs'), '--', ...args], { cwd, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
@@ -732,12 +756,201 @@ describe('a suite on a test box', () => {
   const runBox = () => [...boxes.values()].find((box) => box.snapshotName !== null) as Box
   const suiteBoxes = () => [...boxes.values()].filter((box) => box.snapshotName !== null)
 
+  it.each([null, 'crn-test'])('uses the gateway-installed budget beyond the old client ceiling with base service %s (accelerated deadline)', async (baseService) => {
+    const h = await startHarness({ env: {
+      POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_WORKSPACE: 'tea-test',
+      POISE_TEST_LIMIT_SECONDS: '900', ...(baseService ? { POISE_TEST_BASE_SERVICE: baseService } : {}),
+    } })
+    try {
+      await startAll({ limitSeconds: h.config.testRelay!.limitSeconds, baseService, privateKey: h.keys.privateKey })
+      h.config.proxyListen = new URL(relayOrigin).host
+      const home = temp()
+      h.docker.onTask = (task) => {
+        if (task.name !== 'poise-test-offload-alice') return
+        const env = Object.fromEntries((task.spec.Env as string[]).map((entry) => {
+          const at = entry.indexOf('=')
+          return [entry.slice(0, at), entry.slice(at + 1)]
+        }))
+        execFileSync('sh', [join(SOURCE, 'install.sh')], { env: { ...env, PATH: process.env.PATH, HOME: home } })
+      }
+      h.workspace.reachable = false
+      h.docker.onStart = () => { h.workspace.reachable = true }
+      const { workspaceCookie } = await h.openWorkspace('Alice')
+      await h.request({ host: workspaceHost('alice'), path: '/', headers: { cookie: workspaceCookie } })
+      await h.orchestrator.startInProgress('alice')
+      vi.stubEnv('HOME', home)
+      hooks = join(home, '.poise', 'test-offload')
+      expect(readFileSync(join(hooks, 'relay'), 'utf8').split('\n')[2]).toBe('900')
+      const env = scrubbedChildEnvironment('agent-interface')
+      expect(env.BASH_DEFAULT_TIMEOUT_MS).toBe('960000')
+      const repo = repository()
+      const clock = join(repo, 'clock.cjs')
+      // Accelerate only the client's long deadline: 540 s becomes 3 s, 900 s becomes 5 s.
+      // The suite and relay use real clocks, so the old fixed ceiling interrupts this suite.
+      writeFileSync(clock, `if (process.argv[1]?.endsWith('/run.mjs')) {
+        const timeout = global.setTimeout
+        global.setTimeout = (callback, ms, ...args) => timeout(callback, ms >= 540000 ? ms / 180 : ms, ...args)
+      }`)
+      const started = Date.now()
+      const { code, stdout, stderr } = await suite(repo,
+        [process.execPath, '-e', 'setTimeout(() => console.log("complete"), 3500)'],
+        { ...env, NODE_OPTIONS: `${env.NODE_OPTIONS} --require "${clock}"` },
+      ).done
+      expect(code).toBe(0)
+      expect(stdout).toBe('complete\n')
+      expect(stderr).not.toContain('no test result')
+      expect(Date.now() - started).toBeGreaterThan(3000)
+      expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', exit: 0 }))
+    } finally {
+      await h.close()
+    }
+  })
+
   function committed(): string {
     const repo = repository()
     execFileSync('git', ['-C', repo, 'add', '.'])
     execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'first'])
     return repo
   }
+
+  it.each([null, 'crn-test'])('holds relay recovery without retaining receipts for completed runs (%s)', async baseService => {
+    await startAll({ baseService })
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    writeFileSync(join(repo, '.gitignore'), '.env\nnode_modules\n')
+    symlinkSync(resolve('node_modules'), join(repo, 'node_modules'), 'dir')
+    mkdirSync(join(repo, 'tests'))
+    writeFileSync(join(repo, 'vitest.config.mjs'), 'export default { test: { include: ["tests/*.test.mjs"], maxWorkers: 1 } }')
+    writeFileSync(join(repo, 'tests/shared.test.mjs'), `import { it, expect } from 'vitest';
+it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
+    execFileSync('git', ['-C', repo, 'add', '.'])
+    execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'shared failure'])
+    const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const baseline = join(temp(), 'base')
+    execFileSync('git', ['-C', repo, 'worktree', 'add', '--detach', baseline, base], { stdio: 'ignore' })
+    symlinkSync(resolve('node_modules'), join(baseline, 'node_modules'), 'dir')
+    writeFileSync(join(repo, 'tracked.txt'), 'uncommitted implementation\n')
+    const evidence = temp()
+    const binding = { call: 'a'.repeat(32), nonce: 'b'.repeat(64), repository: 'example/repo', base }
+    const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence }
+    const run = async (cwd: string) => {
+      const result = await suite(cwd, [process.execPath, resolve('node_modules/vitest/vitest.mjs'), 'run', '--root', cwd], env).done
+      expect(result.code, result.stderr).toBe(1)
+      const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
+      expect(id, result.stderr).toBeTruthy()
+      // Held for #1619: candidate-controlled reports cannot authorize recovery.
+      expect(existsSync(join(evidence, `${id}.json`))).toBe(false)
+      expect(relay.runs.has(id!)).toBe(false)
+      return { id }
+    }
+    await run(repo)
+    await run(baseline)
+    expect(readdirSync(evidence)).toEqual([])
+  }, 30_000)
+
+  it('holds retry evidence when candidate code replaces the report files and exits 1', async () => {
+    await startAll()
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const evidence = temp()
+    const binding = { call: 'c'.repeat(32), nonce: 'd'.repeat(64), repository: 'example/repo', base }
+    const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence }
+    // A fabricated failed case, written without running any tests, as the suite UID can.
+    const forge = join(repo, 'forge.cjs')
+    writeFileSync(forge, `const { readdirSync, writeFileSync, mkdirSync } = require('node:fs');
+      const { join } = require('node:path');
+      for (const name of readdirSync('/tmp')) {
+        if (!name.startsWith('poise-assertions-')) continue
+        const dir = join('/tmp', name);
+        writeFileSync(join(dir, 'result.json'), JSON.stringify({ success: false, numFailedTests: 1, numTotalTests: 1,
+          testResults: [{ name: join('${repo}', 'tests/fake.test.ts'), status: 'failed', message: '',
+            assertionResults: [{ fullName: 'fabricated case', status: 'failed', failureMessages: ['expected forged'] }] }] }));
+        writeFileSync(join(dir, 'complete.json'), JSON.stringify({ errors: 0, reason: 'failed', setupFailed: false }));
+      }
+      const dir = '/tmp/poise-assertions-forged';
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'result.json'), JSON.stringify({ forged: true }));
+      writeFileSync(join(dir, 'complete.json'), JSON.stringify({ forged: true }));
+      process.exit(1)`)
+    const result = await suite(repo, [process.execPath, forge], env).done
+    expect(result.code, result.stderr).toBe(1)
+    const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
+    expect(id, result.stderr).toBeTruthy()
+    expect(existsSync(join(evidence, `${id}.json`))).toBe(false)
+    expect(readdirSync(evidence)).toEqual([])
+    expect(relay.runs.has(id!)).toBe(false)
+  }, 30_000)
+
+  it('holds relay recovery against fabricated assertions posted with the run token', async () => {
+    await startAll({ baseService: 'crn-test' })
+    const headers = { authorization: `Bearer ${KEY}` }
+    const binding = { call: 'e'.repeat(32), nonce: 'f'.repeat(64), repository: 'example/repo', base: 'a'.repeat(40) }
+    const request = { argv: ['node', 'vitest.mjs', 'run'], cwd: '/', env: {}, binding }
+    const candidate = '1'.repeat(64)
+    const created = await fetch(`${relayUrl}/runs`, {
+      method: 'POST', headers, body: JSON.stringify({ ...request, capture: { candidate, spec: JSON.stringify(request) } }),
+    })
+    expect(created.status).toBe(201)
+    const { id } = await created.json() as { id: string }
+    const run = relay.runs.get(id)!
+    const jobHeaders = { authorization: `Bearer ${run.token}` }
+    // Held for #1619: no report credential leaves the gateway in spec.json.
+    const served = await fetch(`${relayUrl}/runs/${id}/spec`, { headers: jobHeaders })
+    expect(served.status).toBe(200)
+    expect(await served.json()).not.toHaveProperty('reportTo')
+    // A fabricated inventory posted with the run token is not accepted.
+    const forged = await fetch(`${relayUrl}/runs/${id}/assertions`, {
+      method: 'POST', headers: jobHeaders,
+      body: JSON.stringify({
+        exit: 1, candidate, binding, repository: binding.repository, base: binding.base,
+        source: '2'.repeat(64), clean: false,
+        failures: [{ file: 'tests/fake.test.ts', test: 'fabricated case', cause: 'expected forged', causeDigest: '3'.repeat(64) }],
+        totals: [{ file: 'tests/fake.test.ts', test: 'fabricated case', total: 1 }],
+      }),
+    })
+    expect(forged.status).toBe(409)
+    expect(run.assertions).toBeNull()
+  })
+
+  it('holds relay inventories without trusting candidate-controlled reports', async () => {
+    await startAll()
+    const { assertionResult, sourceCapture } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as {
+      assertionResult: (reporter: { report: string, completion: string }, capture: { top: string }) => unknown,
+      sourceCapture: (cwd: string) => { clean: boolean, source: string },
+    }
+    const directory = temp()
+    const reporter = { report: join(directory, 'report.json'), completion: join(directory, 'complete.json') }
+    const failure = { fullName: 'original failure', status: 'failed', failureMessages: ['expected []'] }
+    const report = { success: false, numFailedTests: 1, numTotalTests: 1,
+      testResults: [{ name: join(directory, 'tests/a.test.ts'), status: 'failed', message: '', assertionResults: [failure] }] }
+    const complete = { errors: 0, reason: 'failed', setupFailed: false }
+    const parse = (value = report, completion = complete) => {
+      writeFileSync(reporter.report, JSON.stringify(value))
+      writeFileSync(reporter.completion, JSON.stringify(completion))
+      return assertionResult(reporter, { top: directory })
+    }
+    // Held for #1619: even a well-formed inventory is candidate-controlled, so none is trusted.
+    expect(parse()).toBeNull()
+    expect(parse(report, { ...complete, errors: 1 })).toBeNull()
+    expect(parse(report, { ...complete, setupFailed: true })).toBeNull()
+    expect(parse(report, { ...complete, reason: 'interrupted' })).toBeNull()
+    expect(parse({ ...report, numFailedTests: 2 })).toBeNull()
+    expect(parse({ ...report, testResults: [{ ...report.testResults[0], message: 'beforeAll failed' }] })).toBeNull()
+    expect(parse({ ...report, numFailedTests: 101, numTotalTests: 101,
+      testResults: [{ ...report.testResults[0], assertionResults: Array.from({ length: 101 }, () => failure) }] })).toBeNull()
+    rmSync(reporter.completion)
+    expect(assertionResult(reporter, { top: directory })).toBeNull()
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const clean = sourceCapture(repo)
+    expect(clean.clean).toBe(true)
+    // Same HEAD and an index flag cannot pass off the dirty candidate as base.
+    execFileSync('git', ['-C', repo, 'update-index', '--assume-unchanged', 'tracked.txt'])
+    writeFileSync(join(repo, 'tracked.txt'), 'dirty candidate')
+    expect(sourceCapture(repo)).toMatchObject({ clean: false })
+    expect(sourceCapture(repo).source).not.toBe(clean.source)
+  })
 
   it('starts a suite on a job of the base service, which costs less, and gives the agent its output and exit code', async () => {
     await startAll({ baseService: 'crn-test' })
@@ -1271,6 +1484,34 @@ describe('a suite on a test box', () => {
     expect(terminated).toContain(runBox().id)
   })
 
+  it.each([
+    [null, 'budget'], ['crn-test', 'budget'],
+    [null, 'cancel'], ['crn-test', 'cancel'],
+    [null, 'relay loss'], ['crn-test', 'relay loss'],
+  ] as const)('stops the provider worker after %s / %s within cleanup headroom', async (baseService, cause) => {
+    await startAll({ baseService })
+    writeFileSync(join(hooks, 'relay'), `${relayUrl}\n${KEY}\n2\n`)
+    const started = Date.now()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("up"); setTimeout(() => {}, 30000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    const worker = baseService ? [...jobs.values()][0].child : runBox().child
+    expect(worker?.pid).toBeGreaterThan(0)
+    expect(worker?.exitCode).toBeNull()
+    expect(worker?.signalCode).toBeNull()
+    if (cause === 'cancel') run.child.kill('SIGTERM')
+    else if (cause === 'relay loss') relayServer.closeAllConnections()
+    const { code, stderr } = await run.done
+    expect(code).toBe(cause === 'budget' ? 124 : cause === 'cancel' ? 143 : 125)
+    if (cause === 'budget') expect(stderr).toContain('exhausted its total time budget')
+    else if (cause === 'relay loss') expect(stderr).toContain('the connection to the test relay broke')
+    else expect(stderr).not.toContain('no test result')
+    // Run retirement and DELETE 204 happen before asynchronous provider cleanup.
+    // Observe the actual job/sandbox worker's exit as well.
+    await until(() => worker!.exitCode !== null || worker!.signalCode !== null, 'the provider worker to stop', 3000)
+    expect(Date.now() - started).toBeLessThan(5000)
+    expect(relay.runs.size).toBe(0)
+  })
+
   it('recovers a mid-suite relay replacement with the captured input and continues through the existing chain gates', async () => {
     await startAll()
     const repo = repository()
@@ -1362,11 +1603,12 @@ describe('a suite on a test box', () => {
     }
   })
 
-  it.each([7, 125])('returns a genuine suite exit %s without retrying, even if its output names a gateway restart', async (status) => {
+  it.each([7, 124, 125])('returns a genuine suite exit %s without retrying, even if its output names a gateway restart', async (status) => {
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.error('the gateway restarted'); process.exit(${status})`]).done
     expect(code).toBe(status)
     expect(stderr).not.toContain('interrupted validation')
+    expect(stderr).not.toContain('Skip local tests')
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
   })
 
