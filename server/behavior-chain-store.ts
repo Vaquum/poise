@@ -472,7 +472,9 @@ export class BehaviorChainJournal {
   capacityWaiters(): BehaviorChain[] {
     const rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current WHERE merged = 0
       AND json_extract(state, '$.held') IS NULL
-      AND json_extract(state, '$.waiting') IN (?, ?)
+      AND (json_extract(state, '$.waiting') IN (?, ?)
+        OR json_extract(state, '$.waiting') LIKE 'shared native resource budget is exhausted: %'
+        OR json_extract(state, '$.waiting') LIKE 'insufficient behavior resource headroom: %')
       AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i
         WHERE json_extract(i.value, '$.state') != 'settled')`)
       .all('shared native invocation capacity is occupied', 'waiting for the shared native behavior capacity') as Array<{ chain_id: string }>

@@ -244,11 +244,12 @@ function preferObservationError(current: Error | null, candidate: Error): Error 
 
 function capacityWait(reason: string): boolean {
   return reason === 'shared native invocation capacity is occupied' || reason === 'waiting for the shared native behavior capacity'
+    || reason.startsWith('shared native resource budget is exhausted: ') || reason.startsWith('insufficient behavior resource headroom: ')
 }
 
-function modelDecisionBasis(chain: BehaviorChain, observation: ChainObservation, now: number): string | null {
+function admissionDecisionBasis(chain: BehaviorChain, observation: ChainObservation, now: number): string | null {
   const decision = decideBehaviorChain(chain, observation, now)
-  return decision.kind === 'invoke' && decision.reviewer
+  return decision.kind === 'invoke'
     ? chainBasis([decision.behavior, decision.basis, decision.actor, decision.reviewer]) : null
 }
 
@@ -289,7 +290,7 @@ export class BehaviorChainRuntime {
    * Observations retain waiting, so the reason alone cannot date the episode. */
   private capacityWaitSequence(chain: BehaviorChain): number | null {
     const observation = chain.observation as ChainObservation | null
-    const basis = observation && modelDecisionBasis(chain, observation, observation.checkedAt)
+    const basis = observation && admissionDecisionBasis(chain, observation, observation.checkedAt)
     if (!basis) return null
     let first: number | null = null, matching = false, after = 0
     while (true) {
@@ -297,7 +298,7 @@ export class BehaviorChainRuntime {
       for (const row of events) {
         const event = JSON.parse(row.payload) as ChainEvent
         if (event.type === 'chain.observed') {
-          matching = modelDecisionBasis(chain, event.observation as ChainObservation, row.at) === basis
+          matching = admissionDecisionBasis(chain, event.observation as ChainObservation, row.at) === basis
           if (!matching) first = null
         } else if (event.type === 'chain.waiting' && capacityWait(event.reason) && matching) {
           first ??= row.sequence
@@ -468,7 +469,6 @@ export class BehaviorChainRuntime {
           }
           if (work[index].priority === null && offered.has(chain.id)) continue
           if (work[index].priority !== null) {
-            if (!this.operations.available() || !this.journal.modelCapacityAvailable(this.operations.capacity())) continue
             chain = this.current(chain)
             offered.add(chain.id)
           }
@@ -629,16 +629,14 @@ export class BehaviorChainRuntime {
                   continue
                 }
                 if (work[index].priority !== null && this.capacityWaitSequence(chain) !== work[index].priority) continue
-                if (decision.reviewer && this.operations.available() && this.journal.modelCapacityAvailable(this.operations.capacity())) {
-                  // A receipt can free capacity midway through the cursor page.
-                  // Offer older waiters that turn before preparing this work.
-                  const older = waiters.filter(waiter => !offered.has(waiter.chain.id)
-                    && waiter.sequence < (work[index].priority ?? Infinity))
-                  if (older.length) {
-                    work.splice(index + 1, 0, ...older.map(waiter => ({ chain: waiter.chain, priority: waiter.sequence, cursor: false })),
-                      { chain, priority: work[index].priority, cursor: false })
-                    continue
-                  }
+                // Model work and direct actions share resource reservations.
+                // Offer older waiters before either prepares new work.
+                const older = waiters.filter(waiter => !offered.has(waiter.chain.id)
+                  && waiter.sequence < (work[index].priority ?? Infinity))
+                if (older.length) {
+                  work.splice(index + 1, 0, ...older.map(waiter => ({ chain: waiter.chain, priority: waiter.sequence, cursor: false })),
+                    { chain, priority: work[index].priority, cursor: false })
+                  continue
                 }
                 if (decision.reviewer && !this.operations.available()) {
                   this.waitForCapacity(chain, 'waiting for the shared native behavior capacity')
@@ -656,13 +654,14 @@ export class BehaviorChainRuntime {
                 if (resources) {
                   const exhausted = this.resourceWaitReason(resources)
                   if (exhausted) {
-                    if (this.renewsWait(chain, exhausted)) this.append(chain, { type: 'chain.waiting', reason: exhausted })
+                    if (capacityWait(exhausted)) this.waitForCapacity(chain, exhausted)
+                    else if (this.renewsWait(chain, exhausted)) this.append(chain, { type: 'chain.waiting', reason: exhausted })
                     continue
                   }
                   try {
                     const cramped = headroomShortfall((this.operations.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)
                     if (cramped) {
-                      if (this.renewsWait(chain, cramped)) this.append(chain, { type: 'chain.waiting', reason: cramped })
+                      this.waitForCapacity(chain, cramped)
                       continue
                     }
                   } catch (error) {
@@ -780,7 +779,7 @@ export class BehaviorChainRuntime {
                   ...(resources ? { reservation: resources.reservation } : {}),
                   admittedAt: Date.now(), request }, this.operations.capacity(), resources?.budget ?? null)
                 if (!admitted) {
-                  const reason = !this.journal.modelCapacityAvailable(this.operations.capacity()) ? 'shared native invocation capacity is occupied'
+                  const reason = decision.reviewer && !this.journal.modelCapacityAvailable(this.operations.capacity()) ? 'shared native invocation capacity is occupied'
                     : resources ? this.resourceWaitReason(resources) ?? 'shared native invocation capacity is occupied'
                     : 'shared native invocation capacity is occupied'
                   if (capacityWait(reason)) this.waitForCapacity(chain, reason)
