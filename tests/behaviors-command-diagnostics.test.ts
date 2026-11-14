@@ -77,6 +77,13 @@ function failureScript(stderr: string): string {
   return `process.stdout.write('private-output'); process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = 1`
 }
 
+function branchUpdateDiagnostic(phase: string, submission = phase === 'update_branch' ? 'uncertain' : 'none') {
+  const message = `${phase}: httpx.ReadTimeout: delayed request timed out`
+  return 'caller_diagnostic: ' + JSON.stringify({ version: 1, source: 'caller', severity: 'error',
+    operation: 'update_branch_if_behind', phase, outcome: phase === 'update_branch' ? 'unknown' : 'failed',
+    submission, message, stderr: message, stderr_truncated: false })
+}
+
 function events() {
   const runtime = logging!.loggingRuntime()!
   while (runtime.health().queued) expect(runtime.flush()).toBe(true)
@@ -297,6 +304,100 @@ it.each(['merge-if-ready', 'update-branch-if-behind'])('persists one policy refu
     .toMatchObject({ status: 'failed', note: expect.stringContaining(`op=${primitive}`) })
 })
 
+it.each(['read_pull', 'read_readiness', 'recheck_pull', 'update_branch'])('attributes a terminal branch-update timeout at %s to its retry and ledger attempt', async (phase) => {
+  const stderr = branchUpdateDiagnostic(phase)
+  const { database, behaviors } = await start('update-branch-if-behind', failureScript(stderr))
+  await behaviors.runEnabledBehaviorsOnce()
+  const admission = mocks.captureAdmission.mock.calls[0]![0]
+  const retry = behaviors.getBehaviorFailureState('merge-prs', TARGET)!
+  const readOnly = phase !== 'update_branch'
+  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: admission.nativeId,
+    error: expect.stringContaining(phase), diagnostic: { code: 'network_interruption' } })
+  expect(Date.parse(retry.nextRetryAt) - Date.parse(retry.lastFailureAt)).toBe(60_000)
+  expect(events()).toEqual([expect.objectContaining({
+    operation: 'github-interface.update-branch-if-behind', severity: readOnly ? 'warning' : 'error', phase,
+    target: TARGET, correlationId: admission.nativeId, exitCode: 1, signal: null, stderr,
+    context: expect.objectContaining({ nativeId: admission.nativeId, retry, safeRetry: readOnly,
+      sideEffects: readOnly ? 'none' : 'uncertain' }),
+  })])
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ nativeId: admission.nativeId,
+    state: readOnly ? 'failed' : 'unknown', activity: readOnly ? 'settled' : 'unknown',
+    ...(readOnly ? { outcome: 'read_failed', completedAt: expect.any(String) } : {}),
+  }))
+  const previousRun = database.db.prepare('SELECT status, note FROM behavior_runs WHERE id = ?').get(admission.nativeId)
+  expect(previousRun).toMatchObject({ status: 'failed', note: expect.stringContaining(`phase=${phase}`) })
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(mocks.captureAdmission).toHaveBeenCalledTimes(1)
+
+  const original = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation((command: string, args: string[], options: RunFileOptions) => {
+    if (command === 'github-interface' && args[0] === '--update-branch-if-behind') {
+      expect(args).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA, '--token-user', 'review-bot']))
+      return Promise.resolve({ stdout: JSON.stringify({ action: 'update_branch_if_behind', repository: pr.repo,
+        pull_number: pr.number, head_sha: HEAD_SHA, outcome: 'updated' }), stderr: '' })
+    }
+    return original(command, args, options)
+  })
+  const key = `behavior_merge_prs_failure:${TARGET}`
+  database.setMeta(key, JSON.stringify({ ...JSON.parse(database.getMeta(key)!), nextRetryAtMs: 1 }))
+  await behaviors.runEnabledBehaviorsOnce()
+  const successor = mocks.captureAdmission.mock.calls[1]![0]
+  expect(successor.nativeId).not.toBe(admission.nativeId)
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ nativeId: successor.nativeId,
+    state: 'completed', activity: 'settled', outcome: 'updated' }))
+  expect(mocks.captureOutcome.mock.calls.filter(([value]) => value.nativeId === admission.nativeId)).toHaveLength(1)
+  expect(database.db.prepare('SELECT status, note FROM behavior_runs WHERE id = ?').get(admission.nativeId)).toEqual(previousRun)
+  expect(behaviors.getBehaviorFailureState('merge-prs', TARGET)).toBeNull()
+  expect(events()).toHaveLength(1)
+})
+
+it.each(['retry persistence', 'ledger bookkeeping', 'cancellation', 'disabled'])('retains a read-only branch-update Error after %s', async (blocker) => {
+  const stderr = branchUpdateDiagnostic('read_readiness')
+  const { database, behaviors } = await start('update-branch-if-behind', failureScript(stderr))
+  let stopping: Promise<void> | undefined
+  if (blocker === 'retry persistence') {
+    const setMeta = database.setMeta
+    vi.spyOn(database, 'setMeta').mockImplementation((key, value) => {
+      if (key === `behavior_merge_prs_failure:${TARGET}`) throw new Error('retry bookkeeping failed')
+      return setMeta(key, value)
+    })
+  } else if (blocker === 'ledger bookkeeping') {
+    mocks.captureOutcome.mockImplementationOnce(() => { throw new Error('ledger bookkeeping failed') })
+  } else {
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
+      try { return await original(command, args, options) }
+      catch (error) {
+        if (args[0] === '--update-branch-if-behind') {
+          if (blocker === 'cancellation') stopping = behaviors.stopBehaviorsRuntime()
+          else database.setMeta('behavior_merge_prs_enabled', '0')
+        }
+        throw error
+      }
+    })
+  }
+  await behaviors.runEnabledBehaviorsOnce()
+  await stopping
+  const recorded = events()
+  expect(recorded.filter((event) => event.operation === 'github-interface.update-branch-if-behind')).toEqual([
+    expect.objectContaining({ severity: 'error', phase: 'read_readiness', exitCode: 1, stderr,
+      context: expect.objectContaining({ safeRetry: false, retry: null, sideEffects: 'none' }) }),
+  ])
+  if (blocker.includes('bookkeeping') || blocker === 'retry persistence') {
+    expect(recorded.some((event) => event.message === (blocker === 'retry persistence' ? 'retry' : 'ledger') + ' bookkeeping failed')).toBe(true)
+  }
+  expect(behaviors.getBehaviorFailureState('merge-prs', TARGET)).toBeNull()
+})
+
+it.each(['uncertain', 'missing', 'malformed'])('requires valid terminal no-PUT proof for a read-stage Warning (%s)', async (proof) => {
+  const stderr = proof === 'malformed' ? 'caller_diagnostic: {' : branchUpdateDiagnostic('read_pull', proof)
+  const { behaviors } = await start('update-branch-if-behind', failureScript(stderr))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(events()).toEqual([expect.objectContaining({ severity: 'error', exitCode: 1, stderr,
+    context: expect.objectContaining({ safeRetry: false, sideEffects: 'uncertain' }) })])
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ state: 'unknown', activity: 'unknown' }))
+})
+
 it('keeps a killed branch-update process unknown despite read-stage output', async () => {
   const script = `process.stdout.write(JSON.stringify({ phase: 'read' })); setInterval(() => {}, 1000)`
   const { database, behaviors } = await start('update-branch-if-behind', script, true)
@@ -305,7 +406,7 @@ it('keeps a killed branch-update process unknown despite read-stage output', asy
   await expect(mocks.runFile.mock.results[commandIndex]!.value).rejects.toMatchObject({ stdout: JSON.stringify({ phase: 'read' }), stderr: '' })
   const admission = mocks.captureAdmission.mock.calls[0]![0]
   const retry = behaviors.getBehaviorFailureState('merge-prs', TARGET)!
-  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1 })
+  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: admission.nativeId })
   expect(Date.parse(retry.nextRetryAt) - Date.parse(retry.lastFailureAt)).toBe(60_000)
   expect(events()).toEqual([expect.objectContaining({
     operation: 'github-interface.update-branch-if-behind', behavior: 'merge-prs', severity: 'error',

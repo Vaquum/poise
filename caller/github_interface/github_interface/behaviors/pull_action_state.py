@@ -35,6 +35,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     pull: dict[str, Any] = {}
     mine: list[dict[str, Any]] = []
     queue_entry_id: str | None = None
+    queue_entry = None
     for _ in range(3):
         pull = await get_pull(client, owner, repo, number)
         reviews = await list_reviews(client, owner, repo, number)
@@ -50,6 +51,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                     mine[-1]["review_response"] = parse_body(review.get("body") or "")
 
         queue_entry_id = None
+        queue_entry = None
         steady = True
         if pull.get("state") == "open" and pull.get("merged") is not True:
             readiness = await get_pr_readiness_state(client, owner, repo, number)
@@ -58,16 +60,31 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
                     raise RuntimeError("GitHub returned malformed merge queue entry evidence")
                 queue_entry_id = entry["id"]
+                if payload.get("queue_evidence"):
+                    if not isinstance(entry.get("state"), str) or entry["state"] not in {
+                            "QUEUED", "AWAITING_CHECKS", "LOCKED", "MERGEABLE", "UNMERGEABLE"}:
+                        raise RuntimeError("GitHub returned malformed merge queue disposition")
+                    commits = {}
+                    for name, field in (("base", "baseCommit"), ("head", "headCommit")):
+                        commit = entry.get(field)
+                        if field not in entry or commit is not None and (not isinstance(commit, dict)
+                                or not isinstance(commit.get("oid"), str)
+                                or not re.fullmatch(r"[0-9a-fA-F]{40}", commit["oid"])):
+                            raise RuntimeError("GitHub returned malformed merge queue integration commit")
+                        commits[name] = commit["oid"].lower() if commit is not None else None
+                    queue_entry = {"id": queue_entry_id, "state": entry["state"], **commits}
             ready_head = readiness.get("headRefOid")
             rest_head = (pull.get("head") or {}).get("sha")
-            if isinstance(ready_head, str) and isinstance(rest_head, str) \
-                    and ready_head.lower() != rest_head.lower():
+            if not isinstance(ready_head, str) or not isinstance(rest_head, str) \
+                    or ready_head.lower() != rest_head.lower():
                 steady = False
             ready_state = readiness.get("state")
-            if isinstance(ready_state, str) and ready_state != "OPEN":
+            if ready_state != "OPEN":
                 steady = False
         if steady:
             break
+    else:
+        raise RuntimeError("pull-request head or state changed across all three readiness reads")
 
     queue_evidence = {}
     if payload.get("queue_evidence") and pull.get("state") == "open":
@@ -96,7 +113,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "merged_by": _login(pull.get("merged_by")),
         "head_sha": (pull.get("head") or {}).get("sha"),
         "merge_sha": pull.get("merge_commit_sha"),
-        **({"review_context": context_sha(pull), "merged_at": pull.get("merged_at")} if payload.get("queue_evidence") else {}),
+        **({"review_context": context_sha(pull), "merged_at": pull.get("merged_at"),
+            "queue_entry": queue_entry} if payload.get("queue_evidence") else {}),
         "queue_entry_id": queue_entry_id,
         "my_reviews": mine,
         **queue_evidence,

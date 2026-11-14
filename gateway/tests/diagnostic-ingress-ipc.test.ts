@@ -1,11 +1,13 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { createConnection, Socket } from 'node:net'
+import { createConnection, createServer, Socket } from 'node:net'
 import { once } from 'node:events'
+import { PassThrough } from 'node:stream'
+import { setImmediate } from 'node:timers/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, beforeAll, expect, it, vi } from 'vitest'
-import { maintainIngressSocket, startIngressSocket } from '../src/diagnostics/ingress-ipc.js'
+import { maintainIngressSocket, relayIngress, startIngressSocket } from '../src/diagnostics/ingress-ipc.js'
 import { DiagnosticRuntime } from '../src/diagnostics/runtime.js'
 import { DiagnosticStore } from '../src/diagnostics/store.js'
 import { executeLoggingRead } from '../src/diagnostics/query-worker.js'
@@ -79,7 +81,7 @@ it('preserves the legacy manual identity and refuses strict-host violations at t
   }
 })
 
-it('retains one replacement deadline Error per rollout and workspace through fresh verifier processes', async () => {
+it('retries busy deadline and recovery observations through the compiled CLI without duplicating retained evidence', async () => {
   const w = await writer(), requested = 'a'.repeat(40), serving = 'b'.repeat(40)
   const rollout = requested + '.FIRST1', later = requested + '.SECOND', at = Date.now() - 60_000
   const health = { ok: true, version: serving, release: serving, draining: true, desiredRelease: serving, pendingSince: null,
@@ -87,6 +89,27 @@ it('retains one replacement deadline Error per rollout and workspace through fre
     environment: { SECRET: 'excluded' } }
   const observe = (id: string, workspace: string, seconds: number, budget: number, elapsed: number, snapshot: unknown, complete = false) =>
     cli(w.directory, ['deployment', id, workspace, String(budget), String(elapsed), new Date(at + seconds * 1000).toISOString(), String(complete)], JSON.stringify(snapshot))
+  const observeAfterContention = async (...args: Parameters<typeof observe>) => {
+    const held = createConnection(w.socket)
+    held.on('error', () => held.destroy())
+    await once(held, 'connect'); held.write('ingress-stream\n')
+    const hello = JSON.parse(String((await once(held, 'data'))[0])) as Record<string, unknown>
+    const end = Socket.prototype.end; let refusals = 0
+    const observed = vi.spyOn(Socket.prototype, 'end').mockImplementation(function(this: Socket, ...args: unknown[]) {
+      if (args[0] === '{"error":"Ingress writer is busy"}\n') refusals++
+      return Reflect.apply(end, this, args)
+    })
+    try {
+      const [reply] = await Promise.all([observe(...args), (async () => {
+        await vi.waitFor(() => expect(refusals).toBeGreaterThan(0))
+        const ack = once(held, 'data')
+        held.end(JSON.stringify({ version: 1, challenge: hello.challenge, expected: hello.checkpoint, container: 'd'.repeat(64),
+          from: new Date(Date.now() - 1000).toISOString(), until: new Date().toISOString(), state: 'complete', records: [] }))
+        await ack
+      })()])
+      return reply
+    } finally { observed.mockRestore(); held.destroy() }
+  }
   const read = (workspace: string | null = null, operator = true) => {
     const reply = executeLoggingRead({ path: w.path, policy: w.runtime.health().policy, now: Date.now(), operation: 'list', access: { workspace, operator }, filter: {} })
     expect(reply.status).toBe(200)
@@ -96,10 +119,11 @@ it('retains one replacement deadline Error per rollout and workspace through fre
   expect((await observe(rollout, 'alice', 1, 0, 0, health))[0].events).toBe(0)
   expect((await observe(rollout, 'alice', 1, 600, 600, { ...health, release: requested, version: requested }))[0].events).toBe(0)
   expect(read().total).toBe(0)
+  await observeAfterContention(rollout, 'alice', 2, 600, 604, health)
   await observe(rollout, 'alice', 2, 600, 604, health)
   const first = read().events[0]
   expect(first).toMatchObject({ severity: 'error', operation: 'workspace.deployment.pause', phase: 'deadline', release: requested,
-    target: rollout, workspace: 'alice', timeoutMs: 600_000, occurrences: 1,
+    target: rollout, workspace: 'alice', timeoutMs: 600_000, occurrences: 1, eventTime: new Date(at + 2000).toISOString(),
     context: { rollout, requestedRevision: requested, servingRevision: serving, budget: 'deployment-verifier', budgetSeconds: 600,
       elapsedSeconds: 604, admissionState: 'drained', blocker: 'runningCallerCalls', nextRetry: null,
       health: { desiredRelease: serving, pendingSince: null, runningCallerCalls: 2, unsettledNativeCalls: null } } })
@@ -116,14 +140,101 @@ it('retains one replacement deadline Error per rollout and workspace through fre
   await observe(rollout, 'bob', 6, 600, 600, health)
   await observe(later, 'alice', 7, 0, 0, { ...health, draining: false, release: requested, version: requested }, true)
   expect(read().events.filter((event) => event.target === rollout && event.workspace === 'alice')).toEqual([first])
+  await observeAfterContention(rollout, 'alice', 8, 0, 0, { ...health, draining: false })
   await observe(rollout, 'alice', 8, 0, 0, { ...health, draining: false })
   const recovered = read().events.find((event) => event.target === rollout && event.workspace === 'alice' && event.phase === 'recovered')
-  expect(recovered).toMatchObject({ severity: 'warning', incidentId: first.incidentId, context: { recovery: 'admissions_restored', admissionState: 'open' } })
+  expect(recovered).toMatchObject({ severity: 'warning', incidentId: first.incidentId, eventTime: new Date(at + 8000).toISOString(),
+    context: { recovery: 'admissions_restored', admissionState: 'open' } })
+  expect(read().events.filter((event) => event.target === rollout && event.workspace === 'alice')).toHaveLength(2)
   // Neither delayed evidence nor a later drained snapshot reopens this pause.
   await observe(rollout, 'alice', 7, 600, 1200, health)
   await observe(rollout, 'alice', 9, 600, 1200, health)
   expect(read().events.filter((event) => event.severity === 'error')).toHaveLength(3)
   expect(read().events.find((event) => event.id === first.id)).toEqual({ ...first, occurrences: 2 })
+})
+
+it('exhausts only deployment contention retries and leaves other ingress commands single-attempt', async () => {
+  const w = await writer(), held = createConnection(w.socket)
+  held.on('error', () => held.destroy())
+  await once(held, 'connect'); held.write('ingress-stream\n'); await once(held, 'data')
+  const end = Socket.prototype.end; let refusals = 0
+  const observed = vi.spyOn(Socket.prototype, 'end').mockImplementation(function(this: Socket, ...args: unknown[]) {
+    if (args[0] === '{"error":"Ingress writer is busy"}\n') refusals++
+    return Reflect.apply(end, this, args)
+  })
+  try {
+    await expect(cli(w.directory, ['deployment', 'a'.repeat(40) + '.BUSY01', 'alice', '600', '600', new Date().toISOString(), 'false'], '{"ok":true,"draining":true}')).rejects.toThrow('Ingress writer is busy')
+    expect(refusals).toBe(5)
+    for (const command of ['ingress', 'ingress-stream']) {
+      await expect(cli(w.directory, command, 'null')).rejects.toThrow()
+      expect(refusals).toBe(command === 'ingress' ? 6 : 7)
+    }
+  } finally { observed.mockRestore(); held.destroy() }
+})
+
+it.each(['input', 'retry'] as const)('bounds deployment %s to the same total delivery deadline', async (phase) => {
+  const w = await writer(), held = createConnection(w.socket)
+  held.on('error', () => held.destroy())
+  await once(held, 'connect'); held.write('ingress-stream\n'); await once(held, 'data')
+  const input = new PassThrough(), write = vi.fn()
+  const end = Socket.prototype.end
+  let refused!: () => void
+  const busy = new Promise<void>((resolve) => { refused = resolve })
+  const observed = vi.spyOn(Socket.prototype, 'end').mockImplementation(function(this: Socket, ...args: unknown[]) {
+    if (args[0] === '{"error":"Ingress writer is busy"}\n') refused()
+    return Reflect.apply(end, this, args)
+  })
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    const result = expect(relayIngress(w.socket, 'deployment', input, write)).rejects.toThrow('Ingress relay exceeded 30 seconds')
+    await vi.advanceTimersByTimeAsync(29_000)
+    if (phase === 'retry') {
+      input.end('observation\nnull')
+      await busy
+      await setImmediate(); await setImmediate()
+    }
+    await vi.advanceTimersByTimeAsync(1000)
+    await result
+    expect(write).not.toHaveBeenCalled()
+  } finally { vi.useRealTimers(); observed.mockRestore(); input.destroy(); held.destroy() }
+})
+
+it('reports bounded redacted invalid-payload and storage causes without retrying', async () => {
+  const w = await writer(), args = ['deployment', 'a'.repeat(40) + '.FAIL01', 'alice', '600', '600', new Date().toISOString(), 'false']
+  const end = Socket.prototype.end; let refusals = 0
+  const observed = vi.spyOn(Socket.prototype, 'end').mockImplementation(function(this: Socket, ...args: unknown[]) {
+    if (typeof args[0] === 'string' && args[0].includes('Ingress delivery rejected:')) refusals++
+    return Reflect.apply(end, this, args)
+  })
+  try {
+    await expect(cli(w.directory, args, '[]')).rejects.toThrow('Invalid deployment observation')
+    expect(refusals).toBe(1)
+    const failure = vi.spyOn(DiagnosticStore.prototype, 'commitDelivery').mockImplementation(() => {
+      throw new Error('Storage failed: Bearer private-storage-credential ' + 'x'.repeat(2000))
+    })
+    try {
+      const error = await cli(w.directory, args, '{"ok":true,"draining":true}').then(() => { throw new Error('Expected storage rejection') }, (error: unknown) => error)
+      expect(error).toBeInstanceOf(Error)
+      const message = (error as Error).message
+      expect(message).toContain('Storage failed: [redacted credential]')
+      expect(message).not.toContain('private-storage-credential')
+      expect(message.length).toBeLessThan(600)
+      expect(refusals).toBe(2)
+    } finally { failure.mockRestore() }
+  } finally { observed.mockRestore() }
+})
+
+it('does not retry an ambiguous disconnect after sending a deployment frame', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'poise-ingress-disconnect-'))
+  let connections = 0
+  const server = createServer({ allowHalfOpen: true }, (socket) => {
+    connections++
+    socket.resume(); socket.once('end', () => socket.destroy())
+  })
+  await new Promise<void>((resolve) => server.listen(join(directory, 'logging.ingress.sock'), resolve))
+  cleanups.push(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); rmSync(directory, { recursive: true, force: true }) })
+  await expect(cli(directory, ['deployment', 'a'.repeat(40) + '.LOST01', 'alice', '600', '600', new Date().toISOString(), 'false'], '{"ok":true,"draining":true}')).rejects.toThrow('Ingress acknowledgement is incomplete')
+  expect(connections).toBe(1)
 })
 
 it('keeps completed pauses closed and rejects malformed deployment evidence at the private boundary', async () => {

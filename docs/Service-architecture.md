@@ -628,8 +628,13 @@ its own instead of refusing with dirty_unowned.
   only for a known switch whose fresh health probe cannot reach the workspace
   or finds it healthy on the requested release. A healthy old release keeps
   the ordinary 502. The reset invalidates cached readiness, so recovery freshly
-  verifies `/api/service/health` on the requested release. `proxy.failed` retains
-  its Error with request and requested-release evidence; no request is replayed.
+  verifies `/api/service/health` on the requested release. `proxy.failed` is one
+  Warning only after the retryable update response is produced; unverified
+  resets, interrupted mutations and unanswered failures retain an Error.
+  Request, requested release and actual response disposition are retained in
+  diagnostics (`disconnect` records the status/disposition or an unanswered
+  response). Failed rollout evidence remains in the existing rollout diagnostics;
+  no request is replayed.
 - **Everything else.** An image of another base, a workspace started without
   the supervisor, or a changed container setting still gets a new container,
   drained first ([Deployment](#deployment)). The gateway makes the new image's
@@ -1426,7 +1431,10 @@ then attribution and normalization run again at the gateway. See the
 The host deployment verifier also sends bounded observations through that
 private operator socket. The gateway retains rollout/workspace deadline and
 recovery diagnostics using the existing v1 envelope/store, without a public
-ingestion route or a release/replacement control change; [Logging](Logging.md#collection-and-operation)
+ingestion route or a release/replacement control change. Only deployment delivery
+retries the writer's exact busy refusal, replaying the same bounded observation
+within one 30-second deadline; other refusals retain a bounded, redacted cause.
+[Logging](Logging.md#collection-and-operation)
 defines the budget, deduplication and recovery contract.
 The edge also derives the fixed `/api/link/events` route label before removing
 the URI. All ingress paths apply the narrow native cancellation exception and

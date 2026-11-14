@@ -552,6 +552,54 @@ it.each([
   }
 })
 
+it('observes the #1517 queue blocker independently of PR mergeability and replaces integration evidence on the same head', async () => {
+  const head = 'ee7c6737a58dbdbbebbc59eb9222891e7af72f22'
+  const predecessor = '7ad75ba8c4fa9ab4df456e13824a311715082e64'
+  const entry = { id: 'MQE_lQDOU59AVM8AAAABO91Wr84ABOPkzgP6O_8', state: 'UNMERGEABLE', base: predecessor, head: null as string | null }
+  const state = { pull_number: 1517, state: 'open', head_sha: head, review_context: 'b'.repeat(64), merged: false,
+    queue_entry_id: entry.id as string | null, queue_entry: entry as typeof entry | null,
+    queue_removals: [] as Array<{ id: string, reason: string, createdAt: string, actor: null }>, my_reviews: [] }
+  const ci = { head_sha: head, pull_number: 1517, failing: [], mergeable: null, mergeable_state: 'unknown', base_sha: 'c'.repeat(40) }
+  mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
+    const evidence: Record<string, unknown> = {
+      '--chain-seed': { repository: chain.repository, issue_number: 7, actor: 'author', branch: chain.branch,
+        issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+        publication: { existing_pulls: [], pull_number: 1517, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
+      '--pull-action-state': state,
+      '--pr-readiness': { head_sha: head, draft: false, reviewer_approved_current_head: true, checks_state: 'SUCCESS',
+        unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0, green: false, blockers: ['not_mergeable'] },
+      '--list-failing-ci': ci,
+    }
+    if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
+    return { stdout: JSON.stringify(evidence[argv[0]]) }
+  })
+  const operations = actionOperations()
+  const first = await operations.observe(chain)
+  expect(first.pull).toMatchObject({ head, queueEntry: entry.id, queueEntryDetails: entry, conflict: false, behind: false })
+  expect(decideBehaviorChain(chain, first, Date.now())).toEqual({ kind: 'wait',
+    reason: `native merge queue owns entry ${entry.id}; queue UNMERGEABLE; cause unknown` })
+  // An integration is replaceable without changing the PR head or queue entry.
+  Object.assign(entry, { state: 'AWAITING_CHECKS', base: 'd'.repeat(40), head: 'e'.repeat(40) })
+  const replaced = await operations.observe({ ...chain, observation: first })
+  expect(replaced.pull).toMatchObject({ head, headSince: first.pull!.headSince, queueEntryDetails: entry, conflict: false })
+  expect(decideBehaviorChain(chain, replaced, Date.now())).toMatchObject({ kind: 'wait', reason: expect.stringContaining('AWAITING_CHECKS') })
+  state.queue_entry_id = 'replacement-entry'
+  await expect(operations.observe(chain)).rejects.toThrow('disposition is incomplete or mismatched')
+  entry.id = state.queue_entry_id
+  expect((await operations.observe(chain)).pull?.queueEntryDetails).toEqual(entry)
+  // GitHub removed the entry at 22:18:15 Helsinki; #1525 became main one second later.
+  state.queue_entry_id = null; state.queue_entry = null
+  state.queue_removals = [{ id: 'recorded-removal', reason: 'merge_conflict', createdAt: '2026-11-13T20:18:15Z', actor: null }]
+  ci.base_sha = predecessor; state.review_context = 'f'.repeat(64)
+  const removed = await operations.observe({ ...chain, observation: first })
+  expect(removed.pull).toMatchObject({ head, queueEntry: null, queueEntryDetails: null,
+    queueRemoval: { id: 'recorded-removal', reason: 'merge_conflict' }, reviewContext: state.review_context, conflict: false })
+  const repair = await operations.request(chain, removed,
+    { kind: 'invoke', behavior: 'repair-pr', basis: 'queue-repair', actor: 'author', reviewer, reason: 'verified removal' }, 'repair')
+  expect(repair?.context).toMatchObject({ head, queueRemoval: 'recorded-removal' })
+  expect(repair?.argv).toContain('--merge-base')
+})
+
 it('records a pull closed without merging, which carries no queue removal evidence, and holds', async () => {
   const pullState: Record<string, unknown> = { pull_number: 21, state: 'closed', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, my_reviews: [] }
   mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {

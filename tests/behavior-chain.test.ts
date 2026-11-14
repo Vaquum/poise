@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
-import { chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
+import { behaviorChainAttention, CHAIN_ATTENTION_DELAY_MS, chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
@@ -268,7 +268,7 @@ describe('completion-driven atomic behavior decisions', () => {
     obs.pull!.ready = true
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
     obs.pull!.queueEntry = 'repaired-queue-entry'
-    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('native merge queue owns') })
+    expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'native merge queue owns entry repaired-queue-entry' })
   })
 
   it.each([
@@ -345,14 +345,47 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'complete', mergeSha: MERGE })
   })
 
-  it.each([false, true])('requires diagnosis, baseline recovery when shared=%s, and approval before a fresh integration attempt', (shared) => {
+  it('surfaces an unmergeable queue entry after 24 hours without resetting attention age on polls or restart', () => {
+    const { db, journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    Object.assign(obs.pull!, { approved: true, checksState: 'SUCCESS', queueEntry: 'entry',
+      queueEntryDetails: { id: 'entry', state: 'UNMERGEABLE', base: NEXT, head: null } })
+    current = record(journal, current, { type: 'chain.observed', observation: structuredClone(obs) })
+    const decision = decideBehaviorChain(current, obs, NOW)
+    expect(decision).toMatchObject({ kind: 'wait', reason: expect.stringContaining('UNMERGEABLE; cause unknown') })
+    if (decision.kind !== 'wait') throw new Error('expected queue wait')
+    current = record(journal, current, { type: 'chain.waiting', reason: decision.reason })
+    for (const elapsed of [CHAIN_ATTENTION_DELAY_MS - 1, CHAIN_ATTENTION_DELAY_MS, CHAIN_ATTENTION_DELAY_MS + 1000]) {
+      obs.checkedAt = NOW + elapsed
+      current = journal.append(chain.id, `poll-${elapsed}`, current.sequence, { type: 'chain.observed', observation: structuredClone(obs) }, obs.checkedAt)
+      const attention = behaviorChainAttention(journal, obs.checkedAt)
+      if (elapsed < CHAIN_ATTENTION_DELAY_MS) expect(attention).toEqual([])
+      else expect(attention[0]).toMatchObject({ progressAt: NOW, ageMs: elapsed,
+        evidence: { state: 'fresh', gates: expect.arrayContaining(['Queue UNMERGEABLE; cause unknown']) },
+        nextAction: 'Queue UNMERGEABLE needs attention; cause unknown. Await GitHub queue resolution or removal; GitHub retains ownership' })
+    }
+    const before = behaviorChainAttention(journal, obs.checkedAt)
+    const recovered = new BehaviorChainJournal(db); recovered.rebuild()
+    expect(behaviorChainAttention(recovered, obs.checkedAt)).toEqual(before)
+    expect(recovered.read(chain.id)!.held).toBeNull()
+  })
+
+  it.each([{ shared: false, reason: 'failed_checks' }, { shared: true, reason: 'failed_checks' }, { shared: false, reason: 'merge_conflict' }])(
+    'requires diagnosis, baseline recovery when shared=$shared, and approval after $reason before a fresh integration attempt', ({ shared, reason }) => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
     current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
       { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
     current = finish(journal, current, 'queue', 'merge-pr', 'queue-basis', { status: 'completed', outcome: 'enqueued', head_sha: HEAD }, null)
     obs.pull!.approved = true; obs.pull!.ready = true
-    obs.pull!.queueRemoval = { id: 'failed-integration', reason: 'failed_checks', at: NOW, actor: null }
+    obs.pull!.queueEntry = 'unmergeable-entry'
+    obs.pull!.queueEntryDetails = { id: 'unmergeable-entry', state: 'UNMERGEABLE', base: NEXT, head: null }
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('UNMERGEABLE; cause unknown') })
+    obs.pull!.queueEntry = null; obs.pull!.queueEntryDetails = null
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('removal evidence') })
+    obs.pull!.queueRemoval = { id: 'failed-integration', reason, at: NOW, actor: null }
     const repair = decideBehaviorChain(current, obs, NOW)
     expect(repair).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
     if (repair.kind !== 'invoke') throw new Error('expected repair')
