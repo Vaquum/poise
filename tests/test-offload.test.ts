@@ -630,12 +630,14 @@ describe('a suite on a test box', () => {
 
   async function startAll(overrides: Partial<TestRelayDeps['config']> & Partial<TestRelayDeps> = {}): Promise<void> {
     const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, deployment = 'poise.example.com', baseService = null, jobPlan = 'plan-crn-005', ...deps } = overrides
+    const relayEvents = events
+    const relayWarnings = warnings
     renderOrigin = `http://127.0.0.1:${await listen(render)}`
     relay = new TestRelay({
       config: { renderApiKey, workspace: 'tea-test', deployment, plan: '1c-2g', baseService, jobPlan, limitSeconds, maxRuns },
       privateKey,
       origin: () => relayOrigin,
-      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: (_event: string, fields: Record<string, unknown>) => { warnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: (event: string, fields: Record<string, unknown>) => { relayEvents.push({ event, ...fields }) }, warn: (_event: string, fields: Record<string, unknown>) => { relayWarnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
@@ -1088,6 +1090,59 @@ describe('a suite on a test box', () => {
     await until(() => [...events, ...warnings].some(({ event, boxId }) => boxId === box.id && event === (failed ? 'test_relay.box.terminate.failed' : 'test_relay.box.terminate')), 'the termination diagnostic', 3_000)
     if (failed) expect(warnings).toContainEqual({ event: 'test_relay.box.terminate.failed', boxId: box.id, error: 'fetch failed' })
     else expect(events).toContainEqual({ event: 'test_relay.box.terminate', boxId: box.id, status: 204 })
+  })
+
+  it.each([[false, false], [false, true], [true, false], [true, true]])('keeps delayed termination diagnostics with their relay (replacement: %s, termination failure: %s)', async (replacement, failed) => {
+    runBoxes = false
+    await startAll()
+    if (replacement) {
+      await until(() => events.some(({ event }) => event === 'test_relay.box.terminate'), 'the initial snapshot builder to end')
+      relay.stop()
+      await startAll2()
+    }
+    const headers = { authorization: `Bearer ${KEY}` }
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers })
+    const { id } = await created.json() as { id: string }
+    const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers })
+    await until(() => relay.runs.get(id)?.ready === true, 'the old box to be ready')
+    const box = runBox()
+    pendingTerminations = []
+    await output.body!.cancel()
+    await until(() => pendingTerminations!.length === 1, 'the old termination request')
+    const [oldTermination] = pendingTerminations
+    relay.stop()
+    const oldEvents = events
+    const oldWarnings = warnings
+    events = []
+    warnings = []
+    // Reuse the sandbox ID as the next test's fresh Render fixture does.
+    boxes.delete(box.id)
+    await startAll2()
+    const next = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers })
+    const nextId = (await next.json() as { id: string }).id
+    const nextOutput = await fetch(`${relayUrl}/runs/${nextId}/output`, { headers })
+    await until(() => relay.runs.get(nextId)?.ready === true, 'the new box to be ready')
+    expect(runBox().id).toBe(box.id)
+    await nextOutput.body!.cancel()
+    await until(() => pendingTerminations!.length === 2, 'the new termination request')
+    const [, newTermination] = pendingTerminations
+    const newEvents = [...events]
+    const newWarnings = [...warnings]
+    const diagnostic = failed
+      ? { event: 'test_relay.box.terminate.failed', boxId: box.id, error: 'fetch failed' }
+      : { event: 'test_relay.box.terminate', boxId: box.id, status: 204 }
+    if (failed) oldTermination.destroy()
+    else oldTermination.writeHead(204).end()
+    await until(() => [...oldEvents, ...oldWarnings].some(({ event, boxId }) => event === diagnostic.event && boxId === box.id), 'the old termination diagnostic', 3_000)
+    expect(failed ? oldWarnings : oldEvents).toContainEqual(diagnostic)
+    expect(events).toEqual(newEvents)
+    expect(warnings).toEqual(newWarnings)
+    expect([...events, ...warnings]).not.toContainEqual(expect.objectContaining({ event: diagnostic.event, boxId: box.id }))
+    pendingTerminations = null
+    if (failed) newTermination.destroy()
+    else newTermination.writeHead(204).end()
+    await until(() => [...events, ...warnings].some(({ event, boxId }) => event === diagnostic.event && boxId === box.id), 'the new termination diagnostic', 3_000)
+    expect(failed ? warnings : events).toContainEqual(diagnostic)
   })
 
   it.each([false, true])('discards authenticated late output while job cancellation is pending (cancellation failure: %s)', async (failed) => {
@@ -1802,13 +1857,15 @@ ${stderr}`
   // Another gateway, of the same Render workspace.
   async function startAll2(overrides: Partial<TestRelayDeps['config']> & Partial<TestRelayDeps> = {}): Promise<void> {
     const { maxRuns = 5, ...deps } = overrides
+    const relayEvents = events
+    const relayWarnings = warnings
     const port = Number(new URL(relayUrl).port)
     await new Promise((done) => { relayServer.close(done) })
     relay = new TestRelay({
       config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', baseService: null, jobPlan: 'plan-crn-005', limitSeconds: 3600, maxRuns },
       privateKey,
       origin: () => relayOrigin,
-      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: (event: string, fields: Record<string, unknown>) => { warnings.push({ event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: (event: string, fields: Record<string, unknown>) => { relayEvents.push({ event, ...fields }) }, warn: (event: string, fields: Record<string, unknown>) => { relayWarnings.push({ event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
