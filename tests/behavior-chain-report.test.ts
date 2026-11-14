@@ -417,7 +417,7 @@ it('reproduces both named fixture conditions without changing assertions or dead
   expect(recheckFixture(current, 'another reported test')).toEqual({ source: current, names: ['another reported test'], condition: 'unmodified reported test', observations: 0 })
 })
 
-it.each(['unrelated', 'skipped', 'inconclusive', 'unhandled', 'unaccounted', 'duplicate', 'missing memory command', 'missing timing observation', 'no assertion'])(
+it.each(['unrelated', 'skipped', 'inconclusive', 'unhandled', 'unaccounted', 'duplicate', 'pending duplicate', 'missing memory command', 'missing timing observation', 'no assertion'])(
   'rejects %s recheck results instead of admitting from a passing job', async mode => {
     const { recheckResults } = await vi.importActual<typeof import('../server/behavior-chain-test-recheck')>('../server/behavior-chain-test-recheck')
     const name = 'a suite on a test box > recovers mid-suite when only one suite may run'
@@ -432,6 +432,7 @@ it.each(['unrelated', 'skipped', 'inconclusive', 'unhandled', 'unaccounted', 'du
     if (mode === 'unhandled') result.completion.errors = 1
     if (mode === 'unaccounted') result.numTotalTests = 2
     if (mode === 'duplicate') { result.testResults[0].assertionResults.push(assertion); result.numTotalTests++; result.numPassedTests++ }
+    if (mode === 'pending duplicate') { result.testResults[0].assertionResults.push({ ...assertion, status: 'pending' }); result.numTotalTests++; result.numPendingTests++ }
     if (mode === 'missing memory command') names = ['old memory test', name, 'sh case', 'npm case']
     if (mode === 'no assertion') { assertion.status = 'failed'; result.success = false; result.numFailedTests = 1; result.numPassedTests = 0; result.completion.reason = 'failed' }
     expect(() => recheckResults(JSON.stringify(result), '/clean', names, mode === 'no assertion', undefined,
@@ -575,6 +576,53 @@ it.each(['recover', 'memory recovery', 'restart before admission', 'failed reche
       expect(journal.read(id)?.waiting).toContain('shared failure was not reproduced')
     }
   })
+
+it('lets a later CI-only hold resume past a retained pre-PR report', async () => {
+  const { db, journal } = setup()
+  const id = 'acme/repo#7'
+  let chain = journal.append(id, 'seed:7', 0, { type: 'chain.admitted', repository: 'acme/repo', issue: 7,
+    branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' }, NOW - 600_000)
+  const pre = unpublished()
+  chain = record(journal, chain, { type: 'chain.observed', observation: { ...pre, checkedAt: NOW - 600_000 } })
+  const basis = chainBasis(['issue', pre.issue.revision])
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-implement',
+    behavior: 'implement-issue', basis, actor: chain.author, slot: reviewer.slot, model: reviewer.model,
+    admittedAt: NOW - 300_000, request: { command: 'agent-interface', cwd: '/fixture',
+      argv: ['--expected-issue-revision', pre.issue.revision] } } })
+  chain = record(journal, chain, { type: 'chain.held', reason: INCIDENT_1778 })
+  const holdSequence = chain.sequence
+  const callId = '15b20584dcea402faeb94959a0e7f699'
+  chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'original-implement', callId,
+    outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'atomic_work_blocked', error: INCIDENT_1778, completedAt: NOW - 120_000,
+      artifact: { phase: 'executing', prepared: { repository: 'acme/repo', issue_number: 7, actor: chain.author,
+        branch: chain.branch, checkout_head: HEAD, head_sha: null, pull_number: null } },
+      resources_settled_at: new Date(NOW - 100_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  const key = chainBasis(['atomic_work_blocked', id])
+  db.prepare('INSERT INTO meta(key,value) VALUES (?,?)').run(`behavior_chain_repair_report:${key}`, JSON.stringify({ key,
+    source: id, pull: null, holdSequence, heldAt: NOW - 60_000, head: null, basis, slot: reviewer.slot,
+    attempts: [{ invocation: 'original-implement', call: callId, completedAt: NOW - 120_000 }], issueNumber: 99 }))
+  chain = record(journal, chain, { type: 'chain.resumed', recovery: { origin: 'operator' } })
+  const obs = observation()
+  chain = record(journal, chain, { type: 'chain.observed', observation: { ...obs, checkedAt: NOW - 60_000 } })
+  const repairCall = '09bfede268214c4caa6e0237f99e5f17'
+  const repairError = 'atomic behavior blocked: CI failed'
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'repair-1', behavior: 'repair-pr',
+    basis: chainBasis(['repair', HEAD]), actor: chain.author, slot: reviewer.slot, model: reviewer.model,
+    admittedAt: NOW - 30_000, request: { command: 'agent-interface', cwd: '/fixture',
+      context: { head: HEAD, reviewRevision: obs.pull!.reviewRevision },
+      argv: ['--pull-number', '21', '--expected-head', HEAD, '--expected-issue-revision', obs.issue.revision] } } })
+  chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'repair-1', callId: repairCall,
+    outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'atomic_work_blocked', error: repairError, completedAt: NOW - 20_000,
+      artifact: { phase: 'executing', prepared: { checkout_head: HEAD } },
+      resources_settled_at: new Date(NOW - 10_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  chain = record(journal, chain, { type: 'chain.held', reason: repairError,
+    ciHold: { invocationId: 'repair-1', callId: repairCall, head: HEAD } })
+  const result = await recoverReportedRepair(db, journal, chain, { ...obs, checkedAt: Date.now() }, async () => obs, () => true)
+  expect(result).toBeNull()
+  expect(mocks.recheck).not.toHaveBeenCalled()
+})
 
 async function diagnosedRepair(path = ':memory:', diagnosticText?: string, reviewOnly = false) {
   const { db, journal } = setup(path)

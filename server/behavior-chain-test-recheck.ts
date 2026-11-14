@@ -74,6 +74,8 @@ export function recheckResults(stdout: string, cwd: string, names: string[], fai
   const expected = names.length === 1 || failed ? names.slice(0, 1) : names.slice(1)
   if (!selected.length || tests.length !== expected.length || new Set(tests).size !== tests.length
     || expected.some(name => !tests.includes(name))
+    || assertions.some(item => ['pending', 'skipped', 'todo'].includes(item.status)
+      && expected.includes([...item.ancestorTitles, item.title].filter(Boolean).join(' > ')))
     || selected.some(item => !['passed', 'failed'].includes(item.status))
     || result.numTotalTests !== assertions.length || result.numFailedTests !== selected.filter(item => item.status === 'failed').length
     || result.numPassedTests !== selected.filter(item => item.status === 'passed').length

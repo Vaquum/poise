@@ -1142,6 +1142,9 @@ async function recoverReportedImplementation(db: Database, journal: BehaviorChai
   if (!allowed() || !getBehaviorChainSettings().enabled || accounts.me.toLowerCase() !== chain.author.toLowerCase()
     || accounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) return pending('admissions are disabled or configured accounts changed')
   const original = chain.invocations.at(-1), evidence = original?.evidence
+  // A retained pre-PR report must not fence later PR work. Only a current
+  // pre-PR implement-issue hold without a typed CI hold can recheck.
+  if (original?.behavior !== 'implement-issue' || observation.pull !== null || chain.ciHold) return undefined
   const diagnosis = qualifyingImplementationHold(db, { ...chain, held: chain.held ?? String(evidence?.error ?? '') }, observation, Date.now())
   const matching = reports.filter(({ report }) => report.issueNumber !== null && report.holdSequence === diagnosis?.hold.sequence
     && report.heldAt === diagnosis.hold.at && report.attempts[0].invocation === original?.id && report.attempts[0].call === original.callId
