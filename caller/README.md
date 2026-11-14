@@ -34,8 +34,12 @@ whose immutable plan, pushed head, unattempted replies and released worker
 resources are proven. It starts no model and cannot replace that plan.
 Shared baseline CI dependencies use that same atomic repair artifact and the
 existing chain tick ([dependency evidence and recovery](../docs/Behavior-chain.md)).
-Before new implementation, Poise reads `github-datastore view issue-dependencies`
-under the existing freshness gate. For each explicit same-repository prerequisite,
+Before new implementation, Poise reads live `blockedBy` evidence in the existing
+authenticated `--chain-seed` / `--issue-work` GraphQL preflight, bounded to 100
+nodes with a matching total count and complete page. The mirror health gate
+remains required. After awaited request preparation, the same observation and
+decision run again before implementation admission; missing or truncated live
+evidence waits. For each explicit same-repository prerequisite,
 `github-interface --read-issue ISSUE --delivery-base SHA --token-user USER`
 reads its state and linked closing PRs, including closed PRs. It returns
 `verified: true` only for a closed issue with a linked closing PR's merge commit
@@ -91,6 +95,19 @@ retaining `artifact.test_dependency`. `github-interface --chain-seed ISSUE
 proof and the delivered recovery on the current implementation base. See
 [pre-PR recovery](../docs/Behavior-chain.md#bounded-reconciliation) for admission
 and evidence limits. Relay prose and digests alone remain actionable holds.
+
+For new Calls, `source: "relay"` would identify the original and clean-base
+completed relay run IDs, but recovery is currently held for #1619: the suite UID
+owns the report files, so candidate code can replace them before signing.
+Caller supplies its own retained Call/capture binding and reads the signed runner
+receipts saved by the hook; worker-supplied receipt text cannot replace them.
+The gateway would authenticate both complete assertion inventories. A distinct run
+at the same HEAD is insufficient: the baseline must independently match a clean
+prepared-base source capture. Direct Vitest commands, wrappers, other runners,
+canceled/incomplete results and evidence overflow all retain the hold until the
+runner establishes the inventory independently. The same delivered-fix and
+full-suite CI validation gates would apply, including every duplicate parameter
+under a failing title.
 
 ## Accounts
 

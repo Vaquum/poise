@@ -257,6 +257,37 @@ test('a notice’s journal link opens the task’s timeline at its step, newest 
   expect(posts).toEqual([{ id: 'acme/site#501', sequence: 901, operation: 'resume' }])
 })
 
+test('completed merged tasks retain unmet native clearance and separately identify the later GitHub approval', async ({ page }) => {
+  await open(page, '/?view=observe&part=tasks')
+  const head = 'a'.repeat(40)
+  const completed = chain(1635, { mergeSha: 'c'.repeat(40), reviewPending: false, reviewStatus: 'complete', invocationCount: 22,
+    mergedReviewWarning: { head, reviews: [{ id: 91, head, submittedAt: NOW - 7000,
+      url: 'https://github.com/acme/site/pull/1636#pullrequestreview-91',
+      verdict: 'Changes requested: retain the original native review clearance after merge.' }],
+    githubApproval: { id: 93, head, submittedAt: NOW - 4000, url: 'https://github.com/acme/site/pull/1636#pullrequestreview-93', client: 'unknown' } } })
+  const writes: string[] = []
+  await page.route(url => url.pathname === '/api/behavior-chains', route => {
+    if (route.request().method() !== 'GET') writes.push(route.request().method())
+    const id = new URL(route.request().url()).searchParams.get('id')
+    return route.fulfill({ json: id ? { chain: completed, events: [], next: null }
+      : { chains: [completed], attention: [], next: null, cutover: { mode: 'v2', legacyPulls: [] } } })
+  })
+  await page.goto('/?view=observe&part=tasks&which=merged')
+  const row = tasks(page).locator('.tk-row')
+  await expect(row).toContainText('Merged as ccccccc · native review clearance unmet')
+  await row.click()
+  const evidence = tasks(page).locator('[data-ref="tk.evidence"]')
+  await expect(evidence).toContainText(`Unmet at merge on head ${head}`)
+  await expect(evidence).toContainText('Changes requested: retain the original native review clearance after merge.')
+  await expect(evidence.getByRole('link', { name: 'Changes requested', exact: true })).toHaveAttribute('href', 'https://github.com/acme/site/pull/1636#pullrequestreview-91')
+  await expect(evidence.getByRole('link', { name: 'Review #93' })).toHaveAttribute('href', 'https://github.com/acme/site/pull/1636#pullrequestreview-93')
+  await expect(evidence).toContainText(`submitted ${iso(NOW - 4000)} · submitting client unknown`)
+  await expect(tasks(page).getByRole('button', { name: /Hold new invocations|Resume/ })).toHaveCount(0)
+  await page.reload()
+  await expect(tasks(page).locator('[data-ref="tk.evidence"]')).toContainText('Native review clearance')
+  expect(writes).toEqual([])
+})
+
 test('a settlement link names original review completion and keeps the earlier merge and run links', async ({ page }) => {
   await open(page, '/?view=observe&part=tasks')
   const completed = chain(1564, { sequence: 21, mergeSha: 'd'.repeat(40), reviewPending: false, reviewStatus: 'complete' })

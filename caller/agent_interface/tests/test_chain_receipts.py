@@ -127,14 +127,48 @@ class ManagedReceipts(TestCase):
 
     def test_publication_helper_refuses_foreign_scope_parent_or_remaining_worker(self):
         self.active_publication()
-        for parent, namespace, pids in ((9, "pid:[91]", [1, 2, 3]), (2, "pid:[92]", [1, 2, 3]), (2, "pid:[91]", [1, 2, 3, 4])):
-            scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=lambda: {"pids": pids})
+        for helper, parent, namespace, pids, reason in (
+                (2, 2, "pid:[91]", [1, 2], "helper_pid"),
+                (3, 9, "pid:[91]", [1, 2, 3], "helper_parent"),
+                (3, 2, "pid:[92]", [1, 2, 3], "helper_namespace"),
+                (3, 2, "pid:[91]", [1, 3], "namespace_members"),
+                (3, 2, "pid:[91]", [1, 2, 3, 4], "namespace_busy")):
+            scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(return_value={"pids": pids}))
             with self.subTest(parent=parent, namespace=namespace, pids=pids), \
                     patch.object(native_namespace, "active", return_value=None), \
                     patch.object(resource_ownership, "original_scope", return_value=scope), \
-                    patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=parent), \
-                    patch.object(os, "readlink", return_value=namespace), self.assertRaises(RuntimeError):
+                    patch.object(os, "getpid", return_value=helper), patch.object(os, "getppid", return_value=parent), \
+                    patch.object(os, "readlink", return_value=namespace), \
+                    patch.object(review_receipt.time, "monotonic", side_effect=[0, 0, 0, 0, 2]), \
+                    self.assertRaisesRegex(RuntimeError, reason):
                 review_receipt.work_publication(HEAD, start_replies=True)
+            if reason.startswith("helper_"):
+                scope.read.assert_not_called()
+        self.assertFalse(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
+
+    def test_executed_helper_waits_only_for_extra_members_with_reads_bounded_by_remaining_time(self):
+        self.active_publication()
+        scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(side_effect=[
+            {"pids": [1, 2, 3, 4]}, {"pids": [1, 2, 3]}]))
+        with patch.object(native_namespace, "active", return_value=None), \
+                patch.object(resource_ownership, "original_scope", return_value=scope), \
+                patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=2), \
+                patch.object(os, "readlink", return_value="pid:[91]"), \
+                patch.object(review_receipt.time, "monotonic", side_effect=[0, 0.2, 0.25, 0.3, 0.4, 0.5]):
+            review_receipt.work_publication(HEAD, start_replies=True)
+        self.assertEqual([read.kwargs["timeout_seconds"] for read in scope.read.call_args_list], [1.8, 1.6])
+        self.assertTrue(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
+
+    def test_executed_helper_rejects_idle_evidence_arriving_after_the_settlement_deadline(self):
+        self.active_publication()
+        scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(return_value={"pids": [1, 2, 3]}))
+        with patch.object(native_namespace, "active", return_value=None), \
+                patch.object(resource_ownership, "original_scope", return_value=scope), \
+                patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=2), \
+                patch.object(os, "readlink", return_value="pid:[91]"), \
+                patch.object(review_receipt.time, "monotonic", side_effect=[0, 0, 2.1]), \
+                self.assertRaisesRegex(RuntimeError, "namespace_read_timeout"):
+            review_receipt.work_publication(HEAD, start_replies=True)
         self.assertFalse(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
 
     def test_unacknowledged_issue_comment_is_never_reclassified_as_no_write(self):
@@ -1095,6 +1129,60 @@ class AtomicWorkLimits(TestCase):
                 self.assertEqual((status, code, action), ("failed", "atomic_work_blocked", "not_started"))
                 self.assertEqual(json.loads(artifact).get("test_dependency"), proof if verified else None)
                 self.assertIsNone(plan)
+
+    def test_relay_dependency_uses_original_caller_binding_and_retained_runner_receipts(self):
+        for index, missing in enumerate((False, True)):
+            dependency = {"source": "relay", "base": HEAD, "run": "1" * 32, "baselineRun": "2" * 32,
+                          "remediation": "https://github.com/example/repo/issues/1530"}
+            captured, verified = {}, {}
+
+            def interface(*args, **_kwargs):
+                if args[0] == "--issue-work":
+                    return {"outcome": "prepared", "checkout_head": HEAD}
+                actual = json.loads(args[args.index("--test-dependency-json") + 1])
+                self.assertEqual(actual["capture"], captured)
+                self.assertEqual(actual["relay"], {name: {"payload": name, "signature": "runner signature"}
+                                                 for name in ("original", "baseline")})
+                verified.update(actual, verified=True, runAttempt=1, baselineAttempt=1,
+                                failures=[{"file": "tests/test-relay.test.ts", "test": "warning", "cause": "expected []"}])
+                return {"test_dependency": verified}
+
+            def worker(_lease, _args, **kwargs):
+                captured.update(json.loads(kwargs["env"]["POISE_TEST_BINDING"]))
+                for key, name in (("run", "original"), ("baselineRun", "baseline")):
+                    if missing and name == "original":
+                        continue
+                    receipt = Path(kwargs["env"]["POISE_TEST_EVIDENCE_DIR"]) / f"{dependency[key]}.json"
+                    receipt.write_text(json.dumps({"payload": name, "signature": "runner signature"}))
+                (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                    "blocked": "Original relay assertion failed", "testDependency": {**dependency,
+                    "capture": {"call": "worker-selected"}, "relay": {"original": "worker text"}}}))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def execute():
+                # Exercise the CLI finalizer with the existing library scope;
+                # native namespace admission has its own contract tests.
+                with patch.object(api, "_native_cli", False):
+                    self.run_behavior(correlation_id=f"00000000-0000-4000-8000-00000000001{index}")
+
+            with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                    patch.object(issue_review, "interface", side_effect=interface), \
+                    patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                    patch.object(issue_review, "_terminal_failure", return_value=None), \
+                    patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                    patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                    patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                    patch.object(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source", "poise:behavior-chain"]), \
+                    patch.object(api, "_main", side_effect=execute), \
+                    self.assertRaisesRegex(ValueError, "Original relay assertion failed"):
+                api.main()
+            with sqlite3.connect(self.path) as conn:
+                call, artifact, settled = conn.execute("select id,artifact,resources_settled_at from calls order by rowid desc limit 1").fetchone()
+            artifact = json.loads(artifact)
+            self.assertEqual(captured["call"], call)
+            self.assertEqual(artifact["test_capture"], captured)
+            self.assertEqual(artifact.get("test_dependency"), None if missing else verified)
+            self.assertIsNotNone(settled)
 
     def test_ci_only_blocker_drops_check_summaries_to_fit_the_receipt_limit(self):
         failing = [{"type": "check_run", "name": f"unit-{index}", "state": "completed", "conclusion": "failure",

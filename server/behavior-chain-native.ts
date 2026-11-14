@@ -181,7 +181,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       if (seed.remediation) observation.remediation = object(seed.remediation, 'redundant remediation')
       if (testProof && originalTest) {
         const proof = object(seed.test_dependency, 'implementation test dependency')
-        if (proof.verified === true && ['base', 'run', 'runAttempt', 'baselineRun', 'baselineAttempt', 'remediation', 'failures']
+        if (proof.verified === true && ['base', 'run', 'runAttempt', 'baselineRun', 'baselineAttempt', 'remediation', 'failures',
+          ...(testProof.source === 'relay' ? ['source', 'capture', 'candidate', 'baselineCapture', 'relay', 'totals'] : [])]
           .some(key => chainBasis(proof[key]) !== chainBasis(testProof[key as keyof typeof testProof]))) throw new Error('original implementation test evidence changed')
         const recovery = proof.recovered === true ? object(proof.recovery, 'implementation test recovery') : null
         observation.testDependency = { invocationId: originalTest.id, verified: proof.verified === true, recovered: proof.recovered === true,
@@ -226,10 +227,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       let number = observation.publication.pull_number
       if (number === null && observation.issue.open && !observation.publication.head_sha) {
         await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['implement-issue'])
-        const { stdout } = await runFile('github-datastore', organizationArgs(org,
-          ['view', 'issue-dependencies', '--repo', chain.repository, '--number', String(chain.issue), '--format', 'json']),
-        { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
-        const dependencies = object(JSON.parse(stdout), 'issue prerequisites')
+        const dependencies = object(publication.prerequisites ?? {}, 'live issue prerequisites')
         const base = typeof publication.base_sha === 'string' && /^[0-9a-f]{40}$/.test(publication.base_sha) ? publication.base_sha : null
         const prerequisites: NonNullable<ChainObservation['prerequisites']> = { wait: null, base, evidence: [dependencies] }
         observation.prerequisites = prerequisites

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import closing
+import gzip
 import hashlib
 import json
 import os
@@ -146,10 +147,19 @@ def capture(database: Path, archive: Path, spec: Path, candidate: str, run: str,
         if not re.fullmatch(r"[0-9a-f]{40}", base) or not Path(request["cwd"]).is_relative_to(checkout) \
                 or checkout != Path(artifact["resource_root"]) / "repo":
             raise ValueError("capture checkout mismatch")
+        # The runner and the box hash the specification plus the uncompressed
+        # tar stream, so a gzipped archive is verified after decompression.
         digest = hashlib.sha256(request_bytes)
-        with archive.open("rb") as source:
-            while chunk := source.read(1024 * 1024):
-                digest.update(chunk)
+        with archive.open("rb") as raw:
+            gzipped = raw.read(2) == b"\x1f\x8b"
+            raw.seek(0)
+            if gzipped:
+                with gzip.GzipFile(fileobj=raw) as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+            else:
+                while chunk := raw.read(1024 * 1024):
+                    digest.update(chunk)
         if digest.hexdigest() != candidate:
             raise ValueError("candidate capture mismatch")
         payload = json.dumps({"call": call_id, "candidate": candidate, "run": run, "base": base,
@@ -165,7 +175,7 @@ def capture(database: Path, archive: Path, spec: Path, candidate: str, run: str,
         metadata = {"status": "available", "candidate": candidate, "run": run, "base": base,
                     "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
                     "expires_at": int(time()) + RETENTION_SECONDS}
-    except (OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, TypeError, EOFError, tarfile.TarError, subprocess.SubprocessError):
         # Exception text can contain a source path or payload; only this fixed reason leaves the private store.
         metadata["reason"] = "capture could not be bound or safely retained within the source limit"
         if written:

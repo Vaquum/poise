@@ -24,6 +24,13 @@ export interface ChainSupersession {
   recovery: { id: number } | null
 }
 
+interface ReviewReceipt { id: number, head: string, submittedAt: number, url: string }
+export interface MergedReviewWarning {
+  head: string
+  reviews: Array<ReviewReceipt & { verdict: string }>
+  githubApproval: (ReviewReceipt & { client: 'unknown' }) | null
+}
+
 export interface ChainRow {
   id: string
   repository: string
@@ -34,6 +41,7 @@ export interface ChainRow {
   mergeSha: string | null
   reviewPending: boolean | null
   reviewStatus: 'pending' | 'complete' | 'not-recorded'
+  mergedReviewWarning: MergedReviewWarning | null
   supersession: ChainSupersession | null
   reconciliation: { nextObservationAt: number | null, waitingForOriginalResponse: boolean, waitingForResourceRelease: boolean } | null
   pullNumber: number | null
@@ -102,6 +110,21 @@ function invocation(value: unknown): ChainInvocation {
     slot: text(value.slot), outcome: text(value.outcome), admittedAt: count(value.admittedAt) }
 }
 
+function reviewReceipt(value: unknown): ReviewReceipt {
+  if (!object(value) || !Number.isSafeInteger(value.id) || typeof value.head !== 'string'
+    || typeof value.submittedAt !== 'number' || !Number.isFinite(value.submittedAt) || typeof value.url !== 'string') return incomplete('a review receipt')
+  return { id: Number(value.id), head: value.head, submittedAt: value.submittedAt, url: value.url }
+}
+
+function mergedReviewWarning(value: unknown): MergedReviewWarning | null {
+  if (value == null) return null
+  if (!object(value) || typeof value.head !== 'string' || !Array.isArray(value.reviews) || !value.reviews.length) return incomplete('merged review clearance')
+  return { head: value.head, reviews: value.reviews.map(review => {
+    if (!object(review) || typeof review.verdict !== 'string') return incomplete('a retained review verdict')
+    return { ...reviewReceipt(review), verdict: review.verdict }
+  }), githubApproval: value.githubApproval == null ? null : { ...reviewReceipt(value.githubApproval), client: 'unknown' } }
+}
+
 export function readChain(value: unknown): ChainRow {
   if (!object(value) || typeof value.id !== 'string' || typeof value.repository !== 'string' || !Number.isSafeInteger(value.issue)
     || !Number.isSafeInteger(value.sequence) || !Array.isArray(value.invocations)) return incomplete('a chain')
@@ -117,6 +140,7 @@ export function readChain(value: unknown): ChainRow {
     held: text(value.held), waiting: text(value.waiting), mergeSha: text(value.mergeSha),
     reviewPending: typeof value.reviewPending === 'boolean' ? value.reviewPending : null,
     reviewStatus: value.reviewStatus === 'pending' || value.reviewStatus === 'complete' ? value.reviewStatus : 'not-recorded',
+    mergedReviewWarning: mergedReviewWarning(value.mergedReviewWarning),
     supersession,
     reconciliation: object(r) ? { nextObservationAt: count(r.nextObservationAt), waitingForOriginalResponse: r.waitingForOriginalResponse === true, waitingForResourceRelease: r.waitingForResourceRelease === true } : null,
     pullNumber: Number.isSafeInteger(value.pullNumber) ? Number(value.pullNumber) : null,
@@ -235,6 +259,7 @@ export function taskState(chain: ChainRow): { state: StateKey, reason: string } 
   }
   if (chain.mergeSha) {
     if (chain.reviewPending) return { state: 'waiting', reason: `Merged as ${sha(chain.mergeSha)} · review evidence pending` }
+    if (chain.mergedReviewWarning) return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · native review clearance unmet` }
     if (chain.reviewStatus === 'not-recorded') return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · pre-merge review completion not recorded` }
     return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)}` }
   }

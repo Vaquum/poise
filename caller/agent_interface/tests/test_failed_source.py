@@ -1,5 +1,6 @@
 """Validation-time bytes survive normal Caller cleanup, without publication authority."""
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -83,7 +84,8 @@ def captured(checkout, directory):
             path = checkout / name.decode()
             if name and path.exists():
                 tree.add(path, arcname=str(path).lstrip("/"))
-    candidate = hashlib.sha256(spec.read_bytes() + archive.read_bytes()).hexdigest()
+    # The runner hashes the specification plus the uncompressed tar stream.
+    candidate = hashlib.sha256(spec.read_bytes() + gzip.decompress(archive.read_bytes())).hexdigest()
     return archive, spec, candidate
 
 

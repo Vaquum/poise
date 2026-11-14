@@ -955,12 +955,18 @@ describe('artifact restore', () => {
     await writeFile(join(checkout, 'package.json'), '{"name":"x"}\n')
     await writeFile(join(chatRoot, 'workers', id, '.poise-maintenance.json'), JSON.stringify({ prunedAt: new Date().toISOString(), pruned: ['node_modules'] }))
     const controller = new AbortController()
+    let installerReady!: () => void
+    const ready = new Promise<void>((resolve) => { installerReady = resolve })
     let sawSignal = false
     const pending = maintenance.restorePrunedArtifacts(checkout, chatRoot, (_command, _args, opts) => new Promise((_resolve, reject) => {
-      sawSignal = !!opts?.signal
-      opts?.signal?.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })), { once: true })
+      // Exercise startup that outlasts the former 50 ms abort wait.
+      setTimeout(() => {
+        sawSignal = !!opts?.signal
+        opts?.signal?.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })), { once: true })
+        installerReady()
+      }, 100)
     }), { signal: controller.signal })
-    await new Promise((r) => setTimeout(r, 50))
+    await ready
     controller.abort()
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(sawSignal).toBe(true)

@@ -3,17 +3,22 @@
 // on the container network) and from its own health check (loopback), with
 // every piece of state under an isolated home folder.
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server } from 'node:http'
 import { createRequire } from 'node:module'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
+import { Worker } from 'node:worker_threads'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import Database from 'better-sqlite3'
+import { Context } from '../gateway/src/context'
+import { EnvironmentCollectors } from '../gateway/src/diagnostics/collectors'
+import { DiagnosticRuntime } from '../gateway/src/diagnostics/runtime'
 import { DiagnosticStore } from '../gateway/src/diagnostics/store'
+import { startHarness } from '../gateway/tests/harness'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
 import { STATUS, assertFakeClis, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { fakePresetCommand } from './fixtures/accounts/fake-presets'
@@ -342,6 +347,100 @@ describe('Poise in service mode', () => {
     expect(await send('POST', '/api/service/drain', { ...gatewayCall, identity: signAssertion(gateway.privateKey, { scope: 'admin' }) })).toMatchObject({ status: 200, json: { draining: true } })
     expect(await send('POST', '/api/service/resume', { ...gatewayCall, identity: signAssertion(gateway.privateKey, { scope: 'admin' }) })).toMatchObject({ status: 200, json: { draining: false } })
   })
+
+  it('delivers an authenticated bounded diagnostic page within five seconds while Caller drains a backlog', async () => {
+    const logging = await import('../server/logging')
+    const processes = await import('../server/process')
+    await logging.stopLogging()
+    const previousEvents = process.env.POISE_LOG_QUEUE_EVENTS, previousBytes = process.env.POISE_LOG_QUEUE_BYTES
+    vi.stubEnv('POISE_LOG_QUEUE_EVENTS', '10000')
+    vi.stubEnv('POISE_LOG_QUEUE_BYTES', String(16 * 1024 * 1024))
+    const h = await startHarness()
+    h.store.saveSignIn({ handle: HANDLE, login: OWNER, githubId: 1001, accessOrg: null })
+    const central = new DiagnosticRuntime({ path: join(root, 'delivery-central.db'), report: () => undefined })
+    let releaseCaller!: (result: { stdout: string; stderr: string }) => void
+    const originalRun = processes.runFile
+    const run = vi.spyOn(processes, 'runFile').mockImplementation((command, args, options) => command === 'agent-interface' && args[0] === '--diagnostics'
+      ? new Promise((resolve, reject) => {
+        releaseCaller = resolve
+        options?.signal?.addEventListener('abort', () => reject(new Error('fixture diagnostics stopped')), { once: true })
+      }) : originalRun(command, args, options))
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    const source = logging.loggingRuntime()!
+    const checkpointPath = join(home, '.poise', 'logging.db.caller')
+    const checkpoint = () => existsSync(checkpointPath) ? JSON.parse(readFileSync(checkpointPath, 'utf8')).cursor as number : null
+    const before = checkpoint()
+    let clientStarted = 0, elapsed = 0, queuedAtHandler = 0, checkpointAtHandler: number | null = null
+    let flushMs = 0, maxFlushMs = 0, batches = 0
+    const flush = source.flush.bind(source)
+    const flushing = vi.spyOn(source, 'flush').mockImplementation(() => {
+      const started = performance.now(), result = flush(), duration = performance.now() - started
+      flushMs += duration; maxFlushMs = Math.max(maxFlushMs, duration); batches++
+      return result
+    })
+    const deliver = central.deliver.bind(central)
+    vi.spyOn(central, 'deliver').mockImplementation((...args) => {
+      elapsed = performance.now() - clientStarted
+      expect(args[0].length).toBeLessThanOrEqual(3)
+      return deliver(...args)
+    })
+    const peer = (req: IncomingMessage) => {
+      if (req.headers.host !== PUBLIC_HOST) return
+      Object.defineProperty(req.socket, 'remoteAddress', { value: GATEWAY_PEER, configurable: true })
+      if (req.url === '/api/service/diagnostics') {
+        queuedAtHandler = source.localSnapshot().queued
+        checkpointAtHandler = checkpoint()
+      }
+    }
+    server.prependListener('request', peer)
+    const callerPage = { version: 1, streamId: 'a'.repeat(32), cursor: 3, hasMore: false, backfillPending: false,
+      events: [{ id: 'b'.repeat(32), error: 'loaded Caller diagnostic cause' }] }
+    const context = new Context({ ...h.context.deps, config: { ...h.config, domain: 'poise.example.test' },
+      keys: { privateKey: gateway.privateKey, publicKeyBase64: gateway.publicKey }, upstream: () => {
+        clientStarted = performance.now()
+        queueMicrotask(() => releaseCaller({ stdout: JSON.stringify(callerPage), stderr: '' }))
+        return { host: '127.0.0.1', port }
+      } })
+    vi.spyOn(h.context.deps.docker, 'diagnosticContainers').mockResolvedValue([])
+    vi.spyOn(h.context.deps.docker, 'diagnosticRead').mockResolvedValue(Buffer.alloc(0))
+    const collector = new EnvironmentCollectors(central, h.context.deps.docker, context)
+    const workers: Worker[] = []
+    try {
+      // Concurrent CLI/test processes compete for CPU with the workspace event loop.
+      await Promise.all(Array.from({ length: 8 }, () => new Promise<void>((resolve, reject) => {
+        const worker = new Worker(`const { parentPort } = require('node:worker_threads');
+          const until = Date.now() + 60_000; parentPort.postMessage('ready'); while (Date.now() < until) {}`, { eval: true })
+        workers.push(worker); worker.once('message', () => resolve()); worker.once('error', reject)
+      })))
+      source.flush()
+      for (let i = 0; i < 7000; i++) expect(logging.diagnostic({ id: 'loaded-' + i, level: 'error', operation: 'loaded.failure',
+        message: 'Concurrent workspace diagnostic backlog', stack: 'frame\n'.repeat(100) })).not.toBeNull()
+      expect(source.localSnapshot().queued).toBe(7000)
+      collector.start()
+      await vi.waitFor(() => expect(central.health().sources.some(row => row.id === 'workspace:' + HANDLE)).toBe(true), { timeout: 30_000 })
+      await collector.stop()
+      await Promise.all(workers.map(worker => worker.terminate()))
+      console.info(`[diagnostic delivery] response=${elapsed.toFixed(0)}ms, flushes=${batches}, totalFlush=${flushMs.toFixed(0)}ms, maxFlush=${maxFlushMs.toFixed(0)}ms, queuedAtHandler=${queuedAtHandler}`)
+      expect(central.query(db => db.checkpoint('workspace:' + HANDLE))).not.toBeNull()
+      expect(elapsed).toBeLessThan(5000)
+      expect(queuedAtHandler).toBeGreaterThan(0)
+      expect(checkpointAtHandler).toBe(before)
+      await vi.waitFor(() => expect(checkpoint()).toBe(3), { timeout: 30_000 })
+      expect(source.query(db => db.query({ workspace: HANDLE, operator: false }, { source: 'caller', search: 'loaded Caller diagnostic cause' })).total).toBe(1)
+      expect((await send('GET', '/api/service/diagnostics', fromGateway('admin'))).status).toBe(200)
+      for (const caller of [fromGateway('browser'), fromGateway('link'), fromGateway('admin', { sub: 'another-owner' }), fromGateway('admin', { aud: 'workspace:another' })]) {
+        expect((await send('GET', '/api/service/diagnostics', caller)).status).not.toBe(200)
+      }
+    } finally {
+      await Promise.all(workers.map(worker => worker.terminate()))
+      await collector.stop(); await logging.stopLogging()
+      server.off('request', peer); flushing.mockRestore(); run.mockRestore(); stderr.mockRestore()
+      central.stop(); context.agent.destroy(); await h.close()
+      vi.stubEnv('POISE_LOG_QUEUE_EVENTS', previousEvents); vi.stubEnv('POISE_LOG_QUEUE_BYTES', previousBytes)
+      logging.startLogging()
+    }
+  }, 60_000)
 
   it('accepts only trusted service reporting configuration and validates explicit repository scope', async () => {
     const path = '/api/service/config'

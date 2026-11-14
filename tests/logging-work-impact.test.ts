@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3'
 import { afterAll, afterEach, expect, it } from 'vitest'
 import { BehaviorChainJournal, chainBasis, type ChainAdmission } from '../server/behavior-chain-store'
-import { behaviorChainAttention, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
+import { behaviorChainAttention, behaviorChainWorkImpact, behaviorChainWorkImpacts } from '../server/behavior-chain-summary'
 import { decideBehaviorChain } from '../server/behavior-chain-decision'
 import { normalize } from '../gateway/src/diagnostics/contract'
 import { DiagnosticStore } from '../gateway/src/diagnostics/store'
@@ -79,7 +79,7 @@ it('keeps the original failed invocation boundary when resource reconciliation r
   expect(behaviorChainWorkImpact(journal, nextCall, next)).toMatchObject({ impact: 'blocked', recovered: true, progressAt: at + 6000 })
 })
 
-it('reads completed chains and refuses missing, conflicting and ambiguous exact associations', () => {
+it('keeps batch associations equivalent for merged, missing, conflicting and ambiguous identities', () => {
   const journal = new BehaviorChainJournal(db)
   const fixture = loggingWorkFixture(journal, 'acme/repo', 7, correlation, call, at)
   fixture.append({ type: 'chain.merged', mergeSha: 'c'.repeat(40), evidence: { repository: 'acme/repo', pull_number: 107,
@@ -90,9 +90,79 @@ it('reads completed chains and refuses missing, conflicting and ambiguous exact 
   expect(behaviorChainWorkImpact(journal, call, '3'.repeat(32))).toBeNull()
   const other = loggingWorkFixture(journal, 'acme/repo', 8, '2'.repeat(32), '2'.repeat(32), at)
   expect(behaviorChainWorkImpact(journal, call, other.chain.invocations[0].id)).toBeNull()
-  loggingWorkFixture(journal, 'acme/repo', 9, correlation, call, at)
-  expect(behaviorChainWorkImpact(journal, call, correlation)).toBeNull()
+  // OR ambiguity wins even when the correlation selects only one shared-Call invocation.
+  loggingWorkFixture(journal, 'acme/repo', 9, '3'.repeat(32), '2'.repeat(32), at)
+  loggingWorkFixture(journal, 'acme/repo', 10, '4'.repeat(32), '4'.repeat(32), at)
+  loggingWorkFixture(journal, 'acme/repo', 11, '4'.repeat(32), '5'.repeat(32), at)
+  const aliases = loggingWorkFixture(journal, 'acme/repo', 12, '6'.repeat(32), '6'.repeat(32), at)
+  aliases.append({ type: 'invocation.admitted', invocation: { ...aliases.chain.invocations[0], id: '7'.repeat(32), admittedAt: at + 4000 } }, at + 4000)
+  aliases.append({ type: 'invocation.settled', invocationId: '7'.repeat(32), callId: '7'.repeat(32), outcome: 'preflight_failed',
+    evidence: { status: 'failed', action: 'not_started', nativeCallId: '7'.repeat(32), callId: '7'.repeat(32), completedAt: at + 5000 } }, at + 5000)
+  const contradictory = loggingWorkFixture(journal, 'acme/repo', 13, '8'.repeat(32), '8'.repeat(32), at)
+  contradictory.append({ type: 'invocation.admitted', invocation: { ...contradictory.chain.invocations[0], id: '9'.repeat(32), admittedAt: at + 4000 } }, at + 4000)
+  contradictory.append({ type: 'invocation.reconciled', invocationId: '9'.repeat(32),
+    evidence: { nativeCallId: 'a'.repeat(32), callId: 'b'.repeat(32) } }, at + 5000)
+  const pairs = [[call, correlation], [null, correlation], [call, null], [call, correlation],
+    ['2'.repeat(32), '2'.repeat(32)], [null, '2'.repeat(32)], ['2'.repeat(32), null],
+    ['4'.repeat(32), '4'.repeat(32)], ['4'.repeat(32), null], [null, '4'.repeat(32)],
+    ['7'.repeat(32), '7'.repeat(32)], ['7'.repeat(32), null], [null, '7'.repeat(32)],
+    ['a'.repeat(32), '9'.repeat(32)], [null, '9'.repeat(32)], ['b'.repeat(32), null],
+    [call, '2'.repeat(32)], ['c'.repeat(32), correlation], [call, 'c'.repeat(32)], ['c'.repeat(32), null], [null, null]]
+    .map(([callId, correlationId]) => ({ callId, correlationId }))
+  const before = db.prepare('SELECT * FROM behavior_chain_events').all()
+  expect(journal.forInvocations(pairs)).toEqual(pairs.map(({ callId, correlationId }) => journal.forInvocation(callId, correlationId)))
+  const impacts = behaviorChainWorkImpacts(journal, pairs)
+  expect(impacts).toEqual(pairs.map(({ callId, correlationId }) => behaviorChainWorkImpact(journal, callId, correlationId)))
+  expect(impacts.map(impact => impact?.impact ?? null)).toEqual(['recovered', 'recovered', 'recovered', 'recovered',
+    null, 'retrying', null, null, 'retrying', null, 'unknown', 'unknown', 'unknown', null, null, null, null, null, null, null, null])
+  expect(db.prepare('SELECT * FROM behavior_chain_events').all()).toEqual(before)
+  // Selected projections still pass the journal's authoritative validation.
+  db.prepare("UPDATE behavior_chain_current SET state = json_set(state, '$.held', 'unrecorded hold') WHERE chain_id = ?").run(fixture.chain.id)
+  expect(() => journal.forInvocations([pairs[0]])).toThrow('behavior projection disagrees with the authoritative event journal')
 })
+
+it('scans a large retained journal once for 100 distinct hit/miss pairs', () => {
+  const journal = new BehaviorChainJournal(db)
+  const chainCount = 1000, invocationsPerChain = 5
+  const identity = (issue: number, invocation: number) => ({
+    correlationId: (issue * 10 + invocation).toString(16).padStart(32, '0'),
+    callId: (100_000 + issue * 10 + invocation).toString(16).padStart(32, '0'),
+  })
+  db.transaction(() => {
+    for (let issue = 1; issue <= chainCount; issue++) {
+      const first = identity(issue, 1)
+      const fixture = loggingWorkFixture(journal, 'bench/impact', issue, first.correlationId, first.callId, at)
+      for (let invocation = 2; invocation <= invocationsPerChain; invocation++) {
+        const pair = identity(issue, invocation)
+        fixture.append({ type: 'invocation.admitted', invocation: { ...fixture.chain.invocations[0], id: pair.correlationId, admittedAt: at + invocation * 4000 } }, at + invocation * 4000)
+        fixture.append({ type: 'invocation.settled', invocationId: pair.correlationId, callId: pair.callId, outcome: 'preflight_failed',
+          evidence: { status: 'failed', action: 'not_started', completedAt: at + invocation * 4000 + 1000 } }, at + invocation * 4000 + 1000)
+      }
+    }
+  })()
+  const pairs = Array.from({ length: 100 }, (_, index) => identity(index % 2 ? chainCount + index : index / 2 + 1, invocationsPerChain))
+  let visits = 0
+  // Instrument the source, so even one SQL statement that rescans per pair fails.
+  // Both measurements also include the 50 authoritative point reads for hits.
+  db.function('count_impact_state', (value: string) => { visits++; return value })
+  db.exec(`CREATE TEMP VIEW behavior_chain_current AS SELECT chain_id, sequence,
+    count_impact_state(state) AS state, merged, resource_pending FROM main.behavior_chain_current`)
+  try {
+    const originalStart = performance.now()
+    const original = pairs.map(({ callId, correlationId }) => journal.forInvocation(callId, correlationId))
+    const originalMs = performance.now() - originalStart, originalVisits = visits
+    visits = 0
+    const batchStart = performance.now()
+    const batch = journal.forInvocations(pairs)
+    const batchMs = performance.now() - batchStart, batchVisits = visits
+    expect(batch).toEqual(original)
+    expect(batch.filter(Boolean)).toHaveLength(50)
+    expect(originalVisits).toBe(chainCount * pairs.length + 50)
+    expect(batchVisits).toBe(chainCount + 50)
+    console.info('work-impact lookup comparison', { chains: chainCount, invocations: chainCount * invocationsPerChain,
+      distinctPairs: pairs.length, hits: 50, originalMs, batchMs, originalVisits, batchVisits })
+  } finally { db.exec('DROP VIEW temp.behavior_chain_current') }
+}, 30_000)
 
 it('directs a held merged chain to original review evidence despite an external approval', () => {
   const journal = new BehaviorChainJournal(db)

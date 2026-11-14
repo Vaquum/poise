@@ -74,8 +74,12 @@ function captureDiagnostics() {
 
 it.each(['recovery', 'restart before admission', 'identical operator hold', 'missing original proof', 'unreleased resources',
   'unknown publication', 'changed source', 'ineligible source', 'pushed branch', 'bound PR', 'competing work',
-  'unrelated passing run', 'source changes during preparation', 'missing review', 'review disappears during preparation'])(
-  'recovers one pre-PR implementation on attempt three through normal admission: %s', async mode => {
+  'unrelated passing run', 'source changes during preparation', 'missing review', 'review disappears during preparation',
+  'relay recovery', 'relay restart before admission', 'relay identical operator hold', 'relay mismatched capture',
+  'relay unreleased resources', 'relay unknown publication', 'relay unrelated passing run'])(
+  'recovers one pre-PR implementation on attempt three through normal admission: %s', async scenario => {
+    const relay = scenario.startsWith('relay ')
+    const mode = scenario.replace(/^relay /, '')
     const { db, journal } = setup()
     let chain = seed(journal)
     const obs = observation(false)
@@ -97,7 +101,11 @@ it.each(['recovery', 'restart before admission', 'identical operator hold', 'mis
           completedAt: NOW - (4 - attempt) * 100_000, resources_settled_at: new Date(NOW - 50_000).toISOString() } })
     }
     const proof = { verified: true, base: 'a'.repeat(40), run: 1, runAttempt: 1, baselineRun: 2, baselineAttempt: 1,
-      remediation: 'https://github.com/acme/repo/issues/1530', failures: [{ file: 'tests/test-relay.test.ts', test: 'warning array', cause: 'expected []' }] }
+      remediation: 'https://github.com/acme/repo/issues/1530', failures: [{ file: 'tests/test-relay.test.ts', test: 'warning array', cause: 'expected []' }],
+      ...(relay ? { source: 'relay', run: '1'.repeat(32), baselineRun: '2'.repeat(32),
+        capture: { call: 'a'.repeat(32), nonce: 'f'.repeat(64), repository: 'acme/repo', base: 'a'.repeat(40) },
+        candidate: '3'.repeat(64), baselineCapture: '4'.repeat(64),
+        relay: { original: { payload: 'original', signature: 'authenticated by Caller' }, baseline: { payload: 'baseline', signature: 'authenticated by Caller' } } } : {}) }
     const original: LogEntry = { ...completedReviewCall(chain.repository, 7, 'a'.repeat(40), chain.author), id: 'a'.repeat(32),
       behavior: 'implement_issue', source: 'poise:behavior-chain', correlation_id: 'implementation-3', status: 'failed',
       action: 'not_started', outcome: 'preflight_failed', head_sha: null, review_id: null,
@@ -105,6 +113,7 @@ it.each(['recovery', 'restart before admission', 'identical operator hold', 'mis
       completed_at: new Date(NOW - 3000).toISOString(), resources_settled_at: mode === 'unreleased resources' ? null : new Date(NOW - 2000).toISOString(),
       resource_ownership: { version: 1, roots: [], errors: [] },
       artifact: { phase: mode === 'unknown publication' ? 'publishing' : 'executing',
+        ...(relay ? { test_capture: { ...proof.capture, ...(mode === 'mismatched capture' ? { nonce: '0'.repeat(64) } : {}) } } : {}),
         prepared: { repository: chain.repository, issue_number: 7, actor: chain.author, branch: chain.branch,
           checkout_head: proof.base, head_sha: null, pull_number: null },
         ...(mode === 'missing original proof' ? {} : { test_dependency: proof }) } }
@@ -222,10 +231,10 @@ it.each(['receipt-read', 'observation', 'request-preparation'] as const)(
     } else {
       expect(current.held).toBe('concurrent person hold')
       expect(current.invocations).toHaveLength(0)
-      expect(observe.mock.calls.filter(([chain]) => chain.id === first.id)).toHaveLength(2)
+      expect(observe.mock.calls.filter(([chain]) => chain.id === first.id)).toHaveLength(phase === 'request-preparation' ? 3 : 2)
     }
     expect(diagnostics()).toMatchObject([{ severity: 'warning', target: first.id,
-      phase: phase === 'receipt-read' ? 'reconciliation' : phase === 'request-preparation' ? 'invocation-admission' : phase,
+      phase: phase === 'receipt-read' ? 'reconciliation' : phase,
       context: { outcome: 'recovered', attempts: 2 } }])
   })
 

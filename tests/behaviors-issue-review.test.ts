@@ -279,6 +279,20 @@ with api.db() as conn:
     await behaviors.runEnabledBehaviorsOnce()
     const beforeMs = performance.now() - beforeStarted
     expect(database.listBehaviorLaunchClaims(KEY).map(claim => claim.launchCallId).sort()).toEqual(running.map(row => row.id).sort())
+    // Release the inspected response and decoded snapshot before the next large read.
+    mocks.runFile.mockClear()
+    mocks.observeSnapshot.mockClear()
+    let retainedBytes = 0
+    for (const [snapshot] of mocks.observeSnapshot.mock.calls) {
+      for (const entry of snapshot.entries) retainedBytes += Buffer.byteLength(entry.prompt)
+    }
+    for (const result of mocks.runFile.mock.settledResults) {
+      const value: unknown = result.value
+      if (value && typeof value === 'object' && 'stdout' in value && typeof value.stdout === 'string') {
+        retainedBytes += Buffer.byteLength(value.stdout)
+      }
+    }
+    expect(retainedBytes).toBeLessThan(1024 * 1024)
     baseline = false
     const afterStarted = performance.now()
     await resetLogCache()
@@ -310,7 +324,7 @@ api.finish(sys.argv[1], 'completed', action='commented', outcome='commented')
     expect(database.hasSeen(KEY, `${childRepo}#600`)).toBe(true)
     expect(database.listBehaviorLaunchClaims(KEY).some(claim => claim.claimId === originalClaims[0])).toBe(false)
     expect(database.listBehaviorLaunchClaims(KEY).filter(claim => originalClaims.includes(claim.claimId))).toHaveLength(2)
-    let retainedBytes = 0
+    retainedBytes = 0
     for (const [snapshot] of mocks.observeSnapshot.mock.calls) {
       for (const entry of snapshot.entries) retainedBytes += Buffer.byteLength(entry.prompt)
     }

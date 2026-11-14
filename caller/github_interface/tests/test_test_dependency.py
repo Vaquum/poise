@@ -4,7 +4,7 @@ import io
 import json
 import zipfile
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from github_interface import test_dependency
 
@@ -172,3 +172,83 @@ class TestDependency(IsolatedAsyncioTestCase):
         self.assertIn("every original failing assertion", recovered["reason"])
         self.tests[3].append(copy.deepcopy(passing))
         self.assertTrue((await self.inspect(proof))["recovered"])
+
+    def relay_fixture(self):
+        binding = {"call": "d" * 32, "nonce": "e" * 64, "repository": TARGET, "base": BASE}
+        value = {"source": "relay", "base": BASE, "run": "1" * 32, "baselineRun": "2" * 32,
+                 "capture": binding, "remediation": self.value["remediation"],
+                 "relay": {name: {"payload": name, "signature": "gateway signature"} for name in ("original", "baseline")}}
+        failed = {"file": "tests/test-relay.test.ts", "test": self.tests[1][0]["fullName"],
+                  "cause": self.tests[1][0]["failureMessages"][0], "causeDigest": "8" * 64}
+        runs = {name: {"binding": binding, "base": BASE, "repository": TARGET, "exit": 1,
+                       "run": value["run" if name == "original" else "baselineRun"],
+                       "candidate": ("3" if name == "original" else "4") * 64,
+                       "source": ("5" if name == "original" else "6") * 64,
+                       "clean": name == "baseline", "command": ["node", "$CHECKOUT/node_modules/vitest/vitest.mjs", "run"],
+                       "failures": [copy.deepcopy(failed)], "totals": [{"file": failed["file"], "test": failed["test"], "total": 2}]}
+                for name in ("original", "baseline")}
+        return value, runs
+
+    async def test_completed_relay_proof_reuses_delivery_and_full_original_case_validation(self):
+        value, runs = self.relay_fixture()
+        with patch.object(test_dependency, "_relay_receipt", side_effect=lambda receipt: copy.deepcopy(runs[receipt["payload"]])):
+            proof = await self.inspect(value)
+            self.assertTrue(proof["verified"], proof)
+            self.assertFalse(proof["recovered"])
+            self.assertEqual(proof["capture"], value["capture"])
+            self.assertEqual(proof["candidate"], runs["original"]["candidate"])
+            self.delivered = True
+            # The passing fixed-title parameter cannot replace the missing
+            # failing parameter, even though the title appears in green CI.
+            self.assertFalse((await self.inspect(proof))["recovered"])
+            self.tests[3].append(copy.deepcopy(self.tests[3][0]))
+            self.assertTrue((await self.inspect(proof))["recovered"])
+            self.tests[3][1]["status"] = "skipped"
+            self.assertFalse((await self.inspect(proof))["recovered"])
+            runs["original"]["candidate"] = "7" * 64
+            self.assertFalse((await self.inspect(proof))["verified"])
+
+    async def test_same_head_dirty_replay_mismatched_call_and_missing_relay_results_keep_hold(self):
+        value, runs = self.relay_fixture()
+        changes = [
+            ("baseline", {"clean": False}),
+            ("baseline", {"source": runs["original"]["source"]}),
+            ("baseline", {"candidate": runs["original"]["candidate"]}),
+            ("baseline", {"base": MAIN}),
+            ("baseline", {"command": ["node", "other-suite"]}),
+            ("original", {"binding": {**value["capture"], "call": "f" * 32}}),
+            ("original", {"exit": 125}),
+            ("original", {"failures": []}),
+            ("original", {"totals": []}),
+        ]
+        with patch.object(test_dependency, "_relay_receipt", side_effect=lambda receipt: copy.deepcopy(runs[receipt["payload"]])):
+            for name, change in changes:
+                before = copy.deepcopy(runs[name])
+                runs[name].update(change)
+                with self.subTest(change=change):
+                    self.assertFalse((await self.inspect(value))["verified"])
+                runs[name] = before
+        with patch.object(test_dependency, "_relay_receipt", side_effect=ValueError("signature is invalid")):
+            self.assertFalse((await self.inspect(value))["verified"])
+
+    async def test_complete_relay_multiset_rejects_candidate_only_failure_beyond_excerpt_and_overflow(self):
+        value, runs = self.relay_fixture()
+        for run in runs.values():
+            run["failures"][0]["cause"] += "\n" + "common stack detail\n" * 300
+        extra = {"file": "tests/candidate.test.ts", "test": "candidate regression", "cause": "expected candidate behavior", "causeDigest": "9" * 64}
+        runs["original"]["failures"].append(extra)
+        runs["original"]["totals"].append({"file": extra["file"], "test": extra["test"], "total": 1})
+        with patch.object(test_dependency, "_relay_receipt", side_effect=lambda receipt: copy.deepcopy(runs[receipt["payload"]])):
+            self.assertFalse((await self.inspect(value))["verified"])
+            # Sharing one cause does not excuse a second candidate-only cause
+            # under that same title either.
+            runs["baseline"]["failures"].append({**extra, "cause": "different assertion"})
+            runs["baseline"]["totals"].append(copy.deepcopy(runs["original"]["totals"][-1]))
+            self.assertFalse((await self.inspect(value))["verified"])
+            runs["baseline"]["failures"][-1] = copy.deepcopy(extra)
+            self.assertTrue((await self.inspect(value))["verified"])
+            runs["baseline"]["failures"][-1]["causeDigest"] = "0" * 64
+            self.assertFalse((await self.inspect(value))["verified"])
+            for run in runs.values():
+                run["failures"][0]["cause"] = "x" * (32 * 1024 + 1)
+            self.assertFalse((await self.inspect(value))["verified"])
