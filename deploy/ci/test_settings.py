@@ -195,6 +195,81 @@ class RuntimeImageTest(LibTest):
         self.assertIn('a digest; name a tag', result.stderr)
 
 
+@unittest.skipUnless(shutil.which('node'), 'Node parses the lockfile, as it does in the workspace image')
+class RuntimeBaseTest(LibTest):
+    def setUp(self):
+        super().setUp()
+        self.runtime = os.path.join(self.work.name, 'deploy', 'runtime')
+        os.makedirs(self.runtime)
+        for name in ('Dockerfile', 'entrypoint.sh', 'install-clis.sh', 'supervisor.mjs', 'resource-witness.mjs', 'install-release.sh'):
+            shutil.copy(os.path.join(ROOT, 'deploy', 'runtime', name), self.runtime)
+        with open(os.path.join(ROOT, 'package-lock.json')) as file:
+            self.lock = json.load(file)
+        self.write_lock()
+        self.bin = os.path.join(self.work.name, 'bin')
+        os.mkdir(self.bin)
+        docker = os.path.join(self.bin, 'docker')
+        with open(docker, 'w') as file:
+            file.write(f'''#!{sys.executable}
+import os, sys
+args = sys.argv[1:]
+if args[:2] == ['image', 'inspect']:
+    sys.exit(0)
+if args[:1] == ['run']:
+    at = args.index('--entrypoint')
+    os.execvp(args[at + 1], [args[at + 1], *args[at + 3:]])
+sys.exit(0)
+''')
+        os.chmod(docker, 0o755)
+
+    def write_lock(self):
+        with open(os.path.join(self.work.name, 'package-lock.json'), 'w') as file:
+            json.dump(self.lock, file)
+
+    def runtime_base(self):
+        result = self.lib('root=$1; runtime_base', self.work.name, path=self.bin)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r'^[0-9a-f]{16}\n$')
+        return result.stdout
+
+    def test_playwright_version_and_integrity_each_change_the_base(self):
+        before = self.runtime_base()
+        package = self.lock['packages']['node_modules/playwright-core']
+        for field in ('version', 'integrity'):
+            with self.subTest(field=field):
+                original = package[field]
+                package[field] += '-changed'
+                self.write_lock()
+                self.assertNotEqual(self.runtime_base(), before)
+                package[field] = original
+
+    def test_unrelated_lockfile_and_app_changes_keep_the_base(self):
+        before = self.runtime_base()
+        self.lock['packages']['node_modules/@types/ws']['version'] = '8.18.0'
+        self.write_lock()
+        with open(os.path.join(self.work.name, 'app.js'), 'w') as file:
+            file.write('console.log("app change")\n')
+        self.assertEqual(self.runtime_base(), before)
+
+    def test_runtime_recipe_changes_still_change_the_base(self):
+        before = self.runtime_base()
+        with open(os.path.join(self.runtime, 'Dockerfile'), 'a') as file:
+            file.write('\n# changed runtime\n')
+        self.assertNotEqual(self.runtime_base(), before)
+
+    def test_invalid_lock_identity_stops_the_build(self):
+        package = self.lock['packages']['node_modules/playwright-core']
+        for field in ('version', 'integrity'):
+            with self.subTest(field=field):
+                original = package.pop(field)
+                self.write_lock()
+                result = self.lib('root=$1; build_runtime_image poise-runtime test-release', self.work.name, path=self.bin)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn('must lock playwright-core version and integrity', result.stderr)
+                self.assertIn('cannot fingerprint the workspace runtime', result.stderr)
+                package[field] = original
+
+
 class LintTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which('shellcheck'), 'shellcheck is not installed')
     def test_operator_scripts_pass_shellcheck(self):

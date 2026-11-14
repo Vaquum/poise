@@ -1104,8 +1104,11 @@ Poise's menu (☰) says which commit a workspace runs, linked to it on
 autonomio/poise, and when the workspace was updated to it, as in
 `46815bf · 9 Oct 21:40`.
 
-An upgrade that changes the system itself, the files under `deploy/runtime/`,
-gets a new container instead. The gateway drains a running workspace first:
+An upgrade that changes the runtime recipe or the locked `playwright-core`
+version or integrity gets a new container instead, so Chromium and its system
+libraries match the new checkout. Unrelated lockfile changes keep the same
+base. Existing images take one replacement when this expanded fingerprint is
+introduced. The gateway drains a running workspace first:
 the workspace refuses new Chat turns and agent launches, which then answer
 that Poise is installing an update, and lets running work finish. In an ordinary
 drain, one Chat turn holds the drain at most 30 minutes: past that the workspace stops it
