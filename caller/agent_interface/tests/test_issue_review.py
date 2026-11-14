@@ -360,7 +360,9 @@ class TestRevisionBoundReview(IssueReviewCase):
                     def execute():
                         # Exercise the original CLI finalizer with the historical
                         # library resource receipt; namespace delivery has its own tests.
-                        with patch.object(agent_interface, "_native_cli", False):
+                        # The host process table is not part of this closure proof.
+                        with patch.object(agent_interface, "_native_cli", False), \
+                                patch.object(issue_review, "_cwd_pids", return_value=[]):
                             result.append(self.run_review(github, supervise, expected=expected, source=source,
                                                           correlation=f"{source}:{state}"))
 
@@ -1356,7 +1358,9 @@ class TestVerifiedResultsOrExplicitFailures(IssueReviewCase):
             github.last_call_id = call_id
             return call_id
 
-        with patch.object(agent_interface, "track", side_effect=tracking):
+        # The host process table is not part of this reconciliation proof.
+        with patch.object(agent_interface, "track", side_effect=tracking), \
+                patch.object(issue_review, "_cwd_pids", return_value=[]):
             row, printed = self.run_review(flaky, agent_writes(review), source="poise:behavior-chain",
                                           expected=issue_review.revision(github.issues[452]))
         exported = self.exported(row)
