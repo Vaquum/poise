@@ -6,7 +6,6 @@ import { pipeline } from 'node:stream/promises'
 import { createGunzip } from 'node:zlib'
 import type { Logger } from './log.js'
 import { TestDependencyCache } from './test-dependency-cache.js'
-import { environmentSecrets, redact } from './diagnostics/redaction.mjs'
 
 /**
  * Where agents' test suites leave a workspace (docs/Operating.md, "Agents' test suites"). This starts a disposable
@@ -232,13 +231,6 @@ function commandLabel(argv: string[]): string {
     if (script && ['test', 'test:full', 'test:e2e', 'check', 'lint', 'typecheck', 'typecheck:tests', 'verify'].includes(script)) return `npm run ${script}`
   }
   return executable.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64) || 'command'
-}
-
-function redactAssertions(value: unknown, secrets: string[]): unknown {
-  if (typeof value === 'string') return redact(value, secrets)
-  if (Array.isArray(value)) return value.map(item => redactAssertions(item, secrets))
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactAssertions(item, secrets)]))
-  return value
 }
 
 export class TestRelay {
@@ -599,12 +591,14 @@ export class TestRelay {
     return run.job && timingSafeEqual(digest(bearer(req)), digest(run.token))
   }
 
-  private runnerSpec(run: Run): Run['spec'] & { reportTo?: { url: string; token: string } } {
-    return { ...run.spec, ...(run.spec.capture ? { reportTo: { url: `${this.deps.origin(run.handle)}${TEST_RELAY_PATH}/runs/${run.id}/assertions`, token: run.token } } : {}) }
+  private runnerSpec(run: Run): Run['spec'] {
+    // Held for #1619: no report credential leaves the gateway, so candidate code reading spec.json cannot POST fabricated assertions.
+    return { ...run.spec }
   }
 
   /** Only an authenticated runner result followed by its genuine completed
    * failure can produce this receipt. Stream text and canceled runs cannot.
+   * Held for #1619: POST assertions never stores, so run.assertions stays null and this never emits.
    */
   private retainAssertions(run: Run, code: number, noResult: unknown): void {
     if (code !== 1 || noResult || !run.assertions) return
@@ -640,18 +634,8 @@ export class TestRelay {
       const run = this.runs.get(id ?? '')
       const digest = (value: string): Buffer => createHash('sha256').update(value).digest()
       if (!run || !timingSafeEqual(digest(bearer(req)), digest(run.token))) throw new RelayError(410, 'this run is over')
-      if (!run.spec.capture || run.assertions) throw new RelayError(409, 'assertion result is not expected')
-      const value = JSON.parse((await readLimited(req, 40 * 1024)).toString()) as Record<string, unknown>
-      if (!run.spec.binding || value.exit !== 1 || value.candidate !== run.spec.capture.candidate
-        || JSON.stringify(value.binding) !== JSON.stringify(run.spec.binding)
-        || value.repository !== run.spec.binding.repository || value.base !== run.spec.binding.base
-        || !/^[a-f0-9]{64}$/.test(String(value.source)) || typeof value.clean !== 'boolean'
-        || !Array.isArray(value.failures) || !value.failures.length || !Array.isArray(value.totals)) throw new RelayError(422, 'assertions do not match the original capture')
-      // Redact the whole bounded result before retention, never a partial
-      // excerpt. Overflow produces no receipt and keeps the existing hold.
-      run.assertions = redactAssertions(value, environmentSecrets()) as Record<string, unknown>
-      res.writeHead(204).end()
-      return
+      // Held for #1619: the suite UID can present this token, so no inventory is accepted even when authenticated.
+      throw new RelayError(409, 'assertion result is not expected')
     }
     const fromJob = (req.method === 'GET' && (part === 'spec' || part === 'tree')) || (req.method === 'POST' && (part === 'output' || part === 'docker'))
     if (fromJob) {

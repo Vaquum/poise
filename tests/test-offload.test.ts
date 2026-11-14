@@ -801,6 +801,37 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
     expect(relay.runs.has(id!)).toBe(false)
   }, 30_000)
 
+  it('holds relay recovery against fabricated assertions posted with the run token', async () => {
+    await startAll({ baseService: 'crn-test' })
+    const headers = { authorization: `Bearer ${KEY}` }
+    const binding = { call: 'e'.repeat(32), nonce: 'f'.repeat(64), repository: 'example/repo', base: 'a'.repeat(40) }
+    const request = { argv: ['node', 'vitest.mjs', 'run'], cwd: '/', env: {}, binding }
+    const candidate = '1'.repeat(64)
+    const created = await fetch(`${relayUrl}/runs`, {
+      method: 'POST', headers, body: JSON.stringify({ ...request, capture: { candidate, spec: JSON.stringify(request) } }),
+    })
+    expect(created.status).toBe(201)
+    const { id } = await created.json() as { id: string }
+    const run = relay.runs.get(id)!
+    const jobHeaders = { authorization: `Bearer ${run.token}` }
+    // Held for #1619: no report credential leaves the gateway in spec.json.
+    const served = await fetch(`${relayUrl}/runs/${id}/spec`, { headers: jobHeaders })
+    expect(served.status).toBe(200)
+    expect(await served.json()).not.toHaveProperty('reportTo')
+    // A fabricated inventory posted with the run token is not accepted.
+    const forged = await fetch(`${relayUrl}/runs/${id}/assertions`, {
+      method: 'POST', headers: jobHeaders,
+      body: JSON.stringify({
+        exit: 1, candidate, binding, repository: binding.repository, base: binding.base,
+        source: '2'.repeat(64), clean: false,
+        failures: [{ file: 'tests/fake.test.ts', test: 'fabricated case', cause: 'expected forged', causeDigest: '3'.repeat(64) }],
+        totals: [{ file: 'tests/fake.test.ts', test: 'fabricated case', total: 1 }],
+      }),
+    })
+    expect(forged.status).toBe(409)
+    expect(run.assertions).toBeNull()
+  })
+
   it('holds relay inventories without trusting candidate-controlled reports', async () => {
     await startAll()
     const { assertionResult, sourceCapture } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as {

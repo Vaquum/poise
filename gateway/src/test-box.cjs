@@ -129,8 +129,9 @@ function ranOutOfMemory() {
 }
 
 function git(cwd, ...args) {
-  // Unpacking runs as the suite user, so this must too; root trips Git's ownership check on sandboxes.
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...asUser })
+  // Unpacking runs as the suite user, so this must too when root; otherwise run as self (tests, jobs).
+  const identity = process.getuid?.() === 0 ? asUser : {}
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...identity })
   if (result.status !== 0) throw new Error('test capture git identity is unavailable')
   return result.stdout
 }
