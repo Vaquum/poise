@@ -411,13 +411,18 @@ temporary observation conditions preserve assertions and production code. Other
 reported tests run unchanged. The completion reporter must witness the injected
 observation on both bases. A passing old case cannot prove a shared failure.
 
-The existing report saves intent before checkout or execution and retains the
-outcome. Restart, repeated observations, an interrupted attempt or a newer base
+The existing report saves `running` intent before checkout or execution. The
+bounded recheck runs outside the observation sweep, retaining its result without
+resuming the source. Release switching counts it as background work; shutdown
+waits through cleanup and result persistence. Sequential sweeps can observe and
+advance unrelated chains while it runs. Restart, repeated observations, an
+interrupted attempt or a newer base
 cannot relaunch that recheck. Checkout and each dependency install have a
 120-second bound, each suite a 90-second bound, and Git reads a 30-second bound;
 suites use one worker without retries. An unverified correction or failed recheck
-states its blocker on the existing hold. A successful recheck feeds the same
-single-retry admission below, with source, publication, resources, controls and
+states its blocker on the existing hold. A later sweep freshly verifies a saved
+pass before feeding the same single-retry admission below, with source,
+publication, resources, controls and
 the pinned corrected base checked again after preparation. The new implementation
 still runs normal full required validation, review and CI.
 

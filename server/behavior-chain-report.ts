@@ -13,6 +13,7 @@ import { HttpError } from './http'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
 import type { ProcessDiagnostic } from './process-diagnostic'
+import { trackReleaseBackground } from './release-background'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { isServiceMode, readServiceConfig } from './service/config'
 import { recheckImplementationTest, type TestRecheckResult } from './behavior-chain-test-recheck'
@@ -28,6 +29,11 @@ const APPROVAL_CAUSE = 'approval_budget_exhausted'
 const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', APPROVAL_CAUSE, MERGE_CAUSE, CLOSED_CAUSE, IMPLEMENTATION_CAUSE, IMPLEMENTATION_BUDGET_CAUSE, IMPLEMENTATION_PUBLICATION_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
 const REPOSITORIES_KEY = 'service_repair_exhaustion_repositories'
+const implementationRechecks = new Set<Promise<void>>()
+
+export async function waitForImplementationRechecks(): Promise<void> {
+  await Promise.all(implementationRechecks)
+}
 // Caller retains validation reasons wrapped as `atomic behavior failed during
 // {phase}: {reason} ({operation})` and bounds them at 500 chars, so the
 // sentence is matched where it appears: the reason stays verbatim inside
@@ -1085,7 +1091,7 @@ export function repairReportImplementationFence(db: Database, chain: BehaviorCha
 export async function recoverReportedRepair(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
   allowed: () => boolean): Promise<string | null> {
-  const implementation = await recoverReportedImplementation(db, journal, chain, observation, verify, allowed)
+  const implementation = await recoverReportedImplementation(db, journal, chain, observation, allowed)
   if (implementation !== undefined) return implementation
   const fence = repairReportImplementationFence(db, chain, 'implement-issue')
   if (fence) {
@@ -1307,8 +1313,7 @@ function prePrReports(db: Database, chainId: string) {
 }
 
 async function recoverReportedImplementation(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
-  observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
-  allowed: () => boolean): Promise<string | null | undefined> {
+  observation: ChainObservation, allowed: () => boolean): Promise<string | null | undefined> {
   if (chain.testHold || chain.testRecovery?.admission || chain.mergeSha || chain.supersession) return undefined
   const reports = prePrReports(db, chain.id)
   if (!reports.length || !chain.held && !chain.testRecovery?.recheck) return undefined
@@ -1395,17 +1400,29 @@ async function recoverReportedImplementation(db: Database, journal: BehaviorChai
     if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(intent, saved.storageKey, saved.value).changes !== 1) {
       return pending('another observation owns the saved recheck')
     }
-    try {
-      const result = await recheckImplementationTest(chain.repository, chain.author, prepared.checkout_head, base, merge!, failure.file, failure.test)
-      report.recheck = { ...report.recheck, state: 'passed', result }
-    } catch (error) {
-      report.recheck = { ...report.recheck, state: 'failed', reason: behaviorErrorMessage(error, 2000) }
-    }
-    if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(JSON.stringify(report), saved.storageKey, intent).changes !== 1) {
-      return pending('the saved recheck outcome conflicts with its intent')
-    }
-    chain = journal.read(chain.id)!
-    return recoverReportedImplementation(db, journal, chain, await verify(chain), verify, allowed)
+    // Only execution and result persistence leave the sweep; later sweeps own
+    // fresh verification and the recovery journal writes.
+    const running = report.recheck
+    const oldBase = prepared.checkout_head
+    const release = trackReleaseBackground('behavior')
+    const recheck = (async () => {
+      try {
+        const result = await recheckImplementationTest(chain.repository, chain.author, oldBase, base, merge!, failure.file, failure.test)
+        report.recheck = { ...running, state: 'passed', result }
+      } catch (error) {
+        report.recheck = { ...running, state: 'failed', reason: behaviorErrorMessage(error, 2000) }
+      }
+      if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(JSON.stringify(report), saved.storageKey, intent).changes !== 1) {
+        throw new Error('the saved recheck outcome conflicts with its intent')
+      }
+    })().catch((error: unknown) => {
+      console.error(`[behavior-chain] implementation fixture recheck for ${chain.id} could not persist its outcome:`, error)
+    }).finally(() => {
+      release()
+      implementationRechecks.delete(recheck)
+    })
+    implementationRechecks.add(recheck)
+    return pending('the one saved recheck is in flight or was interrupted; it will not be relaunched')
   }
   const result = report.recheck.result
   if (report.recheck.state !== 'passed' || !result || result.old.base !== prepared.checkout_head || result.current.base !== base
