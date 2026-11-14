@@ -261,6 +261,29 @@ function reviewAttemptLine(invocation: string, call: string, completedAt: number
   return `- Invocation ${invocation}; Caller ${call}; completed ${new Date(completedAt).toISOString()}; error_code=${errorCode}; ${step}; timeout_seconds=${typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 ? timeout : 'unknown'}.`
 }
 
+function isReviewTimeoutCode(code: unknown): boolean {
+  return code === 'review_budget_exhausted' || code === 'review_inspection_timeout'
+}
+
+function isMixedReviewProvider(invocation: { evidence?: unknown }): boolean {
+  const evidence = invocation.evidence as { error_code?: unknown, diagnostic?: unknown } | null | undefined
+  if (evidence?.error_code !== 'review_provider_exit' && evidence?.error_code !== 'authentication_failed') return false
+  const diagnostic = evidence?.diagnostic as { operation?: unknown, phase?: unknown, submission?: unknown,
+    context?: { submission?: unknown } | null } | null | undefined
+  if (!diagnostic || typeof diagnostic !== 'object') return false
+  if (typeof diagnostic.operation !== 'string' || !diagnostic.operation
+    || typeof diagnostic.phase !== 'string' || !diagnostic.phase) return false
+  const context = diagnostic.context != null && typeof diagnostic.context === 'object'
+    ? (diagnostic.context as { submission?: unknown }).submission : undefined
+  return (context ?? (diagnostic as { submission?: unknown }).submission) === 'none'
+}
+
+function isMixedReviewTimeouts(attempts: Array<{ evidence?: unknown }>): boolean {
+  return attempts.length === 3 && attempts.filter(invocation =>
+    isReviewTimeoutCode((invocation.evidence as { error_code?: unknown } | null | undefined)?.error_code)).length === 2
+    && attempts.filter(isMixedReviewProvider).length === 1
+}
+
 /** The normal decision still has to request work on precisely this basis.
  * Ignore failed attempts only to ask what would be needed without exhaustion. */
 function qualifyingAttempts(db: Database, chain: BehaviorChain, observation: ChainObservation, now: number) {
@@ -325,8 +348,10 @@ function qualifyingAttempts(db: Database, chain: BehaviorChain, observation: Cha
       || !resourceReleaseProven(evidence, true)
   })) return null
   // Keep the existing review report identity across both pre-submission timeouts.
-  const cause = review ? attempts.every(invocation => invocation.evidence?.error_code === 'review_budget_exhausted'
-    || invocation.evidence?.error_code === 'review_inspection_timeout') ? 'review_budget_exhausted' : null
+  const mixedReview = review && isMixedReviewTimeouts(attempts)
+    && chain.held === `review-pr failed before publication three times: ${String(attempts.at(-1)?.evidence?.error || 'native failure')}`
+  const cause = review ? attempts.every(invocation => isReviewTimeoutCode(invocation.evidence?.error_code)) || mixedReview
+    ? 'review_budget_exhausted' : null
     : attempts.every(invocation => invocation.evidence?.error_code === 'atomic_work_execution_budget_exhausted')
     ? 'repair_execution_budget_exhausted'
     : attempts.every(invocation => invocation.evidence?.error_code === 'atomic_work_failed'
@@ -1013,6 +1038,16 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       if (!allowed()) return `${label} report creation is unconfirmed; admissions are paused`
       const review = cause === 'review_budget_exhausted'
       const reviewCauses = review ? [...new Set(verified!.attempts.map(invocation => invocation.evidence!.error_code))].join(' or ') : null
+      const mixedReviewTimeouts = review && isMixedReviewTimeouts(verified!.attempts)
+      const lastTimeout = mixedReviewTimeouts ? [...verified!.attempts].reverse()
+        .find(invocation => isReviewTimeoutCode(invocation.evidence?.error_code)) : null
+      const lastTimeoutPhase = (() => {
+        const phase = (lastTimeout?.evidence?.diagnostic as { phase?: unknown } | null | undefined)?.phase
+        return typeof phase === 'string' && /^[a-zA-Z0-9_.-]{1,160}$/.test(phase) ? phase : 'unknown'
+      })()
+      const terminalAttempt = mixedReviewTimeouts ? verified!.attempts.at(-1)! : null
+      const terminalCode = typeof terminalAttempt?.evidence?.error_code === 'string'
+        && /^[a-z0-9_]{1,160}$/.test(terminalAttempt.evidence.error_code) ? terminalAttempt.evidence.error_code : 'not recorded'
       const budget = cause === 'repair_execution_budget_exhausted'
       const age = hold ? Math.max(0, Math.floor((Date.now() - hold.at) / 60_000)) : null
       const evidence = verifiedImplementation?.invocation.evidence ?? verifiedMerge?.invocation.evidence
@@ -1062,7 +1097,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         `Poise is holding https://github.com/${chain.repository}/pull/${report.pull}.`, '',
         `Stage: ${verified!.decision.behavior}. Cause: ${reviewCauses ?? cause}. Held since ${new Date(hold!.at).toISOString()} (${age} minutes at reporting).`,
         `Source: ${chain.id}; hold event ${hold!.sequence}; head ${report.head}; basis ${report.basis}; slot ${report.slot}.`, '',
-        `Verified receipts: three or more settled Caller ${review ? 'PR reviews' : 'repairs'} on this basis after the last Resume. Each failed before ${review ? 'review submission' : 'publication'} with ${review ? `${reviewCauses}, action=not_started, outcome=preflight_failed` : budget ? 'atomic_work_execution_budget_exhausted, action=not_started, outcome=preflight_failed' : 'atomic_work_failed, action=not_started, outcome=preflight_failed and the incomplete-reply validation cause'}; resources were released.`,
+        `Verified receipts: three or more settled Caller ${review ? 'PR reviews' : 'repairs'} on this basis after the last Resume. Each failed before ${review ? 'review submission' : 'publication'} with ${review ? `${reviewCauses}, action=not_started, outcome=preflight_failed` : budget ? 'atomic_work_execution_budget_exhausted, action=not_started, outcome=preflight_failed' : 'atomic_work_failed, action=not_started, outcome=preflight_failed and the incomplete-reply validation cause'}; resources were released.${mixedReviewTimeouts ? ` Last timeout phase: ${lastTimeoutPhase}; terminal attempt: ${terminalCode}.` : ''}`,
       ]
       const body = [marker, '', ...details,
         ...report.attempts.map((attempt, index) => {
