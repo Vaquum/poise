@@ -1753,6 +1753,15 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Their own implementation additionally requires an explicit disposition through
+the existing guarded chain control, bound to the authenticated report, native
+issue review, reviewed revision and original source hold/Call. Source-only and
+missing or stale dispositions wait without starting report implementation;
+a verified distinct-fix disposition retains ordinary admission gates, including
+fresh source verification after preparation. Diagnosis and next action persist
+on the held source through the existing report metadata and journal waits.
+This adds no retry or checkout-retention authority; see
+[report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,

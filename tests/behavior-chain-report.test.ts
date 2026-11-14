@@ -2,13 +2,14 @@ import Database from 'better-sqlite3'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, ReviewScopeIndexingError, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
-import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, setRepairReportRepositories } from '../server/behavior-chain-report'
+import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, implementationReportAdmission, implementationReportBinding, setImplementationReportDisposition, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, setRepairReportRepositories } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
 import { nativeRequestSha } from '../server/behavior-chain-action'
 import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
@@ -17,10 +18,14 @@ import type { LogEntry } from '../server/agent-log-parse'
 import type { Organization } from '../server/organizations'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), settings: { enabled: true, seedMode: 'label', label: 'poise' },
-  accounts: { me: 'author', agentAccount: 'reviewer' } }))
+  accounts: { me: 'author', agentAccount: 'reviewer' }, database: null as Database.Database | null,
+  journal: null as BehaviorChainJournal | null }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn(), MAX_PROCESS_ARG_BYTES: 64 * 1024 }))
 vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? mocks.accounts.me : null,
+  get db() { return mocks.database },
   writeObservation: (write: () => unknown) => write() }))
+vi.mock('../server/behavior-chain-journal', () => ({ behaviorChainJournal: () => mocks.journal }))
+vi.mock('../server/behaviors', () => ({ getBehaviorChainRuntimeHealth: () => [], getBehaviorChainCapacity: () => ({}) }))
 vi.mock('../server/settings', () => ({ getSettings: () => mocks.accounts, getBehaviorChainSettings: () => mocks.settings,
   BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY: 'behavior_chain_integrity_hold' }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/fixture' }))
@@ -275,7 +280,7 @@ function operations(db: Database.Database, journal: BehaviorChainJournal, overri
     roster: forbidden, resolve: forbidden, prepare: forbidden, borrow: () => null, available: () => false, capacity: () => 3,
     permitted: () => false, note: () => '', severity: () => 'p2', received: () => {}, reviews: forbidden, existing: async () => new Set(), wake: () => {},
   })
-  return { enabled: () => true, accounts: () => ({ author: 'author', reviewer: 'reviewer' }), discover: intake.discover,
+  const ops: ChainRuntimeOperations = { enabled: () => true, accounts: () => ({ author: 'author', reviewer: 'reviewer' }), discover: intake.discover,
     ownsRepository: () => true, observe: async chain => chain.issue === 7 ? observation() : { ...observation(),
       pull: null, publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } },
     reportHold: chain => reportRepairExhaustion(db, journal, chain, async () => {
@@ -284,6 +289,8 @@ function operations(db: Database.Database, journal: BehaviorChainJournal, overri
     }, () => true), readInvocations: async () => ({ entries: [], quarantined: [] }), received: () => {}, available: () => false,
     capacity: () => 3, permitted: () => false, request: forbidden, launch: forbidden, perform: forbidden,
     readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {}, ...overrides }
+  ops.implementationAdmission ??= (chain, observation) => implementationReportAdmission(db, journal, chain, observation, ops.observe)
+  return ops
 }
 const posts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1] === 'repos/acme/repo/issues')
 const labelPosts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1].endsWith('/labels') && call[1].includes('POST'))
@@ -566,6 +573,199 @@ it.each([false, true])('reports one verified implementation hold before a PR wit
   await reportRepairExhaustion(db, journal, recovered, async () => fresh, () => true)
   expect(remote[0].body).toBe(filedBody)
   expect(posts()).toHaveLength(1)
+})
+
+async function reviewedImplementationReport(db: Database.Database, journal: BehaviorChainJournal) {
+  const { call } = blockedImplementation(journal)
+  let entries = [call]
+  const observe = async (chain: BehaviorChain) => chain.issue === 7 ? { ...fresh, checkedAt: Date.now() } : {
+    ...unpublished(), issue: { open: true, eligible: true, revision: chainBasis([remote[0].title, remote[0].body]), commentIds: [700] },
+    issueReviewers: [reviewer], prerequisites: { wait: null, base: HEAD, evidence: [] } }
+  const request = vi.fn(async (chain: BehaviorChain, observation: ChainObservation, decision: { behavior: string }) => ({
+    command: 'agent-interface' as const, cwd: '/fixture', argv: [decision.behavior === 'review-issue' ? '--issue-review' : '--atomic-work',
+      chain.id, '--model', 'fixture', '--expected-issue-revision', observation.issue.revision] }))
+  const launch = vi.fn(async () => true)
+  const overrides = { observe, request, launch, available: () => true, permitted: () => true,
+    readInvocations: async () => ({ entries, quarantined: [] }) }
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  indexed = true
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  let report = journal.read('acme/repo#99')!
+  const review = report.invocations.at(-1)!
+  expect(review.behavior).toBe('review-issue')
+  entries = [call, { ...call, id: 'b'.repeat(32), correlation_id: review.id, behavior: 'issue_review',
+    pr_id: '99', actor: 'reviewer', status: 'completed', action: 'commented', outcome: 'commented', error: '', error_code: null,
+    started_at: new Date(review.admittedAt).toISOString(), completed_at: new Date(NOW).toISOString(), resources_settled_at: new Date(NOW).toISOString(),
+    issue_revision: (await observe(report)).issue.revision, artifact: null,
+    receipts: [{ issue: report.id, comment_id: 700, author: 'reviewer', url: 'https://github.com/acme/repo/issues/99#issuecomment-700' }] }]
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  report = journal.read(report.id)!
+  expect(report.invocations).toMatchObject([{ behavior: 'review-issue', state: 'settled', outcome: 'commented' }])
+  request.mockClear(); launch.mockClear()
+  return { call, overrides, request, launch, review: review.id }
+}
+
+it.each(['source-only', 'distinct-fix', 'missing', 'stale'] as const)(
+  'gates normally admitted and reviewed implementation reports across restart (%s)', async kind => {
+    const root = mkdtempSync(join(tmpdir(), 'source-disposition-')); roots.push(root)
+    const path = join(root, 'journal.sqlite')
+    let { db, journal } = setup(path)
+    const fixture = await reviewedImplementationReport(db, journal)
+    let report = journal.read('acme/repo#99')!
+    if (kind !== 'missing') {
+      await setImplementationReportDisposition(db, journal, report, report.sequence, implementationReportBinding(db, report), {
+        kind: kind === 'distinct-fix' ? kind : 'source-only', review: fixture.review, commentId: 700,
+        diagnosis: kind === 'distinct-fix' ? 'Verified shared defect in tracked main code; independently implementable.'
+          : 'The failing test exists only in the unpublished source candidate.',
+        nextAction: 'Inspect the original Call; recover the source evidence, then explicitly Resume when safe.' })
+    }
+    if (kind === 'stale') {
+      remote[0].body += '\nChanged triage scope.'
+      // A new revision is reviewed normally; its old disposition cannot cover it.
+      report = journal.read(report.id)!
+      const observation = await fixture.overrides.observe(report)
+      report = record(journal, report, { type: 'invocation.admitted', invocation: { id: 'revised-review', behavior: 'review-issue',
+        actor: 'reviewer', basis: chainBasis(['issue', observation.issue.revision]), model: 'fixture', slot: reviewer.slot,
+        admittedAt: NOW, request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+      record(journal, report, { type: 'invocation.settled', invocationId: 'revised-review', callId: 'c'.repeat(32), outcome: 'commented',
+        evidence: { status: 'completed', action: 'commented', issue_revision: observation.issue.revision,
+          receipts: [{ issue: report.id, comment_id: 700, author: 'reviewer' }],
+          resources_settled_at: new Date(NOW).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+    }
+    const original = journal.read('acme/repo#7')!
+    const intent = reports(db)
+    journal.rebuild()
+    db.close(); databases.splice(databases.indexOf(db), 1)
+    ;({ db, journal } = setup(path))
+    // Revoking report creation must not disable an existing report's admission gate.
+    vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+    await new BehaviorChainRuntime(journal, operations(db, journal, fixture.overrides)).run()
+    const current = journal.read('acme/repo#99')!
+    if (kind === 'distinct-fix') {
+      expect(fixture.request).toHaveBeenCalledOnce()
+      expect(fixture.launch).toHaveBeenCalledOnce()
+      expect(current.invocations.at(-1)?.behavior).toBe('implement-issue')
+    } else {
+      expect(fixture.request).not.toHaveBeenCalled()
+      expect(fixture.launch).not.toHaveBeenCalled()
+      expect(current.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
+      expect(current.waiting).toContain(kind === 'source-only' ? 'source-only disposition' : 'awaits a current explicit')
+    }
+    expect(journal.read(original.id)).toMatchObject({ held: original.held, resumedAfterSequence: original.resumedAfterSequence,
+      invocations: original.invocations })
+    if (kind === 'source-only') {
+      vi.setSystemTime(NOW + 86_400_000)
+      await new BehaviorChainRuntime(journal, operations(db, journal, fixture.overrides)).run()
+      expect(fixture.request).not.toHaveBeenCalled()
+      expect(fixture.launch).not.toHaveBeenCalled()
+      expect(journal.read(original.id)?.waiting).toContain('failing test exists only in the unpublished source candidate')
+      expect(journal.read(original.id)?.waiting).toContain('Next action: Inspect the original Call')
+      expect(journal.read(original.id)?.waiting).toContain('https://github.com/acme/repo/issues/99')
+    }
+    expect(reports(db)).toEqual(intent)
+    expect(posts()).toHaveLength(1)
+  })
+
+it.each(['resume', 'same-text-hold', 'later-call', 'publication', 'source-revision', 'closed', 'competing-work', 'stale-observation', 'preparation', 'report-during-preparation', 'admission', 'launch'] as const)(
+  'invalidates a distinct-fix disposition when its source changes (%s)', async change => {
+    const { db, journal } = setup()
+    const fixture = await reviewedImplementationReport(db, journal)
+    const report = journal.read('acme/repo#99')!
+    await setImplementationReportDisposition(db, journal, report, report.sequence, implementationReportBinding(db, report), {
+      kind: 'distinct-fix', review: fixture.review, commentId: 700,
+      diagnosis: 'A distinct verified defect in main requires a repository fix.', nextAction: 'Implement that distinct fix.' })
+    const source = journal.read('acme/repo#7')!
+    if (change === 'resume' || change === 'later-call') record(journal, source, { type: 'chain.resumed' })
+    if (change === 'same-text-hold') record(journal, source, { type: 'chain.held', reason: source.held! })
+    if (change === 'later-call') blockedImplementation(journal, 'later-implementation')
+    if (change === 'publication') fresh = observation()
+    if (change === 'source-revision') fresh.issue.revision = chainBasis('changed source')
+    if (change === 'closed') fresh.issue.open = false
+    if (change === 'competing-work') fresh.existingPulls = ['https://github.com/acme/repo/pull/22']
+    const overrides = { ...fixture.overrides }
+    if (change === 'stale-observation') overrides.observe = async chain => {
+      const result = await fixture.overrides.observe(chain)
+      if (chain.id === source.id) result.checkedAt = NOW - 500_000
+      return result
+    }
+    if (change === 'preparation' || change === 'report-during-preparation') overrides.request = vi.fn(async (chain: BehaviorChain, observation: ChainObservation, decision: { behavior: string }) => {
+      if (change === 'preparation') {
+        const current = journal.read(source.id)!
+        record(journal, current, { type: 'chain.held', reason: current.held! })
+      } else remote[0].body += '\nChanged report after preparation.'
+      return fixture.request(chain, observation, decision)
+    })
+    // Only reconcile the report here: the held source cannot independently retry.
+    const ops = operations(db, journal, { ...overrides, ownsRepository: () => true, permitted: chain => chain.issue === 99,
+      discover: async () => [], readInvocations: async () => ({ entries: [], quarantined: [] }) })
+    if (change === 'admission') {
+      const admission = ops.implementationAdmission!
+      ops.implementationAdmission = async (...args) => {
+        const result = await admission(...args)
+        if (result.source && fixture.request.mock.calls.length) {
+          const current = journal.read(source.id)!
+          record(journal, current, { type: 'chain.held', reason: current.held! })
+        }
+        return result
+      }
+    }
+    if (change === 'launch') ops.launch = async (_invocation, _onExit, allowed) => {
+      const current = journal.read(source.id)!
+      record(journal, current, { type: 'chain.held', reason: current.held! })
+      expect(allowed()).toBe(false)
+      return false
+    }
+    await new BehaviorChainRuntime(journal, ops).run()
+    expect(fixture.launch).not.toHaveBeenCalled()
+    if (change === 'launch') {
+      expect(journal.read(report.id)?.invocations.at(-1)).toMatchObject({ outcome: 'launch_deferred' })
+      return
+    }
+    expect(journal.read(report.id)?.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
+    expect(journal.read(report.id)?.waiting).toContain('awaits a current explicit')
+    expect(posts()).toHaveLength(1)
+  })
+
+it('refuses unauthenticated, stale and unreviewed disposition controls', async () => {
+  const { db, journal } = setup()
+  const fixture = await reviewedImplementationReport(db, journal)
+  const report = journal.read('acme/repo#99')!
+  const binding = implementationReportBinding(db, report)
+  const disposition = { kind: 'source-only', review: fixture.review, commentId: 700,
+    diagnosis: 'Source candidate only.', nextAction: 'Inspect the original Call before Resume.' }
+  await expect(setImplementationReportDisposition(db, journal, report, report.sequence - 1, binding, disposition)).rejects.toThrow('changed')
+  await expect(setImplementationReportDisposition(db, journal, report, report.sequence, { ...binding, call: 'forged' }, disposition)).rejects.toThrow('stale')
+  await expect(setImplementationReportDisposition(db, journal, report, report.sequence, binding, { ...disposition, commentId: 701 })).rejects.toThrow('authenticated report review')
+  remote[0].user.login = 'outsider'
+  await expect(setImplementationReportDisposition(db, journal, report, report.sequence, binding, disposition)).rejects.toThrow('identity')
+  expect(JSON.parse(reports(db)[0].value).disposition).toBeUndefined()
+  expect(fixture.launch).not.toHaveBeenCalled()
+})
+
+it('records explicit triage through the existing HTTP chain control and rejects a stale control', async () => {
+  const { db, journal } = setup()
+  const fixture = await reviewedImplementationReport(db, journal)
+  mocks.database = db; mocks.journal = journal
+  const { handleBehaviorChains } = await import('../server/behavior-chain-api')
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const url = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  try {
+    const view = await (await fetch(`${url}?id=acme/repo%2399`)).json()
+    expect(view.implementationReport).toMatchObject({ source: 'acme/repo#7', call: fixture.call.id, disposition: null })
+    const body = { id: 'acme/repo#99', sequence: view.chain.sequence, operation: 'report-disposition', binding: view.implementationReport,
+      disposition: { kind: 'source-only', review: fixture.review, commentId: 700,
+        diagnosis: 'The failure belongs to the unpublished source candidate.', nextAction: 'Inspect the original Call before explicit Resume.' } }
+    const post = () => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    expect((await post()).status).toBe(200)
+    expect(journal.read('acme/repo#7')?.waiting).toContain(body.disposition.diagnosis)
+    expect((await post()).status).toBe(409)
+    expect(JSON.parse(reports(db)[0].value).disposition).toMatchObject(body.disposition)
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
 })
 
 it('keeps the implementation blocker and dated report disposition between ordinary rechecks and after closure', async () => {

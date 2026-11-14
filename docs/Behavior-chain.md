@@ -804,6 +804,37 @@ diagnostic facts. Caller's blocked result does not independently verify the work
 health-check, test-relay or other runner explanation. Its next action is to inspect
 the original Call, remedy the blocker and explicitly Resume for a fresh implementation.
 
+These pre-PR implementation-hold reports require explicit triage before their
+own implementation can prepare or start. A posted issue review alone cannot
+authorize implementation. Through the existing guarded `/api/behavior-chains`
+control, the workspace owner records `source-only` or `distinct-fix`, with a
+diagnosis and next action. Read `GET /api/behavior-chains?id=OWNER/REPO%23N` for
+the report chain's current sequence and `implementationReport` binding, then
+POST `{ id, sequence, operation: "report-disposition", binding, disposition }`.
+`binding` is that exact read value. `disposition` contains `kind`, `review`
+(the settled native issue-review invocation ID), `commentId` (its posted receipt),
+`diagnosis` and `nextAction`. Triage must identify an independently implementable,
+verified defect to select `distinct-fix`; source-candidate-only failures select
+`source-only`. The control verifies the publishing account and report marker,
+the reviewed title/body revision and native posted-review receipt, the source's
+exact original hold event and Call, and configured ownership. It persists the
+disposition inside the existing report intent and records the diagnosis and next
+action on both chains. Labels, comment wording and closure supply no disposition.
+
+At implementation admission, missing or stale dispositions wait visibly, even
+when new report publishing is disabled. `source-only` leaves the source held and
+starts no report implementation on main. Checkout availability remains explicitly
+unverified; disposition does not depend on retaining the unpublished checkout.
+Only a current `distinct-fix` can pass through the ordinary implementation gates.
+Admission freshly verifies the original source's open state, no-publication and
+resource-release evidence before and after awaited preparation, and guards the
+source journal revision atomically with admission. Resume, a replacement Hold
+(even with identical text), a different failed Call, changed report revision or
+new source publication invalidates the old binding. The report link and generated
+issue recursion guard remain retained. No disposition retries the source: later
+source work still requires existing verified recovery or explicit Resume, original
+no-publication/resource evidence and absence of competing work.
+
 `implementation_publication_uncertain` qualifies an original `implement-issue`
 invocation that remains uncertain after recovery, including an unheld source.
 Its failed terminal Call is retained in `evidence.callId` while `invocation.callId`
