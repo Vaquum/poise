@@ -48,6 +48,8 @@ export interface BehaviorChain {
   ciHold?: { invocationId: string, callId: string, head: string }
   testHold?: { invocationId: string, callId: string, sequence: number }
   testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string }
+  repairRecovery?: { report: number, key: string, holdSequence: number, head: string, basis: string, slot: string,
+    diagnosis: string, note: string, admission?: string }
   waiting: string | null
   resumedAfterSequence: number
   mergeSha: string | null
@@ -68,7 +70,8 @@ export type ChainEvent =
   | { type: 'chain.observed', observation: Record<string, unknown> }
   | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'], testHold?: Omit<NonNullable<BehaviorChain['testHold']>, 'sequence'> }
   | { type: 'chain.waiting', reason: string }
-  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'], recovery?: ChainRecoveryOrigin }
+  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'],
+    repairRecovery?: BehaviorChain['repairRecovery'], recovery?: ChainRecoveryOrigin }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
@@ -153,14 +156,27 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (event.testHold) next.testHold = { ...event.testHold, sequence }
     else delete next.testHold
   } else if (event.type === 'chain.resumed') {
+    if (event.repairRecovery) {
+      const recovery = event.repairRecovery, original = next.invocations.at(-1)
+      if (!next.held || next.repairRecovery || recovery.admission || event.ciRecovery || event.testRecovery
+        || !Number.isSafeInteger(recovery.report) || recovery.report < 1 || !SHA.test(recovery.head)
+        || !/^[a-f0-9]{64}$/.test(recovery.key) || !/^[a-f0-9]{64}$/.test(recovery.diagnosis)
+        || !Number.isSafeInteger(recovery.holdSequence) || recovery.holdSequence <= next.resumedAfterSequence
+        || recovery.holdSequence > current.sequence || !recovery.note.trim()
+        || original?.behavior !== 'repair-pr' || original.state !== 'settled' || original.basis !== recovery.basis
+        || original.slot !== recovery.slot || original.request.context?.head !== recovery.head) {
+        throw new Error('repair report recovery requires its original automatic hold and pinned repair')
+      }
+      next.repairRecovery = recovery
+    } else if (!event.ciRecovery && !event.testRecovery) delete next.repairRecovery
     if (event.testRecovery) {
       if (!next.held || !next.testHold || next.testRecovery || event.testRecovery.admission
         || chainBasis(event.testRecovery.hold) !== chainBasis(next.testHold)
         || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
       next.testRecovery = event.testRecovery
-    } else if (!event.ciRecovery) delete next.testRecovery
+    } else if (!event.ciRecovery && !event.repairRecovery) delete next.testRecovery
     next.held = null
-    if (!event.ciRecovery && !event.testRecovery) next.resumedAfterSequence = sequence
+    if (!event.ciRecovery && !event.testRecovery && !event.repairRecovery) next.resumedAfterSequence = sequence
     delete next.ciHold
     delete next.testHold
   }
@@ -187,6 +203,16 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
   } else if (event.type === 'invocation.admitted') {
     if (next.held || next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
     const invocation = event.invocation
+    if (invocation.behavior === 'repair-pr' && next.repairRecovery) {
+      const recovery = next.repairRecovery
+      const prior = next.invocations.find(item => item.id === recovery.admission)
+      if (recovery.admission && prior?.evidence?.status !== 'completed') throw new Error('repair report recovery already consumed its single admission')
+      if (!recovery.admission) {
+        if (invocation.basis !== recovery.basis || invocation.slot !== recovery.slot || invocation.actor !== next.author
+          || invocation.request.context?.head !== recovery.head) throw new Error('repair report recovery admits only its pinned source repair')
+        next.repairRecovery = { ...recovery, admission: invocation.id }
+      }
+    }
     if (invocation.behavior === 'implement-issue' && next.testRecovery) {
       const original = next.invocations.find(item => item.id === next.testRecovery!.hold.invocationId)
       if (next.testRecovery.admission || !original || original.basis !== invocation.basis || original.slot !== invocation.slot

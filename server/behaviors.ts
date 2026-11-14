@@ -9,7 +9,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
-import { repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories } from './behavior-chain-report'
+import { recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories } from './behavior-chain-report'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
@@ -8516,6 +8516,12 @@ async function runBehaviorChains(): Promise<void> {
       wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
     })
     runtime = new BehaviorChainRuntime(behaviorChainJournal(), { ...operations,
+      permitted: (chain, decision) => !repairReportImplementationFence(db, chain, decision.behavior) && operations.permitted(chain, decision),
+      recoverReport: (chain, observation) => recoverReportedRepair(db, behaviorChainJournal(), chain, observation, async target => {
+        await requireFreshDatastore()
+        return operations.observe(target)
+      }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
+        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled),
       reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {
         await requireFreshDatastore()
         return operations.observe(chain)

@@ -1759,6 +1759,14 @@ They retain the hold and distinguish worker-reported blockers from Caller diagno
 Terminal repair reports require the matching automatic hold, settled original Call,
 positive release and unchanged open PR head and repair basis, without possible
 publication effects. They preserve repair ownership and exclude CI-only recovery holds.
+Verified repair-exhaustion reports fence ordinary report implementation and can
+hand a pinned actionable diagnosis to the source chain's existing exact-head
+repair owner. The existing journal bounds that recovery to one admission without
+resetting retries; original no-publication/resource receipts, the saved automatic
+hold and unchanged source/diagnosis are rechecked. An already-admitted report's
+original implementation must settle without publication before this handoff.
+The original seed/branch, normal publication, review and CI gates remain in force;
+missing evidence, changed heads and later operator holds retain the wait.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,

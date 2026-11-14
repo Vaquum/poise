@@ -733,8 +733,10 @@ repair holds, automatic implementation holds before a PR, uncertain implementati
 publication, and uncertain merge
 submissions during their ordinary bounded reconciliation, including open `poise`
 seeds whose only PR closed unmerged; no Resume or extra poller is needed.
-Reporting preserves the source hold, uncertainty and ownership and does not
-perform recovery.
+Creating a report preserves the source hold, uncertainty and ownership. A verified
+repair-exhaustion report can subsequently hand an actionable diagnosis to the
+source chain's existing `repair-pr` owner; other report causes keep their existing
+behavior.
 The initial report body includes a dated snapshot of the same
 [verified work impact](Logging.md#native-logging-view) used by Logging and existing
 Notifications. It names the work, stage, last verified progress and known retry or
@@ -781,6 +783,29 @@ review causes outside these two timeouts cannot qualify. Closed or merged target
 remain ineligible for a new review exhaustion report.
 Revoking repository scope during verification prevents publication and leaves the
 creation intent unconsumed, so re-enabling can still report once.
+
+Repair-exhaustion recovery matches the saved automatic hold event, open source
+PR, exact head, repair basis, slot and original no-publication/resource-release
+receipts. Ordinary implementation and publication of that report issue are
+fenced, including admissions from before this routing existed. An already-started
+report implementation must settle with its original blocked, no-publication
+receipt and released resources. Its retained, untruncated Caller diagnostic must
+name the source PR, pinned head and a concrete code location. For a report with no
+implementation, a settled native issue-review receipt and its actual posted
+comment must supply that diagnosis. Creation, labeling, review completion or
+closure alone cannot admit recovery. The explanation remains worker-reported;
+the source repair verifies it.
+
+The original seed and branch remain unchanged. The existing `--note` carries the
+diagnosis, original Call, report reference and configured accounts' report guidance
+into exact-head repair preparation. The existing journal retains one recovery
+admission without resetting the original retry boundary. Source, diagnosis and
+operator holds are checked again after provider preparation; missing or changed
+evidence keeps an actionable wait. A failed or deferred recovery cannot admit
+another attempt after restart or repeated report observation. Explicit Resume
+retains its operator meaning. Publication, validation, review and CI use the
+ordinary source PR gates. This admission is separate from the bounded alternate
+model attempt; report deduplication and recursion suppression remain unchanged.
 
 Legacy review and approval ticks also report retained automatic retry stops in
 opted-in repositories, before checking model readiness and with v2 disabled.
