@@ -41,6 +41,20 @@ describe('approve-prs change gate', () => {
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 
+  it('keeps its watermark off the main connection, whose commits wait for the disk', async () => {
+    arrangeCli(false)
+    const { db, runtime } = await startApproving()
+    // A temporary trigger belongs to the main connection alone: it refuses the watermark written through it.
+    for (const event of ['INSERT', 'UPDATE']) {
+      db.db.exec(`CREATE TEMP TRIGGER main_approve_check_${event.toLowerCase()} BEFORE ${event} ON main.meta
+        WHEN new.key LIKE '%approve_prs_check:%' BEGIN SELECT RAISE(ABORT, 'written through the main connection'); END`)
+    }
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(cliCalls('--requested-changes-addressed')).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
   it('re-checks in the first tick after the datastore row changes', async () => {
     arrangeCli(false)
     const { runtime } = await startApproving()
