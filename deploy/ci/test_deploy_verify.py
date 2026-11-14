@@ -78,6 +78,9 @@ elif args[:1] == ['exec']:
     if args[1:6] == ['-i', 'poise-gateway', 'node', 'dist/diagnostics/cli.js', 'deployment']:
         state.setdefault('pause_reports', []).append({'args': args[6:], 'health': json.load(sys.stdin)})
         save()
+        if state.get('pause_error'):
+            print(state['pause_error'], file=sys.stderr)
+            sys.exit(1)
         print('{"accepted":true,"events":0}')
         sys.exit(0)
     if args[2] == 'sh':
@@ -563,6 +566,28 @@ class RolloutTest(LibTest):
         count = len(reports())
         self.assertEqual(self.resume(rollout).returncode, 0)
         self.assertEqual(len(reports()), count)
+
+    def test_exhausted_diagnostic_contention_warns_without_changing_rollout_proof(self):
+        for ready in [False, True]:
+            with self.subTest(ready=ready):
+                snapshot = json.loads(health(NEW if ready else OLD))
+                snapshot['draining'] = not ready
+                result = self.start({
+                    'containers': [f'alice {IMAGE_ID} true /poise-ws-alice'],
+                    'health': {'poise-ws-alice': [json.dumps(snapshot)]},
+                    'pause_error': 'Gateway refused ingress delivery: Ingress writer is busy',
+                }, timeout=600)
+                self.assertEqual(result.returncode, 0 if ready else 1, result.stdout + result.stderr)
+                self.assertIn('Ingress writer is busy', result.stderr)
+                self.assertIn('cannot retain the deployment pause observation', result.stderr)
+                self.assertEqual(self.record(self.current())[4], 'complete' if ready else 'pending')
+                with open(self.state) as file:
+                    reports = json.load(file)['pause_reports']
+                self.assertEqual(len(reports), 1)
+                self.assertEqual(reports[0]['args'][2], '0' if ready else '600')
+                self.assertEqual(reports[0]['args'][5], str(ready).lower())
+                if not ready:
+                    self.assertGreaterEqual(int(reports[0]['args'][3]), 600)
 
     def test_timeout_then_new_process_observes_completion_without_deploying(self):
         alice = f'alice {IMAGE_ID} true /poise-ws-alice'

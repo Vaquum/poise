@@ -3,7 +3,7 @@ import { DATASTORE_MAX_AGE_SECONDS, staleDatastoreFailure } from './datastore-he
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, implementationTestDependency, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -25,6 +25,7 @@ export interface ChainRuntimeOperations {
   implementationAdmission?(chain: BehaviorChain, observation: ChainObservation): Promise<{
     reason: string | null, source?: { id: string, sequence: number }
   }>
+  recoverReport?(chain: BehaviorChain, observation: ChainObservation): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
   authenticationRejected?(call: LogEntry): void
@@ -87,7 +88,11 @@ function ciOnlyHold(invocation: ChainInvocation, call: LogEntry): BehaviorChain[
     || !ci || ci.action !== 'list_failing_ci' || ci.repository !== call.repo || ci.pull_number !== Number(call.pr_id)
     || ci.head_sha !== call.expected_head || ci.head_sha !== invocation.request.context?.head
     || typeof ci.head_sha !== 'string' || !/^[0-9a-f]{40}$/i.test(ci.head_sha)
-    || !Array.isArray(ci.failing) || !ci.failing.length) return undefined
+    || !Array.isArray(ci.failing)) return undefined
+  if (ci.queue) {
+    const queue = queueCiBlocker({ ...invocation, evidence: receipt(call) })
+    return queue ? { invocationId: invocation.id, callId: call.id, head: ci.head_sha, queue } : undefined
+  }
   // A job/check identity pins the failed attempt even after the workflow is
   // rerun. Pending checks or a worker's prose alone cannot establish a cause.
   if (!ci.failing.some((check: Record<string, unknown>) => check?.type === 'check_run' && check.state === 'completed'
@@ -126,6 +131,10 @@ function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, no
   return (pull.head === hold.head || observation.ciBaseUpdate?.from === hold.head && observation.ciBaseUpdate.head === pull.head
       && observation.publication.pull_number === pull.number && observation.publication.head_sha === pull.head)
     && pull.checksState === 'SUCCESS' && !pull.pending && pull.failing.length === 0
+    && (!hold.queue || observation.ciRecovery?.invocationId === original.id && observation.ciRecovery.recovered
+      && observation.ciRecovery.removal === hold.queue.removal && observation.ciRecovery.integration === hold.queue.integration
+      && pull.queueRemoval?.id === hold.queue.removal && pull.queueRemoval.reason === 'failed_checks'
+      && chainBasis(queueCiBlocker(original)) === chainBasis(hold.queue))
 }
 
 function recoveredImplementation(chain: BehaviorChain, observation: ChainObservation, now: number): BehaviorChain['testRecovery'] | null {
@@ -248,6 +257,25 @@ export class BehaviorChainRuntime {
   private waitForCapacity(chain: BehaviorChain, reason: string): void {
     if (chain.waiting !== reason || this.capacityWaitSequence(chain) === null) {
       this.append(chain, { type: 'chain.waiting', reason })
+    }
+  }
+
+  /** Resume retains waiting in hashed reducer state; a still-blocking reason
+   * starts a new wait episode on the first sweep that reaches it after Resume,
+   * even when an observation-only sweep (such as a capacity-fairness deferral)
+   * intervened. Later sweeps deduplicate against the fresh event. */
+  private renewsWait(chain: BehaviorChain, reason: string): boolean {
+    if (chain.waiting !== reason) return true
+    if (chain.resumedAfterSequence <= 0) return false
+    let after = chain.resumedAfterSequence
+    while (true) {
+      const events = this.journal.history(chain.id, after)
+      for (const row of events) {
+        const event = JSON.parse(row.payload) as ChainEvent
+        if (event.type === 'chain.waiting' && event.reason === reason) return false
+      }
+      if (events.length < 100) return true
+      after = events.at(-1)!.sequence
     }
   }
 
@@ -468,6 +496,16 @@ export class BehaviorChainRuntime {
                   pull_number: observation.pull.number, merged: true, merge_sha: observation.pull.mergeSha, review_complete: false } })
               }
               if (owned && call?.status === 'running') continue
+              if (this.operations.recoverReport) {
+                const reason = await this.operations.recoverReport(chain, observation)
+                chain = this.current(chain)
+                observation = chain.observation as ChainObservation
+                if (reason) {
+                  if (chain.repairRecovery && !chain.repairRecovery.admission && !chain.held) chain = this.append(chain, { type: 'chain.held', reason })
+                  if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                  continue
+                }
+              }
               const pendingInvocation = chain.invocations.find((invocation) => invocation.state !== 'settled')
               if (pendingInvocation) {
                 phase = 'invocation-recovery'
@@ -549,18 +587,18 @@ export class BehaviorChainRuntime {
                 if (resources) {
                   const exhausted = this.resourceWaitReason(resources)
                   if (exhausted) {
-                    if (chain.waiting !== exhausted) this.append(chain, { type: 'chain.waiting', reason: exhausted })
+                    if (this.renewsWait(chain, exhausted)) this.append(chain, { type: 'chain.waiting', reason: exhausted })
                     continue
                   }
                   try {
                     const cramped = headroomShortfall((this.operations.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)
                     if (cramped) {
-                      if (chain.waiting !== cramped) this.append(chain, { type: 'chain.waiting', reason: cramped })
+                      if (this.renewsWait(chain, cramped)) this.append(chain, { type: 'chain.waiting', reason: cramped })
                       continue
                     }
                   } catch (error) {
                     const reason = error instanceof Error ? error.message : String(error)
-                    if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                    if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
                     continue
                   }
                 }
@@ -590,14 +628,12 @@ export class BehaviorChainRuntime {
                   if (firstWait !== undefined && Date.now() - firstWait > DATASTORE_MAX_AGE_SECONDS * 1000) {
                     throw new Error(`${error.message}; indexing delay exceeds ${DATASTORE_MAX_AGE_SECONDS} seconds`)
                   }
-                  if (chain.waiting !== error.message) this.append(chain, { type: 'chain.waiting', reason: error.message })
+                  if (this.renewsWait(chain, error.message)) this.append(chain, { type: 'chain.waiting', reason: error.message })
                   continue
                 }
                 if (!request) {
                   const reason = `${decision.behavior} is waiting for native provider backoff`
-                  // Resume retains waiting; its first observed sweep starts a new episode.
-                  if (chain.waiting !== reason || (chain.resumedAfterSequence > 0
-                    && this.journal.history(chain.id, chain.resumedAfterSequence, 1)[0]?.sequence === chain.sequence)) {
+                  if (this.renewsWait(chain, reason)) {
                     this.append(chain, { type: 'chain.waiting', reason })
                   }
                   continue
@@ -620,6 +656,21 @@ export class BehaviorChainRuntime {
                 // Preparation can await provider/auth/configuration. Recheck admission
                 // at the last boundary, before committing authority for an effect.
                 if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
+                if (this.operations.recoverReport && (chain.repairRecovery && !chain.repairRecovery.admission
+                  || decision.behavior === 'implement-issue' || decision.behavior === 'publish-issue')) {
+                  const reason = await this.operations.recoverReport(this.current(chain), observation)
+                  chain = this.current(chain)
+                  if (reason) {
+                    if (chain.repairRecovery && !chain.repairRecovery.admission && !chain.held) chain = this.append(chain, { type: 'chain.held', reason })
+                    if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                    continue
+                  }
+                  observation = chain.observation as ChainObservation
+                  const fresh = decideBehaviorChain(chain, observation, Date.now())
+                  if (fresh.kind !== 'invoke' || fresh.behavior !== decision.behavior || fresh.basis !== decision.basis
+                    || fresh.actor !== decision.actor || fresh.reviewer?.slot !== decision.reviewer?.slot) continue
+                  if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
+                }
                 if (decision.behavior === 'implement-issue') {
                   const fresh = await this.operations.observe(chain)
                   chain = this.append(chain, { type: 'chain.observed', observation: fresh })
@@ -663,7 +714,7 @@ export class BehaviorChainRuntime {
               } else {
                 const reason = decision.kind === 'wait' ? decision.reason : !this.operations.enabled() ? 'behavior chain admissions are paused'
                   : `${decision.behavior} is disabled or held by its behavior controls`
-                if (reason !== chain.waiting) this.append(chain, { type: 'chain.waiting', reason })
+                if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
               }
             } catch (error) {
               if (!(error instanceof BehaviorChainRevisionConflict)) throw error
@@ -775,9 +826,10 @@ export class BehaviorChainRuntime {
     const resourceStopped = ['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable', 'resource_receipt_unavailable'].includes(call.error_code || '')
     const workBlocked = call.error_code === 'atomic_work_blocked'
     const ciHold = workBlocked ? ciOnlyHold(invocation, call) : undefined
-    const testHold = !chain.testRecovery && workBlocked && implementationTestDependency({ ...invocation, evidence: receipt(call) })
+    const testHold = !chain.testRecovery && workBlocked && implementationTestDependency({ ...invocation, callId: call.id, evidence: receipt(call) })
       ? { invocationId: invocation.id, callId: call.id } : undefined
-    if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: call.error,
+    if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held',
+      reason: ciHold?.queue ? `${call.error}; merge-group ${ciHold.queue.integration}: ${ciHold.queue.failures.map(failure => `${failure.name} (${failure.url})`).join(', ')}; awaiting later matching integration success or verified shared-baseline recovery` : call.error,
       ...(ciHold ? { ciHold } : {}), ...(testHold ? { testHold } : {}) })
     if (stopped && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: `behavior invocation ${invocation.id} was stopped by the person` })
     if (!nativeResourcesReleased(call)) {
@@ -1037,9 +1089,13 @@ export class BehaviorChainRuntime {
       const expected = invocation.request.argv[invocation.request.argv.indexOf('--expected-head') + 1]
       const review = observation.pull.reviewReceipts.find((receipt) => receipt.invocation === nativeId && receipt.head === expected)
       const action = review?.state === 'APPROVED' ? 'approved' : review?.state === 'CHANGES_REQUESTED' ? 'requested_changes' : review?.state === 'COMMENTED' ? 'reviewed_clean' : null
+      const artifact = invocation.evidence?.artifact as Record<string, unknown> | null
+      const coverage = (artifact?.review_response as { coverage?: unknown } | null)?.coverage
+      // A published partial keeps its incomplete disposition; the failed call outcome cannot speak for it.
+      const partial = action === 'requested_changes' && coverage === 'incomplete'
       if (review && action && chainReviewResponse(chain, { ...invocation, callId: nativeId,
-        evidence: { ...invocation.evidence, action, review_id: review.id } }, observation, Date.now())) {
-        const outcome = action === 'approved' ? 'approved' : action === 'requested_changes' ? 'changes_requested' : 'clean'
+        evidence: { ...invocation.evidence, action, review_id: review.id, ...(partial ? { outcome: 'incomplete' } : {}) } }, observation, Date.now())) {
+        const outcome = action === 'approved' ? 'approved' : action === 'requested_changes' ? (partial ? 'incomplete' : 'changes_requested') : 'clean'
         this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: nativeId, outcome,
           evidence: { ...invocation.evidence, status: 'completed', action, outcome, review_id: review.id, head_sha: review.head,
             reconciliation: 'native invocation marker verified on the actual GitHub review' } })

@@ -5,6 +5,7 @@ import './components.css'
 import './states.css'
 import './narrow.css'
 import { watchForUpdates } from '../updating'
+import { reportActivity } from '../activity'
 import { watchForSignOut } from '../signed-out'
 import { installSelfUpdateWatch } from '../self-update-watch'
 import { initMotion } from '../motion'
@@ -30,6 +31,8 @@ import { startSetup } from './setup'
 watchForUpdates()
 watchForSignOut()
 installSelfUpdateWatch()
+// Input on the page holds a release switch until a quiet moment.
+reportActivity()
 
 // The Style panel's Motion switch answers the motion runtime's one question, so it is in place first.
 const motionTurned = installMotionSwitch(() => styleToken('--ctl-motion') === '0')

@@ -284,7 +284,7 @@ def command(model: Model, text: str, checkout: Path, work: Path, seconds: float,
     else:
         env = os.environ.copy()
     # Worker tests must not register their scratch against the parent Call.
-    for key in ("AGENT_INTERFACE_RECEIPT_DB", "AGENT_INTERFACE_RECEIPT_CALL"):
+    for key in ("AGENT_INTERFACE_RECEIPT_DB", "AGENT_INTERFACE_RECEIPT_CALL", "AGENT_INTERFACE_FAILED_SOURCE_CALL"):
         env.pop(key, None)
     scratch = work.resolve() / "tmp"
     scratch.mkdir(mode=0o700, exist_ok=True)

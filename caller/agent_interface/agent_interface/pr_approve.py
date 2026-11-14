@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import shlex
 
-from . import atoms
+from . import atoms, review_receipt
 from . import review_cap as followup
 from .pr_review import VERIFY_FIXES
 
@@ -152,6 +153,10 @@ def run(
         # round: review the full diff once, and say so in the prompt.
         lost_since = since
         packet_text = atoms.packet(pwd, pr, actor, expected_head, p, since_head=None)
+    if capped and review_receipt.coverage_disposition(json.loads(packet_text)) != "complete":
+        capped = False
+        if spec.provider == "claude":
+            tools = allowed(pr, actor, expected_head)
     if capped and spec.provider == "claude":
         policy: str = capped_policy(review_round or 0, review_cap or 0)
         rules = capped_rules(repo_name(pr, pwd), pr, expected_head, review_round or 0, review_cap or 0, actor)

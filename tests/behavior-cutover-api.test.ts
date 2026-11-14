@@ -3,11 +3,12 @@ import { afterAll, beforeEach, expect, it, vi } from 'vitest'
 import { db, getMeta, setMeta, closeDatabase } from '../server/db'
 import { behaviorChainJournal } from '../server/behavior-chain-journal'
 import type { BehaviorChain, ChainEvent } from '../server/behavior-chain-store'
+import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
-import { chainSummaryFixture } from './fixtures/behavior-chain-summary'
+import { chainSummaryFixture, mergedReviewFixture, type MergedReviewCase } from './fixtures/behavior-chain-summary'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
 import { parseProcessDiagnostic } from '../server/process-diagnostic'
-import { eventWords, readJournalPage, taskState, timelineLines } from '../src/ui/places/observe/chains'
+import { eventWords, readChain, readJournalPage, taskState, timelineLines } from '../src/ui/places/observe/chains'
 import { readFrom } from '../src/ui/places/observe/journal'
 
 const native = vi.hoisted(() => ({ support: { status: 'supported', error: null as string | null } }))
@@ -141,7 +142,7 @@ it('projects confirmed merges without obsolete queue waits while retaining origi
     expect(eventWords(legacyPage.events.at(-1)!, new Map()).text).toBe('Merged')
     const canonical = journal.read(pending.id)!
     expect(canonical).toEqual(pending)
-    expect(detail.chain).toEqual(behaviorChainSummary(canonical, { at: journal.reconciliationAt(canonical) }))
+    expect(detail.chain).toEqual(behaviorChainSummary(canonical, journal, { at: journal.reconciliationAt(canonical) }))
     for (const operation of ['hold', 'resume']) {
       const response = await fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: pending.id, sequence: pending.sequence, operation }) })
@@ -198,12 +199,140 @@ it('preserves exact-sequence Hold and Resume for unmerged ownership', async () =
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })
 
+it.each([false, true])('projects a resumed wait as history while preserving original native ownership (uncertain=%s)', async uncertain => {
+  const journal = behaviorChainJournal()
+  const issue = uncertain ? 1705 : 1704
+  const reason = 'Worker sandbox Python blocker; explicitly Resume. Report https://github.com/api/repo/issues/99'
+  let chain = journal.append(`api/repo#${issue}`, `resume-seed-${issue}`, 0, { type: 'chain.admitted', repository: 'api/repo', issue,
+    branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' })
+  const record = (event: ChainEvent) => { chain = journal.append(chain.id, `${chain.id}:${chain.sequence}`, chain.sequence, event) }
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const observation: ChainObservation = { checkedAt: Date.now(), existingPulls: [], pull: null,
+    issue: { open: true, eligible: true, revision: 'seed', commentIds: [] }, issueReviewers: [], prReviewers: [],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }
+  record({ type: 'chain.observed', observation })
+  const invocation = { id: `original-resume-${issue}`, behavior: 'implement-issue' as const, actor: chain.author,
+    model: 'fixture', slot: 'primary', basis: 'seed', admittedAt: Date.now(), reservation: { memoryBytes: 6, diskBytes: 3 },
+    request: { command: 'agent-interface' as const, cwd: '/fixture', argv: [], nativeResources: 2 as const } }
+  record({ type: 'invocation.admitted', invocation })
+  if (uncertain) record({ type: 'invocation.uncertain', invocationId: invocation.id, reason: 'original Call and resource release remain unverified' })
+  else record({ type: 'invocation.settled', invocationId: invocation.id, callId: 'a'.repeat(32), outcome: 'preflight_failed',
+    evidence: { status: 'failed', action: 'not_started', resources_settled_at: new Date().toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] } } })
+  record({ type: 'chain.held', reason: 'automatic implementation hold' })
+  record({ type: 'chain.waiting', reason })
+  const original = journal.history(chain.id)
+  const invocations = structuredClone(chain.invocations)
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  const post = (body: unknown) => fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  try {
+    await post({})
+    const held = await (await fetch(base)).json()
+    expect(held.chains.find((item: { id: string }) => item.id === chain.id).waiting).toBe(reason)
+    const response = await post({ id: chain.id, sequence: chain.sequence, operation: 'resume' })
+    expect(response.status).toBe(200)
+    const resumed = await response.json()
+    expect(resumed.chain).toMatchObject({ held: null, waiting: null, invocationCount: 1 })
+    const list = await (await fetch(base)).json()
+    const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
+    expect(list.chains.find((item: { id: string }) => item.id === chain.id)).toEqual(resumed.chain)
+    expect(detail.chain).toEqual(resumed.chain)
+    expect(detail.events).toContainEqual(expect.objectContaining({ type: 'chain.waiting', reason }))
+    expect(taskState(readJournalPage(detail).chain!).state).toBe(uncertain ? 'blocked' : 'idle')
+    if (uncertain) {
+      expect(taskState(readJournalPage(detail).chain!).reason).toContain('original Call and resource release')
+      expect(list.attention.find((item: { id: string }) => item.id === chain.id)).toMatchObject({
+        nextAction: 'Reconcile the original invocation receipt before any retry' })
+    }
+    chain = journal.read(chain.id)!
+    expect(chain.waiting).toBe(reason)
+    expect(chain.invocations).toEqual(invocations)
+    const boundary = chain.resumedAfterSequence
+    record({ type: 'chain.observed', observation: { ...observation, checkedAt: Date.now() } })
+    expect((await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()).chain.waiting).toBeNull()
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(chain)
+    expect(journal.history(chain.id).slice(0, original.length)).toEqual(original)
+    if (uncertain) {
+      expect(decideBehaviorChain(chain, observation, Date.now())).toMatchObject({ kind: 'wait', reason: expect.stringContaining('native outcome must settle first') })
+      expect(journal.admitInvocation(chain, `replacement-${issue}`, { ...invocation, id: `replacement-${issue}` }, 3)).toBeNull()
+      expect(journal.reservedResources().memoryBytes).toBeGreaterThanOrEqual(6)
+      expect(journal.read(chain.id)!.invocations).toEqual(invocations)
+    }
+    record({ type: 'chain.waiting', reason })
+    expect(chain.sequence).toBeGreaterThan(boundary)
+    expect((await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()).chain.waiting).toBe(reason)
+  } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+})
+
 it('shares the production summary and historical rebuild contract with browser payloads', () => {
   expect(chainSummaryFixture('pending-active').chains[0]).toMatchObject({ reviewStatus: 'pending', reviewPending: true,
     invocations: [{ behavior: 'repair-pr', state: 'uncertain' }] })
   expect(chainSummaryFixture('pending-no-invocation').chains[0]).toMatchObject({ reviewStatus: 'pending', reviewPending: true, invocations: [] })
   expect(chainSummaryFixture('complete').chains[0]).toMatchObject({ reviewStatus: 'complete', reviewPending: false })
   expect(chainSummaryFixture('historical').chains[0]).toMatchObject({ reviewStatus: 'not-recorded', reviewPending: null })
+})
+
+it('retains unmet native clearance on completed merged list/detail reads across expiry and rebuild, without rewriting receipts', async () => {
+  const journal = behaviorChainJournal()
+  const cases: MergedReviewCase[] = ['requested-changes', 'clean', 'native-approval', 'late-native-approval', 'late-review',
+    'missing-basis', 'changed-context', 'changed-head', 'missing-panel', 'incomplete-panel']
+  const now = Date.now()
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now)
+  const chains = cases.map((mode, index) => mergedReviewFixture(journal, 1635 + index, mode))
+  for (const [index, chain] of chains.entries()) {
+    if (!['requested-changes', 'clean', 'native-approval', 'late-native-approval'].includes(cases[index])) continue
+    const observation = chain.observation as ChainObservation
+    expect(decideBehaviorChain(chain, observation, observation.checkedAt, {
+      before: journal.preMergeObservation(chain.id, observation.pull!.mergedAt!) as ChainObservation | null,
+      firstMerged: journal.firstMergedObservation(chain.id) as ChainObservation | null,
+    })).toEqual({ kind: 'complete', mergeSha: 'c'.repeat(40) })
+  }
+  const history = db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').all()
+  journal.rebuild()
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  try {
+    for (const time of [now + 10_001, now + 120_001]) {
+      clock.mockReturnValue(time)
+      const merged = await (await fetch(`${base}?state=merged`)).json()
+      for (const [index, chain] of chains.entries()) {
+        expect(journal.read(chain.id)).toEqual(chain)
+        expect(merged.attention.map((entry: { id: string }) => entry.id)).not.toContain(chain.id)
+        const listed = merged.chains.find((entry: { id: string }) => entry.id === chain.id)
+        const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
+        expect(listed).toBeDefined()
+        expect(detail.chain).toEqual(listed)
+        expect(listed).toMatchObject({ mergeSha: 'c'.repeat(40), reviewPending: false, reviewStatus: 'complete', invocationCount: chain.invocations.length })
+        expect(listed.invocations).toHaveLength(20)
+        expect(listed.invocations.every((entry: { behavior: string }) => entry.behavior === 'repair-pr')).toBe(true)
+        const warning = listed.mergedReviewWarning
+        if (cases[index] === 'requested-changes' || cases[index] === 'late-native-approval') {
+          expect(warning).toMatchObject({ head: 'a'.repeat(40), reviews: [{ id: 91, head: 'a'.repeat(40), submittedAt: now - 7000,
+            verdict: 'Changes requested: retain the original native review clearance after merge.',
+            url: `https://github.com/acme/repo/pull/${chain.issue + 1}#pullrequestreview-91` }],
+          githubApproval: { id: 93, head: 'a'.repeat(40), submittedAt: now - 4000,
+            url: `https://github.com/acme/repo/pull/${chain.issue + 1}#pullrequestreview-93`, client: 'unknown' } })
+          expect(taskState(readChain(listed))).toEqual({ state: 'done', reason: 'Merged as ccccccc · native review clearance unmet' })
+        } else expect(warning).toBeNull()
+      }
+    }
+    journal.rebuild()
+    expect(db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').all()).toEqual(history)
+    for (const chain of chains) expect(journal.read(chain.id)).toEqual(chain)
+  } finally {
+    await fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    clock.mockRestore()
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
 })
 
 it('retains the original failed native Call and diagnostic in list and History without rewriting uncertainty', async () => {
@@ -331,7 +460,7 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
       expect(all.chains).toContainEqual(expect.objectContaining({ id: chain.id, mergeSha: null, reviewStatus: 'not-recorded' }))
       expect(merged.chains.map((row: { id: string }) => row.id)).not.toContain(chain.id)
       const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
-      expect(detail.chain).toEqual(behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) }))
+      expect(detail.chain).toEqual(behaviorChainSummary(chain, journal, { at: journal.reconciliationAt(chain) }))
       expect(detail.events.map((event: { type: string }) => event.type)).toEqual(before[index].map(row => JSON.parse(row.payload).type))
       expect(journal.read(chain.id)).toEqual(chain)
       expect(journal.history(chain.id)).toEqual(before[index])
@@ -397,7 +526,6 @@ it('batches exact work-impact lookups through the existing classifier without ch
   const at = Date.now() - 10_000
   const call = '4'.repeat(32), correlation = '5'.repeat(32), other = '6'.repeat(32)
   const fixture = loggingWorkFixture(journal, 'api/impact', 7, correlation, call, at)
-  fixture.append({ type: 'chain.held', reason: 'independent hold' }, at + 4000)
   const completed = loggingWorkFixture(journal, 'api/impact', 8, other, other, at)
   completed.append({ type: 'chain.merged', mergeSha: 'c'.repeat(40), evidence: { repository: 'api/impact', pull_number: 108,
     merged: true, merge_sha: 'c'.repeat(40), review_complete: true } }, at + 4000)
@@ -412,8 +540,12 @@ it('batches exact work-impact lookups through the existing classifier without ch
     for (const [callId, correlationId] of [[call, correlation], ['', other], ['7'.repeat(32), ''], [call, other]]) {
       params.append('callId', callId); params.append('correlationId', correlationId)
     }
+    const batchLookup = vi.spyOn(journal, 'forInvocations')
+    const singleLookup = vi.spyOn(journal, 'forInvocation')
     const response = await fetch(`${base}?${params}`)
     expect(response.status).toBe(200)
+    expect(batchLookup).toHaveBeenCalledTimes(1)
+    expect(singleLookup).not.toHaveBeenCalled()
     expect(await response.json()).toEqual({ impacts: [behaviorChainWorkImpact(journal, call, correlation),
       behaviorChainWorkImpact(journal, null, other), null, null] })
     const single = await (await fetch(`${base}?callId=${call}&correlationId=${correlation}`)).json()
@@ -423,13 +555,29 @@ it('batches exact work-impact lookups through the existing classifier without ch
       expect((await fetch(`${base}?${query}`)).status).toBe(400)
     }
     const bounded = new URLSearchParams({ batch: '1' })
-    for (let index = 0; index < 100; index++) { bounded.append('callId', call); bounded.append('correlationId', '') }
+    for (let index = 0; index < 100; index++) {
+      bounded.append('callId', index ? index.toString(16).padStart(32, '0') : call)
+      bounded.append('correlationId', '')
+    }
     const full = await fetch(`${base}?${bounded}`)
     expect(full.status).toBe(200)
-    expect((await full.json()).impacts).toHaveLength(100)
+    expect((await full.json()).impacts).toEqual([behaviorChainWorkImpact(journal, call, null), ...Array(99).fill(null)])
     bounded.append('callId', call); bounded.append('correlationId', '')
     expect((await fetch(`${base}?${bounded}`)).status).toBe(400)
     expect([journal.history(fixture.chain.id), journal.history(completed.chain.id)]).toEqual(before)
+    const appendedId = '8'.repeat(32)
+    fixture.append({ type: 'invocation.admitted', invocation: { ...fixture.chain.invocations[0], id: appendedId, admittedAt: at + 5000 } }, at + 5000)
+    fixture.append({ type: 'invocation.reconciled', invocationId: appendedId,
+      evidence: { nativeCallId: '7'.repeat(32), callId: '7'.repeat(32) } }, at + 6000)
+    const withInvocation = await (await fetch(`${base}?${params}`)).json()
+    expect(withInvocation.impacts[2]).toMatchObject({ invocationId: appendedId, stage: 'repair-pr: admitted' })
+    expect(withInvocation.impacts[2]).toEqual(behaviorChainWorkImpact(journal, '7'.repeat(32), null))
+    fixture.append({ type: 'chain.held', reason: 'independent hold' }, at + 7000)
+    const afterAppend = journal.history(fixture.chain.id)
+    const refreshed = await (await fetch(`${base}?${params}`)).json()
+    expect(refreshed.impacts[0]).toMatchObject({ impact: 'blocked', nextAction: expect.stringContaining('independent hold') })
+    expect(refreshed.impacts[0]).toEqual(behaviorChainWorkImpact(journal, call, correlation))
+    expect([journal.history(fixture.chain.id), journal.history(completed.chain.id)]).toEqual([afterAppend, before[1]])
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })
 

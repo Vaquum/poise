@@ -21,7 +21,7 @@ const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,1
 const SHA = /^[a-f0-9]{40}$/
 const SLOTS: readonly LedgerSlot[] = ['primary', 'secondary', 'tertiary']
 const PRECEDENCE: readonly LedgerState[] = ['running', 'held', 'unknown', 'pending', 'failed', 'superseded', 'completed']
-const OUTCOMES = new Set(['clean', 'changes_requested', 'approved', 'commented', 'preflight_failed', 'resolved', 'waiting', 'no_op', 'merged', 'already_merged', 'updated', 'not_ready', 'superseded', 'closed', 'already_closed', 'rerun_requested', 'read_failed', 'spawn_failed', 'adopted', 'enqueued', 'review_target_closed'])
+const OUTCOMES = new Set(['clean', 'changes_requested', 'approved', 'incomplete', 'commented', 'preflight_failed', 'resolved', 'waiting', 'no_op', 'merged', 'already_merged', 'updated', 'not_ready', 'superseded', 'closed', 'already_closed', 'rerun_requested', 'read_failed', 'spawn_failed', 'adopted', 'enqueued', 'review_target_closed'])
 const TERMINAL = new Set<LedgerState>(['completed', 'failed', 'superseded'])
 const DIRECT = new Set(['resolve-unblocking', 'merge-prs', 'rerun-grey-ci', 'close-old-prs'])
 const cliBehavior = { 'review-new-prs': 'pr_review', 'approve-prs': 'pr_approve', 'review-new-issues': 'issue_review' } as const
@@ -735,7 +735,7 @@ function completedPair(record: LedgerRecord, row: LedgerCaller): boolean {
   if (!row.completedAt || !iso(row.completedAt) || Date.parse(row.completedAt) < Date.parse(row.startedAt!)) return false
   if (record.behavior === 'review-new-issues') return row.action === 'commented' && row.outcome === 'commented' && row.head === null
   if (row.head !== record.head) return false
-  return row.action === 'requested_changes' && row.outcome === 'changes_requested'
+  return row.action === 'requested_changes' && ['changes_requested', 'incomplete'].includes(row.outcome ?? '')
     || record.behavior === 'review-new-prs' && row.action === 'reviewed_clean' && row.outcome === 'clean'
     || record.behavior === 'approve-prs' && row.action === 'approved' && row.outcome === 'approved'
 }

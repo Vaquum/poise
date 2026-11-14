@@ -54,7 +54,7 @@ function addWorkspaceContainer(h: Harness, handle: string, imageId: string, runn
     imageId,
     imageRef: 'poise-runtime:latest',
     running,
-    labels: { 'poise.managed': 'true', 'poise.workspace': handle, ...(dns ? { 'poise.dns': dns.label } : {}) },
+    labels: { ...h.docker.imageLabels.get(imageId), 'poise.managed': 'true', 'poise.workspace': handle, ...(dns ? { 'poise.dns': dns.label } : {}) },
     networks: new Set([`poise-net-${handle}`]),
     spec: { Env: env, HostConfig: { Mounts: mounts } },
   })
@@ -1156,6 +1156,19 @@ describe('updates in place', () => {
     await h.close()
   })
 
+  it('keeps a healthy same-release container after a rebuild makes its original image unavailable', async () => {
+    await start({ release: 'new-release' })
+    const { workspaceCookie } = await h.openWorkspace('Alice')
+    const before = containerId()
+    h.docker.imageLabels.delete(OLD_IMAGE_ID)
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    expect(h.workspace.switches).toEqual([])
+    expect(releaseTasks()).toEqual([])
+    expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/drain')).toBe(false)
+    expect((await h.request({ host: ALICE, path: '/', headers: { cookie: workspaceCookie, ...NAVIGATE } })).status).toBe(200)
+  })
+
   it('installs a new release of the same base into a running workspace and asks Poise to switch, keeping its container', async () => {
     await start()
     const before = containerId()
@@ -1237,9 +1250,15 @@ describe('updates in place', () => {
       if (kind === 'navigation') expect(reset.body).toContain('Updating to the latest version')
       else if (kind === 'HEAD') expect(reset.body).toBe('')
       else expect(reset.json()).toMatchObject({ error: 'workspace_updating' })
-      expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({
-        level: 'error', handle: 'alice', errno: 'ECONNRESET', release: 'new-release', method, route: '/',
+      const failures = h.logs.filter(entry => String(entry.event).startsWith('proxy.'))
+      expect(failures).toEqual([expect.objectContaining({
+        event: 'proxy.failed', level: 'warn', handle: 'alice', errno: 'ECONNRESET', release: 'new-release', method, route: '/',
         requestId: expect.any(String), upstream: `127.0.0.1:${h.workspace.port}`, durationMs: expect.any(Number),
+        disconnect: 'responded 503 workspace_updating',
+      })])
+      expect(normalize(gatewayDiagnostic(String(failures[0].level), 'proxy.failed', failures[0]))).toMatchObject({
+        severity: 'warning', requestId: failures[0].requestId, workspace: 'alice',
+        context: { method, release: 'new-release', disconnect: 'responded 503 workspace_updating' },
       })
       expect(events(h.logs, 'workspace.update.finished')).toHaveLength(0)
 
@@ -1273,7 +1292,15 @@ describe('updates in place', () => {
       expect(reset.headers['x-poise-updating']).toBeUndefined()
       expect(h.workspace.serviceRequests.slice(probes).map(request => request.url))
         .toEqual(kind === 'no update' ? [] : ['/api/service/health'])
-      expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({ level: 'error', errno: 'ECONNRESET' })
+      const failures = h.logs.filter(entry => String(entry.event).startsWith('proxy.'))
+      expect(failures).toEqual([expect.objectContaining({
+        event: 'proxy.failed', level: 'error', errno: 'ECONNRESET', method: 'GET',
+        release: kind === 'no update' ? null : 'new-release', disconnect: 'responded 502 bad_gateway',
+      })])
+      expect(normalize(gatewayDiagnostic(String(failures[0].level), 'proxy.failed', failures[0]))).toMatchObject({
+        severity: 'error', requestId: failures[0].requestId, workspace: 'alice',
+        context: { method: 'GET', release: kind === 'no update' ? null : 'new-release', disconnect: 'responded 502 bad_gateway' },
+      })
       expect(events(h.logs, 'workspace.update.finished')).toHaveLength(0)
       expect(h.workspace.requests.filter(request => request.url === '/reset')).toHaveLength(1)
     })
@@ -1294,9 +1321,69 @@ describe('updates in place', () => {
     // The fixture records the received mutation before dropping its answer; its outcome is ambiguous to the client.
     expect(h.workspace.requests.filter(request => request.url === '/reset')).toMatchObject([{ method, body }])
     expect(h.workspace.requestLines.filter(line => line === `${method} /reset`)).toHaveLength(1)
-    expect(h.logs.find(entry => entry.event === 'proxy.failed')).toMatchObject({
-      level: 'error', method, errno: 'ECONNRESET', release: 'new-release',
+    const failures = h.logs.filter(entry => String(entry.event).startsWith('proxy.'))
+    expect(failures).toEqual([expect.objectContaining({
+      event: 'proxy.failed', level: 'error', method, errno: 'ECONNRESET', release: 'new-release',
+      disconnect: 'responded 502 bad_gateway',
+    })])
+    expect(normalize(gatewayDiagnostic(String(failures[0].level), 'proxy.failed', failures[0]))).toMatchObject({
+      severity: 'error', requestId: failures[0].requestId, workspace: 'alice',
+      context: { method, release: 'new-release', disconnect: 'responded 502 bad_gateway' },
     })
+  })
+
+  it.each(['closed client', 'thrown answer', 'switch completed'])('keeps Error when a verified reset cannot produce the update response (%s)', async kind => {
+    await start()
+    const { workspaceCookie } = await h.openWorkspace('Alice')
+    const headers = { cookie: workspaceCookie }
+    expect((await h.request({ host: ALICE, path: '/api/workspace', headers })).status).toBe(200)
+    await h.orchestrator.upgradePass()
+    h.workspace.health.release = 'new-release'
+    const probe = h.orchestrator.restartingForUpdate.bind(h.orchestrator)
+    const restart = vi.spyOn(h.orchestrator, 'restartingForUpdate').mockImplementation(async (handle, login) => {
+      const restarting = await probe(handle, login)
+      expect(restarting).toBe(true)
+      if (kind === 'closed client') {
+        const session = h.store.findSession(workspaceCookie.slice('poise_ws='.length))!
+        h.context.endSessionTraffic(session.parentHash ?? session.idHash)
+      } else if (kind === 'switch completed') {
+        // Another readiness check completes the switch before starting() re-reads it.
+        expect(await h.orchestrator.readiness(handle, login)).toEqual({ ready: true })
+      }
+      return restarting
+    })
+    const answer = kind === 'thrown answer' ? vi.spyOn(h.orchestrator, 'startInBackground').mockImplementationOnce(() => {
+      throw new Error('update answer failed')
+    }) : null
+    try {
+      const request = h.request({ host: ALICE, path: '/reset', headers })
+      if (kind === 'switch completed') {
+        const response = await request
+        expect(response.status).toBe(503)
+        expect(response.json()).toMatchObject({ error: 'workspace_starting' })
+        expect(response.headers['x-poise-updating']).toBeUndefined()
+        expect(response.headers['retry-after']).toBe('2')
+      } else {
+        await expect(request).rejects.toThrow('socket hang up')
+      }
+      await waitFor(() => h.logs.some(entry => String(entry.event).startsWith('proxy.')), 'the reset diagnostic')
+      const failures = h.logs.filter(entry => String(entry.event).startsWith('proxy.'))
+      const disconnect = kind === 'switch completed' ? 'responded 503 workspace_starting'
+        : kind === 'closed client' ? 'response unanswered (client closed)' : 'response unanswered'
+      const event = kind === 'thrown answer' ? 'proxy.failure.unanswered' : 'proxy.failed'
+      expect(failures).toEqual([expect.objectContaining({
+        event, level: 'error', method: 'GET', errno: 'ECONNRESET', release: 'new-release', disconnect,
+        ...(kind === 'thrown answer' ? { error: 'update answer failed' } : {}),
+      })])
+      expect(normalize(gatewayDiagnostic(String(failures[0].level), event, failures[0]))).toMatchObject({
+        severity: 'error', requestId: failures[0].requestId, workspace: 'alice',
+        context: { method: 'GET', release: 'new-release', disconnect },
+      })
+      expect(h.workspace.requests.filter(request => request.url === '/reset')).toHaveLength(1)
+    } finally {
+      answer?.mockRestore()
+      restart.mockRestore()
+    }
   })
 
   it('recreates the container when the new image has another base, its release made current first', async () => {
@@ -1454,7 +1541,7 @@ describe('updates in place', () => {
     expect(h.workspace.switches).toEqual(['new-release'])
     await h.close()
 
-    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_WORKSPACE: 'tea-x' } })
+    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_WORKSPACE: 'tea-x', POISE_TEST_LIMIT_SECONDS: '900' } })
     await h.openWorkspace('Alice')
     h.store.noteWorkspace('alice', 'Alice')
     h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })
@@ -1464,7 +1551,7 @@ describe('updates in place', () => {
     await h.orchestrator.upgradePass()
     const env = (offloadTasks()[0].spec as { Env: string[] }).Env
     // The relay's address and this workspace's own key, and never the Render key.
-    expect(env).toEqual(['HOME=/home/poise', expect.stringMatching(/^POISE_TEST_RELAY_URL=https?:\/\/alice\..+\/api\/link\/test-relay$/), expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\.[\w-]+$/)])
+    expect(env).toEqual(['HOME=/home/poise', expect.stringMatching(/^POISE_TEST_RELAY_URL=https?:\/\/alice\..+\/api\/link\/test-relay$/), expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\.[\w-]+$/), 'POISE_TEST_LIMIT_SECONDS=900'])
     expect(env.join('\n')).not.toContain('render-key')
   })
 
@@ -1695,7 +1782,7 @@ describe('updates in place', () => {
       h.workspace.health.runningCallerCalls = 1
       h.workspace.health.ok = cause !== 'unhealthy'
       if (cause === 'changed setting') containerEnv(h, 'alice').push('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES=6442450944')
-      if (cause === 'changed base') h.docker.imageLabels.set(OLD_IMAGE_ID, { 'poise.release': 'old-release', 'poise.base': 'base-0' })
+      if (cause === 'changed base') h.docker.containers.get('poise-ws-alice')!.labels['poise.base'] = 'base-0'
       await upgrade
 
       expect(events(h.logs, 'workspace.drain.timeout')).toHaveLength(1)

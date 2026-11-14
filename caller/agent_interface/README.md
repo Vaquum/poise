@@ -39,6 +39,41 @@ still reject absence; it grants no publication or retry authority. Failed reads
 retain the exact Call ID and reader purpose. Native receipt digest verification
 continues to use the original response bytes before the CLI's trailing newline.
 
+# Inspecting failed unpublished source
+
+For a managed `implement_issue`, the test-offload runner hands Caller the original
+archive and command specification after a completed nonzero suite exit, before
+deleting that archive. Caller verifies their combined candidate digest and
+checkout binding, then retains only changes against the prepared base: tracked
+files (including deletions) and new source files present in that archive. Ignored
+dependencies, Git metadata and other untracked files are excluded. Symlinks retain
+their target text without following it. Unsupported or mismatched captures are
+unavailable; no cleanup-time diff substitutes for them.
+
+The first failed capture is bounded to 2 MiB including its JSON/base64 encoding,
+in a mode-0600 file under the owning workspace's `incident-recovery` directory.
+It uses existing 30-day incident-artifact expiry, also enforced on reads. The
+ordinary managed checkout and process cleanup still runs. Only a settled,
+failed implementation with no publication attempt keeps the evidence; a later
+successful implementation discards it. Exported `artifact.failed_source` contains
+only validated availability, candidate/run/base identities, size, digest and
+expiry, or a fixed unavailable reason. It never contains source bytes or paths.
+
+The existing linked remediation report exposes availability and the command
+`agent-interface --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID`. This returns
+the private file location, never its contents, only inside the owning workspace
+to a running implementation Call for that report's issue, repository and actor.
+The original no-publication receipt, positive resource release, exact capture
+identity, private file permissions and digest must still match. Missing, expired,
+oversized, tampered or unauthorized evidence returns unavailable and requires a
+fresh reproduction. Historical deleted artifacts are not recovered.
+
+The retained capture can explain an earlier failure; edits made after it still
+require fresh validation. Source contents stay out of GitHub, notifications and
+logs. Inspection grants no publication, retry or approval authority. The blocked
+Call and captured bytes are bound evidence; the worker's diagnosis remains
+worker-reported and does not establish a defect on main.
+
 # Stopping a run
 
 Every local call records its supervisor PID and available kernel start/epoch
@@ -544,9 +579,19 @@ issue then approve. It must submit nothing when filing fails.
 
 A governed review admits up to 3,000,000 UTF-8 prompt bytes. Diff generation
 is capped at 2,850,000 bytes and the serialized packet at 2,950,000 bytes,
-leaving room for context and policy. Existing bulk-data compaction rules still
+leaving room for context and policy. JSON remains required regardless of its
+name or size, including during compaction, unless an existing exclusion identifies
+it as installed dependency content. Other bulk-data and archive exclusions still
 apply. These byte limits do not guarantee that an input fits a provider's token
 window. Claude receives the whole packet in one call.
+
+The packet builder records `coverage` as `complete` or `incomplete`, separately
+from declared `excluded_files`. Capacity omissions in `omitted_files` leave
+coverage incomplete even when every retained file group finishes. Caller pins
+this disposition in the native response; model assessments cannot change it.
+Incomplete reviews can submit genuine change requests and retain their receipts,
+but cannot submit clean reviews or approvals, including capped approvals.
+Their outcome remains `incomplete`, and they cannot qualify for automated merge.
 
 A structured review whose packet exceeds one provider call's reliable size
 runs in file-group stages targeting at most 8 files or 200,000 diff bytes each.
@@ -583,12 +628,12 @@ handing it to another model. Rejected writes remain distinct from possibly
 accepted writes; a lost issue or review POST response holds without replay or
 approval.
 A follow-up (`--pr-approve`) round reviews the diff since
-the reviewer's last submitted review instead of the whole PR again: new
+the reviewer's last proven complete review instead of the whole PR again: new
 findings on current lines stay on current-head lines, while a defect caused
 by a removal is commented on the removed line and validated against the full
-pull request diff before the single submission. An unfetchable last head, or
-a base that moved since the last review, widens the round to the full diff
-instead. Both full and follow-up reviews validate every inline location against
+pull request diff before the single submission. An unfetchable last head,
+a base that moved since the last review, or no proven complete baseline widens
+the round to the full diff instead. Both full and follow-up reviews validate every inline location against
 the retained PR diff before invoking the GitHub submission command. Any finding
 without a verified position fails the review before
 submission, including a capped round's follow-up issue and approval.

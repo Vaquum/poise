@@ -83,6 +83,10 @@ pairs open GitHub. Unrecorded targets have no link.
 
 Each list snapshot also reads the owner's existing managed chain journal in one
 batch for retained Poise/Caller records with exact Call or correlation identities.
+Each batch scans retained invocation candidates once and validates matching chains
+against the journal. Ambiguity across either selector is rejected before checking
+that both selectors agree; repeated input positions retain their order. The next
+request reads current journal state, including changes since the preceding batch.
 The Work impact column leads with retrying/blocked/recovered/unknown, the verified
 target and stage. Duplicate diagnostics retain their event rows and identify the
 same work target; Count still measures retained diagnostic occurrences.
@@ -282,6 +286,11 @@ without another process error. The existing sign-in notice stays until the
 monitor verifies recovery with its canary. Status JSON must contain a boolean
 `loggedIn`; unrecognized output (including exit 0), other exit-1 failures,
 start failures and timeouts remain diagnostic errors.
+The auth monitor also keeps a missing optional Claude CLI unavailable without an
+Error only when the wrapper reports `spawn claude ENOENT`, the strict account
+record has no Claude connection, no sign-in was previously observed by the
+monitor, and no launcher entry exists on its launch PATH. Broken launchers and
+unreadable account or path evidence retain the Error; the launch gate is unchanged.
 The live canary owns its failure diagnostic, retaining a fixed recognized reason
 from bounded probe evidence, or `cause unavailable`, with the process outcome.
 It retains no provider output. Unchanged reason/outcome repeats are suppressed;
@@ -307,6 +316,10 @@ Workspace backfill reads three durable events per authenticated maintenance
 page and commits its checkpoint only with central persistence. Replacement or
 removal of the source does not delete central records. Query/collection outages
 never become empty successful reads.
+Caller ingestion waits for the runtime's scheduled 100-event persistence batches,
+leaving event-loop turns for queued maintenance requests within the collector's
+five-second complete response budget. Its completion checkpoint still waits for
+durable local ingestion.
 
 The gateway reads native host kernel and `docker.service` Warning-or-higher
 journal records using `journalctl`, with a durable native cursor. Compose mounts
@@ -351,6 +364,18 @@ completion proof; missing health, supersession and another rollout's completion
 cannot establish recovery. The rollout stays pending until its existing release
 and build/image verification gates pass. Diagnostic delivery failure is visible
 on stderr and does not change those gates.
+Only a complete response containing solely the private writer's exact busy
+refusal is retried for `deployment`: at most five connections, waiting 250,
+500, 1,000 and 2,000 milliseconds between attempts.
+The writer drains refused connections until client EOF or the existing 30-second
+connection deadline, preserving the reply when the client writes before reading it.
+The complete observation frame, including its original timestamp and health
+snapshot, is read once within 64 KiB and replayed unchanged. Input, attempts and
+waits share one 30-second delivery deadline; the verifier's proof clock is
+unchanged. Other refusals retain a bounded, redacted cause and fail immediately;
+an ambiguous disconnect, bare write error or incomplete reply is not retried.
+Exhausted contention leaves the verifier's warning visible. Manual ingress and
+the continuous reader keep single attempts and their existing input/handshake behavior.
 
 External Caddy installations can instead run the bounded continuous
 [operator reader](../deploy/ingress/README.md). A dedicated forced-command SSH

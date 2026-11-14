@@ -1,20 +1,22 @@
 // @vitest-environment node
 // Agents' test suites run on disposable test boxes: these run the real hooks, runner, relay and box
 // script, with only Render itself replaced. docs/Operating.md, "Agents' test suites".
-import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash, generateKeyPairSync } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { gzipSync } from 'node:zlib'
+import { runInNewContext } from 'node:vm'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
 import { createLogger } from '../gateway/src/log'
 import { gatewayDiagnostic } from '../gateway/src/diagnostics/collectors'
 import { normalize } from '../gateway/src/diagnostics/contract'
+import { startHarness, workspaceHost } from '../gateway/tests/harness'
 import { filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
 import { BehaviorChainJournal, chainBasis, type ChainEvent } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
@@ -276,7 +278,7 @@ describe('installing it into a home volume', () => {
     const home = temp()
     install(home, { POISE_TEST_RELAY_URL: 'https://alice.example/api/link/test-relay', POISE_TEST_RELAY_KEY: 'alice.signed' })
     const hooks = join(home, '.poise', 'test-offload')
-    expect(readFileSync(join(hooks, 'relay'), 'utf8')).toBe('https://alice.example/api/link/test-relay\nalice.signed\n')
+    expect(readFileSync(join(hooks, 'relay'), 'utf8')).toBe('https://alice.example/api/link/test-relay\nalice.signed\n540\n')
     expect(statSync(join(hooks, 'relay')).mode & 0o777).toBe(0o600)
     for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
     expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'relay', 'run.mjs', 'sitecustomize.py'])
@@ -427,11 +429,14 @@ process.stdout.write(JSON.stringify(status ? { loggedIn: true, authMethod: 'clau
   }
 
   it('passes the hooks on, so that agents on Claude get them', () => {
-    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000' })
+    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000',
+      POISE_TEST_BINDING: '{"call":"original"}', POISE_TEST_EVIDENCE_DIR: '/original/evidence' })
     expect(seen.PYTHONPATH).toMatch(/\.poise\/test-offload:src$/)
     expect(seen.NODE_OPTIONS).toMatch(/--require ".*\.poise\/test-offload\/hook\.cjs"$/)
     expect(seen.BASH_DEFAULT_TIMEOUT_MS).toBe('600000')
     expect(seen.BASH_MAX_TIMEOUT_MS).toBe('3600000')
+    expect(seen.POISE_TEST_BINDING).toBe('{"call":"original"}')
+    expect(seen.POISE_TEST_EVIDENCE_DIR).toBe('/original/evidence')
   })
 
   it('still keeps out what those variables carry without the hooks', () => {
@@ -461,6 +466,26 @@ describe('Poise', () => {
     vi.stubEnv('HOME', temp())
     const env = scrubbedChildEnvironment('agent-interface')
     for (const name of ['PYTHONPATH', 'NODE_OPTIONS', 'BASH_DEFAULT_TIMEOUT_MS', 'BASH_MAX_TIMEOUT_MS']) expect(env[name]).toBeUndefined()
+  })
+
+  it.each(['900', '3540'])('derives the shell deadline from the installed %s-second limit', (limit) => {
+    const home = temp()
+    vi.stubEnv('HOME', home)
+    execFileSync('sh', [join(SOURCE, 'install.sh')], {
+      env: { PATH: process.env.PATH, HOME: home, POISE_TEST_RELAY_URL: 'https://relay.example.com', POISE_TEST_RELAY_KEY: 'key', POISE_TEST_LIMIT_SECONDS: limit },
+    })
+    const env = scrubbedChildEnvironment('agent-interface')
+    expect(env.BASH_DEFAULT_TIMEOUT_MS).toBe(String((Number(limit) + 60) * 1000))
+    expect(env.BASH_MAX_TIMEOUT_MS).toBe('3600000')
+  })
+
+  it.each(['0', '1.5', '3541', '9007199254740991'])('refuses an invalid installed limit: %s', (limit) => {
+    const home = temp()
+    vi.stubEnv('HOME', home)
+    const hooks = join(home, '.poise', 'test-offload')
+    mkdirSync(hooks, { recursive: true })
+    writeFileSync(join(hooks, 'relay'), `https://relay.example.com\nkey\n${limit}\n`)
+    expect(() => scrubbedChildEnvironment('agent-interface')).toThrow('POISE_TEST_LIMIT_SECONDS must be a whole number from 1 to 3540')
   })
 })
 
@@ -637,12 +662,14 @@ describe('a suite on a test box', () => {
 
   async function startAll(overrides: Partial<TestRelayDeps['config']> & Partial<TestRelayDeps> = {}): Promise<void> {
     const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, deployment = 'poise.example.com', baseService = null, jobPlan = 'plan-crn-005', ...deps } = overrides
+    const relayEvents = events
+    const relayWarnings = warnings
     renderOrigin = `http://127.0.0.1:${await listen(render)}`
     relay = new TestRelay({
       config: { renderApiKey, workspace: 'tea-test', deployment, plan: '1c-2g', baseService, jobPlan, limitSeconds, maxRuns },
       privateKey,
       origin: () => relayOrigin,
-      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: (_event: string, fields: Record<string, unknown>) => { warnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: (event: string, fields: Record<string, unknown>) => { relayEvents.push({ event, ...fields }) }, warn: (_event: string, fields: Record<string, unknown>) => { relayWarnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
@@ -698,7 +725,7 @@ describe('a suite on a test box', () => {
     }
   })
 
-  function suite(cwd: string, args: string[], env: Record<string, string> = {}): { child: ChildProcess; done: Promise<{ code: number | null; stdout: string; stderr: string }> } {
+  function suite(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): { child: ChildProcess; done: Promise<{ code: number | null; stdout: string; stderr: string }> } {
     const child = spawn(process.execPath, [join(hooks, 'run.mjs'), '--', ...args], { cwd, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
@@ -718,6 +745,17 @@ describe('a suite on a test box', () => {
     return repo
   }
 
+  function vitestFixture(source: string): { repo: string; argv: string[] } {
+    const repo = repository()
+    symlinkSync(resolve('node_modules'), join(repo, 'node_modules'), 'dir')
+    mkdirSync(join(repo, 'tests'))
+    writeFileSync(join(repo, 'tests', 'fixture.test.mjs'), `import { describe, expect, it } from 'vitest'\n${source}`)
+    // Use the production registration, so removing the reporter breaks the interruption regression.
+    writeFileSync(join(repo, 'vitest.config.mjs'), `import config from ${JSON.stringify(resolve('vitest.config.ts'))}
+      export default { ...config, test: { ...config.test, setupFiles: [], include: ['tests/fixture.test.mjs'], pool: 'threads' } }`)
+    return { repo, argv: [process.execPath, resolve('node_modules/vitest/vitest.mjs'), 'run'] }
+  }
+
   async function until(condition: () => boolean, what: string, ms = 20_000): Promise<void> {
     const start = Date.now()
     while (!condition()) {
@@ -729,12 +767,201 @@ describe('a suite on a test box', () => {
   const runBox = () => [...boxes.values()].find((box) => box.snapshotName !== null) as Box
   const suiteBoxes = () => [...boxes.values()].filter((box) => box.snapshotName !== null)
 
+  it.each([null, 'crn-test'])('uses the gateway-installed budget beyond the old client ceiling with base service %s (accelerated deadline)', async (baseService) => {
+    const h = await startHarness({ env: {
+      POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_WORKSPACE: 'tea-test',
+      POISE_TEST_LIMIT_SECONDS: '900', ...(baseService ? { POISE_TEST_BASE_SERVICE: baseService } : {}),
+    } })
+    try {
+      await startAll({ limitSeconds: h.config.testRelay!.limitSeconds, baseService, privateKey: h.keys.privateKey })
+      h.config.proxyListen = new URL(relayOrigin).host
+      const home = temp()
+      h.docker.onTask = (task) => {
+        if (task.name !== 'poise-test-offload-alice') return
+        const env = Object.fromEntries((task.spec.Env as string[]).map((entry) => {
+          const at = entry.indexOf('=')
+          return [entry.slice(0, at), entry.slice(at + 1)]
+        }))
+        execFileSync('sh', [join(SOURCE, 'install.sh')], { env: { ...env, PATH: process.env.PATH, HOME: home } })
+      }
+      h.workspace.reachable = false
+      h.docker.onStart = () => { h.workspace.reachable = true }
+      const { workspaceCookie } = await h.openWorkspace('Alice')
+      await h.request({ host: workspaceHost('alice'), path: '/', headers: { cookie: workspaceCookie } })
+      await h.orchestrator.startInProgress('alice')
+      vi.stubEnv('HOME', home)
+      hooks = join(home, '.poise', 'test-offload')
+      expect(readFileSync(join(hooks, 'relay'), 'utf8').split('\n')[2]).toBe('900')
+      const env = scrubbedChildEnvironment('agent-interface')
+      expect(env.BASH_DEFAULT_TIMEOUT_MS).toBe('960000')
+      const repo = repository()
+      const clock = join(repo, 'clock.cjs')
+      // Accelerate only the client's long deadline: 540 s becomes 3 s, 900 s becomes 5 s.
+      // The suite and relay use real clocks, so the old fixed ceiling interrupts this suite.
+      writeFileSync(clock, `if (process.argv[1]?.endsWith('/run.mjs')) {
+        const timeout = global.setTimeout
+        global.setTimeout = (callback, ms, ...args) => timeout(callback, ms >= 540000 ? ms / 180 : ms, ...args)
+      }`)
+      const started = Date.now()
+      const { code, stdout, stderr } = await suite(repo,
+        [process.execPath, '-e', 'setTimeout(() => console.log("complete"), 3500)'],
+        { ...env, NODE_OPTIONS: `${env.NODE_OPTIONS} --require "${clock}"` },
+      ).done
+      expect(code).toBe(0)
+      expect(stdout).toBe('complete\n')
+      expect(stderr).not.toContain('no test result')
+      expect(Date.now() - started).toBeGreaterThan(3000)
+      expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', exit: 0 }))
+    } finally {
+      await h.close()
+    }
+  })
+
   function committed(): string {
     const repo = repository()
     execFileSync('git', ['-C', repo, 'add', '.'])
     execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'first'])
     return repo
   }
+
+  it.each([null, 'crn-test'])('holds relay recovery without retaining receipts for completed runs (%s)', async baseService => {
+    await startAll({ baseService })
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    writeFileSync(join(repo, '.gitignore'), '.env\nnode_modules\n')
+    symlinkSync(resolve('node_modules'), join(repo, 'node_modules'), 'dir')
+    mkdirSync(join(repo, 'tests'))
+    writeFileSync(join(repo, 'vitest.config.mjs'), 'export default { test: { include: ["tests/*.test.mjs"], maxWorkers: 1 } }')
+    writeFileSync(join(repo, 'tests/shared.test.mjs'), `import { it, expect } from 'vitest';
+it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
+    execFileSync('git', ['-C', repo, 'add', '.'])
+    execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'shared failure'])
+    const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const baseline = join(temp(), 'base')
+    execFileSync('git', ['-C', repo, 'worktree', 'add', '--detach', baseline, base], { stdio: 'ignore' })
+    symlinkSync(resolve('node_modules'), join(baseline, 'node_modules'), 'dir')
+    writeFileSync(join(repo, 'tracked.txt'), 'uncommitted implementation\n')
+    const evidence = temp()
+    const binding = { call: 'a'.repeat(32), nonce: 'b'.repeat(64), repository: 'example/repo', base }
+    const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence }
+    const run = async (cwd: string) => {
+      const result = await suite(cwd, [process.execPath, resolve('node_modules/vitest/vitest.mjs'), 'run', '--root', cwd], env).done
+      expect(result.code, result.stderr).toBe(1)
+      const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
+      expect(id, result.stderr).toBeTruthy()
+      // Held for #1619: candidate-controlled reports cannot authorize recovery.
+      expect(existsSync(join(evidence, `${id}.json`))).toBe(false)
+      expect(relay.runs.has(id!)).toBe(false)
+      return { id }
+    }
+    await run(repo)
+    await run(baseline)
+    expect(readdirSync(evidence)).toEqual([])
+  }, 30_000)
+
+  it('holds retry evidence when candidate code replaces the report files and exits 1', async () => {
+    await startAll()
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const evidence = temp()
+    const binding = { call: 'c'.repeat(32), nonce: 'd'.repeat(64), repository: 'example/repo', base }
+    const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence }
+    // A fabricated failed case, written without running any tests, as the suite UID can.
+    const forge = join(repo, 'forge.cjs')
+    writeFileSync(forge, `const { readdirSync, writeFileSync, mkdirSync } = require('node:fs');
+      const { join } = require('node:path');
+      for (const name of readdirSync('/tmp')) {
+        if (!name.startsWith('poise-assertions-')) continue
+        const dir = join('/tmp', name);
+        writeFileSync(join(dir, 'result.json'), JSON.stringify({ success: false, numFailedTests: 1, numTotalTests: 1,
+          testResults: [{ name: join('${repo}', 'tests/fake.test.ts'), status: 'failed', message: '',
+            assertionResults: [{ fullName: 'fabricated case', status: 'failed', failureMessages: ['expected forged'] }] }] }));
+        writeFileSync(join(dir, 'complete.json'), JSON.stringify({ errors: 0, reason: 'failed', setupFailed: false }));
+      }
+      const dir = '/tmp/poise-assertions-forged';
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'result.json'), JSON.stringify({ forged: true }));
+      writeFileSync(join(dir, 'complete.json'), JSON.stringify({ forged: true }));
+      process.exit(1)`)
+    const result = await suite(repo, [process.execPath, forge], env).done
+    expect(result.code, result.stderr).toBe(1)
+    const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
+    expect(id, result.stderr).toBeTruthy()
+    expect(existsSync(join(evidence, `${id}.json`))).toBe(false)
+    expect(readdirSync(evidence)).toEqual([])
+    expect(relay.runs.has(id!)).toBe(false)
+  }, 30_000)
+
+  it('holds relay recovery against fabricated assertions posted with the run token', async () => {
+    await startAll({ baseService: 'crn-test' })
+    const headers = { authorization: `Bearer ${KEY}` }
+    const binding = { call: 'e'.repeat(32), nonce: 'f'.repeat(64), repository: 'example/repo', base: 'a'.repeat(40) }
+    const request = { argv: ['node', 'vitest.mjs', 'run'], cwd: '/', env: {}, binding }
+    const candidate = '1'.repeat(64)
+    const created = await fetch(`${relayUrl}/runs`, {
+      method: 'POST', headers, body: JSON.stringify({ ...request, capture: { candidate, spec: JSON.stringify(request) } }),
+    })
+    expect(created.status).toBe(201)
+    const { id } = await created.json() as { id: string }
+    const run = relay.runs.get(id)!
+    const jobHeaders = { authorization: `Bearer ${run.token}` }
+    // Held for #1619: no report credential leaves the gateway in spec.json.
+    const served = await fetch(`${relayUrl}/runs/${id}/spec`, { headers: jobHeaders })
+    expect(served.status).toBe(200)
+    expect(await served.json()).not.toHaveProperty('reportTo')
+    // A fabricated inventory posted with the run token is not accepted.
+    const forged = await fetch(`${relayUrl}/runs/${id}/assertions`, {
+      method: 'POST', headers: jobHeaders,
+      body: JSON.stringify({
+        exit: 1, candidate, binding, repository: binding.repository, base: binding.base,
+        source: '2'.repeat(64), clean: false,
+        failures: [{ file: 'tests/fake.test.ts', test: 'fabricated case', cause: 'expected forged', causeDigest: '3'.repeat(64) }],
+        totals: [{ file: 'tests/fake.test.ts', test: 'fabricated case', total: 1 }],
+      }),
+    })
+    expect(forged.status).toBe(409)
+    expect(run.assertions).toBeNull()
+  })
+
+  it('holds relay inventories without trusting candidate-controlled reports', async () => {
+    await startAll()
+    const { assertionResult, sourceCapture } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as {
+      assertionResult: (reporter: { report: string, completion: string }, capture: { top: string }) => unknown,
+      sourceCapture: (cwd: string) => { clean: boolean, source: string },
+    }
+    const directory = temp()
+    const reporter = { report: join(directory, 'report.json'), completion: join(directory, 'complete.json') }
+    const failure = { fullName: 'original failure', status: 'failed', failureMessages: ['expected []'] }
+    const report = { success: false, numFailedTests: 1, numTotalTests: 1,
+      testResults: [{ name: join(directory, 'tests/a.test.ts'), status: 'failed', message: '', assertionResults: [failure] }] }
+    const complete = { errors: 0, reason: 'failed', setupFailed: false }
+    const parse = (value = report, completion = complete) => {
+      writeFileSync(reporter.report, JSON.stringify(value))
+      writeFileSync(reporter.completion, JSON.stringify(completion))
+      return assertionResult(reporter, { top: directory })
+    }
+    // Held for #1619: even a well-formed inventory is candidate-controlled, so none is trusted.
+    expect(parse()).toBeNull()
+    expect(parse(report, { ...complete, errors: 1 })).toBeNull()
+    expect(parse(report, { ...complete, setupFailed: true })).toBeNull()
+    expect(parse(report, { ...complete, reason: 'interrupted' })).toBeNull()
+    expect(parse({ ...report, numFailedTests: 2 })).toBeNull()
+    expect(parse({ ...report, testResults: [{ ...report.testResults[0], message: 'beforeAll failed' }] })).toBeNull()
+    expect(parse({ ...report, numFailedTests: 101, numTotalTests: 101,
+      testResults: [{ ...report.testResults[0], assertionResults: Array.from({ length: 101 }, () => failure) }] })).toBeNull()
+    rmSync(reporter.completion)
+    expect(assertionResult(reporter, { top: directory })).toBeNull()
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const clean = sourceCapture(repo)
+    expect(clean.clean).toBe(true)
+    // Same HEAD and an index flag cannot pass off the dirty candidate as base.
+    execFileSync('git', ['-C', repo, 'update-index', '--assume-unchanged', 'tracked.txt'])
+    writeFileSync(join(repo, 'tracked.txt'), 'dirty candidate')
+    expect(sourceCapture(repo)).toMatchObject({ clean: false })
+    expect(sourceCapture(repo).source).not.toBe(clean.source)
+  })
 
   it('starts a suite on a job of the base service, which costs less, and gives the agent its output and exit code', async () => {
     await startAll({ baseService: 'crn-test' })
@@ -857,6 +1084,58 @@ describe('a suite on a test box', () => {
     expect((await fetch(`${relayUrl}/runs/${finished!.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } })).status).toBe(204)
     expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   })
+
+  it('hands Caller the failed run archive before deleting it, despite a later edit under the same HEAD', async () => {
+    await startAll()
+    const repo = committed()
+    const retained = temp()
+    const bin = temp()
+    const original = `console.log('candidate A loaded'); setTimeout(() => { require('node:assert/strict').equal(1, 2) }, 500)\n`
+    writeFileSync(join(repo, 'candidate.test.cjs'), original)
+    writeFileSync(join(bin, 'agent-interface'), `#!${process.execPath}
+const fs = require('node:fs'), path = require('node:path');
+if (process.argv[2] !== '--capture-failed-source') process.exit(9);
+fs.copyFileSync(process.argv[3], path.join(process.env.FIXTURE_RETENTION, 'tree'));
+fs.copyFileSync(process.argv[4], path.join(process.env.FIXTURE_RETENTION, 'spec'));
+fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stringify(process.argv.slice(5)));
+`, { mode: 0o700 })
+    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+    const run = suite(repo, [process.execPath, 'candidate.test.cjs'], {
+      PATH: `${bin}:${process.env.PATH}`, FIXTURE_RETENTION: retained, AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+    })
+    let observed = ''
+    run.child.stdout?.on('data', chunk => { observed += chunk })
+    await until(() => observed.includes('candidate A loaded'), 'candidate A to run')
+    writeFileSync(join(repo, 'candidate.test.cjs'), '// untested candidate B\n')
+    const result = await run.done
+    expect(result.code).toBe(1)
+    expect(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' })).toBe(head)
+    const archive = readFileSync(join(retained, 'tree'))
+    const specification = readFileSync(join(retained, 'spec'))
+    // The runner hashes the specification plus the uncompressed tar stream.
+    const tree = archive[0] === 0x1f && archive[1] === 0x8b ? gunzipSync(archive) : archive
+    const candidate = createHash('sha256').update(specification).update(tree).digest('hex')
+    const [digest, id, exit] = JSON.parse(readFileSync(join(retained, 'identity'), 'utf8')) as string[]
+    expect(digest).toBe(candidate)
+    expect(exit).toBe('1')
+    expect(result.stderr).toContain(`candidate ${candidate}, suite node candidate.test.cjs, run ${id}`)
+    expect(execFileSync('tar', ['-xOf', join(retained, 'tree'), join(repo, 'candidate.test.cjs').slice(1)], { encoding: 'utf8' })).toBe(original)
+    expect(result.stderr).not.toContain('failed source capture unavailable')
+  })
+
+  it('keeps a completed nonzero suite result when source capture outlasts the remaining budget', async () => {
+    await startAll()
+    const repo = committed()
+    const bin = temp()
+    // A slow capture must not let the suite budget replace the genuine failure with a no-result handoff.
+    writeFileSync(join(bin, 'agent-interface'), '#!/bin/sh\nsleep 6\nexit 0\n', { mode: 0o700 })
+    const result = await suite(repo, [process.execPath, '-e', 'process.exit(1)'], {
+      PATH: `${bin}:${process.env.PATH}`, BASH_DEFAULT_TIMEOUT_MS: '5000', AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+    }).done
+    expect(result.code).toBe(1)
+    expect(result.stderr).not.toContain('no test result')
+    expect(result.stderr).not.toContain('total time budget')
+  }, 30_000)
 
   it('runs the command exactly as it was typed, with nothing of this workspace\'s hooks', async () => {
     await startAll()
@@ -1036,28 +1315,84 @@ describe('a suite on a test box', () => {
     expect(stderr).toContain('cannot start /no/such/command')
   })
 
-  it.each([false, true])('retains observed output before a relay timeout (test failure: %s)', async (failed) => {
-    await startAll({ limitSeconds: 2 })
-    const started = Date.now()
-    const assertion = `try { require('node:assert/strict').equal(1, 2) } catch (error) { console.error('FAIL fixture.validation::test_first_failure\\n' + error.stack) }; `
-    const script = (failed ? assertion : '') + 'setInterval(() => {}, 1000)'
-    const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
-    expect(code).toBe(124)
-    expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
-    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
-    expect(stderr).toContain('let CI run the tests')
-    const admission = /\[poise\] candidate ([a-f0-9]{64}), suite .*, run ([a-f0-9]{32})/.exec(stderr)
-    expect(admission).not.toBeNull()
-    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![2] }))
-    if (failed) {
-      const failure = 'FAIL fixture.validation::test_first_failure\nAssertionError'
-      expect(stderr).toContain(failure)
-      expect(stderr.indexOf(admission![0])).toBeLessThan(stderr.indexOf(failure))
-      expect(stderr.indexOf('AssertionError')).toBeLessThan(stderr.indexOf('no test result:'))
-    } else expect(stderr).not.toContain('AssertionError')
-    expect(Date.now() - started).toBeLessThan(10_000)
-    const box = runBox()
-    await until(() => terminated.includes(box.id), 'the box to be terminated')
+  it.each(['none', 'assertion', 'oversized'])('retains real Vitest evidence before interruption (failure: %s)', async (failure) => {
+    let now = Date.now()
+    await startAll({ limitSeconds: 2, now: () => now })
+    const failed = failure !== 'none'
+    const oversized = failure === 'oversized'
+    const fixture = vitestFixture(`describe('offload reporting', () => {
+      ${failed ? `it('first failed expectation ghp_fixturecredential', () => {
+        const context = ${oversized ? "'expected received-value to equal expected-value\\nhttps://example.test/?token=' + 'boundarysecret'.repeat(3000) + '\\nafter-redaction\\n' + 'x'.repeat(12000) + '\\nafter-excerpt-limit'" : 'undefined'}
+        expect('received-value', context).toBe('expected-value')
+      })
+      // Flush Vitest's batched case events before the last test deliberately holds the file open.
+      it('second failed expectation', async () => {
+        await new Promise(done => setTimeout(done, 200))
+        expect(3).toBe(4)
+      })` : ''}
+      it('keeps the suite open', async () => {
+        console.log('VITEST_HELD ' + process.pid)
+        await new Promise(() => {})
+      }, 60000)
+    })`)
+    const running = suite(fixture.repo, fixture.argv)
+    let output = '', evidence = ''
+    running.child.stdout?.on('data', (chunk) => { output += chunk })
+    running.child.stderr?.on('data', (chunk) => { evidence += chunk })
+    try {
+      await until(() => output.includes('VITEST_HELD '), 'Vitest to keep the suite open', 5_000)
+      if (failed) {
+        await until(() => evidence.includes('[poise] first test failure:'), 'the first Vitest assertion before interruption', 3_000)
+          .catch((error: Error) => { throw new Error(`${error.message}\n${evidence}\n${output}`) })
+        const excerpt = evidence.slice(evidence.indexOf('[poise] first test failure:'))
+        expect(excerpt).toContain('tests/fixture.test.mjs > offload reporting > first failed expectation [redacted]')
+        expect(excerpt).toContain('AssertionError:')
+        expect(excerpt).toContain('received-value')
+        expect(excerpt).toContain('expected-value')
+        expect(excerpt).not.toContain('ghp_fixturecredential')
+        expect(excerpt).not.toContain('second failed expectation')
+        expect(excerpt.length).toBeLessThanOrEqual(8193)
+        if (oversized) {
+          expect(excerpt).toContain('https:[redacted header]')
+          expect(excerpt).toContain('after-redaction')
+          expect(excerpt).toContain('[truncated]')
+          expect(excerpt).not.toContain('boundarysecret')
+          expect(excerpt).not.toContain('after-excerpt-limit')
+        }
+      } else expect(evidence).not.toContain('[poise] first test failure:')
+      now += 3_000
+      const { code, stderr } = await running.done
+      expect(code).toBe(124)
+      expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
+      expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+      expect(stderr).toContain('let CI run the tests')
+      const admission = /\[poise\] candidate ([a-f0-9]{64}), suite .*, run ([a-f0-9]{32})/.exec(stderr)
+      expect(admission).not.toBeNull()
+      expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![2] }))
+      if (failed) {
+        expect(stderr.match(/\[poise\] first test failure:/g)).toHaveLength(1)
+        expect(stderr.indexOf(admission![0])).toBeLessThan(stderr.indexOf('[poise] first test failure:'))
+        expect(stderr.indexOf('AssertionError')).toBeLessThan(stderr.indexOf('no test result:'))
+      } else expect(stderr).not.toContain('AssertionError')
+      const box = runBox()
+      await until(() => terminated.includes(box.id), 'the box to be terminated')
+      expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', id: admission![2] }))
+    } finally {
+      // Render ends every process on the box; the local stand-in only ends its box script.
+      const pid = /VITEST_HELD (\d+)/.exec(output)?.[1]
+      if (pid) process.kill(Number(pid), 'SIGTERM')
+    }
+  })
+
+  it.each([false, true])('preserves completed Vitest output and exit status (test failure: %s)', async (failed) => {
+    await startAll()
+    const fixture = vitestFixture(`it.each([1, 2])('completed expectation %s', () => { expect(1).toBe(${failed ? 2 : 1}) })`)
+    const { code, stdout, stderr } = await suite(fixture.repo, fixture.argv).done
+    expect(code).toBe(failed ? 1 : 0)
+    expect(stdout).toContain(failed ? '2 failed' : '2 passed')
+    expect(stderr).not.toContain('no test result:')
+    expect(stderr.match(/\[poise\] first test failure:/g) ?? []).toHaveLength(failed ? 1 : 0)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', exit: failed ? 1 : 0 }))
   })
 
   it('destroys the box when the agent’s side is killed outright', async () => {
@@ -1095,6 +1430,59 @@ describe('a suite on a test box', () => {
     await until(() => [...events, ...warnings].some(({ event, boxId }) => boxId === box.id && event === (failed ? 'test_relay.box.terminate.failed' : 'test_relay.box.terminate')), 'the termination diagnostic', 3_000)
     if (failed) expect(warnings).toContainEqual({ event: 'test_relay.box.terminate.failed', boxId: box.id, error: 'fetch failed' })
     else expect(events).toContainEqual({ event: 'test_relay.box.terminate', boxId: box.id, status: 204 })
+  })
+
+  it.each([[false, false], [false, true], [true, false], [true, true]])('keeps delayed termination diagnostics with their relay (replacement: %s, termination failure: %s)', async (replacement, failed) => {
+    runBoxes = false
+    await startAll()
+    if (replacement) {
+      await until(() => events.some(({ event }) => event === 'test_relay.box.terminate'), 'the initial snapshot builder to end')
+      relay.stop()
+      await startAll2()
+    }
+    const headers = { authorization: `Bearer ${KEY}` }
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers })
+    const { id } = await created.json() as { id: string }
+    const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers })
+    await until(() => relay.runs.get(id)?.ready === true, 'the old box to be ready')
+    const box = runBox()
+    pendingTerminations = []
+    await output.body!.cancel()
+    await until(() => pendingTerminations!.length === 1, 'the old termination request')
+    const [oldTermination] = pendingTerminations
+    relay.stop()
+    const oldEvents = events
+    const oldWarnings = warnings
+    events = []
+    warnings = []
+    // Reuse the sandbox ID as the next test's fresh Render fixture does.
+    boxes.delete(box.id)
+    await startAll2()
+    const next = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers })
+    const nextId = (await next.json() as { id: string }).id
+    const nextOutput = await fetch(`${relayUrl}/runs/${nextId}/output`, { headers })
+    await until(() => relay.runs.get(nextId)?.ready === true, 'the new box to be ready')
+    expect(runBox().id).toBe(box.id)
+    await nextOutput.body!.cancel()
+    await until(() => pendingTerminations!.length === 2, 'the new termination request')
+    const [, newTermination] = pendingTerminations
+    const newEvents = [...events]
+    const newWarnings = [...warnings]
+    const diagnostic = failed
+      ? { event: 'test_relay.box.terminate.failed', boxId: box.id, error: 'fetch failed' }
+      : { event: 'test_relay.box.terminate', boxId: box.id, status: 204 }
+    if (failed) oldTermination.destroy()
+    else oldTermination.writeHead(204).end()
+    await until(() => [...oldEvents, ...oldWarnings].some(({ event, boxId }) => event === diagnostic.event && boxId === box.id), 'the old termination diagnostic', 3_000)
+    expect(failed ? oldWarnings : oldEvents).toContainEqual(diagnostic)
+    expect(events).toEqual(newEvents)
+    expect(warnings).toEqual(newWarnings)
+    expect([...events, ...warnings]).not.toContainEqual(expect.objectContaining({ event: diagnostic.event, boxId: box.id }))
+    pendingTerminations = null
+    if (failed) newTermination.destroy()
+    else newTermination.writeHead(204).end()
+    await until(() => [...events, ...warnings].some(({ event, boxId }) => event === diagnostic.event && boxId === box.id), 'the new termination diagnostic', 3_000)
+    expect(failed ? warnings : events).toContainEqual(diagnostic)
   })
 
   it.each([false, true])('discards authenticated late output while job cancellation is pending (cancellation failure: %s)', async (failed) => {
@@ -1215,6 +1603,34 @@ describe('a suite on a test box', () => {
     expect(terminated).toContain(runBox().id)
   })
 
+  it.each([
+    [null, 'budget'], ['crn-test', 'budget'],
+    [null, 'cancel'], ['crn-test', 'cancel'],
+    [null, 'relay loss'], ['crn-test', 'relay loss'],
+  ] as const)('stops the provider worker after %s / %s within cleanup headroom', async (baseService, cause) => {
+    await startAll({ baseService })
+    writeFileSync(join(hooks, 'relay'), `${relayUrl}\n${KEY}\n2\n`)
+    const started = Date.now()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("up"); setTimeout(() => {}, 30000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    const worker = baseService ? [...jobs.values()][0].child : runBox().child
+    expect(worker?.pid).toBeGreaterThan(0)
+    expect(worker?.exitCode).toBeNull()
+    expect(worker?.signalCode).toBeNull()
+    if (cause === 'cancel') run.child.kill('SIGTERM')
+    else if (cause === 'relay loss') relayServer.closeAllConnections()
+    const { code, stderr } = await run.done
+    expect(code).toBe(cause === 'budget' ? 124 : cause === 'cancel' ? 143 : 125)
+    if (cause === 'budget') expect(stderr).toContain('exhausted its total time budget')
+    else if (cause === 'relay loss') expect(stderr).toContain('the connection to the test relay broke')
+    else expect(stderr).not.toContain('no test result')
+    // Run retirement and DELETE 204 happen before asynchronous provider cleanup.
+    // Observe the actual job/sandbox worker's exit as well.
+    await until(() => worker!.exitCode !== null || worker!.signalCode !== null, 'the provider worker to stop', 3000)
+    expect(Date.now() - started).toBeLessThan(5000)
+    expect(relay.runs.size).toBe(0)
+  })
+
   it('recovers a mid-suite relay replacement with the captured input and continues through the existing chain gates', async () => {
     await startAll()
     const repo = repository()
@@ -1278,7 +1694,7 @@ describe('a suite on a test box', () => {
       expect(decideBehaviorChain(chain, obs, now)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
       const callId = '1'.repeat(32)
       const response = { repository: 'Example/Repo', pull_number: 21, head_sha: head, context_sha: context, invocation_id: callId,
-        reviewer: 'reviewer', model: reviewer.model, completed_at: now,
+        reviewer: 'reviewer', model: reviewer.model, completed_at: now, coverage: 'complete',
         assessment: { verdict: 'Fixture candidate passes review.', reviewed_context: 'Fixture exact-head diff.', limitations: 'No live GitHub actions.' } }
       append({ type: 'invocation.admitted', invocation: { id: 'review', behavior: 'review-pr', basis: chainBasis(['pr', head, context]),
         actor: 'reviewer', model: reviewer.model, slot: reviewer.slot, admittedAt: now, request: { command: 'agent-interface', argv: [], cwd: repo } } })
@@ -1306,11 +1722,12 @@ describe('a suite on a test box', () => {
     }
   })
 
-  it.each([7, 125])('returns a genuine suite exit %s without retrying, even if its output names a gateway restart', async (status) => {
+  it.each([7, 124, 125])('returns a genuine suite exit %s without retrying, even if its output names a gateway restart', async (status) => {
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.error('the gateway restarted'); process.exit(${status})`]).done
     expect(code).toBe(status)
     expect(stderr).not.toContain('interrupted validation')
+    expect(stderr).not.toContain('Skip local tests')
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
   })
 
@@ -1809,13 +2226,15 @@ ${stderr}`
   // Another gateway, of the same Render workspace.
   async function startAll2(overrides: Partial<TestRelayDeps['config']> & Partial<TestRelayDeps> = {}): Promise<void> {
     const { maxRuns = 5, ...deps } = overrides
+    const relayEvents = events
+    const relayWarnings = warnings
     const port = Number(new URL(relayUrl).port)
     await new Promise((done) => { relayServer.close(done) })
     relay = new TestRelay({
       config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', baseService: null, jobPlan: 'plan-crn-005', limitSeconds: 3600, maxRuns },
       privateKey,
       origin: () => relayOrigin,
-      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: (event: string, fields: Record<string, unknown>) => { warnings.push({ event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: (event: string, fields: Record<string, unknown>) => { relayEvents.push({ event, ...fields }) }, warn: (event: string, fields: Record<string, unknown>) => { relayWarnings.push({ event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
@@ -1913,6 +2332,111 @@ ${stderr}`
     expect(relay.runs.has(id)).toBe(true)
     expect((await fetch(`${relayUrl}/instance`)).status).toBe(200)
     expect(await (await fetch(`${relayUrl}/instance/box`)).text()).toBe(readFileSync('gateway/src/test-box.cjs', 'utf8'))
+  })
+})
+
+describe('a test box\'s kernel memory evidence', () => {
+  const oldKill = '[ 1.000] Out of memory: Killed process 42 (private-task)\n'
+  const freshKill = '[ 2.000] Out of memory: Killed process 43 (private-task)\n'
+
+  async function run(kind: string, before: string | null, after: string | null, status: number) {
+    const nativeRequire = createRequire(import.meta.url)
+    const observations: string[] = []
+    let exited = false
+    let stdout = ''
+    let stderr = ''
+    const sample = () => {
+      observations.push('sample')
+      return exited ? after : before
+    }
+    // Keep root='/' so both production kernel branches run. Replace only the kernel observations and uid switch;
+    // the real suite still writes to its pipes and exits before the runner drains output.
+    const code = await new Promise<number>((done) => {
+      runInNewContext(`${readFileSync('gateway/src/test-box.cjs', 'utf8')}\nrunSuite(spec, {})`, {
+        require: (name: string) => {
+          if (name === 'node:timers/promises') return {
+            setTimeout: (ms: number) => {
+              observations.push('drain')
+              return new Promise<void>((resolve) => setTimeout(resolve, ms))
+            },
+          }
+          if (name === 'node:fs') return {
+            readFileSync: (path: string) => {
+              expect(path).toBe('/sys/fs/cgroup/memory.events')
+              const value = sample()
+              if (value === null) throw new Error('memory.events unavailable')
+              return value
+            },
+            constants: {},
+          }
+          if (name === 'node:child_process') return {
+            spawn: (file: string, args: string[], options: SpawnOptions) => {
+              expect(options).toMatchObject({ uid: 10001, gid: 10001 })
+              observations.push('spawn')
+              const child = spawn(file, args, { ...options, uid: undefined, gid: undefined })
+              child.prependOnceListener('exit', () => { exited = true; observations.push('exit') })
+              return child
+            },
+            spawnSync: (file: string) => {
+              expect(file).toBe('dmesg')
+              const value = sample()
+              return value === null ? { status: 1, stdout: oldKill } : { status: 0, stdout: value }
+            },
+          }
+          return nativeRequire(name)
+        },
+        module: { exports: {} },
+        process: {
+          argv: [], env: kind === 'job' ? { POISE_TEST_JOB: '1' } : {}, exit: done,
+          stdout: { write: (chunk: Buffer | string, callback?: () => void) => { stdout += chunk; callback?.(); return true } },
+          stderr: { write: (chunk: Buffer | string, callback?: () => void) => { stderr += chunk; callback?.(); return true } },
+        },
+        spec: { argv: [process.execPath, '-e', `console.log('suite stdout'); console.error('suite stderr'); process.exit(${status})`], cwd: process.cwd() },
+      })
+    })
+    expect(stdout).toBe('suite stdout\n')
+    expect(stderr).toContain('suite stderr\n')
+    expect(stderr).not.toContain('private-task')
+    return { code, stderr, observations }
+  }
+
+  describe.each([
+    { kind: 'job', clear: 'oom_kill 0\n', old: 'oom_kill 1\n', fresh: 'oom_kill 2\n' },
+    { kind: 'sandbox', clear: '[ 0.000] booted\n', old: oldKill, fresh: oldKill + freshKill },
+  ])('$kind', ({ kind, clear, old, fresh }) => {
+    it.each([
+      ['unchanged pre-existing kill', old, old, 7, 7],
+      ['no kill', clear, clear, 7, 7],
+      ['fresh kill', old, fresh, 7, 125],
+      ['first kill', clear, fresh, 7, 125],
+      ['unavailable baseline', null, old, 7, 7],
+      ['unavailable final observation', old, null, 7, 7],
+      ['unavailable observations', null, null, 7, 7],
+      ['passing suite with a fresh kill', old, fresh, 0, 0],
+      ['removed old evidence', old, clear, 7, 7],
+    ] as const)('preserves or classifies the suite result with %s', async (_label, before, after, status, expected) => {
+      const result = await run(kind, before, after, status)
+      expect(result.code).toBe(expected)
+      expect(result.observations.slice(0, 4)).toEqual(['sample', 'spawn', 'exit', 'sample'])
+      expect(result.observations.filter((event) => event === 'sample')).toHaveLength(2)
+      if (expected === 125) expect(result.stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
+      else expect(result.stderr).toBe('suite stderr\n')
+    })
+  })
+
+  it.each([
+    ['unrelated kernel text', oldKill + '[ 2.000] device ready\n', 7],
+    ['a container memory kill', oldKill + '[ 2.000] Memory cgroup out of memory: Killed process 43\n', 7],
+    ['a fresh kernel kill after unrelated text', oldKill + '[ 2.000] device ready\n' + freshKill, 125],
+  ] as const)('only counts new matching sandbox records with %s', async (_label, after, expected) => {
+    expect((await run('sandbox', oldKill, after, 7)).code).toBe(expected)
+  })
+
+  it.each([
+    ['oom_kill invalid\n', 'oom_kill 1\n'],
+    ['oom_kill 1\n', 'oom_kill invalid\n'],
+  ])('preserves a failure with a malformed job observation: %s -> %s', async (before, after) => {
+    expect((await run('job', before, after, 7)).code).toBe(7)
   })
 })
 

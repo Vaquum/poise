@@ -142,7 +142,7 @@ def correlation_id(value: str) -> str:
 
 
 def last_reviewed_head(pwd: str, pr: str, actor_name: str) -> str | None:
-    """The head the reviewer's latest submitted review covered, if any."""
+    """The last head with controller-proven complete source coverage, if any."""
     limit = review_budget.timeout(120)
     progress.stage("locating_last_review", "Locating the last reviewed head", timeout=limit)
     args = [
@@ -169,7 +169,7 @@ def last_reviewed_head(pwd: str, pr: str, actor_name: str) -> str | None:
         reply = json.loads(done.stdout)
     except ValueError as error:
         raise AgentPreflightError(f"review activity is not JSON: {error}") from error
-    commit = reply.get("reviewer_latest_commit") if isinstance(reply, dict) else None
+    commit = reply.get("reviewer_latest_complete_commit") if isinstance(reply, dict) else None
     if commit in (None, ""):
         return None
     try:
@@ -366,6 +366,11 @@ def run_agent(
             diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
                                 stderr=cause, provider=spec.provider, submission="noop",
                                 refusal="repeat_only" if details["repeat_only"] else "duplicate"))
+    if packet and review_receipt.coverage_disposition(json.loads(packet)) != "complete" \
+            and review_receipt.get() is None and review_receipt.failure() is None:
+        raise review_budget.ReviewLimitError(
+            "Review incomplete: required source coverage is not complete; clearance refused",
+            "review_incomplete")
     return result
 
 

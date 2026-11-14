@@ -37,6 +37,10 @@ export interface ChainInvocation {
   outcome: string | null
   evidence: (Record<string, unknown> & { publicationPlan?: PublicationPlanCondition }) | null
 }
+export interface QueueCiBlocker {
+  removal: string, integration: string, base: string,
+  failures: Array<{ name: string, check: number, job: number, run: number, workflow: number, attempt: number, url: string }>
+}
 export interface BehaviorChain {
   id: string
   repository: string
@@ -46,9 +50,11 @@ export interface BehaviorChain {
   reviewer: string
   sequence: number
   held: string | null
-  ciHold?: { invocationId: string, callId: string, head: string }
+  ciHold?: { invocationId: string, callId: string, head: string, queue?: QueueCiBlocker }
   testHold?: { invocationId: string, callId: string, sequence: number }
   testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string }
+  repairRecovery?: { report: number, key: string, holdSequence: number, head: string, basis: string, slot: string,
+    diagnosis: string, note: string, admission?: string }
   waiting: string | null
   resumedAfterSequence: number
   mergeSha: string | null
@@ -69,7 +75,8 @@ export type ChainEvent =
   | { type: 'chain.observed', observation: Record<string, unknown> }
   | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'], testHold?: Omit<NonNullable<BehaviorChain['testHold']>, 'sequence'> }
   | { type: 'chain.waiting', reason: string }
-  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'], recovery?: ChainRecoveryOrigin }
+  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'],
+    repairRecovery?: BehaviorChain['repairRecovery'], recovery?: ChainRecoveryOrigin }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
@@ -154,14 +161,27 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (event.testHold) next.testHold = { ...event.testHold, sequence }
     else delete next.testHold
   } else if (event.type === 'chain.resumed') {
+    if (event.repairRecovery) {
+      const recovery = event.repairRecovery, original = next.invocations.at(-1)
+      if (!next.held || next.repairRecovery || recovery.admission || event.ciRecovery || event.testRecovery
+        || !Number.isSafeInteger(recovery.report) || recovery.report < 1 || !SHA.test(recovery.head)
+        || !/^[a-f0-9]{64}$/.test(recovery.key) || !/^[a-f0-9]{64}$/.test(recovery.diagnosis)
+        || !Number.isSafeInteger(recovery.holdSequence) || recovery.holdSequence <= next.resumedAfterSequence
+        || recovery.holdSequence > current.sequence || !recovery.note.trim()
+        || original?.behavior !== 'repair-pr' || original.state !== 'settled' || original.basis !== recovery.basis
+        || original.slot !== recovery.slot || original.request.context?.head !== recovery.head) {
+        throw new Error('repair report recovery requires its original automatic hold and pinned repair')
+      }
+      next.repairRecovery = recovery
+    } else if (!event.ciRecovery && !event.testRecovery) delete next.repairRecovery
     if (event.testRecovery) {
       if (!next.held || !next.testHold || next.testRecovery || event.testRecovery.admission
         || chainBasis(event.testRecovery.hold) !== chainBasis(next.testHold)
         || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
       next.testRecovery = event.testRecovery
-    } else if (!event.ciRecovery) delete next.testRecovery
+    } else if (!event.ciRecovery && !event.repairRecovery) delete next.testRecovery
     next.held = null
-    if (!event.ciRecovery && !event.testRecovery) next.resumedAfterSequence = sequence
+    if (!event.ciRecovery && !event.testRecovery && !event.repairRecovery) next.resumedAfterSequence = sequence
     delete next.ciHold
     delete next.testHold
   }
@@ -188,6 +208,16 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
   } else if (event.type === 'invocation.admitted') {
     if (next.held || next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
     const invocation = event.invocation
+    if (invocation.behavior === 'repair-pr' && next.repairRecovery) {
+      const recovery = next.repairRecovery
+      const prior = next.invocations.find(item => item.id === recovery.admission)
+      if (recovery.admission && prior?.evidence?.status !== 'completed') throw new Error('repair report recovery already consumed its single admission')
+      if (!recovery.admission) {
+        if (invocation.basis !== recovery.basis || invocation.slot !== recovery.slot || invocation.actor !== next.author
+          || invocation.request.context?.head !== recovery.head) throw new Error('repair report recovery admits only its pinned source repair')
+        next.repairRecovery = { ...recovery, admission: invocation.id }
+      }
+    }
     if (invocation.behavior === 'implement-issue' && next.testRecovery) {
       const original = next.invocations.find(item => item.id === next.testRecovery!.hold.invocationId)
       if (next.testRecovery.admission || !original || original.basis !== invocation.basis || original.slot !== invocation.slot
@@ -505,7 +535,49 @@ export class BehaviorChainJournal {
       .all(correlationId, callId, callId, callId) as Array<{ chain_id: string, position: number }>
     if (rows.length !== 1) return null
     const chain = this.read(rows[0].chain_id)!
-    const invocation = chain.invocations[rows[0].position]
+    return this.invocationMatch(chain, rows[0].position, callId, correlationId)
+  }
+
+  /** One request-scoped scan for all selectors, including retained merged chains. */
+  forInvocations(identities: Array<{ callId: string | null, correlationId: string | null }>): Array<{ chain: BehaviorChain, invocation: ChainInvocation } | null> {
+    if (!identities.length) return []
+    const calls = JSON.stringify([...new Set(identities.map(identity => identity.callId).filter(Boolean))])
+    const correlations = JSON.stringify([...new Set(identities.map(identity => identity.correlationId).filter(Boolean))])
+    const rows = cachedStatement(this.db, `SELECT c.chain_id, CAST(i.key AS INTEGER) AS position,
+      json_extract(i.value, '$.id') AS correlation_id, json_extract(i.value, '$.callId') AS call_id,
+      json_extract(i.value, '$.evidence.nativeCallId') AS native_call_id, json_extract(i.value, '$.evidence.callId') AS evidence_call_id
+      FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+      WHERE json_extract(i.value, '$.id') IN (SELECT value FROM json_each(?))
+        OR json_extract(i.value, '$.callId') IN (SELECT value FROM json_each(?))
+        OR json_extract(i.value, '$.evidence.nativeCallId') IN (SELECT value FROM json_each(?))
+        OR json_extract(i.value, '$.evidence.callId') IN (SELECT value FROM json_each(?))`)
+      .all(correlations, calls, calls, calls) as Array<{ chain_id: string, position: number, correlation_id: string,
+        call_id: unknown, native_call_id: unknown, evidence_call_id: unknown }>
+    const byCall = new Map<string, typeof rows[number] | null>()
+    const byCorrelation = new Map<string, typeof rows[number] | null>()
+    for (const row of rows) {
+      byCorrelation.set(row.correlation_id, byCorrelation.has(row.correlation_id) ? null : row)
+      // Multiple aliases on one invocation count once; multiple invocations are ambiguous.
+      for (const call of new Set([row.call_id, row.native_call_id, row.evidence_call_id])) {
+        if (typeof call === 'string') byCall.set(call, byCall.has(call) ? null : row)
+      }
+    }
+    const chains = new Map<string, BehaviorChain>()
+    return identities.map(({ callId, correlationId }) => {
+      const call = callId ? byCall.get(callId) : undefined
+      const correlation = correlationId ? byCorrelation.get(correlationId) : undefined
+      // The original OR lookup rejects ambiguity before checking selector agreement.
+      if (call === null || correlation === null || call && correlation && call !== correlation) return null
+      const row = call ?? correlation
+      if (!row) return null
+      let chain = chains.get(row.chain_id)
+      if (!chain) { chain = this.read(row.chain_id)!; chains.set(row.chain_id, chain) }
+      return this.invocationMatch(chain, row.position, callId, correlationId)
+    })
+  }
+
+  private invocationMatch(chain: BehaviorChain, position: number, callId: string | null, correlationId: string | null): { chain: BehaviorChain, invocation: ChainInvocation } | null {
+    const invocation = chain.invocations[position]
     const calls = new Set([invocation.callId, invocation.evidence?.nativeCallId, invocation.evidence?.callId].filter(value => typeof value === 'string'))
     if (correlationId && invocation.id !== correlationId
       || calls.size > 1 || callId && !calls.has(callId)) return null

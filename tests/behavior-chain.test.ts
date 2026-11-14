@@ -2,8 +2,8 @@ import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
-import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
-import { chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
+import { BehaviorChainRuntime, ReviewScopeIndexingError, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { behaviorChainAttention, behaviorChainSummary, CHAIN_ATTENTION_DELAY_MS, chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
@@ -50,7 +50,7 @@ function finish(journal: BehaviorChainJournal, chain: BehaviorChain, id: string,
 function reviewResponse(callId: string, head = HEAD) {
   return { repository: 'Example/Repo', pull_number: 21, head_sha: head, context_sha: CONTEXT,
     invocation_id: callId, reviewer: 'reviewer', model: 'fixture-model', completed_at: NOW,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
 }
 function reviewed(journal: BehaviorChainJournal, chain: BehaviorChain, obs: ChainObservation, slot = 'primary', comment = 17): BehaviorChain {
@@ -165,6 +165,21 @@ describe('authoritative behavior journal', () => {
 })
 
 describe('completion-driven atomic behavior decisions', () => {
+  it('retains receipted partial findings for repair without granting merge clearance', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'requested_changes', outcome: 'incomplete', review_id: 27, head_sha: HEAD })
+    const response = { ...reviewResponse(chainBasis('pr-review').slice(0, 32)), coverage: 'incomplete' }
+    current.invocations.at(-1)!.evidence!.artifact = { review_response: response }
+    Object.assign(obs.pull!.reviewReceipts[0], { state: 'CHANGES_REQUESTED', response })
+    obs.pull!.changesRequested = true
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+    obs.pull!.changesRequested = false; obs.pull!.approved = true; obs.pull!.ready = true
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'hold',
+      reason: 'merge requires a retained substantive final-context review response' })
+  })
+
   it('keeps acknowledgements pending and rejects metadata, late and superseded response coverage', () => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
     let current = reviewed(journal, chain, obs)
@@ -179,6 +194,16 @@ describe('completion-driven atomic behavior decisions', () => {
     const valid = structuredClone(current)
     valid.invocations.at(-1)!.evidence!.artifact = { review_response: reviewResponse(chainBasis(first.id).slice(0, 32)) }
     expect(decideBehaviorChain(valid, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+    for (const coverage of ['incomplete', null, true, {}]) {
+      const partial = structuredClone(valid)
+      const response = { ...reviewResponse(chainBasis(first.id).slice(0, 32)), coverage }
+      partial.invocations.at(-1)!.evidence!.artifact = { review_response: response }
+      const bounded = structuredClone(obs)
+      bounded.pull!.reviewReceipts[0].response = response
+      expect(decideBehaviorChain(partial, bounded, NOW)).toMatchObject({ kind: 'hold' })
+      bounded.pull!.approved = true; bounded.pull!.ready = true
+      expect(decideBehaviorChain(partial, bounded, NOW)).toMatchObject({ kind: 'hold' })
+    }
     const late = structuredClone(valid)
     late.invocations.at(-1)!.evidence!.completedAt = NOW + 1
     expect(decideBehaviorChain(late, obs, NOW)).toMatchObject({ kind: 'hold' })
@@ -268,7 +293,7 @@ describe('completion-driven atomic behavior decisions', () => {
     obs.pull!.ready = true
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
     obs.pull!.queueEntry = 'repaired-queue-entry'
-    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('native merge queue owns') })
+    expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'native merge queue owns entry repaired-queue-entry' })
   })
 
   it.each([
@@ -345,14 +370,47 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'complete', mergeSha: MERGE })
   })
 
-  it.each([false, true])('requires diagnosis, baseline recovery when shared=%s, and approval before a fresh integration attempt', (shared) => {
+  it('surfaces an unmergeable queue entry after 24 hours without resetting attention age on polls or restart', () => {
+    const { db, journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    Object.assign(obs.pull!, { approved: true, checksState: 'SUCCESS', queueEntry: 'entry',
+      queueEntryDetails: { id: 'entry', state: 'UNMERGEABLE', base: NEXT, head: null } })
+    current = record(journal, current, { type: 'chain.observed', observation: structuredClone(obs) })
+    const decision = decideBehaviorChain(current, obs, NOW)
+    expect(decision).toMatchObject({ kind: 'wait', reason: expect.stringContaining('UNMERGEABLE; cause unknown') })
+    if (decision.kind !== 'wait') throw new Error('expected queue wait')
+    current = record(journal, current, { type: 'chain.waiting', reason: decision.reason })
+    for (const elapsed of [CHAIN_ATTENTION_DELAY_MS - 1, CHAIN_ATTENTION_DELAY_MS, CHAIN_ATTENTION_DELAY_MS + 1000]) {
+      obs.checkedAt = NOW + elapsed
+      current = journal.append(chain.id, `poll-${elapsed}`, current.sequence, { type: 'chain.observed', observation: structuredClone(obs) }, obs.checkedAt)
+      const attention = behaviorChainAttention(journal, obs.checkedAt)
+      if (elapsed < CHAIN_ATTENTION_DELAY_MS) expect(attention).toEqual([])
+      else expect(attention[0]).toMatchObject({ progressAt: NOW, ageMs: elapsed,
+        evidence: { state: 'fresh', gates: expect.arrayContaining(['Queue UNMERGEABLE; cause unknown']) },
+        nextAction: 'Queue UNMERGEABLE needs attention; cause unknown. Await GitHub queue resolution or removal; GitHub retains ownership' })
+    }
+    const before = behaviorChainAttention(journal, obs.checkedAt)
+    const recovered = new BehaviorChainJournal(db); recovered.rebuild()
+    expect(behaviorChainAttention(recovered, obs.checkedAt)).toEqual(before)
+    expect(recovered.read(chain.id)!.held).toBeNull()
+  })
+
+  it.each([{ shared: false, reason: 'failed_checks' }, { shared: true, reason: 'failed_checks' }, { shared: false, reason: 'merge_conflict' }])(
+    'requires diagnosis, baseline recovery when shared=$shared, and approval after $reason before a fresh integration attempt', ({ shared, reason }) => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
     current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
       { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
     current = finish(journal, current, 'queue', 'merge-pr', 'queue-basis', { status: 'completed', outcome: 'enqueued', head_sha: HEAD }, null)
     obs.pull!.approved = true; obs.pull!.ready = true
-    obs.pull!.queueRemoval = { id: 'failed-integration', reason: 'failed_checks', at: NOW, actor: null }
+    obs.pull!.queueEntry = 'unmergeable-entry'
+    obs.pull!.queueEntryDetails = { id: 'unmergeable-entry', state: 'UNMERGEABLE', base: NEXT, head: null }
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('UNMERGEABLE; cause unknown') })
+    obs.pull!.queueEntry = null; obs.pull!.queueEntryDetails = null
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('removal evidence') })
+    obs.pull!.queueRemoval = { id: 'failed-integration', reason, at: NOW, actor: null }
     const repair = decideBehaviorChain(current, obs, NOW)
     expect(repair).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
     if (repair.kind !== 'invoke') throw new Error('expected repair')
@@ -857,6 +915,7 @@ describe('native admission and recovery', () => {
     let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
     current = record(journal, current, { type: 'chain.resumed' })
     expect(current.waiting).toBe(JSON.parse(firstWait.payload).reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
     const restarted = new BehaviorChainJournal(db); restarted.rebuild()
     expect(restarted.read(chain.id)).toEqual(current)
 
@@ -866,12 +925,101 @@ describe('native admission and recovery', () => {
     expect(waits()[0]).toEqual(firstWait)
     expect(waits()[1].payload).toBe(firstWait.payload)
     expect(waits()[1].sequence).toBeGreaterThan(current.resumedAfterSequence)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(JSON.parse(firstWait.payload).reason)
     await runtime.run()
     await new BehaviorChainRuntime(restarted, ops).run()
     expect(waits()).toHaveLength(2)
     expect(request).toHaveBeenCalledTimes(4)
     expect(journal.read(chain.id)!.invocations).toHaveLength(0)
     expect(launch).not.toHaveBeenCalled()
+  })
+
+  it('keeps journal-less summary callers on the pre-boundary projection', () => {
+    const { journal, chain } = setup()
+    const reason = 'older caller cannot date its wait'
+    let current = record(journal, chain, { type: 'chain.waiting', reason })
+    current = record(journal, current, { type: 'chain.held', reason: 'person paused it' })
+    current = record(journal, current, { type: 'chain.resumed' })
+    expect(behaviorChainSummary(current).waiting).toBe(reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+  })
+
+  it('records one fresh draft wait after Hold and Resume while the PR remains a draft', async () => {
+    const { db, journal, chain } = setup()
+    const obs = observation(); pull(obs)
+    obs.pull!.draft = true
+    const request = vi.fn<ChainRuntimeOperations['request']>(async () => { throw new Error('must not prepare a provider while the PR is a draft') })
+    const launch = vi.fn<ChainRuntimeOperations['launch']>(async () => true)
+    const ops = operations({ observe: async () => ({ ...obs, checkedAt: Date.now() }), request, launch })
+    const waits = () => journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'chain.waiting')
+    await new BehaviorChainRuntime(journal, ops).run()
+    const firstWait = waits()[0]
+    expect(JSON.parse(firstWait.payload)).toEqual({ type: 'chain.waiting', reason: 'pull request is a draft' })
+    let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
+    current = record(journal, current, { type: 'chain.resumed' })
+    expect(current.waiting).toBe('pull request is a draft')
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+    const restarted = new BehaviorChainJournal(db); restarted.rebuild()
+    expect(restarted.read(chain.id)).toEqual(current)
+
+    const runtime = new BehaviorChainRuntime(restarted, ops)
+    await runtime.run()
+    expect(waits()).toHaveLength(2)
+    expect(waits()[0]).toEqual(firstWait)
+    expect(waits()[1].payload).toBe(firstWait.payload)
+    expect(waits()[1].sequence).toBeGreaterThan(current.resumedAfterSequence)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe('pull request is a draft')
+    await runtime.run()
+    await new BehaviorChainRuntime(restarted, ops).run()
+    expect(waits()).toHaveLength(2)
+    expect(request).not.toHaveBeenCalled()
+    expect(journal.read(chain.id)!.invocations).toHaveLength(0)
+    expect(launch).not.toHaveBeenCalled()
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(restarted.read(chain.id))
+    expect(journal.history(chain.id)).toEqual(history)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe('pull request is a draft')
+  })
+
+  it('records one fresh indexing wait after Hold and Resume while PR scope stays unindexed', async () => {
+    const { db, journal, chain } = setup()
+    const reason = `Repair report review awaits indexed PR closing references for ${chain.repository}#21`
+    const request = vi.fn<ChainRuntimeOperations['request']>(async () => { throw new ReviewScopeIndexingError(chain.repository, 21) })
+    const launch = vi.fn<ChainRuntimeOperations['launch']>(async () => true)
+    const ops = operations({ request, launch })
+    const waits = () => journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'chain.waiting')
+    await new BehaviorChainRuntime(journal, ops).run()
+    const firstWait = waits()[0]
+    expect(JSON.parse(firstWait.payload)).toEqual({ type: 'chain.waiting', reason })
+    let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
+    current = record(journal, current, { type: 'chain.resumed' })
+    expect(current.waiting).toBe(reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+    // A deferred sweep observes without reaching the wait site; renewal must survive it.
+    current = record(journal, current, { type: 'chain.observed', observation: { checkedAt: Date.now() } })
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+    const restarted = new BehaviorChainJournal(db); restarted.rebuild()
+    expect(restarted.read(chain.id)).toEqual(current)
+
+    const runtime = new BehaviorChainRuntime(restarted, ops)
+    await runtime.run()
+    expect(waits()).toHaveLength(2)
+    expect(waits()[0]).toEqual(firstWait)
+    expect(waits()[1].payload).toBe(firstWait.payload)
+    expect(waits()[1].sequence).toBeGreaterThan(current.resumedAfterSequence)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
+    await runtime.run()
+    await new BehaviorChainRuntime(restarted, ops).run()
+    expect(waits()).toHaveLength(2)
+    expect(request).toHaveBeenCalled()
+    expect(journal.read(chain.id)!.invocations).toHaveLength(0)
+    expect(launch).not.toHaveBeenCalled()
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(restarted.read(chain.id))
+    expect(journal.history(chain.id)).toEqual(history)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
   })
 
   it('recovers a review only with its retained substantive response and preserves its original completion time', async () => {

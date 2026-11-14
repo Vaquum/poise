@@ -4,6 +4,7 @@ import { parseAgentLogStdout } from '../server/agent-log-parse'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent } from '../server/behavior-chain-store'
 import { parseResourceOwnership } from '../server/behavior-resource-receipt'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { behaviorChainSummary } from '../server/behavior-chain-summary'
 import { BehaviorResourceRecovery } from '../server/behavior-chain-resource-recovery'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import type { ChainObservation } from '../server/behavior-chain-decision'
@@ -513,6 +514,58 @@ describe('resource-aware behavior admission', () => {
     await blind.run()
     expect(journal.read(chain.id)).toMatchObject({
       waiting: 'behavior resource measurement unavailable: disk read of /fixture failed: gone', invocations: [] })
+  })
+
+  it.each(['budget', 'headroom', 'probe'] as const)('records a fresh %s wait after Resume while the resource blocker still holds', async (mode) => {
+    bounded()
+    const { journal, chain } = setup()
+    if (mode === 'budget') {
+      let held = seed(journal, 8)
+      held = journal.admitInvocation(held, 'admit-held', invocation('held', RESERVATION), 2, BUDGET)!
+      held = record(journal, held, { type: 'invocation.uncertain', invocationId: 'held', reason: 'worker ended without proof of release' })
+      record(journal, held, { type: 'chain.held', reason: 'held for the test' })
+    }
+    const measureHeadroom = mode === 'headroom'
+      ? () => ({ freeMemoryBytes: 1, freeDiskBytes: 100, diskPath: '/fixture' })
+      : mode === 'probe'
+        ? () => { throw new Error('behavior resource measurement unavailable: disk read of /fixture failed: gone') }
+        : () => ({ freeMemoryBytes: 100, freeDiskBytes: 100, diskPath: '/fixture' })
+    const runtime = new BehaviorChainRuntime(journal, operations({ measureHeadroom,
+      request: async () => { throw new Error('must not prepare a provider while resources block') } }))
+    await runtime.run()
+    const reason = mode === 'budget'
+      ? 'shared native resource budget is exhausted: memory needs 12 of 10 bytes'
+      : mode === 'headroom'
+        ? 'insufficient behavior resource headroom: only 1 bytes of free memory for a 6 byte reservation'
+        : 'behavior resource measurement unavailable: disk read of /fixture failed: gone'
+    expect(journal.read(chain.id)).toMatchObject({ waiting: reason, invocations: [] })
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
+
+    let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
+    current = record(journal, current, { type: 'chain.resumed' })
+    const boundary = current.resumedAfterSequence
+    expect(current.waiting).toBe(reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+    // A deferred sweep observes without reaching the wait site; renewal must survive it.
+    current = record(journal, current, { type: 'chain.observed', observation: { checkedAt: Date.now() } })
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+
+    await runtime.run()
+    const next = journal.read(chain.id)!
+    expect(next.waiting).toBe(reason)
+    expect(next.sequence).toBeGreaterThan(boundary)
+    const fresh = journal.history(chain.id, boundary).filter(row => {
+      const event = JSON.parse(row.payload) as ChainEvent
+      return event.type === 'chain.waiting' && event.reason === reason
+    })
+    expect(fresh).toHaveLength(1)
+    expect(behaviorChainSummary(next, journal).waiting).toBe(reason)
+
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(next)
+    expect(journal.history(chain.id)).toEqual(history)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
   })
 
   it('records no reservation and runs no probe when budgets are unset', async () => {

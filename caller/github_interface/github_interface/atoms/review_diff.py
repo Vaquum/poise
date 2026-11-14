@@ -22,7 +22,8 @@ from .process_diagnostic import GitProcessError, StderrCapture, failure
 MAX_DIFF_BYTES = 2_850_000
 MAX_PACKET_BYTES = 2_950_000  # Leave room for the governed agent policy.
 BULK_FILE_BYTES = 32_000
-BULK_SUFFIXES = {".json", ".jsonl", ".ndjson", ".csv", ".tsv"}
+# JSON can be runtime source regardless of its name, size or references.
+BULK_SUFFIXES = {".jsonl", ".ndjson", ".csv", ".tsv"}
 OPAQUE_SUFFIXES = {".gz", ".zip", ".tar", ".bz2", ".xz", ".7z", ".pdf", ".parquet", ".arrow"}
 FILE_STATUS = {"A": "added", "D": "removed", "M": "modified", "T": "changed"}
 PACKET_LIMIT_CODE = "review_packet_too_large"
@@ -212,6 +213,7 @@ async def _bounded_packet(git, files: list[dict[str, Any]], retained: list[str],
                        "old_mode": meta[path]["old_mode"], "new_mode": meta[path]["new_mode"]} for path in chosen],
             "excluded_files": excluded,
             "omitted_files": omitted,
+            "coverage": "incomplete" if omitted else "complete",
             "merge_base_sha": merge_base,
             "since_head_sha": since,
             "review_scope": scope,
@@ -354,6 +356,7 @@ async def review_diff(
                                "status": FILE_STATUS[f["status"]],
                                "old_mode": f["old_mode"], "new_mode": f["new_mode"]} for f in files if f["filename"] in retained_paths],
                     "excluded_files": excluded,
+                    "coverage": "complete",
                     "merge_base_sha": merge_base,
                     "since_head_sha": since,
                     "review_scope": scope,

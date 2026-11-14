@@ -1,7 +1,8 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { delimiter, join, relative } from 'node:path'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import * as logins from '../server/accounts/logins'
 import { probeAccount } from '../server/accounts/status'
 import {
   CLAUDE_AUTH_LOGIN_TIMEOUT_MS,
@@ -13,6 +14,7 @@ import {
   type ClaudeAuthRunFile,
   type ClaudeAuthTimer,
 } from '../server/claude-auth'
+import { closeDatabase, setMeta } from '../server/db'
 import { loggingRuntime, startLogging, stopLogging } from '../server/logging'
 import { CLAUDE_SUBSCRIPTION_CLI, runFile } from '../server/process'
 import { STATUS, fakeCalls, script, setScript, writeFakeClis } from './fixtures/accounts/fake-clis'
@@ -635,6 +637,7 @@ describe('Claude status diagnostics through the process helper', () => {
     vi.stubEnv('POISE_DB', join(root, 'cache.db'))
     vi.stubEnv('POISE_MODE', 'service')
     vi.stubEnv('POISE_WORKSPACE_HANDLE', 'alice')
+    setMeta('account_logins', '{}')
     await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeSignedOut) })
     vi.spyOn(process.stderr, 'write').mockReturnValue(true)
     startLogging()
@@ -646,17 +649,124 @@ describe('Claude status diagnostics through the process helper', () => {
     await rm(root, { recursive: true, force: true })
   })
 
+  afterAll(closeDatabase)
+
   function failures() {
     loggingRuntime()!.flush()
     return loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false })).events
       .filter((event) => event.source === 'poise' && event.severity === 'error')
   }
 
+  it('keeps positively absent, unconfigured Claude unavailable without an Error and rejects launch', async () => {
+    await rm(join(root, 'bin', 'claude'))
+    vi.stubEnv('PATH', `${join(root, 'absent')}${delimiter}${join(root, 'bin')}`)
+    const monitor = new ClaudeAuthMonitor({ clock: new FakeClock() })
+    try {
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'unavailable', verifiedAt: null, authMethod: null })
+      await expect(monitor.requireReady()).rejects.toMatchObject({
+        statusCode: 503, code: 'CLAUDE_AUTH_NOT_READY', authStatus: 'unavailable',
+      })
+      expect(failures()).toEqual([])
+      expect(await fakeCalls(home)).toEqual([])
+    } finally {
+      await monitor.stop()
+    }
+  })
+
+  it('retains the wrapped missing-CLI Error for recorded Claude', async () => {
+    setMeta('account_logins', JSON.stringify({ claude: '2026-11-14T01:00:00Z' }))
+    await rm(join(root, 'bin', 'claude'))
+    await expect(new ClaudeAuthMonitor().check()).resolves.toMatchObject({ status: 'unavailable' })
+    expect(failures()).toMatchObject([{
+      operation: 'claude.auth.status', exitCode: 1,
+      stderr: '[poise] Claude subscription command failed: spawn claude ENOENT\n',
+    }])
+  })
+
+  it.each([0, 2])('retains missing-CLI diagnostics after observing sign-in, even with canary exit %i', async (code) => {
+    await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: { ...OK, code } })
+    const monitor = new ClaudeAuthMonitor({ canaryModel: async () => ({ selector: 'haiku', effort: 'low' }), clock: new FakeClock() })
+    try {
+      await expect(monitor.check()).resolves.toMatchObject({ status: code === 0 ? 'authenticated' : 'degraded' })
+      await setScript(home, 'claude', script('claude', STATUS.claudeSignedOut))
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'reauth_required' })
+      await rm(join(root, 'bin', 'claude'))
+      const before = failures().length
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'reauth_required' })
+      expect(failures()).toHaveLength(before + 1)
+      expect(failures()[0]).toMatchObject({ operation: 'claude.auth.status', exitCode: 1, stderr: expect.stringContaining('spawn claude ENOENT') })
+    } finally {
+      await monitor.stop()
+    }
+  })
+
+  it.each(['corrupt', 'unreadable', 'mistyped', 'empty'])('retains missing-CLI diagnostics with %s account evidence', async (kind) => {
+    await rm(join(root, 'bin', 'claude'))
+    if (kind === 'corrupt') setMeta('account_logins', 'not json')
+    else if (kind === 'mistyped') setMeta('account_logins', JSON.stringify({ claude: 123 }))
+    else if (kind === 'empty') setMeta('account_logins', '')
+    else vi.spyOn(logins, 'accountLoginsStrict').mockImplementationOnce(() => { throw new Error('provider record could not be read') })
+    await expect(new ClaudeAuthMonitor().check()).resolves.toMatchObject({ status: 'unavailable' })
+    expect(failures()).toMatchObject([{
+      operation: 'claude.auth.status', exitCode: 1,
+      context: { configurationError: expect.stringMatching(kind === 'unreadable' ? /could not be read/ : /corrupt/) },
+    }])
+  })
+
+  it.each(['interpreter', 'symlink', 'permissions', 'directory'])('retains diagnostics for a broken launcher: %s', async (kind) => {
+    const launcher = join(root, 'bin', 'claude')
+    if (kind === 'interpreter') await writeFile(launcher, '#!/no-such-poise-claude-interpreter\n')
+    else if (kind === 'permissions') await chmod(launcher, 0o644)
+    else {
+      await rm(launcher)
+      if (kind === 'symlink') await symlink(join(root, 'missing-claude'), launcher)
+      else await mkdir(launcher)
+    }
+    await expect(new ClaudeAuthMonitor().check()).resolves.toMatchObject({ status: 'unavailable' })
+    expect(failures()).toMatchObject([{
+      operation: 'claude.auth.status', exitCode: 1,
+      stderr: expect.stringMatching(/spawn claude (ENOENT|EACCES)/),
+    }])
+  })
+
+  it('checks launcher entries on relative PATH segments too', async () => {
+    await rm(join(root, 'bin', 'claude'))
+    await symlink(join(root, 'missing-claude'), join(root, 'claude'))
+    vi.stubEnv('PATH', `${join(root, 'bin')}${delimiter}${relative(process.cwd(), root)}`)
+    await expect(new ClaudeAuthMonitor().check()).resolves.toMatchObject({ status: 'unavailable' })
+    expect(failures()).toMatchObject([{ operation: 'claude.auth.status', exitCode: 1, stderr: expect.stringContaining('spawn claude ENOENT') }])
+  })
+
+  it('follows a symlinked PATH segment past .. like the launcher does', async () => {
+    await rm(join(root, 'bin', 'claude'))
+    await mkdir(join(root, 'tools', 'bin'), { recursive: true })
+    await mkdir(join(root, 'tools', 'current'), { recursive: true })
+    await symlink(join(root, 'missing-claude'), join(root, 'tools', 'bin', 'claude'))
+    await mkdir(join(root, 'opt'), { recursive: true })
+    await symlink(join(root, 'tools', 'current'), join(root, 'opt', 'link'))
+    // Lexically this is root/opt/bin (absent); the kernel follows the symlink first to root/tools/bin.
+    vi.stubEnv('PATH', `${join(root, 'opt', 'link')}/../bin${delimiter}${join(root, 'bin')}`)
+    await expect(new ClaudeAuthMonitor().check()).resolves.toMatchObject({ status: 'unavailable' })
+    expect(failures()).toMatchObject([{ operation: 'claude.auth.status', exitCode: 1, stderr: expect.stringContaining('spawn claude ENOENT') }])
+  })
+
+  it('retains the Error when launcher absence cannot be established on the launch PATH', async () => {
+    await rm(join(root, 'bin', 'claude'))
+    const notDirectory = join(root, 'not-directory')
+    await writeFile(notDirectory, '')
+    vi.stubEnv('PATH', `${join(notDirectory, 'bin')}${delimiter}${join(root, 'bin')}`)
+    await expect(new ClaudeAuthMonitor().check()).resolves.toMatchObject({ status: 'unavailable' })
+    expect(failures()).toMatchObject([{
+      operation: 'claude.auth.status', exitCode: 1,
+      stderr: expect.stringContaining('spawn claude ENOENT'),
+      context: { configurationError: expect.stringContaining('ENOTDIR') },
+    }])
+  })
+
   it('keeps one sign-in notice across repeated signed-out probes and failures until a canary verifies recovery', async () => {
-    const database = await import('../server/db')
     const { claudeAuthStatusChanged } = await import('../server/alerts/producers')
     const { openAlerts, latestAlertSeq } = await import('../server/alerts/store')
-    database.setMeta('account_logins', JSON.stringify({ claude: new Date().toISOString() }))
+    setMeta('account_logins', JSON.stringify({ claude: new Date().toISOString() }))
     const clock = new FakeClock()
     const monitor = new ClaudeAuthMonitor({ canaryModel: async () => ({ selector: 'haiku', effort: 'low' }), clock })
     const unsubscribe = monitor.onStatus(claudeAuthStatusChanged)
@@ -695,7 +805,6 @@ describe('Claude status diagnostics through the process helper', () => {
     } finally {
       unsubscribe()
       await monitor.stop()
-      database.closeDatabase()
     }
   })
 

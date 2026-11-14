@@ -171,7 +171,7 @@ class TestRecovery(TestCase):
         return api.logs()[-1]
 
     def execute_verdicts(self, replies, checks, submission=None):
-        packet = json.dumps({'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD,
+        packet = json.dumps({'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD, 'coverage': 'complete', 'files': [],
                              'pull': {'title': 'Pinned approval target', 'base': {'sha': 'b' * 40}}})
         replies = iter(replies)
         self.verdict_snapshots = []
@@ -187,7 +187,7 @@ class TestRecovery(TestCase):
         def github(args, **kwargs):
             self.assertEqual(args[args.index('--token-user') + 1], 'bit-mis')
             if args[1] == '--review-activity-since':
-                return SimpleNamespace(returncode=0, stdout=json.dumps({'reviewer_latest_commit': HEAD}), stderr='')
+                return SimpleNamespace(returncode=0, stdout=json.dumps({'reviewer_latest_complete_commit': HEAD}), stderr='')
             self.assertEqual(args[args.index('--expected-head') + 1], HEAD)
             if args[1] == '--pr-review':
                 return SimpleNamespace(returncode=0, stdout=packet, stderr='')
@@ -588,7 +588,7 @@ class TestRecovery(TestCase):
         # Latencies are bounded fixture costs, not measured production timings.
         paths = [f'src/f{i:03d}.py' for i in range(files)]
         lines = max(finding_counts) if finding_counts else 1
-        packet = {'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD,
+        packet = {'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD, 'coverage': 'complete',
                   'merge_base_sha': 'b' * 40,
                   'pull': {'title': 'Pinned staged review', 'body': 'Review every group',
                            'base': {'sha': 'b' * 40}},

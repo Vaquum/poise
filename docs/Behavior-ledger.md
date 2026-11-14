@@ -6,6 +6,8 @@ has a permanent 64-character hexadecimal hash. The ledger observes work; its
 state never controls eligibility, claims, retries, locks, metrics or launches.
 Capture does not wait for storage and adds no Caller reads.
 Ledger states map to the shared contract in [Error-state handling contract](Error-State-Contract.md).
+Published partial change requests retain the native `incomplete` outcome;
+the [review contract](Behavior-Contract.md) defines coverage and clearance.
 
 A native `review_target_closed` outcome supersedes an obsolete review panel,
 including configured slots that never started. It does not claim publication

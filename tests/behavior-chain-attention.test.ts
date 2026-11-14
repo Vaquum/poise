@@ -283,6 +283,9 @@ it('distinguishes known retry eligibility from a hold and an unknown provider ba
   chain = append(journal, chain, { type: 'chain.waiting', reason: 'implement-issue is in native failure backoff' })
   chain = append(journal, chain, { type: 'chain.resumed' })
   expect(behaviorChainAttention(journal, now)[0].retryAt).toBeNull()
+  expect(behaviorChainAttention(journal, now)[0].step).toBe('Issue admission')
+  expect(behaviorChainAttention(journal, now)[0].blocker).not.toContain('native failure backoff')
+  expect(behaviorChainAttention(journal, now)[0].nextAction).toBe('Await a fresh, complete chain observation')
   append(journal, chain, { type: 'chain.held', reason: 'person intervention required' })
   expect(behaviorChainAttention(journal, now)[0].retryAt).toBeNull()
 })
@@ -1047,7 +1050,7 @@ it('directs a fully verified approved head to merge-pr', () => {
   const callId = chainBasis('review-988').slice(0, 32)
   const response = { repository: 'autonomio/poise', pull_number: 988, reviewer: 'reviewer', model: 'fixture',
     invocation_id: callId, head_sha: head, context_sha: 'b'.repeat(64), completed_at: admittedAt + 40_000,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
     issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
@@ -1226,7 +1229,7 @@ it('waits for the merge artifact instead of repeating merge-pr', () => {
   const callId = chainBasis('review-990').slice(0, 32)
   const response = { repository: 'autonomio/poise', pull_number: 990, reviewer: 'reviewer', model: 'fixture',
     invocation_id: callId, head_sha: head, context_sha: 'b'.repeat(64), completed_at: admittedAt + 40_000,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   const mergeBasis = chainBasis(['merge', head, null])
   const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
