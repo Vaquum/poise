@@ -363,6 +363,15 @@ completion proof; missing health, supersession and another rollout's completion
 cannot establish recovery. The rollout stays pending until its existing release
 and build/image verification gates pass. Diagnostic delivery failure is visible
 on stderr and does not change those gates.
+Only the private writer's exact busy refusal is retried for `deployment`: at most
+five connections, waiting 250, 500, 1,000 and 2,000 milliseconds between attempts.
+The complete observation frame, including its original timestamp and health
+snapshot, is read once within 64 KiB and replayed unchanged. Input, attempts and
+waits share one 30-second delivery deadline; the verifier's proof clock is
+unchanged. Other refusals retain a bounded, redacted cause and fail immediately;
+an ambiguous disconnect is not retried. Exhausted contention leaves the verifier's
+warning visible. Manual ingress and the continuous reader keep single attempts
+and their existing input/handshake behavior.
 
 External Caddy installations can instead run the bounded continuous
 [operator reader](../deploy/ingress/README.md). A dedicated forced-command SSH

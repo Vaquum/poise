@@ -3,38 +3,79 @@ import { createConnection, createServer, type Socket } from 'node:net'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { once } from 'node:events'
+import { setTimeout as delay } from 'node:timers/promises'
+import { environmentSecrets, redact } from './contract.js'
 import { receiveIngress, receiveManualIngress } from './ingress.js'
 import { receiveDeployment } from './deployment.js'
 import type { DiagnosticRuntime } from './runtime.js'
 
 /** A forced-command process relays bytes; only the gateway owns a writable store. */
 export async function relayIngress(path: string, command: 'ingress' | 'ingress-stream' | 'deployment', stdin: AsyncIterable<Buffer | string>, write: (line: string) => void): Promise<void> {
-  const socket = createConnection({ path })
-  const timer = setTimeout(() => socket.destroy(new Error('Ingress relay exceeded 30 seconds')), 30_000)
-  let reply = '', size = 0, lines = 0
-  socket.on('data', (chunk: Buffer) => {
-    try {
-    reply += chunk.toString('utf8')
-    if (reply.length > 8192) { socket.destroy(new Error('Ingress reply exceeds its bound')); return }
-    let end: number
-    while ((end = reply.indexOf('\n')) >= 0) {
-      const line = reply.slice(0, end); reply = reply.slice(end + 1)
-      const value: unknown = JSON.parse(line)
-      if (!value || typeof value !== 'object' || 'error' in value) { socket.destroy(new Error('Gateway refused ingress delivery')); return }
-      write(line); lines++
-    }
-    } catch { socket.destroy(new Error('Invalid ingress acknowledgement')) }
-  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error('Ingress relay exceeded 30 seconds')), 30_000)
   try {
-    await once(socket, 'connect')
-    const ended = once(socket, 'end')
-    socket.write(command + '\n')
-    await Promise.all([ended, pipeline(Readable.from(stdin), new Transform({ transform(chunk: Buffer, _encoding, done) {
-      size += chunk.length
-      done(size > (command === 'ingress-stream' ? 1024 * 1024 : 64 * 1024) ? new Error('Ingress input exceeds its bound') : null, chunk)
-    } }), socket)])
-    if (reply || lines !== (command === 'ingress-stream' && size ? 2 : 1)) throw new Error('Ingress acknowledgement is incomplete')
-  } finally { clearTimeout(timer); socket.destroy() }
+    let frame: Buffer | null = null
+    if (command === 'deployment') {
+      // The CLI supplies a one-shot generator, including the observation header.
+      const chunks: Buffer[] = []; let size = 0
+      const expired = new Promise<never>((_resolve, reject) => {
+        controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true })
+      })
+      await Promise.race([pipeline(Readable.from(stdin), async (source) => {
+        for await (const chunk of source) {
+          const bytes = Buffer.from(chunk)
+          size += bytes.length
+          if (size > 64 * 1024) throw new Error('Ingress input exceeds its bound')
+          chunks.push(bytes)
+        }
+      }, { signal: controller.signal }), expired])
+      frame = Buffer.concat([Buffer.from(command + '\n'), ...chunks])
+    }
+    for (let attempt = 0; ; attempt++) {
+      const socket = createConnection({ path, signal: controller.signal })
+      let reply = '', size = 0, lines = 0, busy = false
+      socket.on('data', (chunk: Buffer) => {
+        try {
+          reply += chunk.toString('utf8')
+          if (reply.length > 8192) { socket.destroy(new Error('Ingress reply exceeds its bound')); return }
+          let end: number
+          while ((end = reply.indexOf('\n')) >= 0) {
+            const line = reply.slice(0, end); reply = reply.slice(end + 1)
+            const value: unknown = JSON.parse(line)
+            if (!value || typeof value !== 'object') { socket.destroy(new Error('Invalid ingress acknowledgement')); return }
+            if ('error' in value) {
+              busy = command === 'deployment' && lines === 0 && Object.keys(value).length === 1 && value.error === 'Ingress writer is busy'
+              const cause = typeof value.error === 'string' ? redact(value.error, environmentSecrets()).slice(0, 512) : 'Invalid ingress refusal'
+              socket.destroy(new Error('Gateway refused ingress delivery: ' + cause)); return
+            }
+            write(line); lines++
+          }
+        } catch { socket.destroy(new Error('Invalid ingress acknowledgement')) }
+      })
+      try {
+        await once(socket, 'connect')
+        const ended = once(socket, 'end')
+        if (frame) {
+          // Read an immediate busy refusal before writing to its closed peer.
+          await Promise.all([ended, delay(0, undefined, { signal: controller.signal }).then(() => {
+            if (!socket.destroyed) socket.end(frame)
+          })])
+        } else {
+          socket.write(command + '\n')
+          await Promise.all([ended, pipeline(Readable.from(stdin), new Transform({ transform(chunk: Buffer, _encoding, done) {
+            size += chunk.length
+            done(size > (command === 'ingress-stream' ? 1024 * 1024 : 64 * 1024) ? new Error('Ingress input exceeds its bound') : null, chunk)
+          } }), socket, { signal: controller.signal })])
+        }
+        if (reply || lines !== (command === 'ingress-stream' && size ? 2 : 1)) throw new Error('Ingress acknowledgement is incomplete')
+        return
+      } catch (error) {
+        if (!busy || attempt >= 4 || controller.signal.aborted) throw error
+      } finally { socket.destroy() }
+      await delay(250 * 2 ** attempt, undefined, { signal: controller.signal })
+    }
+  } catch (error) { throw controller.signal.aborted ? controller.signal.reason : error }
+  finally { clearTimeout(timer) }
 }
 
 export async function startIngressSocket(runtime: DiagnosticRuntime, path: string, domain: string, configured: boolean): Promise<{ close(): Promise<void> }> {
@@ -80,7 +121,10 @@ export async function startIngressSocket(runtime: DiagnosticRuntime, path: strin
       else if (command === 'deployment') await receiveDeployment(runtime.query((db) => db), input(), write)
       else throw new Error('Unknown ingress command')
       socket.end(() => socket.destroy())
-    })().catch(() => { if (!socket.destroyed) socket.end('{"error":"Ingress delivery rejected"}\n', () => socket.destroy()) }).finally(() => { active = null })
+    })().catch((error: unknown) => {
+      const cause = redact(error instanceof Error ? error.message : 'Unknown ingress failure', environmentSecrets()).slice(0, 512)
+      if (!socket.destroyed) socket.end(JSON.stringify({ error: 'Ingress delivery rejected: ' + cause }) + '\n', () => socket.destroy())
+    }).finally(() => { active = null })
   })
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(path, () => {
     try { chmodSync(path, 0o600); runtime.ownCoverage('external-ingress', configured); resolve() }
