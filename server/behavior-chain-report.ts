@@ -531,6 +531,9 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
     const decision = decideBehaviorChain(chain, observation, Date.now())
     return decision.kind === 'invoke' && decision.behavior === 'review-issue' ? null : fence
   }
+  // A merged source has no recovery to pend; ordinary merged-review
+  // reconciliation owns the chain from here.
+  if (chain.mergeSha || observation.pull?.merged) return null
   if (chain.repairRecovery?.admission || !chain.held && !chain.repairRecovery) return null
   const reports = repairExhaustionReports(db, chain)
   if (!reports.length) return null
@@ -588,8 +591,9 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
   const comments = result.comments.filter(comment => [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(comment.author.toLowerCase()))
   // Review alone is insufficient: the original comment must name this exact
   // source PR/head and a concrete code site. The repair validates the diagnosis.
+  const repository = chain.repository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const actionable = (text: unknown): text is string => typeof text === 'string' && text.includes(report.head!)
-    && (text.includes(`https://github.com/${chain.repository}/pull/${report.pull}`) || new RegExp(`\\bPR #${report.pull}\\b`, 'i').test(text))
+    && (new RegExp(`https://github\\.com/${repository}/pull/${report.pull}(?!\\d)`).test(text) || new RegExp(`\\bPR #${report.pull}\\b`, 'i').test(text))
     && /\b[\w.-]+(?:\/[\w.-]+)*\.[\w]+:\d+\b/.test(text)
   const reviewed = !implementations.length ? reportChain.invocations.flatMap(invocation => {
     const evidence = invocation.evidence

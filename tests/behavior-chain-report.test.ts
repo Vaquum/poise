@@ -556,6 +556,35 @@ it('does not replenish a failed report recovery after journal rebuild or repeate
   expect(posts()).toHaveLength(1)
 })
 
+it('requires an exact pull URL match for a repair diagnosis', async () => {
+  const textFor = (pull: number) => (`TS2352 at tests/behavior-chain-action-recovery.test.ts:397: context_sha is missing. `
+    + `See https://github.com/acme/repo/pull/${pull} head ${HEAD}. Retain context_sha; the faulty test exists only on the source PR branch.`)
+  const exact = await diagnosedRepair(':memory:', textFor(21))
+  await new BehaviorChainRuntime(exact.journal, exact.ops).run()
+  expect(exact.launch).toHaveBeenCalledTimes(1)
+  expect(exact.journal.read(exact.source.id)!.repairRecovery).toMatchObject({ report: 99, head: HEAD })
+  const longer = await diagnosedRepair(':memory:', textFor(210))
+  await new BehaviorChainRuntime(longer.journal, longer.ops).run()
+  expect(longer.launch).not.toHaveBeenCalled()
+  expect(longer.journal.read(longer.source.id)!.held).toBe(longer.source.held)
+  expect(longer.journal.read(longer.source.id)!.repairRecovery).toBeUndefined()
+  expect(longer.journal.read(longer.source.id)!.waiting).toContain('Repair report recovery pending')
+})
+
+it('lets a merged source reach merged reconciliation instead of recovery pending', async () => {
+  const { journal, source, ops, launch } = await diagnosedRepair()
+  const MERGE = 'b'.repeat(40)
+  Object.assign(fresh.pull!, { state: 'closed', merged: true, mergeSha: MERGE, mergedAt: NOW })
+  Object.assign(fresh.publication, { state: 'closed', merged: true, merge_sha: MERGE })
+  await new BehaviorChainRuntime(journal, ops).run()
+  const current = journal.read(source.id)!
+  expect(current.mergeSha).toBe(MERGE)
+  expect(current.reviewPending).toBe(true)
+  expect(current.waiting).not.toContain('Repair report recovery pending')
+  expect(current.repairRecovery).toBeUndefined()
+  expect(launch).not.toHaveBeenCalled()
+})
+
 it('routes an open seed past its only closed unmerged PR through ordinary continuation intake', async () => {
   const { db, journal } = setup()
   const source = openSeed(journal)
