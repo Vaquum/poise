@@ -741,7 +741,7 @@ does not disturb native cleanup holds. Explicit empty durably overrides a legacy
 container environment after Poise restarts. Local mode keeps environment-based
 configuration. Unset or empty opts out.
 
-Native repair and PR review reporting requires at least three settled original Caller
+Native repair and PR review exhaustion reporting requires at least three settled original Caller
 receipts for the same phase, current head, review basis and slot after the last
 Resume, each with positive resource release, `action=not_started`, retained
 `outcome=preflight_failed` and no
@@ -804,6 +804,18 @@ diagnostic facts. Caller's blocked result does not independently verify the work
 health-check, test-relay or other runner explanation. Its next action is to inspect
 the original Call, remedy the blocker and explicitly Resume for a fresh implementation.
 
+For `repair-pr`, `atomic_work_blocked` also qualifies one settled original Call
+under its matching active automatic hold after the last Resume. The same
+no-publication and positive resource-release proof is required, with fresh
+evidence that the open PR still has the admitted head and repair basis. Operator
+holds, unknown effects and structured CI-only holds with their existing recovery
+path do not qualify. The report names the source issue, PR, original Call and
+verified stage, and distinguishes the settled no-publication fact from the
+bounded, redacted **worker-reported** blocker. It preserves the source hold and
+repair ownership without admitting work or relaunching repair. Its identity is
+`atomic_work_blocked` + source chain + PR, separate from the pre-PR implementation
+identity; even a closed historical implementation report cannot cover this repair.
+
 `implementation_publication_uncertain` qualifies an original `implement-issue`
 invocation that remains uncertain after recovery, including an unheld source.
 Its failed terminal Call is retained in `evidence.callId` while `invocation.callId`
@@ -860,7 +872,7 @@ Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the
 stage, stable cause, target, hold time/age, head/basis, safe invocation and Caller
 receipt identities, and next action. Apart from the explicitly worker-reported
-implementation blocker, it excludes raw errors, omitted finding IDs, worker paths
+implementation or terminal repair blocker, it excludes raw errors, omitted finding IDs, worker paths
 and provider output. An intent in the existing durable metadata store
 links the original failure to the report issue. Repair identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
