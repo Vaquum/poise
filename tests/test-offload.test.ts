@@ -894,6 +894,20 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect(result.stderr).not.toContain('failed source capture unavailable')
   })
 
+  it('keeps a completed nonzero suite result when source capture outlasts the remaining budget', async () => {
+    await startAll()
+    const repo = committed()
+    const bin = temp()
+    // A slow capture must not let the suite budget replace the genuine failure with a no-result handoff.
+    writeFileSync(join(bin, 'agent-interface'), '#!/bin/sh\nsleep 6\nexit 0\n', { mode: 0o700 })
+    const result = await suite(repo, [process.execPath, '-e', 'process.exit(1)'], {
+      PATH: `${bin}:${process.env.PATH}`, BASH_DEFAULT_TIMEOUT_MS: '5000', AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+    }).done
+    expect(result.code).toBe(1)
+    expect(result.stderr).not.toContain('no test result')
+    expect(result.stderr).not.toContain('total time budget')
+  }, 30_000)
+
   it('runs the command exactly as it was typed, with nothing of this workspace\'s hooks', async () => {
     await startAll()
     const repo = repository()

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -44,6 +45,10 @@ def workspace(monkeypatch, request):
     monkeypatch.setattr(issue_review, "command", lambda *args: (["fixture-provider"], "", {
         key: value for key, value in os.environ.items() if not key.startswith("AGENT_INTERFACE_RECEIPT_")}))
     monkeypatch.setattr(atomic_work.checkout_lock, "Lease", lambda *args, **kwargs: MagicMock(held=False))
+    # Fixture-owned release proof: the worker waits for its own subprocesses, so an
+    # unreadable host-wide /proc entry must not fail settlement. Production keeps
+    # its fail-closed scan; receipts and managed reclamation stay real.
+    monkeypatch.setattr(issue_review, "_cwd_pids", lambda *args, **kwargs: [])
     return tmp_path
 
 
@@ -222,3 +227,27 @@ def test_inspection_refuses_unavailable_or_unauthorized_evidence(retained, monke
         with sqlite3.connect(database) as conn:
             conn.execute("create table calls(id text primary key)")
     assert failed_source.inspect(database, call, candidate, run)["status"] == "unavailable"
+
+
+def test_inspection_returns_unavailable_without_blocking_on_fifo_evidence(retained, monkeypatch):
+    call, work, archive, spec, candidate = retained
+    assert failed_source.capture(api.DB, archive, spec, candidate, RUN, 1)["status"] == "available"
+    with api.db() as conn:
+        conn.execute("update calls set status='failed', error_code='atomic_work_blocked',action='not_started',outcome='preflight_failed',resources_settled_at=? where id=?",
+                     (failed_source.time(), call))
+    original, = api.logs_selected({"latest": [], "ids": [call]})
+    linked_reader(monkeypatch, original)
+    path = Path(os.environ["POISE_DB"]).parent / "incident-recovery" / f"failed-source-{call}-{RUN}.json"
+    path.unlink()
+    os.mkfifo(path)
+
+    def _hung(*args):
+        raise AssertionError("inspect blocked on FIFO evidence instead of returning unavailable")
+
+    previous = signal.signal(signal.SIGALRM, _hung)
+    signal.alarm(10)
+    try:
+        assert failed_source.inspect(api.DB, call, candidate, RUN)["status"] == "unavailable"
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)

@@ -438,6 +438,8 @@ async function main(args) {
       if (failure) die(failure.message, failure.code)
       else if (exitCode === null) die('the connection to the test relay ended before the suite did')
       else {
+        // The suite has its result; its budget must not replace it during source capture.
+        clearTimeout(deadline)
         if (exitCode > 0 && process.env.AGENT_INTERFACE_FAILED_SOURCE_CALL) {
           // Read the archive that was actually sent, while it still exists. A later
           // edit under the same HEAD must never replace this validation's source.

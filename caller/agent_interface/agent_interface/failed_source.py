@@ -237,7 +237,7 @@ def inspect(database: Path, call_id: str, candidate: str, run: str) -> dict:
             return unavailable
         fd = _directory()
         name = f"failed-source-{call_id}-{run}.json"
-        with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), "rb") as source_file:
+        with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), "rb") as source_file:
             node = os.fstat(source_file.fileno())
             if not stat.S_ISREG(node.st_mode) or node.st_uid != os.getuid() or node.st_mode & 0o077 \
                     or node.st_size > MAX_BYTES or node.st_size != metadata.get("bytes"):
