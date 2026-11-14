@@ -236,15 +236,20 @@ def _ci_only_blocker(ci: object, queue: dict, head: str, actor: str) -> object:
             or len(parents) < 2 or head not in parents[1:] or not re.fullmatch(r"[0-9a-f]{40}", str(parents[0])):
         raise AtomicWorkFailed("CI blocker integration does not contain the admitted candidate and base")
     failures = []
+    verified: set[tuple[int, str]] = set()
+    pending = []
     for check in packet.get("failing", []):
         run = next((run for run in packet.get("runs", []) if run.get("id") == check.get("run_id")), None)
+        if check.get("state") != "completed":
+            pending.append((check, run))
+            continue
         if check.get("type") != "check_run" or check.get("head_sha") != integration or check.get("state") != "completed" \
                 or check.get("conclusion") not in {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"} \
                 or not check.get("name") or not check.get("url") or not run or run.get("head_sha") != integration \
                 or run.get("event") != "merge_group" \
                 or any(type(value) is not int or value < 1 for value in
                        (check.get("check_run_id"), check.get("log_id"), run.get("id"), run.get("workflow_id"), run.get("run_attempt"))):
-            return blocker  # Unknown or pending obligations cannot authorize recovery.
+            return blocker  # Unknown obligations cannot authorize recovery.
         attempt = run["run_attempt"]
         rerun_finished = run.get("status") == "completed" and run.get("conclusion") == "success"
         rerun_running = isinstance(run.get("status"), str) and run.get("status") != "completed" and attempt > 1
@@ -257,6 +262,19 @@ def _ci_only_blocker(ci: object, queue: dict, head: str, actor: str) -> object:
             attempt -= 1
         failures.append({"name": check["name"], "check": check["check_run_id"], "job": check["log_id"],
                          "run": run["id"], "workflow": run["workflow_id"], "attempt": attempt, "url": check["url"]})
+        verified.add((run["workflow_id"], check["name"]))
+    for check, run in pending:
+        if not isinstance(check, dict) or check.get("type") != "check_run" or check.get("head_sha") != integration \
+                or not isinstance(check.get("state"), str) or check.get("state") == "completed" \
+                or check.get("conclusion") is not None or not check.get("name") or not check.get("url") \
+                or not run or run.get("head_sha") != integration or run.get("event") != "merge_group" \
+                or any(type(value) is not int or value < 1 for value in
+                       (check.get("check_run_id"), check.get("log_id"), run.get("id"), run.get("workflow_id"), run.get("run_attempt"))):
+            return blocker  # Unknown or malformed pending obligations cannot authorize recovery.
+        if (run["workflow_id"], check["name"]) not in verified:
+            return blocker  # A pending distinct obligation leaves the original failure set unknown.
+        # A pending rerun of a verified failure keeps the original
+        # evidence; recovery waits for its later result.
     if failures:
         blocker["queue"] = {"removal": removal["id"], "integration": integration, "base": parents[0], "failures": failures}
     return blocker
@@ -436,8 +454,11 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                             dependency = _verify_ci_dependency(publication["ciDependency"], repo, pull, expected_head or "", actor, evidence["queue"])
                             if dependency["remediation"] in {f"https://github.com/{repo}/issues/{number}", f"https://github.com/{repo}/pull/{pull}"}:
                                 raise AtomicWorkFailed("CI dependency cannot use its own repair as the external remediation")
-                            blocker["ci_dependency"] = {**dependency, "failures": [
-                                {key: value for key, value in failure.items() if key != "evidence"} for failure in dependency["failures"]]}
+                            if dependency.get("allShared") is True:
+                                blocker["ci_dependency"] = {**dependency, "failures": [
+                                    {key: value for key, value in failure.items() if key != "evidence"} for failure in dependency["failures"]]}
+                            # A partial proof cannot grant baseline recovery; the
+                            # retained queue failures still allow integration recovery.
                     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
                         raise AtomicWorkBlocked(f"{blocked['reason']}; authoritative queue CI evidence is unavailable: {error}") from error
                     record({"phase": "executing", "prepared": prepared, "ci_blocker": blocker})
