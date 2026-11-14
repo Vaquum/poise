@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
-import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { BehaviorChainRuntime, ReviewScopeIndexingError, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { behaviorChainAttention, behaviorChainSummary, CHAIN_ATTENTION_DELAY_MS, chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
@@ -945,6 +945,43 @@ describe('native admission and recovery', () => {
     expect(journal.read(chain.id)).toEqual(restarted.read(chain.id))
     expect(journal.history(chain.id)).toEqual(history)
     expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe('pull request is a draft')
+  })
+
+  it('records one fresh indexing wait after Hold and Resume while PR scope stays unindexed', async () => {
+    const { db, journal, chain } = setup()
+    const reason = `Repair report review awaits indexed PR closing references for ${chain.repository}#21`
+    const request = vi.fn<ChainRuntimeOperations['request']>(async () => { throw new ReviewScopeIndexingError(chain.repository, 21) })
+    const launch = vi.fn<ChainRuntimeOperations['launch']>(async () => true)
+    const ops = operations({ request, launch })
+    const waits = () => journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'chain.waiting')
+    await new BehaviorChainRuntime(journal, ops).run()
+    const firstWait = waits()[0]
+    expect(JSON.parse(firstWait.payload)).toEqual({ type: 'chain.waiting', reason })
+    let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
+    current = record(journal, current, { type: 'chain.resumed' })
+    expect(current.waiting).toBe(reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+    const restarted = new BehaviorChainJournal(db); restarted.rebuild()
+    expect(restarted.read(chain.id)).toEqual(current)
+
+    const runtime = new BehaviorChainRuntime(restarted, ops)
+    await runtime.run()
+    expect(waits()).toHaveLength(2)
+    expect(waits()[0]).toEqual(firstWait)
+    expect(waits()[1].payload).toBe(firstWait.payload)
+    expect(waits()[1].sequence).toBeGreaterThan(current.resumedAfterSequence)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
+    await runtime.run()
+    await new BehaviorChainRuntime(restarted, ops).run()
+    expect(waits()).toHaveLength(2)
+    expect(request).toHaveBeenCalled()
+    expect(journal.read(chain.id)!.invocations).toHaveLength(0)
+    expect(launch).not.toHaveBeenCalled()
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(restarted.read(chain.id))
+    expect(journal.history(chain.id)).toEqual(history)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
   })
 
   it('recovers a review only with its retained substantive response and preserves its original completion time', async () => {

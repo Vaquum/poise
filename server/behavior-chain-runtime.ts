@@ -586,7 +586,7 @@ export class BehaviorChainRuntime {
                   if (firstWait !== undefined && Date.now() - firstWait > DATASTORE_MAX_AGE_SECONDS * 1000) {
                     throw new Error(`${error.message}; indexing delay exceeds ${DATASTORE_MAX_AGE_SECONDS} seconds`)
                   }
-                  if (chain.waiting !== error.message) this.append(chain, { type: 'chain.waiting', reason: error.message })
+                  if (this.renewsWait(chain, error.message)) this.append(chain, { type: 'chain.waiting', reason: error.message })
                   continue
                 }
                 if (!request) {
