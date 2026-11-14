@@ -330,6 +330,10 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     && row.runner == null && row.review_id == null && row.review_comments == null && row.receipts == null && row.response == null
     && artifact !== null && typeof artifact === 'object' && !Array.isArray(artifact)
     && (artifact as Record<string, unknown>).phase === 'admission_fenced' && Object.keys(artifact).length === 1
+  const closedIssueReview = issueReview && source?.startsWith('poise:') && errorCode === 'review_target_closed'
+    && headSha === null && expectedHead === null && row.review_id == null && row.review_comments == null && row.receipts == null
+    && (artifact === null ? source !== 'poise:behavior-chain' : (artifact as Record<string, unknown>).phase === 'reviewing'
+      && !(artifact as Record<string, unknown>).plan_sha)
   if (!LOG_CALL_ID.test(id)
     || (prId !== null && !LOG_PR_ID.test(prId))
     || (repo !== null && !LOG_REPO.test(repo))
@@ -384,7 +388,7 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
       throw new Error(`agent-interface log row ${index} has no terminal error`)
     }
     if (status === 'superseded' && !closedFence
-      && (!completedAt || outcome !== 'superseded' || !headSha || action !== null)) {
+      && (!completedAt || outcome !== 'superseded' || !headSha && !closedIssueReview || action !== null)) {
       throw new Error(`agent-interface log row ${index} has incomplete superseded outcome`)
     }
   }
