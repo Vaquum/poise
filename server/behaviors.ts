@@ -2,6 +2,7 @@ import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-cont
 import { diagnostic, diagnosticFailure, loggingWorkspace } from './logging'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { parseAgentLogList } from './agent-log-parse'
+import { parseProcessDiagnostic } from './process-diagnostic'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
 import { behaviorChainForPull, behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
@@ -6374,6 +6375,23 @@ function retireClosedQueueAdmissions(open: ReadonlySet<string>): void {
   }
 }
 
+function branchUpdateFailureDiagnostic(error: unknown) {
+  const failure = error as { code?: unknown; signal?: unknown; killed?: unknown; stderr?: unknown } | null
+  // A last-seen stage cannot prove that a killed process never reached the PUT.
+  if (failure?.code !== 1 || failure.signal != null || failure.killed === true || typeof failure.stderr !== 'string') return null
+  const prefix = 'caller_diagnostic: '
+  const line = failure.stderr.trim()
+  if (!line.startsWith(prefix) || Buffer.byteLength(line) > 64 * 1024) return null
+  try {
+    const evidence = parseProcessDiagnostic(JSON.parse(line.slice(prefix.length)))
+    return evidence?.operation === 'update_branch_if_behind'
+      && ['read_pull', 'read_readiness', 'recheck_pull', 'update_branch'].includes(evidence.phase) ? evidence : null
+  } catch {
+    // Unreadable terminal evidence leaves the original process failure unknown.
+    return null
+  }
+}
+
 async function tickMergePrs(): Promise<void> {
   if (!isEnabled('merge-prs')) return
   const author = getMeta('me') || ''
@@ -6570,10 +6588,11 @@ async function tickMergePrs(): Promise<void> {
       source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
       actor, repository: updatePr.repo, number: updatePr.number, head: expectedHead, startedAt: new Date().toISOString() })
     updatePhase = 'command'
-    const { stdout } = await runFile(GH_INTERFACE, [
+    const { stdout } = await withNoticeDiagnosticIdentity({ correlationId: updateRunId, behavior: 'merge-prs',
+      repository: updatePr.repo, target: updateTarget, account: actor, phase: updatePhase, expectedHead }, () => runFile(GH_INTERFACE, [
       '--update-branch-if-behind', `#${updatePr.number}`, '--expected-head', expectedHead,
       '--author', updatePr.author, '--token-user', actor,
-    ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false })
+    ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false }))
     updatePhase = 'validation'
     const result = objectValue(parseJson(stdout, 'github-interface --update-branch-if-behind'), 'update-branch-if-behind')
     if (result.action !== 'update_branch_if_behind' || result.repository !== updatePr.repo
@@ -6594,20 +6613,31 @@ async function tickMergePrs(): Promise<void> {
     }
     clearBehaviorFailure('merge-prs', updateTarget, actor)
   } catch (error) {
+    const evidence = updatePhase === 'command' ? branchUpdateFailureDiagnostic(error) : null
+    const readOnly = evidence?.context.submission === 'none' && evidence.outcome === 'failed'
+      && ['read_pull', 'read_readiness', 'recheck_pull'].includes(evidence.phase)
     let retry: BehaviorFailureState | null = null
+    let safeRetry = false
     try {
       if (updateRunId) {
-        captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
-        updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${update.head ?? 'unknown'} op=update-branch-if-behind error=${behaviorErrorMessage(error)}`
+        updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${update.head ?? 'unknown'} op=update-branch-if-behind phase=${evidence?.phase ?? updatePhase} side_effects=${readOnly ? 'none' : 'uncertain'} error=${behaviorErrorMessage(error)}`
+        captureBehaviorOutcome({ nativeId: updateRunId, state: readOnly ? 'failed' : 'unknown',
+          activity: readOnly ? 'settled' : 'unknown', stateSource: 'native',
+          ...(readOnly ? { outcome: 'read_failed', completedAt: new Date().toISOString() } : {}) })
       }
       if (behaviorAborted()) return
       recordBehaviorFailure('merge-prs', 'operation', error, updateTarget, { actingAccount: actor })
       retry = getBehaviorFailureState('merge-prs', updateTarget)
+      safeRetry = readOnly && retry?.kind === 'operation' && retry.correlationId === updateNativeId
+        && Date.parse(retry.nextRetryAt) > Date.now()
+        && ['rate_limit', 'upstream_unavailable', 'network_interruption'].includes(retry.diagnostic?.code ?? '')
+        && isRunnable('merge-prs') && !behaviorAborted() && stillEligible('merge-prs', updatePr, actor)
     } finally {
       diagnosticFailure('github-interface.update-branch-if-behind', error, {
         behavior: 'merge-prs', repository: updatePr.repo, target: updateTarget, account: actor, correlationId: updateNativeId,
-        primitive: 'update-branch-if-behind', nativeId: updateNativeId, phase: updatePhase, timeoutMs: 30_000, retry,
-      })
+        primitive: 'update-branch-if-behind', nativeId: updateNativeId, phase: evidence?.phase ?? updatePhase,
+        timeoutMs: 30_000, sideEffects: readOnly ? 'none' : 'uncertain', retry, safeRetry,
+      }, { level: safeRetry ? 'warning' : 'error' })
     }
   } finally {
     if (updateRunId) finishDirectBehaviorRun(updateRunId, false, null, updateRunNote ?? undefined)
