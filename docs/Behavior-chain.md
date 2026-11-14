@@ -152,6 +152,16 @@ API summaries include nullable `reviewPending` and `reviewStatus` (`pending`,
 `complete`, `not-recorded`). Older merges without an explicit review verdict
 stay not-recorded; they acquire neither fabricated proof nor a new obligation.
 These fields are projections, never normalized into historical reducer state.
+Merged list and detail reads also expose `mergedReviewWarning` when the original
+head, context and reviewer panel prove completed pre-merge native responses but
+no response qualifies under the native favorable-review check. Observe → Tasks
+retains the merge and completed review status, and shows the unmet clearance,
+retained changes-requested verdicts and review links. A separately verified later
+GitHub approval includes its head, submission time and link; its submitting client
+remains unknown. A qualifying native approval before merge clears this diagnosis;
+a post-merge submission cannot. Missing or contradictory original evidence leaves
+the diagnosis unproven (`null`). The projection uses full canonical history,
+survives observation expiry and rebuild, and grants no execution authority.
 A confirmed merge remains visible alongside any hold or uncertain invocation.
 List and detail summaries omit the superseded native merge queue wait only when
 the canonical merge SHA is recorded. Other waits and pending original evidence
