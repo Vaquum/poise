@@ -1778,6 +1778,113 @@ it('reports mixed native PR review timeouts after Resume once across observation
   expect(journal.read(source.id)).toMatchObject({ held: source.held, resumedAfterSequence: resumed.sequence, invocations: source.invocations })
 })
 
+it.each([
+  { code: 'review_provider_exit', position: 0 },
+  { code: 'review_provider_exit', position: 2 },
+  { code: 'authentication_failed', position: 0 },
+  { code: 'authentication_failed', position: 2 },
+])('reports mixed PR review timeouts with $code at position $position once across restart', async ({ code, position }) => {
+  const root = mkdtempSync(join(tmpdir(), 'mixed-review-report-')); roots.push(root)
+  const path = join(root, 'journal.sqlite')
+  const initial = setup(path)
+  type ReviewFailure = Pick<LogEntry, 'error' | 'error_code' | 'diagnostic'> & { callId: string }
+  const fileGroup: ReviewFailure = { callId: '4672ce8cf3384703881e05bf08d9d5ed', error_code: 'review_budget_exhausted',
+    error: 'Review file-group time limit reached; incomplete analysis; reduce the review scope',
+    diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'file_group',
+      outcome: 'timed_out', stderr: '', stderr_truncated: false,
+      context: { submission: 'none', timeout_seconds: 60 }, filesystem: null } }
+  const overall: ReviewFailure = { callId: '5bfab39a3e9e46978b36f0a728385a33', error_code: 'review_budget_exhausted',
+    error: 'Review reached its total time limit; needs attention',
+    diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'overall',
+      outcome: 'timed_out', stderr: '', stderr_truncated: false,
+      context: { submission: 'none', timeout_seconds: 1413 }, filesystem: null } }
+  const provider: ReviewFailure = { callId: 'd16f8f29e3a44fac8b72674e8e3ec23e', error_code: code,
+    error: code === 'review_provider_exit' ? 'codex review failed: refresh rejected' : 'Codex refresh token was already used',
+    diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'provider_execution',
+      outcome: 'exit', stderr: code === 'review_provider_exit' ? 'codex review failed: refresh rejected' : 'Codex refresh token was already used',
+      stderr_truncated: false, context: { submission: 'none', exit_code: 1 }, filesystem: null } }
+  const timeouts = [fileGroup, overall]
+  const failures = position === 0 ? [provider, ...timeouts] : [...timeouts, provider]
+  const source = await exhaustedReviews(initial.journal, failures)
+  expect(source.invocations).toHaveLength(3)
+  const overrides = { observe: async () => ({ ...fresh, checkedAt: Date.now() }) }
+  const runtime = new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal, overrides))
+  await runtime.run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0].title).toBe('fix: PR review exhausted its time limits for #21')
+  expect(remote[0].body).toContain(`hold event ${source.sequence}; head ${HEAD}; basis ${source.invocations[0].basis}; slot primary`)
+  const expectedCauses = position === 0 ? `${code} or review_budget_exhausted` : `review_budget_exhausted or ${code}`
+  expect(remote[0].body).toContain(`Cause: ${expectedCauses}.`)
+  expect(remote[0].body).toContain('Last timeout phase: overall; terminal attempt: '
+    + (position === 0 ? 'review_budget_exhausted' : code) + '.')
+  for (const [index, invocation] of source.invocations.entries()) {
+    const line = remote[0].body.split('\n').find(line => line.startsWith(`- Invocation ${invocation.id};`))!
+    expect(line).toContain(`Caller ${failures[index].callId}`)
+    expect(line).toContain(`error_code=${failures[index].error_code}`)
+    const expected = failures[index] === provider
+      ? 'operation=provider.review; phase=provider_execution; timeout_seconds=unknown'
+      : failures[index] === fileGroup
+        ? 'operation=provider.review; phase=file_group; timeout_seconds=60'
+        : 'operation=provider.review; phase=overall; timeout_seconds=1413'
+    expect(line).toContain(expected)
+  }
+  for (const failure of failures) expect(remote[0].body).not.toContain(failure.error)
+  expect(remote[0].body).not.toMatch(/\/private\/work|refresh token was already used: .*token/i)
+  expect(remote[0].body).toContain(`<!-- poise-repair-exhaustion:${chainBasis(['review_budget_exhausted', source.id, 21])} -->`)
+  expect(remote[0].body).toContain('does not recover review or relax any review, admission or merge gate')
+  expect(initial.journal.read(source.id)).toMatchObject({ held: source.held, invocations: source.invocations })
+  vi.setSystemTime(Date.now() + 86_400_000)
+  await runtime.run()
+  initial.db.close(); databases.splice(databases.indexOf(initial.db), 1)
+  const { db, journal } = setup(path)
+  journal.rebuild()
+  vi.setSystemTime(Date.now() + 86_400_000)
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  expect(posts()).toHaveLength(1)
+  expect(reports(db)).toHaveLength(1)
+  expect(journal.read(source.id)).toMatchObject({ held: source.held, invocations: source.invocations })
+})
+
+it.each(['operator hold', 'changed basis', 'provider-only', 'submitting_review provider', 'provider receipt',
+  'other provider code', 'missing provider diagnostic', 'missing submission'])(
+  'does not report mixed PR review exhaustion with %s', async change => {
+    const { db, journal } = setup()
+    type ReviewFailure = Pick<LogEntry, 'error' | 'error_code' | 'diagnostic'> & { callId: string }
+    const timeout = (callId: string, phase: string, timeout_seconds: number): ReviewFailure => ({ callId,
+      error_code: 'review_budget_exhausted', error: phase === 'file_group'
+        ? 'Review file-group time limit reached; incomplete analysis; reduce the review scope'
+        : 'Review reached its total time limit; needs attention',
+      diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase,
+        outcome: 'timed_out', stderr: '', stderr_truncated: false,
+        context: { submission: 'none', timeout_seconds }, filesystem: null } })
+    const providerFailure = (error_code: string, callId = 'd16f8f29e3a44fac8b72674e8e3ec23e'): ReviewFailure => ({ callId, error_code,
+      error: error_code === 'review_provider_exit' ? 'codex review failed: refresh rejected' : 'Codex refresh token was already used',
+      diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'provider_execution',
+        outcome: 'exit', stderr: 'provider rejected the review', stderr_truncated: false,
+        context: { submission: 'none', exit_code: 1 }, filesystem: null } })
+    const failures = change === 'provider-only'
+      ? [providerFailure('review_provider_exit', 'd16f8f29e3a44fac8b72674e8e3ec23e'),
+        providerFailure('authentication_failed', '4672ce8cf3384703881e05bf08d9d5ed'),
+        providerFailure('review_provider_exit', '5bfab39a3e9e46978b36f0a728385a33')]
+      : [providerFailure('review_provider_exit'), timeout('4672ce8cf3384703881e05bf08d9d5ed', 'file_group', 60),
+        timeout('5bfab39a3e9e46978b36f0a728385a33', 'overall', 1413)]
+    let held = await exhaustedReviews(journal, failures)
+    if (change === 'operator hold') held = record(journal, held, { type: 'chain.held', reason: 'New invocations held by the person' })
+    const chain = structuredClone(held)
+    chain.observation = structuredClone(fresh)
+    const provider = chain.invocations[change === 'provider-only' ? 1 : 0]
+    if (change === 'changed basis') fresh.pull!.reviewContext = chainBasis('edited title, body or base')
+    if (change === 'submitting_review provider') provider.evidence!.artifact = { phase: 'submitting_review', expected_head: HEAD }
+    if (change === 'provider receipt') provider.evidence!.review_id = 123
+    if (change === 'other provider code') provider.evidence!.error_code = 'review_provider_error'
+    if (change === 'missing provider diagnostic') provider.evidence!.diagnostic = null
+    if (change === 'missing submission') (provider.evidence!.diagnostic as { context: { submission: string } }).context.submission = 'uncertain'
+    await operations(db, journal).reportHold!(chain)
+    expect(posts()).toHaveLength(0)
+    expect(reports(db)).toHaveLength(0)
+    expect(journal.read(chain.id)?.held).toBe(chain.held)
+  })
+
 it.each(['incomplete replies', 'execution budget', 'review budget', 'implementation hold'])('carries the recorded %s report policy only to its closing remediation PR', async mode => {
   const { db, journal } = setup()
   if (mode === 'implementation hold') {

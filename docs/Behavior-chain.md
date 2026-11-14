@@ -834,18 +834,29 @@ admissions by the reviewer account, pinned with `--expected-head`. Their basis
 includes `reviewContext` (base SHA, title and body), distinct from repair's
 `reviewRevision`. Each original receipt must retain the pre-submission `reviewing`
 phase and one of those timeout codes; differing raw messages do not change their
-typed causes. Each report lists the original code for every attempt and bounded
-diagnostic operation, phase and timeout in seconds where retained. Missing step
-evidence stays unknown; raw errors, paths and inspection arguments are excluded.
-Both codes reuse the existing review report intent and marker. `submitting_review`
-cannot prove no action even without a returned review ID.
+typed causes. An automatic three-attempt hold with exactly two of those timeout
+receipts and one `review_provider_exit` or `authentication_failed` receipt on the
+same head, basis and slot also qualifies, in any order, when the provider receipt
+retains the same `reviewing` phase, no-submission proof and a structured diagnostic
+with `submission=none`. The mixed report reuses the same review intent, marker and
+title, lists every original code with bounded operation, phase and timeout, names
+the last timeout's diagnostic phase and the terminal attempt separately, preserves
+the source hold and grants no retry or recovery authority. Each report lists the
+original code for every attempt and bounded diagnostic operation, phase and timeout
+in seconds where retained. Missing step evidence stays unknown; raw errors, paths
+and inspection arguments are excluded. All three codes reuse the existing review
+report intent and marker. `submitting_review` cannot prove no action even without
+a returned review ID.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads or PR review contexts leave reporting pending,
 including title, body or base changes on an unchanged head. Other causes remain
-visible in their ordinary holds without an issue report; mixed repair causes or
-review causes outside these two timeouts cannot qualify. Closed or merged targets
-remain ineligible for a new review exhaustion report.
+visible in their ordinary holds without an issue report; mixed repair causes,
+provider-only review episodes, other provider codes, or review causes outside
+these two timeouts and the mixed provider pair cannot qualify. Operator or
+ambiguous holds cannot qualify; only the automatic three-attempt hold on the same
+basis reports. Closed or merged targets remain ineligible for a new review
+exhaustion report.
 Revoking repository scope during verification prevents publication and leaves the
 creation intent unconsumed, so re-enabling can still report once.
 
