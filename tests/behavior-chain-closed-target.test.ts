@@ -64,6 +64,26 @@ function setup(behavior: ChainBehavior | null = 'repair-pr', started = false) {
   return { db, journal, chain, calls, operations, forbidden, fenceClosedTarget }
 }
 
+it('accepts only unattempted managed issue reviews superseded by closure without a PR head', () => {
+  const closed = { ...completedReviewCall('aaa/repo', 7, HEAD, 'reviewer'), behavior: 'issue_review', head_sha: null,
+    expected_head: null, status: 'superseded', outcome: 'superseded', error_code: 'review_target_closed',
+    action: null, receipts: null, review_id: null, review_comments: null }
+  const parse = (row: Record<string, unknown>) => parseAgentLogStdout(JSON.stringify([row]), 'closed issue review')
+  for (const source of ['poise:review-new-issues', 'poise:behavior-chain']) {
+    const row = { ...closed, source, artifact: source === 'poise:behavior-chain' ? { phase: 'reviewing' } : null }
+    expect(parse(row)).toMatchObject({ entries: [{ status: 'superseded', head_sha: null }], quarantined: [] })
+    for (const change of [{ receipts: [] }, { review_id: 7 }, { review_comments: 1 }, { expected_head: HEAD },
+      { error_code: null }, { action: 'not_started' }, { outcome: 'target_closed' }, { completed_at: null },
+      { artifact: { phase: 'posting_issue_reviews', plan_sha: 'b'.repeat(64) } },
+      { artifact: { phase: 'reviewing', plan_sha: 'b'.repeat(64) } }]) {
+      expect(parse({ ...row, ...change })).toMatchObject({ entries: [], quarantined: [expect.anything()] })
+    }
+  }
+  for (const change of [{ source: 'poise:behavior-chain', artifact: null }, { behavior: 'pr_review', expected_head: HEAD }]) {
+    expect(parse({ ...closed, ...change })).toMatchObject({ entries: [], quarantined: [expect.anything()] })
+  }
+})
+
 it.each(['repair-pr', 'review-pr', 'approve-pr', 'review-issue', 'implement-issue'] as const)(
   'settles an admitted %s on a merged target before any worker start, even while paused', async behavior => {
     const { journal, chain, operations, forbidden, fenceClosedTarget } = setup(behavior)

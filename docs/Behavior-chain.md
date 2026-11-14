@@ -392,7 +392,7 @@ must show no pushed branch, PR or competing work; this is checked again after
 provider preparation at admission.
 
 When the original assertion run did not finish, a saved automatic implementation
-hold report can instead authorize one fresh clean-base recheck. Its saved source,
+hold report can instead authorize a fresh clean-base recheck. Its saved source,
 Call, implementation basis/slot and hold sequence must still match the current
 failed-before-publication receipt and released resources. The current report and
 its author/reviewer comments identify a unique delivered remediation of the named
@@ -413,17 +413,20 @@ observation on both bases. A passing old case cannot prove a shared failure.
 
 The existing report saves `running` intent before checkout or execution. The
 bounded recheck runs outside the observation sweep, retaining its result without
-resuming the source. Release switching counts it as background work; shutdown
-waits through cleanup and result persistence. Sequential sweeps can observe and
-advance unrelated chains while it runs. Restart, repeated observations, an
-interrupted attempt or a newer base
-cannot relaunch that recheck. Checkout and each dependency install have a
-120-second bound, each suite a 90-second bound, and Git reads a 30-second bound;
+resuming the source. Release switching counts it as background work. Shutdown
+cancels the running command and waits for cleanup and result persistence.
+Sequential sweeps recheck a running source on the two-minute cadence and can
+advance unrelated chains while it runs. Restart and repeated observations do
+not rerun an interrupted or failed recheck or reuse a pass for a different
+base. If the base advances after a passing recheck, a later sweep can check
+the new base once the same remediation is verified on it. Checkout and each
+dependency install have a 120-second bound, each suite a 90-second bound,
+and Git reads a 30-second bound;
 suites use one worker without retries. An unverified correction or failed recheck
 states its blocker on the existing hold. A later sweep freshly verifies a saved
-pass before feeding the same single-retry admission below, with source,
-publication, resources, controls and
-the pinned corrected base checked again after preparation. The new implementation
+pass before feeding the same single-retry admission below. After preparation it
+checks source, publication, resources, controls and the pinned corrected base.
+The new implementation
 still runs normal full required validation, review and CI.
 
 The automatic hold carries its original journal sequence. An operator Hold,

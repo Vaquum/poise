@@ -1606,7 +1606,7 @@ inventory independently of candidate-controlled reports.
 The journal admits one fresh implementation for that automatic hold and recovery
 commit, independently of report publishing. An incomplete original assertion can
 instead use the saved automatic hold report and linked delivered fixture fix for
-one persisted clean-base recheck, requiring reproduction on the old base and an
+a persisted clean-base recheck, requiring reproduction on the old base and an
 executed pass on the corrected base. Execution and result persistence run outside
 the observation sweep under the existing release/shutdown background barrier;
 a later sweep freshly verifies the saved pass. This uses the same single-retry
@@ -1675,6 +1675,10 @@ Poise's existing log decoder validates the fence's exact terminal no-effect
 shape and native resource-release timestamp before the journal can settle its
 reservation. Closed-target native resource waits are separate from public
 GitHub recheck times; unrelated open-PR review/approval stays eligible.
+An in-flight managed issue review whose final live seed read observes closure
+settles superseded without a PR head or publication plan. The reader accepts this
+unattempted receipt while retaining its original resource-release requirement;
+[Issue review](Issue-review.md) defines the publication race and reconciliation.
 Managed native admissions recheck the bounded receipt reader at their final
 launch, action and publication boundaries. Its independent diagnostics retain
 the first typed SQLite cause and affected workspace; confirmed integrity failure

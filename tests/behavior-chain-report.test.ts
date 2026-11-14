@@ -490,13 +490,17 @@ it.each([false, true])('runs independent pinned clean bases and rejects an unrep
 
 it.each(['recover', 'memory recovery', 'restart during recheck', 'failed recheck', 'interrupted recheck', 'operator hold', 'changed source',
   'ineligible', 'closed source', 'unsettled resources', 'possible publication', 'branch', 'PR', 'competing work',
-  'changed during recheck', 'changed after recheck', 'changed during preparation', 'missing review'])(
+  'changed during recheck', 'changed after recheck', 'restart before admission', 'changed during preparation', 'missing review',
+  'base advances during recheck', 'base advances before admission', 'remedy is unverified on new base', 'recheck fails on new base'])(
   'revalidates the persisted #1778/#1782 incident once through normal admission: %s', async mode => {
     const { db, journal } = setup()
     mocks.accounts = { me: 'mikkokotila', agentAccount: 'bit-mis' }
     const memory = mode === 'memory recovery', number = memory ? 1754 : 1778, reportNumber = memory ? 99 : 1782, remedy = memory ? 1747 : 1765
     const repository = 'autonomio/poise', id = `${repository}#${number}`, call = memory ? 'f'.repeat(32) : '15b20584dcea402faeb94959a0e7f699'
     const old = 'd45773e5250787a9c6c6efea1fa320f986145237', base = 'e'.repeat(40), merge = 'c'.repeat(40)
+    const nextBase = 'f'.repeat(40)
+    const advancesDuringRecheck = ['base advances during recheck', 'remedy is unverified on new base', 'recheck fails on new base'].includes(mode)
+    const restartsBeforeAdmission = ['restart before admission', 'base advances during recheck', 'base advances before admission'].includes(mode)
     const test = 'a suite on a test box > ' + (memory ? 'keeps memory warnings correlatable without logging command bodies with base service null'
       : 'recovers mid-suite when only one suite may run')
     const blocker = memory ? `atomic behavior blocked: npm run check first failed at tests/test-offload.test.ts > ${test} (tests/test-offload.test.ts:2055): Test timed out in 20000ms.` : INCIDENT_1778
@@ -527,7 +531,8 @@ it.each(['recover', 'memory recovery', 'restart during recheck', 'failed recheck
       const number = Number(argv[1]), delivery = argv.includes('--delivery-base')
       return { stderr: '', stdout: JSON.stringify({ repository, issue_number: number,
         ...(argv[0] === '--issue-comments' ? { comments: [{ author: 'bit-mis', body: `#${remedy} owns that test; use its existing repair.` }] }
-          : delivery ? { verified: number === remedy, base_sha: base, merge_sha: merge }
+          : delivery ? { verified: number === remedy && !(mode === 'remedy is unverified on new base' && obs.prerequisites.base === nextBase),
+            base_sha: obs.prerequisites.base, merge_sha: merge }
             : { issue: { body: number === reportNumber
               ? `<!-- poise-repair-exhaustion:${key} -->\nSource: ${id}; hold event ${holdSequence}; basis ${basis}; slot primary.\n${blocker}\nCaller ${call}`
               : 'tests/test-offload.test.ts: ' + (memory ? 'keeps memory warnings correlatable without logging command bodies'
@@ -536,12 +541,13 @@ it.each(['recover', 'memory recovery', 'restart during recheck', 'failed recheck
     let finishRecheck!: () => void
     const recheckGate = new Promise<void>(resolve => { finishRecheck = resolve })
     mocks.recheck.mockReset()
-    mocks.recheck.mockImplementation(async () => {
+    mocks.recheck.mockImplementation(async (_repository, _actor, _old, checkedBase) => {
       await recheckGate
-      if (mode === 'failed recheck') throw new Error('old-base recheck passed; shared failure was not reproduced')
+      if (advancesDuringRecheck && checkedBase === base) obs.prerequisites.base = nextBase
+      if (mode === 'failed recheck' || mode === 'recheck fails on new base' && checkedBase === nextBase) throw new Error('old-base recheck passed; shared failure was not reproduced')
       if (mode === 'changed during recheck') record(journal, journal.read(id)!, { type: 'chain.held', reason: INCIDENT_1778 })
       return { old: { base: old, tests: [test], failure: 'AssertionError: expected stdout to contain two started lines' },
-        current: { base, tests: memory ? ['node', 'sh', 'npm run check'].map(command => `${test} and command ${command}`) : [test] },
+        current: { base: checkedBase, tests: memory ? ['node', 'sh', 'npm run check'].map(command => `${test} and command ${command}`) : [test] },
         condition: memory ? '6650 ms before each memory-warning command' : '750 ms after first output, before relay interruption' }
     })
     if (mode === 'interrupted recheck') db.prepare('UPDATE meta SET value=? WHERE key=?').run(JSON.stringify({ ...report,
@@ -554,11 +560,17 @@ it.each(['recover', 'memory recovery', 'restart during recheck', 'failed recheck
     if (mode === 'PR') obs.publication.pull_number = 1871
     if (mode === 'competing work') obs.existingPulls = ['https://github.com/autonomio/poise/pull/1871']
     if (mode === 'missing review') obs.issueReviewers = [reviewer]
-    const launch = vi.fn(async () => true)
+    let permitted = !restartsBeforeAdmission
+    const launch = vi.fn(async (invocation: BehaviorChain['invocations'][number]) => {
+      if (invocation.basis === basis && (advancesDuringRecheck || mode === 'base advances before admission')) {
+        expect(journal.read(id)?.observation?.testDependency).toMatchObject({ recovery: { base: nextBase, merge } })
+      }
+      return true
+    })
     const observe = vi.fn(async (current: BehaviorChain) => ({ ...structuredClone(current.id === id ? obs
       : { ...unpublished(), prerequisites: { wait: null, base, evidence: [] } }), checkedAt: Date.now() }))
     const ops = operations(db, journal, { accounts: () => ({ author: 'mikkokotila', reviewer: 'bit-mis' }), discover: async () => [],
-      available: () => true, permitted: (_chain, decision) => decision.behavior === 'implement-issue', observe,
+      available: () => true, permitted: (_chain, decision) => permitted && decision.behavior === 'implement-issue', observe,
       launch, request: async () => {
         if (mode === 'changed during preparation') obs.existingPulls = ['https://github.com/autonomio/poise/pull/1871']
         return { command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] }
@@ -571,7 +583,8 @@ it.each(['recover', 'memory recovery', 'restart during recheck', 'failed recheck
       await vi.waitFor(() => expect(swept).toBe(true))
       expect(launch).not.toHaveBeenCalled()
       if (!['unsettled resources', 'possible publication'].includes(mode)) expect(journal.read(id)?.invocations).toEqual([original])
-      const rechecked = ['recover', 'memory recovery', 'restart during recheck', 'failed recheck', 'changed during recheck',
+      const rechecked = restartsBeforeAdmission || advancesDuringRecheck
+        || ['recover', 'memory recovery', 'restart during recheck', 'failed recheck', 'changed during recheck',
         'changed after recheck', 'changed during preparation', 'missing review'].includes(mode)
       expect(mocks.recheck).toHaveBeenCalledTimes(rechecked ? 1 : 0)
       expect(releaseBackgroundBusy()).toBe(rechecked ? 1 : 0)
@@ -582,7 +595,9 @@ it.each(['recover', 'memory recovery', 'restart during recheck', 'failed recheck
         journal.append(unrelated, 'unrelated', 0, { type: 'chain.admitted', repository, issue: 2000,
           branch: 'poise/issue-2000', author: chain.author, reviewer: chain.reviewer })
         for (let tick = 0; tick < 2; tick++) {
-          vi.setSystemTime(Date.now() + 86_400_000)
+          const waiting = journal.read(id)!
+          expect(journal.reconciliationAt(waiting)).toBe(Number(waiting.observation!.checkedAt) + 120_000)
+          vi.setSystemTime(journal.reconciliationAt(waiting)!)
           await runtime.run()
           expect(journal.read(unrelated)?.observation).not.toBeNull()
           expect(journal.read(unrelated)?.invocations).toMatchObject([{ behavior: 'implement-issue' }])
@@ -610,20 +625,34 @@ it.each(['recover', 'memory recovery', 'restart during recheck', 'failed recheck
       if (rechecked) expect(readRecheck()).toMatchObject({ state: mode === 'failed recheck' ? 'failed' : 'passed' })
       expect(journal.read(id)?.testRecovery).toBeUndefined()
       if (mode === 'changed after recheck') obs.issue.revision = 'new revision'
+      if (restartsBeforeAdmission && !advancesDuringRecheck) {
+        vi.setSystemTime(Date.now() + 86_400_000)
+        await runtime.run()
+        expect(journal.read(id)).toMatchObject({ held: null, testRecovery: { base, recheck: key } })
+        expect(launch).not.toHaveBeenCalled()
+        if (mode === 'base advances before admission') obs.prerequisites.base = nextBase
+      }
+      permitted = true
       journal.rebuild()
       runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), ops)
-      for (let tick = 0; tick < 3; tick++) { vi.setSystemTime(Date.now() + 86_400_000); await runtime.run() }
-      const recovered = ['recover', 'memory recovery', 'restart during recheck'].includes(mode)
+      for (let tick = 0; tick < 3; tick++) {
+        vi.setSystemTime(Date.now() + 86_400_000)
+        await runtime.run()
+        await waitForImplementationRechecks()
+      }
+      const recovered = restartsBeforeAdmission || ['recover', 'memory recovery', 'restart during recheck'].includes(mode)
       if (rechecked) expect(observe.mock.calls.length).toBeGreaterThan(reads)
       expect(journal.read(id)?.invocations).toHaveLength(recovered ? 2 : 1)
       expect(launch).toHaveBeenCalledTimes((recovered ? 1 : 0) + (mode === 'restart during recheck' ? 1 : 0))
-      expect(mocks.recheck).toHaveBeenCalledTimes(rechecked ? 1 : 0)
+      const checkedBases = ['base advances during recheck', 'base advances before admission', 'recheck fails on new base'].includes(mode)
+        ? [base, nextBase] : rechecked ? [base] : []
+      expect(mocks.recheck.mock.calls).toEqual(checkedBases.map(checkedBase =>
+        [repository, 'mikkokotila', old, checkedBase, merge, 'tests/test-offload.test.ts', test, undefined]))
     } finally {
       finishRecheck()
       await sweep
       await waitForImplementationRechecks()
     }
-    if (mocks.recheck.mock.calls.length) expect(mocks.recheck.mock.calls[0]).toEqual([repository, 'mikkokotila', old, base, merge, 'tests/test-offload.test.ts', test])
     if (!['unsettled resources', 'possible publication'].includes(mode)) expect(journal.read(id)?.invocations[0]).toEqual(original)
     const retained = JSON.parse((db.prepare('SELECT value FROM meta WHERE key=?').get(storageKey) as { value: string }).value)
     const { recheck, ...unchanged } = retained
