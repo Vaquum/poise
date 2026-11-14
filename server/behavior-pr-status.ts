@@ -277,7 +277,8 @@ export interface PrStatusRow {
   verdict: (PrStatusVerdict & { onCurrentHead: boolean | null }) | null
   ci: { state: string | null, head: string | null, asOf: string | null } | { state: 'unknown', reason: string }
   queue: { state: PrStatusQueueState, entryId: string | null, since: string | null,
-    attribution?: 'accepted-response' | 'observed', invocationId?: string }
+    attribution?: 'accepted-response' | 'observed', invocationId?: string,
+    disposition?: string, integrationBase?: string | null, integrationHead?: string | null }
   blocker: { id: PrBlockerId, line: string, since: string, sinceRestart: boolean, details: string[] }
   flags: { age: boolean, staleBlocker: boolean }
   eligibility: { refusal: string | null, skippedBy: string[] }

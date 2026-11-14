@@ -494,31 +494,58 @@ check_upgrade() {
 # answers, so alice's running workspace answers at once rather than after a
 # start, and the upgrade after this drains it through the new container.
 # Traffic runs through Caddy while the container is replaced: Caddy retries
-# dials and the old gateway exits 0, so every answer is 200, never a 502.
+# dials and the old gateway exits 0, so every answer is 200. A same-SHA
+# reinstall must also keep the healthy workspace, even if build attestations change.
 check_gateway_recreated() {
-  local before after traffic=$work/gateway-traffic.log loop code
+  local before after workspace_before workspace_image traffic=$work/gateway-traffic.log loop code completed started
   before=$(docker inspect --format '{{.Id}}' poise-gateway)
+  workspace_before=$(docker inspect --format '{{.Id}}' poise-ws-alice)
+  workspace_image=$(docker inspect --format '{{.Image}}' poise-ws-alice)
+  started=$(date -u +%FT%TZ)
+  gateway_replacement_inspect "$workspace_image" >"$work/gateway-replacement-inspect.log"
   : >"$traffic"
   (
-    while :; do
-      code=$(curl --silent --max-time 60 --cookie "$alice" --output /dev/null --write-out '%{http_code}' "${navigate[@]}" "http://alice.$domain/" 2>/dev/null) || code="curl:$?"
-      printf '%s %s\n' "$(date -u +%FT%TZ)" "$code" >>"$traffic"
+    local request_started
+    while [ ! -f "$work/gateway-probe-stop" ]; do
+      request_started=$(date -u +%FT%T.%3NZ)
+      : >"$work/gateway-probe-headers"
+      : >"$work/gateway-probe-body"
+      code=$(curl --silent --max-time 60 --max-filesize 65536 --cookie "$alice" --dump-header "$work/gateway-probe-headers" \
+        --output "$work/gateway-probe-body" --write-out '%{http_code}' "${navigate[@]}" "http://alice.$domain/" 2>/dev/null) || code="curl:$?"
+      # Retain only fixed classifications, never cookies, redirect URLs or raw response text.
+      local response=unclassified via=unknown
+      if grep --quiet '<title>Starting your workspace · Poise</title>' "$work/gateway-probe-body"; then response=gateway_starting
+      elif grep --quiet --ignore-case '^x-poise-updating: 1' "$work/gateway-probe-headers"; then response=gateway_updating
+      elif grep --quiet '<title>Poise</title>' "$work/gateway-probe-body"; then response=poise
+      elif [ ! -s "$work/gateway-probe-body" ]; then response=empty
+      fi
+      if grep --quiet --ignore-case '^server: Caddy' "$work/gateway-probe-headers"; then via=caddy; fi
+      printf '%s started=%s via=%s response=%s %s\n' "$(date -u +%FT%T.%3NZ)" "$request_started" "$via" "$response" "$code" >>"$traffic"
       sleep 0.2
     done
   ) &
   loop=$!
+  trap 'touch "$work/gateway-probe-stop"; wait "$loop" || true; gateway_replacement_evidence "$started" "$before" "$workspace_image"' EXIT
   compose stop gateway
   code=$(docker inspect --format '{{.State.ExitCode}}' poise-gateway)
-  if [ "$code" != 0 ]; then kill $loop 2>/dev/null || true; fail "the replaced gateway exited $code, not 0"; fi
+  [ "$code" = 0 ] || fail "the replaced gateway exited $code, not 0"
   compose up --detach --force-recreate gateway
   "$deploy/install.sh" >"$work/gateway-recreate-install.log"
-  kill $loop 2>/dev/null || true
-  wait $loop 2>/dev/null || true
+  # Complete another response through the successor, then let any in-flight request finish.
+  completed=$(wc -l <"$traffic")
+  for _ in $(seq 1 65); do
+    [ "$(wc -l <"$traffic")" -gt "$completed" ] && break
+    sleep 1
+  done
+  [ "$(wc -l <"$traffic")" -gt "$completed" ] || fail "no completed probe through the successor gateway"
+  touch "$work/gateway-probe-stop"
+  wait "$loop"
   after=$(docker inspect --format '{{.Id}}' poise-gateway)
   [ "$before" != "$after" ] || fail "the gateway container did not change"
-  grep --quiet ' 200$' "$traffic" || fail "no traffic reached the workspace during replacement: $(cat "$traffic")"
+  grep --quiet ' 200$' "$traffic" || fail "no traffic reached the workspace during replacement: $(head -n 5 "$traffic")"
   if grep --quiet -v ' 200$' "$traffic"; then fail "traffic during replacement saw non-200: $(grep -v ' 200$' "$traffic" | head -n 5)"; fi
-  pass "traffic during gateway replacement saw zero 502s and zero connection failures ($(wc -l <"$traffic") requests)"
+  [ "$(docker inspect --format '{{.Id}}' poise-ws-alice)" = "$workspace_before" ] || fail "same-SHA reinstall replaced alice's healthy workspace"
+  pass "same-SHA reinstall kept alice's workspace and every gateway replacement response was 200 ($(wc -l <"$traffic") requests)"
   docker logs poise-gateway 2>&1 | awk '
     /"event":"workspace.network.connected"/ && /"handle":"alice"/ { joined = NR }
     /"event":"gateway.listening"/ { listening = NR }
@@ -526,6 +553,42 @@ check_gateway_recreated() {
     || fail "the recreated gateway did not join alice's network before it answered"
   pass "the recreated gateway joined alice's network before it answered"
   expect 200 "alice's workspace, right after the gateway was recreated" "$alice" "http://alice.$domain/" "${navigate[@]}"
+  gateway_replacement_inspect "$workspace_image" >>"$work/gateway-replacement-inspect.log"
+  cat "$work/gateway-replacement-inspect.log"
+  trap - EXIT
+}
+
+# Project the exact unversioned inspect responses the gateway uses. No environment or arbitrary labels.
+gateway_replacement_inspect() {
+  local image
+  curl --silent --show-error --fail --max-time 5 --unix-socket /var/run/docker.sock http://docker/containers/poise-ws-alice/json \
+    | jq --compact-output '{Id, Image, manifest: .ImageManifestDescriptor.digest, State: {Status: .State.Status, Running: .State.Running},
+        labels: {base: .Config.Labels["poise.base"], release: .Config.Labels["poise.release"]}}'
+  for image in "$1" poise-runtime:latest; do
+    if ! curl --silent --show-error --fail --max-time 5 --unix-socket /var/run/docker.sock "http://docker/images/$image/json" \
+      | jq --compact-output '{Id, descriptor: .Descriptor.digest, labels: {base: .Config.Labels["poise.base"], release: .Config.Labels["poise.release"]}, layers: .RootFS.Layers[:32]}'; then
+      printf 'image inspect unavailable: %s\n' "$image"
+    fi
+  done
+}
+
+gateway_replacement_evidence() {
+  local started=$1 before=$2 image=$3 container
+  cat "$work/gateway-replacement-inspect.log"
+  gateway_replacement_inspect "$image" || echo 'replacement inspect unavailable'
+  for container in poise-gateway poise-caddy; do
+    docker inspect --format '{{.Name}} {{.Id}} {{json .State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}' "$container" \
+      || echo 'container lifecycle unavailable'
+  done
+  docker events --since "$started" --until "$(date -u +%FT%TZ)" --filter type=container --filter "container=$before" \
+    --filter container=poise-gateway --filter container=poise-caddy --filter container=poise-ws-alice \
+    --filter event=create --filter event=start --filter event=stop --filter event=die --filter event=destroy --format '{{json .}}' \
+    | jq --compact-output '{timeNano, Action, id, name: .Actor.Attributes.name}' | sed -n '1,100p' || echo 'Docker events unavailable'
+  docker logs --since "$started" --tail 100 poise-gateway 2>&1 \
+    | jq --raw-input --compact-output 'fromjson? | select(.event // "" | test("^(gateway\\.(listening|shutdown)|workspace\\.(network|container|upgrade|update|drain|ready))"))
+        | {time, level, event, handle, image, release, readyAfterMs,
+            reason: (if .reason == "outdated image" or .reason == "changed drain timeout" or .reason == "changed workspace DNS"
+              or .reason == "changed native behavior resource budgets" then .reason else null end)}' || echo 'gateway lifecycle unavailable'
 }
 
 # The installation behind a proxy the server already runs (POISE_PROXY_LISTEN):

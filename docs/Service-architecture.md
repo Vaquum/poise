@@ -362,11 +362,18 @@ volume by running `/opt/poise/scripts/test-offload/install.sh` in a short-lived
 container of the image. With `POISE_TEST_RENDER_API_KEY` and
 `POISE_TEST_WORKSPACE` set, it passes `POISE_TEST_RELAY_URL`, which is
 `/api/link/test-relay` on the workspace's host or on `POISE_PROXY_LISTEN`, and
-`POISE_TEST_RELAY_KEY`, the workspace's handle signed by the gateway. That writes the hooks and `relay`, holding those
-two, to `~/.poise/test-offload`; without them it removes `relay`. Poise starts its
+`POISE_TEST_RELAY_KEY`, the workspace's handle signed by the gateway, and the
+validated `POISE_TEST_LIMIT_SECONDS`. That writes the hooks and `relay`, holding
+URL, key and limit on successive lines, to `~/.poise/test-offload`; without them it removes `relay`. Poise starts its
 children with the hooks while `relay` exists
 ([Agents' test suites](Operating.md#agents-test-suites)). The settings travel this
 way because only a new container would take an environment variable.
+The limit defaults to 540 seconds and accepts whole seconds from 1 to 3540.
+The runner reads it from this installed configuration for one command lifetime,
+including capture and retries. Workspace children get a shell default of that
+budget plus 60 seconds for reporting and cleanup, within the existing 3600000 ms
+shell maximum. Explicit shorter shell deadlines still cap the command. Older
+two-line relay files retain the 540-second default.
 
 The relay retains the last 1,024 retired run IDs, their workspace owners and, for
 jobs, SHA-256 runner-token digests in memory, outside active admission slots.
@@ -385,6 +392,21 @@ member, which the relay verifies against the SHA-256 of its uncompressed tar
 bytes before forwarding and retaining it. Earlier runners and relays still
 exchange the whole checkout through the existing tree upload. Jobs and
 sandboxes receive the same single tar stream from either route.
+
+New atomic Calls also pass a Caller-owned random capture binding through the
+test-offload hooks, outside the suite environment. The box independently hashes
+the captured archive and source files before running a direct Vitest command.
+Relay recovery is currently held for #1619: the suite UID owns the report files,
+so no assertion inventory is trusted and no evidence frame is emitted. The held
+design would post a complete bounded inventory from the private run credential to
+`POST /runs/:id/assertions`; workspace credentials cannot submit that result.
+Only a matching completed failure would emit an Ed25519-signed evidence frame
+before the relay deletes the run. The hook would retain the redacted receipt for
+Caller; `POST /evidence/verify` would authenticate it against the existing gateway
+key and workspace credential after run deletion or restart. There is no unsigned
+or partial-result fallback. Caller would retain the verified receipt in its
+original artifact before resource cleanup. This extends the existing relay
+interface, without a new identity scope, setting or runner-retention store.
 
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
 gateway's, or with none, is recreated as one on an outdated image is: drained
@@ -419,7 +441,12 @@ networks the one it replaced had joined, so the gateway joins them itself:
 
 A workspace takes a new image without a new container when the image's
 system base is the one its container runs, so the agents in it are never cut
-off. Agent calls (behavior runs, manual reviews, replays) are processes Poise
+off. The container's inherited `poise.base` and `poise.release` labels retain
+that proof even when a cached rebuild changes an attestation/index digest and
+the original image can no longer be inspected. A healthy workspace already on
+the requested release keeps its container; missing base/release labels and
+changed container settings retain the drained replacement path.
+Agent calls (behavior runs, manual reviews, replays) are processes Poise
 starts detached; they keep running while Poise restarts, and the next Poise
 reconciles them as after any restart. Chat turns survive the same way: each
 session's agent runs under a per-session relay that owns its stdio and
@@ -601,8 +628,13 @@ its own instead of refusing with dirty_unowned.
   only for a known switch whose fresh health probe cannot reach the workspace
   or finds it healthy on the requested release. A healthy old release keeps
   the ordinary 502. The reset invalidates cached readiness, so recovery freshly
-  verifies `/api/service/health` on the requested release. `proxy.failed` retains
-  its Error with request and requested-release evidence; no request is replayed.
+  verifies `/api/service/health` on the requested release. `proxy.failed` is one
+  Warning only after the retryable update response is produced; unverified
+  resets, interrupted mutations and unanswered failures retain an Error.
+  Request, requested release and actual response disposition are retained in
+  diagnostics (`disconnect` records the status/disposition or an unanswered
+  response). Failed rollout evidence remains in the existing rollout diagnostics;
+  no request is replayed.
 - **Everything else.** An image of another base, a workspace started without
   the supervisor, or a changed container setting still gets a new container,
   drained first ([Deployment](#deployment)). The gateway makes the new image's
@@ -1548,8 +1580,10 @@ failed head blocks that update, retaining the original Call, resource-release
 proof, repair retry bound and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 For a pre-PR implementation, the existing Caller artifact and seed read can
-instead verify an original CI assertion failure on its exact prepared base and
-the delivered main recovery with validation of the original failing tests.
+instead verify an original CI assertion failure on its exact prepared base, and
+the delivered main recovery with validation of every original failing test and
+case. Relay assertions remain held for #1619 until the runner establishes their
+inventory independently of candidate-controlled reports.
 The journal admits one fresh implementation for that automatic hold and recovery
 commit, independently of report publishing. Missing original evidence and later
 operator holds retain their authority; no gateway route or new poller is added.
