@@ -3926,7 +3926,10 @@ async function tickReviewNewPrs(): Promise<void> {
         if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
-        const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor)
+        const pwd = await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs',
+          repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: bundle.actor, phase: 'checkout',
+          expectedHead: bundle.expectedHead, progress: { slot, expectedHead: bundle.expectedHead } },
+        () => localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor, false))
         if (behaviorAborted() || !isRunnable('review-new-prs') || !prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
@@ -3945,15 +3948,50 @@ async function tickReviewNewPrs(): Promise<void> {
       } catch (err) {
         // A superseded spawn releases its claim like any other launch
         // failure; the exit settler tolerates the missing claim.
-        releaseOwnedClaim('review-new-prs', target, claimId)
-        releasePrOperationOwned(bundle.operationId)
-        if (behaviorAborted()) return
+        // Neither release may replace the failure below: child reporting
+        // is suppressed, so a throw here would erase the checkout cause
+        // the diagnostic attributes.
+        try {
+          releaseOwnedClaim('review-new-prs', target, claimId)
+        } catch (releaseError) {
+          console.error(`[behaviors] review-new-prs claim release failed for ${pr.repo}#${pr.number}:`, releaseError)
+        }
+        try {
+          releasePrOperationOwned(bundle.operationId)
+        } catch (releaseError) {
+          console.error(`[behaviors] review-new-prs operation release failed for ${pr.repo}#${pr.number}:`, releaseError)
+        }
         // A checkout failure leaves no worker behind its launch intent: the
         // claim above is released and the ledger records the preflight end.
+        // One attributed Error and a next-tick retry on timeout; other
+        // failures keep their backoff. Cancellation records nothing.
         if (!checkoutReady) {
-          captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
-            outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+          let retry: BehaviorFailureState | null = null
+          try {
+            try {
+              if (behaviorAborted()) return
+              if (err instanceof BehaviorLogFeedError) failure ??= err
+              else {
+                const timeout = isTimeoutCause(behaviorErrorMessage(err))
+                recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget,
+                  { actingAccount: bundle.actor, ...(timeout ? { noBackoff: true } : {}) })
+                retry = getBehaviorFailureState('review-new-prs', checkTarget)
+              }
+            } finally {
+              if (!behaviorAborted()) captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled',
+                stateSource: 'native', outcome: 'preflight_failed', head: bundle.expectedHead,
+                completedAt: new Date().toISOString() })
+            }
+          } finally {
+            if (!(err instanceof BehaviorLogFeedError) && !isAbortError(err)) {
+              const context = diagnosticIdentity(err)
+              diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err,
+                { ...context, ...context?.progress, timeoutMs: 30_000, retry })
+            }
+          }
+          return
         }
+        if (behaviorAborted()) return
         if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
@@ -7964,6 +8002,25 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       }
       setBehaviorLaunchErrorOwned(claim.key, claim.target, claim.claimId, null)
       renewSeenOwned(claim.key, claim.target, claim.claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
+      continue
+    }
+    if (status === 'superseded'
+      && call.outcome === 'superseded'
+      && call.error_code === 'review_target_closed'
+      && call.action === null
+      && call.head_sha === null
+      && call.receipts == null
+      && Number.isFinite(Date.parse(call.completed_at || ''))
+      && unambiguousAgentCall(snapshot, call)) {
+      // Caller proved seed closure, not a no-publication outcome. Keep
+      // the terminal launch and Caller receipt evidence; do not release
+      // its seen marker or infer that a conflicting worker stopped.
+      if (completeClaimSafely(claim, call.error || 'review target closed')) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'superseded', activity: 'settled', stateSource: 'native',
+          outcome: 'review_target_closed', completedAt: call.completed_at })
+        clearBehaviorFailureKeepHold(ISSUES_KEY, claim.target)
+      }
       continue
     }
     const message = `unrecognized agent call status "${status || 'missing'}"`

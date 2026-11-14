@@ -26,6 +26,16 @@ Logging event. Unknown levels or invalid source timestamps produce visible
 collection warnings with the original source identity. Notification colors and
 successful change-request reviews do not determine technical severity.
 
+For future collection, a failed `pr_approve` with
+`approval_blocked_unresolved_conversations` is Warning only when the complete
+original flat Caller Error envelope records `provider.review`, `submitting`,
+`exit`, `submission: blocked` and explicitly untruncated stderr, with the original
+`not_started` / `preflight_failed` result and null executed head. Missing or
+conflicting evidence, publication receipts and process or cleanup failures retain
+their authoritative severity. The shared source classification governs storage,
+delivery, filters, counts and export; retained events remain immutable. Approval,
+backoff and resource gates are unchanged.
+
 Repair preflight refusals are retained as Warnings when a failed `repair_pr`
 Call has `not_started` / `preflight_failed`, no executed head, and either
 `atomic_work_blocked` or `atomic_work_failed` with the exact cause
@@ -242,13 +252,14 @@ erase that original failure; independent wrapper and invalid-output failures
 remain visible. Resolve uses Warning only for a confirmed no-action transient
 exit with a recorded safe retry. Uncertain outcomes, timeouts and policy
 refusals remain Errors. Separate attempts retain separate event IDs.
-Legacy approval batch reads, the final head check and checkout preparation retain one Error
-per failed child after recording the scheduler consequence. The fixed primitive,
-phase, checked targets, available expected heads, correlation, original process
-timing/result and recorded retry state travel together. Two failed children
-remain separate even within one sweep correlation; cancellation or failed retry
-bookkeeping cannot erase either cause. These diagnostics do not change backoff,
-launch progress or the exact-head publication checks.
+Legacy approval batch reads, the final head check and checkout preparation, and review
+launch checkout, retain one Error per failed child after recording the scheduler
+consequence. The fixed primitive, phase, checked targets, available expected heads,
+correlation, original process timing/result and recorded retry state travel together.
+Two failed children remain separate even within one sweep correlation; cancellation
+or failed retry bookkeeping cannot erase either cause. These diagnostics do not change
+backoff, launch progress or the exact-head publication checks, except a stalled review
+checkout defers without backoff and retries on the next tick.
 Checkout failures use phase `checkout` and fixed operations
 `github-interface.local-checkout-path` or `github-interface.checkout-repo`;
 other checkout callers retain default process reporting.

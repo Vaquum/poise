@@ -141,7 +141,7 @@ test('leaving Settings with invalid days keeps the error and the previous thresh
   const row = page.locator('tr[data-behavior="close-old-prs"]')
   await expect(row).toBeVisible()
   // Let the bell's away reads settle, so later bell changes come only from this test.
-  await expect.poll(() => ['/api/chat/requests', '/api/chat/switchboard', '/api/editor/reviews', '/api/behavior-chains', '/api/answers/dismissals']
+  await expect.poll(() => ['/api/chat/requests', '/api/chat/switchboard', '/api/behavior-chains', '/api/answers/dismissals']
     .every((path) => requested.has(path))).toBe(true)
   const badge = page.locator('[data-bell]')
   await expect(badge).toHaveText('0')
@@ -155,7 +155,7 @@ test('leaving Settings with invalid days keeps the error and the previous thresh
   await expect(dialog).toBeHidden()
   await expect.poll(() => writes).toEqual([])
   await expect(badge).toHaveText('1')
-  await expect(badge).toHaveAttribute('data-tone', 'needs-you')
+  await expect(badge).toHaveAttribute('data-tone', 'failed')
   // Invalid days with a skip change: the skip saves, the days do not.
   await page.locator('a[data-go="behaviors"]').click()
   await expect(page).toHaveURL(/settings=behaviors/)

@@ -522,7 +522,7 @@ async function shipGreetingChange(j) {
   expect(await readFile(join(paths.logsDir, 'changes', payload.id, 'npm-ci.stdout.log'), 'utf8')).toBeDefined()
   expect(await j.remoteSha(prepared.branch)).toBe(headSha)
   const pull = j.github.state.pulls.get(checked.prNumber)
-  expect(pull).toMatchObject({ head: prepared.branch, base: BASE_BRANCH, headSha, title: checked.title, state: 'open' })
+  expect(pull).toMatchObject({ head: prepared.branch, base: BASE_BRANCH, headSha, title: `feat: ${checked.title}`, state: 'open' })
   expect(pull.body).toContain(REQUEST)
   expect(pull.body).toContain(headSha)
   expect(checked.prUrl).toBe(`https://github.com/${REPOSITORY}/pull/${checked.prNumber}`)
@@ -649,7 +649,7 @@ async function reconcileSource(j, { daemon, client }, shipped) {
   expect(revert.baseSha).toBe(mergeSha)
   expect(await j.remoteSha(revertBranch(payload.id))).toBe(revert.headSha)
   expect(await readFile(join(j.paths.logsDir, 'reverts', payload.id, 'check.stdout.log'), 'utf8')).toMatch(/# pass 1/)
-  expect(j.github.state.pulls.get(revert.prNumber)).toMatchObject({ head: revertBranch(payload.id), headSha: revert.headSha, title: `Revert: ${title}` })
+  expect(j.github.state.pulls.get(revert.prNumber)).toMatchObject({ head: revertBranch(payload.id), headSha: revert.headSha, title: `revert: ${title}` })
   j.github.state.ci[revert.headSha] = 'success'
   await settle(() => daemon.tick(), 'revert merged', () => revertOf().sourceRevert?.state === 'merged', { logs: j.logs })
   const reconciledMain = await j.remoteSha(BASE_BRANCH)

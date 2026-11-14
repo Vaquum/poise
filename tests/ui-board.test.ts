@@ -16,10 +16,18 @@ describe('Board puts every live item in the seven states', () => {
   it('maps each of main’s pull request blockers to one state', () => {
     const expected: Record<BlockerId, string | null> = {
       review_running: 'running', ci_pending: 'waiting', in_queue: 'waiting', behind: 'blocked', ci_failing: 'failed',
-      conflicting: 'blocked', blocked: 'blocked', held: 'needs-you', awaiting_review: 'needs-you', awaiting_author: 'needs-you',
-      unresolved_threads: 'needs-you', approved_not_enqueued: 'needs-you', not_eligible: 'idle', unknown: null,
+      conflicting: 'blocked', blocked: 'blocked', held: 'blocked', awaiting_review: 'waiting', awaiting_author: 'waiting',
+      unresolved_threads: 'waiting', approved_not_enqueued: 'waiting', not_eligible: 'idle', unknown: null,
     }
     for (const [id, state] of Object.entries(expected)) expect(blockerState(id as BlockerId)).toBe(state)
+  })
+
+  it('shows an explicit request for the owner’s review independently of the behavior status', () => {
+    expect(item({ status: status('awaiting_review'), record: record({ reviewRequested: false }) }).state).toBe('waiting')
+    expect(item({ status: undefined, record: record({ reviewRequested: true }) })).toMatchObject({
+      state: 'needs-you', detail: 'GitHub requested your review',
+    })
+    expect(item({ record: record({ state: 'closed', reviewRequested: true }) }).state).toBe('idle')
   })
 
   it('reads a pull request’s blocker as its state, with the blocker’s words and since', () => {
@@ -67,7 +75,7 @@ describe('Board’s phase, order and Assign', () => {
   })
 
   it('orders by attention: Needs you first, then Blocked, Failed, Running, Waiting, Idle, Done', () => {
-    const a = item({ status: status('ci_pending') }), b = item({ status: status('held') }), c = item({ status: status('conflicting') })
+    const a = item({ status: status('ci_pending') }), b = item({ status: status('held') }), c = item({ record: record({ reviewRequested: true }) })
     expect(sortItems([a, b, c], 'attention').map((x) => x.state)).toEqual(['needs-you', 'blocked', 'waiting'])
   })
 

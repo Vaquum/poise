@@ -78,7 +78,7 @@ export const OBSERVE: Registry = {
   'gh.state': {
     name: 'Status', kind: 'Display', what: 'Its state on GitHub. CI runs speak the state words; issues and pull requests keep GitHub’s Open, Merged and Closed.',
     now: (el) => textOf(el),
-    values: [['Open, Merged, Closed', 'Issues and pull requests, as GitHub says.'], ['Failed', 'CI that failed or timed out.'], ['Done', 'CI that passed, or ended neutral.'], ['Running, Waiting', 'CI in progress, or queued.'], ['Needs you', 'CI that waits for an action.'], ['Idle', 'CI that was cancelled, skipped or went stale.']],
+    values: [['Open, Merged, Closed', 'Issues and pull requests, as GitHub says.'], ['Failed', 'CI that failed or timed out.'], ['Done', 'CI that passed, or ended neutral.'], ['Running, Waiting', 'CI in progress, or queued.'], ['Blocked', 'CI that requires an action.'], ['Idle', 'CI that was cancelled, skipped or went stale.']],
   },
   'gh.updated': { name: 'Updated', kind: 'Display', what: 'How long ago it last changed. Rows repaint in place at the refresh rate from General; nothing moves while you read.', now: (el) => el.getAttribute('data-help') ?? textOf(el) },
   'gh.review': { name: 'Consensus review', kind: 'Action', what: 'Asks several models to review an open pull request together, and posts the result on it.', shows: 'Accepted, Executing, then Review posted, on the row. Afterwards it offers to run again.', unavailable: 'A merged or closed pull request has nothing to review.' },

@@ -9,9 +9,9 @@ const text = (el: Element | null | undefined): string => ((el instanceof HTMLEle
 export const OVERVIEW: Registry = {
   /* ---------- Answer here ---------- */
   'ov.answer': {
-    name: 'Answer here', kind: 'Panel', what: 'Everything that wants you, with its answers on it: questions, permissions, decisions, reviews, sign-ins, merges and faults.',
+    name: 'Answer here', kind: 'Panel', what: 'Requests addressed to you, with answers on each entry. Show also opens faults and work status.',
     does: 'Answer in place. J and K move between entries; 1 to 9 answer; Enter opens the detail; O opens it where it lives.',
-    source: 'Poise’s notices, your chats’ open requests, the Switchboard’s open decisions, your publications’ review threads, the behavior chain and Behaviors’ diagnostics: the same entries the bell counts.',
+    source: 'Poise’s notices, open chat requests and Switchboard decisions, publication threads, the behavior chain and Behaviors’ diagnostics.',
   },
   'ov.count-open': {
     name: 'Open', kind: 'Display', what: 'How many entries are open at the level you chose. The bell shows the same number, in the same colour.',
@@ -21,14 +21,13 @@ export const OVERVIEW: Registry = {
   'ov.level': {
     name: 'Show', kind: 'Control', what: 'How much of Answer here you see. Each level includes the ones before it.',
     now: (el) => { const b = el.querySelector<HTMLElement>('[aria-checked="true"]'); return b ? `${text(b)}: ${b.dataset.gloss ?? ''}.` : '' },
-    values: [['Only you', 'Only what waits on you: a question, a permission, a decision, a sign-in, a review comment, or a pull request nothing else will move. Nothing moves until you act.'], ['+ Faults', 'Also what is stuck: chain work that is held or has not moved for 4 hours, a behavior that gave up, Poise’s own failures, and anything automatic still open after 4 hours. The default; the bell counts what it shows.'], ['Everything', 'Also what Poise is handling on its own: chain work and pull requests it is moving, and retries.'], ['Done', 'Never listed: what has finished is in Handled today.']],
+    values: [['Only you', 'Open decisions and permissions for you, sign-ins, and formal GitHub review requests addressed to your personal account.'], ['+ Faults', 'Also what is stuck: held or stalled chain work, behavior failures and other faults. This is the default.'], ['Everything', 'Also work status, retries and publication review threads.'], ['Done', 'What has finished is in Handled today.']],
     scope: 'This panel, and the bell in every place.', when: 'Applies now; remembered in this browser.', unchanged: 'The entries themselves: a hidden one is still there, and shows again when you show more.',
   },
   'ov.remembered': { name: 'Last read', kind: 'Display', what: 'Answer here paints what it read last at once, while it reads afresh. Those entries are quieter and nothing on them acts until their source has been read again; each source replaces its own as its read lands.', now: (el) => text(el) },
   'ov.held': { name: 'New, waiting', kind: 'Display', what: 'Entries that arrived while your pointer or focus was in the list. They wait so nothing moves under you.', does: 'Show now brings them in; leaving the list does too.', now: (el) => text(el) },
-  'ov.idle': { name: 'Idle worker slots', kind: 'Notice', what: 'The Manager’s slots sit idle and its enhancement backlog is empty, so nothing is left for it to start. It names up to five issues to label.', when: 'After slots sit idle for 15 minutes; it reminds at most hourly. It clears when a slot fills or an issue is labelled.', shows: 'Dismiss hides it until its next reminder; Silence until a slot fills or an issue is labelled.', source: 'Poise, from the Manager’s slots and the open issues (#782).' },
   'ov.notice': {
-    name: 'Entry', kind: 'Notice', what: 'Something that wants you: what it is, who it is from, where, its state, and its answers.',
+    name: 'Entry', kind: 'Notice', what: 'A request, fault or work update, with its source and available actions.',
     now: (el) => { const n = el.closest<HTMLElement>('[data-notice]'); return n ? `${text(n.querySelector('.card-meta .nc-kind'))}: ${text(n.querySelector('.card-title'))}.` : '' },
     does: 'Its answers are its buttons. Its other actions show under the pointer, at its lower right: open it, its timeline or diagnostic, more, silence, dismiss.',
   },

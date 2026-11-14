@@ -36,19 +36,17 @@ PR stop gate uses the same opposite-account rule from live PR author evidence.
 
 Behaviors' diagnostics are listed in the notification rail
 ([Notifications](Notifications.md)), grouped by target and cause.
-- **Poise faults** are red and mean the scheduler or Poise's launch/result
-  integration needs repair.
-- **Needs you** is amber for repository access, sign-in, provider limits and
-  uncertain outcomes, including unusable model verdicts and exhausted review
-  recovery.
+- **Faults** shows stopped or failed work, including repository access,
+  unusable model verdicts, uncertain outcomes and exhausted review recovery.
 - **Handled automatically** is grey and folded. It covers known capacity, head
   changes, upstream 429/5xx and transport interruptions that Poise rechecks.
 
+Confirmed account sign-in requests appear in **Only you** through Connected accounts.
+
 A failed behavior's notice and its diagnostic are one entry, in the group the
 diagnostic decides.
-Unknown causes stay yellow until their cause is established; a process exit or
-retry count alone never proves Poise is broken. Each row expands to its full
-diagnostic details, retaining its expansion through refresh.
+Unknown causes retain their diagnostic details. Each row expands to those
+details and retains its expansion through refresh.
 Chain observation summaries include the bounded, redacted stderr cause. Known
 upstream 5xx and transport observation failures are grey while the existing
 scheduler rechecks them; other runtime faults remain red.
@@ -73,7 +71,7 @@ A grey no-action PR incident requires one validated Caller row matching its
 call, correlation, actor, repository, PR, behavior and source, with
 `not_started` / `preflight_failed`, a pinned expected head, and no executed head
 or review/posting receipts. Missing, conflicting or quarantined evidence stays
-visible under Needs you. Classification never authorizes a retry.
+visible under Faults. Classification never authorizes a retry.
 Distinct attempts are read before visual grouping, so a newer automatic event
 cannot hide an older held reviewer. Persisted launch contract and quarantine
 evidence overrides Caller no-action text; a matching correlation must identify

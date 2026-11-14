@@ -86,7 +86,7 @@ export const BOARD_REF: Registry = {
     name: 'State', kind: 'Display', what: 'Where this item stands, in the seven state words, with the detail that matters.',
     now: (el: any) => { const c = el.closest('[data-state]'); const s = c?.dataset.state; const d = el.querySelector('.detail')?.textContent; return s ? `${term(`state.${s}`)}${d ? ` · ${d}` : ''}. ${entry(`state.${s}`)?.what ?? ''}` : ''; },
     shows: 'For a pull request, its one current blocker from Poise’s per-pull-request status (#747), in plain words: held by a behavior; a review running on a head; changes requested; awaiting review, with its round; in the merge queue; approved but not enqueued; CI failing or pending on a head; unresolved conversations; a merge conflict; behind its base; blocked by GitHub; or unknown, naming what is missing.',
-    values: [['Needs you', 'Ready to merge, your review requested, a conversation for you, or the chat on it asks you.'], ['Blocked', 'A merge conflict or another prerequisite.'], ['Failed', 'A check failed.'], ['Running', 'A worker, a chat or a run is working on it.'], ['Waiting', 'Checks are running, or it is next for a worker and gets one when a slot frees.'], ['Idle', 'Open; nothing in progress.'], ['Done', 'Merged or closed.']],
+    values: [['Needs you', 'GitHub formally requested your personal account to review this pull request.'], ['Blocked', 'A merge conflict or another prerequisite.'], ['Failed', 'A check failed.'], ['Running', 'A worker, a chat or a run is working on it.'], ['Waiting', 'Checks are running, or it is next for a worker and gets one when a slot frees.'], ['Idle', 'Open; nothing in progress.'], ['Done', 'Merged or closed.']],
     source: 'GitHub’s checks and reviews, and the chats and runs on it.'
   },
   'card.worker': {
@@ -116,12 +116,12 @@ export const BOARD_REF: Registry = {
     name: 'Blocker', kind: 'Display', what: 'The one thing that holds this pull request now, from Poise’s per-pull-request status: the first that applies, in this order.',
     now: (el: any) => `${el.firstChild?.textContent || el.textContent}.`,
     values: [
-      ['not handled by Poise: why', 'not_eligible. Idle.'], ['held by a behavior, with when it tries again', 'held. Waiting, or Needs you when only you can clear it.'],
-      ['review running on a head · round n of the cap', 'review_running. Running.'], ['changes requested on a head: the author’s turn', 'awaiting_author. Needs you, or the worker’s.'],
+      ['not handled by Poise: why', 'not_eligible. Idle.'], ['held by a behavior, with when it tries again', 'held. Blocked.'],
+      ['review running on a head · round n of the cap', 'review_running. Running.'], ['changes requested on a head: the author’s turn', 'awaiting_author. Waiting.'],
       ['waiting for review of a head · round n of the cap', 'awaiting_review. Waiting; the cap reached says so.'], ['in the merge queue, since when', 'in_queue. Waiting.'],
-      ['approved, not in the queue: why', 'approved_not_enqueued: removed from the queue, Merge Pull Requests off (the merge is yours), paused, or a retry time. Needs you or Waiting.'],
+      ['approved, not in the queue: why', 'approved_not_enqueued: removed from the queue, Merge Pull Requests off, paused, or a retry time. Waiting.'],
       ['CI failing: the checks, by name', 'ci_failing. Failed.'], ['CI running on a head', 'ci_pending. Waiting.'],
-      ['n open conversations on a head', 'unresolved_threads. Needs you.'], ['conflicts with the base', 'conflicting. Blocked.'],
+      ['n open conversations on a head', 'unresolved_threads. Waiting.'], ['conflicts with the base', 'conflicting. Blocked.'],
       ['behind the base', 'behind. Blocked.'], ['blocked by GitHub’s rules', 'blocked. Blocked.'], ['not known: what could not be read', 'unknown. No state word: when it was last read.']
     ],
     source: 'Poise’s per-pull-request status (#747), from the behavior ledger. It has no screen on main yet; these are the interface’s words for each of its fourteen blockers.'

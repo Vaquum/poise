@@ -107,7 +107,8 @@ def publication_metadata(payload: dict, target: str, number: int, *, creating: b
     if not COMMIT.fullmatch(message) or any(char in message for char in "\r\n") \
             or (creating and (not COMMIT.fullmatch(title) or any(char in title for char in "\r\n") or not body.strip())):
         raise ValueError("publication requires Conventional Commit metadata and a nonempty PR body")
-    publication_body(body, target, number)
+    if creating:
+        publication_body(body, target, number)
     return message, title, body
 
 
@@ -381,11 +382,11 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
         title, body = str(payload.get("title") or ""), str(payload.get("body") or "")
         if not expected or not invocation or invocation.group(1) != call_id:
             raise ValueError("publication recovery requires the original invocation and exact pushed head")
-        publication_body(body, target, issue_number)
         if pull is not None:
             pull = await confirmed_pull(client, owner, repo, pull, expected)
             posted = await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=True, head=expected)
             return {**result, "outcome": "published", "reply_receipts": posted}
+        publication_body(body, target, issue_number)
         if not COMMIT.fullmatch(title) or any(char in title for char in "\r\n") or not body.strip():
             raise ValueError("PR creation recovery requires its original Conventional Commit title and body")
         pull = await client.post(f"/repos/{target}/pulls", json={"title": title, "body": f"{body}\n\nCloses #{issue_number}\n\n{marker}",

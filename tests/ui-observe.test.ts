@@ -29,7 +29,7 @@ describe('a chain as a task', () => {
   it('says where it stands in the seven state words, with its reason', () => {
     expect(taskState(chain({ invocations: [invocation('review-pr', 'started')] }))).toEqual({ state: 'running', reason: 'PR review · round 1 · Opus' })
     expect(taskState(chain({ waiting: 'native merge queue owns entry 88' }))).toEqual({ state: 'waiting', reason: 'In the merge queue' })
-    expect(taskState(chain({ held: 'queue removal requires a decision: manual (q1)' })).state).toBe('needs-you')
+    expect(taskState(chain({ held: 'queue removal requires a decision: manual (q1)' })).state).toBe('blocked')
     expect(taskState(chain({ held: 'New invocations held by the person' })).reason).toBe('Held by you: no new invocations')
     expect(taskState(chain({ invocations: [invocation('repair-pr', 'uncertain', { outcome: 'a reply may have posted' })] }))).toEqual({ state: 'blocked', reason: 'Not confirmed: a reply may have posted; reconciling' })
     expect(taskState(chain({ invocations: [invocation('review-pr', 'admitted')] })).state).toBe('waiting')
@@ -191,7 +191,7 @@ describe('runs in the seven state words', () => {
 describe('the GitHub history', () => {
   it('speaks the state words for CI and GitHub’s own for issues and pull requests', () => {
     expect(historyState({ kind: 'action', state: 'failure', mergedAt: null })).toMatchObject({ state: 'failed', word: 'Failed' })
-    expect(historyState({ kind: 'action', state: 'action_required', mergedAt: null })).toMatchObject({ state: 'needs-you' })
+    expect(historyState({ kind: 'action', state: 'action_required', mergedAt: null })).toMatchObject({ state: 'blocked' })
     expect(historyState({ kind: 'action', state: 'cancelled', mergedAt: null })).toMatchObject({ state: 'idle', word: 'Idle · Cancelled' })
     expect(historyState({ kind: 'pr', state: 'closed', mergedAt: '2026-11-11T00:00:00Z' })).toMatchObject({ state: 'done', word: 'Merged', settled: true })
     expect(historyState({ kind: 'issue', state: 'open', mergedAt: null })).toMatchObject({ state: null, word: 'Open', settled: false })

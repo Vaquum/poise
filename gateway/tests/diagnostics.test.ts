@@ -6,6 +6,7 @@ import Database from 'better-sqlite3'
 import { environmentSecrets, normalize, redact, severity, type DiagnosticInput, type LogEvent } from '../src/diagnostics/contract.js'
 import { DiagnosticRuntime } from '../src/diagnostics/runtime.js'
 import { runOperator } from '../src/diagnostics/cli.js'
+import { executeLoggingRead } from '../src/diagnostics/query-worker.js'
 import { DiagnosticStore, DEFAULT_LOG_POLICY } from '../src/diagnostics/store.js'
 import { callerDiagnostic, nativeDiagnostic, workspaceEnvelope } from '../src/diagnostics/sources.js'
 
@@ -167,6 +168,91 @@ describe('one diagnostic contract', () => {
       expect(input.level).toBe('error')
       expect(input.operation).not.toBe('provider.review.handoff')
     }
+  })
+
+  describe('unresolved-conversation approval waits', () => {
+    const row = { id: 'f'.repeat(32), completed_at: new Date(NOW).toISOString(), status: 'failed', behavior: 'pr_approve',
+      error_code: 'approval_blocked_unresolved_conversations', action: 'not_started', outcome: 'preflight_failed', head_sha: null,
+      error: 'approval blocked by unresolved review conversations: 1 unresolved review conversation(s) from other reviewers remain',
+      repo: 'acme/repo', pr_id: '12', actor: 'bot', expected_head: 'a'.repeat(40),
+      resource_error: null, ownership_error: null,
+      diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'submitting', outcome: 'exit',
+        submission: 'blocked', provider: 'codex', stderr: '1 unresolved review conversation(s) from other reviewers remain', stderr_truncated: false } }
+
+    it('stores and delivers the verified flat Caller refusal as Warning with matching filters, counts and export', () => {
+      const before = JSON.stringify(row)
+      const original = normalize(callerDiagnostic(row, 'alice')!, NOW)!
+      expect(original).toMatchObject({ severity: 'warning', source: 'caller', operation: 'provider.review', phase: 'submitting',
+        message: row.error, stderr: row.diagnostic.stderr, truncated: false, callId: row.id,
+        context: { errorCode: row.error_code, action: row.action, outcome: row.outcome, submission: 'blocked',
+          expectedHead: row.expected_head, observedHead: null, evidenceIncomplete: false } })
+      expect(callerDiagnostic({ ...row, error: 'Different wording' }, 'alice')).toMatchObject({ level: 'warning' })
+      expect(JSON.stringify(row)).toBe(before)
+      const local = store(); local.append([original])
+      const delivery = local.delivery(alice)
+      expect(delivery.events).toEqual([original])
+      const path = join(directory(), 'approval.db')
+      const central = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW); stores.push(central)
+      central.append([workspaceEnvelope(delivery.events[0], 'alice', NOW, [])])
+      expect(central.lookup(alice, original.id)).toMatchObject({ status: 'found', event: original })
+      for (const severity of ['warning', 'error'] as const) {
+        const total = severity === 'warning' ? 1 : 0
+        const filter = { source: 'caller', callId: row.id, severities: [severity] }
+        expect(central.query(alice, filter)).toMatchObject({ total, countKind: 'events', events: total ? [{ severity }] : [] })
+        const exported = executeLoggingRead({ path, policy: DEFAULT_LOG_POLICY, now: NOW, access: alice, operation: 'export', filter })
+        expect(exported.status).toBe(200)
+        const lines = exported.body.trim().split('\n').map(line => JSON.parse(line))
+        expect(lines[0]).toMatchObject({ type: 'metadata', total, exported: total })
+        expect(lines.slice(1)).toEqual(total ? [{ type: 'event', event: { ...original, occurrences: 1 } }] : [])
+      }
+      const retained = store(); retained.append([{ ...original, severity: 'error' }])
+      expect(retained.lookup(alice, original.id)).toMatchObject({ status: 'found', event: { severity: 'error' } })
+    })
+
+    it.each([
+      { name: 'another behavior', update: { behavior: 'pr_review' } },
+      { name: 'a nonfailed Call', update: { status: 'completed' } },
+      { name: 'another error code', update: { error_code: 'review_contract_violation' } },
+      { name: 'a missing action', update: { action: null } },
+      { name: 'a conflicting outcome', update: { outcome: 'approved' } },
+      { name: 'a missing executed-head field', update: { head_sha: undefined } },
+      { name: 'an executed head', update: { head_sha: 'b'.repeat(40) } },
+      { name: 'an existing review', update: { review_id: 17 } },
+      { name: 'review comments', update: { review_comments: 1 } },
+      { name: 'publication receipts', update: { receipts: [] } },
+      { name: 'unavailable original evidence', update: { evidence_unavailable: 'Stored evidence exceeds bounded decoding limits' } },
+      { name: 'a cleanup failure', update: { resource_error: 'cleanup_failed' } },
+      { name: 'an ownership failure', update: { ownership_error: 'ownership_failed' } },
+      { name: 'missing diagnostic evidence', update: { diagnostic: null } },
+    ])('keeps $name at Error despite the approval-blocked code and prose', ({ update }) => {
+      expect(normalize(callerDiagnostic({ ...row, ...update }, 'alice')!, NOW)).toMatchObject({ severity: 'error', message: row.error })
+    })
+
+    it.each([
+      { name: 'an unsupported envelope', update: { version: 2 } },
+      { name: 'an unverified source', update: { source: 'other' } },
+      { name: 'a process operation', update: { operation: 'git.fetch', exit_code: 128 } },
+      { name: 'a cleanup phase', update: { phase: 'cleanup' } },
+      { name: 'a timeout', update: { outcome: 'timed_out' } },
+      { name: 'uncertain submission', update: { submission: 'uncertain' } },
+      { name: 'rejected submission', update: { submission: 'rejected' } },
+      { name: 'missing submission', update: { submission: undefined } },
+      { name: 'missing stderr', update: { stderr: undefined } },
+      { name: 'truncated stderr', update: { stderr_truncated: true } },
+      { name: 'unknown stderr completeness', update: { stderr_truncated: undefined } },
+      { name: 'a conflicting nested submission', update: { context: { submission: 'uncertain' } } },
+      { name: 'a nested process failure', update: { context: { exit_code: 128 } } },
+      { name: 'a nested-only blocked submission', update: { submission: undefined, context: { submission: 'blocked' } } },
+      { name: 'an exit code', update: { exit_code: 128 } },
+      { name: 'a signal', update: { signal: 'SIGTERM' } },
+      { name: 'an OS error', update: { errno: 'ENOSPC' } },
+      { name: 'a process deadline', update: { timeout_seconds: 60 } },
+      { name: 'filesystem failure evidence', update: { filesystem: { measurement_error: 'stat failed' } } },
+      { name: 'a diagnostic executed head', update: { observed_head: 'b'.repeat(40) } },
+    ])('keeps $name at Error instead of treating it as a verified guard refusal', ({ update }) => {
+      const input = callerDiagnostic({ ...row, diagnostic: { ...row.diagnostic, ...update } }, 'alice')!
+      expect(normalize(input, NOW)).toMatchObject({ severity: 'error', message: row.error })
+    })
   })
 
   it.each([

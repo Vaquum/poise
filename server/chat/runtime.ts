@@ -1805,11 +1805,18 @@ export class ChatRuntime extends EventEmitter {
 
   private withLive(record: SessionRecord): SessionRecord {
     const live = this.live.get(record.id)
-    if (live) { live.record.pendingRequests = [...live.pending.keys()]; record = live.record }
+    if (live) {
+      const ownerRequests = live.pending.size && record === live.record
+        ? storage.listPendingRequests(record.id).filter((request) => request.ownerAction).map((request) => request.requestId)
+        : record.ownerRequests ?? []
+      live.record.pendingRequests = [...live.pending.keys()]
+      live.record.ownerRequests = ownerRequests.filter((requestId) => live.pending.has(requestId))
+      record = live.record
+    }
     const queue = this.messageQueue(record.id)
     const timers = timerSummaries(this.instance, record.id)
-    // Live summaries are computed on a copy, never on `live.record`, and
-    // sessions without any read exactly as before.
+    // Queue and timer summaries are computed on a copy. The live record
+    // stays authoritative for callers that update it in place.
     if (!queue.revision && !timers.length) {
       if (record.timers === undefined) return record
       const clean = { ...record }
@@ -4091,6 +4098,19 @@ export class ChatRuntime extends EventEmitter {
     return { questions: pending.questions ?? [] }
   }
 
+  escalateQuestion(id: string, requestId: string, reason: string): boolean {
+    const session = this.requireLive(id)
+    if (session.turn?.stopping || session.pending.get(requestId)?.kind !== 'question') {
+      throw new ChatError(409, 'this question is no longer pending', 'no_turn')
+    }
+    const pending = storage.listPendingRequests(id).find((request) => request.requestId === requestId)
+    if (!pending) throw new ChatError(409, 'this question is no longer pending', 'no_turn')
+    if (pending.ownerAction) return false
+    this.emit_(id, { type: 'question.escalated', id: requestId, reason })
+    this.refreshWaitingAlert(session)
+    return true
+  }
+
   /** Who answered first, named relative to the caller: the actor, or the
    *  person when it is absent. A cancelled request, or one with no answer
    *  event, keeps the old message. */
@@ -4106,7 +4126,22 @@ export class ChatRuntime extends EventEmitter {
   }
 
   private afterRequestAnswered(session: LiveSession): void {
-    if (session.turn && !session.turn.stopping && session.pending.size === 0 && session.record.status === 'waiting') this.setStatus(session, 'running')
+    if (session.record.status !== 'waiting' || session.turn?.stopping) return
+    if (session.turn && session.pending.size === 0) this.setStatus(session, 'running')
+    else {
+      this.emit_(session.record.id, { type: 'session.updated', session: session.record })
+      this.refreshWaitingAlert(session)
+    }
+  }
+
+  private refreshWaitingAlert(session: LiveSession): void {
+    const id = session.record.id
+    const request = storage.listPendingRequests(id).find((candidate) => candidate.ownerAction && session.pending.has(candidate.requestId))
+    const detail = request && storage.pendingRequestDetail(id, request.requestId)
+    if (!detail) chatWaitingEnded(id)
+    else chatWaiting(alertContext(session.record), detail.kind === 'permission'
+      ? { kind: 'permission', title: detail.title }
+      : { kind: 'question', question: detail.title })
   }
 
   private settlePending(session: LiveSession, by: 'cancelled', actor: HandlingActor = 'poise'): void {
@@ -5141,9 +5176,7 @@ export class ChatRuntime extends EventEmitter {
     try {
       this.emit_(session.record.id, event)
       this.setStatus(session, 'waiting')
-      chatWaiting(alertContext(session.record), event.type === 'permission.requested'
-        ? { kind: 'permission', title: event.title }
-        : { kind: 'question', question: event.questions[0]?.question ?? 'answer a question' })
+      this.refreshWaitingAlert(session)
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error))
       session.pending.get(requestId)?.reject(failure)
@@ -5356,7 +5389,7 @@ export class ChatRuntime extends EventEmitter {
     this.emit('event', envelope)
     // The open-request revision moved with the pending rows, inside the
     // same transaction; every open Chat view hears the new revision.
-    if (event.type === 'permission.requested' || event.type === 'question.asked'
+    if (event.type === 'permission.requested' || event.type === 'question.asked' || event.type === 'question.escalated'
       || event.type === 'permission.resolved' || event.type === 'question.answered') {
       this.emit('chatRequests', storage.requestRevision(this.instance))
     }

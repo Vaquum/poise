@@ -151,6 +151,15 @@ and asks for the review file early; a timeout records what the file held and
 never posts late work, and a posting timeout is reconciled through the
 call marker before it counts as a failure.
 
+Before persisting a publication plan or posting, a managed review uses its final
+live seed read to check closure. If that read observes the seed closed, the Call
+settles `superseded` with `review_target_closed`, no PR head and no comments
+attempted. Its original cleanup owner still must prove resource settlement before
+capacity is released. Title/body revision identity is unchanged. The read and
+comment POST are separate GitHub requests; closure after that read can still race
+publication. Already-attempted comments retain their read-only reconciliation,
+and manual `github-interface --comment-issue` calls remain available.
+
 Poise launches each reviewer with your agent account as `--actor` and in
 `GITHUB_INTERFACE_AGENT_USER`, and nothing launches while it is not set. Caller
 reads, checks out and comments as that account (`--token-user`), and refuses a

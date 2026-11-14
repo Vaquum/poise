@@ -23,6 +23,7 @@ export interface GhRecord {
   created_at: string
   updated_at: string
   merged_at: string | null
+  reviewRequested?: boolean | null
 }
 
 export type BlockerId = 'not_eligible' | 'held' | 'review_running' | 'awaiting_author' | 'awaiting_review' | 'ci_pending'
@@ -71,10 +72,10 @@ export const itemKey = (repo: string, number: number): string => `${repo}#${numb
 export function blockerState(id: BlockerId): StateKey | null {
   switch (id) {
     case 'review_running': return 'running'
-    case 'ci_pending': case 'in_queue': return 'waiting'
+    case 'ci_pending': case 'in_queue': case 'awaiting_review': case 'awaiting_author':
+    case 'unresolved_threads': case 'approved_not_enqueued': return 'waiting'
     case 'ci_failing': return 'failed'
-    case 'conflicting': case 'behind': case 'blocked': return 'blocked'
-    case 'held': case 'awaiting_review': case 'awaiting_author': case 'unresolved_threads': case 'approved_not_enqueued': return 'needs-you'
+    case 'conflicting': case 'behind': case 'blocked': case 'held': return 'blocked'
     case 'not_eligible': return 'idle'
     case 'unknown': return null
   }
@@ -106,6 +107,9 @@ export function toItem(input: ItemInput): Item {
   const poise: Who | null = chain || labelled ? { tag: 'Poise', kind: 'poise', href: '' } : null
   if (record.state !== 'open') {
     return { ...base, state: record.kind === 'pr' && record.state === 'closed' ? 'idle' : 'done', detail: record.state === 'merged' ? 'merged' : 'closed', since: ms(record.merged_at) ?? base.updatedAt, sinceRestart: false, who: poise }
+  }
+  if (record.kind === 'pr' && record.reviewRequested === true) {
+    return { ...base, state: 'needs-you', detail: 'GitHub requested your review', since: null, sinceRestart: false, who: poise }
   }
   if (chain) {
     const { state, reason } = taskState(chain)

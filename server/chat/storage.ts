@@ -54,7 +54,9 @@ db.exec(`
     session_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('permission', 'question')),
     seq INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    escalation TEXT,
+    addressed_to_owner INTEGER CHECK (addressed_to_owner IN (0, 1))
   );
   CREATE INDEX IF NOT EXISTS idx_chat_pending_session ON chat_pending(session_id);
 
@@ -127,13 +129,23 @@ try {
 
 const EVENT_MAX_BYTES = 4 * 1024 * 1024
 
+db.transaction(() => {
+  const columns = db.prepare('PRAGMA table_info(chat_pending)').all() as { name: string }[]
+  if (!columns.some((column) => column.name === 'escalation')) {
+    db.exec('ALTER TABLE chat_pending ADD COLUMN escalation TEXT')
+  }
+  if (!columns.some((column) => column.name === 'addressed_to_owner')) {
+    db.exec('ALTER TABLE chat_pending ADD COLUMN addressed_to_owner INTEGER CHECK (addressed_to_owner IN (0, 1))')
+  }
+}).immediate()
+
 export function insertSession(record: SessionRecord): void {
   cachedStatement(db, `
     INSERT INTO chat_sessions (id, record, agent, repo, checkout, branch, status, title, native_session_id, instance, created_at, updated_at, last_seq, role)
     VALUES (@id, @record, @agent, @repo, @checkout, @branch, @status, @title, @native, @instance, @created, @updated, 0, @role)
   `).run({
     id: record.id,
-    record: JSON.stringify({ ...record, queue: undefined, timers: undefined }),
+    record: JSON.stringify({ ...record, queue: undefined, timers: undefined, ownerRequests: undefined }),
     agent: record.agent,
     repo: record.repo,
     checkout: record.checkout,
@@ -163,7 +175,7 @@ export function saveSession(record: SessionRecord): void {
     WHERE id = @id
   `).run({
     id: record.id,
-    record: JSON.stringify({ ...record, queue: undefined, timers: undefined }),
+    record: JSON.stringify({ ...record, queue: undefined, timers: undefined, ownerRequests: undefined }),
     agent: record.agent,
     repo: record.repo,
     checkout: record.checkout,
@@ -182,7 +194,9 @@ function parseRecord(row: { record: string, last_seq: number, status: string, ro
   // The column is the role's only source; any role in the record JSON is ignored.
   if (row.role === 'manager' || row.role === 'worker') record.role = row.role
   else delete record.role
-  record.pendingRequests = listPendingRequests(record.id).map((p) => p.requestId)
+  const pending = listPendingRequests(record.id)
+  record.pendingRequests = pending.map((request) => request.requestId)
+  record.ownerRequests = pending.filter((request) => request.ownerAction).map((request) => request.requestId)
   return record
 }
 
@@ -318,8 +332,16 @@ export const appendEvent = db.transaction((sessionId: string, event: ChatEvent, 
       .run(event.id, sessionId, 'permission', seq, at)
     bumpRequestRevision(row.instance)
   } else if (event.type === 'question.asked') {
-    cachedStatement(db, 'INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(event.id, sessionId, 'question', seq, at)
+    cachedStatement(db, `INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at, addressed_to_owner)
+      SELECT ?, s.id, 'question', ?, ?, ${QUESTION_TO_OWNER} FROM chat_sessions s WHERE s.id = ?`)
+      .run(event.id, seq, at, sessionId)
+    bumpRequestRevision(row.instance)
+  } else if (event.type === 'question.escalated') {
+    const changed = cachedStatement(db, `
+      UPDATE chat_pending SET escalation = ?
+      WHERE session_id = ? AND request_id = ? AND kind = 'question' AND escalation IS NULL
+    `).run(event.reason, sessionId, event.id).changes
+    if (changed !== 1) throw new Error('this question is no longer awaiting escalation')
     bumpRequestRevision(row.instance)
   } else if (event.type === 'permission.resolved' || event.type === 'question.answered') {
     const removed = cachedStatement(db, 'DELETE FROM chat_pending WHERE request_id = ? AND session_id = ?').run(event.id, sessionId)
@@ -391,7 +413,18 @@ export function findTurnFinished(sessionId: string, turnId: string): ChatEnvelop
   return row ? { seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent } : null
 }
 
-export interface PendingRequest { requestId: string, sessionId: string, kind: 'permission' | 'question', seq: number }
+export interface PendingRequest { requestId: string, sessionId: string, kind: 'permission' | 'question', seq: number, ownerAction: boolean }
+
+// A chat created by another chat asks that chat first. An owner-created
+// Worker without an open Manager asks the owner, like other owner chats.
+const QUESTION_TO_OWNER = `(json_extract(s.record, '$.createdBy.sessionId') IS NULL AND (
+  s.role IS NOT 'worker' OR NOT EXISTS (
+    SELECT 1 FROM chat_sessions manager WHERE manager.instance = s.instance AND manager.role = 'manager' AND manager.status <> 'closed'
+  )
+))`
+// Preserve the addressee of new questions. Older pending rows have no
+// captured addressee. Permissions and Manager escalations are for the owner.
+const OWNER_ACTION = `(p.kind = 'permission' OR p.escalation IS NOT NULL OR COALESCE(p.addressed_to_owner, ${QUESTION_TO_OWNER}))`
 
 /** One open request with its stored title and ask time, for the handling
  *  log. Read before the answering event deletes the pending row. */
@@ -417,8 +450,12 @@ export function pendingRequestDetail(sessionId: string, requestId: string): { ki
 }
 
 export function listPendingRequests(sessionId: string): PendingRequest[] {
-  return (cachedStatement(db, 'SELECT request_id, session_id, kind, seq FROM chat_pending WHERE session_id = ? ORDER BY seq').all(sessionId) as Array<{ request_id: string, session_id: string, kind: 'permission' | 'question', seq: number }>)
-    .map((row) => ({ requestId: row.request_id, sessionId: row.session_id, kind: row.kind, seq: row.seq }))
+  const rows = cachedStatement(db, `
+    SELECT p.request_id AS requestId, p.session_id AS sessionId, p.kind, p.seq, ${OWNER_ACTION} AS ownerAction
+    FROM chat_pending p JOIN chat_sessions s ON s.id = p.session_id
+    WHERE p.session_id = ? ORDER BY p.seq
+  `).all(sessionId) as (Omit<PendingRequest, 'ownerAction'> & { ownerAction: number })[]
+  return rows.map((row) => ({ ...row, ownerAction: row.ownerAction === 1 }))
 }
 
 // The open-request revision: every change the Overview must see bumps it,
@@ -445,26 +482,27 @@ export interface OpenChatRequest {
   sessionTitle: string
   createdAt: string
   content: unknown
-  /** The escalation reason, once the Manager escalates requests. */
+  /** The reason the Manager sent this question to the person. */
   escalation: string | null
+  ownerAction: boolean
 }
 
 /** Every open request of this instance with its stored content: one
- *  consistent snapshot carrying its revision, newest first. Each pending
+ *  consistent snapshot carrying its revision, owner requests first. Each pending
  *  row joins by seq to its exact stored request event, never a transcript
  *  scan. Foreign instances' rows stay out. */
 export const listOpenChatRequests = db.transaction((instance: string): { revision: number, complete: boolean, requests: OpenChatRequest[] } => {
   const revision = requestRevision(instance)
   const rows = cachedStatement(db, `
     SELECT p.request_id AS requestId, p.session_id AS sessionId, p.kind AS kind, p.created_at AS createdAt,
-      e.event AS event, s.title AS sessionTitle
+      e.event AS event, s.title AS sessionTitle, p.escalation, ${OWNER_ACTION} AS ownerAction
     FROM chat_pending p
     JOIN chat_events e ON e.session_id = p.session_id AND e.seq = p.seq
     JOIN chat_sessions s ON s.id = p.session_id
     WHERE s.instance = ?
-    ORDER BY p.created_at DESC, p.request_id DESC
+    ORDER BY ownerAction DESC, p.created_at DESC, p.request_id DESC
     LIMIT ?
-  `).all(instance, OPEN_CHAT_REQUEST_LIMIT + 1) as Array<{ requestId: string, sessionId: string, kind: 'permission' | 'question', createdAt: string, event: string, sessionTitle: string }>
+  `).all(instance, OPEN_CHAT_REQUEST_LIMIT + 1) as Array<Omit<OpenChatRequest, 'id' | 'content' | 'ownerAction'> & { requestId: string, event: string, ownerAction: number }>
   const requests: OpenChatRequest[] = []
   for (const row of rows.slice(0, OPEN_CHAT_REQUEST_LIMIT)) {
     let content: unknown = null
@@ -481,7 +519,7 @@ export const listOpenChatRequests = db.transaction((instance: string): { revisio
       continue
     }
     requests.push({ id: row.requestId, kind: row.kind, sessionId: row.sessionId,
-      sessionTitle: row.sessionTitle, createdAt: row.createdAt, content, escalation: null })
+      sessionTitle: row.sessionTitle, createdAt: row.createdAt, content, escalation: row.escalation, ownerAction: row.ownerAction === 1 })
   }
   return { revision, complete: rows.length <= OPEN_CHAT_REQUEST_LIMIT, requests }
 })
@@ -642,7 +680,7 @@ export const resetConversation = db.transaction((current: SessionRecord): { sess
   const row = cachedStatement(db, 'SELECT last_seq FROM chat_sessions WHERE id = ?').get(current.id) as { last_seq: number } | undefined
   if (!row) throw new Error('unknown chat session')
   const session: SessionRecord = { ...current, status: 'idle', contextResetting: false, contextCompacting: false,
-    contextResetSeq: row.last_seq + 1, lastSeq: row.last_seq + 1, pendingRequests: [],
+    contextResetSeq: row.last_seq + 1, lastSeq: row.last_seq + 1, pendingRequests: [], ownerRequests: [],
     nativeSessionId: undefined, context: undefined, queuedHandoff: undefined,
     forkedFrom: undefined, staged: undefined, interruptedTurnId: undefined,
     orphanNotice: undefined, safeModePending: false, queuedBehind: undefined }

@@ -263,7 +263,7 @@ export function taskState(chain: ChainRow): { state: StateKey, reason: string } 
     if (chain.reviewStatus === 'not-recorded') return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · pre-merge review completion not recorded` }
     return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)}` }
   }
-  if (chain.held) return { state: 'needs-you', reason: chain.held === 'New invocations held by the person' ? 'Held by you: no new invocations' : `Held: ${reasonWords(chain.held)}` }
+  if (chain.held) return { state: 'blocked', reason: chain.held === 'New invocations held by the person' ? 'Held by you: no new invocations' : `Held: ${reasonWords(chain.held)}` }
   const active = chain.invocations.find((i) => i.state !== 'settled')
   if (active?.state === 'uncertain') return { state: 'blocked', reason: `Not confirmed: ${active.outcome || 'the original receipt is unverified'}; reconciling` }
   if (active?.state === 'started') {

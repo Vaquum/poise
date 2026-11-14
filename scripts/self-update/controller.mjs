@@ -617,7 +617,8 @@ export function createController({
         '',
         'Opened by the Poise release controller. It merges automatically once the required checks pass on this exact head.',
       ].join('\n')
-      const pull = await ensurePullRequest({ branch: record.branch, headSha, title: record.title, body })
+      const title = /^(?:feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(?:\([^\n)]+\))?!?: .+$/.test(record.title) ? record.title : `feat: ${record.title}`
+      const pull = await ensurePullRequest({ branch: record.branch, headSha, title, body })
       return commitChange(record.id, 'change.pull_request', (target) => {
         target.prNumber = pull.number
         target.prUrl = pull.url
@@ -1040,7 +1041,7 @@ export function createController({
           const pull = await ensurePullRequest({
             branch: revert.branch,
             headSha: revert.headSha,
-            title: `Revert: ${record.title}`,
+            title: `revert: ${record.title}`,
             body: [
               `Source reconciliation for rolled-back Poise change \`${record.id}\`${record.prUrl ? ` (${record.prUrl})` : ''}.`,
               '',

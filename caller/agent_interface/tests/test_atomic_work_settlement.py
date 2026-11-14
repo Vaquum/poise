@@ -103,7 +103,7 @@ raise SystemExit({provider_exit})
                 assert connection.execute("select native_call from lease").fetchall() == [(scope.key["callId"],)]
             assert modes == ["prepare"]
         elif provider_exit:
-            with pytest.raises(RuntimeError, match="provider exited 1"):
+            with pytest.raises(atomic_work.issue_review.ProviderFailure, match="failed with exit 1"):
                 run()
             assert modes == ["prepare"]
         else:
@@ -216,11 +216,18 @@ def test_atomic_codex_rejection_is_typed(tmp_path, monkeypatch, capsys, pull, re
         assert CANARY not in json.dumps(diagnostic)
         assert TAIL_MARKER not in json.dumps(diagnostic)
     else:
-        # Generic crashes, GitHub failures and other providers keep the
-        # existing untyped failure; the outer diagnostic still redacts them.
-        assert type(error) is RuntimeError
-        assert getattr(error, "code", None) is None
-        assert getattr(error, "diagnostic", None) is None
-        assert message[:50] in str(error)
+        assert isinstance(error, atomic_work.issue_review.ProviderFailure)
+        assert error.code == "atomic_work_failed"
+        assert "provider cause unavailable" in str(error)
+        assert message[:50] not in str(error)
+        diagnostic = error.diagnostic
+        assert diagnostic["executable"] == provider
+        assert diagnostic["exit_code"] == returncode
+        assert diagnostic["signal"] is None
+        assert diagnostic["submission"] == "none"
+        assert diagnostic["message"] == str(error)
+        assert diagnostic["stderr"] == ""
+        assert CANARY not in json.dumps(diagnostic)
+        assert TAIL_MARKER not in json.dumps(diagnostic)
     assert CANARY not in captured.out + captured.err
     assert TAIL_MARKER not in captured.out + captured.err

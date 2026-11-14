@@ -18,9 +18,12 @@ import pytest
 
 import agent_interface as api
 from agent_interface import atomic_work, failed_source, issue_review
+from agent_interface import review_budget
 
 RUN = "b" * 32
 TEST = "const {test}=require('node:test'); const assert=require('node:assert/strict'); test('candidate-only regression',()=>assert.equal(require('../source.cjs'),2));\n"
+REAL_LEASE = atomic_work.checkout_lock.Lease
+REAL_RUN_GATED = atomic_work.checkout_lock.run_gated
 
 
 @pytest.fixture
@@ -276,3 +279,270 @@ def test_inspection_returns_unavailable_on_deeply_nested_tampered_evidence(retai
     with pytest.raises(RecursionError):
         json.loads(payload)
     assert failed_source.inspect(api.DB, call, candidate, RUN)["status"] == "unavailable"
+
+
+def prepared_fixed(checkout, when="2026-01-01T00:00:00+00:00"):
+    checkout.mkdir()
+    git(checkout, "init", "-q")
+    (checkout / ".gitignore").write_text(".env\nnode_modules/\n")
+    (checkout / "source.cjs").write_text("module.exports=0;\n")
+    (checkout / "deleted.cjs").write_text("module.exports='deleted';\n")
+    git(checkout, "add", ".")
+    env = {**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+    subprocess.run(["git", "-C", str(checkout), "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+                    "commit", "-qm", "fixture base"], check=True, capture_output=True, env=env)
+    return {"outcome": "prepared", "checkout_head": git(checkout, "rev-parse", "HEAD"), "path": str(checkout),
+            "repository": "example/repo", "issue_number": 7, "actor": "author", "branch": "fix/fixture"}
+
+
+def _deadline_provider(code):
+    return [sys.executable, "-c", code]
+
+
+def _run_deadline_original(workspace, monkeypatch, provider_code, when="2026-01-01T00:00:00+00:00"):
+    validation = {}
+    monkeypatch.setattr(atomic_work.checkout_lock, "Lease", REAL_LEASE)
+    monkeypatch.setattr(atomic_work.checkout_lock, "run_gated", REAL_RUN_GATED)
+    monkeypatch.setattr(review_budget, "timeout", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(issue_review, "command", lambda *args: (_deadline_provider(provider_code), "", None))
+
+    def interface(*args, **kwargs):
+        mode = args[args.index("--mode") + 1]
+        assert mode == "prepare"
+        checkout = Path(args[args.index("--path") + 1])
+        validation["prepared"] = prepared_fixed(checkout, when)
+        return validation["prepared"]
+
+    monkeypatch.setattr(issue_review, "interface", interface)
+    monkeypatch.setattr(api, "_main", lambda: api.run_atomic_work(
+        "example/repo#7", "author", "poise:behavior-chain", "deadline-original", "fixture", "fix/fixture"))
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--fixture"])
+    with pytest.raises(review_budget.ReviewLimitError):
+        api.main()
+    original, = api.logs_selected({"latest": [], "ids": [], "correlations": ["deadline-original"]})
+    assert original["error_code"] == "atomic_work_execution_budget_exhausted"
+    assert (original["action"], original["outcome"]) == ("not_started", "preflight_failed")
+    assert original["resources_settled_at"]
+    assert not Path(validation["prepared"]["path"]).parent.exists()
+    return original, validation["prepared"]
+
+
+def _run_deadline_successor(workspace, monkeypatch, base_when, expect_restored, mutate=None):
+    validation, seen = {}, {}
+    monkeypatch.setattr(atomic_work.checkout_lock, "Lease", REAL_LEASE)
+    monkeypatch.setattr(review_budget, "timeout", lambda *args, **kwargs: 30)
+
+    def command(model, instruction, checkout, work, seconds, unattended):
+        seen["instruction"] = instruction
+        return (["fixture-provider"], "", {k: v for k, v in os.environ.items() if not k.startswith("AGENT_INTERFACE_RECEIPT_")})
+
+    monkeypatch.setattr(issue_review, "command", command)
+
+    def interface(*args, **kwargs):
+        mode = args[args.index("--mode") + 1]
+        if mode == "prepare":
+            checkout = Path(args[args.index("--path") + 1])
+            validation["prepared"] = prepared_fixed(checkout, base_when)
+            return validation["prepared"]
+        validation.setdefault("modes", []).append(mode)
+        return {"outcome": "validated" if mode == "validate" else "published",
+                "head_sha": validation["prepared"]["checkout_head"]}
+
+    monkeypatch.setattr(issue_review, "interface", interface)
+
+    def worker(lease, args, *, cwd, env, **kwargs):
+        checkout = Path(cwd)
+        content = (checkout / "source.cjs").read_text()
+        if expect_restored:
+            assert content == "module.exports=1;\n", content
+        else:
+            assert content == "module.exports=0;\n", content
+        validation["checkout"] = checkout
+        (checkout.parent / "publication.json").write_text(json.dumps({
+            "commitMessage": "fix: fixture", "title": "fix: fixture", "body": "Successor validation", "replies": [], "blocked": None}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(atomic_work.checkout_lock, "run_gated", worker)
+    if mutate is not None:
+        mutate()
+    monkeypatch.setattr(api, "_main", lambda: api.run_atomic_work(
+        "example/repo#7", "author", "poise:behavior-chain", "deadline-successor", "fixture", "fix/fixture"))
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--fixture"])
+    api.main()
+    successor, = api.logs_selected({"latest": [], "ids": [], "correlations": ["deadline-successor"]})
+    assert successor["status"] == "completed" and successor["action"] == "published"
+    assert validation.get("modes") == ["validate", "publish"]
+    return successor, validation, seen
+
+
+def test_deadline_edit_survives_reclamation_and_restores_on_same_base(workspace, monkeypatch):
+    provider = "import time, pathlib; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); time.sleep(5)"
+    original, prepared_receipt = _run_deadline_original(workspace, monkeypatch, provider)
+    metadata = original["artifact"].get("deadline_source", {})
+    assert metadata.get("status") == "available" and metadata.get("base") == prepared_receipt["checkout_head"]
+    assert "module.exports" not in json.dumps(original)
+    path = Path(os.environ["POISE_DB"]).parent / "incident-recovery" / f"deadline-source-{original['id']}.json"
+    assert path.is_file() and path.stat().st_mode & 0o077 == 0
+    successor, validation, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", True)
+    assert successor["artifact"]["deadline_restored"]["predecessor"] == original["id"]
+    assert "source.cjs" in seen["instruction"] and original["id"] in seen["instruction"]
+
+
+def test_deadline_changed_base_refuses_restore(workspace, monkeypatch):
+    provider = "import time, pathlib; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); time.sleep(5)"
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "available"
+    successor, _, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-02T00:00:00+00:00", False)
+    assert "deadline_restored" not in successor["artifact"]
+    assert "Restored" not in seen["instruction"]
+
+
+def test_deadline_timeout_without_edits_proceeds_clean(workspace, monkeypatch):
+    provider = "import time; time.sleep(5)"
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "unavailable"
+    successor, _, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False)
+    assert "deadline_restored" not in successor["artifact"]
+
+
+def test_deadline_oversized_capture_proceeds_clean(workspace, monkeypatch):
+    monkeypatch.setattr(failed_source, "MAX_BYTES", 200)
+    provider = "import time, pathlib; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); time.sleep(5)"
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "unavailable"
+    successor, _, _ = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False)
+    assert "deadline_restored" not in successor["artifact"]
+
+
+def test_deadline_unsafe_symlink_never_applies(workspace, monkeypatch):
+    provider = ("import time, pathlib, os; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); "
+                "os.symlink('/etc/passwd', 'evil.cjs'); time.sleep(5)")
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "available"
+    successor, _, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False)
+    assert "deadline_restored" not in successor["artifact"]
+    assert "Restored" not in seen["instruction"]
+
+
+def test_deadline_uncertain_publication_refuses_restore(workspace, monkeypatch):
+    provider = "import time, pathlib; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); time.sleep(5)"
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "available"
+
+    def mutate():
+        with api.db() as conn:
+            conn.execute("update calls set artifact=json_set(artifact,'$.publication_head',?) where id=?",
+                         ("a" * 40, original["id"]))
+
+    successor, _, _ = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False, mutate=mutate)
+    assert "deadline_restored" not in successor["artifact"]
+
+
+def test_deadline_unreleased_cleanup_refuses_restore(workspace, monkeypatch):
+    provider = "import time, pathlib; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); time.sleep(5)"
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "available"
+
+    def mutate():
+        with api.db() as conn:
+            conn.execute("update calls set resources_settled_at=null where id=?", (original["id"],))
+
+    successor, _, _ = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False, mutate=mutate)
+    assert "deadline_restored" not in successor["artifact"]
+
+
+def test_deadline_large_unchanged_file_does_not_veto_capture(workspace, monkeypatch):
+    monkeypatch.setattr(failed_source, "MAX_BYTES", 500)
+    real_prepared = prepared_fixed
+
+    def with_large(checkout, when="2026-01-01T00:00:00+00:00"):
+        receipt = real_prepared(checkout, when)
+        (checkout / "large.cjs").write_text("module.exports='" + "x" * 1500 + "';\n")
+        git(checkout, "add", "large.cjs")
+        env = {**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+        subprocess.run(["git", "-C", str(checkout), "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+                        "commit", "-qm", "fixture large"], check=True, capture_output=True, env=env)
+        receipt["checkout_head"] = git(checkout, "rev-parse", "HEAD")
+        return receipt
+
+    monkeypatch.setattr(sys.modules[__name__], "prepared_fixed", with_large)
+    provider = "import time, pathlib; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); time.sleep(5)"
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "available"
+    successor, _, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", True)
+    assert successor["artifact"]["deadline_restored"]["predecessor"] == original["id"]
+    assert "source.cjs" in seen["instruction"]
+
+
+def test_deadline_chained_symlink_escape_never_applies(workspace, monkeypatch):
+    provider = ("import time, pathlib, os; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); "
+                "pathlib.Path('d').mkdir(exist_ok=True); os.symlink('..', 'd/up.cjs'); "
+                "os.symlink('d/up.cjs/../secret', 'escape.cjs'); time.sleep(5)")
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "available"
+    successor, _, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False)
+    assert "deadline_restored" not in successor["artifact"]
+    assert "Restored" not in seen["instruction"]
+
+
+def test_deadline_base_symlink_escape_never_applies(workspace, monkeypatch):
+    real_prepared = prepared_fixed
+
+    def with_base_link(checkout, when="2026-01-01T00:00:00+00:00"):
+        receipt = real_prepared(checkout, when)
+        (checkout / "d").mkdir(exist_ok=True)
+        os.symlink("..", checkout / "d" / "up.cjs")
+        git(checkout, "add", "d/up.cjs")
+        env = {**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+        subprocess.run(["git", "-C", str(checkout), "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+                        "commit", "-qm", "fixture base link"], check=True, capture_output=True, env=env)
+        receipt["checkout_head"] = git(checkout, "rev-parse", "HEAD")
+        return receipt
+
+    monkeypatch.setattr(sys.modules[__name__], "prepared_fixed", with_base_link)
+    provider = ("import time, pathlib, os; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); "
+                "os.symlink('d/up.cjs/../secret', 'escape.cjs'); time.sleep(5)")
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "available"
+    successor, _, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False)
+    assert "deadline_restored" not in successor["artifact"]
+    assert "Restored" not in seen["instruction"]
+
+
+def test_deadline_parent_symlink_escape_never_captures(workspace, monkeypatch):
+    real_prepared = prepared_fixed
+
+    def with_secret_dir(checkout, when="2026-01-01T00:00:00+00:00"):
+        receipt = real_prepared(checkout, when)
+        (checkout / "d").mkdir(exist_ok=True)
+        (checkout / "d" / "secret.json").write_text('{"base": true}\n')
+        git(checkout, "add", "d/secret.json")
+        env = {**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+        subprocess.run(["git", "-C", str(checkout), "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+                        "commit", "-qm", "fixture secret dir"], check=True, capture_output=True, env=env)
+        receipt["checkout_head"] = git(checkout, "rev-parse", "HEAD")
+        return receipt
+
+    monkeypatch.setattr(sys.modules[__name__], "prepared_fixed", with_secret_dir)
+    provider = ("import time, pathlib, os, shutil; pathlib.Path('source.cjs').write_text('module.exports=1;\\n'); "
+                "pathlib.Path('../private').mkdir(exist_ok=True); "
+                "pathlib.Path('../private/secret.json').write_text('{\"pwned\": true}\\n'); "
+                "shutil.rmtree('d'); os.symlink('../private', 'd'); time.sleep(5)")
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "unavailable"
+    successor, _, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False)
+    assert "deadline_restored" not in successor["artifact"]
+    assert "Restored" not in seen["instruction"]
+
+
+def test_deadline_repo_symlink_escape_never_captures(workspace, monkeypatch):
+    provider = ("import pathlib, os, shutil, time; repo=pathlib.Path.cwd(); root=repo.parent; outside=root/'outside'; "
+                "outside.mkdir(exist_ok=True); shutil.copytree(repo/'.git', outside/'.git', symlinks=True); "
+                "(outside/'source.cjs').write_text('module.exports=1;\\n'); "
+                "(outside/'secret.json').write_text('{\"pwned\": true}\\n'); "
+                "os.rename(repo, root/'repo-backup'); os.symlink('outside', repo); time.sleep(5)")
+    original, _ = _run_deadline_original(workspace, monkeypatch, provider)
+    assert original["artifact"]["deadline_source"]["status"] == "unavailable"
+    successor, _, seen = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False)
+    assert "deadline_restored" not in successor["artifact"]
+    assert "Restored" not in seen["instruction"]

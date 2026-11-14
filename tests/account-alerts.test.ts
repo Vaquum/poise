@@ -47,7 +47,8 @@ function gh(accounts: GhAccount[] | undefined): ConnectedAccount {
   return { ...cli('gh', accounts ? accounts.some((account) => account.signedIn) : null), ...(accounts ? { accounts } : {}) }
 }
 
-const held = (login: string, signedIn = true): GhAccount => ({ login, active: false, signedIn, detail: signedIn ? null : 'HTTP 401: Bad credentials (https://api.github.com/)' })
+const held = (login: string, signedIn = true): GhAccount => ({ login, active: false, signedIn, detail: signedIn ? null : 'HTTP 401: Bad credentials (https://api.github.com/)',
+  ...(signedIn ? {} : { credentialRejected: true }) })
 const nobody = { me: '', agentAccount: '' }
 
 describe('sign-in alerts from Connected accounts', () => {
@@ -177,6 +178,22 @@ describe('sign-in alerts from Connected accounts', () => {
     producers.accountsChecked([{ ...gh([]), installed: false }], nobody)
     expect(open()).toEqual(['sign-in:gh:you', 'sign-in:gh:agent'])
     producers.accountsChecked([gh([])], nobody)
+    expect(open()).toEqual([])
+  })
+
+  it('alerts when any saved GitHub sign-in is rejected and clears on reconnect', () => {
+    const timeout = { ...held('Secondary'), signedIn: false, detail: 'The GitHub request timed out.' }
+    producers.accountsChecked([gh([timeout])], { me: 'Secondary', agentAccount: '' })
+    producers.accountsChecked([gh([timeout])], nobody)
+    expect(open()).toEqual([])
+    producers.accountsChecked([gh([held('Secondary', false)])], nobody)
+    expect(open()).toEqual(['sign-in:gh:stored:secondary'])
+    expect(rows()[0]).toMatchObject({ title: 'Reconnect GitHub account Secondary', url: '/?settings=accounts' })
+    producers.accountsChecked([gh(undefined)], nobody)
+    producers.accountsChecked([gh([timeout])], nobody)
+    producers.accountsChecked([gh([])], nobody)
+    expect(open()).toHaveLength(1)
+    producers.accountsChecked([gh([held('secondary')])], nobody)
     expect(open()).toEqual([])
   })
 })

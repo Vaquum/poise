@@ -80,7 +80,8 @@ seeds. `--chain-seed` retains the pinned Git trees and distinct covering merge;
 the close action rechecks the current head and base. Independent work and
 unverified coverage retain ordinary processing. The source issue is untouched.
 
-An atomic repair blocked solely by the supplied head's failed CI can return
+An atomic repair blocked solely by failed CI on the supplied PR head or a
+verified merge-group integration can return
 `blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains
 its own supplied CI snapshot as `artifact.ci_blocker`, including the failed
 check and job IDs that identify the original run attempt. Other blockers remain

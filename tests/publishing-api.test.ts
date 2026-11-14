@@ -453,7 +453,7 @@ describe('publishing a document', () => {
     ].join('\n'))
     expect(fileOn('mikkokotila/mikkokotila-com', 'main', POST)).toBeUndefined()
     const pull = repos.get('mikkokotila/mikkokotila-com')!.pulls.get(101)!
-    expect(pull).toMatchObject({ title: 'A better question', head: 'publish/a-better-question', base: 'main', state: 'open' })
+    expect(pull).toMatchObject({ title: 'docs: A better question', head: 'publish/a-better-question', base: 'main', state: 'open' })
     expect(pull.body).toContain(`- File: \`${POST}\``)
     // One commit, through GraphQL, and never as the automation account.
     expect(calls.filter((call) => call.args[1] === 'graphql')).toHaveLength(1)
@@ -463,6 +463,20 @@ describe('publishing a document', () => {
     expect(after.body.publications).toEqual([expect.objectContaining({ slug: 'a-better-question', changed: false, pullRequest: expect.objectContaining({ state: 'open' }) })])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
     expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications[0].changed).toBe(true)
+  })
+
+  it.each(['docs: A better question', 'docs(writing): A better question', 'docs!: A better question', 'docs(writing)!: A better question'])('preserves the title %s on first publication and updates', async (title) => {
+    const content = TEXT.replace('# A better question', `# ${title}`)
+    await writeDocument(DOC, content)
+    expect((await publish([writing()])).body.results[0].ok).toBe(true)
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    expect(repo.pulls.get(101)!.title).toBe(title)
+    expect(fileOn(repo.fullName, 'publish/a-better-question', POST)).toContain(`title: "${title}"`)
+    merge(repo.fullName, 101)
+    await writeDocument(DOC, `${content}\nA new ending.\n`)
+    expect((await publish([writing()])).body.results[0].ok).toBe(true)
+    expect(repo.pulls.get(102)!.title).toBe(title)
+    expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.title).toBe(title)
   })
 
   it('updates the same pull request while it is open, then opens an update once it is merged', async () => {
@@ -480,7 +494,7 @@ describe('publishing a document', () => {
     const update = await publish([writing()])
     expect(update.body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102, state: 'open' } } })
     const pull = repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)!
-    expect(pull).toMatchObject({ title: 'Update: A better question', head: 'publish/a-better-question-2', base: 'main' })
+    expect(pull).toMatchObject({ title: 'docs: Update: A better question', head: 'publish/a-better-question-2', base: 'main' })
     const updated = fileOn('mikkokotila/mikkokotila-com', 'publish/a-better-question-2', POST)!
     expect(updated).toContain('A third thought.')
     expect(updated).toContain('  - "machine-intelligence"')
@@ -606,7 +620,7 @@ describe('publishing a document', () => {
     beforeCommit = () => merge('mikkokotila/mikkokotila-com', 101)
     const again = await publish([writing()])
     expect(again.body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102, state: 'open' } } })
-    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)).toMatchObject({ title: 'Update: A better question', head: 'publish/a-better-question', base: 'main', state: 'open' })
+    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)).toMatchObject({ title: 'docs: Update: A better question', head: 'publish/a-better-question', base: 'main', state: 'open' })
     expect((await editor!.readPublishLedger(DOC)).records[0].pullRequest.number).toBe(102)
   })
 
@@ -1590,7 +1604,7 @@ ${fields}`
     await writeDocument(DOC, `${TEXT}\nA third thought.\n`)
     const again = await publish([writing()])
     expect(again.body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 103 } } })
-    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)).toMatchObject({ title: 'Update: A better question' })
+    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)).toMatchObject({ title: 'docs: Update: A better question' })
     expect(fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)!.head, POST)).toContain('A third thought.')
   })
 

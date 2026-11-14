@@ -16,13 +16,13 @@ const ago = (minutes: number) => new Date(NOW - minutes * 60_000).toISOString()
 const hex = (c: string, n: number) => c.repeat(n)
 const EVIDENCE = { eventId: `evt_${hex('a', 16)}_${hex('b', 64)}`, incidentId: `inc_${hex('a', 16)}_${hex('d', 64)}`, from: '2026-11-10T08:00:00.000Z', to: '2026-11-11T08:00:00.000Z' }
 
-interface Request { id: string, kind: 'permission' | 'question', sessionId: string, sessionTitle: string, createdAt: string, content: unknown, escalation: null }
+interface Request { id: string, kind: 'permission' | 'question', sessionId: string, sessionTitle: string, createdAt: string, content: unknown, escalation: string | null, ownerAction: boolean }
 const permission = (id: string, sessionId: string, title: string): Request => ({
-  id, kind: 'permission', sessionId, sessionTitle: `Chat ${sessionId}`, createdAt: ago(3), escalation: null,
+  id, kind: 'permission', sessionId, sessionTitle: `Chat ${sessionId}`, createdAt: ago(3), escalation: null, ownerAction: true,
   content: { title, description: 'Open a pull request.', input: { command: 'gh pr create' }, options: [{ id: 'allow', name: 'Allow once', kind: 'allow_once' }, { id: 'deny', name: 'Deny', kind: 'reject_once' }] },
 })
 const question = (id: string, sessionId: string, q: { question: string, options: string[], freeText: boolean }): Request => ({
-  id, kind: 'question', sessionId, sessionTitle: `Chat ${sessionId}`, createdAt: ago(5), escalation: null,
+  id, kind: 'question', sessionId, sessionTitle: `Chat ${sessionId}`, createdAt: ago(5), escalation: null, ownerAction: true,
   content: { questions: [{ id: `${id}-q`, question: q.question, options: q.options.map((label) => ({ label })), multiSelect: false, freeText: q.freeText }] },
 })
 
@@ -296,30 +296,52 @@ test('nothing moves when an entry arrives while the pointer is in Answer here; i
 test('the level decides what shows and what the bell counts, and is remembered', async ({ page }) => {
   const notices = [
     { id: 'pr', kind: 'pr_ready', title: 'acme/site#9 is ready to merge', body: 'Checks pass.', since: ago(20), due: ago(5), silenceable: true, target: { pullRequest: 'https://github.com/acme/site/pull/9' } },
+    { id: 'review', kind: 'review_requested', title: 'acme/site#10 requests your review', body: 'New change', since: ago(10), due: ago(10), silenceable: true, target: { pullRequest: 'https://github.com/acme/site/pull/10' } },
+    { id: 'signin', kind: 'sign_in_needed', title: 'Reconnect GitHub', body: 'Sign in again', since: ago(6), due: ago(6), silenceable: false, target: { settings: 'accounts' } },
     { id: 'ledger', kind: 'ledger_queue_stalled', title: 'Behavior ledger is not draining', body: 'Queued 6 minutes.', since: ago(7), due: ago(7), silenceable: false, target: null },
     { id: 'turn', kind: 'chat_turn_finished', title: 'Codex finished', body: 'Done after 6 minutes.', since: ago(9), due: ago(9), silenceable: false, target: { chat: 's2' } },
   ]
   await open(page, { notices, requests: [], decisions: [], revision: 1 }, '/?view=overview&back=board#answer')
   await expect(page.getByRole('link', { name: 'Back to Board' })).toBeVisible()
   await expect.poll(() => page.evaluate(() => !!document.activeElement?.closest('[data-answers]'))).toBe(true)
-  // + Faults, the default: the ready pull request nothing else will merge, and the stalled ledger. Finished work is not listed.
-  await expect(page.locator('[data-bell]')).toHaveText('2')
+  await expect(page.locator('[data-bell]')).toHaveText('3')
+  await expect(entry(page, 'notice:pr')).toHaveCount(0)
   await expect(entry(page, 'notice:turn')).toHaveCount(0)
   await expect(page.locator('[data-bell]')).toHaveAttribute('data-tone', 'failed')
-  await expect(entry(page, 'notice:pr').getByRole('link', { name: 'Open its card on Board' })).toHaveAttribute('href', '?view=board&item=acme%2Fsite%239&back=overview')
+  await expect(entry(page, 'notice:review').getByRole('link', { name: 'Open its card on Board' })).toHaveAttribute('href', '?view=board&item=acme%2Fsite%2310&back=overview')
+  await expect(entry(page, 'notice:review').getByRole('button', { name: 'Approve', exact: true })).toBeVisible()
 
   await answers(page).getByRole('radio', { name: 'Only you' }).click()
-  await expect(page.locator('[data-bell]')).toHaveText('1')
+  await expect(page.locator('[data-bell]')).toHaveText('2')
+  await expect(entry(page, 'notice:signin')).toBeVisible()
   await expect(page.locator('[data-bell]')).toHaveAttribute('data-tone', 'needs-you')
   await expect(entry(page, 'notice:ledger')).toHaveCount(0)
   await page.reload()
   await expect(answers(page).getByRole('radio', { name: 'Only you' })).toHaveAttribute('aria-checked', 'true')
+  await expect(page.locator('[data-bell]')).toHaveText('2')
+})
+
+test('only one worker question asks the owner after the Manager escalates it', async ({ page }) => {
+  const worker = { ...question('q1', 'w1', { question: 'Which release?', options: ['Stable', 'Beta'], freeText: false }), ownerAction: false }
+  const workspace: Workspace = { notices: [], requests: [worker], decisions: [], revision: 1 }
+  const socket = await open(page, workspace)
+  await answers(page).getByRole('radio', { name: 'Only you', exact: true }).click()
+  await expect(entry(page, 'request:q1')).toHaveCount(0)
+  await expect(page.locator('[data-bell]')).toHaveText('0')
+  workspace.requests = [{ ...worker, ownerAction: true, escalation: 'The release choice belongs to the owner.' }]
+  announce(socket, workspace)
+  await answers(page).getByRole('button', { name: 'Show now' }).click()
+  const card = entry(page, 'request:q1')
+  await expect(card).toContainText('Which release?')
+  await expect(card).toContainText('The release choice belongs to the owner.')
   await expect(page.locator('[data-bell]')).toHaveText('1')
+  await card.getByRole('button', { name: 'Stable' }).click()
+  await expect.poll(() => socket.frames.some(frame => frame.command.type === 'question.answer' && frame.command.sessionId === 'w1')).toBe(true)
 })
 
 test('a level brings what it adds into view, or says there is none, and arrow keys keep moving it', async ({ page }) => {
-  const ready = Array.from({ length: 30 }, (_, i) => ({ id: `pr${i}`, kind: 'pr_ready', title: `acme/site#${i} is ready to merge`, body: 'Checks pass.', since: ago(20 + i), due: ago(5), silenceable: true, target: { pullRequest: `https://github.com/acme/site/pull/${i}` } }))
-  const notices = [...ready, { id: 'quota', kind: 'github_quota_warning', title: 'GitHub API quota is low', body: '900 of 5000 left.', since: ago(9), due: ago(9), silenceable: false, target: null }]
+  const requested = Array.from({ length: 30 }, (_, i) => ({ id: `pr${i}`, kind: 'review_requested', title: `acme/site#${i + 1} requested your review`, body: 'A pull request', since: ago(20 + i), due: ago(5), silenceable: true, target: { pullRequest: `https://github.com/acme/site/pull/${i + 1}` } }))
+  const notices = [...requested, { id: 'quota', kind: 'github_quota_warning', title: 'GitHub API quota is low', body: '900 of 5000 left.', since: ago(9), due: ago(9), silenceable: false, target: null }]
   await open(page, { notices, requests: [], decisions: [], revision: 1 })
   const level = (name: string) => answers(page).getByRole('radio', { name })
 
@@ -348,8 +370,7 @@ test('a card shows only what acts; its other actions wait under the pointer, as 
   await expect(card.locator('.nc-d')).toHaveText('outside your configured GitHub account pair')
   await expect(card.locator('.card-meta')).toContainText('Ready to merge')
   await expect(card.locator('.card-meta')).toContainText('acme/site #9')
-  // One button: the one that acts.
-  await expect(card.locator('.nc-acts button')).toHaveText(['Merge'])
+  await expect(card.getByRole('button', { name: 'Merge', exact: true })).toHaveCount(0)
   const acts = card.locator('.card-acts')
   await page.mouse.move(1200, 700)
   await expect.poll(() => acts.evaluate((el) => getComputedStyle(el).opacity)).toBe('0')
@@ -390,9 +411,9 @@ test('Answer here paints its last read at once, quiet and unanswerable, and each
   const kept = [
     { id: 'request:p1', source: 'request', group: 'needs-you', kind: 'Permission', title: 'Run gh pr create', where: 'Chat s1', since: ago(3), detail: 'Asks before a step',
       options: ['Allow once', 'Deny'], primary: 0, open: { href: '?view=chat&chat=s1&back=overview', label: 'Open the chat' } },
-    { id: 'notice:disk', source: 'notice', group: 'needs-you', kind: 'Storage', title: 'Workspace disk is 95% full', where: '', since: ago(30) },
+    { id: 'notice:disk', source: 'notice', group: 'fault', kind: 'Storage', title: 'Workspace disk is 95% full', where: '', since: ago(30) },
   ]
-  await page.addInitScript((value) => { if (!sessionStorage.getItem('kept-once')) { sessionStorage.setItem('kept-once', '1'); localStorage.setItem('poise-overview-answers', value) } },
+  await page.addInitScript((value) => { if (!sessionStorage.getItem('kept-once')) { sessionStorage.setItem('kept-once', '1'); localStorage.setItem('poise-overview-answers-v2', value) } },
     JSON.stringify({ key: 'me|acme:ready', at: NOW - 120_000, entries: kept }))
   const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [permission('p1', 's1', 'Run gh pr create')], answersLate: late }
   const socket = await open(page, workspace)
@@ -419,8 +440,8 @@ test('Answer here paints its last read at once, quiet and unanswerable, and each
   expect((await card.boundingBox())?.height).toBe(box?.height)
   expect(socket.frames.filter((frame) => frame.command.type === 'permission.respond')).toEqual([])
   // What is drawn now is kept for the next load, small: only what a card shows.
-  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers') ?? 'null')?.entries?.map((e: { id: string }) => e.id)), { timeout: 10_000 }).toEqual(['request:p1'])
-  const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers') ?? 'null'))
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers-v2') ?? 'null')?.entries?.map((e: { id: string }) => e.id)), { timeout: 10_000 }).toEqual(['request:p1'])
+  const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers-v2') ?? 'null'))
   expect(stored.key).toBe('me|acme:ready')
   expect(Object.keys(stored.entries[0]).sort()).toEqual(['detail', 'group', 'id', 'kind', 'open', 'options', 'primary', 'since', 'source', 'title', 'where'])
 })
@@ -428,20 +449,20 @@ test('Answer here paints its last read at once, quiet and unanswerable, and each
 test('a failed read stands for nothing: its source’s last read stays, and the kept list is not overwritten', async ({ page }) => {
   const kept = { key: 'me|acme:ready', at: NOW - 60_000, entries: [
     { id: 'diagnostic:["held_result"]', source: 'diagnostic', group: 'fault', kind: 'Behaviors', title: 'The review outcome needs verification before retry.', where: 'acme/site#4', since: ago(30) }] }
-  await page.addInitScript((value) => localStorage.setItem('poise-overview-answers', value), JSON.stringify(kept))
+  await page.addInitScript((value) => localStorage.setItem('poise-overview-answers-v2', value), JSON.stringify(kept))
   await open(page, { notices: [], decisions: [], revision: 1, requests: [], behaviorsFail: true })
   const card = page.locator('[data-notice="diagnostic:[\\"held_result\\"]"]')
   await expect(card).toHaveClass(/is-remembered/)
   // Every other source has read; Behaviors failed. Its last read stays, and nothing is written over it.
   await page.waitForTimeout(3_500)
   await expect(card).toHaveClass(/is-remembered/)
-  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers') ?? 'null')?.at)).toBe(kept.at)
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('poise-overview-answers-v2') ?? 'null')?.at)).toBe(kept.at)
 })
 
 test('settings read afresh for other organizations put the last read away at once', async ({ page }) => {
   const settings = { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'me', agentAccount: 'bot', timezone: 'UTC',
     manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }
-  await page.addInitScript(([last, answers]) => { localStorage.setItem('poise-last-settings', last); localStorage.setItem('poise-overview-answers', answers) },
+  await page.addInitScript(([last, answers]) => { localStorage.setItem('poise-last-settings', last); localStorage.setItem('poise-overview-answers-v2', answers) },
     [JSON.stringify(settings), JSON.stringify({ key: 'me|acme:ready', at: NOW - 60_000, entries: [{ id: 'request:old', source: 'request', group: 'needs-you', kind: 'Permission', title: 'From the old scope', where: 'Chat', since: ago(5) }] })])
   let release!: () => void
   let settingsRead!: () => void
@@ -458,7 +479,7 @@ test('settings read afresh for other organizations put the last read away at onc
 })
 
 test('another GitHub user’s or organizations’ last read never paints', async ({ page }) => {
-  await page.addInitScript(() => localStorage.setItem('poise-overview-answers', JSON.stringify({ key: 'someone-else|acme:ready', at: Date.now(), entries: [
+  await page.addInitScript(() => localStorage.setItem('poise-overview-answers-v2', JSON.stringify({ key: 'someone-else|acme:ready', at: Date.now(), entries: [
     { id: 'request:x', source: 'request', group: 'needs-you', kind: 'Permission', title: 'Not yours', where: 'Chat x', since: null }] })))
   let release!: () => void
   const workspace: Workspace = { notices: [], decisions: [], revision: 1, requests: [], answersLate: new Promise<void>((resolve) => { release = resolve }) }
@@ -543,6 +564,9 @@ test('a review thread answered here stays settled though the reply changes what 
     threads: { notes: [{ id: 't1', messages: [{ author: 'ann', body: 'Typo in the title', createdAt: ago(10) }] }] } }
   await open(page, workspace)
   const card = entry(page, 'thread:notes:t1')
+  await expect(card).toHaveCount(0)
+  await answers(page).getByRole('radio', { name: 'Everything' }).click()
+  await expect(page.locator('[data-bell]')).toHaveText('0')
   await card.getByRole('button', { name: 'Reply…' }).click()
   await card.getByRole('textbox').fill('Fixed, thanks')
   await card.getByRole('button', { name: 'Send reply' }).click()
@@ -616,7 +640,7 @@ test('the right-hand side has one day, one search and the organization; Behavior
 
 test('Show has three levels, each visibly changing the list, and the heading counts what it shows', async ({ page }) => {
   const notice = (id: string, kind: string) => ({ id, kind, title: `${kind} title`, body: '', since: ago(5), due: ago(5), silenceable: false, target: null })
-  await open(page, { notices: [notice('n1', 'storage_low'), notice('n2', 'ledger_queue_stalled'), notice('n3', 'chat_turn_finished'), notice('n4', 'github_quota_warning')], requests: [], decisions: [], revision: 1 })
+  await open(page, { notices: [notice('n1', 'sign_in_needed'), notice('n2', 'storage_low'), notice('n3', 'chat_turn_finished'), notice('n4', 'github_quota_warning')], requests: [], decisions: [], revision: 1 })
   const level = (name: string) => answers(page).getByRole('radio', { name, exact: true })
   await expect(answers(page).getByRole('radio')).toHaveText(['Only you', '+ Faults', 'Everything'])
   const listed = () => answers(page).locator('[data-notice]').evaluateAll((cards) => cards.map((card) => (card as HTMLElement).dataset.notice))
@@ -652,7 +676,7 @@ for (const width of [1440, 1000, 375]) {
 
 test('the bell on Overview brings Answer here to its first entry with the focus ring; its count follows Show (#1433)', async ({ page }) => {
   const notice = (id: string, kind: string, minutes: number) => ({ id, kind, title: `${kind} title`, body: '', since: ago(minutes), due: ago(minutes), silenceable: false, target: null })
-  await open(page, { notices: [notice('n1', 'storage_low', 5), notice('n2', 'ledger_queue_stalled', 6), notice('n3', 'chat_turn_finished', 7)], requests: [], decisions: [], revision: 1 })
+  await open(page, { notices: [notice('n1', 'sign_in_needed', 5), notice('n2', 'ledger_queue_stalled', 6), notice('n3', 'chat_turn_finished', 7)], requests: [], decisions: [], revision: 1 })
   const bell = page.getByRole('button', { name: /^Notifications/ })
   await expect(bell).toHaveAccessibleName(/Brings Answer here to its first entry\.$/)
   // Its count is what Show lists.
@@ -697,24 +721,11 @@ test('with nothing at the level, the bell focuses Answer here’s empty state (#
   await expect(answers(page).locator('[data-key="empty"]')).toBeFocused()
 })
 
-test('a decision whose chat is gone says so, and Dismiss puts it away', async ({ page }) => {
+test('a decision whose chat is gone leaves Only you', async ({ page }) => {
   const decision = (id: number, exists: boolean) => ({ id, kind: 'decision', text: `Decision ${id}`, detail: null, createdAt: ago(4), source: { sessionId: `s${id}`, title: `Chat ${id}`, agent: 'claude', model: 'opus', exists }, sourceSeq: 2, options: [{ id: 'a', label: 'Open the fix', detail: null, recommended: true }], explanation: { state: 'none' } })
   const workspace: Workspace = { notices: [], requests: [], revision: 1, decisions: [decision(7, true), decision(8, false)] }
-  const sent: string[] = []
-  await page.route('**/api/chat/switchboard/items/*/dismiss', (route) => {
-    sent.push(new URL(route.request().url()).pathname)
-    workspace.decisions = workspace.decisions.filter((item) => (item as { id: number }).id !== 8)
-    return json(route, { revision: 2, status: 'live', items: workspace.decisions })
-  })
   await open(page, workspace)
   await expect(entry(page, 'decision:7').getByRole('button', { name: 'Dismiss' })).toHaveCount(0)
-  await expect(entry(page, 'decision:8')).toContainText('The chat that asked no longer exists, so it can no longer be answered.')
-  await expect(entry(page, 'decision:8').getByRole('button', { name: /Open the fix/ })).toHaveAttribute('aria-disabled', 'true')
-
-  await press(entry(page, 'decision:8'), 'Dismiss')
-  await expect(entry(page, 'decision:8')).toContainText('Dismissed')
-  await expect.poll(() => sent, { timeout: 12_000 }).toEqual(['/api/chat/switchboard/items/8/dismiss'])
-  await page.mouse.move(1000, 600)
   await expect(entry(page, 'decision:8')).toHaveCount(0)
   await expect(entry(page, 'decision:7')).toBeVisible()
 })

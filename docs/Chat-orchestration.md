@@ -6,6 +6,9 @@ give them the context they need.” Every provider receives the same Poise
 control command in its native prompt and runs it through its native shell.
 No model or provider credential is added. Safe mode still governs native tools.
 
+Shared guidance on every turn requires Conventional Commits PR titles in every
+repository, including ordinary chats and workers with saved `/worker` snippets.
+
 The command discovers itself with `{"operation":"help"}`. Its connection file
 identifies the calling chat; a request cannot impersonate another chat by
 putting a different sender in its JSON. The private per-chat credential
@@ -30,6 +33,7 @@ operating-system user.
 | `send` | `sessionId`, `text` | Durable internal message; any chat may send to any other chat, the Manager included |
 | `steer` | Your worker, or any chat if you are the workspace Manager: `sessionId`, `text` | Native context delivery during its active turn; the transcript names the acting chat |
 | `answer` | Your worker, or any chat if you are the workspace Manager: `sessionId`, `questionId`, `answers` | Supply known task data; the transcript names the acting chat |
+| `escalate` | Manager only: `sessionId`, `questionId`, `reason` (up to 2,000 UTF-8 bytes) | Bring a pending question to the workspace owner |
 | `inbox` | Optional `afterSeq` | Up to 100 durable messages in sequence order, each with `sender_title` and `sender_role` |
 | `supervise` | `sessionIds`, `intervalMinutes`, `instruction` | Persistent supervision ID |
 | `unsupervise` | `watchId` | Disable the caller's supervision |
@@ -83,10 +87,10 @@ turn references. The deleted sender's pending outgoing messages to other chats
 are still dropped.
 
 A creating chat can explicitly steer its own worker or answer its pending
-question with known task data. Native answer validation still applies. The
-transcript names the acting chat, as described under Attribution; it never
-labels that answer as the person's decision. Questions needing a new human
-decision and all permission requests remain with the person/native Safe mode.
+question with known task data. A Worker started by the owner sends its native
+question to the Manager when that chat is open. Otherwise the question goes
+to the owner and appears in Answer here. Pending permissions go to the owner.
+Native answer validation still applies and the transcript names the answering chat.
 Answering a question that someone else answered first names the first answerer
 relative to the caller ("by you", "by the person", "by the workspace Manager",
 or the answering chat); a cancelled question keeps "no longer pending".
@@ -134,15 +138,22 @@ Who may act on a chat, through the control. Refusals are 403, before any receipt
 | --- | --- | --- | --- |
 | `steer` | allowed, except on itself | allowed | refused |
 | `answer` | allowed, except on itself | allowed | refused |
+| `escalate` | allowed for a pending question | refused | refused |
 | `stop` | allowed, except on itself | allowed | refused |
 | `send`, `create`, `supervise`, `unsupervise`, `bind`, `unbind`, `read`, `list`, `inbox`, `help` | unchanged | unchanged | unchanged |
 
-No chat acts on itself, and none acts on the Switchboard except through its own
+These controls act on other chats. The Switchboard is reached only through its own
 operations. Any chat may `send` to the Manager, as to any chat; each message
 reaches it as source data from that chat, never as the person's request. A chat
 that keeps sending starts a Manager turn each time the Manager is idle, until the
 person stops the sending chat. The Manager's reach ends at the Poise instance:
 another instance's chat reads as unknown, without naming that instance.
+
+The Manager uses `escalate` when a worker's pending question needs a decision
+outside the current policy. The same question appears once in Answer here with
+the Manager's reason and its original options. The owner answers it in Answer
+here or in the source chat. The Manager can ask a native question directly
+about its own work.
 
 When the Manager answers in a chat it did not create, the target agent gets a
 provenance note naming the answered questions: the answer came from the Manager,
@@ -362,8 +373,8 @@ plus six operations that return 403 for every other chat:
 
 `switchboard.read` and `switchboard.items` change nothing and need no
 `requestId`. A post's source event must still be in the chat's transcript, and
-a question or permission the chat asked natively is posted as `blocked`, never
-as a decision. Open decisions are capped at five a chat and fifty a workspace.
+a native request or a worker question is reported as `blocked`. Open decisions
+are capped at five a chat and fifty a workspace.
 
 `create`, `send`, `steer`, `answer`, `bind`, `unbind`, `supervise`,
 `unsupervise` and `stop` return 403 for it, before any receipt is recorded;

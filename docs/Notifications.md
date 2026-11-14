@@ -5,7 +5,7 @@ Answer here. A bell at the end of the top bar, on every place, counts what is
 open and opens Answer here, with a route back to where you were. On Overview
 itself it brings Answer here to its top and moves focus to its first entry, or
 to its empty state when nothing is open at the level; its label says which.
-When nothing needs you, the bell shows no count.
+When the selected level has no requests or faults, the bell shows no count.
 
 ## The bell
 
@@ -18,18 +18,12 @@ counted, and what has finished is never listed. The badge is:
 
 ## Answer here
 
-Answer here lists everything that wants you, each entry with its answers on
-it, by who acts on it next. Show sets how much it lists, each level including
-the one before it:
+Show sets how much Answer here lists. Each level includes the one before it.
 
-- **Only you:** what stays put until you act. A chat's permission or question,
-  a Switchboard decision, a chat waiting for you, a sign-in, a review requested
-  of you, a review comment on your document, low storage, idle worker slots
-  with an empty backlog, an action of yours that failed, and a pull request of
-  yours that nothing else will move: changes
-  requested, a conflict, failing checks, unresolved conversations, a refusal,
-  a review cap reached, merging turned off, or no status read for it. Chain
-  work is never here.
+- **Only you** shows GitHub review requests addressed to your personal account,
+  open questions or decisions addressed to you, pending Safe mode permissions,
+  and confirmed sign-in or reconnect requests. A worker question reaches this
+  level when the [Manager escalates it](Chat-orchestration.md#authority).
 - **+ Faults:** also what is stuck. Chain work that is held or has not moved
   for four hours, a behavior that gave up on a target, Poise's own failures
   (a review outcome to verify, an unusable result, a failed command), a stalled
@@ -37,11 +31,9 @@ the one before it:
   when it was raised, chain work from its last verified advance, a retried
   Behaviors failure from when its run of failures began. The default, and what
   the bell counts.
-- **Everything:** also what Poise is handling on its own: chain work that moved
-  in the last four hours, pull requests a behavior or the chain is moving
-  (reviewing, in the merge queue, checks running, a branch update), and
-  retries (rate limits, a busy model, the network, GitHub's quota, a stalled
-  sweep). This group folds to its count while anything else is listed.
+- **Everything** also shows active changes and retries, pull request status
+  (including readiness to merge), and publication review threads. This group
+  folds to its count while anything else is listed.
 
 What has finished, a chat's turn or an action, is not listed; Handled today
 keeps what was settled here. A pull request's notice takes its group from the
@@ -49,7 +41,7 @@ pull request's current blocker, read from
 `/api/behavior-ledger/pr-status`; the line under its title says that blocker.
 When that status cannot be read, the last read stays, an organization whose
 datastore could not be read keeps its earlier rows, and a pull request with no
-status read waits on you.
+status read says that behavior status is unavailable.
 The heading counts what the level shows, and each group heading counts its own.
 
 A load paints the last read at once: the entries Answer here last showed, under
@@ -60,8 +52,8 @@ lists leaves at once, even under the pointer.
 
 Each entry is a card as on Board: its title (a pull request's own title, a
 chain's first reason), one line on what it waits on, and its kind, place and
-age. Only what acts is a button on it: Merge, an answer's options and Other, a
-reply, Resolve. Its other actions show under the pointer, or with focus, at its
+age. Request cards let you answer or grant permission. Publication threads let
+you reply and resolve. Other actions show under the pointer, or with focus, at its
 lower right: open it where it lives, on GitHub, its timeline or diagnostic,
 More, Resume a held chain, Silence reminders, and Dismiss, whose tip says what
 putting it away does.
@@ -78,8 +70,7 @@ another day and the year for another year.
 Server notices are unresolved alerts, the same alerts
 [Poise Link](Poise-Link.md) shows on the desktop. A failed
 read shows on the element it belongs to, and as a tab-local Poise fault in
-Answer here, which the bell counts. Failed writes and conflicts also
-appear here, classified as faults or actions needing the person. Changed failures
+Answer here. Failed writes and conflicts appear here as faults. Changed failures
 receive a fresh notice; repeating the same failure keeps its dismissal. Unreadable
 run records are tracked by stable record identity instead: reworded evidence for
 known rows updates the notice in place, and only a never-before-seen row raises a
@@ -92,9 +83,8 @@ on recovery. They remain accessible when Notifications are off; the switch
 suppresses their popups. See
 [Analytics](Analytics.md#missing-data-and-failures). They come in this order:
 
-1. A Chat agent is waiting for a permission or an answer.
-2. A sign-in is needed: Claude, another agent CLI, or a GitHub account gh does
-   not hold signed in.
+1. A Chat agent is waiting for the owner's permission or answer.
+2. A [connected account](Connected-accounts.md#alerts) requires sign-in or reconnection.
 3. A behavior failed and is held. The notice leaves once Behaviors no longer
    has the incident. A materially different failure cause replaces the notice
    with a fresh, specific alert, including after dismissal. Repeated failures
@@ -116,8 +106,8 @@ Behaviors' diagnostics are listed too, with the classification and details
 described in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
 
 Delayed, held and uncertain native-chain work uses the existing `attention`
-records as Needs you entries, including progress age, exact-head gates and the
-known next action. Issue/PR links retain their targets; Journal evidence opens
+records to show progress age, gates on the current commit and the known next
+action. Held or stalled work appears under Faults. Journal evidence opens
 the recorded journal cursor in Observe → Tasks, where Hold/Resume and pagination
 remain available. Failed reads retain entries with an explicit stale-evidence notice.
 This follows the existing diagnostics refresh clock and remains accessible with
@@ -196,6 +186,8 @@ fresh one.
 
 - A pull request that becomes ready is noticed at once, and Poise Link shows
   it once.
+- Answer here shows readiness under Everything when the behavior status is
+  healthy. Merge is handled by the configured behavior and GitHub's queue.
 - Its notice comes back every 15 minutes, counted from when it became ready,
   and says how long it has waited.
 - That goes on until it is merged or closed, stops being ready, or you silence
@@ -214,7 +206,7 @@ Every two minutes, on the same pass as the ready check, Poise looks at every
 involved open pull request, whoever authored it, and at your own open pull
 requests:
 
-- A pull request that currently asks your GitHub account to review it is
+- A pull request that formally requests your personal GitHub account to review it is
   noticed once. The request is as fresh as the organization's datastore sync:
   it resolves when a sync shows the request gone — GitHub drops it when you
   submit a review — or when the pull request closes. A failed or incomplete
@@ -249,20 +241,18 @@ diagnostics and General settings; it does not depend on notices or add a poller.
 
 - **Open** goes to what the notice is about and puts the notice away, with a
   route back: the run in Observe → Behaviors, Settings → Accounts or General,
-  the chat in Chat or the Manager place, or the pull request's card on Board,
+  Extensions for an extension sign-in, the chat in Chat or the Manager place, or the pull request's card on Board,
   with GitHub a click away.
   - A failed behavior opens its exact run in Observe → Behaviors with its
     failure detail. A filter that hides the run is cleared for that visit only.
   - A failed behavior without a recorded agent call has nothing to open. Its
     diagnostic is in the entry itself.
-- **Dismiss** puts it away: for good, or for a ready pull request or idle
-  worker slots until its next reminder. Every entry in Answer here has it (see
-  below).
-- **Silence reminders**, on a ready pull request, a requested review, or idle
-  worker slots, silences it: no more reminders while a ready pull request
+- **Dismiss** puts it away: for good, or for a ready pull request until its
+  next reminder. See the rules for prompts with options below.
+- **Silence reminders**, on a ready pull request or a requested review,
+  silences it: no more reminders while a ready pull request
   stays open, nothing more about a review request until the request is
-  removed, and nothing more about idle slots until a slot fills or a ticket
-  is labelled.
+  removed.
 
 ## Putting any entry away
 

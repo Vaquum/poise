@@ -616,6 +616,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       }
       const preview = (value: string) => value.length <= 1024 ? value : `${value.slice(0, 1023)}…`
       entries.push({ id: chain.id, repository: chain.repository, issue: chain.issue,
+        held: chain.held, sequence: chain.sequence, mergeSha: chain.mergeSha,
         pullNumber: observation?.publication?.pull_number ?? null,
         step: active ? `${active.behavior}: ${active.state}` : chain.reviewPending ? 'Merged; review evidence pending'
           : !chain.held ? waiting || (pull ? 'PR merge gates' : 'Issue admission')

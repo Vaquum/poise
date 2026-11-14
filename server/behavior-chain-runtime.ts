@@ -137,6 +137,26 @@ function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, no
       && chainBasis(queueCiBlocker(original)) === chainBasis(hold.queue))
 }
 
+function missingReceiptHoldCanResume(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
+  const held = chain.held, pull = observation.pull
+  const slot = held && /^PR review (\S+) lacks its exact-head submission receipt$/.exec(held)?.[1]
+  if (!slot || chain.mergeSha || chain.supersession || chain.ciHold || chain.testHold || chain.testRecovery || chain.repairRecovery
+    || chain.invocations.some(invocation => invocation.state !== 'settled')
+    || !pull || pull.state !== 'open' || pull.merged || !pull.reviewContext
+    || !Number.isFinite(observation.checkedAt) || observation.checkedAt > now || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return false
+  const basis = chainBasis(['pr', pull.head, pull.reviewContext])
+  const original = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'review-pr' && invocation.slot === slot
+    && invocation.basis === basis && invocation.state === 'settled' && invocation.evidence?.status === 'completed'
+    && invocation.evidence.action === 'requested_changes' && invocation.evidence.outcome === 'changes_requested')
+  const evidence = original?.evidence
+  if (!original || !evidence || !resourceReleaseProven(evidence, true) || typeof evidence.completedAt !== 'number'
+    || !Number.isFinite(evidence.completedAt) || observation.checkedAt < evidence.completedAt
+    || observation.checkedAt < Date.parse(String(evidence.resources_settled_at))
+    || !chainReviewResponse(chain, original, observation, now)) return false
+  const decision = decideBehaviorChain({ ...chain, held: null }, observation, now)
+  return decision.kind === 'invoke' && decision.behavior === 'repair-pr'
+}
+
 function recoveredImplementation(chain: BehaviorChain, observation: ChainObservation, now: number): BehaviorChain['testRecovery'] | null {
   const hold = chain.testHold ?? chain.testRecovery?.hold
   const original = chain.invocations.find(invocation => invocation.id === hold?.invocationId), evidence = original?.evidence
@@ -146,7 +166,8 @@ function recoveredImplementation(chain: BehaviorChain, observation: ChainObserva
   const publication = observation.publication
   if (!hold || chain.mergeSha || chain.supersession || chain.testRecovery?.admission
     || chain.invocations.some(invocation => invocation.state !== 'settled')
-    || !original || original.id !== hold.invocationId || original.callId !== hold.callId || !proof
+    || !original || original.id !== hold.invocationId || original.callId !== hold.callId
+    || !proof && (!chain.testRecovery?.recheck || recovery?.recheck !== chain.testRecovery.recheck)
     || prepared?.repository !== chain.repository || prepared.issue_number !== chain.issue || prepared.branch !== chain.branch
     || prepared.actor !== chain.author || prepared.pull_number !== null || prepared.head_sha !== null
     || chain.held !== null && (!chain.testHold || chain.held !== evidence?.error)
@@ -249,6 +270,7 @@ export class BehaviorChainRuntime {
   private running = false
   private cursor = ''
   private reconciliationCursor = ''
+  private reconciliationFirst = false
   private authenticationCursor = ''
 
   constructor(readonly journal: BehaviorChainJournal, private readonly operations: ChainRuntimeOperations) {}
@@ -419,7 +441,10 @@ export class BehaviorChainRuntime {
         return sequence === null ? [] : [{ chain, sequence }]
       }).sort((a, b) => a.sequence - b.sequence)
       const offered = new Set<string>()
-      for (const deferred of [false, true]) {
+      const visited = new Set<string>()
+      const first = this.reconciliationFirst
+      this.reconciliationFirst = !first
+      for (const deferred of [first, !first]) {
         if (Date.now() - began > 45_000) break
         const cursorKey = deferred ? 'reconciliationCursor' : 'cursor'
         let page = this.journal.reconcilable(this[cursorKey], Date.now(), deferred)
@@ -428,13 +453,19 @@ export class BehaviorChainRuntime {
           page = this.journal.reconcilable('', Date.now(), deferred)
         }
         if (!page.length) { this[cursorKey] = ''; continue }
-        const snapshot = await this.readInvocations(page.filter(chain => !conflicted.has(chain.id)))
+        const snapshot = await this.readInvocations(page.filter(chain => !conflicted.has(chain.id) && !visited.has(chain.id)))
         const work: Array<{ chain: BehaviorChain, priority: number | null, cursor: boolean }> = page.map(chain => ({ chain, priority: null, cursor: true }))
         for (let index = 0; index < work.length; index++) {
           let { chain } = work[index]
           if (Date.now() - began > 45_000) break
           if (work[index].cursor) this[cursorKey] = chain.id
           if (conflicted.has(chain.id)) continue
+          // A due recovery can enter the later active page before Caller has
+          // registered its launch. Explicit capacity retries remain eligible.
+          if (work[index].cursor) {
+            if (visited.has(chain.id)) continue
+            visited.add(chain.id)
+          }
           if (work[index].priority === null && offered.has(chain.id)) continue
           if (work[index].priority !== null) {
             if (!this.operations.available() || !this.journal.modelCapacityAvailable(this.operations.capacity())) continue
@@ -563,6 +594,9 @@ export class BehaviorChainRuntime {
                 const reason = `Original implementation test recovery awaits current source/publication evidence: ${observation.testDependency?.reason || 'recovery is not verified'}`
                 if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
                 continue
+              }
+              if (chain.held && missingReceiptHoldCanResume(chain, observation, Date.now())) {
+                chain = this.append(chain, { type: 'chain.resumed' })
               }
               const mergeEvidence = observation.pull?.merged ? {
                 before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
@@ -709,10 +743,20 @@ export class BehaviorChainRuntime {
                 if (decision.behavior === 'implement-issue') {
                   const fresh = await this.operations.observe(chain)
                   chain = this.append(chain, { type: 'chain.observed', observation: fresh })
-                  if (chain.testRecovery && !chain.testRecovery.admission && !recoveredImplementation(chain, fresh, Date.now())) continue
+                  if (chain.testRecovery?.recheck && !chain.testRecovery.admission) {
+                    const reason = await this.operations.recoverReport?.(chain, fresh)
+                    chain = this.current(chain)
+                    if (reason) {
+                      if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                      continue
+                    }
+                  }
+                  const verified = chain.observation as ChainObservation
+                  observation = verified
+                  if (chain.testRecovery && !chain.testRecovery.admission && !recoveredImplementation(chain, verified, Date.now())) continue
                   // Dependencies can change without an issue revision, including
                   // while request preparation awaited. Retain their ordinary wait.
-                  const redecided = decideBehaviorChain(chain, fresh, Date.now())
+                  const redecided = decideBehaviorChain(chain, verified, Date.now())
                   if (redecided.kind !== 'invoke' || redecided.behavior !== decision.behavior || redecided.basis !== decision.basis) {
                     if (redecided.kind === 'wait' && chain.waiting !== redecided.reason) this.append(chain, { type: 'chain.waiting', reason: redecided.reason })
                     // A report revision changed during preparation also invalidates its disposition; surface that explicitly.
