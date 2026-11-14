@@ -412,8 +412,10 @@ reported tests run unchanged. The completion reporter must witness the injected
 observation on both bases. A passing old case cannot prove a shared failure.
 
 The existing report saves intent before checkout or execution and retains the
-outcome. Restart, repeated observations, an interrupted attempt or a newer base
-cannot relaunch that recheck. Checkout and each dependency install have a
+outcome. Restart and repeated observations do not rerun an interrupted or failed
+recheck or reuse a pass for a different base. If the base advances after a
+passing recheck, a later sweep can check the new base once the same remediation
+is verified on it. Checkout and each dependency install have a
 120-second bound, each suite a 90-second bound, and Git reads a 30-second bound;
 suites use one worker without retries. An unverified correction or failed recheck
 states its blocker on the existing hold. A successful recheck feeds the same

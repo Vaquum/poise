@@ -1382,11 +1382,11 @@ async function recoverReportedImplementation(db: Database, journal: BehaviorChai
     remedy = remedies[0].number; merge = remedies[0].merge
   } else {
     const delivery = await read(remedy, true)
-    if (report.recheck?.base !== base || delivery.verified !== true || delivery.base_sha !== base || delivery.merge_sha !== merge) {
-      return pending('the pinned corrected base or linked remediation changed after the one recheck')
+    if (delivery.verified !== true || delivery.base_sha !== base || delivery.merge_sha !== merge) {
+      return pending('the same linked remediation is not verified on the current base')
     }
   }
-  if (!report.recheck) {
+  if (!report.recheck || report.recheck.state === 'passed' && report.recheck.base !== base) {
     report.recheck = { remedy, merge: merge!, base, state: 'running' }
     // Intent wins before checkout or execution. A lost process/outcome cannot
     // turn the next scheduler read into another expensive recheck.
@@ -1405,7 +1405,10 @@ async function recoverReportedImplementation(db: Database, journal: BehaviorChai
       return pending('the saved recheck outcome conflicts with its intent')
     }
     chain = journal.read(chain.id)!
-    return recoverReportedImplementation(db, journal, chain, await verify(chain), verify, allowed)
+    const fresh = await verify(chain)
+    // Let the next sweep revalidate a newer base instead of repeating work in this one.
+    if (fresh.prerequisites?.base !== base) return pending('the base advanced during recheck; waiting to verify the new base')
+    return recoverReportedImplementation(db, journal, chain, fresh, verify, allowed)
   }
   const result = report.recheck.result
   if (report.recheck.state !== 'passed' || !result || result.old.base !== prepared.checkout_head || result.current.base !== base
