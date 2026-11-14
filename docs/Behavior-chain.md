@@ -215,6 +215,21 @@ Supersession retains the covering merge separately, keeps the duplicate's
 and GitHub evidence links available. Rebuild and restart retain this terminal
 outcome and the original invocation ownership.
 
+Poise-generated pre-PR failure remediations (`implement-issue`,
+`atomic_work_blocked`, with the original repair-report marker) use the same native
+retirement path even while their seed remains open or their PR is queued. Their
+coverage policy is separate: Git must integrate the whole pinned candidate into
+the current default-branch base without conflicts and produce exactly the base
+tree. A distinct merged PR on that base's first-parent history must introduce
+that coverage; a later unrelated merge is not credited. The bounded read examines
+up to 100 base commits and retains the candidate, base, merge base, integration
+tree, and covering merge with its first parent and tree. Retirement revalidates
+this proof and checks both the head and current integration base before closing.
+Changed heads or bases invalidate the decision. Independent changes, conflicts
+or incomplete coverage evidence continue through ordinary gates. Supersession
+keeps the source issue's hold and outstanding work intact; it does not resume or
+complete that source chain.
+
 The existing scheduler selects a normal-work page before a separate due
 reconciliation page under its existing pass budget. Quiescent held or merged
 chains keep their original ownership, but cannot

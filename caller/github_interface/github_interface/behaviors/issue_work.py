@@ -8,14 +8,16 @@ import base64
 import json
 import os
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 
 from github_interface.atoms.local import _run, checkout_repo
-from github_interface.atoms.process_diagnostic import STDERR_BYTES, redact
+from github_interface.atoms.process_diagnostic import GitProcessError, STDERR_BYTES, redact
 from github_interface.atoms.pulls import get_pull
+from github_interface.atoms.review_diff import _env, _git
 from github_interface.atoms.review_identity import work_publication
 from github_interface.client import GitHubClient
 from github_interface.context import repository, token_user
@@ -24,6 +26,72 @@ REQUIRE_TOKEN_USER = True
 BRANCH = re.compile(r"poise/[A-Za-z0-9][A-Za-z0-9._/-]{0,150}")
 SHA = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
 COMMIT = re.compile(r"(?:feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(?:\([^\n)]+\))?!?: .+")
+
+
+def pre_pr_remediation(issue: dict, target: str) -> bool:
+    body = issue.get("body") or ""
+    source = re.search(rf"^Source: {re.escape(target)}#([1-9][0-9]*);", body, re.MULTILINE | re.IGNORECASE)
+    return bool(re.search(r"^<!-- poise-repair-exhaustion:[a-f0-9]{64} -->$", body, re.MULTILINE)
+                and "Stage: implement-issue. Cause: atomic_work_blocked." in body
+                and source and int(source[1]) != issue.get("number"))
+
+
+async def remediation_coverage(client: GitHubClient, target: str, issue: dict, pull: dict, base: str) -> dict:
+    evidence = {"kind": "empty_integration", "verified": False,
+                "duplicate": {"number": pull["number"], "head": pull["head"]["sha"]}, "base": base, "covering": []}
+    if not pre_pr_remediation(issue, target) or pull.get("merged") or pull.get("merged_at") \
+            or (issue.get("user") or {}).get("login", "").lower() != pull["user"]["login"].lower():
+        return {**evidence, "reason": "not an unmerged Poise pre-PR failure remediation"}
+    metadata = await client.get(f"/repos/{target}")
+    if pull["base"]["ref"] != metadata["default_branch"] or pull["base"]["sha"] != base:
+        return {**evidence, "reason": "candidate integration base changed"}
+    head = pull["head"]["sha"]
+    env = _env(client.token)
+    with tempfile.TemporaryDirectory(prefix="caller-remediation-") as directory:
+        async def git(*args):
+            return (await asyncio.to_thread(_git, directory, env, *args, timeout=20)).decode().strip()
+
+        async def integration(commit):
+            try:
+                return await git("merge-tree", "--write-tree", commit, head)
+            except GitProcessError as error:
+                if error.diagnostic["outcome"] == "exit" and error.diagnostic["exit_code"] == 1:
+                    return None  # A conflicting integration cannot prove coverage.
+                raise
+
+        await git("init", "--bare", "--quiet", "--template=")
+        await git("remote", "add", "origin", f"https://github.com/{target}.git")
+        await git("config", "remote.origin.promisor", "true")
+        await git("config", "remote.origin.partialclonefilter", "blob:none")
+        await git("fetch", "--quiet", "--no-tags", "--filter=blob:none", "origin", head, base)
+        tree = await git("rev-parse", f"{base}^{{tree}}")
+        merged_tree = await integration(base)
+        if merged_tree != tree:
+            return {**evidence, "reason": "candidate has independent changes or integration conflicts"}
+        evidence["integration"] = {"tree": merged_tree, "baseTree": tree, "mergeBase": await git("merge-base", base, head)}
+        # Find the change that first made the whole candidate redundant, rather
+        # than attributing coverage to a later unrelated merge with the same result.
+        commits = await git("rev-list", "--first-parent", "--max-count=100", base)
+        for commit in commits.splitlines():
+            parents = (await git("show", "-s", "--format=%P", commit)).split()
+            if not parents:
+                break
+            parent_tree = await git("rev-parse", f"{parents[0]}^{{tree}}")
+            if await integration(parents[0]) == parent_tree:
+                continue
+            linked = await client.get(f"/repos/{target}/commits/{commit}/pulls")
+            for candidate in linked:
+                if candidate["number"] == pull["number"] or not candidate.get("merged_at") or candidate.get("merge_commit_sha") != commit:
+                    continue
+                covering = await get_pull(client, *target.split("/"), candidate["number"])
+                if covering.get("merged") is not True or covering.get("merge_commit_sha") != commit \
+                        or covering["base"]["ref"] != metadata["default_branch"] \
+                        or covering["base"]["repo"]["full_name"].lower() != target.lower():
+                    continue
+                return {**evidence, "verified": True, "covering": [{"number": candidate["number"], "mergeSha": commit,
+                        "url": covering["html_url"], "parent": parents[0], "tree": await git("rev-parse", f"{commit}^{{tree}}")}]}
+            break
+    return {**evidence, "reason": "no distinct covering merge verified in the bounded base history"}
 
 
 def publication_body(body: str, target: str, number: int) -> None:
@@ -237,7 +305,7 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
         proof = json.loads(payload.get("coverage_json") or "null")
         if not pull or not SHA.fullmatch(expected) or not isinstance(proof, dict) or proof.get("verified") is not True \
                 or proof.get("duplicate") != {"number": pull["number"], "head": expected}:
-            raise ValueError("retirement requires the original verified full-suite coverage and duplicate head")
+            raise ValueError("retirement requires the original verified coverage and duplicate head")
         if pull.get("merged_at") or pull.get("merged"):
             raise ValueError("a merged pull request cannot be retired as redundant")
         result.update(merged=False, merge_sha=None, head_sha=expected)
@@ -246,14 +314,21 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
         if pull["head"]["sha"] != expected or remote_head != expected:
             return {**result, "outcome": "superseded", "reason": "duplicate head changed; a decision is required"}
         issue = await client.get(f"/repos/{target}/issues/{issue_number}")
-        comments = await issue_comments.run(client, payload)
-        verified = await full_suite_repair.inspect(client, target, issue, comments["comments"], pull)
+        if proof.get("kind") == "empty_integration":
+            verified = await remediation_coverage(client, target, issue, pull, base_head)
+        else:
+            comments = await issue_comments.run(client, payload)
+            verified = await full_suite_repair.inspect(client, target, issue, comments["comments"], pull)
         if verified != proof:
-            return {**result, "outcome": "not_ready", "reason": "full-suite coverage changed; a decision is required"}
+            return {**result, "outcome": "not_ready", "reason": "retirement coverage changed; a decision is required"}
         current = await get_pull(client, owner, repo, pull["number"])
         if any(current.get(key) != pull.get(key) for key in ("head", "base", "body", "user", "updated_at")) \
                 or current["head"]["sha"] != expected or remote_head != expected or current.get("merged"):
             return {**result, "outcome": "superseded", "reason": "duplicate head or publication context changed; a decision is required"}
+        if proof.get("kind") == "empty_integration":
+            current_base = await client.get(f"/repos/{target}/git/ref/heads/{default_branch}")
+            if current_base["object"]["sha"] != base_head:
+                return {**result, "outcome": "superseded", "reason": "integration base changed; fresh coverage is required"}
         if current["state"] == "closed":
             return {**result, "outcome": "already_closed", "coverage": verified}
         closed = await client.patch(f"/repos/{target}/pulls/{pull['number']}", json={"state": "closed"})

@@ -54,6 +54,9 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     if read["issue"].get("state") == "closed" and read["issue"].get("title") == full_suite_repair.TITLE:
         pull = await get_pull(client, owner, repo, publication["pull_number"]) if publication["pull_number"] else None
         result["full_suite"] = await full_suite_repair.inspect(client, target, read["issue"], comments["comments"], pull)
+    if publication["pull_number"] and publication["merged"] is False and issue_work.pre_pr_remediation(read["issue"], target):
+        pull = await get_pull(client, owner, repo, publication["pull_number"])
+        result["remediation"] = await issue_work.remediation_coverage(client, target, read["issue"], pull, publication["base_sha"])
     return result
 
 
