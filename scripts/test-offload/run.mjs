@@ -5,7 +5,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -27,7 +27,7 @@ const DEPENDENCY_BYTES = CHUNK_BYTES - 64 * 1024
 const zip = promisify(gzip)
 // The first bytes go at once: a proxy gives up on a download that stays silent for long.
 const FIRST_CHUNK_BYTES = 64 * 1024
-const FRAME = { heartbeat: 0, stdout: 1, stderr: 2, exit: 3, fail: 4, ready: 5 }
+const FRAME = { heartbeat: 0, stdout: 1, stderr: 2, exit: 3, fail: 4, ready: 5, evidence: 6 }
 // What a suite cannot run without although git ignores it.
 const DEPENDENCIES = new Set(['node_modules', '.venv', 'venv'])
 // Nothing a suite needs: credentials by name, and what only the provider CLIs and Poise read.
@@ -40,7 +40,7 @@ const LOCAL_ONLY = new Set(['_', 'OLDPWD', 'PWD', 'SHLVL', 'GOMAXPROCS', 'RIPGRE
 export function testEnvironment(env, hooks = HERE) {
   const result = {}
   for (const [name, value] of Object.entries(env)) {
-    if (!value || LOCAL_ONLY.has(name) || SECRET_NAME.test(name) || AGENT_NAME.test(name) || SECRET_VALUE.test(value)) continue
+    if (!value || name.startsWith('POISE_TEST_') || LOCAL_ONLY.has(name) || SECRET_NAME.test(name) || AGENT_NAME.test(name) || SECRET_VALUE.test(value)) continue
     result[name] = value
   }
   // A suite runs on the box as it was typed, so nothing there asks to be moved again.
@@ -206,7 +206,8 @@ async function main(args) {
   const cwd = process.cwd()
   // Names the checkout's history, so a repository whose suites use Docker goes to a sandbox at once.
   const repo = git(cwd, 'rev-list', '--max-parents=0', 'HEAD')?.toString().split('\n')[0] || undefined
-  const request = { argv: command, cwd, env: testEnvironment(process.env), repo }
+  const binding = process.env.POISE_TEST_BINDING ? JSON.parse(process.env.POISE_TEST_BINDING) : undefined
+  const request = { argv: command, cwd, env: testEnvironment(process.env), repo, ...(binding ? { binding } : {}) }
   const spec = JSON.stringify(request)
   let docker = false
   // One clock includes capture, provisioning, upload, recovery and the complete rerun.
@@ -261,7 +262,9 @@ async function main(args) {
     tar.stdin.end(selection.paths.map((path) => path.replace(/^\//, '')).join('\0'))
     const streams = boundaries ? [tar.stdout] : [tar.stdout, createGzip({ level: 1 })]
     const hash = createHash('sha256').update(spec)
-    streams.at(-1).on('data', (chunk) => hash.update(chunk))
+    // Hash the same uncompressed tar bytes on either upload route. The box
+    // independently recomputes this before it unpacks or executes anything.
+    tar.stdout.on('data', (chunk) => hash.update(chunk))
     try {
       const [, code] = await Promise.all([pipeline(...streams, createWriteStream(archive), { signal: lifetime.signal }), closed])
       // tar's exit 1 says a file changed as it was read. Both attempts still use these exact bytes.
@@ -328,7 +331,8 @@ async function main(args) {
   }
 
   const createRun = async (signal = lifetime.signal) => {
-    const created = await call('POST', '/runs', docker ? JSON.stringify({ ...request, docker }) : spec, signal)
+    const created = await call('POST', '/runs', JSON.stringify({ ...request, ...(docker ? { docker } : {}),
+      ...(binding ? { capture: { candidate, spec } } : {}) }), signal)
     const { id, dependencyCache } = await created.json()
     if (!/^[0-9a-f]{32}$/.test(id)) throw new Error('the test relay did not name the new run')
     return { id, dependencyCache: dependencyCache === true }
@@ -373,9 +377,10 @@ async function main(args) {
     throw new Error(`the test relay did not recover within ${RECOVERY_MS / 1000} s${lastError ? `: ${lastError.message}` : ''}`)
   }
 
+  let candidate
   try {
     say('this suite runs on a disposable test box; files it changes stay there. Capturing the checkout.')
-    const candidate = await capture()
+    candidate = await capture()
     const suite = command.slice(0, 5).map((word) => basename(word)).join(' ').slice(0, 200)
     say(`candidate ${candidate}, suite ${suite}, cwd ${cwd}`)
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -395,6 +400,16 @@ async function main(args) {
         if (type === FRAME.stdout) process.stdout.write(payload)
         else if (type === FRAME.stderr) process.stderr.write(payload)
         else if (type === FRAME.exit) exitCode = Number(payload.toString())
+        else if (type === FRAME.evidence && binding && process.env.POISE_TEST_EVIDENCE_DIR && payload.length <= 48 * 1024) {
+          // Only the gateway can authenticate this receipt. Caller checks it
+          // independently and retains it before reclaiming this directory.
+          try {
+            writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, `${id}.json`), payload, { flag: 'wx', mode: 0o600 })
+          } catch (error) {
+            // A failed receipt must not replace the suite's genuine exit with a no-result handoff.
+            say(`assertion recovery evidence could not be retained: ${error.message}`)
+          }
+        }
         else if (type === FRAME.fail) failure = { code: payload[0], message: payload.subarray(1).toString() }
         else if (type === FRAME.ready && !upload) {
           say('the box is up. Sending the captured checkout.')

@@ -428,11 +428,14 @@ process.stdout.write(JSON.stringify(status ? { loggedIn: true, authMethod: 'clau
   }
 
   it('passes the hooks on, so that agents on Claude get them', () => {
-    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000' })
+    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000',
+      POISE_TEST_BINDING: '{"call":"original"}', POISE_TEST_EVIDENCE_DIR: '/original/evidence' })
     expect(seen.PYTHONPATH).toMatch(/\.poise\/test-offload:src$/)
     expect(seen.NODE_OPTIONS).toMatch(/--require ".*\.poise\/test-offload\/hook\.cjs"$/)
     expect(seen.BASH_DEFAULT_TIMEOUT_MS).toBe('600000')
     expect(seen.BASH_MAX_TIMEOUT_MS).toBe('3600000')
+    expect(seen.POISE_TEST_BINDING).toBe('{"call":"original"}')
+    expect(seen.POISE_TEST_EVIDENCE_DIR).toBe('/original/evidence')
   })
 
   it('still keeps out what those variables carry without the hooks', () => {
@@ -808,6 +811,145 @@ describe('a suite on a test box', () => {
     execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'first'])
     return repo
   }
+
+  it.each([null, 'crn-test'])('holds relay recovery without retaining receipts for completed runs (%s)', async baseService => {
+    await startAll({ baseService })
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    writeFileSync(join(repo, '.gitignore'), '.env\nnode_modules\n')
+    symlinkSync(resolve('node_modules'), join(repo, 'node_modules'), 'dir')
+    mkdirSync(join(repo, 'tests'))
+    writeFileSync(join(repo, 'vitest.config.mjs'), 'export default { test: { include: ["tests/*.test.mjs"], maxWorkers: 1 } }')
+    writeFileSync(join(repo, 'tests/shared.test.mjs'), `import { it, expect } from 'vitest';
+it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
+    execFileSync('git', ['-C', repo, 'add', '.'])
+    execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'shared failure'])
+    const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const baseline = join(temp(), 'base')
+    execFileSync('git', ['-C', repo, 'worktree', 'add', '--detach', baseline, base], { stdio: 'ignore' })
+    symlinkSync(resolve('node_modules'), join(baseline, 'node_modules'), 'dir')
+    writeFileSync(join(repo, 'tracked.txt'), 'uncommitted implementation\n')
+    const evidence = temp()
+    const binding = { call: 'a'.repeat(32), nonce: 'b'.repeat(64), repository: 'example/repo', base }
+    const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence }
+    const run = async (cwd: string) => {
+      const result = await suite(cwd, [process.execPath, resolve('node_modules/vitest/vitest.mjs'), 'run', '--root', cwd], env).done
+      expect(result.code, result.stderr).toBe(1)
+      const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
+      expect(id, result.stderr).toBeTruthy()
+      // Held for #1619: candidate-controlled reports cannot authorize recovery.
+      expect(existsSync(join(evidence, `${id}.json`))).toBe(false)
+      expect(relay.runs.has(id!)).toBe(false)
+      return { id }
+    }
+    await run(repo)
+    await run(baseline)
+    expect(readdirSync(evidence)).toEqual([])
+  }, 30_000)
+
+  it('holds retry evidence when candidate code replaces the report files and exits 1', async () => {
+    await startAll()
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const evidence = temp()
+    const binding = { call: 'c'.repeat(32), nonce: 'd'.repeat(64), repository: 'example/repo', base }
+    const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence }
+    // A fabricated failed case, written without running any tests, as the suite UID can.
+    const forge = join(repo, 'forge.cjs')
+    writeFileSync(forge, `const { readdirSync, writeFileSync, mkdirSync } = require('node:fs');
+      const { join } = require('node:path');
+      for (const name of readdirSync('/tmp')) {
+        if (!name.startsWith('poise-assertions-')) continue
+        const dir = join('/tmp', name);
+        writeFileSync(join(dir, 'result.json'), JSON.stringify({ success: false, numFailedTests: 1, numTotalTests: 1,
+          testResults: [{ name: join('${repo}', 'tests/fake.test.ts'), status: 'failed', message: '',
+            assertionResults: [{ fullName: 'fabricated case', status: 'failed', failureMessages: ['expected forged'] }] }] }));
+        writeFileSync(join(dir, 'complete.json'), JSON.stringify({ errors: 0, reason: 'failed', setupFailed: false }));
+      }
+      const dir = '/tmp/poise-assertions-forged';
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'result.json'), JSON.stringify({ forged: true }));
+      writeFileSync(join(dir, 'complete.json'), JSON.stringify({ forged: true }));
+      process.exit(1)`)
+    const result = await suite(repo, [process.execPath, forge], env).done
+    expect(result.code, result.stderr).toBe(1)
+    const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
+    expect(id, result.stderr).toBeTruthy()
+    expect(existsSync(join(evidence, `${id}.json`))).toBe(false)
+    expect(readdirSync(evidence)).toEqual([])
+    expect(relay.runs.has(id!)).toBe(false)
+  }, 30_000)
+
+  it('holds relay recovery against fabricated assertions posted with the run token', async () => {
+    await startAll({ baseService: 'crn-test' })
+    const headers = { authorization: `Bearer ${KEY}` }
+    const binding = { call: 'e'.repeat(32), nonce: 'f'.repeat(64), repository: 'example/repo', base: 'a'.repeat(40) }
+    const request = { argv: ['node', 'vitest.mjs', 'run'], cwd: '/', env: {}, binding }
+    const candidate = '1'.repeat(64)
+    const created = await fetch(`${relayUrl}/runs`, {
+      method: 'POST', headers, body: JSON.stringify({ ...request, capture: { candidate, spec: JSON.stringify(request) } }),
+    })
+    expect(created.status).toBe(201)
+    const { id } = await created.json() as { id: string }
+    const run = relay.runs.get(id)!
+    const jobHeaders = { authorization: `Bearer ${run.token}` }
+    // Held for #1619: no report credential leaves the gateway in spec.json.
+    const served = await fetch(`${relayUrl}/runs/${id}/spec`, { headers: jobHeaders })
+    expect(served.status).toBe(200)
+    expect(await served.json()).not.toHaveProperty('reportTo')
+    // A fabricated inventory posted with the run token is not accepted.
+    const forged = await fetch(`${relayUrl}/runs/${id}/assertions`, {
+      method: 'POST', headers: jobHeaders,
+      body: JSON.stringify({
+        exit: 1, candidate, binding, repository: binding.repository, base: binding.base,
+        source: '2'.repeat(64), clean: false,
+        failures: [{ file: 'tests/fake.test.ts', test: 'fabricated case', cause: 'expected forged', causeDigest: '3'.repeat(64) }],
+        totals: [{ file: 'tests/fake.test.ts', test: 'fabricated case', total: 1 }],
+      }),
+    })
+    expect(forged.status).toBe(409)
+    expect(run.assertions).toBeNull()
+  })
+
+  it('holds relay inventories without trusting candidate-controlled reports', async () => {
+    await startAll()
+    const { assertionResult, sourceCapture } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as {
+      assertionResult: (reporter: { report: string, completion: string }, capture: { top: string }) => unknown,
+      sourceCapture: (cwd: string) => { clean: boolean, source: string },
+    }
+    const directory = temp()
+    const reporter = { report: join(directory, 'report.json'), completion: join(directory, 'complete.json') }
+    const failure = { fullName: 'original failure', status: 'failed', failureMessages: ['expected []'] }
+    const report = { success: false, numFailedTests: 1, numTotalTests: 1,
+      testResults: [{ name: join(directory, 'tests/a.test.ts'), status: 'failed', message: '', assertionResults: [failure] }] }
+    const complete = { errors: 0, reason: 'failed', setupFailed: false }
+    const parse = (value = report, completion = complete) => {
+      writeFileSync(reporter.report, JSON.stringify(value))
+      writeFileSync(reporter.completion, JSON.stringify(completion))
+      return assertionResult(reporter, { top: directory })
+    }
+    // Held for #1619: even a well-formed inventory is candidate-controlled, so none is trusted.
+    expect(parse()).toBeNull()
+    expect(parse(report, { ...complete, errors: 1 })).toBeNull()
+    expect(parse(report, { ...complete, setupFailed: true })).toBeNull()
+    expect(parse(report, { ...complete, reason: 'interrupted' })).toBeNull()
+    expect(parse({ ...report, numFailedTests: 2 })).toBeNull()
+    expect(parse({ ...report, testResults: [{ ...report.testResults[0], message: 'beforeAll failed' }] })).toBeNull()
+    expect(parse({ ...report, numFailedTests: 101, numTotalTests: 101,
+      testResults: [{ ...report.testResults[0], assertionResults: Array.from({ length: 101 }, () => failure) }] })).toBeNull()
+    rmSync(reporter.completion)
+    expect(assertionResult(reporter, { top: directory })).toBeNull()
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const clean = sourceCapture(repo)
+    expect(clean.clean).toBe(true)
+    // Same HEAD and an index flag cannot pass off the dirty candidate as base.
+    execFileSync('git', ['-C', repo, 'update-index', '--assume-unchanged', 'tracked.txt'])
+    writeFileSync(join(repo, 'tracked.txt'), 'dirty candidate')
+    expect(sourceCapture(repo)).toMatchObject({ clean: false })
+    expect(sourceCapture(repo).source).not.toBe(clean.source)
+  })
 
   it('starts a suite on a job of the base service, which costs less, and gives the agent its output and exit code', async () => {
     await startAll({ baseService: 'crn-test' })

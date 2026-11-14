@@ -905,6 +905,14 @@ argument values and shell/interpreter command bodies. Every run is logged with
 that safe command label, exit code and duration as `test_relay.run.finished`.
 The runner prints the captured-candidate digest and suite, then the existing run ID
 at each admission, so observed failures can name the attempt that produced them.
+The digest covers the original command specification and uncompressed captured
+tar bytes, including uncommitted edits, on both dependency-cache upload routes.
+For new atomic Calls, completed direct Vitest assertion failures would retain
+bounded gateway-authenticated evidence before the relay deletes their run, but
+recovery is currently held for #1619: candidate-controlled reports cannot
+authorize it. Missing, interrupted, oversized, unaccounted or relay results cannot
+authorize the existing [pre-PR recovery](Behavior-chain.md#bounded-reconciliation)
+path; historical worker logs remain diagnostic evidence only.
 An explicit gateway-restart failure is the one exception: the active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated

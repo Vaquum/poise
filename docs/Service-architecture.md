@@ -393,6 +393,21 @@ bytes before forwarding and retaining it. Earlier runners and relays still
 exchange the whole checkout through the existing tree upload. Jobs and
 sandboxes receive the same single tar stream from either route.
 
+New atomic Calls also pass a Caller-owned random capture binding through the
+test-offload hooks, outside the suite environment. The box independently hashes
+the captured archive and source files before running a direct Vitest command.
+Relay recovery is currently held for #1619: the suite UID owns the report files,
+so no assertion inventory is trusted and no evidence frame is emitted. The held
+design would post a complete bounded inventory from the private run credential to
+`POST /runs/:id/assertions`; workspace credentials cannot submit that result.
+Only a matching completed failure would emit an Ed25519-signed evidence frame
+before the relay deletes the run. The hook would retain the redacted receipt for
+Caller; `POST /evidence/verify` would authenticate it against the existing gateway
+key and workspace credential after run deletion or restart. There is no unsigned
+or partial-result fallback. Caller would retain the verified receipt in its
+original artifact before resource cleanup. This extends the existing relay
+interface, without a new identity scope, setting or runner-retention store.
+
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
 gateway's, or with none, is recreated as one on an outdated image is: drained
 first if it runs ([Deployment](#deployment)).
@@ -1560,8 +1575,10 @@ failed head blocks that update, retaining the original Call, resource-release
 proof, repair retry bound and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 For a pre-PR implementation, the existing Caller artifact and seed read can
-instead verify an original CI assertion failure on its exact prepared base and
-the delivered main recovery with validation of the original failing tests.
+instead verify an original CI assertion failure on its exact prepared base, and
+the delivered main recovery with validation of every original failing test and
+case. Relay assertions remain held for #1619 until the runner establishes their
+inventory independently of candidate-controlled reports.
 The journal admits one fresh implementation for that automatic hold and recovery
 commit, independently of report publishing. Missing original evidence and later
 operator holds retain their authority; no gateway route or new poller is added.
