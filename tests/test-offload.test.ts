@@ -858,6 +858,42 @@ describe('a suite on a test box', () => {
     expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   })
 
+  it('hands Caller the failed run archive before deleting it, despite a later edit under the same HEAD', async () => {
+    await startAll()
+    const repo = committed()
+    const retained = temp()
+    const bin = temp()
+    const original = `console.log('candidate A loaded'); setTimeout(() => { require('node:assert/strict').equal(1, 2) }, 500)\n`
+    writeFileSync(join(repo, 'candidate.test.cjs'), original)
+    writeFileSync(join(bin, 'agent-interface'), `#!${process.execPath}
+const fs = require('node:fs'), path = require('node:path');
+if (process.argv[2] !== '--capture-failed-source') process.exit(9);
+fs.copyFileSync(process.argv[3], path.join(process.env.FIXTURE_RETENTION, 'tree'));
+fs.copyFileSync(process.argv[4], path.join(process.env.FIXTURE_RETENTION, 'spec'));
+fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stringify(process.argv.slice(5)));
+`, { mode: 0o700 })
+    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+    const run = suite(repo, [process.execPath, 'candidate.test.cjs'], {
+      PATH: `${bin}:${process.env.PATH}`, FIXTURE_RETENTION: retained, AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+    })
+    let observed = ''
+    run.child.stdout?.on('data', chunk => { observed += chunk })
+    await until(() => observed.includes('candidate A loaded'), 'candidate A to run')
+    writeFileSync(join(repo, 'candidate.test.cjs'), '// untested candidate B\n')
+    const result = await run.done
+    expect(result.code).toBe(1)
+    expect(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' })).toBe(head)
+    const archive = readFileSync(join(retained, 'tree'))
+    const specification = readFileSync(join(retained, 'spec'))
+    const candidate = createHash('sha256').update(specification).update(archive).digest('hex')
+    const [digest, id, exit] = JSON.parse(readFileSync(join(retained, 'identity'), 'utf8')) as string[]
+    expect(digest).toBe(candidate)
+    expect(exit).toBe('1')
+    expect(result.stderr).toContain(`candidate ${candidate}, suite node candidate.test.cjs, run ${id}`)
+    expect(execFileSync('tar', ['-xOf', join(retained, 'tree'), join(repo, 'candidate.test.cjs').slice(1)], { encoding: 'utf8' })).toBe(original)
+    expect(result.stderr).not.toContain('failed source capture unavailable')
+  })
+
   it('runs the command exactly as it was typed, with nothing of this workspace\'s hooks', async () => {
     await startAll()
     const repo = repository()

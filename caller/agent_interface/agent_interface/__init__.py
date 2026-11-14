@@ -22,6 +22,7 @@ from . import (
     caller_store,
     chat,
     debate,
+    failed_source,
     fix_failing_ci,
     issue_review,
     issue_simplify,
@@ -1876,10 +1877,14 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
-        if source == "poise:behavior-chain":
-            resource_ownership.cleanup_remaining(DB, id_)
-        elif not issue_review.cleanup(run_dir):
-            record_cleanup_failure(id_)
+        try:
+            if source == "poise:behavior-chain" and pull is None:
+                failed_source.discard_unless_failed(DB, id_)
+        finally:
+            if source == "poise:behavior-chain":
+                resource_ownership.cleanup_remaining(DB, id_)
+            elif not issue_review.cleanup(run_dir):
+                record_cleanup_failure(id_)
 
 
 def run_issue_simplify(issue: str, pwd: str | None = None, note: str = "", timeout_s: int = 3600):
@@ -2997,6 +3002,7 @@ behaviors:
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--expected-issue-revision SHA256] [--note TEXT]
   --atomic-work OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID --branch BRANCH [--pull-number N --expected-head SHA] [--merge-base] [--expected-issue-revision SHA256] [--note TEXT]
   --read-action-plan CALL_ID
+  --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID
   --complete-atomic-publication CALL_ID PLAN_SHA HEAD_SHA
   --author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]
   --debate TOPIC [--rounds N]
@@ -3192,6 +3198,12 @@ def _main():
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--read-action-plan":
         print(json.dumps(read_action_plan(sys.argv[2]), ensure_ascii=False))
+        return
+    if len(sys.argv) == 7 and sys.argv[1] == "--capture-failed-source":
+        failed_source.capture(DB, Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6]))
+        return
+    if len(sys.argv) == 5 and sys.argv[1] == "--read-failed-source":
+        print(json.dumps(failed_source.inspect(DB, *sys.argv[2:])))
         return
     if len(sys.argv) >= 5 and sys.argv[1] == "--complete-atomic-publication":
         import argparse

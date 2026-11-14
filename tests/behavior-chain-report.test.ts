@@ -13,7 +13,7 @@ import { nativeChainOperations } from '../server/behavior-chain-native'
 import { nativeRequestSha } from '../server/behavior-chain-action'
 import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
-import type { LogEntry } from '../server/agent-log-parse'
+import { parseAgentLogRow, parseFailedSource, type LogEntry } from '../server/agent-log-parse'
 import type { Organization } from '../server/organizations'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), settings: { enabled: true, seedMode: 'label', label: 'poise' },
@@ -521,6 +521,44 @@ it('keeps a legacy PR-scoped report when its source PR closes unmerged under a v
   await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
   expect(posts()).toHaveLength(1)
   expect(reports(db)).toHaveLength(1)
+})
+
+it.each(['available', 'unavailable', 'expired', 'missing'])('reports private failed source availability through the original remediation (%s)', async status => {
+  const { db, journal } = setup()
+  const { call } = blockedImplementation(journal)
+  const receipt = status === 'unavailable'
+    ? { status, candidate: 'c'.repeat(64), run: 'd'.repeat(32), reason: 'capture could not be bound or safely retained within the source limit' }
+    : { status: 'available', candidate: 'c'.repeat(64), run: 'd'.repeat(32), base: HEAD, bytes: 512,
+      sha256: 'e'.repeat(64), expires_at: Math.floor(NOW / 1000) + (status === 'expired' ? -1 : 3600) }
+  if (status !== 'missing') call.artifact!.failed_source = receipt
+  const runtime = new BehaviorChainRuntime(journal, operations(db, journal, {
+    observe: async () => ({ ...fresh, checkedAt: Date.now() }), readInvocations: async () => ({ entries: [call], quarantined: [] }),
+  }))
+  await runtime.run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0].body).toContain('worker-reported explanation is not independently verified')
+  if (status === 'available') {
+    expect(remote[0].body).toContain(`agent-interface --read-failed-source ${call.id} ${receipt.candidate} ${receipt.run}`)
+    expect(remote[0].body).toContain('earlier failed capture, not any later untested edit')
+    expect(remote[0].body).toContain('no publication, retry or approval authority')
+  } else expect(remote[0].body).toContain('source changes are unavailable; start with a fresh reproduction')
+  expect(remote[0].body).not.toMatch(/\/private\/work|"content"|"changes"/)
+})
+
+it('validates failed source metadata at the Caller receipt boundary before reports consume it', () => {
+  const valid = { status: 'available', candidate: 'c'.repeat(64), run: 'd'.repeat(32), base: HEAD,
+    bytes: 512, sha256: 'e'.repeat(64), expires_at: Math.floor(NOW / 1000) + 3600 }
+  expect(parseFailedSource(valid)).toEqual(valid)
+  const { journal } = setup()
+  const { call } = blockedImplementation(journal)
+  call.artifact!.failed_source = valid
+  expect(parseAgentLogRow(call, 0)).toHaveProperty('entry')
+  for (const invalid of [null, [], { ...valid, candidate: HEAD }, { ...valid, bytes: 2 * 1024 * 1024 + 1 },
+    { ...valid, changes: [{ content: 'private source' }] }, { ...valid, status: 'unavailable' }]) {
+    expect(() => parseFailedSource(invalid)).toThrow(/failed source/)
+    call.artifact!.failed_source = invalid
+    expect(parseAgentLogRow(call, 0)).toHaveProperty('quarantined')
+  }
 })
 
 it.each([false, true])('reports one verified implementation hold before a PR without relaunching it (diagnostic=%s)', async diagnostic => {

@@ -1,5 +1,5 @@
 import type { Database } from 'better-sqlite3'
-import type { LogEntry } from './agent-log-parse'
+import { parseFailedSource, type LogEntry } from './agent-log-parse'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal } from './behavior-chain-store'
 import { ReviewScopeIndexingError } from './behavior-chain-runtime'
@@ -693,6 +693,9 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       const evidence = verifiedImplementation?.invocation.evidence ?? verifiedMerge?.invocation.evidence
         ?? (cause === IMPLEMENTATION_CAUSE ? verified?.attempts[0].evidence : null)
       const diagnostic = evidence?.diagnostic as ProcessDiagnostic | undefined
+      const artifact = evidence?.artifact
+      const failedSource = implementationReport && artifact && typeof artifact === 'object' && !Array.isArray(artifact)
+        && 'failed_source' in artifact ? parseFailedSource(artifact.failed_source) : null
       const details = cause === CLOSED_CAUSE ? [
         `Poise's open source issue https://github.com/${chain.repository}/issues/${chain.issue} has no live replacement for its closed unmerged PR https://github.com/${chain.repository}/pull/${report.pull}.`, '',
         `Cause: ${cause}. Source: ${chain.id}; hold event ${hold!.sequence}; head ${report.head}.`,
@@ -715,6 +718,11 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           exit_code: diagnostic.context.exit_code, signal: diagnostic.context.signal, errno: diagnostic.context.errno }), 1500)}.`
           : 'Caller diagnostic facts: not recorded in this historical Call receipt.',
         'The blocked result is verified; the worker-reported explanation is not independently verified.',
+        ...(implementationReport ? failedSource?.status === 'available' && failedSource.expires_at * 1000 > Date.now() ? [
+          `Validation-time source changes are privately retained in the owning workspace until ${new Date(failedSource.expires_at * 1000).toISOString()}. Candidate ${failedSource.candidate}; run ${failedSource.run}; base ${failedSource.base}.`,
+          `The linked remediation's implementation Call can inspect their private file location with \`agent-interface --read-failed-source ${verifiedImplementation!.call} ${failedSource.candidate} ${failedSource.run}\`. Source contents must stay out of GitHub, notifications and logs.`,
+          'This is the earlier failed capture, not any later untested edit. It grants no publication, retry or approval authority; corrections require fresh validation. If retrieval is unavailable, reproduce afresh.',
+        ] : ['Validation-time source changes are unavailable; start with a fresh reproduction.'] : []),
       ] : cause === MERGE_CAUSE ? [
         `Poise cannot confirm the merge submission for https://github.com/${chain.repository}/pull/${report.pull}.`, '',
         `Stage: merge-pr. Cause: ${cause}. Source issue: https://github.com/${chain.repository}/issues/${chain.issue}.`,
