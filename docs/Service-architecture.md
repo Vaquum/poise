@@ -419,7 +419,12 @@ networks the one it replaced had joined, so the gateway joins them itself:
 
 A workspace takes a new image without a new container when the image's
 system base is the one its container runs, so the agents in it are never cut
-off. Agent calls (behavior runs, manual reviews, replays) are processes Poise
+off. The container's inherited `poise.base` and `poise.release` labels retain
+that proof even when a cached rebuild changes an attestation/index digest and
+the original image can no longer be inspected. A healthy workspace already on
+the requested release keeps its container; missing base/release labels and
+changed container settings retain the drained replacement path.
+Agent calls (behavior runs, manual reviews, replays) are processes Poise
 starts detached; they keep running while Poise restarts, and the next Poise
 reconciles them as after any restart. Chat turns survive the same way: each
 session's agent runs under a per-session relay that owns its stdio and

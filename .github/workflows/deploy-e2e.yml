@@ -66,15 +66,16 @@ jobs:
       - name: Resolve the test hosts to this runner
         run: echo '127.0.0.1 poise.test alice.poise.test bob.poise.test nobody.poise.test admin.poise.test' | sudo tee -a /etc/hosts
 
-      - name: Use kernel forwarding for the published listener gap
+      - name: Use kernel forwarding and the containerd image store
         shell: bash
         run: |
+          # Keep attestations/indexes, as in the Ubuntu 26.04 fork reproduction.
           daemon_config=$(mktemp)
           if sudo test -f /etc/docker/daemon.json; then
             sudo cat /etc/docker/daemon.json
           else
             printf '{}\n'
-          fi | jq '.["userland-proxy"] = false' >"$daemon_config"
+          fi | jq '.["userland-proxy"] = false | .features["containerd-snapshotter"] = true' >"$daemon_config"
           sudo install -m 0600 "$daemon_config" /etc/docker/daemon.json
           sudo systemctl restart docker
 
