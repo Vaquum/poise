@@ -137,6 +137,26 @@ function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, no
       && chainBasis(queueCiBlocker(original)) === chainBasis(hold.queue))
 }
 
+function missingReceiptHoldCanResume(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
+  const held = chain.held, pull = observation.pull
+  const slot = held && /^PR review (\S+) lacks its exact-head submission receipt$/.exec(held)?.[1]
+  if (!slot || chain.mergeSha || chain.supersession || chain.ciHold || chain.testHold || chain.testRecovery || chain.repairRecovery
+    || chain.invocations.some(invocation => invocation.state !== 'settled')
+    || !pull || pull.state !== 'open' || pull.merged || !pull.reviewContext
+    || !Number.isFinite(observation.checkedAt) || observation.checkedAt > now || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return false
+  const basis = chainBasis(['pr', pull.head, pull.reviewContext])
+  const original = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'review-pr' && invocation.slot === slot
+    && invocation.basis === basis && invocation.state === 'settled' && invocation.evidence?.status === 'completed'
+    && invocation.evidence.action === 'requested_changes' && invocation.evidence.outcome === 'changes_requested')
+  const evidence = original?.evidence
+  if (!original || !evidence || !resourceReleaseProven(evidence, true) || typeof evidence.completedAt !== 'number'
+    || !Number.isFinite(evidence.completedAt) || observation.checkedAt < evidence.completedAt
+    || observation.checkedAt < Date.parse(String(evidence.resources_settled_at))
+    || !chainReviewResponse(chain, original, observation, now)) return false
+  const decision = decideBehaviorChain({ ...chain, held: null }, observation, now)
+  return decision.kind === 'invoke' && decision.behavior === 'repair-pr'
+}
+
 function recoveredImplementation(chain: BehaviorChain, observation: ChainObservation, now: number): BehaviorChain['testRecovery'] | null {
   const hold = chain.testHold ?? chain.testRecovery?.hold
   const original = chain.invocations.find(invocation => invocation.id === hold?.invocationId), evidence = original?.evidence
@@ -563,6 +583,9 @@ export class BehaviorChainRuntime {
                 const reason = `Original implementation test recovery awaits current source/publication evidence: ${observation.testDependency?.reason || 'recovery is not verified'}`
                 if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
                 continue
+              }
+              if (chain.held && missingReceiptHoldCanResume(chain, observation, Date.now())) {
+                chain = this.append(chain, { type: 'chain.resumed' })
               }
               const mergeEvidence = observation.pull?.merged ? {
                 before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,

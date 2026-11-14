@@ -1303,6 +1303,109 @@ describe('native admission and recovery', () => {
       outcome: 'commented', evidence: { status: 'completed', resources_settled_at: new Date(NOW).toISOString() } })
     expect(restarted.admitInvocation(restarted.read(fourth.id)!, 'admit-10', invocation('work-10', 'review-issue', 'revision'), freshSlots.laneCapacity('behavior'))).not.toBeNull()
   })
+
+  it('recovers a held old-format negative for exactly one repair while retaining its finding', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    const callId = chainBasis('pr-review').slice(0, 32)
+    const { coverage: _dropped, ...old } = reviewResponse(callId)
+    current = record(journal, current, { type: 'invocation.admitted',
+      invocation: invocation('pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT])) })
+    current = record(journal, current, { type: 'invocation.started', invocationId: 'pr-review' })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: 'pr-review', callId,
+      outcome: 'changes_requested', evidence: { status: 'completed', action: 'requested_changes', outcome: 'changes_requested',
+        review_id: 27, head_sha: HEAD, completedAt: NOW, resources_settled_at: new Date(NOW).toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] }, artifact: { review_response: old } } })
+    Object.assign(obs.pull!.reviewReceipts[0], { state: 'CHANGES_REQUESTED', response: old })
+    obs.pull!.changesRequested = true; obs.pull!.unresolved = 1
+    current = record(journal, current, { type: 'chain.held', reason: 'PR review primary lacks its exact-head submission receipt' })
+    expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'PR review primary lacks its exact-head submission receipt' })
+    expect(decideBehaviorChain({ ...current, held: null }, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+    const launched: ChainInvocation[] = []
+    const ops = operations({ observe: async () => ({ ...structuredClone(obs), checkedAt: Date.now() }),
+      readInvocations: async () => ({ entries: [], quarantined: [] }),
+      request: async (_chain, _obs, decision) => ({ command: 'agent-interface', cwd: '/fixture', argv: ['--model', 'fixture-model'],
+        ...(decision.behavior === 'repair-pr' ? { context: { head: HEAD, reviewRevision: obs.pull!.reviewRevision } } : {}) }),
+      launch: async invocation => { launched.push(invocation); return true } })
+    let runtime = new BehaviorChainRuntime(journal, ops)
+    await runtime.run()
+    current = journal.read(chain.id)!
+    expect(current.held).toBeNull()
+    expect(launched).toHaveLength(1)
+    expect(launched[0].behavior).toBe('repair-pr')
+    expect(current.invocations.filter(item => item.behavior === 'repair-pr')).toHaveLength(1)
+    expect(current.invocations.find(item => item.id === 'pr-review')!.evidence!.artifact).toEqual({ review_response: old })
+    expect(old).not.toHaveProperty('coverage')
+    journal.rebuild()
+    runtime = new BehaviorChainRuntime(journal, ops)
+    await runtime.run()
+    current = journal.read(chain.id)!
+    expect(current.invocations.filter(item => item.behavior === 'repair-pr')).toHaveLength(1)
+    expect(launched).toHaveLength(1)
+    const repair = current.invocations.find(item => item.behavior === 'repair-pr')!
+    current = record(journal, current, { type: 'invocation.settled', invocationId: repair.id, callId: 'repair-call', outcome: 'no_changes',
+      evidence: { status: 'completed', action: 'no_changes', outcome: 'no_changes', head_sha: HEAD, completedAt: NOW,
+        resources_settled_at: new Date(NOW).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+    journal.rebuild()
+    runtime = new BehaviorChainRuntime(journal, ops)
+    await runtime.run()
+    current = journal.read(chain.id)!
+    expect(current.invocations.filter(item => item.behavior === 'repair-pr')).toHaveLength(1)
+    expect(launched).toHaveLength(2)
+    expect(launched[1].behavior).toBe('approve-pr')
+    expect(current.invocations.find(item => item.id === 'pr-review')!.evidence!.artifact).toEqual({ review_response: old })
+    expect(obs.pull!.reviewReceipts[0]).toMatchObject({ id: 27, state: 'CHANGES_REQUESTED', response: old })
+    expect(obs.pull!.unresolved).toBe(1)
+  })
+
+  it.each(['clean', 'null', 'wrong-head', 'wrong-invocation', 'operator-held'] as const)(
+    'keeps %s from advancing without a verified current-head negative', async variant => {
+      vi.spyOn(Date, 'now').mockReturnValue(NOW)
+      const { journal, chain } = setup(); const obs = observation(); pull(obs)
+      let current = reviewed(journal, chain, obs)
+      const clean = variant === 'clean'
+      const callId = chainBasis('pr-review').slice(0, 32)
+      let response: Record<string, unknown> = reviewResponse(callId)
+      if (variant !== 'null') {
+        const { coverage: _dropped, ...old } = response
+        response = old
+      } else response = { ...response, coverage: null }
+      if (variant === 'wrong-head') response = { ...response, head_sha: NEXT }
+      current = record(journal, current, { type: 'invocation.admitted',
+        invocation: invocation('pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT])) })
+      current = record(journal, current, { type: 'invocation.started', invocationId: 'pr-review' })
+      current = record(journal, current, { type: 'invocation.settled', invocationId: 'pr-review', callId,
+        outcome: clean ? 'clean' : 'changes_requested',
+        evidence: { status: 'completed', action: clean ? 'reviewed_clean' : 'requested_changes',
+          outcome: clean ? 'clean' : 'changes_requested', review_id: 27, head_sha: HEAD, completedAt: NOW,
+          resources_settled_at: new Date(NOW).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] },
+          artifact: { review_response: response } } })
+      Object.assign(obs.pull!.reviewReceipts[0], { state: clean ? 'COMMENTED' : 'CHANGES_REQUESTED', response,
+        head: variant === 'wrong-head' ? NEXT : HEAD,
+        invocation: variant === 'wrong-invocation' ? chainBasis('other').slice(0, 32) : callId })
+      obs.pull!.changesRequested = !clean; obs.pull!.unresolved = clean ? 0 : 1
+      const held = variant === 'operator-held' ? 'New invocations held by the person' : 'PR review primary lacks its exact-head submission receipt'
+      current = record(journal, current, { type: 'chain.held', reason: held })
+      expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: held })
+      const cleared = decideBehaviorChain({ ...current, held: null }, obs, NOW)
+      if (variant === 'operator-held') expect(cleared).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+      else expect(cleared).toMatchObject({ kind: 'hold', reason: expect.stringContaining('exact-head submission receipt') })
+      const launched: ChainInvocation[] = []
+      const ops = operations({ observe: async () => ({ ...structuredClone(obs), checkedAt: Date.now() }),
+        readInvocations: async () => ({ entries: [], quarantined: [] }),
+        launch: async invocation => { launched.push(invocation); return true } })
+      await new BehaviorChainRuntime(journal, ops).run()
+      current = journal.read(chain.id)!
+      expect(current.held).toBe(held)
+      expect(launched).toHaveLength(0)
+      expect(current.invocations.filter(item => item.behavior === 'repair-pr')).toHaveLength(0)
+      journal.rebuild()
+      await new BehaviorChainRuntime(journal, ops).run()
+      current = journal.read(chain.id)!
+      expect(current.held).toBe(held)
+      expect(launched).toHaveLength(0)
+    })
 })
 
 describe('pre-publication prerequisite deferral', () => {
