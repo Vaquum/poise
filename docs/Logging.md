@@ -83,6 +83,10 @@ pairs open GitHub. Unrecorded targets have no link.
 
 Each list snapshot also reads the owner's existing managed chain journal in one
 batch for retained Poise/Caller records with exact Call or correlation identities.
+Each batch scans retained invocation candidates once and validates matching chains
+against the journal. Ambiguity across either selector is rejected before checking
+that both selectors agree; repeated input positions retain their order. The next
+request reads current journal state, including changes since the preceding batch.
 The Work impact column leads with retrying/blocked/recovered/unknown, the verified
 target and stage. Duplicate diagnostics retain their event rows and identify the
 same work target; Count still measures retained diagnostic occurrences.
