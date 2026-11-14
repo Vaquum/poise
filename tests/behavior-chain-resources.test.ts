@@ -191,6 +191,32 @@ describe('durable resource admission order', () => {
     expect(queue.journal.reservedResources()).toEqual({ ...queue.reservation, unaccounted: 0 })
   })
 
+  it('yields queued model waiters without observation once capacity fills mid-sweep', async () => {
+    const queue = resourceQueue('memory', 'headroom')
+    const setupRuntime = new BehaviorChainRuntime(queue.journal, queue.ops)
+    await setupRuntime.run()
+    const second = queue.add(8)
+    await setupRuntime.run()
+    expect(queue.journal.capacityWaiters().map(current => current.id).sort()).toEqual([queue.chain.id, second.id].sort())
+    const direct = queue.add(1000, true)
+    for (let index = 1; index < 100; index++) queue.add(1000 + index)
+    const page = queue.journal.reconcilable('', Date.now(), false).map(current => current.id)
+    expect(page).not.toContain(queue.chain.id)
+    expect(page).not.toContain(second.id)
+    vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '20')
+    queue.ops.capacity = () => 1
+    queue.release()
+    const observed: string[] = []
+    const observe = queue.ops.observe
+    queue.ops.observe = async current => { observed.push(current.id); return observe(current) }
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.launches).toEqual([queue.chain.id, direct.id])
+    expect(observed).toContain(queue.chain.id)
+    expect(observed).toContain(direct.id)
+    expect(observed).not.toContain(second.id)
+    expect(queue.journal.reservedResources()).toEqual({ memoryBytes: 12, diskBytes: 0, unaccounted: 0 })
+  })
+
   it.each(['basis', 'slot'] as const)('records a fresh resource wait after a %s change with identical shortage text', async change => {
     const queue = resourceQueue('memory', 'headroom')
     const runtime = new BehaviorChainRuntime(queue.journal, queue.ops)

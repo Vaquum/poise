@@ -474,7 +474,7 @@ export class BehaviorChainRuntime {
         }
         if (!page.length) { this[cursorKey] = ''; continue }
         const snapshot = await this.readInvocations(page.filter(chain => !conflicted.has(chain.id) && !visited.has(chain.id)))
-        const work: Array<{ chain: BehaviorChain, priority: number | null, cursor: boolean }> = page.map(chain => ({ chain, priority: null, cursor: true }))
+        const work: Array<{ chain: BehaviorChain, priority: number | null, cursor: boolean, model?: boolean }> = page.map(chain => ({ chain, priority: null, cursor: true }))
         for (let index = 0; index < work.length; index++) {
           let { chain } = work[index]
           if (Date.now() - began > 45_000) break
@@ -488,6 +488,13 @@ export class BehaviorChainRuntime {
           }
           if (work[index].priority === null && offered.has(chain.id)) continue
           if (work[index].priority !== null) {
+            // Capacity can fill after older waiters are queued. Queued model
+            // waiters yield without observation once it does, so runnable
+            // direct work behind them is still reached.
+            if (work[index].model && !(this.operations.available() && this.journal.modelCapacityAvailable(this.operations.capacity()))) {
+              offered.add(chain.id)
+              continue
+            }
             chain = this.current(chain)
             offered.add(chain.id)
           }
@@ -657,8 +664,8 @@ export class BehaviorChainRuntime {
                   && waiter.sequence < (work[index].priority ?? Infinity)
                   && (modelAvailable || !waiter.model))
                 if (older.length) {
-                  work.splice(index + 1, 0, ...older.map(waiter => ({ chain: waiter.chain, priority: waiter.sequence, cursor: false })),
-                    { chain, priority: work[index].priority, cursor: false })
+                  work.splice(index + 1, 0, ...older.map(waiter => ({ chain: waiter.chain, priority: waiter.sequence, cursor: false, model: waiter.model })),
+                    { chain, priority: work[index].priority, cursor: false, model: work[index].model })
                   continue
                 }
                 if (decision.reviewer && !this.operations.available()) {
