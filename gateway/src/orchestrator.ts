@@ -707,7 +707,7 @@ export class Orchestrator {
   private async installTestOffload(handle: string): Promise<void> {
     const { config, docker, keys, log, store } = this.deps
     const env = config.testRelay
-      ? [`POISE_TEST_RELAY_URL=${workspaceRelayUrl(config, handle)}`, `POISE_TEST_RELAY_KEY=${workspaceKey(keys.privateKey, handle)}`]
+      ? [`POISE_TEST_RELAY_URL=${workspaceRelayUrl(config, handle)}`, `POISE_TEST_RELAY_KEY=${workspaceKey(keys.privateKey, handle)}`, `POISE_TEST_LIMIT_SECONDS=${config.testRelay.limitSeconds}`]
       : []
     try {
       const code = await docker.runTask(`poise-test-offload-${handle}`, this.homeTask(handle, 'install-test-offload', INSTALL_TEST_OFFLOAD, [], env))

@@ -913,15 +913,26 @@ run handshake and retries the whole suite once. The authenticated
 `this run is over` without a request-failure warning. Other relay failures
 retain their warnings. Both attempts use one captured
 checkout archive, command, cwd and environment, including uncommitted edits.
-Capture, provisioning, upload, waiting and the complete rerun share a nine-minute
-command budget, capped by a shorter inherited `BASH_DEFAULT_TIMEOUT_MS`.
+Capture, provisioning, upload, waiting and the complete rerun share one command
+budget from the gateway's `POISE_TEST_LIMIT_SECONDS`: 540 seconds by default,
+with whole seconds from 1 to 3540 supported. Invalid or excessive configuration
+stops gateway startup. The gateway installs the validated limit beside the URL
+and key in `~/.poise/test-offload/relay`; older two-line files retain 540 seconds.
+A shorter inherited `BASH_DEFAULT_TIMEOUT_MS` still caps the command budget.
 Cancellation retires the active upload and lease and prevents recovery from
 starting a new suite. Only the fresh suite's complete exit is returned; a genuine
 suite exit (including 125), a broken stream or another relay cause never retries.
 A second restart or an unrecovered relay retains the no-result contract above.
-The time limit is under an agent's shell tool's default of ten minutes
-(`BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts`), so that the agent hears this
-from the box and not as a command its tool gave up on.
+Poise derives the agent shell default from the installed budget plus 60 seconds
+for reporting and cleanup (600000 ms at the default budget). The shell maximum
+stays 3600000 ms. The client allows up to one second for its cleanup DELETE;
+retirement is independent of asynchronous provider termination. The gateway
+checks time and leases every five seconds, and lost leases expire after 45
+seconds. Independently, each sandbox has a provider deadline of the configured
+budget plus 60 seconds from its creation; a job's `timeout` has that same limit
+and a further ten-second forced-kill grace. These provider backstops still apply
+when the gateway is unavailable; neither a DELETE response nor run retirement
+alone proves the provider resource stopped.
 
 For atomic implementation and repair, that final relay diagnostic for the command
 permits otherwise complete work to pass to Caller with complete publication metadata
@@ -979,7 +990,7 @@ refuses, the deploy's output shows Render's answer. Give the gateway its service
 | `POISE_TEST_BOX_PLAN` | | `1c-2g` | The sandboxes' size |
 | `POISE_TEST_BASE_SERVICE` | | | The cron job's service ID, `crn-…`: suites then start on its jobs. Unset, every suite goes to a sandbox |
 | `POISE_TEST_PLAN` | | `plan-crn-005` | The jobs' size: one CPU and 2 GB |
-| `POISE_TEST_LIMIT_SECONDS` | | `540` | The time limit, from starting a box to the suite's end; keep it under `BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts` |
+| `POISE_TEST_LIMIT_SECONDS` | | `540` | One command budget in whole seconds, 1–3540, including capture, provisioning, upload and retries. Also bounds each relay run; the enclosing shell default adds 60 seconds |
 | `POISE_TEST_MAX_RUNS` | | `30` | Suites at once; past it an agent's command fails loudly |
 
 In a fork, `POISE_TEST_RENDER_API_KEY` is an Actions secret and the others are

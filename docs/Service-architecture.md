@@ -362,11 +362,18 @@ volume by running `/opt/poise/scripts/test-offload/install.sh` in a short-lived
 container of the image. With `POISE_TEST_RENDER_API_KEY` and
 `POISE_TEST_WORKSPACE` set, it passes `POISE_TEST_RELAY_URL`, which is
 `/api/link/test-relay` on the workspace's host or on `POISE_PROXY_LISTEN`, and
-`POISE_TEST_RELAY_KEY`, the workspace's handle signed by the gateway. That writes the hooks and `relay`, holding those
-two, to `~/.poise/test-offload`; without them it removes `relay`. Poise starts its
+`POISE_TEST_RELAY_KEY`, the workspace's handle signed by the gateway, and the
+validated `POISE_TEST_LIMIT_SECONDS`. That writes the hooks and `relay`, holding
+URL, key and limit on successive lines, to `~/.poise/test-offload`; without them it removes `relay`. Poise starts its
 children with the hooks while `relay` exists
 ([Agents' test suites](Operating.md#agents-test-suites)). The settings travel this
 way because only a new container would take an environment variable.
+The limit defaults to 540 seconds and accepts whole seconds from 1 to 3540.
+The runner reads it from this installed configuration for one command lifetime,
+including capture and retries. Workspace children get a shell default of that
+budget plus 60 seconds for reporting and cleanup, within the existing 3600000 ms
+shell maximum. Explicit shorter shell deadlines still cap the command. Older
+two-line relay files retain the 540-second default.
 
 The relay retains the last 1,024 retired run IDs, their workspace owners and, for
 jobs, SHA-256 runner-token digests in memory, outside active admission slots.

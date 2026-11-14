@@ -17,7 +17,6 @@ import { createGzip, gzip } from 'node:zlib'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const LEASE_MS = 10_000
-const LIMIT_MS = 9 * 60_000
 const RECOVERY_MS = 30_000
 const GATEWAY_RESTART = 'the gateway restarted'
 // A suite that reached for Docker on a job, which has none: it starts again on a sandbox, which has.
@@ -199,7 +198,10 @@ async function main(args) {
   const also = []
   while (args[0] === '--also') also.push(args.splice(0, 2)[1])
   const command = args.slice(1)
-  const [relay, key] = readFileSync(join(HERE, 'relay'), 'utf8').split('\n')
+  const [relay, key, configuredLimit = '540'] = readFileSync(join(HERE, 'relay'), 'utf8').trimEnd().split('\n')
+  if (!/^\d+$/.test(configuredLimit) || Number(configuredLimit) < 1 || Number(configuredLimit) > 3540) {
+    throw new Error('POISE_TEST_LIMIT_SECONDS must be a whole number from 1 to 3540')
+  }
   const headers = { authorization: `Bearer ${key}` }
   const cwd = process.cwd()
   // Names the checkout's history, so a repository whose suites use Docker goes to a sandbox at once.
@@ -209,7 +211,8 @@ async function main(args) {
   let docker = false
   // One clock includes capture, provisioning, upload, recovery and the complete rerun.
   const shellLimit = Number(process.env.BASH_DEFAULT_TIMEOUT_MS)
-  const limit = shellLimit > 0 ? Math.min(LIMIT_MS, shellLimit) : LIMIT_MS
+  const configuredMs = Number(configuredLimit) * 1000
+  const limit = shellLimit > 0 ? Math.min(configuredMs, shellLimit) : configuredMs
   const lifetime = new AbortController()
   let current = null
   let ending = false
