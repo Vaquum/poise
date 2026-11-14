@@ -12,6 +12,9 @@ import { gzipSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
+import { createLogger } from '../gateway/src/log'
+import { gatewayDiagnostic } from '../gateway/src/diagnostics/collectors'
+import { normalize } from '../gateway/src/diagnostics/contract'
 import { filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
 import { BehaviorChainJournal, chainBasis, type ChainEvent } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
@@ -1534,27 +1537,87 @@ ${stderr}`
     expect(warnings.filter(({ event }) => event === 'test_relay.run.failed')).toEqual([])
   })
 
-  it('tells a suite too big for its memory from one that failed, and sends the agent to CI', async () => {
-    await startAll()
-    // The background sweep can warn before the run fails.
-    warnings.push({ event: 'test_relay.sweep.failed', error: 'unrelated sweep failure' })
-    const script = `console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
-    const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
-    expect(code).toBe(125)
-    expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
-    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
-    expect(stderr).toContain('let CI run the tests')
-    // Choosing tests is no job of an agent's.
-    expect(stderr).not.toContain('name a')
-    // Poise hears of it too, with what it needs to find the suite.
-    const [warning] = warnings.filter(({ event }) => event === 'test_relay.run.failed')
-    expect(warning.event).toBe('test_relay.run.failed')
-    expect(warning.error).toContain('this suite is too big for its test box: it ran out of memory')
-    expect(warning.error).toContain('workspace alice')
-    expect(warning.error).toContain('command node -e')
-    expect((await fetch(`${relayUrl}/runs/${warning.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } })).status).toBe(204)
-    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+  it('labels npm command structure without treating arbitrary script names or interpreter bodies as suites', async () => {
+    runJobs = false
+    await startAll({ baseService: 'crn-test' })
+    const cases: [string[], string][] = [
+      [['npm', 'test', '--', 'private-argument'], 'npm run test'],
+      [['npm', '--prefix=private-prefix', '-w', 'private-workspace', 'run', 'test:e2e', '--', 'private-argument'], 'npm run test:e2e'],
+      [['node', '/lib/npm-cli.js', '-C', 'private-prefix', '--workspace=private-workspace', 'run', 'check'], 'npm run check'],
+      [['node', '/bin/npm', 'run', 'check', '--', 'private-argument'], 'npm run check'],
+      [['npm', 'run', 'test-private-argument'], 'npm'],
+      [['sh', '-c', 'npm run check\nprivate-script', 'npm', 'run', 'check'], 'sh'],
+      [['node', '-e', 'private-script', '/lib/npm-cli.js', 'run', 'check'], 'node'],
+      [['python3', '-c', 'private-script', 'npm', 'run', 'check'], 'python3'],
+      [[`/tmp/${'x'.repeat(80)}\nprivate-name`], 'x'.repeat(64)],
+    ]
+    const headers = { authorization: `Bearer ${KEY}` }
+    for (const [argv, command] of cases) {
+      const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: JSON.stringify({ argv, cwd: '/', env: {} }) })
+      const { id } = await created.json() as { id: string }
+      const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers })
+      await until(() => events.some((event) => event.event === 'test_relay.run.created' && event.id === id), 'the labelled run to be created')
+      expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+      await output.arrayBuffer()
+      for (const event of ['test_relay.run.created', 'test_relay.run.killed']) expect(events).toContainEqual(expect.objectContaining({ event, id, command }))
+    }
+    expect(JSON.stringify({ events, warnings })).not.toContain('private-')
   })
+
+  it.each([null, 'crn-test'])('keeps memory warnings correlatable without logging command bodies with base service %s', async (baseService) => {
+    const lines: string[] = []
+    const diagnostics: ReturnType<typeof normalize>[] = []
+    const log = createLogger((line) => lines.push(line), (level, operation, fields) => diagnostics.push(normalize(gatewayDiagnostic(level, operation, fields))))
+    await startAll({ baseService, log })
+    // The background sweep can warn before the run fails.
+    log.warn('test_relay.sweep.failed', { error: 'unrelated sweep failure' })
+    const secret = 'opaque-relay-value-7zQ4mN8p'
+    expect(JSON.stringify(process.env)).not.toContain(secret)
+    const script = `const privateValue = '${secret}'\nconsole.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
+    const shell = `private_value='${secret}'\nprintf '%s\\n' 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory' >&2\nexit 134`
+    const repo = repository()
+    mkdirSync(join(repo, 'gateway'))
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ private: true, workspaces: ['gateway'] }))
+    writeFileSync(join(repo, 'gateway', 'package.json'), JSON.stringify({ name: 'gateway', scripts: { check: `"${process.execPath}" oom.cjs` } }))
+    writeFileSync(join(repo, 'gateway', 'oom.cjs'), script)
+    const commands: [string[], string][] = [
+      [[process.execPath, '-e', script, secret], 'node'],
+      [['/bin/sh', '-c', shell, 'private-shell-argument', secret], 'sh'],
+      [[process.execPath, realpathSync(join(dirname(process.execPath), 'npm')), '--prefix', repo, '--workspace', 'gateway', 'run', 'check', '--', secret], 'npm run check'],
+    ]
+    const headers = { authorization: `Bearer ${KEY}` }
+    for (const [argv, label] of commands) {
+      const { code, stderr } = await suite(repo, argv).done
+      expect(code).toBe(125)
+      expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
+      expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+      expect(stderr).toContain('let CI run the tests')
+      expect(stderr).not.toContain('name a')
+      const id = /, run ([a-f0-9]{32})/.exec(stderr)![1]
+      const message = `run ${id}, workspace alice, command ${label}: this suite is too big for its test box: it ran out of memory`
+      const records = lines.map((line) => JSON.parse(line))
+      expect(records).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', level: 'warn', id, error: message }))
+      for (const event of ['test_relay.run.created', 'test_relay.run.finished']) {
+        expect(records).toContainEqual(expect.objectContaining({ event, id, command: label, ...(event.endsWith('finished') ? { exit: 125 } : {}) }))
+      }
+      expect(diagnostics).toContainEqual(expect.objectContaining({ operation: 'test_relay.run.failed', severity: 'warning', visibility: 'operator',
+        workspace: null, message: `test_relay.run.failed: ${message}` }))
+      expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+
+      // Cancellation uses the same formatter, before any command has executed.
+      const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: JSON.stringify({ argv, cwd: repo, env: {} }) })
+      const stopped = await created.json() as { id: string }
+      const output = await fetch(`${relayUrl}/runs/${stopped.id}/output`, { headers })
+      await until(() => lines.some((line) => { const record = JSON.parse(line); return record.event === 'test_relay.run.created' && record.id === stopped.id }), 'the cancelled run to be created')
+      expect((await fetch(`${relayUrl}/runs/${stopped.id}`, { method: 'DELETE', headers })).status).toBe(204)
+      await output.arrayBuffer()
+      expect(lines.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: stopped.id, command: label }))
+      unpacked = temp()
+    }
+    const output = JSON.stringify({ lines, diagnostics })
+    for (const excluded of [secret, 'const privateValue', 'private_value=', 'private-shell-argument', 'console.error', 'oom.cjs', repo]) expect(output).not.toContain(excluded)
+    expect(lines.map((line) => JSON.parse(line)).filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+  }, 20_000)
 
   it('fails loud when the box dies without a word', async () => {
     await startAll()

@@ -210,9 +210,22 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** What the logs say a run was, short of anything an argument might hold further on. */
+/** Only executable names and known suite names belong in logs, never argument values or command bodies. */
 function commandLabel(argv: string[]): string {
-  return argv.slice(0, 5).map((word) => word.split('/').at(-1)).join(' ').slice(0, 200)
+  const executable = argv[0].split('/').at(-1) ?? ''
+  const args = executable === 'npm' ? argv.slice(1)
+    : executable === 'node' && /^(npm|npm-cli\.js)$/.test(argv[1]?.split('/').at(-1) ?? '') ? argv.slice(2) : null
+  if (args) {
+    const words: string[] = []
+    for (let index = 0; index < args.length && args[index] !== '--' && words.length < 2; index += 1) {
+      if (/^(--prefix|-C|--workspace|-w)$/.test(args[index])) index += 1
+      else if (!args[index].startsWith('-')) words.push(args[index])
+    }
+    const script = /^(test|t|tst)$/.test(words[0] ?? '') ? 'test'
+      : /^(run|run-script|rum|urn)$/.test(words[0] ?? '') ? words[1] : undefined
+    if (script && ['test', 'test:full', 'test:e2e', 'check', 'lint', 'typecheck', 'typecheck:tests', 'verify'].includes(script)) return `npm run ${script}`
+  }
+  return executable.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64) || 'command'
 }
 
 export class TestRelay {
@@ -406,7 +419,7 @@ export class TestRelay {
   /** A warning reaches Poise's diagnostics, which keep only `error` of what a gateway operation says of itself. */
   private runFailed(run: Run, why: string): void {
     this.deps.log.warn('test_relay.run.failed', {
-      id: run.id, handle: run.handle, boxId: run.boxId, error: `${why} (workspace ${run.handle}, command ${commandLabel(run.spec.argv)})`,
+      id: run.id, handle: run.handle, boxId: run.boxId, error: `run ${run.id}, workspace ${run.handle}, command ${commandLabel(run.spec.argv)}: ${why}`,
     })
   }
 
