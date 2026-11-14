@@ -575,6 +575,10 @@ The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
 PR titles, issue-closing references or reply targets fail as unstarted work,
 rather than becoming ambiguous writes that never occurred.
+PR title and body checks apply only when creating a PR, including first-PR
+completion after an interrupted publish. Repairs retain the required proposed
+title/body fields for the atomic plan but preserve existing PR metadata; their
+unused body does not undergo the issue-closing check.
 Validation and publication both return the existing no-write `superseded`
 outcome when GitHub confirms that the original owned PR merged at the repair's
 unchanged head, before rejecting a closed seed. The receipt retains the verified
@@ -770,7 +774,10 @@ The worker's `ciDependency` output must identify the exact candidate, latest
 queue removal, failed merge-group commit and its base, failing check/run,
 existing remediation, and a specific cause excerpt verified in both integration
 and exact-base job logs from the same workflow. Green PR checks, another PR's
-failure or a remediation link alone provide no such proof. Missing evidence
+failure or a remediation link alone provide no such proof. Comparison copies of
+the excerpt and both logs remove only ANSI SGR styling; matching stays literal,
+the raw excerpt size bound and original evidence stay intact, and the 20-character
+minimum applies to visible text. Missing evidence
 remains unresolved; candidate-specific failures still require normal repair.
 
 An unchanged, verified shared failure settles as `no_changes` with that
@@ -927,6 +934,12 @@ when retained, or explicit unavailability requiring a fresh reproduction. This
 inspection preserves the earlier failed capture independently of later untested
 edits and grants no publication, retry or approval authority.
 
+While reporting remains unfinished for the current automatic pre-PR hold, the
+existing deferred scheduler rechecks at `checkedAt + 2 minutes`, regardless of
+implementation age. This covers verification before reservation and reconciliation
+of an unconfirmed creation intent without another POST. A verified report or terminal
+disposition returns to the ordinary quiescent cadence; operator holds retain it.
+
 These pre-PR implementation-hold reports require explicit triage before their
 own implementation can prepare or start. A posted issue review alone cannot
 authorize implementation. This includes follow-up reports keyed by their original
@@ -972,6 +985,43 @@ open, eligible seed must still verify no pushed branch, bound PR or competing li
 is the new cause plus the source chain. It uses the same explicit triage and admission gate with its
 three original Calls; missing or `source-only` waits, only a current `distinct-fix` passes. A single
 timeout with retry remaining and any write evidence do not qualify.
+
+PR review deadline reports (`review_budget_exhausted`, legacy or durable) require
+the same triage before their own implementation can prepare or start. A posted
+issue review alone cannot authorize implementation. Read `GET
+/api/behavior-chains?id=OWNER/REPO%23N` for the report chain's current sequence
+and `reviewReport` binding (`key`, `source`, `pull`, `head`, `holdSequence`
+— null for legacy PR-scoped reports, the hold event for durable chain reports —
+`attempts` as invocation/call pairs, `revision`, `disposition`), then POST the
+same `{ id, sequence, operation: "report-disposition", binding, disposition }`
+with that exact binding value. `implementationReport` keeps its single
+invocation/call shape for pre-PR reports. Triage must identify an independently
+implementable, verified defect to select `distinct-fix`; source-review-only
+diagnoses select `source-only`. The control verifies the publishing account and
+report marker, the reviewed title/body revision and native posted-review receipt,
+and the source: durable binds the exact original hold event, review-pr
+invocations, basis, slot and sole PR ownership; legacy binds the PR-scoped key,
+configured ownership and that no chain owns the PR. It persists the disposition
+inside the existing report intent and records the diagnosis and next action in
+waiting reasons on the report chain and, for durable, the source chain. Liveness
+goes in those reasons only; the report body is never edited. Labels, comment
+wording and closure supply no disposition.
+
+At admission, missing or stale review dispositions wait visibly, even when new
+report publishing is disabled. `source-only` starts no report implementation and
+leaves the original exact-head review obligation and explicit retry path intact.
+Only a current `distinct-fix` can pass through the ordinary implementation gates.
+Durable admission re-verifies the source through a fresh observation and the
+qualifying review attempts (exact head, basis, slot and Calls) with sole
+ownership; legacy re-verifies the marker, configured ownership, that no chain
+owns the PR, and that the report is unchanged. A review ownership change
+(legacy↔durable cutover, a different chain owning the PR), Resume, a replacement
+Hold, different Calls, a changed report revision or a new head invalidates the
+old binding. Original review Calls prove no-submission and resource release, not
+publication. No recovery is added: retry stays explicit and automatic retry stays
+stopped. Admitted-but-unlaunched report implementations retire as
+`launch_deferred`; launched work settles through its original receipts under the
+original reconciliation and publication fences.
 
 For `repair-pr`, `atomic_work_blocked` also qualifies one settled original Call
 under its matching active automatic hold after the last Resume. The same

@@ -95,6 +95,7 @@ const LIST_GRACE_MS = 30_000
 // A box this young may be one whose run does not know its id yet.
 const ORPHAN_GRACE_MS = 60_000
 const POLL_MS = 250
+const CANCEL_TIMEOUT_MS = 10_000
 const BOOT_WAIT_MS = 60_000
 const SNAPSHOT_WAIT_MS = 5 * 60_000
 const SETUP_LIMIT_SECONDS = 30 * 60
@@ -236,6 +237,7 @@ function commandLabel(argv: string[]): string {
 export class TestRelay {
   readonly runs = new Map<string, Run>()
   private readonly retired = new Map<string, { handle: string; tokenDigest: Buffer | null }>()
+  private readonly cancellations = new Set<string>()
   private readonly publicKey: KeyObject
   private readonly api: string
   private readonly owner: string
@@ -302,10 +304,12 @@ export class TestRelay {
   }
 
   private cancel(jobId: string): Promise<void> {
-    return fetch(`${this.api}/services/${this.deps.config.baseService}/jobs/${jobId}/cancel`, { method: 'POST', headers: this.renderHeaders }).then(
+    if (this.cancellations.has(jobId)) return Promise.resolve()
+    this.cancellations.add(jobId)
+    return fetch(`${this.api}/services/${this.deps.config.baseService}/jobs/${jobId}/cancel`, { method: 'POST', headers: this.renderHeaders, signal: AbortSignal.timeout(CANCEL_TIMEOUT_MS) }).then(
       (response) => { this.deps.log.info('test_relay.job.cancel', { jobId, status: response.status }) },
       (error: unknown) => { this.deps.log.warn('test_relay.job.cancel.failed', { jobId, error: errorMessage(error) }) },
-    )
+    ).finally(() => { this.cancellations.delete(jobId) })
   }
 
   private async waitUntil(what: string, waitMs: number, ready: () => Promise<boolean>): Promise<void> {

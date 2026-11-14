@@ -130,7 +130,19 @@ const RECHECK_AT_SQL = `CASE
   WHEN json_extract(state, '$.observation.checkedAt') IS NULL THEN 0
   WHEN json_extract(state, '$.ciHold') IS NOT NULL OR json_extract(state, '$.testHold') IS NOT NULL
     OR (json_extract(state, '$.held') IS NOT NULL AND json_extract(state, '$.mergeSha') IS NULL
-      AND json_extract(state, '$.observation.pull.state') = 'open') THEN json_extract(state, '$.observation.checkedAt') + 120000
+      AND json_extract(state, '$.observation.pull.state') = 'open')
+    OR (json_extract(state, '$.mergeSha') IS NULL AND json_type(state, '$.observation.pull') = 'null'
+      AND json_extract(state, '$.invocations[#-1].behavior') = 'implement-issue'
+      AND json_extract(state, '$.invocations[#-1].state') = 'settled'
+      AND json_extract(state, '$.invocations[#-1].admissionSequence') > json_extract(state, '$.resumedAfterSequence')
+      AND json_extract(state, '$.invocations[#-1].evidence.error_code') = 'atomic_work_blocked'
+      AND json_extract(state, '$.held') = json_extract(state, '$.invocations[#-1].evidence.error')
+      AND (json_extract(state, '$.waiting') LIKE 'Work-failure reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Stage: implement-issue.% Next action: inspect the implementation Call, address the blocker, then explicitly Resume. Implementation hold reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold report pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold report creation is unconfirmed;%'))
+    THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,
     json_extract(state, '$.observation.checkedAt') - coalesce(json_extract(state, '$.observation.pull.mergedAt'),
       json_extract(state, '$.invocations[0].admittedAt'), 0))) END`

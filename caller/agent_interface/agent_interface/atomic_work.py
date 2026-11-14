@@ -9,7 +9,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from . import atoms, checkout_lock, issue_review, progress, review_budget, resource_ownership
+from . import atoms, checkout_lock, failed_source, issue_review, native_namespace, progress, review_budget, resource_ownership
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope, escaped_failure
 
@@ -161,6 +161,7 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
     if baseline.get("head_sha") != head or baseline.get("ref") != base \
             or not isinstance(failures, list) or not failures or len(failures) > 100:
         raise AtomicWorkFailed("CI dependency lacks exact-base failure evidence")
+    sgr = re.compile(r"\x1b\[[0-9;]*m")
     verified, used = [], set()
     for failure in failures:
         if not isinstance(failure, dict):
@@ -168,11 +169,12 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
         check = next((item for item in integration["failing"] if item.get("check_run_id") == failure.get("check")), None)
         prior = next((item for item in baseline["failing"] if item.get("check_run_id") == failure.get("baselineCheck")), None)
         excerpt = failure.get("evidence")
+        visible_excerpt = sgr.sub("", excerpt) if isinstance(excerpt, str) else ""
         if not check or not prior or check["check_run_id"] in used or check.get("head_sha") != value["integration"] \
                 or prior.get("head_sha") != base or check.get("name") != prior.get("name") \
                 or check.get("state") != "completed" or check.get("conclusion") != "failure" \
                 or prior.get("state") != "completed" or prior.get("conclusion") != "failure" \
-                or not isinstance(excerpt, str) or not 20 <= len(excerpt.strip()) <= 2000:
+                or not isinstance(excerpt, str) or len(excerpt.strip()) > 2000 or len(visible_excerpt.strip()) < 20:
             raise AtomicWorkFailed("CI dependency requires matching completed failures and a specific cause excerpt")
         run = next((item for item in integration["runs"] if item.get("id") == check.get("run_id")), None)
         base_run = next((item for item in baseline["runs"] if item.get("id") == prior.get("run_id")), None)
@@ -184,7 +186,7 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
             if not item.get("log_id"):
                 raise AtomicWorkFailed("CI dependency has no readable job log")
             log = issue_review.interface("--read-failing-ci-log", str(item["log_id"]), "--repository", repo, "--token-user", actor)
-            if log.get("repository", "").lower() != repo.lower() or excerpt not in log.get("log", ""):
+            if log.get("repository", "").lower() != repo.lower() or visible_excerpt not in sgr.sub("", log.get("log", "")):
                 raise AtomicWorkFailed("CI dependency cause is absent from its actual job logs")
         used.add(check["check_run_id"])
         verified.append({**failure, "name": check["name"], "run": run["id"], "workflow": run["workflow_id"],
@@ -296,7 +298,8 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
     data = issue_review.packet(repo, number, actor)
     if data["issue"]["state"] != "open":
         raise AtomicWorkFailed("seed issue is no longer open")
-    if expected_issue_revision and issue_review.revision(data["issue"]) != expected_issue_revision:
+    seed_revision = issue_review.revision(data["issue"])
+    if expected_issue_revision and seed_revision != expected_issue_revision:
         raise AtomicWorkFailed("seed issue changed before implementation/repair")
     progress.stage("preparing_checkout", "Preparing the implementation/repair checkout")
     prepared = issue_review.interface("--issue-work", *common, "--mode", "prepare", "--path", str(checkout),
@@ -304,7 +307,23 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
     if prepared.get("outcome") != "prepared":
         return prepared
     test_capture = {"call": call_id, "nonce": secrets.token_hex(32), "repository": repo, "base": prepared["checkout_head"]}
-    record({"phase": "prepared", "prepared": prepared, "test_capture": test_capture})
+    record({"phase": "prepared", "prepared": prepared, "test_capture": test_capture, "seed_revision": seed_revision})
+    restored = None
+    if pull is None:
+        try:
+            bound = resource_ownership.binding()
+        except Exception:
+            bound = None
+        if bound is not None and bound[1] == call_id:
+            try:
+                result = failed_source.restore_deadline(bound[0], call_id, checkout, prepared["checkout_head"], seed_revision)
+            except Exception as error:
+                raise AtomicWorkFailed(f"deadline restore verification failed; no publication attempted: {error}") from error
+            if result.get("status") == "restored":
+                restored = result
+                record({"phase": "prepared", "prepared": prepared, "seed_revision": seed_revision,
+                        "deadline_restored": {"predecessor": result["predecessor"], "base": result["base"],
+                                              "seed": result["seed"], "count": len(result["paths"])}})
     test_evidence = work / "test-evidence"
     test_evidence.mkdir(mode=0o700)
     evidence = {}
@@ -356,6 +375,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         f"Write JSON to {output}: {{\"commitMessage\":\"Conventional Commit subject\",\"title\":\"Conventional Commit PR title\","
         "\"body\":\"Concrete change, reason and actual checks, without a Closes footer\","
         "\"replies\":[{\"commentId\":123,\"body\":\"Your concrete answer to this actual review finding, including what changed or evidence for disagreement\"}],\"blocked\":null}}. "
+        "For repairs, retain the required title/body fields; they describe this repair but are not published. Existing PR metadata is preserved. "
         f"For a repair, include one substantive answer for each of these required unresolved root comment IDs: {json.dumps(sorted(required_reply_ids))}. "
         "This exact set includes outdated unresolved roots and roots that already have replies. Check each finding and its answer against the repaired code and current reviewer input. "
         "When an existing native reply still applies and that finding's reviewer input is unchanged, carry its entire body verbatim in replies, including its original <!-- poise-reply CALL_ID ROOT_ID --> marker. "
@@ -376,6 +396,10 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
         f"Behavior note: {note}\nPreparation receipt:\n{json.dumps(prepared)}\nActual issue and comments:\n{json.dumps(data)}\nActual PR evidence:\n{json.dumps(evidence)}"
     )
+    if restored is not None:
+        instruction += (f"\nRestored {len(restored['paths'])} unvalidated file(s) from previous deadline attempt "
+                        f"{restored['predecessor']} on the same base and seed: {json.dumps(sorted(restored['paths']))}. "
+                        "These edits are unvalidated; validate from scratch and publish only from this attempt.\n")
     progress.stage("preparing_provider", "Preparing the atomic provider command")
     args, stdin, env = issue_review.command(model, instruction, checkout, work, seconds, UNATTENDED)
     env = dict(os.environ if env is None else env)
@@ -395,6 +419,39 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             try:
                 done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
             except subprocess.TimeoutExpired as error:
+                if pull is None:
+                    try:
+                        bound = resource_ownership.binding()
+                    except Exception:
+                        bound = None
+                    if bound is not None and bound[1] == call_id:
+                        base = prepared.get("checkout_head")
+                        proven = not lease.retained
+                        if proven:
+                            try:
+                                issue_review.stop_leftovers(work)
+                                proven = issue_review._cwd_pids(work, require_complete=True) == []
+                            except Exception:
+                                proven = False
+                        if proven:
+                            try:
+                                scope = native_namespace.active()
+                                if scope is not None:
+                                    scope.require_idle()
+                            except Exception:
+                                proven = False
+                        if proven:
+                            try:
+                                failed_source.capture_deadline(bound[0], call_id, checkout, base, seed_revision)
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                record({"phase": "executing", "prepared": prepared,
+                                        "deadline_source": {"status": "unavailable", "base": base,
+                                                            "seed": seed_revision, "reason": failed_source.DEADLINE_REASON}})
+                            except Exception:
+                                pass
                 raise review_budget.ReviewLimitError(
                     "Atomic behavior provider exhausted its execution budget; no publication attempted",
                     "atomic_work_execution_budget_exhausted",

@@ -424,7 +424,12 @@ class AtomicWorkLimits(TestCase):
 
     def test_shared_ci_dependency_waits_without_publication_only_without_edits_and_mixed_or_unknown_failures_are_not_excused(self):
         base, integration = "c" * 40, "d" * 40
-        excerpt = "AssertionError: expired notice fixture returned no handling rows"
+        excerpt = "Error: timed out waiting: the first Vitest assertion before interruption"
+        # GitHub job logs 132463172632 and 132465258335 (#1859).
+        logs = {
+            "11": "2026-11-14T13:38:29.8312034Z \x1b[31m\x1b[1mError\x1b[22m: timed out waiting: the first Vitest assertion before interruption",
+            "21": "2026-11-14T13:47:24.6393561Z \x1b[31m\x1b[1mError\x1b[22m: timed out waiting: the first Vitest assertion before interruption",
+        }
         dependency = {"head": HEAD, "removal": "removed", "integration": integration, "base": base,
                       "remediation": "https://github.com/example/repo/pull/99",
                       "failures": [{"check": 11, "baselineCheck": 21, "evidence": excerpt}]}
@@ -432,10 +437,22 @@ class AtomicWorkLimits(TestCase):
                  "run_id": 10, "log_id": 11}
         baseline_check = {**check, "check_run_id": 21, "head_sha": base, "run_id": 20, "log_id": 21}
         queue = {"head_sha": HEAD, "queue_removals": [{"id": "removed", "reason": "failed_checks", "beforeCommit": {"oid": integration}}]}
-        scenarios = ("shared", "shared-edits", "candidate-only", "mixed", "mixed-unfixed", "wrong-head", "wrong-parent", "wrong-base", "wrong-event", "wrong-workflow", "missing-cause")
+        scenarios = ("shared", "shared-styled", "shared-edits", "candidate-only", "mixed", "mixed-unfixed",
+                     "wrong-head", "wrong-parent", "wrong-base", "wrong-event", "wrong-workflow", "missing-cause",
+                     "changed-assertion", "short-excerpt", "oversized-excerpt", "non-sgr")
         for index, scenario in enumerate(scenarios):
             with self.subTest(scenario=scenario):
                 modes, reads, instructions = [], [], []
+                evidence = excerpt
+                if scenario == "shared-styled":
+                    evidence = "\x1b[1mError\x1b[0m: timed out waiting: the first Vitest assertion before interruption"
+                if scenario == "changed-assertion":
+                    evidence = excerpt.replace("first", "different")
+                if scenario == "short-excerpt":
+                    evidence = "\x1b[31m" * 4 + "Error" + "\x1b[0m"
+                if scenario == "oversized-excerpt":
+                    evidence = "\x1b[31m" * 400 + excerpt
+                dependency["failures"][0]["evidence"] = evidence
                 integration_data = {"head_sha": HEAD, "ref": integration, "parents": [base, HEAD], "failing": [check],
                                     "runs": [{"id": 10, "head_sha": integration, "event": "merge_group", "workflow_id": 1}]}
                 base_data = {"head_sha": HEAD, "ref": base, "failing": [baseline_check],
@@ -469,7 +486,12 @@ class AtomicWorkLimits(TestCase):
                             return {"failing": []}
                         return integration_data if args[-1] == integration else base_data
                     if args[0] == "--read-failing-ci-log":
-                        return {"repository": "example/repo", "log": "different failure" if scenario == "missing-cause" and args[1] == "21" else excerpt}
+                        log = logs[args[1]]
+                        if scenario == "missing-cause" and args[1] == "21":
+                            log = "different failure"
+                        if scenario == "non-sgr":
+                            log = log.replace("Error", "Error\x1b[2K")
+                        return {"repository": "example/repo", "log": log}
                     if args[0] == "--read-issue":
                         return {"issue": {"number": 99}}
                     raise AssertionError(args)
@@ -495,18 +517,20 @@ class AtomicWorkLimits(TestCase):
                         patch.object(issue_review, "_cwd_pids", return_value=[]), \
                         patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
                         patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), redirect_stdout(StringIO()):
-                    if scenario in {"shared", "shared-edits", "mixed", "candidate-only"}:
+                    if scenario in {"shared", "shared-styled", "shared-edits", "mixed", "candidate-only"}:
                         self.run_behavior(3, HEAD, f"00000000-0000-4000-8000-{index + 1:012d}")
                     else:
                         with self.assertRaises(ValueError):
                             self.run_behavior(3, HEAD, f"00000000-0000-4000-8000-{index + 1:012d}")
                 with sqlite3.connect(self.path) as conn:
                     row = conn.execute("select status,action,artifact,action_plan from calls order by rowid desc limit 1").fetchone()
-                if scenario in {"shared"}:
+                if scenario in {"shared", "shared-styled"}:
                     self.assertEqual(modes, ["prepare", "validate"])
                     self.assertEqual(row[:2], ("completed", "no_changes"))
                     self.assertIsNone(row[3])
                     self.assertEqual(json.loads(row[2])["ci_dependency"]["failures"][0]["run"], 10)
+                    self.assertEqual(json.loads(row[2])["ci_dependency"]["failures"][0]["evidence"], evidence)
+                    self.assertTrue(json.loads(row[2])["ci_dependency"]["allShared"])
                     self.assertEqual(json.loads(row[2])["phase"], "waiting_baseline")
                     self.assertIn("Never independently edit a verified shared baseline failure", instructions[0])
                     self.assertIn("shared-only failure leave blocked null", instructions[0])
@@ -712,6 +736,8 @@ class AtomicWorkLimits(TestCase):
                     if mode == "prepare":
                         return {"outcome": "prepared", "checkout_head": HEAD}
                     self.assertEqual(json.loads(args[args.index("--replies-json") + 1]), replies)
+                    self.assertEqual(args[args.index("--title") + 1], "fix: repair seed")
+                    self.assertEqual(args[args.index("--body") + 1], "Concrete repair and checks.")
                     return {"outcome": "validated" if mode == "validate" else "published", "head_sha": HEAD}
 
                 replies = [{"commentId": root, "body": earlier_answer if root == 18 else "Verified the finding against the repair and its regression."}
@@ -738,6 +764,8 @@ class AtomicWorkLimits(TestCase):
                                             f"00000000-0000-4000-8000-{attempt:012d}", "fixture-model", "poise/issue-7", 3, HEAD)
 
                 instruction = command.call_args.args[1]
+                self.assertIn("retain the required title/body fields", instruction)
+                self.assertIn("Existing PR metadata is preserved", instruction)
                 self.assertIn("required unresolved root comment IDs: [17, 18]", instruction)
                 self.assertIn("outdated", instruction)
                 self.assertIn("already have replies", instruction)

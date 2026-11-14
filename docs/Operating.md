@@ -892,6 +892,11 @@ depends on the others:
   ends itself within seconds of its next message going unanswered. A gateway that
   restarts ends every box it finds no run for, and does so again every 15 seconds.
 
+The relay keeps one cancellation request in flight per job, with a ten-second
+deadline. Failures and timeouts retain the cancellation-failure warning, and a
+later sweep retries an owned job that Render still lists. Run retirement frees
+its admission slot immediately, without waiting for cancellation.
+
 **When there is no result.** A suite can be too big for its box, by running out of
 memory or passing the time limit, and the box can also fail to start, the checkout
 can fail to arrive, or Render can be down. The agent's command then says on stderr

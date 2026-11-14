@@ -1887,6 +1887,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         try:
             if source == "poise:behavior-chain" and pull is None:
                 failed_source.discard_unless_failed(DB, id_)
+                failed_source.discard_deadline_unless_failed(DB, id_)
         finally:
             if source == "poise:behavior-chain":
                 resource_ownership.cleanup_remaining(DB, id_)

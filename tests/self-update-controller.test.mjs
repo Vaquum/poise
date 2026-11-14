@@ -190,13 +190,22 @@ describe('check, publish and pull request', () => {
     expect(h.git.log).toContainEqual(['push', `poise/change-${UUID}`, HEAD])
     expect(h.git.remoteRefs[`poise/change-${UUID}`]).toBe(HEAD)
     const pull = h.github.pulls[100]
-    expect(pull.title).toBe('Make the chat header sticky')
+    expect(pull.title).toBe('feat: Make the chat header sticky')
     expect(pull.body).toContain(UUID)
     expect(pull.body).toContain('> Make the chat header sticky')
     expect(pull.body).toContain(SESSION2)
     expect(pull.body).toContain(`Head: \`${HEAD}\``)
     expect(pull.base.ref).toBe('main')
     expect(workspace).toBe(h.workspace)
+  })
+
+  it.each(['fix: keep the header visible', 'feat(chat): keep the header visible', 'refactor!: replace the header', 'perf(chat)!: replace the header'])('preserves the Conventional Commits title %s', async (title) => {
+    const h = await harness()
+    const { workspace } = await h.controller.prepareChange(h.payload({ title }))
+    h.git.commit(workspace, HEAD)
+    await h.controller.finishChange(UUID, { outcome: 'completed' })
+    await h.controller.tick()
+    expect(h.github.pulls[100].title).toBe(title)
   })
 
   it('blocks a change outside the auto lane, fail closed with the paths named', async () => {
@@ -856,7 +865,7 @@ describe('source revert reconciliation', () => {
     await tickUntil(h, () => revert().state === 'awaiting_ci')
     expect(revert().prUrl).toBe(`https://github.com/${REPOSITORY}/pull/101`)
     expect(h.runner.log.slice(runsBefore)).toEqual([['npm', 'ci', '--include=dev'], ['npm', 'run', 'check']])
-    expect(h.github.pulls[101].title).toBe('Revert: Make the chat header sticky')
+    expect(h.github.pulls[101].title).toBe('revert: Make the chat header sticky')
     expect(h.github.pulls[101].body).toContain(live.mergeSha)
     expect(h.git.remoteRefs[`poise/revert-${UUID}`]).toBe(changeOf(h).revert.headSha)
     await tickUntil(h, () => revert().state === 'merged')
