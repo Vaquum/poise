@@ -402,10 +402,6 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                                         timeout_seconds=seconds, repository=repo, pr=pull, expected_head=expected_head,
                                         behavior="repair_pr" if pull is not None else "implement_issue",
                                         message=f"Seed issue {repo}#{number}", submission="none")) from error
-            finally:
-                if model.provider == "codex":
-                    from .structured_review import codex_propagate
-                    codex_propagate(work)
             progress.stage("settling_provider_resources", "Verifying atomic provider resource release")
             record({"phase": "resources_unknown", "prepared": prepared})
             issue_review.stop_leftovers(work)
@@ -415,6 +411,11 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if bound is not None:
                 resource_ownership.process_check(*bound, complete=True)
             record({"phase": "executing", "prepared": prepared})
+            if model.provider == "codex":
+                # After the release proof: leftover writers are gone, so the
+                # isolated credential read here is the run's final state.
+                from .structured_review import codex_propagate
+                codex_propagate(work)
             progress.stage("validating_provider_result", "Checking the atomic provider result")
             terminal = issue_review._terminal_failure(model.provider, done.stdout)
             if done.returncode or terminal:

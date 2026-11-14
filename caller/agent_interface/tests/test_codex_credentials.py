@@ -21,9 +21,12 @@ from agent_interface import atomic_work, issue_review, structured_review
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 
-CANARY_A = '{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-A"}}'
-CANARY_B = '{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-B"}}'
-CANARY_C = '{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-C"}}'
+CANARY_A = ('{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-A",'
+            '"account_id":"codex-canary-acct-1","login_owner_id":"codex-canary-login-1"}}')
+CANARY_B = ('{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-B",'
+            '"account_id":"codex-canary-acct-1","login_owner_id":"codex-canary-login-1"}}')
+CANARY_C = ('{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-C",'
+            '"account_id":"codex-canary-acct-2","login_owner_id":"codex-canary-login-2"}}')
 THREAD = "01234567-89ab-4cde-8123-456789abcdef"
 REUSE_MESSAGE = ("Your access token could not be refreshed because your refresh "
                  "token was already used. Please log out and sign in again.")
@@ -304,6 +307,39 @@ class TestCodexCredentialPreservation(TestCase):
                             structured_review.codex_propagate(root)
                     finally:
                         fcntl.flock(held, fcntl.LOCK_UN)
+                self.assertEqual((original / "auth.json").read_text(), CANARY_A)
+
+    def test_invalid_isolated_output_never_replaces_the_sign_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            original = tmp / "home" / ".codex"
+            original.mkdir(parents=True)
+            (original / "auth.json").write_text(CANARY_A)
+            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
+                for isolated in ("not-json-at-all",
+                                 '{"auth_mode":"chatgpt"}',
+                                 '{"auth_mode":"chatgpt","tokens":{"refresh_token":""}}',
+                                 '{"auth_mode":"chatgpt","tokens":{"refresh_token":"codex-canary-refresh-X"}}',
+                                 '{"auth_mode":"apikey","tokens":{"refresh_token":"x"}}'):
+                    root = tmp / f"run-{abs(hash(isolated)) % 100000}"
+                    root.mkdir(exist_ok=True)
+                    structured_review.codex_environment(root)
+                    (root / "codex-home" / "auth.json").write_text(isolated)
+                    structured_review.codex_propagate(root)
+                    self.assertEqual((original / "auth.json").read_text(), CANARY_A)
+
+    def test_substituted_account_never_replaces_the_sign_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            original = tmp / "home" / ".codex"
+            original.mkdir(parents=True)
+            (original / "auth.json").write_text(CANARY_A)
+            with patch.dict(os.environ, {"CODEX_HOME": str(original)}):
+                root = tmp / "review"
+                root.mkdir()
+                structured_review.codex_environment(root)
+                (root / "codex-home" / "auth.json").write_text(CANARY_C)
+                structured_review.codex_propagate(root)
                 self.assertEqual((original / "auth.json").read_text(), CANARY_A)
 
     def test_issue_review_propagates_an_ephemeral_rotation(self):

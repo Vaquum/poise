@@ -764,9 +764,12 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
 # only session/thread persistence; authentication still resolves from and
 # persists to $CODEX_HOME/auth.json, exactly as without the flag. There is
 # no supported shared-auth mode that preserves isolation: auth and history
-# share CODEX_HOME, and an atomic rename would sever an auth.json symlink.
+# share CODEX_HOME. The CLI resolves an auth.json symlink to its target
+# before replacement and locks the target's sidecar; Caller never writes
+# through a managed link and leaves symlinked originals untouched.
 # So each isolated run copies the sign-in in, keeps its own rotation, and
-# copies a rotation back under the CLI's own lock.
+# copies a rotation back under the CLI's own lock — but only when the
+# isolated document parses as the same ChatGPT login that was copied.
 CODEX_AUTH_SNAPSHOT = "codex-auth.snapshot"
 CODEX_COMMIT_WAIT_SECONDS = 5
 
@@ -802,15 +805,63 @@ def codex_environment(root: Path) -> dict:
     return env
 
 
+def _codex_is_rotation(current: bytes, rotated: bytes) -> bool:
+    """Whether the isolated document is a genuine rotation of the original.
+
+    Rotation rewrites only tokens and last_refresh, preserving auth_mode and
+    the stable login identifiers — the file form of the CLI's same-account
+    check. Anything else is run output, not a refresh: invalid bytes, a mode
+    change, or a different account must never replace the originating
+    sign-in. Files without any stable identifier cannot be proven
+    same-account and are left untouched.
+    """
+    try:
+        orig = json.loads(current.decode("utf-8"))
+        new = json.loads(rotated.decode("utf-8"))
+    except ValueError:
+        return False
+    if not isinstance(orig, dict) or not isinstance(new, dict):
+        return False
+    if orig.get("auth_mode") != "chatgpt" or new.get("auth_mode") != "chatgpt":
+        return False
+    orig_tokens = orig.get("tokens")
+    new_tokens = new.get("tokens")
+    if not isinstance(orig_tokens, dict) or not isinstance(new_tokens, dict):
+        return False
+    for tokens in (orig_tokens, new_tokens):
+        refresh = tokens.get("refresh_token")
+        if not isinstance(refresh, str) or not refresh:
+            return False
+    for key in set(orig) | set(new):
+        if key in ("tokens", "last_refresh"):
+            continue
+        if orig.get(key) != new.get(key):
+            return False
+    for key in set(orig_tokens) | set(new_tokens):
+        if key in ("id_token", "access_token", "refresh_token", "oauth_provenance"):
+            continue
+        if orig_tokens.get(key) != new_tokens.get(key):
+            return False
+    owner = orig_tokens.get("login_owner_id")
+    account = orig_tokens.get("account_id")
+    if not (isinstance(owner, str) and owner) and not (isinstance(account, str) and account):
+        return False
+    for key in ("id_token", "access_token"):
+        if (key in orig_tokens) != (key in new_tokens):
+            return False
+    return True
+
+
 def codex_propagate(root: Path) -> None:
     """Copy a rotated isolated credential back to the originating sign-in.
 
     Best-effort: any failure leaves every sign-in untouched, so a review
     never fails for its credential bookkeeping. Writes only when the CLI
-    rotated this run's copy (isolated differs from the copied snapshot)
-    while the original stayed at that snapshot, under the CLI's own
-    auth.json.lock, so an external sign-in, another Call's propagation or
-    a non-isolated CLI run is never overwritten.
+    rotated this run's copy (isolated differs from the copied snapshot and
+    still parses as that same ChatGPT login) while the original stayed at
+    that snapshot, under the CLI's own auth.json.lock, so an external
+    sign-in, another Call's propagation, a non-isolated CLI run, or this
+    run's own file output is never overwritten into the sign-in.
     """
     try:
         home = root / "codex-home"
@@ -847,6 +898,8 @@ def codex_propagate(root: Path) -> None:
             except OSError:
                 return
             if sha256(current).hexdigest() != expected:
+                return
+            if not _codex_is_rotation(current, rotated):
                 return
             fd, tmp = tempfile.mkstemp(prefix="auth.json.", dir=original)
             try:
