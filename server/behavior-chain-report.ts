@@ -612,10 +612,20 @@ function implementationReport(db: Database, chain: BehaviorChain): RepairReport 
       && report.key !== chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source]))
     if (shared) {
       // Only an explicit generated record keeps its report gated. Intents
-      // persisted before the record cannot conflict with each other.
+      // persisted before the record cannot conflict with each other, but a
+      // pre-record generated report must still run its predatesHold gate
+      // instead of collapsing to ordinary intake when another source adopts
+      // its stripped issue. The earliest pre-record decides: it predates
+      // only when every pre-record does.
       const generated = reports.filter(report => report.adopted === false)
-      if (!generated.length) return null
       if (generated.length === 1) return generated[0]
+      if (!generated.length) {
+        const legacy = reports.filter(report => report.adopted === undefined)
+          .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
+            || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+        if (!legacy.length) return null
+        return legacy[0]
+      }
     }
     throw new Error('Blocked report has conflicting source intents')
   }

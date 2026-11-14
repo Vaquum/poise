@@ -2169,6 +2169,7 @@ it('keeps a pre-record shared blocked-by remedy ordinary after upgrade', async (
   const scoped = intents.find(intent => intent.key !== chainBasis(['atomic_work_blocked', chain.id]))!
   expect(scoped).toMatchObject({ source: chain.id, issueNumber: 98, adopted: true })
   // Intents persisted before the adoption record lack it; downgrade both.
+  // The independently authored remedy predates its source hold.
   const legacy = JSON.parse(JSON.stringify(scoped))
   delete legacy.adopted
   db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(legacy), 'behavior_chain_repair_report:' + scoped.key)
@@ -2178,6 +2179,7 @@ it('keeps a pre-record shared blocked-by remedy ordinary after upgrade', async (
     basis: 'b'.repeat(64), slot: 'primary',
     attempts: [{ invocation: 'second-implementation', call: 'c'.repeat(32), completedAt: Date.now() }],
     issueNumber: 98 }))
+  remote.find(row => row.number === 98)!.created_at = new Date(scoped.heldAt - 86_400_000).toISOString()
   expect(reports(db)).toHaveLength(3)
   vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
   const fixture = await reviewedImplementationReport(db, journal, next.call, 98)
@@ -2187,7 +2189,8 @@ it('keeps a pre-record shared blocked-by remedy ordinary after upgrade', async (
   expect(admitted).toMatchObject({ behavior: 'implement-issue', state: 'started' })
   expect(admitted.request.implementationSource).toBeUndefined()
   expect(() => implementationReportBinding(db, journal.read('acme/repo#98')!)).not.toThrow()
-  expect(implementationReportBinding(db, journal.read('acme/repo#98')!)).toBeNull()
+  expect(implementationReportBinding(db, journal.read('acme/repo#98')!)).toMatchObject({ key: scoped.key, source: chain.id,
+    holdSequence: scoped.holdSequence, invocation: next.call.correlation_id, call: next.call.id })
   expect(journal.read(chain.id)).toMatchObject({ held: next.call.error })
   expect(posts()).toHaveLength(1)
 })
@@ -2227,6 +2230,59 @@ it('keeps a stripped generated report gated when a second source adopts it', asy
     basis: 'b'.repeat(64), slot: 'primary',
     attempts: [{ invocation: 'second-implementation', call: 'c'.repeat(32), completedAt: Date.now() }],
     issueNumber: 100, adopted: true }))
+  expect(reports(db)).toHaveLength(3)
+  vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  const fixture = await reviewedImplementationReport(db, journal, next.call, 100)
+  const report = journal.read('acme/repo#100')!
+  expect(() => implementationReportBinding(db, report)).not.toThrow()
+  expect(implementationReportBinding(db, report)).toMatchObject({ key: scoped.key, source: chain.id,
+    holdSequence: scoped.holdSequence, invocation: next.call.correlation_id, call: next.call.id })
+  const admission = await implementationReportAdmission(db, journal, report,
+    await fixture.overrides.observe(report), fixture.overrides.observe)
+  expect(admission.reason).toContain('awaits a current explicit')
+  expect(fixture.request).not.toHaveBeenCalled()
+  expect(fixture.launch).not.toHaveBeenCalled()
+  expect(report.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
+  expect(journal.read(chain.id)).toMatchObject({ held: next.call.error })
+  expect(posts()).toHaveLength(2)
+})
+
+it('keeps a pre-record generated report gated when a second source adopts it', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedImplementation(journal)
+  call.error = ingressError('a'.repeat(64), 'b'.repeat(32)); call.diagnostic = prePrDiagnostic()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  const originalKey = chainBasis(['atomic_work_blocked', chain.id])
+  remote[0].state = 'closed'
+  record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  const next = blockedImplementation(journal)
+  next.call.error = memoryError('c'.repeat(64), 'd'.repeat(32)); next.call.diagnostic = prePrDiagnostic()
+  fresh.prerequisites = prePrPrerequisites([])
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [next.call], quarantined: [] }) })).run()
+  const intents = reports(db).map(row => JSON.parse(row.value))
+  expect(intents).toHaveLength(2)
+  const scoped = intents.find(intent => intent.key !== originalKey)!
+  expect(scoped).toMatchObject({ source: chain.id, pull: null, issueNumber: 100, adopted: false })
+  // Persisted before the adoption record; downgrade the generated intent.
+  const legacy = JSON.parse(JSON.stringify(scoped))
+  delete legacy.adopted
+  db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(legacy), 'behavior_chain_repair_report:' + scoped.key)
+  // Rewrite the marker and original invocation and Call IDs away, then a
+  // second pre-record source failing the same file/test adopts the issue.
+  remote[1].body = remote[1].body.replace(`<!-- poise-repair-exhaustion:${scoped.key} -->`, '')
+    .split(scoped.attempts[0].invocation).join('').split(scoped.attempts[0].call).join('')
+  expect(remote[1].body).toContain(MEMORY_FILE)
+  expect(remote[1].body).toContain('keeps memory warnings correlatable')
+  fresh.prerequisites = prePrPrerequisites([100])
+  const secondKey = chainBasis(['atomic_work_blocked', 'acme/repo#8', 'second-implementation', 5])
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('behavior_chain_repair_report:' + secondKey, JSON.stringify({
+    key: secondKey, source: 'acme/repo#8', pull: null, holdSequence: 5, heldAt: Date.now(), head: null,
+    basis: 'b'.repeat(64), slot: 'primary',
+    attempts: [{ invocation: 'second-implementation', call: 'c'.repeat(32), completedAt: Date.now() }],
+    issueNumber: 100 }))
   expect(reports(db)).toHaveLength(3)
   vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
   const fixture = await reviewedImplementationReport(db, journal, next.call, 100)
