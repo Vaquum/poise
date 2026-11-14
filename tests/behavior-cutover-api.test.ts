@@ -4,10 +4,11 @@ import { db, getMeta, setMeta, closeDatabase } from '../server/db'
 import { behaviorChainJournal } from '../server/behavior-chain-journal'
 import type { BehaviorChain, ChainEvent } from '../server/behavior-chain-store'
 import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
-import { chainSummaryFixture } from './fixtures/behavior-chain-summary'
+import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
+import { chainSummaryFixture, mergedReviewFixture, type MergedReviewCase } from './fixtures/behavior-chain-summary'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
 import { parseProcessDiagnostic } from '../server/process-diagnostic'
-import { eventWords, readJournalPage, taskState, timelineLines } from '../src/ui/places/observe/chains'
+import { eventWords, readChain, readJournalPage, taskState, timelineLines } from '../src/ui/places/observe/chains'
 import { readFrom } from '../src/ui/places/observe/journal'
 
 const native = vi.hoisted(() => ({ support: { status: 'supported', error: null as string | null } }))
@@ -204,6 +205,63 @@ it('shares the production summary and historical rebuild contract with browser p
   expect(chainSummaryFixture('pending-no-invocation').chains[0]).toMatchObject({ reviewStatus: 'pending', reviewPending: true, invocations: [] })
   expect(chainSummaryFixture('complete').chains[0]).toMatchObject({ reviewStatus: 'complete', reviewPending: false })
   expect(chainSummaryFixture('historical').chains[0]).toMatchObject({ reviewStatus: 'not-recorded', reviewPending: null })
+})
+
+it('retains unmet native clearance on completed merged list/detail reads across expiry and rebuild, without rewriting receipts', async () => {
+  const journal = behaviorChainJournal()
+  const cases: MergedReviewCase[] = ['requested-changes', 'clean', 'native-approval', 'late-native-approval', 'late-review',
+    'missing-basis', 'changed-context', 'changed-head', 'missing-panel', 'incomplete-panel']
+  const now = Date.now()
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now)
+  const chains = cases.map((mode, index) => mergedReviewFixture(journal, 1635 + index, mode))
+  for (const [index, chain] of chains.entries()) {
+    if (!['requested-changes', 'clean', 'native-approval', 'late-native-approval'].includes(cases[index])) continue
+    const observation = chain.observation as ChainObservation
+    expect(decideBehaviorChain(chain, observation, observation.checkedAt, {
+      before: journal.preMergeObservation(chain.id, observation.pull!.mergedAt!) as ChainObservation | null,
+      firstMerged: journal.firstMergedObservation(chain.id) as ChainObservation | null,
+    })).toEqual({ kind: 'complete', mergeSha: 'c'.repeat(40) })
+  }
+  const history = db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').all()
+  journal.rebuild()
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  try {
+    for (const time of [now + 10_001, now + 120_001]) {
+      clock.mockReturnValue(time)
+      const merged = await (await fetch(`${base}?state=merged`)).json()
+      for (const [index, chain] of chains.entries()) {
+        expect(journal.read(chain.id)).toEqual(chain)
+        expect(merged.attention.map((entry: { id: string }) => entry.id)).not.toContain(chain.id)
+        const listed = merged.chains.find((entry: { id: string }) => entry.id === chain.id)
+        const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
+        expect(listed).toBeDefined()
+        expect(detail.chain).toEqual(listed)
+        expect(listed).toMatchObject({ mergeSha: 'c'.repeat(40), reviewPending: false, reviewStatus: 'complete', invocationCount: chain.invocations.length })
+        expect(listed.invocations).toHaveLength(20)
+        expect(listed.invocations.every((entry: { behavior: string }) => entry.behavior === 'repair-pr')).toBe(true)
+        const warning = listed.mergedReviewWarning
+        if (cases[index] === 'requested-changes' || cases[index] === 'late-native-approval') {
+          expect(warning).toMatchObject({ head: 'a'.repeat(40), reviews: [{ id: 91, head: 'a'.repeat(40), submittedAt: now - 7000,
+            verdict: 'Changes requested: retain the original native review clearance after merge.',
+            url: `https://github.com/acme/repo/pull/${chain.issue + 1}#pullrequestreview-91` }],
+          githubApproval: { id: 93, head: 'a'.repeat(40), submittedAt: now - 4000,
+            url: `https://github.com/acme/repo/pull/${chain.issue + 1}#pullrequestreview-93`, client: 'unknown' } })
+          expect(taskState(readChain(listed))).toEqual({ state: 'done', reason: 'Merged as ccccccc · native review clearance unmet' })
+        } else expect(warning).toBeNull()
+      }
+    }
+    journal.rebuild()
+    expect(db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').all()).toEqual(history)
+    for (const chain of chains) expect(journal.read(chain.id)).toEqual(chain)
+  } finally {
+    await fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    clock.mockRestore()
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
 })
 
 it('retains the original failed native Call and diagnostic in list and History without rewriting uncertainty', async () => {

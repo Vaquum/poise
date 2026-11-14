@@ -1,7 +1,7 @@
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
 import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
-import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, lastChainQueueInvocation, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
+import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, lastChainQueueInvocation, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
 import { nativeBehavior } from './behavior-chain-runtime'
 import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
@@ -620,8 +620,40 @@ export function chainWaitsForResourceRelease(chain: BehaviorChain): boolean {
     && !(typeof invocation.evidence?.resources_settled_at === 'string' && Number.isFinite(Date.parse(invocation.evidence.resources_settled_at))))
 }
 
-/** Pure wire projection, shared by the HTTP handler and isolated browser fixtures. */
-export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at: number | null }) {
+/** Historical clearance is separate from completion of the original responses.
+ * Use the canonical basis and full invocation list, even on completed chains. */
+function mergedReviewWarning(chain: BehaviorChain, journal?: BehaviorChainJournal) {
+  const observation = chain.observation as ChainObservation | null
+  const pull = observation?.pull
+  if (!journal || !observation || !chain.mergeSha || !pull?.merged || pull.mergeSha !== chain.mergeSha) return null
+  const before = journal.preMergeObservation(chain.id, pull.mergedAt ?? Number.NaN) as ChainObservation | null
+  const firstMerged = journal.firstMergedObservation(chain.id) as ChainObservation | null
+  if (decideBehaviorChain(chain, observation, observation.checkedAt, { before, firstMerged }).kind !== 'complete') return null
+  const original = { ...observation, prReviewers: before!.prReviewers, pull: { ...pull, reviewContext: before!.pull!.reviewContext } }
+  if (chain.invocations.some(invocation => invocation.evidence?.status === 'completed'
+    && ['reviewed_clean', 'approved'].includes(String(invocation.evidence.action))
+    && chainReviewResponse(chain, invocation, original, original.checkedAt))) return null
+  const basis = chainBasis(['pr', pull.head, original.pull.reviewContext])
+  const url = (id: number) => `https://github.com/${chain.repository}/pull/${pull.number}#pullrequestreview-${id}`
+  const reviews = original.prReviewers.map(reviewer => {
+    const invocation = [...chain.invocations].reverse().find(item => item.behavior === 'review-pr' && item.basis === basis
+      && item.slot === reviewer.slot && item.state === 'settled' && item.evidence?.status === 'completed')!
+    const response = chainReviewResponse(chain, invocation, original, original.checkedAt)!
+    const receipt = pull.reviewReceipts.find(item => item.id === invocation.evidence!.review_id)!
+    return { id: receipt.id, head: receipt.head, submittedAt: receipt.submittedAt!, url: url(receipt.id), verdict: response.assessment.verdict }
+  })
+  const lastReviewAt = Math.max(...reviews.map(review => review.submittedAt))
+  const approval = pull.reviewReceipts.filter(receipt => receipt.state === 'APPROVED' && receipt.head === pull.head
+    && Number.isSafeInteger(receipt.id) && receipt.id > 0 && pull.reviewIds.includes(receipt.id)
+    && typeof receipt.submittedAt === 'number' && Number.isFinite(receipt.submittedAt)
+    && receipt.submittedAt > lastReviewAt && receipt.submittedAt <= pull.mergedAt!)
+    .sort((a, b) => b.submittedAt! - a.submittedAt!)[0]
+  return { head: pull.head, reviews, githubApproval: approval ? { id: approval.id, head: approval.head,
+    submittedAt: approval.submittedAt!, url: url(approval.id), client: 'unknown' as const } : null }
+}
+
+/** Read-only wire projection, shared by the HTTP handler and isolated browser fixtures. */
+export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at: number | null }, journal?: BehaviorChainJournal) {
   const publication = chain.observation?.publication as { pull_number?: number | null } | undefined
   return { id: chain.id, repository: chain.repository, issue: chain.issue, branch: chain.branch, author: chain.author, reviewer: chain.reviewer,
     sequence: chain.sequence, held: chain.held,
@@ -630,6 +662,7 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
     supersession: chain.supersession ?? null,
     reviewPending: chain.reviewPending ?? null,
     reviewStatus: chain.reviewPending === true ? 'pending' : chain.reviewPending === false ? 'complete' : 'not-recorded',
+    mergedReviewWarning: mergedReviewWarning(chain, journal),
     reconciliation: reconciliation ? { nextObservationAt: reconciliation.at,
       ...(chainWaitsForResourceRelease(chain) ? { waitingForResourceRelease: true } : {}),
       waitingForOriginalResponse: reconciliation.at === null && chain.reviewPending === true

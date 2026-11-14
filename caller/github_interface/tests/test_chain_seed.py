@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 from github_interface.behaviors import chain_seed, issue_comments, issue_work, read_issue
 
 PAYLOAD = {"repository": "example/repo", "token_user": "author", "issue": "#7", "branch": "poise/issue-7"}
-ISSUE = {"number": 7, "title": "Seed", "body": "", "state": "open", "labels": []}
+ISSUE = {"number": 7, "title": "Seed", "body": "", "state": "open", "labels": [], "updated_at": "2026-11-14T00:34:29Z"}
 RAW_COMMENTS = [{"id": 3, "user": {"login": "reviewer"}, "body": "note",
                  "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z",
                  "html_url": "https://github.com/example/repo/issues/7#issuecomment-3"}]
@@ -32,7 +32,8 @@ def client():
     mock.paginate.side_effect = fake_paginate
     mock.graphql.return_value = {"repository": {"ref": None,
         "defaultBranchRef": {"target": {"oid": "c" * 40}},
-        "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+        "issue": {"blockedBy": {"nodes": [], "totalCount": 0, "pageInfo": {"hasNextPage": False}},
+                  "closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
     return mock
 
 
@@ -54,6 +55,33 @@ class ChainSeed(IsolatedAsyncioTestCase):
             "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z",
             "url": "https://github.com/example/repo/issues/7#issuecomment-3"}])
         self.assertIsNone(seed["publication"]["pull_number"])
+
+    async def test_live_prerequisites_refresh_without_an_issue_timestamp_change_and_incomplete_reads_are_not_empty(self):
+        mock = client()
+        first = await chain_seed.run(mock, dict(PAYLOAD))
+        expected = {"repo": "example/repo", "number": 7, "found": True, "complete": True, "prerequisites": []}
+        self.assertEqual(first["publication"]["prerequisites"], expected)
+        connection = mock.graphql.return_value["repository"]["issue"]["blockedBy"]
+        node = {"number": 6, "repository": {"nameWithOwner": "EXAMPLE/Repo"}}
+        connection.update(nodes=[node, {"number": 5, "repository": {"nameWithOwner": "other/repo"}}], totalCount=2)
+        current = await chain_seed.run(mock, dict(PAYLOAD))
+        self.assertEqual(current["issue"], first["issue"])
+        self.assertEqual(current["publication"]["prerequisites"],
+                         {**expected, "prerequisites": [{"repo": "example/repo", "number": 6}]})
+        self.assertEqual(mock.graphql.await_count, 2)
+        self.assertIn("blockedBy(first:100)", mock.graphql.call_args.args[0])
+        self.assertEqual(mock.graphql.call_args.args[1]["number"], 7)
+        for invalid in (None, {}, {"nodes": []}, {**connection, "pageInfo": {}},
+                        {**connection, "pageInfo": {"hasNextPage": True}},
+                        {**connection, "totalCount": 3}, {**connection, "nodes": [None]},
+                        {**connection, "nodes": [{"number": 6}]},
+                        {**connection, "nodes": [node] * 101, "totalCount": 101}):
+            with self.subTest(invalid=invalid):
+                mock.graphql.return_value["repository"]["issue"]["blockedBy"] = invalid
+                seed = await chain_seed.run(mock, dict(PAYLOAD))
+                self.assertFalse(seed["publication"]["prerequisites"]["complete"])
+        mock.post.assert_not_awaited()
+        mock.patch.assert_not_awaited()
 
     async def test_facets_share_one_client_and_inspect_without_writing(self):
         mock = client()

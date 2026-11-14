@@ -222,10 +222,10 @@ it.each(['receipt-read', 'observation', 'request-preparation'] as const)(
     } else {
       expect(current.held).toBe('concurrent person hold')
       expect(current.invocations).toHaveLength(0)
-      expect(observe.mock.calls.filter(([chain]) => chain.id === first.id)).toHaveLength(2)
+      expect(observe.mock.calls.filter(([chain]) => chain.id === first.id)).toHaveLength(phase === 'request-preparation' ? 3 : 2)
     }
     expect(diagnostics()).toMatchObject([{ severity: 'warning', target: first.id,
-      phase: phase === 'receipt-read' ? 'reconciliation' : phase === 'request-preparation' ? 'invocation-admission' : phase,
+      phase: phase === 'receipt-read' ? 'reconciliation' : phase,
       context: { outcome: 'recovered', attempts: 2 } }])
   })
 

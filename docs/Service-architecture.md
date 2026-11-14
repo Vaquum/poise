@@ -1454,9 +1454,11 @@ reconnect/provider-verification evidence; these optional fields do not change
 reducer state or old event hashes. Ambiguous older events stay unknown. See
 [System health](Analytics.md#system-health).
 
-New implementation admission also consumes Caller's captured forward GitHub
+New implementation admission also consumes Caller's complete live forward GitHub
 prerequisites and verified delivery on the implementation base through the
-existing chain sweep. [Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
+existing chain sweep, including a final observation after awaited request
+preparation. The mirror health gate remains required.
+[Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
 dependency wait; no gateway route, journal event or poller is added.
 
 The workspace's existing `/api/behavior-chains` controls also expose an explicit

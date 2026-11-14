@@ -152,6 +152,16 @@ API summaries include nullable `reviewPending` and `reviewStatus` (`pending`,
 `complete`, `not-recorded`). Older merges without an explicit review verdict
 stay not-recorded; they acquire neither fabricated proof nor a new obligation.
 These fields are projections, never normalized into historical reducer state.
+Merged list and detail reads also expose `mergedReviewWarning` when the original
+head, context and reviewer panel prove completed pre-merge native responses but
+no response qualifies under the native favorable-review check. Observe → Tasks
+retains the merge and completed review status, and shows the unmet clearance,
+retained changes-requested verdicts and review links. A separately verified later
+GitHub approval includes its head, submission time and link; its submitting client
+remains unknown. A qualifying native approval before merge clears this diagnosis;
+a post-merge submission cannot. Missing or contradictory original evidence leaves
+the diagnosis unproven (`null`). The projection uses full canonical history,
+survives observation expiry and rebuild, and grants no execution authority.
 A confirmed merge remains visible alongside any hold or uncertain invocation.
 List and detail summaries omit the superseded native merge queue wait only when
 the canonical merge SHA is recorded. Other waits and pending original evidence
@@ -401,7 +411,7 @@ requires its original positive proof and does not restart blocked work. The
 hold survives journal rebuild and server replacement; the person can resume
 through the existing control after resolving the blocker.
 
-1. Each configured issue-review slot must finish successfully and its native receipt must identify an actually posted comment on the current issue revision. Before a new implementation, the fresh Caller mirror must expose complete explicit same-repository GitHub `blockedBy` evidence. A verified empty connection permits the ordinary path; absent or truncated capture waits visibly. Each recorded prerequisite waits by issue number until it is closed and a linked closing PR's merge commit is verified as an ancestor of the observed implementation base. Closing an issue, queueing a PR or merging only into another branch is insufficient. The ordinary chain sweep rechecks this dependency wait without admitting a worker, recording an execution failure or creating a remediation issue. Existing holds still require Resume. No elapsed review delay authorizes implementation.
+1. Each configured issue-review slot must finish successfully and its native receipt must identify an actually posted comment on the current issue revision. Before a new implementation, the authenticated Caller seed read must expose complete live same-repository GitHub `blockedBy` evidence; the mirror health gate still applies. This bounded connection is read again after awaited request preparation, immediately before admission, because dependency changes need not change the issue timestamp. A verified empty connection permits the ordinary path; absent or truncated evidence waits visibly. Each recorded prerequisite waits by issue number until it is closed and a linked closing PR's merge commit is verified as an ancestor of the observed implementation base. Closing an issue, queueing a PR or merging only into another branch is insufficient. The ordinary chain sweep rechecks this dependency wait without admitting a worker, recording an execution failure or creating a remediation issue. Existing holds still require Resume. No elapsed review delay authorizes implementation.
 2. Implementation reads the actual issue and comments, makes real changes in a fresh checkout and runs the repository's checks. After the model ends, Caller's publication primitive commits, pushes and opens the linked PR. Commit trailers and the PR's chain marker preserve artifact identity across lost responses.
 3. Fresh exact-head evidence of an actual branch conflict selects the existing scoped repair before PR review, after invocation, hold and queue guards. Clean or merely behind branches still receive the configured current-head reviews first. Repairs use a fresh model invocation and the actual review packet, CI evidence and branch state. They publish code and substantive model-written replies to original findings. A new head requires fresh reviews and approval. An unchanged-code repair still requires independent approval verification.
 4. Existing native primitives handle grey CI, approved nonblocking conversation resolution, strict readiness, merge and merge-queue admission. Conversation resolution also covers outdated threads, because GitHub's merge rule counts them, but only when readiness is blocked solely by `merge_state_not_clean` or `required_reviews_not_approved`, the blockers an open conversation can explain. A PR that readiness reports green goes to merge with its outdated threads left alone. Their repository policy leaves a merely behind branch to native queue integration; an actual conflict still requires repair. Completion requires the actual GitHub merge SHA. Queue admission, a finished turn, approval or CLOSED alone cannot complete a chain.
@@ -706,6 +716,11 @@ unattempted checkpoint do not acquire this recovery authority.
 The executed publication helper verifies its original controller and PID
 namespace, its direct Caller parent and the absence of any other worker before
 reserving replies. It cannot inherit an in-memory Python scope across exec.
+Only extra namespace members receive the existing two-second settlement window;
+each controller read is bounded by the time remaining. Reservation requires
+exactly PID 1, PID 2 and the original helper. Identity mismatches, persistent
+members and namespace read timeouts or I/O failures retain distinct bounded
+reasons through the existing diagnostic, with replies still unattempted.
 After a repair publishes the current head and all required fresh reviews
 complete, answered conversations proceed to independent approval rather than
 another repair solely because the original thread is still unresolved. A new
