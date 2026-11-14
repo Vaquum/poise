@@ -249,10 +249,22 @@ export class BehaviorChainRuntime {
   }
 
   /** Resume retains waiting in hashed reducer state; a still-blocking reason
-   * starts a new wait episode on its first observed sweep after Resume. */
+   * starts a new wait episode on the first sweep that reaches it after Resume,
+   * even when an observation-only sweep (such as a capacity-fairness deferral)
+   * intervened. Later sweeps deduplicate against the fresh event. */
   private renewsWait(chain: BehaviorChain, reason: string): boolean {
-    return chain.waiting !== reason || (chain.resumedAfterSequence > 0
-      && this.journal.history(chain.id, chain.resumedAfterSequence, 1)[0]?.sequence === chain.sequence)
+    if (chain.waiting !== reason) return true
+    if (chain.resumedAfterSequence <= 0) return false
+    let after = chain.resumedAfterSequence
+    while (true) {
+      const events = this.journal.history(chain.id, after)
+      for (const row of events) {
+        const event = JSON.parse(row.payload) as ChainEvent
+        if (event.type === 'chain.waiting' && event.reason === reason) return false
+      }
+      if (events.length < 100) return true
+      after = events.at(-1)!.sequence
+    }
   }
 
   /** Durable-budget wait reason for one more reservation, or null when the

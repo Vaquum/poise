@@ -546,6 +546,9 @@ describe('resource-aware behavior admission', () => {
     const boundary = current.resumedAfterSequence
     expect(current.waiting).toBe(reason)
     expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+    // A deferred sweep observes without reaching the wait site; renewal must survive it.
+    current = record(journal, current, { type: 'chain.observed', observation: { checkedAt: Date.now() } })
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
 
     await runtime.run()
     const next = journal.read(chain.id)!

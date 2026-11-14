@@ -909,6 +909,16 @@ describe('native admission and recovery', () => {
     expect(launch).not.toHaveBeenCalled()
   })
 
+  it('keeps journal-less summary callers on the pre-boundary projection', () => {
+    const { journal, chain } = setup()
+    const reason = 'older caller cannot date its wait'
+    let current = record(journal, chain, { type: 'chain.waiting', reason })
+    current = record(journal, current, { type: 'chain.held', reason: 'person paused it' })
+    current = record(journal, current, { type: 'chain.resumed' })
+    expect(behaviorChainSummary(current).waiting).toBe(reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+  })
+
   it('records one fresh draft wait after Hold and Resume while the PR remains a draft', async () => {
     const { db, journal, chain } = setup()
     const obs = observation(); pull(obs)
@@ -960,6 +970,9 @@ describe('native admission and recovery', () => {
     let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
     current = record(journal, current, { type: 'chain.resumed' })
     expect(current.waiting).toBe(reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+    // A deferred sweep observes without reaching the wait site; renewal must survive it.
+    current = record(journal, current, { type: 'chain.observed', observation: { checkedAt: Date.now() } })
     expect(behaviorChainSummary(current, journal).waiting).toBeNull()
     const restarted = new BehaviorChainJournal(db); restarted.rebuild()
     expect(restarted.read(chain.id)).toEqual(current)

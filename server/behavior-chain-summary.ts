@@ -670,10 +670,12 @@ function mergedReviewWarning(chain: BehaviorChain, journal?: BehaviorChainJourna
     submittedAt: approval.submittedAt!, url: url(approval.id), client: 'unknown' as const } : null }
 }
 
-/** Wire projection, shared by the HTTP handler and isolated browser fixtures. */
-export function behaviorChainSummary(chain: BehaviorChain, journal: BehaviorChainJournal, reconciliation?: { at: number | null }) {
+/** Wire projection, shared by the HTTP handler and isolated browser fixtures.
+ * Without a journal the wait cannot be dated against Resume, so journal-less
+ * callers keep the pre-boundary projection. */
+export function behaviorChainSummary(chain: BehaviorChain, journal?: BehaviorChainJournal, reconciliation?: { at: number | null }) {
   const publication = chain.observation?.publication as { pull_number?: number | null } | undefined
-  const waiting = currentChainWaiting(journal, chain)
+  const waiting = journal ? currentChainWaiting(journal, chain) : chain.waiting
   return { id: chain.id, repository: chain.repository, issue: chain.issue, branch: chain.branch, author: chain.author, reviewer: chain.reviewer,
     sequence: chain.sequence, held: chain.held,
     waiting: chain.mergeSha && waiting?.startsWith('native merge queue owns entry ') ? null : waiting,
