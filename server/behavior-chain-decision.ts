@@ -31,6 +31,7 @@ export interface ChainObservation extends Record<string, unknown> {
   prerequisites?: { wait: string | null, base: string | null, evidence: Record<string, unknown>[] }
   ciBaseUpdate?: { from: string, head: string, base: string, tree: string }
   fullSuite?: Record<string, unknown>
+  remediation?: Record<string, unknown>
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,
     queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null },
@@ -231,7 +232,7 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   mergeEvidence?: MergeReviewEvidence): ChainDecision {
   const pending = chain.invocations.find((invocation) => invocation.state !== 'settled')
   if (pending) return { kind: 'wait', reason: `${pending.behavior} is ${pending.state}; its native outcome must settle first` }
-  if (chain.supersession) return { kind: 'wait', reason: 'full-suite repair is verified superseded' }
+  if (chain.supersession) return { kind: 'wait', reason: 'repair is verified superseded' }
   const pull = observation.pull
   if (!Number.isFinite(observation.checkedAt) || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS || observation.checkedAt > now) return { kind: 'wait', reason: 'behavior observations need refreshing' }
   if (pull?.merged && pull.mergeSha && /^[0-9a-f]{40}$/i.test(pull.mergeSha)) {
@@ -264,10 +265,15 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   // An unconfirmed retirement falls through to fresh evidence below: the
   // duplicate head may have moved since the attempt. Re-invocation is
   // basis-guarded there so identical evidence holds instead of looping.
-  if (!observation.issue.open && observation.fullSuite) {
+  const remediation = observation.remediation
+  const remediationDuplicate = remediation?.duplicate as { number?: unknown, head?: unknown } | undefined
+  const coverage = !observation.issue.open && observation.fullSuite ? observation.fullSuite
+    : remediation?.verified === true && pull && !pull.merged && !observation.existingPulls.length
+      && remediationDuplicate?.number === pull.number && remediationDuplicate.head === pull.head
+      && observation.publication.head_sha === pull.head && observation.publication.pull_number === pull.number ? remediation : null
+  if (coverage) {
     if (chain.held && !automaticClosureHold(chain.held)) return { kind: 'wait', reason: chain.held }
     if (observation.existingPulls.length) return { kind: 'hold', reason: `full-suite recovery needs a decision for linked work: ${observation.existingPulls.join(', ')}` }
-    const coverage = observation.fullSuite
     const duplicate = coverage.duplicate as { number?: unknown, head?: unknown } | null
     if (coverage.verified !== true || !pull || pull.merged || duplicate?.number !== pull.number || duplicate.head !== pull.head
       || observation.publication.head_sha !== pull.head || observation.publication.pull_number !== pull.number) {
@@ -279,7 +285,7 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       return { kind: 'hold', reason: `redundant PR retirement needs a decision: ${String(retiredProof?.result.reason || 'the original close response did not confirm retirement')}` }
     }
     return { kind: 'invoke', behavior: 'retire-pr', basis: chainBasis(['retire', coverage]), actor: chain.author,
-      reviewer: null, reason: 'close the verified redundant full-suite repair after original invocation settlement' }
+      reviewer: null, reason: 'close the verified redundant repair after original invocation settlement' }
   }
   if (chain.held) return { kind: 'wait', reason: chain.held }
   if (!observation.issue.open && !pull) return { kind: 'hold', reason: 'seed issue closed without a confirmed merged pull request' }

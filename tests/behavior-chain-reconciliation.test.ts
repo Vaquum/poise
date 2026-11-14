@@ -374,6 +374,13 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
       await expect(runtime.run()).rejects.toThrow('CI evidence unavailable')
       expect(journal.read(chain.id)!.held).toContain(call.error)
     }
+    if (!recovers) {
+      obs.pull!.conflict = true
+      vi.setSystemTime(Date.now() + 120_000)
+      await runtime.run()
+      expect(journal.read(chain.id)!.held).toContain(call.error)
+      expect(launch).not.toHaveBeenCalled()
+    }
     Object.assign(obs.pull!, { checksState: 'SUCCESS', head: ci.head_sha, pending: false, failing: [] })
     if (source === 'queue') {
       obs.ciRecovery = { invocationId: id, removal: queue.removal, integration: queue.integration, recovered: true, reason: 'Verified integration recovery' }
@@ -433,6 +440,140 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     expect(journal.read(chain.id)!.invocations[0]).toEqual(failedReceipt)
     expect(launch).toHaveBeenCalledTimes(1)
   })
+
+it('admits only a scoped exact-head conflict repair and never replenishes its retry budget across CI holds and rebuilds', async () => {
+  const { db, journal } = setup()
+  const obs = observation()
+  Object.assign(obs.publication, { state: 'open', merged: false, merge_sha: null })
+  Object.assign(obs.pull!, { state: 'open', merged: false, mergeSha: null, checksState: 'FAILURE', failing: ['unit:failure'] })
+  let chain = seed(journal)
+  chain = record(journal, chain, { type: 'chain.resumed' })
+  const retryBoundary = chain.resumedAfterSequence
+  chain = record(journal, chain, { type: 'chain.observed', observation: structuredClone(obs) })
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'old-ci-failure', behavior: 'repair-pr',
+    actor: chain.author, model: reviewer.model, slot: reviewer.slot, basis: 'before-conflict', admittedAt: NOW - 86_400_000,
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--expected-head', obs.pull!.head],
+      context: { head: obs.pull!.head, reviewRevision: obs.pull!.reviewRevision } } } })
+  const original: LogEntry = { ...completedReviewCall(chain.repository, 17, obs.pull!.head, chain.author), id: 'a'.repeat(32),
+    behavior: 'repair_pr', source: 'poise:behavior-chain', correlation_id: 'old-ci-failure', status: 'failed', action: 'not_started',
+    outcome: 'preflight_failed', error_code: 'atomic_work_blocked', error: 'Original CI job failed', review_id: null, head_sha: null,
+    completed_at: new Date(NOW - 3000).toISOString(), resources_settled_at: new Date(NOW - 2000).toISOString(),
+    resource_ownership: { version: 1, roots: [], errors: [] }, artifact: { phase: 'executing', ci_blocker: {
+      action: 'list_failing_ci', repository: chain.repository, pull_number: 17, head_sha: obs.pull!.head,
+      failing: [{ type: 'check_run', name: 'unit', state: 'completed', conclusion: 'failure', check_run_id: 41, log_id: 42,
+        url: 'https://github.com/acme/repo/actions/runs/40/job/42' }] } } }
+  const calls = [original]
+  let enabled = true, permitted = true, author = chain.author
+  const observe = vi.fn(async () => ({ ...structuredClone(obs), checkedAt: Date.now() }))
+  const launch = vi.fn<ChainRuntimeOperations['launch']>(async (invocation, _exit, allowed) => {
+    expect(allowed()).toBe(true)
+    calls.push({ ...original, id: chainBasis(invocation.id).slice(0, 32), correlation_id: invocation.id,
+      completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() })
+    return true
+  })
+  const native = operations({ enabled: () => enabled, permitted: () => permitted, accounts: () => ({ author, reviewer: chain.reviewer }),
+    available: () => true, observe, launch,
+    readInvocations: async () => parseAgentLogStdout(JSON.stringify(calls), 'conflict CI hold retry regression'),
+    request: async (_chain, fresh) => ({ command: 'agent-interface', cwd: '/fixture',
+      argv: ['--model', reviewer.model, '--expected-head', fresh.pull!.head, '--merge-base'],
+      context: { head: fresh.pull!.head, reviewRevision: fresh.pull!.reviewRevision } }) })
+  let runtime = new BehaviorChainRuntime(journal, native)
+  await runtime.run()
+  const held = journal.read(chain.id)!
+  expect(held).toMatchObject({ held: original.error, ciHold: { invocationId: 'old-ci-failure' } })
+  const originalReceipt = structuredClone(held.invocations[0])
+  obs.pull!.conflict = true
+  for (const guard of ['unchanged', 'behind', 'changed head', 'queue', 'draft', 'closed seed', 'competing work',
+    'issue review', 'stale', 'future', 'paused', 'disabled', 'owner']) {
+    vi.setSystemTime(Date.now() + 120_001)
+    const fresh = { ...structuredClone(obs), checkedAt: Date.now() }
+    if (guard === 'unchanged' || guard === 'behind') fresh.pull!.conflict = false
+    if (guard === 'behind') fresh.pull!.behind = true
+    if (guard === 'changed head') {
+      fresh.pull!.head = 'd'.repeat(40); fresh.publication.head_sha = fresh.pull!.head
+      fresh.pull!.checksState = 'SUCCESS'; fresh.pull!.failing = []
+    }
+    if (guard === 'queue') fresh.pull!.queueEntry = 'existing-entry'
+    if (guard === 'draft') fresh.pull!.draft = true
+    if (guard === 'closed seed') fresh.issue.open = false
+    if (guard === 'competing work') fresh.existingPulls = ['https://github.com/acme/repo/pull/99']
+    if (guard === 'issue review') fresh.issueReviewers = [reviewer]
+    if (guard === 'stale') fresh.checkedAt -= 120_001
+    if (guard === 'future') fresh.checkedAt++
+    enabled = guard !== 'paused'; permitted = guard !== 'disabled'; author = guard === 'owner' ? 'another-author' : chain.author
+    observe.mockResolvedValueOnce(fresh)
+    await runtime.run()
+    expect(journal.read(chain.id), guard).toMatchObject({ held: original.error, ciHold: held.ciHold, resumedAfterSequence: retryBoundary })
+    expect(launch, guard).not.toHaveBeenCalled()
+  }
+  enabled = true; permitted = true; author = chain.author
+  vi.setSystemTime(Date.now() + 120_001)
+  await runtime.run()
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    expect(launch).toHaveBeenCalledTimes(attempt)
+    chain = journal.read(chain.id)!
+    const repair = chain.invocations.at(-1)!
+    expect(repair).toMatchObject({ behavior: 'repair-pr', state: 'started' })
+    expect(repair.basis).toBe(chainBasis(['repair', obs.pull!.head, obs.pull!.failing, true, false, false,
+      obs.pull!.unresolved, obs.pull!.reviewRevision, obs.issue.revision]))
+    await runtime.run()
+    chain = journal.read(chain.id)!
+    expect(chain).toMatchObject({ held: original.error, ciHold: { invocationId: repair.id }, resumedAfterSequence: retryBoundary })
+    expect(chain.invocations.at(-1)).toMatchObject({ state: 'settled', evidence: { action: 'not_started' } })
+    journal.rebuild()
+    runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
+    vi.setSystemTime(Date.now() + 120_001)
+    await runtime.run()
+  }
+  for (let tick = 0; tick < 4; tick++) { vi.setSystemTime(Date.now() + 120_001); await runtime.run() }
+  chain = journal.read(chain.id)!
+  expect(launch).toHaveBeenCalledTimes(3)
+  expect(chain.invocations).toHaveLength(4)
+  expect(chain.invocations[0]).toEqual(originalReceipt)
+  expect(chain.resumedAfterSequence).toBe(retryBoundary)
+  expect(journal.history(chain.id).map(row => JSON.parse(row.payload)).filter(event => event.ciRecovery)).toHaveLength(3)
+})
+
+it('releases a CI-only hold for a pending issue review when CI recovers on the conflicted head', async () => {
+  const { journal } = setup()
+  const obs = observation()
+  Object.assign(obs.publication, { state: 'open', merged: false, merge_sha: null })
+  Object.assign(obs.pull!, { state: 'open', merged: false, mergeSha: null, checksState: 'FAILURE', failing: ['unit:failure'] })
+  let chain = seed(journal)
+  chain = record(journal, chain, { type: 'chain.observed', observation: structuredClone(obs) })
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'old-ci-failure', behavior: 'repair-pr',
+    actor: chain.author, model: reviewer.model, slot: reviewer.slot, basis: 'before-conflict', admittedAt: NOW - 86_400_000,
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--expected-head', obs.pull!.head],
+      context: { head: obs.pull!.head, reviewRevision: obs.pull!.reviewRevision } } } })
+  const original: LogEntry = { ...completedReviewCall(chain.repository, 17, obs.pull!.head, chain.author), id: 'a'.repeat(32),
+    behavior: 'repair_pr', source: 'poise:behavior-chain', correlation_id: 'old-ci-failure', status: 'failed', action: 'not_started',
+    outcome: 'preflight_failed', error_code: 'atomic_work_blocked', error: 'Original CI job failed', review_id: null, head_sha: null,
+    completed_at: new Date(NOW - 3000).toISOString(), resources_settled_at: new Date(NOW - 2000).toISOString(),
+    resource_ownership: { version: 1, roots: [], errors: [] }, artifact: { phase: 'executing', ci_blocker: {
+      action: 'list_failing_ci', repository: chain.repository, pull_number: 17, head_sha: obs.pull!.head,
+      failing: [{ type: 'check_run', name: 'unit', state: 'completed', conclusion: 'failure', check_run_id: 41, log_id: 42,
+        url: 'https://github.com/acme/repo/actions/runs/40/job/42' }] } } }
+  const calls = [original]
+  const observe = vi.fn(async () => ({ ...structuredClone(obs), checkedAt: Date.now() }))
+  const launch = vi.fn(async () => true)
+  const native = operations({ enabled: () => true, available: () => true, permitted: () => true, observe, launch,
+    readInvocations: async () => parseAgentLogStdout(JSON.stringify(calls), 'conflicted green review regression'),
+    request: async () => ({ command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] }) })
+  const runtime = new BehaviorChainRuntime(journal, native)
+  await runtime.run()
+  expect(journal.read(chain.id)).toMatchObject({ held: original.error, ciHold: { invocationId: 'old-ci-failure' } })
+  // A seed edit requires a new issue review while CI recovers on the retained conflicted head.
+  obs.issue.revision = 'edited-seed'
+  obs.issueReviewers = [reviewer]
+  Object.assign(obs.pull!, { conflict: true, checksState: 'SUCCESS', failing: [], pending: false })
+  vi.setSystemTime(Date.now() + 120_001)
+  await runtime.run()
+  chain = journal.read(chain.id)!
+  expect(chain.held).toBeNull()
+  expect(chain.ciHold).toBeUndefined()
+  expect(chain.invocations.at(-1)).toMatchObject({ behavior: 'review-issue', state: 'started' })
+  expect(launch).toHaveBeenCalledTimes(1)
+})
 
 it('deduplicates merged holds and bounds repeated observation from durable state across runtime replacement', async () => {
   const { journal } = setup()

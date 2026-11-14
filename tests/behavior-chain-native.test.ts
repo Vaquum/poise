@@ -688,8 +688,9 @@ it.each(['verified', 'edited merge', 'missing proof', 'wrong ref', 'wrong head',
     ])
   })
 
-it.each(['PR head', 'queue', 'baseline'])('retains a Caller-produced %s CI hold through settlement, restart and verified recovery', async source => {
-  const queued = source !== 'PR head'
+it.each(['PR head rerun', 'PR head conflict', 'queue', 'baseline'])('retains a Caller-produced %s CI hold through settlement, restart and verified recovery', async source => {
+  const queued = source === 'queue' || source === 'baseline'
+  const conflictMode = source === 'PR head conflict'
   const failedHead = 'fcea77111bf5842239e81afb5e069b1fafa78fd6'
   const integration = '5a3763807ae617c534c5e3d28224039cf4ec4946', base = 'c'.repeat(40)
   const failedCheck = { type: 'check_run', name: 'Unit & integration (1)', state: 'completed', conclusion: 'failure',
@@ -710,7 +711,9 @@ it.each(['PR head', 'queue', 'baseline'])('retains a Caller-produced %s CI hold 
   const dependency = { head: failedHead, removal: 'removed', integration, base, remediation: 'https://github.com/example/repo/issues/99',
     failures: [{ check: integrationCheck.check_run_id, baselineCheck: baselineCheck.check_run_id,
       evidence: 'AssertionError: original fixture did not complete' }] }
-  let green = false, wire = '[]', released = '', reviewers: typeof reviewer[] = [], mode = 'failed'
+  let green = false, conflict = false, pending = false, ready = false, head = failedHead, publication: string | null = null
+  let wire = '[]', released = '', reviewers: typeof reviewer[] = [], integrationMode = 'failed'
+  const reviews: LogEntry[] = []
   mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
     if (command === 'agent-interface') {
       expect(argv[0]).toBe('--logs')
@@ -719,15 +722,20 @@ it.each(['PR head', 'queue', 'baseline'])('retains a Caller-produced %s CI hold 
     const evidence: Record<string, unknown> = {
       '--chain-seed': { repository: chain.repository, issue_number: 7, actor: 'author', branch: chain.branch,
         issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
-        publication: { existing_pulls: [], pull_number: 21, head_sha: failedHead, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
-      '--pull-action-state': { pull_number: 21, state: 'open', head_sha: failedHead, review_context: 'b'.repeat(64),
-        merged: false, queue_entry_id: null, queue_removals: queued ? queue.queue_removals : [], my_reviews: [] },
-      '--pr-readiness': { head_sha: failedHead, draft: false, checks_state: green || queued ? 'SUCCESS' : 'FAILURE',
-        reviewer_approved_current_head: false, unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0,
-        green: false, blockers: ['reviewer_not_approved_current_head', ...(green ? [] : ['checks_failed'])] },
-      '--list-failing-ci': green ? { ...ci, failing: [], checks: [{ ...failedCheck, conclusion: 'success',
+        publication: { existing_pulls: [], pull_number: 21, head_sha: head, head_invocation: publication, state: 'open', merged: false, merge_sha: null } },
+      '--pull-action-state': { pull_number: 21, state: 'open', head_sha: head, review_context: 'b'.repeat(64),
+        merged: false, queue_entry_id: null, queue_removals: queued ? queue.queue_removals : [], my_reviews: reviews.map(review => ({ id: review.review_id,
+          commit_id: head, state: review.action === 'approved' ? 'APPROVED' : 'COMMENTED', invocation_id: review.id,
+          review_response: review.artifact!.review_response, submitted_at: review.completed_at })) },
+      '--pr-readiness': { head_sha: head, draft: false, checks_state: pending ? 'PENDING' : green || queued ? 'SUCCESS' : 'FAILURE',
+        reviewer_approved_current_head: reviews.some(review => review.action === 'approved'), unresolved_live_conversation_count: 0,
+        unresolved_outdated_conversation_count: 0, green: ready, blockers: ['reviewer_not_approved_current_head', ...(green ? [] : ['checks_failed'])] },
+      '--list-failing-ci': pending ? { ...ci, head_sha: head, mergeable: true,
+        failing: [{ ...failedCheck, state: 'in_progress', conclusion: null }] }
+        : green ? { ...ci, head_sha: head, failing: [], checks: [{ ...failedCheck, conclusion: 'success',
         check_run_id: 132038286725, log_id: 132038286725,
-        url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286725' }] } : ci,
+        url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286725' }] }
+          : { ...ci, mergeable: conflict ? false : true, mergeable_state: conflict ? 'dirty' : 'clean' },
     }
     if (argv[0] === '--list-failing-ci' && argv.includes('--ref')) {
       if (argv[argv.indexOf('--ref') + 1] === 'base') {
@@ -735,22 +743,22 @@ it.each(['PR head', 'queue', 'baseline'])('retains a Caller-produced %s CI hold 
       }
       const success = { ...integrationCheck, check_run_id: integrationCheck.check_run_id + 10, conclusion: 'success' }
       const packet = { ...integrationPacket,
-        runs: [{ ...integrationPacket.runs[0], run_attempt: green || mode !== 'failed' ? 2 : 1,
+        runs: [{ ...integrationPacket.runs[0], run_attempt: green || integrationMode !== 'failed' ? 2 : 1,
           conclusion: green ? 'success' : 'failure' }],
         checks: green && source !== 'baseline' ? [success] : integrationPacket.checks }
-      if (mode === 'stale success') packet.checks = [success, { ...integrationCheck, check_run_id: success.check_run_id + 1 }]
-      if (mode === 'other workflow') {
+      if (integrationMode === 'stale success') packet.checks = [success, { ...integrationCheck, check_run_id: success.check_run_id + 1 }]
+      if (integrationMode === 'other workflow') {
         packet.runs.push({ ...packet.runs[0], id: 43469739428, workflow_id: 2 })
         packet.checks = [integrationCheck, { ...success, run_id: 43469739428 }]
       }
-      if (mode === 'same attempt') packet.runs[0].run_attempt = 1
-      if (mode === 'pending') packet.checks = [{ ...success, state: 'in_progress' }]
-      if (mode === 'newer pending run' || mode === 'newer failed run') {
+      if (integrationMode === 'same attempt') packet.runs[0].run_attempt = 1
+      if (integrationMode === 'pending') packet.checks = [{ ...success, state: 'in_progress' }]
+      if (integrationMode === 'newer pending run' || integrationMode === 'newer failed run') {
         packet.runs.push({ ...packet.runs[0], id: 43469739428,
-          status: mode === 'newer pending run' ? 'in_progress' : 'completed', conclusion: 'failure' })
+          status: integrationMode === 'newer pending run' ? 'in_progress' : 'completed', conclusion: 'failure' })
       }
-      if (mode === 'unknown result') packet.runs[0].status = ''
-      if (mode === 'wrong integration') packet.ref = base
+      if (integrationMode === 'unknown result') packet.runs[0].status = ''
+      if (integrationMode === 'wrong integration') packet.ref = base
       return { stdout: JSON.stringify(packet) }
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
@@ -759,7 +767,7 @@ it.each(['PR head', 'queue', 'baseline'])('retains a Caller-produced %s CI hold 
   const native = actionOperations({ roster: async () => ({ issueReviewers: [], prReviewers: reviewers,
     implementer: reviewer, repairer: reviewer, approver: reviewer }) })
   const launch = vi.fn<ChainRuntimeOperations['launch']>(async invocation => {
-    if (invocation.behavior === 'repair-pr') {
+    if (invocation.behavior === 'repair-pr' && wire === '[]') {
       const receipts = JSON.parse(execFileSync('python3', ['tests/fixtures/ci-only-repair.py'], {
         input: JSON.stringify({ argv: invocation.request.argv, ci, ...(queued ? { queue, integration: integrationPacket, baseline,
           ...(source === 'baseline' ? { dependency } : {}) } : {}) }), encoding: 'utf8', timeout: 10_000,
@@ -832,14 +840,15 @@ it.each(['PR head', 'queue', 'baseline'])('retains a Caller-produced %s CI hold 
       await reject() // Green PR-head CI must not release the red integration.
       if (source === 'queue') {
         green = true
-        for (const invalid of ['stale success', 'other workflow', 'same attempt', 'pending', 'newer pending run', 'newer failed run', 'unknown result']) { mode = invalid; await reject() }
-        mode = 'wrong integration'
+        for (const invalid of ['stale success', 'other workflow', 'same attempt', 'pending', 'newer pending run', 'newer failed run', 'unknown result']) { integrationMode = invalid; await reject() }
+        integrationMode = 'wrong integration'
         vi.setSystemTime(Date.now() + 120_000)
         await expect(runtime.run()).rejects.toThrow('original queue integration')
       }
-      mode = 'failed'
+      integrationMode = 'failed'
     }
-    green = true
+    green = !conflictMode
+    conflict = conflictMode
     reviewers = [reviewer]
     vi.setSystemTime(Math.max(Date.now(), journal.reconciliationAt(journal.read(chain.id)!)!))
     await runtime.run()
@@ -847,21 +856,69 @@ it.each(['PR head', 'queue', 'baseline'])('retains a Caller-produced %s CI hold 
     expect(recovered.held).toBeNull()
     expect(recovered.ciHold).toBeUndefined()
     expect(recovered.invocations.slice(0, settled.invocations.length)).toEqual(settled.invocations)
-    expect(recovered.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
+    expect(recovered.invocations.at(-1)).toMatchObject({ behavior: conflict ? 'repair-pr' : 'review-pr', state: 'started' })
     expect(launch).toHaveBeenCalledTimes(2)
     expect(journal.history(chain.id).map(row => JSON.parse(row.payload))).toContainEqual({ type: 'chain.resumed', ciRecovery: hold })
+    if (!queued) expect(recovered.resumedAfterSequence).toBe(settled.resumedAfterSequence)
     if (queued) {
       const current: ChainObservation = { ...recovered.observation as ChainObservation, prReviewers: [] }
-      const ready = { ...recovered, invocations: settled.invocations }
-      const approval = decideBehaviorChain(ready, current, Date.now())
+      const readyChain = { ...recovered, invocations: settled.invocations }
+      const approval = decideBehaviorChain(readyChain, current, Date.now())
       expect(approval).toMatchObject({ kind: 'invoke', behavior: 'approve-pr', reason: expect.stringContaining('queue-rejection') })
       current.pull = { ...current.pull!, reviewContext: 'd'.repeat(64) }
-      const changedBase = decideBehaviorChain(ready, current, Date.now())
+      const changedBase = decideBehaviorChain(readyChain, current, Date.now())
       expect(changedBase).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
       expect(changedBase.kind === 'invoke' && changedBase.basis).not.toBe(approval.kind === 'invoke' && approval.basis)
       current.prReviewers = [reviewer]
-      expect(decideBehaviorChain(ready, current, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+      expect(decideBehaviorChain(readyChain, current, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+      return
     }
+    if (!conflictMode) return
+    const repair = recovered.invocations.at(-1)!
+    expect(repair.request.argv).toEqual(expect.arrayContaining(['--pull-number', '21', '--expected-head', failedHead, '--merge-base']))
+    expect(recovered.observation).toMatchObject({ pull: { head: failedHead, conflict: true, failing: [expect.stringContaining('failure')] } })
+    head = 'e'.repeat(40); publication = 'e'.repeat(32); conflict = false; pending = true
+    vi.setSystemTime(Date.now() + 2000)
+    const published: LogEntry = { ...call, id: publication, correlation_id: repair.id, status: 'completed', action: 'published',
+      outcome: 'published', head_sha: head, error: '', error_code: null, artifact: { phase: 'published' },
+      completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() }
+    const calls: LogEntry[] = [call, published]
+    wire = JSON.stringify(calls)
+    await runtime.run()
+    let current = journal.read(chain.id)!
+    expect(current.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
+    expect(current.invocations.at(-1)!.request.argv).toEqual(expect.arrayContaining(['--expected-head', head]))
+    expect(launch).toHaveBeenCalledTimes(3)
+    vi.setSystemTime(Date.now() + 2000)
+    const review = { ...completedReviewCall(chain.repository, 21, head, chain.reviewer), source: 'poise:behavior-chain',
+      correlation_id: current.invocations.at(-1)!.id, resources_settled_at: new Date().toISOString(),
+      resource_ownership: { version: 1 as const, roots: [], errors: [] } }
+    reviews.push(review); calls.push(review); wire = JSON.stringify(calls)
+    await runtime.run()
+    expect(journal.read(chain.id)!.waiting).toBe('exact-head CI is still running')
+    expect(launch).toHaveBeenCalledTimes(3)
+    pending = false; green = true
+    await runtime.run()
+    current = journal.read(chain.id)!
+    expect(current.invocations.at(-1)).toMatchObject({ behavior: 'approve-pr', state: 'started' })
+    expect(launch).toHaveBeenCalledTimes(4)
+    vi.setSystemTime(Date.now() + 2000)
+    const approval: LogEntry = { ...completedReviewCall(chain.repository, 21, head, chain.reviewer), id: 'f'.repeat(32),
+      source: 'poise:behavior-chain', behavior: 'pr_approve', action: 'approved', outcome: 'approved', review_id: 92,
+      correlation_id: current.invocations.at(-1)!.id, resources_settled_at: new Date().toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] } }
+    approval.artifact!.review_response = { ...(approval.artifact!.review_response as Record<string, unknown>), invocation_id: approval.id }
+    reviews.push(approval); calls.push(approval); wire = JSON.stringify(calls)
+    await runtime.run()
+    current = journal.read(chain.id)!
+    expect(current.waiting).toBe('native repository readiness gates are not satisfied')
+    expect(current.invocations[0]).toEqual(settled.invocations[0])
+    expect(launch).toHaveBeenCalledTimes(4)
+    ready = true
+    const fresh = await operations.observe(current)
+    expect(decideBehaviorChain(current, fresh, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
+    fresh.pull!.queueEntry = 'new-head-queue'
+    expect(decideBehaviorChain(current, fresh, Date.now())).toEqual({ kind: 'wait', reason: 'native merge queue owns entry new-head-queue' })
   } finally { db.close() }
 })
 
@@ -963,10 +1020,11 @@ it('seeds roster draws and resolutions by the chain seed issue', async () => {
 })
 
 it('reads the seed issue, comments and publication inspection in one native process', async () => {
+  const remediation = { kind: 'empty_integration', verified: true, base: 'b'.repeat(40), duplicate: { number: 21, head: HEAD } }
   mocks.runFile.mockClear()
   mocks.runFile.mockImplementation(async () => ({ stdout: JSON.stringify({ repository: 'example/repo', issue_number: 7,
     actor: 'author', branch: 'poise/issue-7', issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
-    publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }) }))
+    publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, remediation }) }))
   const operations = nativeChainOperations({ login: 'example' } as Organization, {
     roster: async () => ({ issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
     resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
@@ -975,9 +1033,18 @@ it('reads the seed issue, comments and publication inspection in one native proc
   })
   const observation = await operations.observe(chain)
   expect(observation.issue.commentIds).toEqual([])
+  expect(observation.remediation).toEqual(remediation)
   const native = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')
   expect(native).toHaveLength(1)
   expect(native[0][1]).toEqual(['--chain-seed', '#7', '--branch', 'poise/issue-7', '--token-user', 'author'])
+  const request = await operations.request(chain, { ...observation, pull: { number: 21, head: HEAD, headSince: Date.now(),
+    state: 'open', draft: false, merged: false, mergeSha: null, queueEntry: 'queued', queueRemoval: null, changesRequested: false,
+    unresolved: 0, approved: true, ready: true, reviewIds: [], reviewRevision: '', reviewReceipts: [], greyRuns: [],
+    pending: false, failing: [], conflict: false, behind: false } },
+  { kind: 'invoke', behavior: 'retire-pr', basis: chainBasis(['retire', remediation]), actor: 'author', reviewer: null, reason: 'covered' }, 'retirement')
+  if (!request) throw new Error('retirement must prepare a native close request')
+  expect(request.argv).toEqual(['--issue-work', '7', '--mode', 'retire', '--branch', chain.branch, '--pull-number', '21',
+    '--coverage-json', JSON.stringify(remediation), '--expected-head', HEAD, '--token-user', 'author'])
 })
 
 it('revalidates the retained original test evidence in the bounded seed observation, independently of reporting', async () => {

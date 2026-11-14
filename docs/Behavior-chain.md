@@ -215,6 +215,21 @@ Supersession retains the covering merge separately, keeps the duplicate's
 and GitHub evidence links available. Rebuild and restart retain this terminal
 outcome and the original invocation ownership.
 
+Poise-generated pre-PR failure remediations (`implement-issue`,
+`atomic_work_blocked`, with the original repair-report marker) use the same native
+retirement path even while their seed remains open or their PR is queued. Their
+coverage policy is separate: Git must integrate the whole pinned candidate into
+the current default-branch base without conflicts and produce exactly the base
+tree. A distinct merged PR on that base's first-parent history must introduce
+that coverage; a later unrelated merge is not credited. The bounded read examines
+up to 100 base commits and retains the candidate, base, merge base, integration
+tree, and covering merge with its first parent and tree. Retirement revalidates
+this proof and checks both the head and current integration base before closing.
+Changed heads or bases invalidate the decision. Independent changes, conflicts
+or incomplete coverage evidence continue through ordinary gates. Supersession
+keeps the source issue's hold and outstanding work intact; it does not resume or
+complete that source chain.
+
 The existing scheduler selects a normal-work page before a separate due
 reconciliation page under its existing pass budget. Quiescent held or merged
 chains keep their original ownership, but cannot
@@ -285,6 +300,16 @@ existing resume event records `ciRecovery`. The normal decision path then
 rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
+When a fresh conflict on the retained failed head prevents a clean base update,
+the same settled receipt and resource proof can instead release the hold for
+the existing `repair-pr --merge-base` path. The ordinary repair, ownership,
+closure and queue guards must permit that repair; an unchanged, merely behind
+or unrelated changed head does not qualify. Automatic release preserves
+`resumedAfterSequence`, so another CI-only failure and hold cannot replenish
+the three-attempt budget on the same repair basis, including after restart.
+The original failed CI receipt remains unchanged and unresolved by admission;
+the published repair still requires fresh head checks, reviews, approval and
+the normal queue gates.
 Work impact and attention describe this automatic CI recheck instead of asking
 for Resume; attention retains the scheduled `reconciliation.nextObservationAt`.
 Unsettled original receipts and resources still require reconciliation first.
@@ -742,7 +767,7 @@ does not disturb native cleanup holds. Explicit empty durably overrides a legacy
 container environment after Poise restarts. Local mode keeps environment-based
 configuration. Unset or empty opts out.
 
-Native repair and PR review reporting requires at least three settled original Caller
+Native repair and PR review exhaustion reporting requires at least three settled original Caller
 receipts for the same phase, current head, review basis and slot after the last
 Resume, each with positive resource release, `action=not_started`, retained
 `outcome=preflight_failed` and no
@@ -805,6 +830,18 @@ diagnostic facts. Caller's blocked result does not independently verify the work
 health-check, test-relay or other runner explanation. Its next action is to inspect
 the original Call, remedy the blocker and explicitly Resume for a fresh implementation.
 
+For `repair-pr`, `atomic_work_blocked` also qualifies one settled original Call
+under its matching active automatic hold after the last Resume. The same
+no-publication and positive resource-release proof is required, with fresh
+evidence that the open PR still has the admitted head and repair basis. Operator
+holds, unknown effects and structured CI-only holds with their existing recovery
+path do not qualify. The report names the source issue, PR, original Call and
+verified stage, and distinguishes the settled no-publication fact from the
+bounded, redacted **worker-reported** blocker. It preserves the source hold and
+repair ownership without admitting work or relaunching repair. Its identity is
+`atomic_work_blocked` + source chain + PR, separate from the pre-PR implementation
+identity; even a closed historical implementation report cannot cover this repair.
+
 `implementation_publication_uncertain` qualifies an original `implement-issue`
 invocation that remains uncertain after recovery, including an unheld source.
 Its failed terminal Call is retained in `evidence.callId` while `invocation.callId`
@@ -861,7 +898,7 @@ Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the
 stage, stable cause, target, hold time/age, head/basis, safe invocation and Caller
 receipt identities, and next action. Apart from the explicitly worker-reported
-implementation blocker, it excludes raw errors, omitted finding IDs, worker paths
+implementation or terminal repair blocker, it excludes raw errors, omitted finding IDs, worker paths
 and provider output. An intent in the existing durable metadata store
 links the original failure to the report issue. Repair identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.

@@ -368,11 +368,14 @@ children with the hooks while `relay` exists
 ([Agents' test suites](Operating.md#agents-test-suites)). The settings travel this
 way because only a new container would take an environment variable.
 
-The relay retains the last 1,024 retired run IDs and their workspace owners in
-memory, outside active admission slots. After the signed-key and current-access
+The relay retains the last 1,024 retired run IDs, their workspace owners and, for
+jobs, SHA-256 runner-token digests in memory, outside active admission slots.
+After the signed-key and current-access
 checks, the owner's exact `DELETE /runs/:id` returns 204 even while box termination
-is pending. Unknown, evicted and foreign IDs and other requests retain their
-failure warnings. Suite results and box-termination diagnostics remain independent.
+is pending. An exact `POST /runs/:id/output` with a constant-time digest match
+returns 410 without processing output or logging a redundant request warning.
+Unknown, evicted and foreign IDs, invalid tokens and other requests retain their
+failure warnings. Run-stop, missing-result and box-termination diagnostics remain independent.
 
 The relay's run admission advertises `dependencyCache: true`. The authenticated
 workspace can send `POST /runs/:id/dependency?sha256=…` between checkout parts
@@ -1531,7 +1534,9 @@ declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 The same reconciliation can release a CI-only hold after a proven clean base
-update, retaining the original Call, resource-release proof and remaining gates
+update, or admit the existing scoped repair when a fresh conflict on the retained
+failed head blocks that update, retaining the original Call, resource-release
+proof, repair retry bound and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 Queue-only CI holds retain their original removal, integration, workflow and
 failed attempt in the existing Caller blocker. Recovery requires later matching
@@ -1743,7 +1748,8 @@ configured-account issue publisher and datastore intake. An explicit per-reposit
 opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review timeout exhaustion, including retained legacy review/approval stops
 from their existing reconciliation independently of model readiness or v2 mode,
-verified automatic implementation holds before a PR,
+verified automatic implementation holds before a PR and terminal repair holds
+before publication,
 terminal uncertain implementation publication,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
@@ -1756,6 +1762,9 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Terminal repair reports require the matching automatic hold, settled original Call,
+positive release and unchanged open PR head and repair basis, without possible
+publication effects. They preserve repair ownership and exclude CI-only recovery holds.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,

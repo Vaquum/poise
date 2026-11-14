@@ -899,8 +899,10 @@ why there is no test result, that this says nothing about its code, and to skip
 local tests for this work: not to retry or run parts of it, but to push and let CI
 run the tests. It exits with 125, or 124 at the time limit, and never falls back to
 running in the workspace. Each that the gateway can see also reaches its diagnostics
-as `test_relay.run.failed`, naming the workspace, the command and the reason; every
-run is logged with its command, exit code and duration as `test_relay.run.finished`.
+as `test_relay.run.failed`, naming the relay run ID, workspace, a bounded executable
+basename or recognized npm suite, and the reason. Relay lifecycle logs exclude
+argument values and shell/interpreter command bodies. Every run is logged with
+that safe command label, exit code and duration as `test_relay.run.finished`.
 The runner prints the captured-candidate digest and suite, then the existing run ID
 at each admission, so observed failures can name the attempt that produced them.
 An explicit gateway-restart failure is the one exception: the active command
