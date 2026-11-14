@@ -70,7 +70,7 @@ def prepared(checkout):
 
 def captured(checkout, directory):
     (checkout / "source.cjs").write_text("module.exports=1;\n")
-    (checkout / "deleted.cjs").unlink()
+    (checkout / "deleted.cjs").unlink(missing_ok=True)
     (checkout / "tests").mkdir(exist_ok=True)
     (checkout / "tests/candidate.test.cjs").write_text(TEST)
     (checkout / ".env").write_text("PRIVATE_CREDENTIAL=never retain\n")
@@ -253,3 +253,26 @@ def test_inspection_returns_unavailable_without_blocking_on_fifo_evidence(retain
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
+
+
+def test_inspection_returns_unavailable_on_deeply_nested_tampered_evidence(retained, monkeypatch):
+    call, work, archive, spec, candidate = retained
+    checkout = work / "repo"
+    (checkout / "large.cjs").write_text("module.exports='" + "x" * 100_000 + "';\n")
+    archive, spec, candidate = captured(checkout, work)
+    assert failed_source.capture(api.DB, archive, spec, candidate, RUN, 1)["status"] == "available"
+    with api.db() as conn:
+        conn.execute("update calls set status='failed', error_code='atomic_work_blocked',action='not_started',outcome='preflight_failed',resources_settled_at=? where id=?",
+                     (failed_source.time(), call))
+    original, = api.logs_selected({"latest": [], "ids": [call]})
+    linked_reader(monkeypatch, original)
+    path = Path(os.environ["POISE_DB"]).parent / "incident-recovery" / f"failed-source-{call}-{RUN}.json"
+    size = path.stat().st_size
+    depth = size // 2
+    assert depth > 30000, f"retained payload ({size} bytes) is too small to nest beyond the recursion limit"
+    payload = b"[" * depth + b"]" * depth + b" " * (size - 2 * depth)
+    assert len(payload) == size
+    path.write_bytes(payload)
+    with pytest.raises(RecursionError):
+        json.loads(payload)
+    assert failed_source.inspect(api.DB, call, candidate, RUN)["status"] == "unavailable"

@@ -258,7 +258,7 @@ def inspect(database: Path, call_id: str, candidate: str, run: str) -> dict:
                 or any(evidence.get(key) != value for key, value in {"call": call_id, "candidate": candidate, "run": run, "base": metadata.get("base")}.items()):
             return unavailable
         return {**metadata, "path": str(_poise_database().parent / "incident-recovery" / name)}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError, sqlite3.Error):
         return unavailable
     finally:
         if fd is not None:
