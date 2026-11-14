@@ -270,6 +270,7 @@ export class BehaviorChainRuntime {
   private running = false
   private cursor = ''
   private reconciliationCursor = ''
+  private reconciliationFirst = false
   private authenticationCursor = ''
 
   constructor(readonly journal: BehaviorChainJournal, private readonly operations: ChainRuntimeOperations) {}
@@ -440,7 +441,10 @@ export class BehaviorChainRuntime {
         return sequence === null ? [] : [{ chain, sequence }]
       }).sort((a, b) => a.sequence - b.sequence)
       const offered = new Set<string>()
-      for (const deferred of [false, true]) {
+      const visited = new Set<string>()
+      const first = this.reconciliationFirst
+      this.reconciliationFirst = !first
+      for (const deferred of [first, !first]) {
         if (Date.now() - began > 45_000) break
         const cursorKey = deferred ? 'reconciliationCursor' : 'cursor'
         let page = this.journal.reconcilable(this[cursorKey], Date.now(), deferred)
@@ -449,13 +453,19 @@ export class BehaviorChainRuntime {
           page = this.journal.reconcilable('', Date.now(), deferred)
         }
         if (!page.length) { this[cursorKey] = ''; continue }
-        const snapshot = await this.readInvocations(page.filter(chain => !conflicted.has(chain.id)))
+        const snapshot = await this.readInvocations(page.filter(chain => !conflicted.has(chain.id) && !visited.has(chain.id)))
         const work: Array<{ chain: BehaviorChain, priority: number | null, cursor: boolean }> = page.map(chain => ({ chain, priority: null, cursor: true }))
         for (let index = 0; index < work.length; index++) {
           let { chain } = work[index]
           if (Date.now() - began > 45_000) break
           if (work[index].cursor) this[cursorKey] = chain.id
           if (conflicted.has(chain.id)) continue
+          // A due recovery can enter the later active page before Caller has
+          // registered its launch. Explicit capacity retries remain eligible.
+          if (work[index].cursor) {
+            if (visited.has(chain.id)) continue
+            visited.add(chain.id)
+          }
           if (work[index].priority === null && offered.has(chain.id)) continue
           if (work[index].priority !== null) {
             if (!this.operations.available() || !this.journal.modelCapacityAvailable(this.operations.capacity())) continue

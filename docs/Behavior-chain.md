@@ -246,8 +246,14 @@ or incomplete coverage evidence continue through ordinary gates. Supersession
 keeps the source issue's hold and outstanding work intact; it does not resume or
 complete that source chain.
 
-The existing scheduler selects a normal-work page before a separate due
-reconciliation page under its existing pass budget. Quiescent held or merged
+The existing scheduler alternates which of the normal-work and due
+reconciliation pages gets first use of the shared 45-second sweep budget,
+advancing that choice even when the budget is exhausted. Each populated pass
+gets first use within two sweeps, including after runtime replacement. The
+budget is checked between work units; an admitted observation still reaches
+its recovery or report evaluation. A chain is not visited again by the later
+page in that sweep; explicit capacity-waiter retries remain eligible.
+Quiescent held or merged
 chains keep their original ownership, but cannot
 consume the normal-work page. Native model/resource receipts are still read
 while an original model lacks resource-release proof, including after a merge;

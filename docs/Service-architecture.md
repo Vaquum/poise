@@ -1579,8 +1579,8 @@ and its native close receipt; summaries expose that evidence separately from
 `mergeSha`. Original writes and native resources must settle first. Unclear or
 independent work remains open with its decision visible. The existing Caller
 action performs head-checked retirement; a lost close response stays uncertain.
-The normal-work page precedes due quiescent
-reconciliation; observation failures remain reported after unrelated progress.
+The normal-work and due quiescent reconciliation pages alternate first use of
+the shared sweep budget; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
 operation or authority; a deliberate wait keeps GitHub facets unknown without
