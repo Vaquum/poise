@@ -398,7 +398,8 @@ def test_original_publication_boundary_reconciles_without_repeating_work(databas
     client.graphql = AsyncMock(return_value={"repository": {
         "ref": {"target": {"oid": parent, "message": "fix: original parent"}} if repair else None,
         "defaultBranchRef": {"target": {"oid": parent}},
-        "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}})
+        "issue": {"blockedBy": {"nodes": [], "totalCount": 0, "pageInfo": {"hasNextPage": False}},
+                  "closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}})
     committed, pushes = False, []
 
     def git(command, *_secrets):

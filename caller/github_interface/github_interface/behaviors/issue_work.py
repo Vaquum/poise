@@ -19,6 +19,7 @@ from github_interface.atoms.process_diagnostic import GitProcessError, STDERR_BY
 from github_interface.atoms.pulls import get_pull
 from github_interface.atoms.review_diff import _env, _git
 from github_interface.atoms.review_identity import work_publication
+from github_interface.behaviors import read_issue
 from github_interface.client import GitHubClient
 from github_interface.context import repository, token_user
 
@@ -432,6 +433,37 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
         if replies and pull is not None:
             await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=False)
         return {**result, "outcome": "validated", "has_changes": bool(dirty)}
+    if pull is None:
+        # First PR: the admission decision can go stale while the worker runs.
+        # Re-verify live same-repository prerequisites on the candidate base
+        # before any write. Delivery uses starting_head, not current main.
+        base = starting_head.lower()
+        prereq = result.get("prerequisites") if isinstance(result.get("prerequisites"), dict) else None
+        deps = prereq.get("prerequisites") if isinstance(prereq, dict) and isinstance(prereq.get("prerequisites"), list) else None
+        if prereq is None or str(prereq.get("repo") or "").lower() != target.lower() \
+                or prereq.get("number") != issue_number or prereq.get("found") is not True \
+                or prereq.get("complete") is not True or deps is None:
+            reason = f"GitHub blocked-by evidence is missing or incomplete for {target}#{issue_number}"
+            return {**result, "outcome": "prerequisite_wait", "prerequisite_wait": {
+                "base": base, "prerequisites": prereq if isinstance(prereq, dict) else None,
+                "deliveries": [], "reason": reason}}
+        deliveries: list = []
+        for dep in deps:
+            if not isinstance(dep, dict) or str(dep.get("repo") or "").lower() != target.lower() \
+                    or type(dep.get("number")) is not int or dep["number"] < 1:
+                reason = f"GitHub blocked-by evidence is missing or incomplete for {target}#{issue_number}"
+                return {**result, "outcome": "prerequisite_wait", "prerequisite_wait": {
+                    "base": base, "prerequisites": prereq, "deliveries": deliveries, "reason": reason}}
+            delivery = await read_issue.run(client, {"repository": target, "issue": f"#{dep['number']}", "delivery_base": base})
+            deliveries.append(delivery)
+            if str(delivery.get("repository") or "").lower() != target.lower() \
+                    or delivery.get("issue_number") != dep["number"] or delivery.get("base_sha") != base \
+                    or delivery.get("state") != "closed" or delivery.get("verified") is not True \
+                    or not isinstance(delivery.get("merge_sha"), str) or not re.fullmatch(r"[0-9a-f]{40}", delivery["merge_sha"]) \
+                    or type(delivery.get("pull_number")) is not int or delivery["pull_number"] < 1:
+                reason = f"Waiting for prerequisite {target}#{dep['number']}: {delivery.get('reason') or 'delivery is not verified on the implementation base'}"
+                return {**result, "outcome": "prerequisite_wait", "prerequisite_wait": {
+                    "base": base, "prerequisites": prereq, "deliveries": deliveries, "reason": reason}}
     if not dirty:
         if replies and pull is not None:
             work_publication(current_head)

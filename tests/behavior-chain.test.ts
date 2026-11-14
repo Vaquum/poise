@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
-import { BehaviorChainRuntime, ReviewScopeIndexingError, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { BehaviorChainRuntime, ReviewScopeIndexingError, implementationPrerequisiteWait, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { behaviorChainAttention, behaviorChainSummary, CHAIN_ATTENTION_DELAY_MS, chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
@@ -1302,5 +1302,79 @@ describe('native admission and recovery', () => {
     record(restarted, restarted.read(chain.id)!, { type: 'invocation.settled', invocationId: 'work-7', callId: 'native',
       outcome: 'commented', evidence: { status: 'completed', resources_settled_at: new Date(NOW).toISOString() } })
     expect(restarted.admitInvocation(restarted.read(fourth.id)!, 'admit-10', invocation('work-10', 'review-issue', 'revision'), freshSlots.laneCapacity('behavior'))).not.toBeNull()
+  })
+})
+
+describe('pre-publication prerequisite deferral', () => {
+  const BASE = 'a'.repeat(40)
+  function prerequisiteCall(): LogEntry {
+    return { id: 'c'.repeat(32), pr_id: '7', repo: 'Example/Repo', actor: 'author', model: 'fixture-model',
+      behavior: 'implement_issue', session_id: null, prompt: '', started_at: new Date(NOW - 2000).toISOString(),
+      completed_at: new Date(NOW).toISOString(), time_elapsed: '2s', status: 'completed', action: 'not_started',
+      outcome: 'prerequisite_wait', head_sha: null, expected_head: null, source: 'poise:behavior-chain',
+      correlation_id: 'work-1', response: null, error: '', review_id: null, receipts: null,
+      resources_settled_at: new Date(NOW).toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [], process_pending: false },
+      artifact: { phase: 'prerequisite_wait', plan_sha: 'b'.repeat(64),
+        prepared: { repository: 'Example/Repo', issue_number: 7, branch: 'poise/issue-7', actor: 'author',
+          pull_number: null, head_sha: null, checkout_head: BASE },
+        prerequisite_wait: { base: BASE,
+          prerequisites: { repo: 'Example/Repo', number: 7, found: true, complete: true,
+            prerequisites: [{ repo: 'example/repo', number: 6 }] },
+          deliveries: [{ repository: 'example/repo', issue_number: 6, base_sha: BASE }],
+          reason: 'Waiting for prerequisite example/repo#6: prerequisite is open' } } } as unknown as LogEntry
+  }
+  function deferredChain(): BehaviorChain {
+    const { journal, chain } = setup()
+    const obs = observation()
+    let current = reviewed(journal, chain, obs)
+    const basis = chainBasis(['issue', obs.issue.revision])
+    current = finish(journal, current, 'work-1', 'implement-issue', basis,
+      { status: 'deferred', action: 'not_started', outcome: 'prerequisite_wait', completedAt: NOW })
+    return journal.read(current.id)!
+  }
+  it('accepts only the typed no-write proof, never worker prose or attempted writes', () => {
+    const { chain } = setup()
+    const invocation = { id: 'work-1', behavior: 'implement-issue', model: 'fixture-model' } as ChainInvocation
+    expect(implementationPrerequisiteWait(chain, invocation, prerequisiteCall())).toMatchObject({ base: BASE })
+    // Worker prose alone cannot establish a typed disposition.
+    const prose = prerequisiteCall()
+    prose.status = 'failed'
+    ;(prose as unknown as Record<string, unknown>).error_code = 'atomic_work_blocked'
+    prose.error = 'atomic behavior blocked: prerequisite example/repo#6 is absent from the base'
+    ;(prose.artifact as Record<string, unknown>).phase = 'executing'
+    delete (prose.artifact as Record<string, unknown>).prerequisite_wait
+    expect(implementationPrerequisiteWait(chain, invocation, prose)).toBeNull()
+    // An attempted publication is not a no-write deferral.
+    for (const tamper of [
+      (call: LogEntry) => { (call.artifact as Record<string, unknown>).publication_head = 'd'.repeat(40) },
+      (call: LogEntry) => { (call.artifact as Record<string, unknown>).replies_started = false },
+      (call: LogEntry) => { (call.artifact as Record<string, unknown>).result = { outcome: 'published' } },
+      (call: LogEntry) => { call.head_sha = 'd'.repeat(40) },
+      (call: LogEntry) => { ((call.artifact as Record<string, unknown>).prerequisite_wait as Record<string, unknown>).base = 'e'.repeat(40) },
+    ]) {
+      const call = prerequisiteCall()
+      tamper(call)
+      expect(implementationPrerequisiteWait(chain, invocation, call)).toBeNull()
+    }
+    // Logging sees a routine completion without error evidence.
+    const call = prerequisiteCall()
+    expect(call.status).toBe('completed')
+    expect(call.error || (call as unknown as Record<string, unknown>).error_code || (call as unknown as Record<string, unknown>).diagnostic).toBeFalsy()
+  })
+  it('waits visibly without another worker, then admits exactly one fresh implementation after delivery without Resume or backoff', () => {
+    const chain = deferredChain()
+    expect(chain.held).toBeNull()
+    expect(chain.invocations).toHaveLength(2)
+    const waiting = observation()
+    waiting.prerequisites = { wait: 'Waiting for prerequisite Example/Repo#6: prerequisite is open', base: waiting.prerequisites!.base, evidence: [] }
+    expect(decideBehaviorChain(chain, waiting, NOW)).toEqual({ kind: 'wait', reason: waiting.prerequisites.wait })
+    // Repeated sweeps keep waiting; the deferred attempt never counts toward the three-attempt budget.
+    expect(decideBehaviorChain(chain, waiting, NOW + 60_000)).toEqual({ kind: 'wait', reason: waiting.prerequisites.wait })
+    const delivered = observation()
+    delivered.prerequisites = { wait: null, base: 'f'.repeat(40), evidence: [] }
+    const decision = decideBehaviorChain(chain, delivered, NOW + 1_000)
+    expect(decision).toMatchObject({ kind: 'invoke', behavior: 'implement-issue' })
+    expect(chain.resumedAfterSequence).toBe(0)
   })
 })

@@ -547,6 +547,15 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             record(receipt)
             progress.stage("publishing", "Publishing the verified checkout through github-interface")
             published = issue_review.interface(*publication_args, "--mode", "publish", seconds=120)
+            if published.get("outcome") == "prerequisite_wait":
+                if pull is not None:
+                    raise AtomicWorkFailed("prerequisite wait is only available for first publication")
+                wait = published.get("prerequisite_wait")
+                if not isinstance(wait, dict) or wait.get("base") != str(prepared.get("checkout_head") or "").lower() \
+                        or not isinstance(wait.get("reason"), str) or not wait["reason"].strip():
+                    raise AtomicWorkFailed("prerequisite wait lacks its original candidate base and reason")
+                record({"phase": "prerequisite_wait", "prepared": prepared, "prerequisite_wait": wait})
+                return published
             record({**receipt, "phase": "published", "result": published})
             return published
         finally:
