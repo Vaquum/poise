@@ -187,6 +187,13 @@ validation step. Caller-authored validation reasons and JSON line/column details
 are retained in both the error and diagnostic message before cleanup; other
 exception text remains excluded. These failures keep `atomic_work_failed` and
 the existing result, resource-release and retry rules.
+Recognized atomic provider failures retain `provider.atomic_work` diagnostics
+with the safe `executable`, observed exit code (including zero for a failed
+terminal) or negative-result signal, and `submission: none`. Caller names a
+failed terminal explicitly and reports `provider cause unavailable` without
+retaining either raw stream. Existing fixed account/rate-limit markers remain.
+An observed exit 137 stays an exit; the lease gate does not distinguish a child
+signal from an explicit exit with that status.
 The outer detached Caller records an explicit unknown cause and observed exit
 status when its inner continuation leaves no cause. These SQLite records survive
 Poise restarts; they authorize neither publication nor resource release.
@@ -277,6 +284,13 @@ stale row whose holder is dead is recovered by the next writer only when the
 registered group is dead too. Each hold uses a fresh token; a released or lost
 lease never touches the row again.
 
+A provider deadline that retains the lease raises `WorkerOrphaned`, keeping the
+original timeout as exception context. Atomic work records `resources_unknown`
+in its artifact and resource ownership errors, leaving `resources_settled_at`
+unset. The checkout grants no capture, publication, retry or release authority
+while ownership is unverified. A deadline with proven release remains an
+ordinary timeout.
+
 # PR review models
 
 Provider supervision hands off after a minute of quota or reconnect diagnostics
@@ -290,12 +304,20 @@ Every attempt ends with one durable terminal state: a validated result with its
 authoritative `review_id` receipt, or a typed failure carrying provider, phase,
 bounded redacted cause and known (`none`, `rejected`, `noop`, `blocked`) or
 unknown submission state. Structured provider exits and signals are `review_provider_exit`,
-provider-reported error terminals are `review_provider_error`; both keep
+provider-reported error terminals are `review_provider_error`, except a Codex
+credential rejection, which is `authentication_failed`; all three keep
 `not_started` / `preflight_failed` with no receipt, so Poise can safely retry
 after proving no reviewer action. On a nonzero Codex exit, the cause prefers the
 last usable `error` / `turn.failed` message, then a recognizable stderr failure;
 startup warnings alone report cause unavailable with the observed exit or signal.
 Malformed event lines cannot replace that process failure with invalid output.
+Poise verifies a fresh Connect with `agent-interface --verify-codex-login MODEL
+--pwd DIR`: one non-publishing request using the review's private Codex home and
+tool-free ChatGPT options. The caller owns the temporary directory, 30-second
+deadline and 64 KiB output limit, and validates the completed `OK` response.
+An isolated credential refresh that cannot seed the next worker fails verification;
+this command never copies credentials back to the canonical sign-in. Cross-Call
+credential persistence remains #1822's responsibility.
 Uncorrected invalid, missing, duplicate or contradictory
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
 GitHub reviews are `review_contract_violation` and held. A repeat-only

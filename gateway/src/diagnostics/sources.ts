@@ -38,11 +38,22 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
     && row.action === 'not_started' && row.outcome === 'preflight_failed' && row.head_sha == null
     && (row.error_code === 'atomic_work_blocked' || row.error_code === 'atomic_work_failed'
       && error === 'repair did not answer every unresolved review finding')
+  // Only the complete original flat pre-POST refusal can override Caller Error.
+  const approvalWait = row.behavior === 'pr_approve' && row.status === 'failed'
+    && row.error_code === 'approval_blocked_unresolved_conversations'
+    && row.action === 'not_started' && row.outcome === 'preflight_failed' && row.head_sha === null
+    && row.evidence_unavailable == null && row.resource_error == null && row.ownership_error == null
+    && row.review_id == null && row.review_comments == null && row.receipts == null
+    && raw?.version === 1 && raw.source === 'caller' && raw.severity === 'error'
+    && raw.operation === 'provider.review' && raw.phase === 'submitting' && raw.outcome === 'exit'
+    && raw.submission === 'blocked' && typeof raw.stderr === 'string' && raw.stderr_truncated === false
+    && raw.context == null && raw.filesystem == null && raw.observed_head == null
+    && ['exit_code', 'signal', 'errno', 'timeout_seconds'].every(key => raw[key] == null)
   const transient = (!row.error_code || row.error_code === 'review_submission_failed')
     && /\b(?:GitHub|HTTP)\s*5\d\d\b|\b(?:httpx\.(?:ReadTimeout|ConnectTimeout|ConnectError)|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN)\b/.test(error)
   return {
     id: 'caller:' + row.id, time: text(row.completed_at), source: unavailable && !row.error && !diagnostic ? 'collection' : 'caller', component: text(row.behavior) ?? 'agent-interface',
-    level: handoff ? 'error' : unavailable && !row.error && !diagnostic ? 'warning' : diagnostic?.severity === 'warning' ? 'warning' : diagnostic?.severity === 'error' ? 'error' : heldRepair || transient || ['overloaded', 'rate_limit', 'authentication_failed', 'interrupted'].includes(String(row.error_code)) ? 'warning' : 'error',
+    level: handoff ? 'error' : approvalWait ? 'warning' : unavailable && !row.error && !diagnostic ? 'warning' : diagnostic?.severity === 'warning' ? 'warning' : diagnostic?.severity === 'error' ? 'error' : heldRepair || transient || ['overloaded', 'rate_limit', 'authentication_failed', 'interrupted'].includes(String(row.error_code)) ? 'warning' : 'error',
     operation: handoff ? 'provider.review.handoff' : unavailable && !row.error && !diagnostic ? 'caller.evidence_unavailable' : text(diagnostic?.operation) || text(row.behavior) || 'call.failed', phase: text(diagnostic?.phase), workspace,
     repository, pr, target: repository && pr ? `${repository}#${pr}` : repository,
     account: text(row.actor), reviewer: text(row.actor), behavior: text(row.behavior), callId: String(row.id),
@@ -53,7 +64,7 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
     timeoutMs: number(context.timeout_seconds) === null ? null : Number(context.timeout_seconds) * 1000,
     errno: number(context.errno) ?? text(context.errno), resources: object(diagnostic?.filesystem) ?? {},
     context: { model: text(row.model), errorCode: text(row.error_code), outcome: text(row.outcome), action: text(row.action),
-      ...(handoff ? { submission: 'none' } : {}),
+      ...(handoff ? { submission: 'none' } : approvalWait ? { submission: 'blocked' } : {}),
       expectedHead: text(row.expected_head), observedHead: text(row.head_sha), executable: text(context.executable),
       resolvedExecutable: text(context.resolved_executable), cwd: text(context.cwd), elapsedMs: number(context.elapsed_ms),
       startedAt: text(row.started_at_precise) ?? text(row.started_at), source: text(row.source),

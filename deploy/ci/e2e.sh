@@ -445,33 +445,65 @@ backup_and_restore() {
 
 # A new commit on the branch this checkout follows, as a merge to main makes one.
 next_commit() {
-  local upstream=$work/upstream.git next=$work/next
-  git init --quiet --bare "$upstream"
-  git -C "$root" checkout --quiet -B e2e
-  git -C "$root" push --quiet "$upstream" e2e
-  git -C "$root" remote add e2e "$upstream"
-  git -C "$root" fetch --quiet e2e
-  git -C "$root" branch --quiet --set-upstream-to=e2e/e2e
-  git clone --quiet --branch e2e "$upstream" "$next"
-  git -C "$next" -c user.name=e2e -c user.email=e2e@poise.test commit --quiet --allow-empty --message 'test: the next commit'
+  local dependency=$1 upstream=$work/upstream.git next=$work/next
+  if [ ! -d "$upstream" ]; then
+    git init --quiet --bare "$upstream"
+    git -C "$root" checkout --quiet -B e2e
+    git -C "$root" push --quiet "$upstream" e2e
+    git -C "$root" remote add e2e "$upstream"
+    git -C "$root" fetch --quiet e2e
+    git -C "$root" branch --quiet --set-upstream-to=e2e/e2e
+    git clone --quiet --branch e2e "$upstream" "$next"
+  fi
+  (cd "$next" && npm install --package-lock-only --ignore-scripts --save-dev "$dependency" >&2)
+  git -C "$next" add package.json package-lock.json
+  git -C "$next" -c user.name=e2e -c user.email=e2e@poise.test commit --quiet --message "test: update $dependency"
   git -C "$next" push --quiet origin e2e
   git -C "$next" rev-parse HEAD
 }
 
-# The new commit leaves the workspace image's base as it was, so the gateway
+# Use the target checkout's locked Playwright with the container's inherited
+# browser path. npm installs packages only, never a browser or system libraries.
+check_workspace_chromium() {
+  local checkout=/home/poise/e2e/browser-checkout
+  in_workspace mkdir -p "$checkout"
+  docker cp "$root/package.json" "poise-ws-alice:$checkout/package.json"
+  docker cp "$root/package-lock.json" "poise-ws-alice:$checkout/package-lock.json"
+  in_workspace npm ci --prefix "$checkout" --ignore-scripts --include=dev --omit=optional --no-audit --no-fund
+  docker exec --workdir "$checkout" poise-ws-alice node --input-type=module -e '
+import assert from "node:assert/strict";
+import { chromium } from "playwright";
+assert(process.env.PLAYWRIGHT_BROWSERS_PATH, "workspace must supply its browser path");
+const browser = await chromium.launch();
+try {
+  const page = await browser.newPage();
+  await page.setContent("<title>Workspace Chromium</title>");
+  assert.equal(await page.title(), "Workspace Chromium");
+  console.log(`launched ${browser.version()} through ${chromium.executablePath()}`);
+} finally {
+  await browser.close();
+}
+'
+  pass "the target checkout launches its matching Chromium in the upgraded workspace"
+}
+
+# An unrelated lockfile change leaves the workspace image's base as it was, so the gateway
 # updates alice's workspace in place: it installs the new release in it and
 # Poise restarts on it alone, in the same container, while a process Poise
 # does not wait for, as it does not wait for a detached agent call, runs on.
 check_upgrade() {
-  local sha before version=''
+  local sha before base version=''
   before=$(docker inspect --format '{{.Id}}' poise-ws-alice)
+  base=$(docker inspect --format '{{index .Config.Labels "poise.base"}}' poise-ws-alice)
   docker exec --detach poise-ws-alice setsid sleep 3600
-  sha=$(next_commit)
+  sha=$(next_commit @types/ws@8.18.0)
   "$deploy/upgrade.sh" | tee "$work/upgrade.log"
   [ "$(git -C "$root" rev-parse HEAD)" = "$sha" ] || fail "upgrade.sh did not pull $sha"
   grep --quiet 'alice: running. The gateway installs the new release in it' "$work/upgrade.log" \
     || fail "upgrade.sh did not say it will update alice's workspace in place"
   docker image inspect "poise-runtime:$sha" >/dev/null || fail "upgrade.sh did not tag the image with the commit"
+  [ "$(docker image inspect --format '{{index .Config.Labels "poise.base"}}' "poise-runtime:$sha")" = "$base" ] \
+    || fail "an unrelated lockfile change changed the runtime base"
   # The gateway looks for outdated workspaces when it starts and every five minutes.
   for _ in $(seq 1 90); do
     version=$(workspace_version 2>/dev/null || true)
@@ -479,6 +511,9 @@ check_upgrade() {
     sleep 5
   done
   [ "$version" = "$sha" ] || fail "alice's workspace did not come back on $sha within 7.5 minutes; it reports '$version'"
+  in_workspace curl --fail --silent --show-error http://127.0.0.1:5555/api/service/health \
+    | jq --exit-status --arg sha "$sha" '.version == $sha and .release == $sha' >/dev/null \
+    || fail "alice's health does not confirm release $sha"
   [ "$(docker inspect --format '{{.Id}}' poise-ws-alice)" = "$before" ] || fail "the gateway replaced alice's container instead of updating it in place"
   [ "$(in_workspace printenv POISE_REPAIR_EXHAUSTION_REPOSITORIES)" = acme/repair-test ] || fail "upgrade lost the repair report allowlist"
   in_workspace pgrep -f 'sleep 3600' >/dev/null || fail "a process running in alice's workspace did not survive the update"
@@ -487,6 +522,38 @@ check_upgrade() {
   pass "the gateway updated alice's workspace in place: Poise runs $sha in the same container, and its other processes kept running"
   check_data "$(cat "$work/marker")"
   wait_for_poise "$alice" alice
+  check_workspace_chromium
+}
+
+# This pinned Playwright uses a different Chromium from the target checkout's
+# initial lock. Both images use runtime_base(), so only the browser identity
+# change should require a drained replacement.
+check_browser_upgrade() {
+  local sha before base version=''
+  before=$(docker inspect --format '{{.Id}}' poise-ws-alice)
+  base=$(docker inspect --format '{{index .Config.Labels "poise.base"}}' poise-ws-alice)
+  sha=$(next_commit @playwright/test@1.58.2)
+  "$deploy/upgrade.sh" | tee "$work/browser-upgrade.log"
+  [ "$(git -C "$root" rev-parse HEAD)" = "$sha" ] || fail "upgrade.sh did not pull $sha"
+  [ "$(docker image inspect --format '{{index .Config.Labels "poise.base"}}' "poise-runtime:$sha")" != "$base" ] \
+    || fail "a Playwright lockfile change kept the old runtime base"
+  grep --quiet 'alice: running. The gateway drains it first' "$work/browser-upgrade.log" \
+    || fail "upgrade.sh did not plan a drained replacement for the browser change"
+  for _ in $(seq 1 90); do
+    version=$(workspace_version 2>/dev/null || true)
+    [ "$version" = "$sha" ] && break
+    sleep 5
+  done
+  [ "$version" = "$sha" ] || fail "alice's browser upgrade did not reach $sha; it reports '$version'"
+  in_workspace curl --fail --silent --show-error http://127.0.0.1:5555/api/service/health \
+    | jq --exit-status --arg sha "$sha" '.version == $sha and .release == $sha' >/dev/null \
+    || fail "alice's health does not confirm release $sha"
+  [ "$(docker inspect --format '{{.Id}}' poise-ws-alice)" != "$before" ] \
+    || fail "the gateway kept alice's old container after the browser change"
+  check_data "$(cat "$work/marker")"
+  wait_for_poise "$alice" alice
+  check_workspace_chromium
+  pass "the Playwright change replaced the container and runs release $sha with matching Chromium"
 }
 
 # A gateway container Compose recreates is on Compose's network alone; the
@@ -767,6 +834,7 @@ run() {
   check_gateway_recreated
   check_persisted_public_pages
   check_upgrade
+  check_browser_upgrade
   check_persisted_public_pages
   check_proxy_mode
   echo "The deployment works end to end."

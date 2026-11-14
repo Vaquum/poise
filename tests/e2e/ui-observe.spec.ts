@@ -175,7 +175,7 @@ test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest 
   await expect(rows.nth(0)).toContainText('acme/site#493')
   await expect(rows.nth(0)).toContainText('no verified advance for 1d 2h')
   await expect(rows.nth(1)).toContainText('acme/site#501 → #502')
-  await expect(rows.nth(1)).toContainText('Needs you')
+  await expect(rows.nth(1)).toContainText('Blocked')
   await expect(rows.nth(2)).toContainText('acme/site#495')
   await expect(rows.nth(2)).toContainText('Blocked')
   await expect(rows.nth(2)).toContainText('Not confirmed: a reply may have posted')

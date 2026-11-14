@@ -178,6 +178,9 @@ also bounds mock data still held after recovery.
 ## Agents' suites
 
 On a deployment with a test relay, a suite an agent starts in a workspace runs on a disposable test box, not beside Poise ([Agents' test suites](Operating.md#agents-test-suites)). `tests/test-offload.test.ts` runs the real hooks, runner, relay and box script against a stand-in for Render's API.
+Its interrupted Vitest fixture awaits an annotation to deliver pending case
+updates before holding the suite open. Caller also retains an actual emitted
+timeout excerpt through checkout reclamation without validating or publishing.
 With GNU tar it exercises dependency reuse on jobs and sandboxes, including
 hard links, metadata, source edits and dependency edits at the same HEAD and
 mtime. It checks workspace isolation and replays the original dependency
@@ -189,6 +192,9 @@ rerun share the original command budget. A journal/decision fixture continues
 from the fresh complete result through exact-head review, CI, readiness and merge
 observations without Resume; it performs no live GitHub actions and retains the
 interrupted attempt as missing a result.
+Caller's native-receipt regression also feeds completed pytest assertion and
+setup-error output through the client, truncates the worker's console, and checks
+the original persisted diagnostic after a different run returns no result.
 
 ## Agent tool CPU defaults
 

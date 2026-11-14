@@ -310,10 +310,12 @@ only once the oldest queued capture outwaits the ten-second stall budget or
 the worker has failed. Startup uses the same stall budget while readiness is
 pending. Captures the store rejects as storage failures wait at the
 head of the queue and retry; observations the store rejects as invalid are shed
-with loss accounting. With no read waiting, the worker commits up to 32 queued
-captures in one transaction and acknowledges them only after commit. Retention
-still applies after each observation. A failed group rolls back and retries
-individually, so a rejected observation cannot discard its valid neighbors.
+with loss accounting. On a selected capture turn, the worker commits up to 32
+queued captures from the leading run in one transaction and acknowledges them
+only after commit. Retention
+still applies after each observation. A failed group rolls back. Storage failures
+remain eligible for batching after backoff; 4xx rejections retry individually,
+so a rejected observation cannot discard its valid neighbors.
 Loss diagnostics (`behavior-ledger.capture_loss`) identify queue saturation,
 oversized/invalid captures, store rejection, worker failure or shutdown timeout,
 with queue count, bytes, age and limits; rejection includes the worker's error

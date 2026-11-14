@@ -86,6 +86,28 @@ it('disconnect supersedes an authorization completion already waiting for Google
   expect(accounts.googleAccounts()).toEqual([{ id: 'account-one', email: 'one@example.com', connected: false }])
   expect(database.getMeta('google:account:account-one')).not.toContain('private-refresh')
 })
+it('asks for a reconnect only after Google confirms a lost sign-in', async () => {
+  const connect = async () => {
+    const { url, browserSecret } = await begin()
+    fakeFetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(identity())
+    await accounts.completeGoogleLogin(request(), { state: url.searchParams.get('state'), code: 'code', browserSecret })
+    accounts.googleAccountSettings()
+  }
+  const { openAlerts } = await import('../server/alerts/store')
+  const alerts = () => openAlerts({ kind: 'sign_in_needed' })
+  await connect()
+
+  fakeFetch.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'server_error' }), { status: 500 }))
+  await expect(accounts.googleAccessToken('account-one', true)).rejects.toThrow('could not complete sign-in')
+  expect(alerts()).toEqual([])
+  fakeFetch.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 }))
+  await expect(accounts.googleAccessToken('account-one', true)).rejects.toThrow('Google sign-in has ended')
+  expect(alerts()).toMatchObject([{ title: 'Reconnect Google account one@example.com', target: { settings: 'accounts' } }])
+  accounts.googleAccountSettings()
+  expect(alerts()).toHaveLength(1)
+  await connect()
+  expect(alerts()).toEqual([])
+})
 it('client reconfiguration invalidates older unfinished authorizations', async () => {
   const auth = await begin()
   let release!: (value: Response) => void

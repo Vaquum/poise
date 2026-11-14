@@ -280,8 +280,8 @@ describe('installing it into a home volume', () => {
     const hooks = join(home, '.poise', 'test-offload')
     expect(readFileSync(join(hooks, 'relay'), 'utf8')).toBe('https://alice.example/api/link/test-relay\nalice.signed\n540\n')
     expect(statSync(join(hooks, 'relay')).mode & 0o777).toBe(0o600)
-    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
-    expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'relay', 'run.mjs', 'sitecustomize.py'])
+    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs', 'redaction.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
+    expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'redaction.mjs', 'relay', 'run.mjs', 'sitecustomize.py'])
     // Ahead of a first start, whose entrypoint leaves a ~/.poise it finds as it is.
     expect(statSync(join(home, '.poise')).mode & 0o777).toBe(0o700)
   })
@@ -290,7 +290,7 @@ describe('installing it into a home volume', () => {
     const home = temp()
     install(home, { POISE_TEST_RELAY_URL: 'https://alice.example', POISE_TEST_RELAY_KEY: 'k' })
     install(home)
-    expect(readdirSync(join(home, '.poise', 'test-offload')).sort()).toEqual(['hook.cjs', 'run.mjs', 'sitecustomize.py'])
+    expect(readdirSync(join(home, '.poise', 'test-offload')).sort()).toEqual(['hook.cjs', 'redaction.mjs', 'run.mjs', 'sitecustomize.py'])
   })
 
   it('leaves nothing behind where it was never on', () => {
@@ -303,7 +303,7 @@ describe('installing it into a home volume', () => {
 describe('the hooks at work', () => {
   function hooked(relay: boolean): { hooks: string; env: NodeJS.ProcessEnv } {
     const hooks = temp()
-    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
+    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs', 'redaction.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
     // Nothing listens there: a suite that reaches for its instance fails at once, and one that does not runs.
     if (relay) writeFileSync(join(hooks, 'relay'), 'http://127.0.0.1:9/api/link/test-relay\nk\n')
     // Without the npm script this very test may be running under.
@@ -614,13 +614,16 @@ describe('a suite on a test box', () => {
         return
       }
       if (service && jobAction === 'cancel') {
+        if (pendingCancellations) {
+          pendingCancellations.push(res)
+          return
+        }
         const job = jobs.get(jobId)
         if (job) {
           job.status = 'canceled'
           job.child?.kill('SIGKILL')
         }
-        if (pendingCancellations) pendingCancellations.push(res)
-        else res.writeHead(job ? 200 : 404).end()
+        res.writeHead(job ? 200 : 404).end()
         return
       }
       const [, id, action, operation] = /^\/v1\/sandboxes\/([^/]+)\/?([^/]*)\/?(.*)$/.exec(path) ?? []
@@ -685,7 +688,7 @@ describe('a suite on a test box', () => {
     relayUrl = `${relayOrigin}${TEST_RELAY_PATH}`
     relay.start()
     hooks = temp()
-    for (const file of ['run.mjs', 'hook.cjs', 'sitecustomize.py']) copyFileSync(join(SOURCE, file), join(hooks, file))
+    for (const file of ['run.mjs', 'hook.cjs', 'sitecustomize.py', 'redaction.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
     writeFileSync(join(hooks, 'relay'), `${relayUrl}\n${KEY}\n`)
     unpacked = temp()
   }
@@ -1315,22 +1318,25 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect(stderr).toContain('cannot start /no/such/command')
   })
 
-  it.each(['none', 'assertion', 'oversized'])('retains real Vitest evidence before interruption (failure: %s)', async (failure) => {
+  it.each(['none', 'assertion', 'timeout', 'oversized'])('retains real Vitest evidence before interruption (failure: %s)', async (failure) => {
     let now = Date.now()
     await startAll({ limitSeconds: 2, now: () => now })
     const failed = failure !== 'none'
     const oversized = failure === 'oversized'
+    const timeout = failure === 'timeout'
     const fixture = vitestFixture(`describe('offload reporting', () => {
-      ${failed ? `it('first failed expectation ghp_fixturecredential', () => {
+      ${failed ? (timeout ? `it('first timed out expectation', async () => {
+        await new Promise(() => {})
+      }, 200)` : `it('first failed expectation ghp_fixturecredential', () => {
         const context = ${oversized ? "'expected received-value to equal expected-value\\nhttps://example.test/?token=' + 'boundarysecret'.repeat(3000) + '\\nafter-redaction\\n' + 'x'.repeat(12000) + '\\nafter-excerpt-limit'" : 'undefined'}
         expect('received-value', context).toBe('expected-value')
       })
-      // Flush Vitest's batched case events before the last test deliberately holds the file open.
-      it('second failed expectation', async () => {
-        await new Promise(done => setTimeout(done, 200))
+      it('second failed expectation', () => {
         expect(3).toBe(4)
-      })` : ''}
-      it('keeps the suite open', async () => {
+      })`) : ''}
+      it('keeps the suite open', async ({ annotate }) => {
+        // annotate awaits Vitest's pending case updates; a fixed delay can miss its throttle boundary.
+        await annotate('completed cases delivered before holding the suite open')
         console.log('VITEST_HELD ' + process.pid)
         await new Promise(() => {})
       }, 60000)
@@ -1345,11 +1351,17 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
         await until(() => evidence.includes('[poise] first test failure:'), 'the first Vitest assertion before interruption', 3_000)
           .catch((error: Error) => { throw new Error(`${error.message}\n${evidence}\n${output}`) })
         const excerpt = evidence.slice(evidence.indexOf('[poise] first test failure:'))
-        expect(excerpt).toContain('tests/fixture.test.mjs > offload reporting > first failed expectation [redacted]')
-        expect(excerpt).toContain('AssertionError:')
-        expect(excerpt).toContain('received-value')
-        expect(excerpt).toContain('expected-value')
-        expect(excerpt).not.toContain('ghp_fixturecredential')
+        if (timeout) {
+          expect(excerpt).toContain('tests/fixture.test.mjs > offload reporting > first timed out expectation')
+          expect(excerpt).toContain('Test timed out in 200ms')
+          expect(excerpt).toContain('STACK_TRACE_ERROR')
+        } else {
+          expect(excerpt).toContain('tests/fixture.test.mjs > offload reporting > first failed expectation [redacted]')
+          expect(excerpt).toContain('AssertionError:')
+          expect(excerpt).toContain('received-value')
+          expect(excerpt).toContain('expected-value')
+          expect(excerpt).not.toContain('ghp_fixturecredential')
+        }
         expect(excerpt).not.toContain('second failed expectation')
         expect(excerpt.length).toBeLessThanOrEqual(8193)
         if (oversized) {
@@ -1360,19 +1372,21 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
           expect(excerpt).not.toContain('after-excerpt-limit')
         }
       } else expect(evidence).not.toContain('[poise] first test failure:')
+      const admission = /\[poise\] candidate ([a-f0-9]{64}), suite .*, run ([a-f0-9]{32})/.exec(evidence)
+      expect(admission).not.toBeNull()
+      expect(evidence).toContain(`candidate ${admission![1]}, suite node vitest.mjs run, cwd ${fixture.repo}`)
+      expect(relay.runs.has(admission![2])).toBe(true)
       now += 3_000
       const { code, stderr } = await running.done
       expect(code).toBe(124)
       expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
       expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
       expect(stderr).toContain('let CI run the tests')
-      const admission = /\[poise\] candidate ([a-f0-9]{64}), suite .*, run ([a-f0-9]{32})/.exec(stderr)
-      expect(admission).not.toBeNull()
       expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![2] }))
       if (failed) {
         expect(stderr.match(/\[poise\] first test failure:/g)).toHaveLength(1)
         expect(stderr.indexOf(admission![0])).toBeLessThan(stderr.indexOf('[poise] first test failure:'))
-        expect(stderr.indexOf('AssertionError')).toBeLessThan(stderr.indexOf('no test result:'))
+        expect(stderr.indexOf(timeout ? 'Test timed out' : 'AssertionError')).toBeLessThan(stderr.indexOf('no test result:'))
       } else expect(stderr).not.toContain('AssertionError')
       const box = runBox()
       await until(() => terminated.includes(box.id), 'the box to be terminated')
@@ -1485,17 +1499,28 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect(failed ? warnings : events).toContainEqual(diagnostic)
   })
 
-  it.each([false, true])('discards authenticated late output while job cancellation is pending (cancellation failure: %s)', async (failed) => {
+  it.each(['success', 'failure', 'timeout'] as const)('keeps one cancellation in flight through an orphan sweep and discards authenticated late output (cancellation: %s)', async (outcome) => {
     runJobs = false
-    await startAll({ baseService: 'crn-test' })
+    // Run sweeps explicitly so each finishes while the cancellation response is still held.
+    await startAll({ baseService: 'crn-test', sweepMs: 60_000 })
     const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
     const { id } = await created.json() as { id: string }
     const run = relay.runs.get(id)!
     const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: `Bearer ${KEY}` } })
     await until(() => run.boxId !== null, 'the job to be created')
+    const job = jobs.get(run.boxId!)!
+    const foreign = { ...job, id: 'job-foreign', startCommand: job.startCommand.replace(relayUrl, `https://alice.elsewhere.example${TEST_RELAY_PATH}`) }
+    jobs.set(foreign.id, foreign)
+    const requests = vi.spyOn(globalThis, 'fetch')
+    const cancelUrl = `${renderOrigin}/v1/services/crn-test/jobs/${job.id}/cancel`
+    const deadline = new AbortController()
+    const timeout = outcome === 'timeout' ? vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(deadline.signal) : null
     pendingCancellations = []
     await output.body!.cancel()
     await until(() => relay.runs.size === 0 && pendingCancellations!.length > 0, 'retirement before cancellation answers', 3_000)
+    await relay['sweep'](Date.now(), true)
+    expect(job.status).toBe('running')
+    expect(requests.mock.calls.filter(([url]) => String(url).endsWith('/cancel')).map(([url]) => url)).toEqual([cancelUrl])
     expect(pendingCancellations).toHaveLength(1)
     expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id, error: 'the workspace went away' }))
     const write = vi.spyOn(run.output!, 'write')
@@ -1511,12 +1536,23 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
     expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.job.cancel', jobId: run.boxId }))
     const [cancellation] = pendingCancellations
-    pendingCancellations = null
-    if (failed) cancellation.destroy()
+    if (outcome === 'timeout') {
+      expect(timeout).toHaveBeenCalledWith(10_000)
+      deadline.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+    } else if (outcome === 'failure') cancellation.destroy()
     else cancellation.writeHead(200).end()
+    const failed = outcome !== 'success'
     await until(() => [...events, ...warnings].some(({ event, jobId }) => jobId === run.boxId && event === (failed ? 'test_relay.job.cancel.failed' : 'test_relay.job.cancel')), 'the cancellation diagnostic', 3_000)
-    if (failed) expect(warnings).toContainEqual({ event: 'test_relay.job.cancel.failed', jobId: run.boxId, error: 'fetch failed' })
-    else expect(events).toContainEqual({ event: 'test_relay.job.cancel', jobId: run.boxId, status: 200 })
+    if (failed) {
+      expect(warnings).toContainEqual({ event: 'test_relay.job.cancel.failed', jobId: run.boxId, error: outcome === 'timeout' ? 'The operation was aborted due to timeout' : 'fetch failed' })
+      expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.job.cancel', jobId: run.boxId }))
+    } else expect(events).toContainEqual({ event: 'test_relay.job.cancel', jobId: run.boxId, status: 200 })
+    expect(job.status).toBe('running')
+    pendingCancellations = null
+    await relay['sweep'](Date.now(), true)
+    await until(() => job.status === 'canceled', 'a later sweep to retry cancellation', 3_000)
+    expect(requests.mock.calls.filter(([url]) => String(url).endsWith('/cancel')).map(([url]) => url)).toEqual([cancelUrl, cancelUrl])
+    expect(foreign.status).toBe('running')
   })
 
   it('limits retirement evidence to owner cleanup and authenticated late output, and evicts it without occupying admission slots', async () => {
@@ -1821,22 +1857,71 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
   })
 
-  it('keeps the full rerun within the remaining command budget', async () => {
+  it.each([0, 4_000])('keeps the full rerun within the remaining command budget (setup delayed %i ms)', async (setupDelay) => {
+    setupMs = setupDelay
     await startAll()
-    const started = Date.now()
-    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 2500)'], { BASH_DEFAULT_TIMEOUT_MS: '3500' })
-    await new Promise((done) => { run.child.stdout?.once('data', done) })
-    await new Promise((done) => setTimeout(done, 500))
+    const control = temp()
+    const clock = join(control, 'clock.cjs')
+    const time = join(control, 'time')
+    const observed = join(control, 'observed')
+    writeFileSync(time, '0')
+    // Hold only the runner's lifetime timer. Cancellation, refresh and rearming retain their due times.
+    writeFileSync(clock, `if (process.argv[1]?.endsWith('/run.mjs')) {
+      const fs = require('node:fs')
+      const now = () => Number(fs.readFileSync(${JSON.stringify(time)}, 'utf8'))
+      const timeout = global.setTimeout, cancel = global.clearTimeout
+      const timers = new Map()
+      global.setTimeout = (callback, ms, ...args) => {
+        if (ms !== 3500) return timeout(callback, ms, ...args)
+        const timer = timeout(() => {}, 2147483647)
+        const pending = { due: now() + ms, fire: () => callback(...args) }
+        timer.refresh = () => { pending.due = now() + ms; return timer }
+        timers.set(timer, pending)
+        return timer
+      }
+      global.clearTimeout = (timer) => { timers.delete(timer); return cancel(timer) }
+      setInterval(() => {
+        const at = now()
+        for (const [timer, pending] of timers) {
+          if (pending.due <= at) { clearTimeout(timer); pending.fire() }
+        }
+        fs.writeFileSync(${JSON.stringify(observed)}, String(at))
+      }, 10)
+    }`)
+    // A held suite exits when its fake box is terminated, including after a failed assertion.
+    const run = suite(repository(), [process.execPath, '-e', 'const parent = process.ppid; console.log("started"); setInterval(() => { if (process.ppid !== parent) process.exit(0) }, 25)'], {
+      BASH_DEFAULT_TIMEOUT_MS: '3500', NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require "${clock}"`].filter(Boolean).join(' '),
+    })
+    let output = ''
+    run.child.stdout?.on('data', (chunk) => { output += chunk })
+    const advance = async (at: number) => {
+      writeFileSync(time, String(at))
+      await until(() => existsSync(observed) && readFileSync(observed, 'utf8') === String(at), 'the runner clock to advance', 5_000)
+    }
+    await until(() => output === 'started\n', 'the first suite to start')
+    const original = [...relay.runs.keys()][0]
+    expect(original).toMatch(/^[a-f0-9]{32}$/)
+    await advance(1_000)
     relay.stop()
     await startAll2()
+    await until(() => relay.runs.size === 1, 'the replacement run to be admitted')
+    const replacement = [...relay.runs.keys()][0]
+    expect(replacement).not.toBe(original)
+    await until(() => output === 'started\nstarted\n', 'the replacement suite to start')
+    await advance(3_499)
+    expect(run.child.exitCode).toBeNull()
+    expect(relay.runs.has(replacement)).toBe(true)
+    await advance(3_500)
+    await until(() => run.child.exitCode !== null, 'the original deadline to stop the replacement suite', 5_000)
     const { code, stdout, stderr } = await run.done
     expect(code).toBe(124)
     expect(stdout).toBe('started\nstarted\n')
-    expect(stderr).toContain('total time budget')
-    expect(Date.now() - started).toBeLessThan(5500)
+    expect(stderr).toContain('no test result: the test offload exhausted its total time budget')
     expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
-    await until(() => relay.runs.size === 0, 'the timed-out run to be retired')
-  })
+    await until(() => !relay.runs.has(replacement), 'the timed-out replacement run to be retired')
+    expect(relay.runs.size).toBe(0)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: replacement }))
+  }, 30_000)
 
   it('gives up when the relay never recovers', async () => {
     await startAll()
@@ -1855,18 +1940,42 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
 
   it('recovers mid-suite when only one suite may run', async () => {
     await startAll({ maxRuns: 1 })
-    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 300)'])
-    await new Promise((done) => { run.child.stdout?.once('data', done) })
-    relay.stop()
-    await startAll2({ maxRuns: 1 })
-    const { code, stdout, stderr } = await run.done
-    expect(code).toBe(0)
-    expect(stdout).toBe('started\nstarted\ncomplete\n')
-    expect(stderr).toContain('interrupted validation')
-    expect(stderr).not.toContain('with HTTP 429:')
-    expect(stderr).not.toContain('Skip local tests')
-    expect(relay.runs.size).toBe(0)
-    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)
+    const repo = repository()
+    const run = suite(repo, [process.execPath, '-e', 'console.log("started"); const fs = require("fs");'
+      + ' if (fs.existsSync("gate")) { setTimeout(() => console.log("complete"), 100) }'
+      + ' else { fs.writeFileSync("held.pid", String(process.pid)); fs.writeFileSync("gate", "held"); setInterval(() => {}, 1000) }'])
+    let output = ''
+    let errors = ''
+    run.child.stdout?.on('data', (chunk) => { output += chunk })
+    run.child.stderr?.on('data', (chunk) => { errors += chunk })
+    const diagnostic = () => `stdout:\n${output}\nstderr:\n${errors}\nrunner exit: ${run.child.exitCode}`
+    try {
+      await until(() => output.includes('started'), 'the first suite to start', 5_000)
+        .catch((error: Error) => { throw new Error(`${error.message}\n${diagnostic()}`) })
+      await until(() => existsSync(join(repo, 'gate')), 'the first suite to hold', 3_000)
+        .catch((error: Error) => { throw new Error(`${error.message}\n${diagnostic()}`) })
+      // Delayed observation: the held suite must still be incomplete before the relay is interrupted.
+      await new Promise((done) => setTimeout(done, 750))
+      expect(output).toBe('started\n')
+      relay.stop()
+      await startAll2({ maxRuns: 1 })
+      await until(() => run.child.exitCode !== null, 'the replacement suite to finish', 5_000)
+        .catch((error: Error) => { throw new Error(`${error.message}\n${diagnostic()}\nruns: ${relay.runs.size}`) })
+      const { code, stdout, stderr } = await run.done
+      expect(code).toBe(0)
+      expect(stdout).toBe('started\nstarted\ncomplete\n')
+      expect(stderr).toContain('interrupted validation')
+      expect(stderr).not.toContain('with HTTP 429:')
+      expect(stderr).not.toContain('Skip local tests')
+      expect(relay.runs.size).toBe(0)
+      expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)
+    } finally {
+      // Fake Render ends only the box wrapper; the held suite is a separate process.
+      if (existsSync(join(repo, 'held.pid'))) {
+        const pid = Number(readFileSync(join(repo, 'held.pid'), 'utf8'))
+        if (pid) try { process.kill(pid, 'SIGTERM') } catch { /* the suite already ended */ }
+      }
+    }
   })
 
   it('sends no second admission after a lost admission response', async () => {
@@ -1940,16 +2049,26 @@ ${stderr}`
   it('recovers when the restart reaches the upload before its fail frame is read', async () => {
     await startAll()
     const repo = repository()
-    let held: { req: IncomingMessage; res: ServerResponse } | null = null
+    // Only the fixture copy acknowledges the upload handler, after its callback returns.
+    const runnerPath = join(hooks, 'run.mjs')
+    const runnerSource = readFileSync(runnerPath, 'utf8')
+    expect(runnerSource).toContain('uploadError = error')
+    writeFileSync(runnerPath, runnerSource.replace('uploadError = error', `uploadError = error
+            queueMicrotask(() => { if (error?.status === 410) say('fixture: upload 410 handled') })`))
+    const held: { upload: { req: IncomingMessage; res: ServerResponse } | null; output: ServerResponse | null } = { upload: null, output: null }
     let heldOnce = false
     let failFrame: Buffer | null = null
     let failEnd = false
+    let admissions = 0
+    const order: string[] = []
     const releaser: { release: (() => void) | null } = { release: null }
     const inner = relayServer.listeners('request').slice()
     relayServer.removeAllListeners('request')
     relayServer.on('request', (req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url ?? '/', 'http://relay')
+      if (req.method === 'POST' && url.pathname === `${TEST_RELAY_PATH}/runs`) admissions += 1
       if (req.method === 'GET' && url.pathname.endsWith('/output')) {
+        held.output = res
         const write = res.write.bind(res)
         const end = res.end.bind(res)
         res.write = ((chunk: any, ...args: any[]) => {
@@ -1964,40 +2083,73 @@ ${stderr}`
           return (end as (...a: any[]) => ServerResponse)(...args)
         }) as typeof res.end
         releaser.release = () => {
-          if (failFrame) (write as (c: Buffer) => void)(failFrame)
+          if (failFrame) {
+            order.push('restart frame released')
+            write(failFrame)
+          }
           failFrame = null
           if (failEnd) (end as () => void)()
           failEnd = false
         }
       } else if (req.method === 'POST' && url.pathname.endsWith('/tree') && !heldOnce) {
         heldOnce = true
-        held = { req, res }
+        held.upload = { req, res }
         req.resume()
         return
       }
       for (const listener of inner) (listener as (req: IncomingMessage, res: ServerResponse) => void)(req, res)
     })
     const run = suite(repo, [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 300)'])
-    await until(() => held !== null, 'the upload to start')
-    relay.stop()
-    await until(() => failFrame !== null, 'the restart frame to be queued')
-    const pending = held as unknown as { req: IncomingMessage; res: ServerResponse }
-    held = null
-    pending.res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
-    pending.req.resume()
-    // Let the runner process the upload 410 before the restart frame arrives: the old code
-    // aborts the output here and never recovers.
-    await new Promise((done) => setTimeout(done, 200))
-    releaser.release?.()
-    await startAll2()
-    const { code, stdout, stderr } = await run.done
-    expect(code).toBe(0)
-    expect(stdout).toBe('started\ncomplete\n')
-    expect(stderr).toContain('interrupted validation')
-    expect(stderr).toContain('no test result: the gateway restarted')
-    expect(stderr).not.toContain('Skip local tests')
-    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)
-  })
+    let notices = ''
+    run.child.stderr?.on('data', (chunk) => {
+      notices += chunk
+      if (notices.includes('fixture: upload 410 handled') && !order.includes('upload 410 handled')) order.push('upload 410 handled')
+    })
+    let runnerClosed = false
+    void run.done.then(() => { runnerClosed = true })
+    try {
+      await until(() => held.upload !== null, 'the upload to start', 10_000)
+      const originalId = [...relay.runs.keys()][0]
+      expect(originalId).toMatch(/^[a-f0-9]{32}$/)
+      relay.stop()
+      await until(() => failFrame !== null, 'the restart frame to be queued', 10_000)
+      held.upload!.res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
+      await until(() => order.includes('upload 410 handled'), `the client's upload 410 handler\n${notices}`, 10_000)
+      expect(failFrame).not.toBeNull()
+      expect(order).toEqual(['upload 410 handled'])
+      releaser.release!()
+      await startAll2()
+      relayServer.prependListener('request', (req: IncomingMessage) => {
+        if (req.method === 'POST' && req.url === `${TEST_RELAY_PATH}/runs`) admissions += 1
+      })
+      await until(() => runnerClosed, `the recovered suite to finish\n${notices}`, 35_000)
+      const { code, stdout, stderr } = await run.done
+      expect(code, stderr).toBe(0)
+      expect(stdout).toBe('started\ncomplete\n')
+      expect(order).toEqual(['upload 410 handled', 'restart frame released'])
+      const captured = /candidate ([a-f0-9]{64}), suite .+, run ([a-f0-9]{32})/.exec(stderr)
+      expect(captured?.[2]).toBe(originalId)
+      const finished = events.filter((event) => event.event === 'test_relay.run.finished')
+      expect(finished).toEqual([expect.objectContaining({ exit: 0 })])
+      expect(finished[0].id).not.toBe(originalId)
+      expect(stderr).toContain(`relay recovered; rerunning candidate ${captured![1]} as run ${finished[0].id}`)
+      expect(stderr).toContain('interrupted validation')
+      expect(stderr).toContain('no test result: the gateway restarted')
+      expect(stderr).not.toContain('Skip local tests')
+      expect(admissions).toBe(2)
+      expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: originalId, error: 'the gateway restarted' }))
+      expect(relay.runs.size).toBe(0)
+      expect(suiteBoxes()).toHaveLength(2)
+    } finally {
+      releaser.release?.()
+      held.output?.destroy()
+      held.upload?.res.destroy()
+      held.upload?.req.destroy()
+      if (!runnerClosed) run.child.kill('SIGKILL')
+      await until(() => runnerClosed, 'the runner to close after cleanup', 3_000)
+    }
+    // Three 10 s phase bounds, 35 s for recovery/completion and 3 s for cleanup.
+  }, 80_000)
 
   it('says nothing of memory when a suite that mentions it passes', async () => {
     await startAll()
@@ -2044,11 +2196,18 @@ ${stderr}`
     expect(JSON.stringify({ events, warnings })).not.toContain('private-')
   })
 
-  it.each([null, 'crn-test'])('keeps memory warnings correlatable without logging command bodies with base service %s', async (baseService) => {
+  it.each([
+    [null, 'node'],
+    [null, 'sh'],
+    [null, 'npm run check'],
+    ['crn-test', 'node'],
+    ['crn-test', 'sh'],
+    ['crn-test', 'npm run check'],
+  ])('keeps memory warnings correlatable without logging command bodies with base service %s and command %s', async (baseService, command) => {
     const lines: string[] = []
     const diagnostics: ReturnType<typeof normalize>[] = []
     const log = createLogger((line) => lines.push(line), (level, operation, fields) => diagnostics.push(normalize(gatewayDiagnostic(level, operation, fields))))
-    await startAll({ baseService, log })
+    await startAll({ baseService: baseService as string | null, log })
     // The background sweep can warn before the run fails.
     log.warn('test_relay.sweep.failed', { error: 'unrelated sweep failure' })
     const secret = 'opaque-relay-value-7zQ4mN8p'
@@ -2060,42 +2219,40 @@ ${stderr}`
     writeFileSync(join(repo, 'package.json'), JSON.stringify({ private: true, workspaces: ['gateway'] }))
     writeFileSync(join(repo, 'gateway', 'package.json'), JSON.stringify({ name: 'gateway', scripts: { check: `"${process.execPath}" oom.cjs` } }))
     writeFileSync(join(repo, 'gateway', 'oom.cjs'), script)
-    const commands: [string[], string][] = [
-      [[process.execPath, '-e', script, secret], 'node'],
-      [['/bin/sh', '-c', shell, 'private-shell-argument', secret], 'sh'],
-      [[process.execPath, realpathSync(join(dirname(process.execPath), 'npm')), '--prefix', repo, '--workspace', 'gateway', 'run', 'check', '--', secret], 'npm run check'],
-    ]
+    const label = command as string
+    const argv = label === 'node'
+      ? [process.execPath, '-e', script, secret]
+      : label === 'sh'
+        ? ['/bin/sh', '-c', shell, 'private-shell-argument', secret]
+        : [process.execPath, realpathSync(join(dirname(process.execPath), 'npm')), '--prefix', repo, '--workspace', 'gateway', 'run', 'check', '--', secret]
     const headers = { authorization: `Bearer ${KEY}` }
-    for (const [argv, label] of commands) {
-      const { code, stderr } = await suite(repo, argv).done
-      expect(code).toBe(125)
-      expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
-      expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
-      expect(stderr).toContain('let CI run the tests')
-      expect(stderr).not.toContain('name a')
-      const id = /, run ([a-f0-9]{32})/.exec(stderr)![1]
-      const message = `run ${id}, workspace alice, command ${label}: this suite is too big for its test box: it ran out of memory`
-      const records = lines.map((line) => JSON.parse(line))
-      expect(records).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', level: 'warn', id, error: message }))
-      for (const event of ['test_relay.run.created', 'test_relay.run.finished']) {
-        expect(records).toContainEqual(expect.objectContaining({ event, id, command: label, ...(event.endsWith('finished') ? { exit: 125 } : {}) }))
-      }
-      expect(diagnostics).toContainEqual(expect.objectContaining({ operation: 'test_relay.run.failed', severity: 'warning', visibility: 'operator',
-        workspace: null, message: `test_relay.run.failed: ${message}` }))
-      expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
-
-      // Cancellation uses the same formatter, before any command has executed.
-      const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: JSON.stringify({ argv, cwd: repo, env: {} }) })
-      const stopped = await created.json() as { id: string }
-      const output = await fetch(`${relayUrl}/runs/${stopped.id}/output`, { headers })
-      await until(() => lines.some((line) => { const record = JSON.parse(line); return record.event === 'test_relay.run.created' && record.id === stopped.id }), 'the cancelled run to be created')
-      expect((await fetch(`${relayUrl}/runs/${stopped.id}`, { method: 'DELETE', headers })).status).toBe(204)
-      await output.arrayBuffer()
-      expect(lines.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: stopped.id, command: label }))
-      unpacked = temp()
+    const { code, stderr } = await suite(repo, argv).done
+    expect(code).toBe(125)
+    expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
+    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+    expect(stderr).toContain('let CI run the tests')
+    expect(stderr).not.toContain('name a')
+    const id = /, run ([a-f0-9]{32})/.exec(stderr)![1]
+    const message = `run ${id}, workspace alice, command ${label}: this suite is too big for its test box: it ran out of memory`
+    const records = lines.map((line) => JSON.parse(line))
+    expect(records).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', level: 'warn', id, error: message }))
+    for (const event of ['test_relay.run.created', 'test_relay.run.finished']) {
+      expect(records).toContainEqual(expect.objectContaining({ event, id, command: label, ...(event.endsWith('finished') ? { exit: 125 } : {}) }))
     }
-    const output = JSON.stringify({ lines, diagnostics })
-    for (const excluded of [secret, 'const privateValue', 'private_value=', 'private-shell-argument', 'console.error', 'oom.cjs', repo]) expect(output).not.toContain(excluded)
+    expect(diagnostics).toContainEqual(expect.objectContaining({ operation: 'test_relay.run.failed', severity: 'warning', visibility: 'operator',
+      workspace: null, message: `test_relay.run.failed: ${message}` }))
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+
+    // Cancellation uses the same formatter, before any command has executed.
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: JSON.stringify({ argv, cwd: repo, env: {} }) })
+    const stopped = await created.json() as { id: string }
+    const output = await fetch(`${relayUrl}/runs/${stopped.id}/output`, { headers })
+    await until(() => lines.some((line) => { const record = JSON.parse(line); return record.event === 'test_relay.run.created' && record.id === stopped.id }), 'the cancelled run to be created')
+    expect((await fetch(`${relayUrl}/runs/${stopped.id}`, { method: 'DELETE', headers })).status).toBe(204)
+    await output.arrayBuffer()
+    expect(lines.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: stopped.id, command: label }))
+    const outputText = JSON.stringify({ lines, diagnostics })
+    for (const excluded of [secret, 'const privateValue', 'private_value=', 'private-shell-argument', 'console.error', 'oom.cjs', repo]) expect(outputText).not.toContain(excluded)
     expect(lines.map((line) => JSON.parse(line)).filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   }, 20_000)
 

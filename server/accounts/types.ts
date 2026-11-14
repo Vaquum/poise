@@ -42,6 +42,8 @@ export interface GhAccount {
   login: string
   active: boolean
   signedIn: boolean
+  /** The saved credential was explicitly rejected. A failed check can also be transient. */
+  credentialRejected?: true
   /** Why gh cannot use it, in gh's words; null when it can. */
   detail: string | null
 }

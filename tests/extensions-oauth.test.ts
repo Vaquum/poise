@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { db } from '../server/db'
+import { openAlerts } from '../server/alerts/store'
 import { createServer as addServer, deleteServer, listServers, readSecret, secretValues, serverView, writeSecret } from '../server/extensions/store'
 import { checkServer } from '../server/extensions/probe'
 import { accessToken, finishSignIn, startSignIn } from '../server/extensions/oauth'
@@ -85,6 +86,8 @@ describe('OAuth sign-in for a remote server', () => {
   it('detects the challenge, signs in, connects, delivers the token and renews it', async () => {
     const id = addServer(validateSpec({ name: 'acme', title: 'Acme', source: 'custom', transport: 'http', url: `${base}/mcp` }), {}, everywhere).id
     expect(await checkServer(id)).toMatchObject({ state: 'signin' })
+    const alerts = () => openAlerts({ kind: 'sign_in_needed' }).filter(alert => alert.dedupeKey === `sign-in:extension:${id}`)
+    expect(alerts()).toEqual([])
     expect(serverView(id).auth).toBe('oauth')
     expect((await extensionsFor({ repo: 'acme/app' })).notices).toEqual(['Extensions: Acme needs a sign-in, so this chat runs without it. Sign in in Extensions; the next turn picks it up.'])
 
@@ -108,6 +111,12 @@ describe('OAuth sign-in for a remote server', () => {
     expireTokens(id)
     expect(await accessToken(id)).toBeNull()
     expect(serverView(id).signedIn).toBe(false)
+    expect(alerts()).toMatchObject([{ title: 'Reconnect Acme', target: { settings: 'extensions' } }])
+    refuseRefresh = false
+    const again = await startSignIn(id, ORIGIN)
+    const returned = new URL((await fetch(again.authorizationUrl, { redirect: 'manual' })).headers.get('location')!)
+    await finishSignIn({ code: returned.searchParams.get('code'), state: returned.searchParams.get('state') })
+    expect(alerts()).toEqual([])
   })
 
   it('keeps a working sign-in until a new one completes', async () => {

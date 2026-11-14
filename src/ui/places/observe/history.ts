@@ -51,7 +51,7 @@ export function historyState(row: Pick<HistoryRow, 'kind' | 'state' | 'mergedAt'
       case 'neutral': return { state: 'done', word: 'Done · Neutral', settled: true }
       case 'failure': return { state: 'failed', word: 'Failed', settled: true }
       case 'timed_out': return { state: 'failed', word: 'Failed · Timed out', settled: true }
-      case 'action_required': return { state: 'needs-you', word: 'Needs you · Action required', settled: false }
+      case 'action_required': return { state: 'blocked', word: 'Blocked · Action required', settled: false }
       case 'cancelled': case 'skipped': case 'stale': return { state: 'idle', word: `Idle · ${capital(row.state)}`, settled: true }
       default: return { state: 'idle', word: capital(row.state.replace(/_/g, ' ')) || 'Unknown', settled: true }
     }

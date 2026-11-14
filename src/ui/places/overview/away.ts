@@ -1,21 +1,18 @@
 // The bell away from Overview (#556: the bell on every view counts what the
 // level shows). On Overview, Answer here hands over its own entries; on every
-// other place this reads the same sources, once a minute while the tab is in
+// other place this reads the counted sources, once a minute while the tab is in
 // front, and counts them the way Answer here does. A failed read keeps the last
 // and says so under Answer here's own words, so the count is never silently stale.
 import { getBehaviorDiagnostics, refreshState } from '../../../behaviors'
 import { chatClient } from '../../../chat-client'
 import { LOCAL_NOTICE_KINDS, noticeFeed } from '../../../notices'
 import { notificationItems, type ChainAttentionRow } from '../../../notification-items'
-import { decisionEntries, foldWaiting, itemEntries, prStatusesFrom, requestEntries, requestsFrom, threadEntries, undismissed, type DecisionItem, type Entry, type OpenRequest, type Publication, type PrStatuses, type ThreadReview } from './entries'
+import { decisionEntries, itemEntries, prStatusesFrom, requestEntries, requestsFrom, undismissed, type DecisionItem, type OpenRequest, type PrStatuses } from './entries'
 import type { Group } from './level'
 import { json, reason } from './util'
 
 let requests: readonly OpenRequest[] = []
 let decisions: readonly DecisionItem[] = []
-let publications: Publication[] = []
-/** Each document's open threads as entries, read once per change of its count; null while unread. */
-const threadsRead = new Map<string, { openThreads: number, checkedAt: string | null, entries: Entry[] | null }>()
 /** Put-away entries Answer here keeps (server/answer-dismissals.ts): key → revision. */
 let dismissals = new Map<string, string>()
 let attention: ChainAttentionRow[] = []
@@ -34,19 +31,13 @@ export function awayGroups(): Group[] {
   const feed = noticeFeed.current
   const notices = feed.notices.filter((notice) => feed.enabled || (LOCAL_NOTICE_KINDS as readonly string[]).includes(notice.kind))
   const items = notificationItems(notices, getBehaviorDiagnostics(), Date.now(), attention)
-  const entries = undismissed(foldWaiting([...itemEntries(items, noRole, chains, prs, Date.now()), ...requestEntries(requests, noRole), ...decisionEntries(decisions, noRole)]), dismissals)
-  // A document's open threads, as its sweep counts them, less those put away at
-  // what they report now: a reply, or a thread its cache does not list, counts.
-  const threads = publications.reduce((sum, publication) => {
-    const entries = threadsRead.get(publication.slug)?.entries ?? []
-    const putAway = entries.length - undismissed(entries, dismissals).length
-    return sum + Math.max(0, publication.openThreads - putAway)
-  }, 0)
-  return [...entries.map((entry) => entry.group), ...Array<Group>(threads).fill('needs-you')]
+  return undismissed([
+    ...itemEntries(items, noRole, chains, prs, Date.now()), ...requestEntries(requests, noRole), ...decisionEntries(decisions, noRole),
+  ], dismissals).map((entry) => entry.group)
 }
 
 /** A place's own reads go first: the bell reads a moment after whatever asked
- *  for it, so a load or a move never has its five sources compete with the
+ *  for it, so a load or a move never has its sources compete with the
  *  reads that draw the place. */
 export const AWAY_READ_DELAY_MS = 2_500
 
@@ -60,10 +51,9 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     if (reading || !away() || document.visibilityState !== 'visible' || Date.now() - readAt < 60_000) return
     reading = true
     readAt = Date.now()
-    const [r, b, v, c, , d, p] = await Promise.allSettled([
+    const [r, b, c, , d, p] = await Promise.allSettled([
       json('/api/chat/requests'),
       chatClient.switchboard(),
-      json<{ publications?: Publication[] }>('/api/editor/reviews'),
       json<{ chains?: { id: string, sequence: number, held: string | null }[], attention?: ChainAttentionRow[] }>('/api/behavior-chains?state=active'),
       refreshState(),
       json<{ dismissals?: { key: string, revision: string }[] }>('/api/answers/dismissals'),
@@ -76,22 +66,6 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     if (requestsRead) requests = requestsRead.requests
     const items = b.status === 'fulfilled' ? (b.value as { items?: unknown } | null)?.items : null
     if (Array.isArray(items)) decisions = items as DecisionItem[]
-    const read = v.status === 'fulfilled' ? v.value.publications : null
-    if (Array.isArray(read)) {
-      publications = read.filter((publication) => typeof publication?.slug === 'string' && (publication.openThreads ?? 0) > 0)
-      for (const slug of threadsRead.keys()) if (!publications.some((publication) => publication.slug === slug)) threadsRead.delete(slug)
-      await Promise.all(publications.map(async (publication) => {
-        const before = threadsRead.get(publication.slug)
-        // Read again when the sweep checked it since: a reply brings a put-away thread back.
-        if (before?.entries && before.openThreads === publication.openThreads && before.checkedAt === publication.checkedAt) return
-        try {
-          const cached = await json<{ reviews?: ThreadReview[] }>(`/api/editor/doc/${encodeURIComponent(publication.slug)}/reviews`)
-          threadsRead.set(publication.slug, { openThreads: publication.openThreads, checkedAt: publication.checkedAt, entries: Array.isArray(cached.reviews) ? threadEntries(publication, cached.reviews, () => '') : null })
-        } catch {
-          threadsRead.set(publication.slug, { openThreads: publication.openThreads, checkedAt: publication.checkedAt, entries: null })
-        }
-      }))
-    }
     const putAway = d.status === 'fulfilled' ? d.value.dismissals : null
     if (Array.isArray(putAway)) dismissals = new Map(putAway.map((row) => [row.key, row.revision]))
     const chainsRead = c.status === 'fulfilled' && Array.isArray(c.value.chains) && Array.isArray(c.value.attention) ? c.value : null
@@ -101,7 +75,6 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
     }
     report('overview-requests', 'Your chats’ requests could not be read', failed(r, !!requestsRead))
     report('overview-switchboard', 'The Switchboard’s decisions could not be read', failed(b, Array.isArray(items)))
-    report('overview-reviews', 'Review threads could not be read', failed(v, Array.isArray(read)))
     report('overview-dismissals', 'Put-away entries could not be read', failed(d, Array.isArray(putAway)))
     report('overview-chains', 'Attention evidence unavailable', failed(c, !!chainsRead))
     let prsError = p.status === 'rejected' ? reason(p.reason) : ''

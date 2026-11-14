@@ -21,7 +21,7 @@ from uuid import UUID
 from pathlib import Path
 from time import monotonic
 
-from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, ReviewVerdictError, actor, bounded_cause, expected_head, pr_ref, provider_blocked
+from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, ReviewVerdictError, actor, bounded_cause, credential_rejected, expected_head, pr_ref, provider_blocked
 from .atoms import packet as fetch_packet
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
@@ -65,14 +65,18 @@ def provider_failure(message: str, *, provider: str = "provider", phase: str = "
         bounded = bounded_cause(cause or f"{provider} refused the review")
         raise AgentPreflightError(bounded, "review_provider_blocked",
                                   _diagnostic(provider, phase, exit_code=exit_code, signal=signal, cause=bounded))
+    # Classify the provider's own cause before credential redaction can
+    # hide natural-language words such as "token was".
+    code = "authentication_failed" if provider == "codex" and credential_rejected(cause) else "review_provider_exit"
     bounded = bounded_cause(cause or f"{provider} exited {exit_code}")
-    raise AgentPreflightError(f"{provider} review failed: {bounded}", "review_provider_exit",
+    raise AgentPreflightError(f"{provider} review failed: {bounded}", code,
                               _diagnostic(provider, phase, exit_code=exit_code, signal=signal, cause=bounded))
 
 
 def provider_error(provider: str, message: str, *, phase: str = "provider_execution") -> None:
+    code = "authentication_failed" if provider == "codex" and credential_rejected(message) else "review_provider_error"
     bounded = bounded_cause(message)
-    raise AgentPreflightError(f"{provider} review failed: {bounded}", "review_provider_error",
+    raise AgentPreflightError(f"{provider} review failed: {bounded}", code,
                               _diagnostic(provider, phase, cause=bounded))
 
 
@@ -752,6 +756,17 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
 
 
 # ── Codex ─────────────────────────────────────────────────────────────
+# Verified against Codex CLI 0.169.0 (deploy/runtime installs
+# @openai/codex@latest unpinned): ChatGPT sign-in lives in
+# $CODEX_HOME/auth.json; a refresh rewrites that same file (atomic
+# temp-file + rename under $CODEX_HOME/auth.json.lock); `codex exec
+# --ephemeral` still resolves and persists auth there; auth and history
+# share CODEX_HOME, so no supported shared-auth mode preserves isolation.
+# Caller copies the sign-in in once per run and never writes back: the
+# isolated file is worker-writable (issue/atomic run danger-full-access),
+# and same-account forged JSON is indistinguishable from a genuine
+# rotation, so any copy-back could replace the sign-in. Cross-Call
+# persistence stays explicitly unresolved under #1797.
 def codex_environment(root: Path) -> dict:
     env = os.environ.copy()
     for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
@@ -766,19 +781,18 @@ def codex_environment(root: Path) -> dict:
     original = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
     auth = original / "auth.json"
     if original.resolve() != home.resolve() and auth.is_file():
-        shutil.copyfile(auth, home / "auth.json")
-        (home / "auth.json").chmod(0o600)
+        target = home / "auth.json"
+        if not target.exists():
+            # Copy once: a later fragment, inspection round or file group
+            # keeps this run's rotated credential instead of re-copying the
+            # older original over it.
+            shutil.copyfile(auth, target)
+            target.chmod(0o600)
     env["CODEX_HOME"] = str(home)
     return env
 
 
-def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, watch: ReviewWatch, timeout: float) -> str:
-    output = root / "verdict.json"
-    output.unlink(missing_ok=True)
-    prompt = f"{system}\n\n{text}"
-    state_path = root / "codex-session.json"
-    state = json.loads(state_path.read_text()) if state_path.exists() else None
-    same_prefix = (state is not None and state["prefix_digest"] == sha256(prompt[:state["prefix_length"]].encode()).hexdigest())
+def codex_command(model: Model) -> list[str]:
     args = [
         os.getenv("CODEX_CLI", "codex"), "exec",
         "--ignore-user-config", "--ignore-rules",
@@ -791,8 +805,6 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
         "-c", 'web_search="disabled"',
         "-c", "project_doc_max_bytes=0",
         "-c", "skills.include_instructions=false",
-        "--output-schema", str(root / "verdict.schema.json"), "--output-last-message", str(output),
-        "--json",
     ]
     # No shell, connectors, extensions, or delegated agents. The empty
     # work directory also prevents loading PR checkout instructions.
@@ -800,6 +812,35 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
                     "multi_agent", "browser_use", "computer_use", "image_generation",
                     "code_mode", "code_mode_host", "skill_search"):
         args.extend(["--disable", feature])
+    return args
+
+
+def verify_codex_login(root: Path, model: Model) -> int:
+    if model.provider != "codex":
+        raise ValueError("Codex sign-in verification requires a Codex model")
+    original = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
+    env = codex_environment(root)
+    done = subprocess.run([*codex_command(model), "--ephemeral", "--json", "Reply with exactly OK. Do not use tools."],
+                          cwd=root, env=env, timeout=30)
+    if done.returncode:
+        return done.returncode
+    # A refresh left only in this disposable home cannot seed the next Call.
+    # Persistence belongs to #1822; never copy worker-writable credentials back.
+    isolated = Path(env["CODEX_HOME"]) / "auth.json"
+    if not original.is_file() or not isolated.is_file() or original.read_bytes() != isolated.read_bytes():
+        raise RuntimeError("Codex verification credentials are unavailable to the next Caller worker. Connect again in Settings → Accounts.")
+    return 0
+
+
+def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, watch: ReviewWatch, timeout: float) -> str:
+    output = root / "verdict.json"
+    output.unlink(missing_ok=True)
+    prompt = f"{system}\n\n{text}"
+    state_path = root / "codex-session.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else None
+    same_prefix = (state is not None and state["prefix_digest"] == sha256(prompt[:state["prefix_length"]].encode()).hexdigest())
+    args = [*codex_command(model), "--output-schema", str(root / "verdict.schema.json"),
+            "--output-last-message", str(output), "--json"]
     env = codex_environment(root)
     # Each review owns one fresh native conversation. Resume that exact ID
     # with only newly supplied inspection evidence, retaining the provider's
@@ -871,7 +912,12 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
         completed_turns = 0
         for event in events(done.stdout):
             if event.get("type") in {"error", "turn.failed"}:
-                provider_error("codex", event.get("message") or "Codex review did not complete successfully")
+                error = event.get("error")
+                messages = (error.get("message") if isinstance(error, dict) else error, event.get("message"))
+                cause = next((message.strip() for message in messages
+                              if isinstance(message, str) and message.strip()),
+                             "Codex review did not complete successfully")
+                provider_error("codex", cause)
             if event.get("type") == "turn.completed":
                 completed_turns += 1
                 if completed_turns > 1:

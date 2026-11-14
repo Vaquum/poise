@@ -506,7 +506,12 @@ its own instead of refusing with dirty_unowned.
   `poise.release` (the commit `deploy/lib.sh` built it from) and `poise.base`
   (a digest of the files that build the system around it:
   `deploy/runtime/Dockerfile`, `entrypoint.sh`, `install-clis.sh`,
-  `supervisor.mjs` and `install-release.sh`).
+  `supervisor.mjs`, `resource-witness.mjs` and `install-release.sh`, plus the
+  locked `node_modules/playwright-core` version and integrity from
+  `package-lock.json`). That package supplies Chromium's revision and browser
+  system dependencies. An unrelated dependency change keeps the same base;
+  a Playwright identity change takes the drained replacement path. Images from
+  before this browser identity was included take one replacement on introduction.
 - **The supervisor.** `entrypoint.sh` becomes `supervisor.mjs`, which runs
   Poise from `~/.poise/releases/current` when that release is installed for
   its base, and from the image's own release otherwise. When Poise exits with
@@ -659,7 +664,7 @@ computer.
   call it.
   The native command can also use the normal loopback Poise APIs under their
   existing policy. Creating-chat and worker relationships, the workspace Manager's role, inbox admission, supervision,
-  explicit issue/PR ownership, durable timers and their holds persist in the
+  explicit issue/PR ownership, pending owner escalations, durable timers and their holds persist in the
   workspace's SQLite store.
   Dispatch pauses while draining; running monitor reads join the existing
   background-work barrier. New observation passes, including queued follow-ups,
@@ -958,7 +963,8 @@ not use the gateway's discarded OAuth token.
   - Every read records sign-in alerts (`sign_in_needed`): one for an
     installed, configured CLI that says it is not signed in, and one each for
     the person's own account and the GitHub automation account while gh does
-    not hold it signed in. A provider with no configuration record raises no
+    not hold it signed in. A rejected saved GitHub account also raises one.
+    A provider with no configuration record raises no
     sign-in demand, and a stale demand clears once the provider reads as
     unconfigured. Status-based conditions clear once signed in again; Claude's alert stays its
     auth monitor's, gated on the same participation. In service mode Poise
@@ -967,11 +973,17 @@ not use the gateway's discarded OAuth token.
     A native Codex credential rejection raises the same condition immediately,
     retaining the affected stage, issue and redacted cause. It survives a status
     poll that still reports signed in. After a fresh successful Connect,
-    Accounts attempts one native verification (30 seconds, 64 KiB), forcing the
-    review's ChatGPT login route and removing API-key/base-URL overrides.
+    Accounts attempts one native verification (30 seconds, 64 KiB) through
+    Caller's `--verify-codex-login`, using the review's private credential home
+    and tool-free ChatGPT request options, without API-key/base-URL overrides.
+    Canonical-home success alone cannot clear the block. A refresh retained
+    only in the disposable home also cannot prove the next worker can sign in;
+    verification never writes its credentials back to the canonical sign-in.
     A successful response after the latest rejection clears the condition and
     permits one early review probe through existing admission. Failed
-    verification requires another Connect; a failed review probe cannot reuse
+    verification keeps its fixed typed reason in the existing sign-in
+    alert and requires another Connect; one completed during a failed
+    verification remains eligible. A failed review probe cannot reuse
     old recovery evidence. Successful native reviews on that route also prove
     recovery. Quota backoff and uncertain publication retain their own gates.
   - Participation: a provider takes part in model maintenance when
@@ -1227,8 +1239,8 @@ alerts once, and again only after it has cleared:
   an initial low reading. Recovery to 6 GB clears and rearms the warning so
   fluctuations near a threshold do not repeat it. Measurements and
   warnings never pause, reject or stop work;
-- a Claude or other provider sign-in is needed, or the person's own GitHub
-  account or the agent account is not signed in to gh;
+- a configured agent, GitHub, Google or extension account needs to sign in
+  again ([Connected accounts](Connected-accounts.md#alerts));
 - a behavior failed and is held, with a fresh alert when its cause materially
   changes even if the previous alert was dismissed. Repeats of the same cause
   remain deduplicated ([Notifications](Notifications.md));
@@ -1237,13 +1249,13 @@ alerts once, and again only after it has cleared:
   exhausted (`github_quota_exhausted`), while notifications are on. These use
   the same alert event envelope; [Notifications](Notifications.md#github-api-quota)
   defines their reset, recovery and dismissal behavior;
-- a Chat agent is waiting for a permission or an answer;
+- a Chat agent is waiting for the owner's permission or answer;
 - a Chat turn that ran longer than two minutes has finished;
 - a pull request of the person's own has become ready to merge, while
   notifications are on ([Notifications](Notifications.md)).
 
-With the browser open, Overview's *Answer here* shows the unresolved alerts too,
-and the bell on every place counts them.
+With the browser open, Overview's *Answer here* and the bell apply the
+[selected notification level](Notifications.md#answer-here).
 
 **Poise Link** runs on macOS, Windows and Linux from one Tauri codebase.
 - **First run:** asks for the server address, runs device pairing, keeps the
@@ -1297,8 +1309,10 @@ The supporting reads behind those names:
 - `GET /api/behavior-estimates`: each running behavior run with its remaining
   time from similar runs (same behavior and model, last 30 days, at least
   five); an overrun reads `overrun`, never below zero.
-- `GET /api/chat/requests`: every open chat request with a revision, kept
-  current by the `chatRequests.updated` frame.
+- `GET /api/chat/requests`: up to 200 open chat requests with a revision,
+  kept current by the `chatRequests.updated` frame. `ownerAction` identifies
+  requests for the owner and sorts them first. `escalation` carries the
+  Manager's reason when it escalates a pending question.
 - `GET /api/notices/handled?since=<ISO>`: the append-only handling log, kept
   30 days from each entry's time. It answers from the stored log at once and
   starts the notices check without waiting for it, so what that check
@@ -1570,8 +1584,8 @@ and its native close receipt; summaries expose that evidence separately from
 `mergeSha`. Original writes and native resources must settle first. Unclear or
 independent work remains open with its decision visible. The existing Caller
 action performs head-checked retirement; a lost close response stays uncertain.
-The normal-work page precedes due quiescent
-reconciliation; observation failures remain reported after unrelated progress.
+The normal-work and due quiescent reconciliation pages alternate first use of
+the shared sweep budget; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
 operation or authority; a deliberate wait keeps GitHub facets unknown without
@@ -1595,8 +1609,15 @@ the delivered main recovery with validation of every original failing test and
 case. Relay assertions remain held for #1619 until the runner establishes their
 inventory independently of candidate-controlled reports.
 The journal admits one fresh implementation for that automatic hold and recovery
-commit, independently of report publishing. Missing original evidence and later
-operator holds retain their authority; no gateway route or new poller is added.
+commit, independently of report publishing. An incomplete original assertion can
+instead use the saved automatic hold report and linked delivered fixture fix for
+a persisted clean-base recheck, requiring reproduction on the old base and an
+executed pass on the corrected base. Execution and result persistence run outside
+the observation sweep under the existing release/shutdown background barrier;
+a later sweep freshly verifies the saved pass. This uses the same single-retry
+admission and normal validation gates, as defined in [bounded reconciliation](Behavior-chain.md#bounded-reconciliation).
+Unverified rechecks and later operator holds retain their authority; no gateway
+route or new poller is added.
 
 The first `/api/behavior-chains` list page also includes read-only `attention`
 across all active chain pages. It joins durable progress age, holds, exact-head
@@ -1659,6 +1680,10 @@ Poise's existing log decoder validates the fence's exact terminal no-effect
 shape and native resource-release timestamp before the journal can settle its
 reservation. Closed-target native resource waits are separate from public
 GitHub recheck times; unrelated open-PR review/approval stays eligible.
+An in-flight managed issue review whose final live seed read observes closure
+settles superseded without a PR head or publication plan. The reader accepts this
+unattempted receipt while retaining its original resource-release requirement;
+[Issue review](Issue-review.md) defines the publication race and reconciliation.
 Managed native admissions recheck the bounded receipt reader at their final
 launch, action and publication boundaries. Its independent diagnostics retain
 the first typed SQLite cause and affected workspace; confirmed integrity failure
@@ -1809,6 +1834,15 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Their own implementation additionally requires an explicit disposition through
+the existing guarded chain control, bound to the authenticated report, native
+issue review, reviewed revision and original source hold/Call. Source-only and
+missing or stale dispositions wait without starting report implementation;
+a verified distinct-fix disposition retains ordinary admission gates, including
+fresh source verification after preparation. Diagnosis and next action persist
+on the held source through the existing report metadata and journal waits.
+This adds no retry or checkout-retention authority; see
+[report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
 The existing linked remediation also exposes bounded private source evidence
 from the original failed validation capture, retained through normal checkout
 cleanup under the workspace's incident-artifact lifecycle. Only its availability

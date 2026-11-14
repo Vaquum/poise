@@ -15,7 +15,8 @@ import { BehaviorResourceRecovery } from '../../server/behavior-chain-resource-r
 
 const wire = readFileSync(process.argv[2], 'utf8')
 const mode = process.argv[3] ?? 'fence'
-assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked', 'atomic-work-failed', 'atomic-merged-repair', 'ancestor-recovery'].includes(mode))
+assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked', 'atomic-work-failed', 'atomic-merged-repair', 'ancestor-recovery', 'issue-review-closed'].includes(mode))
+const closedIssueReview = mode === 'issue-review-closed'
 const atomic = mode.startsWith('atomic-')
 const mergedRepair = mode === 'atomic-merged-repair'
 const blocked = mode === 'atomic-work-blocked'
@@ -38,8 +39,9 @@ assert.ok(behavior)
 const db = new Database(':memory:')
 try {
   const journal = new BehaviorChainJournal(db)
-  const id = chainIdentity(call.repo, 7)
-  let chain = journal.append(id, 'seed', 0, { type: 'chain.admitted', repository: call.repo, issue: 7,
+  const issue = closedIssueReview ? Number(call.pr_id) : 7
+  const id = chainIdentity(call.repo, issue)
+  let chain = journal.append(id, 'seed', 0, { type: 'chain.admitted', repository: call.repo, issue,
     branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' })
   chain = journal.append(id, 'admit', chain.sequence, { type: 'invocation.admitted', invocation: { id: call.correlation_id,
     behavior, actor: call.actor, model: direct ? null : call.model, slot: direct ? null : 'primary', basis: 'original-contract-admission',
@@ -66,9 +68,12 @@ try {
         failing: [], conflict: false, behind: false } : null }),
     available: () => blocked, capacity: () => 1, permitted: () => blocked, received: () => {}, request: forbidden, launch: forbidden,
     perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {} }
-  if (atomic) {
-    const pending = JSON.stringify(JSON.parse(wire).map((row: Record<string, unknown>) => ({ ...row, resources_settled_at: null })))
-    operations.readInvocations = async () => parseAgentLogStdout(pending, 'actual timeout awaiting resource release')
+  if (atomic || closedIssueReview) {
+    const pending = closedIssueReview ? readFileSync(process.argv[4], 'utf8')
+      : JSON.stringify(JSON.parse(wire).map((row: Record<string, unknown>) => ({ ...row, resources_settled_at: null })))
+    const pendingSnapshot = parseAgentLogStdout(pending, 'actual receipt awaiting resource release')
+    assert.equal(pendingSnapshot.quarantined.length, 0, JSON.stringify(pendingSnapshot.quarantined))
+    operations.readInvocations = async () => pendingSnapshot
     await new BehaviorChainRuntime(journal, operations).run()
     assert.equal(journal.read(id)!.invocations[0].state, 'uncertain')
     assert.deepEqual(journal.read(id)!.invocations[0].evidence?.diagnostic ?? null, call.diagnostic)
@@ -111,6 +116,12 @@ try {
   assert.equal(current.invocations[0].state, pending || interrupted ? 'uncertain' : 'settled')
   if (mode === 'fence') assert.equal(current.invocations[0].outcome, 'target_closed')
   if (mode === 'released' || mode === 'recovered') assert.equal(current.invocations[0].outcome, 'commented')
+  if (closedIssueReview) {
+    assert.equal(current.invocations[0].outcome, 'superseded')
+    assert.equal(current.invocations[0].evidence?.error_code, 'review_target_closed')
+    assert.equal(current.invocations[0].evidence?.issue_revision, call.issue_revision)
+    assert.equal(current.invocations.length, 1)
+  }
   if (physical) {
     assert.equal(current.invocations[0].outcome, 'original effect remains uncertain')
     assert.equal(current.invocations[0].callId, null)
@@ -160,6 +171,14 @@ try {
       assert.equal(page.events[0].message, call.error)
       assert.equal(page.events[0].phase, call.diagnostic!.phase)
       assert.equal(page.events[0].correlationId, call.correlation_id)
+      const raw = JSON.parse(wire)[0].diagnostic
+      for (const key of ['executable', 'exit_code', 'signal', 'submission', 'message']) {
+        assert.equal(call.diagnostic!.context[key], raw[key] ?? null)
+      }
+      assert.equal(page.events[0].exitCode, raw.exit_code ?? null)
+      assert.equal(page.events[0].signal, raw.signal ?? null)
+      assert.equal(page.events[0].context.executable, raw.executable ?? null)
+      assert.equal(page.events[0].stderr, raw.stderr ?? null)
     }
     if (blocked) {
       assert.equal(current.held, call.error)

@@ -520,6 +520,55 @@ describe('bounded behavior ledger transport', () => {
     expect(page.body.records!.some((record) => record.target.number === 1)).toBe(true)
   })
 
+  it('retries a rolled-back 503 capture batch in order without splitting or loss', async () => {
+    const observer = await fixture(`
+      import { appendFileSync, existsSync, watch } from 'node:fs';
+      let first=true, rejected=false;
+      port.postMessage({ready:true,captureBatch:true,health,pending:[]});
+      port.on('message',request=>{
+        const reply=(status=200)=>port.postMessage({id:request.id,status,body:{version:1,health,
+          ...(status===503?{error:'ledger_unavailable'}:{})},pending:[]});
+        if(request.operation!=='capture') { reply(); return; }
+        const observations=request.observations??[request.observation];
+        appendFileSync(new URL('./dispatches',import.meta.url),observations.length+'\\n');
+        if(observations.length>1&&!rejected) { rejected=true; reply(503); return; }
+        const accept=()=>{
+          for(const observation of observations) {
+            if(observation.type==='loss') health.dropped+=observation.count;
+            else {
+              appendFileSync(new URL('./accepted',import.meta.url),observation.nativeId+'\\n');
+              health.instances++;
+            }
+          }
+          reply();
+        };
+        if(!first) { accept(); return; }
+        first=false;
+        const release=new URL('./release',import.meta.url);
+        let released=false;
+        const watcher=watch(new URL('.',import.meta.url),()=>check());
+        function check() {
+          if(released||!existsSync(release)) return;
+          released=true; watcher.close(); accept();
+        }
+        check();
+      });`)
+    const directory = directories.at(-1)!
+    const release = join(directory, 'release')
+    const nativeIds = Array.from({ length: 25 }, (_, index) => `retry-${index}`)
+    try {
+      for (const nativeId of nativeIds) observer.capture({ ...admission, nativeId, admissionKey: nativeId })
+      expect(observer.snapshot().pending).toBe(25)
+      await writeFile(release, '')
+      await vi.waitFor(() => {
+        expect(observer.snapshot()).toMatchObject({ pending: 0, unreportedLoss: 0,
+          health: { status: 'ok', pending: 0, dropped: 0, instances: 25, gaps: [] } })
+      }, { timeout: 5000, interval: 25 })
+      expect((await readFile(join(directory, 'dispatches'), 'utf8')).trim().split('\n').map(Number)).toEqual([1, 24, 24])
+      expect((await readFile(join(directory, 'accepted'), 'utf8')).trim().split('\n')).toEqual(nativeIds)
+    } finally { await writeFile(release, '') }
+  })
+
   it('queues overflow while the worker drains and spills only once the queue stalls', async () => {
     const observer = await fixture(`
       import { existsSync, watch } from 'node:fs';

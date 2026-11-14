@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { CheckSemaphore } from '../server/check-semaphore'
@@ -664,4 +664,152 @@ it.each([
   expect(launches().filter((args) => args.includes('#17'))).toHaveLength(3)
   expect(launches().filter((args) => args.includes('#18'))).toHaveLength(3)
   expect(behaviors.getBehaviorFailureState('review-new-prs', checkTarget)).toBeNull()
+})
+
+it('defers a stalled review checkout with one Error and launches the same head on retry', async () => {
+  arrangeCli(false)
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const { database, behaviors } = await loadModules()
+  database.setMeta('me', 'poise-user')
+  database.setMeta('behavior_review_new_prs_keyver', '3')
+  database.setMeta('behavior_review_new_prs_enabled', '1')
+  database.recordSeen('review-new-prs', '__snapshot_v3__')
+  behaviors.startBehaviorsRuntime()
+  vi.stubEnv('CALLER_BIN_ROOT', fixture.tempRoot)
+  writeFileSync(join(fixture.tempRoot, 'github-interface'), `#!${process.execPath}
+process.stdout.write('private-output')
+process.stderr.write('delayed checkout\\nAuthorization: Bearer [REDACTED]\\n')
+setInterval(() => {}, 1000)
+`, { mode: 0o700 })
+  const original = mocks.runFile.getMockImplementation()!
+  let failing = true
+  mocks.runFile.mockImplementation((command: string, args: string[], options: RunFileOptions) => {
+    if (command === 'agent-interface' && args[0] === '--diagnostics') return Promise.resolve({
+      stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+    })
+    if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+      const error = Object.assign(new Error('Command failed (1): github-interface'),
+        { code: 1, killed: false, signal: null, stdout: '',
+          stderr: `error: checkout not found under /fake/dev: ${args[1]}/${args[2]}\n` })
+      return Promise.reject(error)
+    }
+    if (failing && command === 'github-interface' && args[0] === '--checkout-repo') {
+      expect(options.timeoutMs).toBe(30_000)
+      return mocks.realRunFile!(command, args, { ...options, timeoutMs: 500 })
+    }
+    if (command === 'github-interface' && args[0] === '--checkout-repo') {
+      mkdirSync(args[3]!, { recursive: true })
+      return Promise.resolve({ stdout: JSON.stringify({ action: 'checkout_repo', repository: pr.repo, path: args[3] }), stderr: '' })
+    }
+    if (command === 'git') return Promise.resolve({
+      stdout: args[0] === 'remote' ? `https://github.com/${pr.repo}.git` : args[0] === 'rev-parse' ? HEAD_SHA : '', stderr: '',
+    })
+    return original(command, args, options)
+  })
+  logging = await import('../server/logging')
+  vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+  logging.startLogging()
+  const checkoutPath = join(fixture.tempRoot, 'review-checkouts', HEAD_SHA, pr.repo.toLowerCase())
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await behaviors.runEnabledBehaviorsOnce()
+    const retry = behaviors.getBehaviorFailureState('review-new-prs', CHECK)!
+    const recorded = events()
+    expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: expect.any(String) })
+    expect(Date.parse(retry.nextRetryAt)).toBeLessThanOrEqual(Date.now())
+    expect(recorded).toHaveLength(attempt + 1)
+    expect(new Set(recorded.map((event) => event.id)).size).toBe(attempt + 1)
+    expect(new Set(recorded.map((event) => event.correlationId)).size).toBe(attempt + 1)
+    const latest = recorded.find((event) => event.correlationId === retry.correlationId)!
+    expect(latest).toMatchObject({ operation: 'github-interface.checkout-repo', behavior: 'review-new-prs',
+      phase: 'checkout', severity: 'error', repository: pr.repo, target: TARGET, account: 'review-bot',
+      exitCode: null, signal: 'SIGKILL', timeoutMs: 30_000, correlationId: retry.correlationId,
+      stderr: expect.stringContaining('delayed checkout'),
+      context: expect.objectContaining({ slot: 'primary', expectedHead: HEAD_SHA, killed: true,
+        executable: join(fixture.tempRoot, 'github-interface'), configuredCommand: 'github-interface',
+        retry: expect.objectContaining({ consecutiveFailures: 1 }) }) })
+    expect(Number(latest.context.elapsedMs)).toBeGreaterThanOrEqual(500)
+    for (const secret of ['private-output', '--token-user', '--path', 'checkout not found']) {
+      expect(JSON.stringify(recorded)).not.toContain(secret)
+    }
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(database.listBehaviorLaunchClaims('review-new-prs')).toEqual([])
+    expect(database.db.prepare("SELECT target FROM behavior_seen WHERE key = 'pr-operation'").all()).toEqual([])
+    expect(behaviors.getBehaviorCheckSlots().stats()).toMatchObject({ running: 0, behaviorRunning: 0 })
+    expect(existsSync(checkoutPath)).toBe(false)
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: retry.correlationId, outcome: 'preflight_failed', state: 'failed', activity: 'settled',
+    }))
+  }
+  failing = false
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+  expect(mocks.spawnDetached.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA, '--pwd', checkoutPath]))
+  expect(existsSync(checkoutPath)).toBe(true)
+  expect(behaviors.getBehaviorFailureState('review-new-prs', CHECK)).toBeNull()
+  expect(events()).toHaveLength(2)
+})
+
+it('keeps the checkout failure when claim release throws', async () => {
+  arrangeCli(false)
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const { database, behaviors } = await loadModules()
+  database.setMeta('me', 'poise-user')
+  database.setMeta('behavior_review_new_prs_keyver', '3')
+  database.setMeta('behavior_review_new_prs_enabled', '1')
+  database.recordSeen('review-new-prs', '__snapshot_v3__')
+  behaviors.startBehaviorsRuntime()
+  vi.stubEnv('CALLER_BIN_ROOT', fixture.tempRoot)
+  writeFileSync(join(fixture.tempRoot, 'github-interface'), `#!${process.execPath}\nprocess.stdout.write('private-output')\nprocess.stderr.write('original checkout failure\\n')\nprocess.exitCode = 1\n`, { mode: 0o700 })
+  const original = mocks.runFile.getMockImplementation()!
+  let checkoutFailed = false
+  mocks.runFile.mockImplementation((command: string, args: string[], options: RunFileOptions) => {
+    if (command === 'agent-interface' && args[0] === '--diagnostics') return Promise.resolve({
+      stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+    })
+    if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+      const error = Object.assign(new Error('Command failed (1): github-interface'),
+        { code: 1, killed: false, signal: null, stdout: '',
+          stderr: `error: checkout not found under /fake/dev: ${args[1]}/${args[2]}\n` })
+      return Promise.reject(error)
+    }
+    if (command === 'github-interface' && args[0] === '--checkout-repo') {
+      checkoutFailed = true
+      return mocks.realRunFile!(command, args, options)
+    }
+    if (command === 'git') return Promise.resolve({
+      stdout: args[0] === 'remote' ? `https://github.com/${pr.repo}.git` : args[0] === 'rev-parse' ? HEAD_SHA : '', stderr: '',
+    })
+    return original(command, args, options)
+  })
+  const realReleaseSeen = database.releaseSeenOwned.bind(database)
+  const realReleaseOperation = database.releasePrOperationOwned.bind(database)
+  let claimThrown = false, operationThrown = false
+  vi.spyOn(database, 'releaseSeenOwned').mockImplementation(((...args: Parameters<typeof database.releaseSeenOwned>) => {
+    if (checkoutFailed && !claimThrown) { claimThrown = true; throw new Error('claim release failed') }
+    return realReleaseSeen(...args)
+  }) as typeof database.releaseSeenOwned)
+  vi.spyOn(database, 'releasePrOperationOwned').mockImplementation(((...args: Parameters<typeof database.releasePrOperationOwned>) => {
+    if (checkoutFailed && !operationThrown) { operationThrown = true; throw new Error('operation release failed') }
+    return realReleaseOperation(...args)
+  }) as typeof database.releasePrOperationOwned)
+  logging = await import('../server/logging')
+  vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+  logging.startLogging()
+  await behaviors.runEnabledBehaviorsOnce()
+  const recorded = events()
+  const checkout = recorded.filter((event) => event.operation === 'github-interface.checkout-repo')
+  expect(checkout).toEqual([expect.objectContaining({ behavior: 'review-new-prs',
+    phase: 'checkout', severity: 'error', repository: pr.repo, target: TARGET, exitCode: 1,
+    stderr: expect.stringContaining('original checkout failure'),
+    context: expect.objectContaining({ slot: 'primary', expectedHead: HEAD_SHA }) })])
+  expect(JSON.stringify(checkout)).not.toContain('private-output')
+  expect(recorded.some((event) => event.message === 'claim release failed')).toBe(true)
+  expect(recorded.some((event) => event.message === 'operation release failed')).toBe(true)
+  const retry = behaviors.getBehaviorFailureState('review-new-prs', CHECK)!
+  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: checkout[0]!.correlationId })
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+    nativeId: retry.correlationId, outcome: 'preflight_failed', state: 'failed', activity: 'settled',
+  }))
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  expect(behaviors.getBehaviorCheckSlots().stats()).toMatchObject({ running: 0, behaviorRunning: 0 })
 })

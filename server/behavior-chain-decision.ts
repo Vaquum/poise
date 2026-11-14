@@ -27,6 +27,7 @@ export interface ChainObservation extends Record<string, unknown> {
   ciDependency?: { invocationId: string, base: string, recovered: boolean }
   ciRecovery?: { invocationId: string, removal: string, integration: string, recovered: boolean, reason: string }
   testDependency?: { invocationId: string, verified: boolean, recovered: boolean, reason?: string,
+    recheck?: string,
     recovery?: { merge: string, base: string, run: Record<string, unknown> } }
   prerequisites?: { wait: string | null, base: string | null, evidence: Record<string, unknown>[] }
   ciBaseUpdate?: { from: string, head: string, base: string, tree: string }
@@ -163,6 +164,7 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
     || !validReviewResponse(response, { repository: chain.repository, number: pull.number, head: pull.head,
       actor: invocation.actor, callId: invocation.callId, model: invocation.model, context: pull.reviewContext,
       incompleteFindings: evidence.action === 'requested_changes' && evidence.outcome === 'incomplete',
+      legacyNegative: evidence.action === 'requested_changes' && evidence.outcome === 'changes_requested',
       recoveryModel: recoveryIndex >= 0 ? invocation.request.argv[recoveryIndex + 1] : null,
       startedAt: invocation.admittedAt, completedAt: Number(evidence.completedAt) }, now)
     || chainBasis(response) !== chainBasis(review.response) || typeof review.submittedAt !== 'number' || !Number.isFinite(review.submittedAt)

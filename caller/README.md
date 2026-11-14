@@ -46,7 +46,12 @@ reads its state and linked closing PRs, including closed PRs. It returns
 verified on that exact base by GitHub's commit comparison; missing or incomplete
 evidence returns an explicit unverified reason. The result retains the base, PR
 number and merge SHA. [Dependency waits](../docs/Behavior-chain.md#handoffs-and-outcomes)
-preserve ordinary chain holds and admission gates.
+preserve ordinary chain holds and admission gates. Before the first push,
+`--issue-work --mode publish` re-verifies those same live prerequisites on
+`--starting-head` (the prepared candidate base, not current main); a new
+unresolved dependency or incomplete evidence returns `prerequisite_wait`
+without committing, pushing or opening a PR. Already pushed branches still
+reconcile through `--mode complete`.
 `github-interface --list-failing-ci PR --repository OWNER/REPO --ref SHA`
 includes the exact commit's checks, parent SHAs and workflow identities while
 retaining the current candidate head. `--ref base` reads the current base.
@@ -75,7 +80,8 @@ seeds. `--chain-seed` retains the pinned Git trees and distinct covering merge;
 the close action rechecks the current head and base. Independent work and
 unverified coverage retain ordinary processing. The source issue is untouched.
 
-An atomic repair blocked solely by the supplied head's failed CI can return
+An atomic repair blocked solely by failed CI on the supplied PR head or a
+verified merge-group integration can return
 `blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains
 its own supplied CI snapshot as `artifact.ci_blocker`, including the failed
 check and job IDs that identify the original run attempt. Other blockers remain

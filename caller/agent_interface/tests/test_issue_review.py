@@ -120,16 +120,17 @@ class IssueReviewCase(TestCase):
             self.addCleanup(target.stop)
         agent_interface.init_db()
 
-    def run_review(self, github, supervise, model="opus-5-max", recovery=None, expect_exit=False, expected=None, correlation="claim-1"):
+    def run_review(self, github, supervise, model="opus-5-max", recovery=None, expect_exit=False, expected=None, correlation="claim-1",
+                   source="poise:review-new-issues"):
         with patch.object(issue_review, "interface", github), patch.object(issue_review, "supervise", supervise), \
                 redirect_stdout(io.StringIO()) as output:
             if expect_exit:
                 with self.assertRaises(SystemExit):
-                    agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", correlation,
+                    agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", source, correlation,
                                                      model, recovery, note="Remember the charts.",
                                                      expected_issue_revision=expected)
             else:
-                agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", correlation,
+                agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", source, correlation,
                                                  model, recovery, note="Remember the charts.",
                                                  expected_issue_revision=expected)
         with agent_interface.db() as conn:
@@ -334,6 +335,83 @@ class TestIssueReviewRun(IssueReviewCase):
 
 
 class TestRevisionBoundReview(IssueReviewCase):
+    def test_managed_reviews_observe_closure_before_publication_and_retain_cleanup_ownership(self):
+        for source in ("poise:review-new-issues", "poise:behavior-chain"):
+            for state in ("open", "closed"):
+                with self.subTest(source=source, state=state):
+                    github = FakeGitHub()
+                    expected = issue_review.revision(github.issues[452])
+
+                    def supervise(args, **kwargs):
+                        github.issues[452]["state"] = state
+                        return agent_writes({"comments": [{"issue": "#452", "body": "One."},
+                                                          {"issue": "#453", "body": "Two."}]})(args, **kwargs)
+
+                    pending = []
+                    cleanup = resource_ownership.cleanup_remaining
+
+                    def capture_cleanup(database, call_id, **kwargs):
+                        if not pending:
+                            pending.extend(entry for entry in agent_interface.logs() if entry["id"] == call_id)
+                        return cleanup(database, call_id, **kwargs)
+
+                    result = []
+
+                    def execute():
+                        # Exercise the original CLI finalizer with the historical
+                        # library resource receipt; namespace delivery has its own tests.
+                        # The host process table is not part of this closure proof.
+                        with patch.object(agent_interface, "_native_cli", False), \
+                                patch.object(issue_review, "_cwd_pids", return_value=[]):
+                            result.append(self.run_review(github, supervise, expected=expected, source=source,
+                                                          correlation=f"{source}:{state}"))
+
+                    with patch.object(resource_ownership, "cleanup_remaining", side_effect=capture_cleanup):
+                        if source == "poise:behavior-chain":
+                            with patch.object(sys, "argv", ["agent-interface", "--issue-review", f"{REPO}#452", "--source", source]), \
+                                    patch.object(agent_interface, "_main", side_effect=execute):
+                                agent_interface.main()
+                        else:
+                            execute()
+                    row, printed = result[0]
+                    exported = self.exported(row)
+                    self.assertEqual(exported["issue_revision"], expected)
+                    posted = [call for call in github.calls if call[0] == "--comment-issue"]
+                    if state == "open":
+                        self.assertEqual((row["status"], row["outcome"], row["action"]), ("completed", "commented", "commented"))
+                        self.assertEqual(len(posted), 2)
+                    else:
+                        self.assertEqual((row["status"], row["outcome"], row["action"], row["error_code"]),
+                                         ("superseded", "superseded", None, "review_target_closed"))
+                        self.assertEqual(printed["outcome"], "superseded")
+                        self.assertIsNone(exported["receipts"])
+                        self.assertEqual(posted, [])
+                        if source == "poise:behavior-chain":
+                            self.assertEqual(exported["artifact"]["phase"], "reviewing")
+                            self.assertNotIn("plan_sha", exported["artifact"])
+                            self.assertIsNone(pending[0]["resources_settled_at"])
+                            self.assertIsNotNone(exported["resources_settled_at"])
+                            self.assert_closed_review_projection(pending, exported)
+
+    def assert_closed_review_projection(self, pending, exported):
+        repo = Path(__file__).resolve().parents[3]
+        output = repo / "test-results"
+        output.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="closed-issue-review-", dir=output) as work:
+            root = Path(work)
+            environment = {"PATH": os.environ["PATH"], "HOME": self.work.name, "TMPDIR": work}
+            wire, original = root / "caller.json", root / "pending.json"
+            wire.write_text(json.dumps([exported]))
+            original.write_text(json.dumps(pending))
+            build = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"),
+                                    str(repo / "tests/fixtures/behavior-fence-contract.ts"), "--bundle", "--platform=node",
+                                    "--packages=external", "--format=esm", "--target=node22", f"--outfile={root / 'contract.mjs'}"],
+                                   cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            projected = subprocess.run(["node", str(root / "contract.mjs"), str(wire), "issue-review-closed", str(original)],
+                                       cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(projected.returncode, 0, projected.stderr)
+
     def assert_superseded_projection_and_replacement(self, row, github):
         original = dict(row)
         exported = self.exported(row)
@@ -1263,8 +1341,9 @@ class TestVerifiedResultsOrExplicitFailures(IssueReviewCase):
         def flaky(*args: str, seconds: float = 120):
             calls.append(args)
             if args[0] == "--comment-issue":
+                github.issues[452]["state"] = "closed"
                 raise subprocess.TimeoutExpired(list(args), seconds)
-            if args[0] == "--issue-comments":
+            if args[0] == "--issue-comments" and github.issues[452]["state"] == "closed":
                 call_id = github.last_call_id
                 return {"comments": [{"id": 777, "author": ACTOR,
                                       "body": f"hello\n\n<!-- agent-interface issue-review call={call_id} -->",
@@ -1279,12 +1358,17 @@ class TestVerifiedResultsOrExplicitFailures(IssueReviewCase):
             github.last_call_id = call_id
             return call_id
 
-        with patch.object(agent_interface, "track", side_effect=tracking):
-            row, printed = self.run_review(flaky, agent_writes(review))
+        # The host process table is not part of this reconciliation proof.
+        with patch.object(agent_interface, "track", side_effect=tracking), \
+                patch.object(issue_review, "_cwd_pids", return_value=[]):
+            row, printed = self.run_review(flaky, agent_writes(review), source="poise:behavior-chain",
+                                          expected=issue_review.revision(github.issues[452]))
         exported = self.exported(row)
         self.assertEqual(exported["status"], "completed")
         self.assertEqual(exported["receipts"], [{"issue": f"{REPO}#452", "comment_id": 777,
                                                  "url": "https://example.test/c/777", "author": ACTOR}])
+        self.assertEqual(len([call for call in calls if call[0] == "--comment-issue"]), 1)
+        self.assertEqual(exported["artifact"]["phase"], "posting_issue_reviews")
 
     def test_unreconciled_posting_timeout_stays_uncertain_with_receipts_held(self):
         review = {"comments": [{"issue": f"{REPO}#452", "body": "hello"}]}

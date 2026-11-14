@@ -67,13 +67,13 @@ so its first report covers recent context rather than history.
 Every update names the chat it is about and the transcript event it rests on,
 which must still exist, and has one of four kinds:
 
-- **Needs you:** a question the chat asked you in its own words and is waiting
-  on. If the chat named its choices, the update carries them, up to four, in
+- **Needs you:** a pending question explicitly addressed to you in a chat
+  you started. If the chat named its choices, the update carries them, up to four, in
   its words and order, its recommendation first; an open question carries
   none.
-- **Blocked:** the chat cannot go on without something outside it. A question
-  or permission shown as a card in the chat itself is reported as blocked,
-  "waiting for your answer in the chat", and you answer it there.
+- **Blocked:** the chat cannot go on without something outside it. Native
+  requests already have their own answer cards. Worker questions go through
+  the [Manager's escalation path](Chat-orchestration.md#authority).
 - **In progress:** a finding or step worth knowing.
 - **Done:** a completion, such as a merge.
 
@@ -105,8 +105,9 @@ one of the two closes the other, and Escape closes the one that is open.
   buttons, the chat's recommendation first and marked. **Something else…**
   takes your own words; ⌘↩ or Ctrl+↩ sends. If the chat has started turns
   since it asked, the card says the question may be out of date. Other
-  decisions wait below as one-line rows, and each answer you gave in the last
-  ten minutes stays listed with where it is.
+  decisions wait below as one-line rows.
+- **Recent answers:** answers you gave in the last ten minutes, with their
+  delivery status.
 - **All chats:** one row per chat, with a lamp for its state, its latest
   update and how long ago that was. A chat whose last completion is more than
   45 minutes old is shown as quiet. A row opens to the chat's last five updates

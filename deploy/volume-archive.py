@@ -100,7 +100,7 @@ def add_file(tar, path, name, staging, skipped):
             except sqlite3.Error as error:
                 if getattr(error, 'sqlite_errorcode', 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                     raise RuntimeError(f'{path}: SQLite snapshot is busy or locked; refusing an unsafe live-file copy') from error
-                note(f'{path}: SQLite cannot read it ({error}), so it is archived as it is, with its -wal and -shm files')
+                raise RuntimeError(f'{path}: SQLite snapshot failed: {error}') from error
             else:
                 skipped.update(path + suffix for suffix in COMPANIONS)
                 info.size = os.path.getsize(copy)
