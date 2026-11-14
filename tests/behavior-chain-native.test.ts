@@ -688,14 +688,16 @@ it.each(['verified', 'edited merge', 'missing proof', 'wrong ref', 'wrong head',
     ])
   })
 
-it('retains a Caller-produced CI-only hold through settlement and restart, then recovers a same-head rerun', async () => {
+it.each(['rerun', 'conflict'])('retains a Caller-produced CI-only hold through settlement and restart, then recovers a %s', async mode => {
   const failedHead = 'fcea77111bf5842239e81afb5e069b1fafa78fd6'
   const failedCheck = { type: 'check_run', name: 'Unit & integration (1)', state: 'completed', conclusion: 'failure',
     check_run_id: 132038286724, log_id: 132038286724,
     url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286724' }
   const ci = { action: 'list_failing_ci', repository: chain.repository, pull_number: 21, head_sha: failedHead,
     checks: [failedCheck], failing: [failedCheck], mergeable: true, mergeable_state: 'clean' }
-  let green = false, wire = '[]', released = '', reviewers: typeof reviewer[] = []
+  let green = false, conflict = false, pending = false, ready = false, head = failedHead, publication: string | null = null
+  let wire = '[]', released = '', reviewers: typeof reviewer[] = []
+  const reviews: LogEntry[] = []
   mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
     if (command === 'agent-interface') {
       expect(argv[0]).toBe('--logs')
@@ -704,15 +706,20 @@ it('retains a Caller-produced CI-only hold through settlement and restart, then 
     const evidence: Record<string, unknown> = {
       '--chain-seed': { repository: chain.repository, issue_number: 7, actor: 'author', branch: chain.branch,
         issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
-        publication: { existing_pulls: [], pull_number: 21, head_sha: failedHead, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
-      '--pull-action-state': { pull_number: 21, state: 'open', head_sha: failedHead, review_context: 'b'.repeat(64),
-        merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
-      '--pr-readiness': { head_sha: failedHead, draft: false, checks_state: green ? 'SUCCESS' : 'FAILURE',
-        reviewer_approved_current_head: false, unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0,
-        green: false, blockers: ['reviewer_not_approved_current_head', ...(green ? [] : ['checks_failed'])] },
-      '--list-failing-ci': green ? { ...ci, failing: [], checks: [{ ...failedCheck, conclusion: 'success',
+        publication: { existing_pulls: [], pull_number: 21, head_sha: head, head_invocation: publication, state: 'open', merged: false, merge_sha: null } },
+      '--pull-action-state': { pull_number: 21, state: 'open', head_sha: head, review_context: 'b'.repeat(64),
+        merged: false, queue_entry_id: null, queue_removals: [], my_reviews: reviews.map(review => ({ id: review.review_id,
+          commit_id: head, state: review.action === 'approved' ? 'APPROVED' : 'COMMENTED', invocation_id: review.id,
+          review_response: review.artifact!.review_response, submitted_at: review.completed_at })) },
+      '--pr-readiness': { head_sha: head, draft: false, checks_state: pending ? 'PENDING' : green ? 'SUCCESS' : 'FAILURE',
+        reviewer_approved_current_head: reviews.some(review => review.action === 'approved'), unresolved_live_conversation_count: 0,
+        unresolved_outdated_conversation_count: 0, green: ready, blockers: ['reviewer_not_approved_current_head', ...(green ? [] : ['checks_failed'])] },
+      '--list-failing-ci': pending ? { ...ci, head_sha: head, mergeable: true,
+        failing: [{ ...failedCheck, state: 'in_progress', conclusion: null }] }
+        : green ? { ...ci, head_sha: head, failing: [], checks: [{ ...failedCheck, conclusion: 'success',
         check_run_id: 132038286725, log_id: 132038286725,
-        url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286725' }] } : ci,
+        url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286725' }] }
+          : { ...ci, mergeable: conflict ? false : true, mergeable_state: conflict ? 'dirty' : 'clean' },
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
     return { stdout: JSON.stringify(evidence[argv[0]]) }
@@ -720,7 +727,7 @@ it('retains a Caller-produced CI-only hold through settlement and restart, then 
   const native = actionOperations({ roster: async () => ({ issueReviewers: [], prReviewers: reviewers,
     implementer: reviewer, repairer: reviewer, approver: reviewer }) })
   const launch = vi.fn<ChainRuntimeOperations['launch']>(async invocation => {
-    if (invocation.behavior === 'repair-pr') {
+    if (invocation.behavior === 'repair-pr' && wire === '[]') {
       const receipts = JSON.parse(execFileSync('python3', ['tests/fixtures/ci-only-repair.py'], {
         input: JSON.stringify({ argv: invocation.request.argv, ci }), encoding: 'utf8', timeout: 10_000,
         env: { ...process.env, PYTHONPATH: resolve('caller/agent_interface') },
@@ -768,7 +775,8 @@ it('retains a Caller-produced CI-only hold through settlement and restart, then 
     expect(journal.read(chain.id)).toEqual(settled)
     await runtime.run()
     expect(journal.history(chain.id)).toEqual(history)
-    green = true
+    green = mode === 'rerun'
+    conflict = mode === 'conflict'
     reviewers = [reviewer]
     vi.setSystemTime(journal.reconciliationAt(settled)!)
     await runtime.run()
@@ -776,9 +784,56 @@ it('retains a Caller-produced CI-only hold through settlement and restart, then 
     expect(recovered.held).toBeNull()
     expect(recovered.ciHold).toBeUndefined()
     expect(recovered.invocations[0]).toEqual(settled.invocations[0])
-    expect(recovered.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
+    expect(recovered.invocations.at(-1)).toMatchObject({ behavior: conflict ? 'repair-pr' : 'review-pr', state: 'started' })
     expect(launch).toHaveBeenCalledTimes(2)
     expect(journal.history(chain.id).map(row => JSON.parse(row.payload))).toContainEqual({ type: 'chain.resumed', ciRecovery: hold })
+    expect(recovered.resumedAfterSequence).toBe(settled.resumedAfterSequence)
+    if (mode === 'rerun') return
+    const repair = recovered.invocations.at(-1)!
+    expect(repair.request.argv).toEqual(expect.arrayContaining(['--pull-number', '21', '--expected-head', failedHead, '--merge-base']))
+    expect(recovered.observation).toMatchObject({ pull: { head: failedHead, conflict: true, failing: [expect.stringContaining('failure')] } })
+    head = 'e'.repeat(40); publication = 'e'.repeat(32); conflict = false; pending = true
+    vi.setSystemTime(Date.now() + 2000)
+    const published: LogEntry = { ...call, id: publication, correlation_id: repair.id, status: 'completed', action: 'published',
+      outcome: 'published', head_sha: head, error: '', error_code: null, artifact: { phase: 'published' },
+      completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() }
+    const calls: LogEntry[] = [call, published]
+    wire = JSON.stringify(calls)
+    await runtime.run()
+    let current = journal.read(chain.id)!
+    expect(current.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
+    expect(current.invocations.at(-1)!.request.argv).toEqual(expect.arrayContaining(['--expected-head', head]))
+    expect(launch).toHaveBeenCalledTimes(3)
+    vi.setSystemTime(Date.now() + 2000)
+    const review = { ...completedReviewCall(chain.repository, 21, head, chain.reviewer), source: 'poise:behavior-chain',
+      correlation_id: current.invocations.at(-1)!.id, resources_settled_at: new Date().toISOString(),
+      resource_ownership: { version: 1 as const, roots: [], errors: [] } }
+    reviews.push(review); calls.push(review); wire = JSON.stringify(calls)
+    await runtime.run()
+    expect(journal.read(chain.id)!.waiting).toBe('exact-head CI is still running')
+    expect(launch).toHaveBeenCalledTimes(3)
+    pending = false; green = true
+    await runtime.run()
+    current = journal.read(chain.id)!
+    expect(current.invocations.at(-1)).toMatchObject({ behavior: 'approve-pr', state: 'started' })
+    expect(launch).toHaveBeenCalledTimes(4)
+    vi.setSystemTime(Date.now() + 2000)
+    const approval: LogEntry = { ...completedReviewCall(chain.repository, 21, head, chain.reviewer), id: 'f'.repeat(32),
+      source: 'poise:behavior-chain', behavior: 'pr_approve', action: 'approved', outcome: 'approved', review_id: 92,
+      correlation_id: current.invocations.at(-1)!.id, resources_settled_at: new Date().toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] } }
+    approval.artifact!.review_response = { ...(approval.artifact!.review_response as Record<string, unknown>), invocation_id: approval.id }
+    reviews.push(approval); calls.push(approval); wire = JSON.stringify(calls)
+    await runtime.run()
+    current = journal.read(chain.id)!
+    expect(current.waiting).toBe('native repository readiness gates are not satisfied')
+    expect(current.invocations[0]).toEqual(settled.invocations[0])
+    expect(launch).toHaveBeenCalledTimes(4)
+    ready = true
+    const fresh = await operations.observe(current)
+    expect(decideBehaviorChain(current, fresh, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
+    fresh.pull!.queueEntry = 'new-head-queue'
+    expect(decideBehaviorChain(current, fresh, Date.now())).toEqual({ kind: 'wait', reason: 'native merge queue owns entry new-head-queue' })
   } finally { db.close() }
 })
 

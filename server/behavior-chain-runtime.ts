@@ -95,10 +95,10 @@ function ciOnlyHold(invocation: ChainInvocation, call: LogEntry): BehaviorChain[
   return { invocationId: invocation.id, callId: call.id, head: ci.head_sha }
 }
 
-function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
+function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, now: number, operations: ChainRuntimeOperations): boolean {
   const hold = chain.ciHold, pull = observation.pull, original = chain.invocations.at(-1)
   const evidence = original?.evidence, artifact = evidence?.artifact as Record<string, unknown> | undefined
-  return !!chain.held && !!hold && !chain.mergeSha && original?.id === hold.invocationId && original.state === 'settled'
+  if (!(!!chain.held && !!hold && !chain.mergeSha && original?.id === hold.invocationId && original.state === 'settled'
     && original.callId === hold.callId && evidence?.status === 'failed' && evidence.error_code === 'atomic_work_blocked'
     && evidence.action === 'not_started' && artifact?.phase === 'executing' && !artifact.plan_sha && !evidence.publicationResume
     && evidence.receipts == null && evidence.review_id == null && evidence.head_sha == null
@@ -106,8 +106,19 @@ function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: n
     && Number.isFinite(observation.checkedAt) && observation.checkedAt >= evidence.completedAt
     && observation.checkedAt >= Date.parse(String(evidence.resources_settled_at))
     && observation.checkedAt <= now && now - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
-    && !!pull && pull.state === 'open' && !pull.merged
-    && (pull.head === hold.head || observation.ciBaseUpdate?.from === hold.head && observation.ciBaseUpdate.head === pull.head
+    && !!pull && pull.state === 'open' && !pull.merged)) return false
+  if (pull.head === hold.head && pull.conflict) {
+    // Release only for the ordinary scoped repair, including its retry bound.
+    // The failed CI receipt remains evidence; admission does not resolve it.
+    const resumed = { ...chain, held: null }
+    const decision = decideBehaviorChain(resumed, observation, now)
+    if (decision.kind !== 'invoke' || decision.behavior !== 'repair-pr'
+      || closedChainTarget(chain, observation, decision.behavior) || !operations.enabled()) return false
+    const accounts = operations.accounts()
+    return accounts.author.toLowerCase() === chain.author.toLowerCase()
+      && accounts.reviewer.toLowerCase() === chain.reviewer.toLowerCase() && operations.permitted(resumed, decision)
+  }
+  return (pull.head === hold.head || observation.ciBaseUpdate?.from === hold.head && observation.ciBaseUpdate.head === pull.head
       && observation.publication.pull_number === pull.number && observation.publication.head_sha === pull.head)
     && pull.checksState === 'SUCCESS' && !pull.pending && pull.failing.length === 0
 }
@@ -462,7 +473,7 @@ export class BehaviorChainRuntime {
                 continue
               }
               phase = 'decision'
-              if (ciRecovered(chain, observation, Date.now())) {
+              if (ciHoldCanResume(chain, observation, Date.now(), this.operations)) {
                 chain = this.append(chain, { type: 'chain.resumed', ciRecovery: chain.ciHold })
               }
               const testRecovery = recoveredImplementation(chain, observation, Date.now())
