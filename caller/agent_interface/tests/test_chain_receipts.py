@@ -1100,13 +1100,25 @@ class AtomicWorkLimits(TestCase):
         integration, base = "d" * 40, "c" * 40
         ci = {"action": "list_failing_ci", "repository": "example/repo", "pull_number": 3, "head_sha": HEAD, "failing": []}
         queue = {"head_sha": HEAD, "queue_removals": [{"id": "removed", "reason": "failed_checks", "beforeCommit": {"oid": integration}}]}
-        for mode in ("verified", "wrong-head", "wrong-ref", "wrong-parent", "unknown-run", "wrong-event", "missing-attempt", "pending", "missing-job"):
+        for mode in ("verified", "refailed", "rerun-succeeded", "rerun-running", "rerun-running-first", "wrong-head",
+                     "wrong-ref", "wrong-parent", "unknown-run", "wrong-event", "missing-attempt", "pending", "missing-job",
+                     "contradictory-success"):
             with self.subTest(mode=mode):
                 check = {"type": "check_run", "name": "Caller", "state": "completed", "conclusion": "failure",
                          "check_run_id": 41, "log_id": 42, "run_id": 40, "head_sha": integration,
                          "url": "https://github.com/example/repo/actions/runs/40/job/42", "summary": "x" * 65536}
                 run = {"id": 40, "workflow_id": 1, "run_attempt": 1, "event": "merge_group", "head_sha": integration}
                 packet = {**ci, "ref": integration, "parents": [base, HEAD], "failing": [check], "runs": [run]}
+                if mode == "refailed":
+                    run.update(run_attempt=2, status="completed", conclusion="failure")
+                if mode == "rerun-succeeded":
+                    run.update(run_attempt=2, status="completed", conclusion="success")
+                if mode == "rerun-running":
+                    run.update(run_attempt=2, status="in_progress", conclusion=None)
+                if mode == "rerun-running-first":
+                    run.update(status="in_progress", conclusion=None)
+                if mode == "contradictory-success":
+                    run.update(status="completed", conclusion="success")
                 if mode == "wrong-head":
                     packet["head_sha"] = base
                 if mode == "wrong-ref":
@@ -1130,11 +1142,13 @@ class AtomicWorkLimits(TestCase):
                         continue
                     blocker = api.atomic_work._ci_only_blocker(ci, queue, HEAD, "author")
                 read.assert_called_once_with("--list-failing-ci", "3", "--repository", "example/repo", "--token-user", "author", "--ref", integration)
-                self.assertEqual("queue" in blocker, mode == "verified")
+                expected = {"verified": 1, "refailed": 2, "rerun-succeeded": 1, "rerun-running": 1, "rerun-running-first": 1}.get(mode)
+                self.assertEqual("queue" in blocker, expected is not None)
                 self.assertNotIn("summary", json.dumps(blocker))
-                if mode == "verified":
+                if expected is not None:
                     self.assertEqual(blocker["queue"], {"removal": "removed", "integration": integration, "base": base,
-                        "failures": [{"name": "Caller", "check": 41, "job": 42, "run": 40, "workflow": 1, "attempt": 1, "url": check["url"]}]})
+                        "failures": [{"name": "Caller", "check": 41, "job": 42, "run": 40, "workflow": 1, "attempt": expected,
+                                      "url": check["url"]}]})
 
     def test_ci_only_blocker_drops_check_summaries_to_fit_the_receipt_limit(self):
         failing = [{"type": "check_run", "name": f"unit-{index}", "state": "completed", "conclusion": "failure",

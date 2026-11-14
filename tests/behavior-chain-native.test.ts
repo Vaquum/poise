@@ -851,7 +851,7 @@ it.each(['PR head', 'queue', 'baseline'])('retains a Caller-produced %s CI hold 
     expect(launch).toHaveBeenCalledTimes(2)
     expect(journal.history(chain.id).map(row => JSON.parse(row.payload))).toContainEqual({ type: 'chain.resumed', ciRecovery: hold })
     if (queued) {
-      const current = { ...recovered.observation as ChainObservation, prReviewers: [] }
+      const current: ChainObservation = { ...recovered.observation as ChainObservation, prReviewers: [] }
       const ready = { ...recovered, invocations: settled.invocations }
       const approval = decideBehaviorChain(ready, current, Date.now())
       expect(approval).toMatchObject({ kind: 'invoke', behavior: 'approve-pr', reason: expect.stringContaining('queue-rejection') })

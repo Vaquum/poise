@@ -244,8 +244,18 @@ def _ci_only_blocker(ci: object, queue: dict, head: str, actor: str) -> object:
                 or any(type(value) is not int or value < 1 for value in
                        (check.get("check_run_id"), check.get("log_id"), run.get("id"), run.get("workflow_id"), run.get("run_attempt"))):
             return blocker  # Unknown or pending obligations cannot authorize recovery.
+        attempt = run["run_attempt"]
+        rerun_finished = run.get("status") == "completed" and run.get("conclusion") == "success"
+        rerun_running = isinstance(run.get("status"), str) and run.get("status") != "completed" and attempt > 1
+        if rerun_finished or rerun_running:
+            # The run already moved past the retained failure, so its
+            # current attempt is not the failed one. Pinning it would
+            # reject that existing success and demand another rerun.
+            if attempt < 2:
+                return blocker  # A completed success on attempt 1 contradicts the retained failure.
+            attempt -= 1
         failures.append({"name": check["name"], "check": check["check_run_id"], "job": check["log_id"],
-                         "run": run["id"], "workflow": run["workflow_id"], "attempt": run["run_attempt"], "url": check["url"]})
+                         "run": run["id"], "workflow": run["workflow_id"], "attempt": attempt, "url": check["url"]})
     if failures:
         blocker["queue"] = {"removal": removal["id"], "integration": integration, "base": parents[0], "failures": failures}
     return blocker
