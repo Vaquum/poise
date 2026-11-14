@@ -744,6 +744,17 @@ describe('a suite on a test box', () => {
     return repo
   }
 
+  function vitestFixture(source: string): { repo: string; argv: string[] } {
+    const repo = repository()
+    symlinkSync(resolve('node_modules'), join(repo, 'node_modules'), 'dir')
+    mkdirSync(join(repo, 'tests'))
+    writeFileSync(join(repo, 'tests', 'fixture.test.mjs'), `import { describe, expect, it } from 'vitest'\n${source}`)
+    // Use the production registration, so removing the reporter breaks the interruption regression.
+    writeFileSync(join(repo, 'vitest.config.mjs'), `import config from ${JSON.stringify(resolve('vitest.config.ts'))}
+      export default { ...config, test: { ...config.test, setupFiles: [], include: ['tests/fixture.test.mjs'], pool: 'threads' } }`)
+    return { repo, argv: [process.execPath, resolve('node_modules/vitest/vitest.mjs'), 'run'] }
+  }
+
   async function until(condition: () => boolean, what: string, ms = 20_000): Promise<void> {
     const start = Date.now()
     while (!condition()) {
@@ -1251,28 +1262,84 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
     expect(stderr).toContain('cannot start /no/such/command')
   })
 
-  it.each([false, true])('retains observed output before a relay timeout (test failure: %s)', async (failed) => {
-    await startAll({ limitSeconds: 2 })
-    const started = Date.now()
-    const assertion = `try { require('node:assert/strict').equal(1, 2) } catch (error) { console.error('FAIL fixture.validation::test_first_failure\\n' + error.stack) }; `
-    const script = (failed ? assertion : '') + 'setInterval(() => {}, 1000)'
-    const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
-    expect(code).toBe(124)
-    expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
-    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
-    expect(stderr).toContain('let CI run the tests')
-    const admission = /\[poise\] candidate ([a-f0-9]{64}), suite .*, run ([a-f0-9]{32})/.exec(stderr)
-    expect(admission).not.toBeNull()
-    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![2] }))
-    if (failed) {
-      const failure = 'FAIL fixture.validation::test_first_failure\nAssertionError'
-      expect(stderr).toContain(failure)
-      expect(stderr.indexOf(admission![0])).toBeLessThan(stderr.indexOf(failure))
-      expect(stderr.indexOf('AssertionError')).toBeLessThan(stderr.indexOf('no test result:'))
-    } else expect(stderr).not.toContain('AssertionError')
-    expect(Date.now() - started).toBeLessThan(10_000)
-    const box = runBox()
-    await until(() => terminated.includes(box.id), 'the box to be terminated')
+  it.each(['none', 'assertion', 'oversized'])('retains real Vitest evidence before interruption (failure: %s)', async (failure) => {
+    let now = Date.now()
+    await startAll({ limitSeconds: 2, now: () => now })
+    const failed = failure !== 'none'
+    const oversized = failure === 'oversized'
+    const fixture = vitestFixture(`describe('offload reporting', () => {
+      ${failed ? `it('first failed expectation ghp_fixturecredential', () => {
+        const context = ${oversized ? "'expected received-value to equal expected-value\\nhttps://example.test/?token=' + 'boundarysecret'.repeat(3000) + '\\nafter-redaction\\n' + 'x'.repeat(12000) + '\\nafter-excerpt-limit'" : 'undefined'}
+        expect('received-value', context).toBe('expected-value')
+      })
+      // Flush Vitest's batched case events before the last test deliberately holds the file open.
+      it('second failed expectation', async () => {
+        await new Promise(done => setTimeout(done, 200))
+        expect(3).toBe(4)
+      })` : ''}
+      it('keeps the suite open', async () => {
+        console.log('VITEST_HELD ' + process.pid)
+        await new Promise(() => {})
+      }, 60000)
+    })`)
+    const running = suite(fixture.repo, fixture.argv)
+    let output = '', evidence = ''
+    running.child.stdout?.on('data', (chunk) => { output += chunk })
+    running.child.stderr?.on('data', (chunk) => { evidence += chunk })
+    try {
+      await until(() => output.includes('VITEST_HELD '), 'Vitest to keep the suite open', 5_000)
+      if (failed) {
+        await until(() => evidence.includes('[poise] first test failure:'), 'the first Vitest assertion before interruption', 3_000)
+          .catch((error: Error) => { throw new Error(`${error.message}\n${evidence}\n${output}`) })
+        const excerpt = evidence.slice(evidence.indexOf('[poise] first test failure:'))
+        expect(excerpt).toContain('tests/fixture.test.mjs > offload reporting > first failed expectation [redacted]')
+        expect(excerpt).toContain('AssertionError:')
+        expect(excerpt).toContain('received-value')
+        expect(excerpt).toContain('expected-value')
+        expect(excerpt).not.toContain('ghp_fixturecredential')
+        expect(excerpt).not.toContain('second failed expectation')
+        expect(excerpt.length).toBeLessThanOrEqual(8193)
+        if (oversized) {
+          expect(excerpt).toContain('https:[redacted header]')
+          expect(excerpt).toContain('after-redaction')
+          expect(excerpt).toContain('[truncated]')
+          expect(excerpt).not.toContain('boundarysecret')
+          expect(excerpt).not.toContain('after-excerpt-limit')
+        }
+      } else expect(evidence).not.toContain('[poise] first test failure:')
+      now += 3_000
+      const { code, stderr } = await running.done
+      expect(code).toBe(124)
+      expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
+      expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+      expect(stderr).toContain('let CI run the tests')
+      const admission = /\[poise\] candidate ([a-f0-9]{64}), suite .*, run ([a-f0-9]{32})/.exec(stderr)
+      expect(admission).not.toBeNull()
+      expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![2] }))
+      if (failed) {
+        expect(stderr.match(/\[poise\] first test failure:/g)).toHaveLength(1)
+        expect(stderr.indexOf(admission![0])).toBeLessThan(stderr.indexOf('[poise] first test failure:'))
+        expect(stderr.indexOf('AssertionError')).toBeLessThan(stderr.indexOf('no test result:'))
+      } else expect(stderr).not.toContain('AssertionError')
+      const box = runBox()
+      await until(() => terminated.includes(box.id), 'the box to be terminated')
+      expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', id: admission![2] }))
+    } finally {
+      // Render ends every process on the box; the local stand-in only ends its box script.
+      const pid = /VITEST_HELD (\d+)/.exec(output)?.[1]
+      if (pid) process.kill(Number(pid), 'SIGTERM')
+    }
+  })
+
+  it.each([false, true])('preserves completed Vitest output and exit status (test failure: %s)', async (failed) => {
+    await startAll()
+    const fixture = vitestFixture(`it.each([1, 2])('completed expectation %s', () => { expect(1).toBe(${failed ? 2 : 1}) })`)
+    const { code, stdout, stderr } = await suite(fixture.repo, fixture.argv).done
+    expect(code).toBe(failed ? 1 : 0)
+    expect(stdout).toContain(failed ? '2 failed' : '2 passed')
+    expect(stderr).not.toContain('no test result:')
+    expect(stderr.match(/\[poise\] first test failure:/g) ?? []).toHaveLength(failed ? 1 : 0)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', exit: failed ? 1 : 0 }))
   })
 
   it('destroys the box when the agent’s side is killed outright', async () => {

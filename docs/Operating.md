@@ -913,6 +913,12 @@ recovery is currently held for #1619: candidate-controlled reports cannot
 authorize it. Missing, interrupted, oversized, unaccounted or relay results cannot
 authorize the existing [pre-PR recovery](Behavior-chain.md#bounded-reconciliation)
 path; historical worker logs remain diagnostic evidence only.
+Poise's configured Vitest reporters also emit the first failed test's file, full
+name and assertion/error stack as soon as that test finishes, alongside the
+normal reporter. This failure-only stderr record is redacted in full before
+being limited to 8,192 characters (plus its final newline). Passing tests add no
+output. A later interruption still leaves the suite incomplete and any observed
+failure blocked under the evidence rules below.
 An explicit gateway-restart failure is the one exception: the active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated
