@@ -509,9 +509,10 @@ export class Orchestrator {
         try {
           // A running workspace on the same base takes a new release in place: only Poise restarts, and the
           // agents it started keep running. Anything else needs a new container.
+          // Its inherited labels survive a rebuild that makes the original image unavailable for inspection.
           let fallback: ImageRelease | null = null
           if (reason === 'outdated image' && details.State.Running && target && this.changedSetting(details) === null
-            && imageRelease(await docker.imageLabels(details.Image))?.base === target.base) {
+            && imageRelease(details.Config.Labels ?? null)?.base === target.base) {
             const updated = await this.updateInPlace(handle, login, target)
             if (updated === true) continue
             if (updated === 'unreachable') fallback = target
@@ -1119,7 +1120,7 @@ export class Orchestrator {
       return this.withLock(handle, async () => {
         const details = await this.deps.docker.inspectContainer(workspaceNames(handle).container)
         return details?.State.Running === true && this.changedSetting(details) === null
-          && imageRelease(await this.deps.docker.imageLabels(details.Image))?.base === fallback.base
+          && imageRelease(details.Config.Labels ?? null)?.base === fallback.base
       })
     }
     // Original cleanup may be permanently held after controller loss. It must not subject Chat

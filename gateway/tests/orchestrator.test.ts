@@ -54,7 +54,7 @@ function addWorkspaceContainer(h: Harness, handle: string, imageId: string, runn
     imageId,
     imageRef: 'poise-runtime:latest',
     running,
-    labels: { 'poise.managed': 'true', 'poise.workspace': handle, ...(dns ? { 'poise.dns': dns.label } : {}) },
+    labels: { ...h.docker.imageLabels.get(imageId), 'poise.managed': 'true', 'poise.workspace': handle, ...(dns ? { 'poise.dns': dns.label } : {}) },
     networks: new Set([`poise-net-${handle}`]),
     spec: { Env: env, HostConfig: { Mounts: mounts } },
   })
@@ -1156,6 +1156,19 @@ describe('updates in place', () => {
     await h.close()
   })
 
+  it('keeps a healthy same-release container after a rebuild makes its original image unavailable', async () => {
+    await start({ release: 'new-release' })
+    const { workspaceCookie } = await h.openWorkspace('Alice')
+    const before = containerId()
+    h.docker.imageLabels.delete(OLD_IMAGE_ID)
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    expect(h.workspace.switches).toEqual([])
+    expect(releaseTasks()).toEqual([])
+    expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/drain')).toBe(false)
+    expect((await h.request({ host: ALICE, path: '/', headers: { cookie: workspaceCookie, ...NAVIGATE } })).status).toBe(200)
+  })
+
   it('installs a new release of the same base into a running workspace and asks Poise to switch, keeping its container', async () => {
     await start()
     const before = containerId()
@@ -1695,7 +1708,7 @@ describe('updates in place', () => {
       h.workspace.health.runningCallerCalls = 1
       h.workspace.health.ok = cause !== 'unhealthy'
       if (cause === 'changed setting') containerEnv(h, 'alice').push('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES=6442450944')
-      if (cause === 'changed base') h.docker.imageLabels.set(OLD_IMAGE_ID, { 'poise.release': 'old-release', 'poise.base': 'base-0' })
+      if (cause === 'changed base') h.docker.containers.get('poise-ws-alice')!.labels['poise.base'] = 'base-0'
       await upgrade
 
       expect(events(h.logs, 'workspace.drain.timeout')).toHaveLength(1)
