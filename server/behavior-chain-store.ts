@@ -113,6 +113,7 @@ function resourceArtifact(prior: unknown, value: unknown): Record<string, unknow
 // contradictory historical releases. Index the projection so settled history
 // cannot turn each capacity/observation read into a full journal scan.
 const LIVE_MODEL_SQL = 'resource_pending = 1'
+export const FIXTURE_RECHECK_WAIT = 'Implementation fixture recheck: waiting for its saved outcome'
 /** Automatic holds for review-issue's authentication failures, which the
  *  runtime retires once Claude is signed in again: few chains, read every pass. */
 const AUTHENTICATION_HOLD_SQL = "merged = 0 AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%'"
@@ -141,6 +142,7 @@ const RECHECK_AT_SQL = `CASE
         OR json_extract(state, '$.waiting') LIKE 'Implementation hold reporting pending:%'
         OR json_extract(state, '$.waiting') LIKE 'Stage: implement-issue.% Next action: inspect the implementation Call, address the blocker, then explicitly Resume. Implementation hold reporting pending:%'
         OR json_extract(state, '$.waiting') LIKE 'Implementation hold report pending:%'
+        OR json_extract(state, '$.waiting') = '${FIXTURE_RECHECK_WAIT}'
         OR json_extract(state, '$.waiting') LIKE 'Implementation hold report creation is unconfirmed;%'))
     THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,

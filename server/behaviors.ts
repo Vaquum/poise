@@ -10,7 +10,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
-import { implementationReportAdmission, recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories } from './behavior-chain-report'
+import { implementationReportAdmission, recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories, waitForImplementationRechecks } from './behavior-chain-report'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
@@ -8625,7 +8625,7 @@ async function runBehaviorChains(): Promise<void> {
         await requireFreshDatastore()
         return operations.observe(target)
       }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
-        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled),
+        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled, behaviorAbortController?.signal),
       reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {
         await requireFreshDatastore()
         return operations.observe(chain)
@@ -9267,6 +9267,7 @@ export async function stopBehaviorsRuntime(): Promise<void> {
   behaviorAbortController?.abort()
   behaviorAbortController = null
   await Promise.allSettled([...behaviorOperationTails.values(), ...closedTargetReconciliations.values()])
+  await waitForImplementationRechecks()
   // Detached workers survive Poise itself, but spawn acceptance is not proof
   // of a successful side effect. Leave launched claims with their durable
   // identity so a later runtime reconciles exact log status before retrying;

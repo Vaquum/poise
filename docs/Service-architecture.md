@@ -1611,9 +1611,11 @@ inventory independently of candidate-controlled reports.
 The journal admits one fresh implementation for that automatic hold and recovery
 commit, independently of report publishing. An incomplete original assertion can
 instead use the saved automatic hold report and linked delivered fixture fix for
-one persisted clean-base recheck, requiring reproduction on the old base and an
-executed pass on the corrected base. This uses the same single-retry admission
-and normal validation gates, as defined in [bounded reconciliation](Behavior-chain.md#bounded-reconciliation).
+a persisted clean-base recheck, requiring reproduction on the old base and an
+executed pass on the corrected base. Execution and result persistence run outside
+the observation sweep under the existing release/shutdown background barrier;
+a later sweep freshly verifies the saved pass. This uses the same single-retry
+admission and normal validation gates, as defined in [bounded reconciliation](Behavior-chain.md#bounded-reconciliation).
 Unverified rechecks and later operator holds retain their authority; no gateway
 route or new poller is added.
 

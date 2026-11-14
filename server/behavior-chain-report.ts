@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
 import { parseFailedSource, type LogEntry } from './agent-log-parse'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
-import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal, type ChainBehavior } from './behavior-chain-store'
+import { chainBasis, chainIdentity, FIXTURE_RECHECK_WAIT, type BehaviorChain, type BehaviorChainJournal, type ChainBehavior } from './behavior-chain-store'
 import { ReviewScopeIndexingError } from './behavior-chain-runtime'
 import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
@@ -13,6 +13,7 @@ import { HttpError } from './http'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
 import type { ProcessDiagnostic } from './process-diagnostic'
+import { trackReleaseBackground } from './release-background'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { isServiceMode, readServiceConfig } from './service/config'
 import { recheckImplementationTest, type TestRecheckResult } from './behavior-chain-test-recheck'
@@ -28,6 +29,11 @@ const APPROVAL_CAUSE = 'approval_budget_exhausted'
 const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', APPROVAL_CAUSE, MERGE_CAUSE, CLOSED_CAUSE, IMPLEMENTATION_CAUSE, IMPLEMENTATION_BUDGET_CAUSE, IMPLEMENTATION_PUBLICATION_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
 const REPOSITORIES_KEY = 'service_repair_exhaustion_repositories'
+const implementationRechecks = new Map<string, Promise<void>>()
+
+export async function waitForImplementationRechecks(): Promise<void> {
+  await Promise.all(implementationRechecks.values())
+}
 // Caller retains validation reasons wrapped as `atomic behavior failed during
 // {phase}: {reason} ({operation})` and bounds them at 500 chars, so the
 // sentence is matched where it appears: the reason stays verbatim inside
@@ -1084,8 +1090,8 @@ export function repairReportImplementationFence(db: Database, chain: BehaviorCha
  * the exact-head repair must validate it through the normal publication gates. */
 export async function recoverReportedRepair(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
-  allowed: () => boolean): Promise<string | null> {
-  const implementation = await recoverReportedImplementation(db, journal, chain, observation, verify, allowed)
+  allowed: () => boolean, signal?: AbortSignal): Promise<string | null> {
+  const implementation = await recoverReportedImplementation(db, journal, chain, observation, allowed, signal)
   if (implementation !== undefined) return implementation
   const fence = repairReportImplementationFence(db, chain, 'implement-issue')
   if (fence) {
@@ -1307,8 +1313,7 @@ function prePrReports(db: Database, chainId: string) {
 }
 
 async function recoverReportedImplementation(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
-  observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
-  allowed: () => boolean): Promise<string | null | undefined> {
+  observation: ChainObservation, allowed: () => boolean, signal?: AbortSignal): Promise<string | null | undefined> {
   if (chain.testHold || chain.testRecovery?.admission || chain.mergeSha || chain.supersession) return undefined
   const reports = prePrReports(db, chain.id)
   if (!reports.length || !chain.held && !chain.testRecovery?.recheck) return undefined
@@ -1339,7 +1344,10 @@ async function recoverReportedImplementation(db: Database, journal: BehaviorChai
     || !observation.issue.eligible || !base || !/^[a-f0-9]{40}$/.test(base) || observation.prerequisites?.wait
     || !failure || chain.invocations.some(invocation => !resourceReleaseProven(invocation.evidence ?? {}, true))
     || chain.testRecovery && chain.testRecovery.recheck !== report.key) return pending('source revision, eligibility, fixture identity, base or resources are unverified')
-  if (report.recheck?.state === 'running') return pending('the one saved recheck is in flight or was interrupted; it will not be relaunched')
+  if (report.recheck?.state === 'running') {
+    return implementationRechecks.has(saved.storageKey) ? FIXTURE_RECHECK_WAIT
+      : pending('the saved recheck was interrupted and will not be relaunched')
+  }
   if (report.recheck?.state === 'failed') return pending(report.recheck.reason || 'the one saved recheck failed')
   const read = async (number: number, delivery = false) => {
     const { stdout } = await runFile('github-interface', ['--read-issue', String(number), ...(delivery ? ['--delivery-base', base] : []),
@@ -1390,25 +1398,34 @@ async function recoverReportedImplementation(db: Database, journal: BehaviorChai
     report.recheck = { remedy, merge: merge!, base, state: 'running' }
     // Intent wins before checkout or execution. A lost process/outcome cannot
     // turn the next scheduler read into another expensive recheck.
-    if (journal.read(chain.id)?.sequence !== chain.sequence || !allowed()) return pending('source or admission controls changed before recheck')
+    if (journal.read(chain.id)?.sequence !== chain.sequence || !allowed() || signal?.aborted) return pending('source or admission controls changed before recheck')
     const intent = JSON.stringify(report)
     if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(intent, saved.storageKey, saved.value).changes !== 1) {
       return pending('another observation owns the saved recheck')
     }
-    try {
-      const result = await recheckImplementationTest(chain.repository, chain.author, prepared.checkout_head, base, merge!, failure.file, failure.test)
-      report.recheck = { ...report.recheck, state: 'passed', result }
-    } catch (error) {
-      report.recheck = { ...report.recheck, state: 'failed', reason: behaviorErrorMessage(error, 2000) }
-    }
-    if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(JSON.stringify(report), saved.storageKey, intent).changes !== 1) {
-      return pending('the saved recheck outcome conflicts with its intent')
-    }
-    chain = journal.read(chain.id)!
-    const fresh = await verify(chain)
-    // Let the next sweep revalidate a newer base instead of repeating work in this one.
-    if (fresh.prerequisites?.base !== base) return pending('the base advanced during recheck; waiting to verify the new base')
-    return recoverReportedImplementation(db, journal, chain, fresh, verify, allowed)
+    // Only execution and result persistence leave the sweep; later sweeps own
+    // fresh verification and the recovery journal writes.
+    const running = report.recheck
+    const oldBase = prepared.checkout_head
+    const release = trackReleaseBackground('behavior')
+    const recheck = (async () => {
+      try {
+        const result = await recheckImplementationTest(chain.repository, chain.author, oldBase, base, merge!, failure.file, failure.test, signal)
+        report.recheck = { ...running, state: 'passed', result }
+      } catch (error) {
+        report.recheck = { ...running, state: 'failed', reason: behaviorErrorMessage(error, 2000) }
+      }
+      if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(JSON.stringify(report), saved.storageKey, intent).changes !== 1) {
+        throw new Error('the saved recheck outcome conflicts with its intent')
+      }
+    })().catch((error: unknown) => {
+      console.error(`[behavior-chain] implementation fixture recheck for ${chain.id} could not persist its outcome:`, error)
+    }).finally(() => {
+      release()
+      implementationRechecks.delete(saved.storageKey)
+    })
+    implementationRechecks.set(saved.storageKey, recheck)
+    return FIXTURE_RECHECK_WAIT
   }
   const result = report.recheck.result
   if (report.recheck.state !== 'passed' || !result || result.old.base !== prepared.checkout_head || result.current.base !== base
