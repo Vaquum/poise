@@ -324,7 +324,13 @@ export class ServiceControl {
       this.held = null
       const problem = this.releaseInstallProblem(held.release)
       if (problem) return this.log(`[service] the held switch to release ${held.release} cannot start: ${problem}`)
-      this.queueSwitch(held.release)
+      // A timer has no caller to answer: a failed queue (a full disk, say) is
+      // logged, and the gateway's next ask tries again, as for any switch.
+      try {
+        this.queueSwitch(held.release)
+      } catch (error) {
+        this.log(`[service] the held switch to release ${held.release} could not be queued: ${error instanceof Error ? error.message : String(error)}; the gateway asks again`)
+      }
     }, HOLD_POLL_MS)
   }
 

@@ -475,6 +475,30 @@ describe('switching to another release', () => {
     }
   })
 
+  it('logs a held switch it cannot queue instead of throwing from its timer, and queues it when asked again', async () => {
+    const dir = await releases({ r2: 'b1' })
+    let now = Date.parse('2026-11-14T01:00:00Z')
+    const { runtime, timer, log, service } = switching(dir, { now: () => now })
+    try {
+      service.notePersonActivity()
+      service.switchRelease('r2')
+      // The queue cannot be written: its temporary file's name is taken by a directory.
+      await mkdir(join(dir, 'next.tmp'))
+      now += control.PERSON_QUIET_MS
+      expect(() => timer.fire()).not.toThrow()
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('the held switch to release r2 could not be queued'))
+      expect(existsSync(join(dir, 'next'))).toBe(false)
+      expect(runtime.setSwitchPending).not.toHaveBeenCalled()
+      expect(timer.timers.size).toBe(0)
+      await rm(join(dir, 'next.tmp'), { recursive: true })
+      expect(service.switchRelease('r2')).toEqual({ release: 'r2', switching: true })
+      expect((await readFile(join(dir, 'next'), 'utf8')).trim()).toBe('r2')
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
   it('calls a held switch off when asked for the release it runs', async () => {
     const dir = await releases({ r2: 'b1' })
     const { timer, service } = switching(dir)
