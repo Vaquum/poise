@@ -191,9 +191,7 @@ test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest 
 test('Needs attention links to existing work and groups dependent tasks under the root blocker', async ({ page }) => {
   const root = CHAINS[3], dependent = CHAINS[1]
   const served: Served = { posts: [], attention: [
-    attention(root, minutes(26 * 60), 'Required validation is unresolved', {
-      kind: 'unknown', action: 'No automatic next step verified. Inspect the recorded blocker.', prerequisite: null, work: null,
-    }),
+    attention(root, minutes(26 * 60), 'Required validation is unresolved'),
     attention(dependent, minutes(60), 'Waiting on the prerequisite', {
       kind: 'prerequisite', action: 'Poise is waiting for verified delivery of the prerequisite.', prerequisite: root.id, work: null,
     }),
@@ -202,6 +200,11 @@ test('Needs attention links to existing work and groups dependent tasks under th
   const panel = tasks(page)
   await expect(panel.locator('.tk-row')).toHaveCount(1)
   await panel.locator('.tk-row').click()
+  await expect(panel.getByRole('link', { name: dependent.id })).toBeVisible()
+
+  served.attention![0].nudge = { kind: 'unknown', action: 'No automatic next step verified. Inspect the recorded blocker.', prerequisite: null, work: null }
+  await panel.getByRole('button', { name: 'Active', exact: true }).click()
+  await panel.getByRole('button', { name: 'Needs attention 2' }).click()
   await expect(panel.getByText('Ownership unverified')).toBeVisible()
   await expect(panel.getByRole('link', { name: dependent.id })).toBeVisible()
 

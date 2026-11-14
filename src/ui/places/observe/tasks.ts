@@ -266,14 +266,14 @@ export function createTasks(ctx: PartContext): ObservePart {
       rows.push(['Last verified advance', `${esc(age(now - a.progressAt))} ago · ${esc(clockTime(a.progressAt))} · it needs attention`])
       if (a.blocker && a.blocker !== chain.held) rows.push(['What holds it', esc(a.blocker)])
       if (a.evidence.gates.length) rows.push(['Evidence on its head', `${esc(a.evidence.gates.join(' · '))}${a.evidence.state !== 'fresh' ? ` <span class="note is-warn">${esc(a.evidence.state)} evidence${a.evidence.checkedAt ? `, read ${esc(clockTime(a.evidence.checkedAt))}` : ''}</span>` : ''}`])
+      const entries = new Map(attention.map((entry) => [entry.id, entry]))
+      const root = attentionRoot(chain.id, entries)
+      const affected = attention.filter((entry) => entry.id !== chain.id && attentionRoot(entry.id, entries) === chain.id)
+      const taskLink = (id: string) => `<a class="lnk" href="${esc(partHref('tasks', { which: 'attention', chain: id }, back))}">${esc(id)}</a>`
+      if (root !== chain.id) rows.push(['Root blocker', taskLink(root)])
+      if (affected.length) rows.push(['Waiting on this', affected.map((entry) => taskLink(entry.id)).join(' · ')])
       if (a.nudge) {
         const nudge = a.nudge
-        const entries = new Map(attention.map((entry) => [entry.id, entry]))
-        const root = attentionRoot(chain.id, entries)
-        const affected = attention.filter((entry) => entry.id !== chain.id && attentionRoot(entry.id, entries) === chain.id)
-        const taskLink = (id: string) => `<a class="lnk" href="${esc(partHref('tasks', { which: 'attention', chain: id }, back))}">${esc(id)}</a>`
-        if (root !== chain.id) rows.push(['Root blocker', taskLink(root)])
-        if (affected.length) rows.push(['Waiting on this', affected.map((entry) => taskLink(entry.id)).join(' · ')])
         const work = failure ? null : nudge.work
         rows.push(['Ownership', work?.kind === 'chat'
           ? `<a class="lnk" href="${esc(placeHref(work.manager ? 'manager' : 'chat', { chat: work.manager ? null : work.session, back: 'observe' }))}">${work.manager ? 'Open the Manager' : 'Open the bound Chat'}</a>`
