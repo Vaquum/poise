@@ -1431,7 +1431,10 @@ then attribution and normalization run again at the gateway. See the
 The host deployment verifier also sends bounded observations through that
 private operator socket. The gateway retains rollout/workspace deadline and
 recovery diagnostics using the existing v1 envelope/store, without a public
-ingestion route or a release/replacement control change; [Logging](Logging.md#collection-and-operation)
+ingestion route or a release/replacement control change. Only deployment delivery
+retries the writer's exact busy refusal, replaying the same bounded observation
+within one 30-second deadline; other refusals retain a bounded, redacted cause.
+[Logging](Logging.md#collection-and-operation)
 defines the budget, deduplication and recovery contract.
 The edge also derives the fixed `/api/link/events` route label before removing
 the URI. All ingress paths apply the narrow native cancellation exception and
