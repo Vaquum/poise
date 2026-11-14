@@ -509,7 +509,14 @@ its own instead of refusing with dirty_unowned.
 - **Switching.** The gateway then sends `POST /api/service/switch` with
   `{ release }` (`admin` scope or loopback; 202 `{ release, switching }`,
   409 for a release not installed for this base or a server started without
-  the supervisor). Poise writes `next` and restarts at the first moment no unheld Chat turn and no work of its own
+  the supervisor). While someone is using Poise in a browser (input on a
+  visible page, reported by `POST /api/service/activity` at most every 30
+  seconds), the switch is held, not queued: nothing is written, new Chat
+  turns keep starting, and health names the release with `switchWaitingOn:
+  "someone using Poise"`. It is queued after 90 quiet seconds, or five
+  minutes after it was first asked for, well inside the deploy's ten-minute
+  proof, so the restart and the minutes its caches take to warm land in a
+  quiet moment. Poise then writes `next` and restarts at the first moment no unheld Chat turn and no work of its own
   runs; it waits for no agent call and no turn a healthy relay holds, since
   the relay keeps the turn running and the next server adopts it. While the
   switch is pending, new Chat turns
