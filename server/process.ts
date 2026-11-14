@@ -397,9 +397,16 @@ function applyAgentToolDefaults(env: NodeJS.ProcessEnv, overrides: NodeJS.Proces
 // a test runner does anything but carry on. Off until the gateway installs them into the home volume.
 function applyTestOffload(env: NodeJS.ProcessEnv): void {
   const hooks = join(homedir(), '.poise', 'test-offload')
-  if (!existsSync(join(hooks, 'relay'))) return
+  // One read: the release installer may remove relay to disable offload at any moment.
+  let installed: string
+  try {
+    installed = readFileSync(join(hooks, 'relay'), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
   // Older installed relays have only URL/key. Keep their nine-minute command budget.
-  const limit = readFileSync(join(hooks, 'relay'), 'utf8').trimEnd().split('\n')[2] ?? '540'
+  const limit = installed.trimEnd().split('\n')[2] ?? '540'
   if (!/^\d+$/.test(limit) || Number(limit) < 1 || Number(limit) > 3540) {
     throw new Error('POISE_TEST_LIMIT_SECONDS must be a whole number from 1 to 3540')
   }
