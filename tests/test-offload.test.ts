@@ -2044,11 +2044,18 @@ ${stderr}`
     expect(JSON.stringify({ events, warnings })).not.toContain('private-')
   })
 
-  it.each([null, 'crn-test'])('keeps memory warnings correlatable without logging command bodies with base service %s', async (baseService) => {
+  it.each([
+    [null, 'node'],
+    [null, 'sh'],
+    [null, 'npm run check'],
+    ['crn-test', 'node'],
+    ['crn-test', 'sh'],
+    ['crn-test', 'npm run check'],
+  ])('keeps memory warnings correlatable without logging command bodies with base service %s and command %s', async (baseService, command) => {
     const lines: string[] = []
     const diagnostics: ReturnType<typeof normalize>[] = []
     const log = createLogger((line) => lines.push(line), (level, operation, fields) => diagnostics.push(normalize(gatewayDiagnostic(level, operation, fields))))
-    await startAll({ baseService, log })
+    await startAll({ baseService: baseService as string | null, log })
     // The background sweep can warn before the run fails.
     log.warn('test_relay.sweep.failed', { error: 'unrelated sweep failure' })
     const secret = 'opaque-relay-value-7zQ4mN8p'
@@ -2060,42 +2067,40 @@ ${stderr}`
     writeFileSync(join(repo, 'package.json'), JSON.stringify({ private: true, workspaces: ['gateway'] }))
     writeFileSync(join(repo, 'gateway', 'package.json'), JSON.stringify({ name: 'gateway', scripts: { check: `"${process.execPath}" oom.cjs` } }))
     writeFileSync(join(repo, 'gateway', 'oom.cjs'), script)
-    const commands: [string[], string][] = [
-      [[process.execPath, '-e', script, secret], 'node'],
-      [['/bin/sh', '-c', shell, 'private-shell-argument', secret], 'sh'],
-      [[process.execPath, realpathSync(join(dirname(process.execPath), 'npm')), '--prefix', repo, '--workspace', 'gateway', 'run', 'check', '--', secret], 'npm run check'],
-    ]
+    const label = command as string
+    const argv = label === 'node'
+      ? [process.execPath, '-e', script, secret]
+      : label === 'sh'
+        ? ['/bin/sh', '-c', shell, 'private-shell-argument', secret]
+        : [process.execPath, realpathSync(join(dirname(process.execPath), 'npm')), '--prefix', repo, '--workspace', 'gateway', 'run', 'check', '--', secret]
     const headers = { authorization: `Bearer ${KEY}` }
-    for (const [argv, label] of commands) {
-      const { code, stderr } = await suite(repo, argv).done
-      expect(code).toBe(125)
-      expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
-      expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
-      expect(stderr).toContain('let CI run the tests')
-      expect(stderr).not.toContain('name a')
-      const id = /, run ([a-f0-9]{32})/.exec(stderr)![1]
-      const message = `run ${id}, workspace alice, command ${label}: this suite is too big for its test box: it ran out of memory`
-      const records = lines.map((line) => JSON.parse(line))
-      expect(records).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', level: 'warn', id, error: message }))
-      for (const event of ['test_relay.run.created', 'test_relay.run.finished']) {
-        expect(records).toContainEqual(expect.objectContaining({ event, id, command: label, ...(event.endsWith('finished') ? { exit: 125 } : {}) }))
-      }
-      expect(diagnostics).toContainEqual(expect.objectContaining({ operation: 'test_relay.run.failed', severity: 'warning', visibility: 'operator',
-        workspace: null, message: `test_relay.run.failed: ${message}` }))
-      expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
-
-      // Cancellation uses the same formatter, before any command has executed.
-      const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: JSON.stringify({ argv, cwd: repo, env: {} }) })
-      const stopped = await created.json() as { id: string }
-      const output = await fetch(`${relayUrl}/runs/${stopped.id}/output`, { headers })
-      await until(() => lines.some((line) => { const record = JSON.parse(line); return record.event === 'test_relay.run.created' && record.id === stopped.id }), 'the cancelled run to be created')
-      expect((await fetch(`${relayUrl}/runs/${stopped.id}`, { method: 'DELETE', headers })).status).toBe(204)
-      await output.arrayBuffer()
-      expect(lines.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: stopped.id, command: label }))
-      unpacked = temp()
+    const { code, stderr } = await suite(repo, argv).done
+    expect(code).toBe(125)
+    expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
+    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+    expect(stderr).toContain('let CI run the tests')
+    expect(stderr).not.toContain('name a')
+    const id = /, run ([a-f0-9]{32})/.exec(stderr)![1]
+    const message = `run ${id}, workspace alice, command ${label}: this suite is too big for its test box: it ran out of memory`
+    const records = lines.map((line) => JSON.parse(line))
+    expect(records).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', level: 'warn', id, error: message }))
+    for (const event of ['test_relay.run.created', 'test_relay.run.finished']) {
+      expect(records).toContainEqual(expect.objectContaining({ event, id, command: label, ...(event.endsWith('finished') ? { exit: 125 } : {}) }))
     }
-    const output = JSON.stringify({ lines, diagnostics })
-    for (const excluded of [secret, 'const privateValue', 'private_value=', 'private-shell-argument', 'console.error', 'oom.cjs', repo]) expect(output).not.toContain(excluded)
+    expect(diagnostics).toContainEqual(expect.objectContaining({ operation: 'test_relay.run.failed', severity: 'warning', visibility: 'operator',
+      workspace: null, message: `test_relay.run.failed: ${message}` }))
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+
+    // Cancellation uses the same formatter, before any command has executed.
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: JSON.stringify({ argv, cwd: repo, env: {} }) })
+    const stopped = await created.json() as { id: string }
+    const output = await fetch(`${relayUrl}/runs/${stopped.id}/output`, { headers })
+    await until(() => lines.some((line) => { const record = JSON.parse(line); return record.event === 'test_relay.run.created' && record.id === stopped.id }), 'the cancelled run to be created')
+    expect((await fetch(`${relayUrl}/runs/${stopped.id}`, { method: 'DELETE', headers })).status).toBe(204)
+    await output.arrayBuffer()
+    expect(lines.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: stopped.id, command: label }))
+    const outputText = JSON.stringify({ lines, diagnostics })
+    for (const excluded of [secret, 'const privateValue', 'private_value=', 'private-shell-argument', 'console.error', 'oom.cjs', repo]) expect(outputText).not.toContain(excluded)
     expect(lines.map((line) => JSON.parse(line)).filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   }, 20_000)
 
