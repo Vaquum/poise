@@ -648,9 +648,10 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
   return null
 }
 
-/** A pre-PR failure pairs one unambiguous test file:line with the Caller's
- * retained diagnostic facts. Changed IDs, wording or report closure alone
- * never qualify; a missing or ambiguous file:line or diagnostic stays unknown. */
+/** A pre-PR failure pairs one unambiguous test file:line, case and failure
+ * excerpt with the Caller's retained diagnostic facts. Changed IDs, wording
+ * or report closure alone never qualify; a missing or ambiguous identity or
+ * diagnostic stays unknown. */
 function prePrTestFileLine(error: unknown): { file: string, line: number } | null {
   if (typeof error !== 'string') return null
   const found = new Map<string, number>()
@@ -664,6 +665,39 @@ function prePrTestFileLine(error: unknown): { file: string, line: number } | nul
   if (found.size !== 1) return null
   const [file, line] = [...found.entries()][0]
   return { file, line }
+}
+
+function escapePrePrRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function prePrTestCase(error: string, file: string): string | null {
+  const found = new Set<string>()
+  for (const match of error.matchAll(new RegExp(`\\b${escapePrePrRegExp(file)}\\s*>\\s*([^:\\n]+?)\\s*:`, 'g'))) {
+    const test = match[1].trim()
+    if (!test) return null
+    found.add(test)
+  }
+  if (found.size !== 1) return null
+  return [...found][0]
+}
+
+function prePrFailureExcerpt(error: string, file: string, test: string): string | null {
+  const matches = [...error.matchAll(new RegExp(`\\b${escapePrePrRegExp(file)}\\s*>\\s*${escapePrePrRegExp(test)}\\s*:\\s*`, 'g'))]
+  if (matches.length !== 1 || matches[0].index === undefined) return null
+  let excerpt = error.slice(matches[0].index + matches[0][0].length)
+  const cut = excerpt.search(/Captured candidate/i)
+  if (cut >= 0) excerpt = excerpt.slice(0, cut)
+  excerpt = excerpt.trim().replace(/\s+/g, ' ')
+  return excerpt ? excerpt : null
+}
+
+function prePrFileAndTest(error: unknown): { file: string, test: string } | null {
+  if (typeof error !== 'string') return null
+  const parsed = prePrTestFileLine(error)
+  if (!parsed) return null
+  const test = prePrTestCase(error, parsed.file)
+  return test ? { file: parsed.file, test } : null
 }
 
 function prePrDiagnosticFingerprint(diagnostic: unknown): Record<string, unknown> | null {
@@ -685,9 +719,15 @@ function prePrDiagnosticFingerprint(diagnostic: unknown): Record<string, unknown
 }
 
 function prePrFailure(invocation: BehaviorChain['invocations'][number]) {
-  const file = prePrTestFileLine(invocation.evidence?.error)
+  const error = invocation.evidence?.error
+  const file = prePrTestFileLine(error)
+  if (!file || typeof error !== 'string') return null
+  const test = prePrTestCase(error, file.file)
+  if (!test) return null
+  const failure = prePrFailureExcerpt(error, file.file, test)
+  if (!failure) return null
   const diagnostic = prePrDiagnosticFingerprint(invocation.evidence?.diagnostic)
-  return file && diagnostic ? { ...file, diagnostic } : null
+  return diagnostic ? { ...file, test, failure, diagnostic } : null
 }
 
 function prePrReports(db: Database, chainId: string) {
@@ -734,7 +774,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       const waitingPrefix = `Stage: implement-issue. Worker-reported blocker: ${behaviorErrorMessage(chain.held!, 500)}. Next action: inspect the implementation Call, address the blocker, then explicitly Resume. `
       const current = prePrFailure(implementation.invocation)
       if (!currentHold || !current) {
-        return `${waitingPrefix}Implementation hold reporting pending: current Call ${implementation.call} after Resume has an uncertain failure relationship (no unambiguous test file:line in its worker blocker or missing Caller diagnostic); prior report preserves its hold; inspect the current Call before explicitly resuming; the source remains held`
+        return `${waitingPrefix}Implementation hold reporting pending: current Call ${implementation.call} after Resume has an uncertain failure relationship (no unambiguous test file:line, case and failure excerpt in its worker blocker or missing Caller diagnostic); prior report preserves its hold; inspect the current Call before explicitly resuming; the source remains held`
       }
       const same: typeof priors = []
       const unknown: string[] = []
@@ -743,12 +783,16 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         const priorInvocation = chain.invocations.find(invocation => invocation.id === candidate.report.attempts[0]?.invocation)
         const prior = priorInvocation ? prePrFailure(priorInvocation) : null
         if (!priorInvocation || !prior) { different = false; unknown.push(`prior report ${candidate.report.issueNumber ?? candidate.report.key.slice(0, 8)} original Call evidence is unavailable`); continue }
-        if (current.file === prior.file && current.line === prior.line
-          && chainBasis(current.diagnostic) === chainBasis(prior.diagnostic)) { same.push(candidate); continue }
+        if (current.file === prior.file && current.line === prior.line && current.test === prior.test
+          && current.failure === prior.failure && chainBasis(current.diagnostic) === chainBasis(prior.diagnostic)) { same.push(candidate); continue }
         if (current.file !== prior.file && chainBasis(current.diagnostic) === chainBasis(prior.diagnostic)) continue
+        if (current.file === prior.file && current.line === prior.line && current.test === prior.test
+          && current.failure !== prior.failure && chainBasis(current.diagnostic) === chainBasis(prior.diagnostic)) continue
         different = false
-        unknown.push(current.file === prior.file
+        unknown.push(current.file === prior.file && current.line !== prior.line
           ? `current Call ${implementation.call} (${current.file}:${current.line}) shares its failing file with prior report ${candidate.report.issueNumber ?? candidate.report.key.slice(0, 8)} (${prior.file}:${prior.line}) but lines differ`
+          : current.file === prior.file && current.line === prior.line && current.test !== prior.test
+          ? `current Call ${implementation.call} (${current.file}:${current.line}) shares its failing location with prior report ${candidate.report.issueNumber ?? candidate.report.key.slice(0, 8)} (${prior.file}:${prior.line}) but test case differs`
           : `current Call ${implementation.call} diagnostic differs from prior report ${candidate.report.issueNumber ?? candidate.report.key.slice(0, 8)}`)
       }
       if (same.length) {
@@ -815,14 +859,15 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     && /\b(?:implementation|publication) (?:remains |is )uncertain\b/i.test(body)
     && /\b(?:no|missing|without|lacks)[^.\n]{0,120}\b(?:push (?:result|outcome|evidence)|publication receipt)\b/i.test(body)
     : undefined
-  // A blocked-by remedy for a new pre-PR failure verifies by its failing file.
-  // The remedy predates the hold, so it cannot carry the new marker or Call.
+  // A blocked-by remedy for a new pre-PR failure verifies by its failing file
+  // and test case. The remedy predates the hold, so it cannot carry the new
+  // marker or Call; a file mention alone leaves ownership unresolved.
   const prePrRemedy = cause === IMPLEMENTATION_CAUSE && implementationReport && implementation
     ? (() => {
-        const failure = prePrTestFileLine(implementation.invocation.evidence?.error)
+        const failure = prePrFileAndTest(implementation.invocation.evidence?.error)
         return failure ? (body: string, author: string) =>
           [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
-          && !REPORT_MARKER.test(body) && body.includes(failure.file)
+          && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
           : undefined
       })()
     : undefined
@@ -877,10 +922,11 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     }
     let existing = await reconcileRepairReport(chain.repository, marker, null)
     // A new pre-PR failure after Resume adopts its blocked-by remedy when one
-    // markerless open issue verifies the current failing file. An unavailable
-    // or ambiguous owner read stays pending; it never counts as no owner.
+    // markerless open issue verifies the current failing file and test case.
+    // An unavailable or ambiguous owner read stays pending; it never counts
+    // as no owner. A file mention alone leaves ownership unresolved.
     if (!existing && cause === IMPLEMENTATION_CAUSE && implementationReport && key !== chainBasis([cause, chain.id])) {
-      const failure = prePrTestFileLine(implementation!.invocation.evidence?.error)
+      const failure = prePrFileAndTest(implementation!.invocation.evidence?.error)
       if (!failure) return `${label} reporting pending: current Call ${implementation!.call} failure identity is unavailable during remedy lookup; prior report preserves its hold; inspect the current Call before explicitly resuming`
       const deps = (fresh.prerequisites?.evidence?.[0] ?? null) as { repo?: unknown, number?: unknown,
         found?: unknown, complete?: unknown, prerequisites?: unknown } | null
@@ -897,7 +943,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       if (blockedBy.length) {
         const verifier = (body: string, author: string) =>
           [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
-          && !REPORT_MARKER.test(body) && body.includes(failure.file)
+          && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
         const candidates: Array<{ number: number, url: string, state: string, labels: string[] }> = []
         for (const entry of blockedBy) {
           const number = Number((entry as { number: number }).number)
