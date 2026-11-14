@@ -829,6 +829,97 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
   return null
 }
 
+/** A pre-PR failure pairs one unambiguous test file:line, case and failure
+ * excerpt with the Caller's retained diagnostic facts. Changed IDs, wording
+ * or report closure alone never qualify; a missing or ambiguous identity or
+ * diagnostic stays unknown. */
+function prePrTestFileLine(error: unknown): { file: string, line: number } | null {
+  if (typeof error !== 'string') return null
+  const found = new Map<string, number>()
+  for (const match of error.matchAll(/\b([\w.-]+(?:\/[\w.-]+)*\.(?:test|spec)\.[tj]s[x]?):(\d+)\b/g)) {
+    const line = Number(match[2])
+    if (!Number.isSafeInteger(line) || line < 1) return null
+    const file = match[1]
+    if (found.has(file) && found.get(file) !== line) return null
+    found.set(file, line)
+  }
+  if (found.size !== 1) return null
+  const [file, line] = [...found.entries()][0]
+  return { file, line }
+}
+
+function escapePrePrRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function prePrTestCase(error: string, file: string): string | null {
+  const found = new Set<string>()
+  for (const match of error.matchAll(new RegExp(`\\b${escapePrePrRegExp(file)}\\s*>\\s*([^:\\n]+?)\\s*:`, 'g'))) {
+    const test = match[1].trim()
+    if (!test) return null
+    found.add(test)
+  }
+  if (found.size !== 1) return null
+  return [...found][0]
+}
+
+function prePrFailureExcerpt(error: string, file: string, test: string): string | null {
+  const matches = [...error.matchAll(new RegExp(`\\b${escapePrePrRegExp(file)}\\s*>\\s*${escapePrePrRegExp(test)}\\s*:\\s*`, 'g'))]
+  if (matches.length !== 1 || matches[0].index === undefined) return null
+  let excerpt = error.slice(matches[0].index + matches[0][0].length)
+  const cut = excerpt.search(/Captured candidate/i)
+  if (cut >= 0) excerpt = excerpt.slice(0, cut)
+  excerpt = excerpt.trim().replace(/\s+/g, ' ')
+  return excerpt ? excerpt : null
+}
+
+function prePrFileAndTest(error: unknown): { file: string, test: string } | null {
+  if (typeof error !== 'string') return null
+  const parsed = prePrTestFileLine(error)
+  if (!parsed) return null
+  const test = prePrTestCase(error, parsed.file)
+  return test ? { file: parsed.file, test } : null
+}
+
+function prePrDiagnosticFingerprint(diagnostic: unknown): Record<string, unknown> | null {
+  if (!diagnostic || typeof diagnostic !== 'object' || Array.isArray(diagnostic)) return null
+  const row = diagnostic as { operation?: unknown, phase?: unknown, outcome?: unknown,
+    context?: Record<string, unknown> | null }
+  if (typeof row.operation !== 'string' || typeof row.phase !== 'string'
+    || row.outcome !== null && typeof row.outcome !== 'string') return null
+  const context = row.context ?? {}
+  for (const key of ['submission', 'exit_code', 'signal', 'errno'] as const) {
+    const value = (context as Record<string, unknown>)[key]
+    if (value !== null && typeof value !== 'string' && typeof value !== 'number') return null
+  }
+  return { operation: row.operation, phase: row.phase, outcome: row.outcome,
+    submission: (context as Record<string, unknown>).submission ?? null,
+    exit_code: (context as Record<string, unknown>).exit_code ?? null,
+    signal: (context as Record<string, unknown>).signal ?? null,
+    errno: (context as Record<string, unknown>).errno ?? null }
+}
+
+function prePrFailure(invocation: BehaviorChain['invocations'][number]) {
+  const error = invocation.evidence?.error
+  const file = prePrTestFileLine(error)
+  if (!file || typeof error !== 'string') return null
+  const test = prePrTestCase(error, file.file)
+  if (!test) return null
+  const failure = prePrFailureExcerpt(error, file.file, test)
+  if (!failure) return null
+  const diagnostic = prePrDiagnosticFingerprint(invocation.evidence?.diagnostic)
+  return diagnostic ? { ...file, test, failure, diagnostic } : null
+}
+
+function prePrReports(db: Database, chainId: string) {
+  const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
+    AND json_extract(value, '$.source') = ? AND json_extract(value, '$.pull') IS NULL
+    AND json_extract(value, '$.holdSequence') IS NOT NULL
+    ORDER BY json_extract(value, '$.holdSequence') DESC`)
+    .all(PREFIX + '*', chainId) as Array<{ key: string, value: string }>
+  return rows.map(row => ({ storageKey: row.key, value: row.value, report: JSON.parse(row.value) as RepairReport }))
+}
+
 /** Runs only on the existing reconciliation opportunity. The existing meta
  * store holds creation intent; neither its absence on GitHub nor a restart
  * can reopen that intent for another POST. Intake remains the normal reader. */
@@ -852,6 +943,56 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   const implementation = qualifyingImplementationHold(db, chain, observation, Date.now())
     ?? qualifyingImplementationPublication(chain, observation, Date.now())
   const implementationCause = implementation?.invocation.state === 'uncertain' ? IMPLEMENTATION_PUBLICATION_CAUSE : IMPLEMENTATION_CAUSE
+  // A pre-PR hold after Resume reconciles against its own attempt and hold
+  // sequence. A prior closed intent never silently consumes a newer
+  // qualifying failure; same failures deduplicate, unknown stays pending.
+  let prePrOverride: { cause: typeof IMPLEMENTATION_CAUSE, key: string, storageKey: string, stored: { value: string } | undefined } | null = null
+  if (implementation && implementationCause === IMPLEMENTATION_CAUSE && !observation.pull && !merge && !closed && !qualifying) {
+    const currentHold = db.prepare(`SELECT sequence, at FROM behavior_chain_events WHERE chain_id = ?
+      AND json_extract(payload, '$.type') = 'chain.held' AND sequence > ? ORDER BY sequence DESC LIMIT 1`)
+      .get(chain.id, chain.resumedAfterSequence) as { sequence: number, at: number } | undefined
+    const priors = prePrReports(db, chain.id)
+    const exact = currentHold && priors.find(candidate => candidate.report.attempts.length === 1
+      && candidate.report.attempts[0].invocation === implementation.invocation.id
+      && candidate.report.attempts[0].call === implementation.call
+      && candidate.report.holdSequence === currentHold.sequence && candidate.report.heldAt === currentHold.at)
+    if (exact) {
+      prePrOverride = { cause: IMPLEMENTATION_CAUSE, key: exact.report.key, storageKey: exact.storageKey, stored: { value: exact.value } }
+    } else if (priors.length) {
+      const waitingPrefix = `Stage: implement-issue. Worker-reported blocker: ${behaviorErrorMessage(chain.held!, 500)}. Next action: inspect the implementation Call, address the blocker, then explicitly Resume. `
+      const current = prePrFailure(implementation.invocation)
+      if (!currentHold || !current) {
+        return `${waitingPrefix}Implementation hold reporting pending: current Call ${implementation.call} after Resume has an uncertain failure relationship (no unambiguous test file:line, case and failure excerpt in its worker blocker or missing Caller diagnostic); prior report preserves its hold; inspect the current Call before explicitly resuming; the source remains held`
+      }
+      const same: typeof priors = []
+      const unknown: string[] = []
+      let different = true
+      for (const candidate of priors) {
+        const priorInvocation = chain.invocations.find(invocation => invocation.id === candidate.report.attempts[0]?.invocation)
+        const prior = priorInvocation ? prePrFailure(priorInvocation) : null
+        if (!priorInvocation || !prior) { different = false; unknown.push(`prior report ${candidate.report.issueNumber ?? candidate.report.key.slice(0, 8)} original Call evidence is unavailable`); continue }
+        if (current.file === prior.file && current.line === prior.line && current.test === prior.test
+          && current.failure === prior.failure && chainBasis(current.diagnostic) === chainBasis(prior.diagnostic)) { same.push(candidate); continue }
+        if (current.file !== prior.file && chainBasis(current.diagnostic) === chainBasis(prior.diagnostic)) continue
+        if (current.file === prior.file && current.line === prior.line && current.test === prior.test
+          && current.failure !== prior.failure && chainBasis(current.diagnostic) === chainBasis(prior.diagnostic)) continue
+        different = false
+        unknown.push(current.file === prior.file && current.line !== prior.line
+          ? `current Call ${implementation.call} (${current.file}:${current.line}) shares its failing file with prior report ${candidate.report.issueNumber ?? candidate.report.key.slice(0, 8)} (${prior.file}:${prior.line}) but lines differ`
+          : current.file === prior.file && current.line === prior.line && current.test !== prior.test
+          ? `current Call ${implementation.call} (${current.file}:${current.line}) shares its failing location with prior report ${candidate.report.issueNumber ?? candidate.report.key.slice(0, 8)} (${prior.file}:${prior.line}) but test case differs`
+          : `current Call ${implementation.call} diagnostic differs from prior report ${candidate.report.issueNumber ?? candidate.report.key.slice(0, 8)}`)
+      }
+      if (same.length) {
+        prePrOverride = { cause: IMPLEMENTATION_CAUSE, key: same[0].report.key, storageKey: same[0].storageKey, stored: { value: same[0].value } }
+      } else if (!different || unknown.length) {
+        return `${waitingPrefix}Implementation hold reporting pending: current Call ${implementation.call} (${current.file}:${current.line}) after Resume has an uncertain failure relationship (${unknown.join('; ') || 'no verified same or different failure'}); prior report preserves its hold; inspect the current Call and prior report before explicitly resuming; the source remains held`
+      } else {
+        const scoped = chainBasis([IMPLEMENTATION_CAUSE, chain.id, implementation.invocation.id, currentHold.sequence])
+        prePrOverride = { cause: IMPLEMENTATION_CAUSE, key: scoped, storageKey: PREFIX + scoped, stored: undefined }
+      }
+    }
+  }
   const intents = CAUSES.filter(cause => cause === MERGE_CAUSE ? pendingMerge
     : cause === IMPLEMENTATION_PUBLICATION_CAUSE ? pendingImplementation : cause === IMPLEMENTATION_CAUSE || observation.pull).flatMap(cause => {
     // A terminal repair has its own PR identity; retain the older implementation intent for historical status.
@@ -876,13 +1017,14 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     .get(PREFIX + '*', observation.pull!.number, chain.id,
       `${chain.repository.toLowerCase()}#${observation.pull!.number}`) as { key: string, value: string } | undefined
     : qualifying?.cause === 'review_budget_exhausted' ? existingReviewReport(db, chain.repository, observation.pull!.number) : undefined
-  const intent = linked ? { cause: closed ? CLOSED_CAUSE : 'review_budget_exhausted', key: (JSON.parse(linked.value) as RepairReport).key,
+  let intent = linked ? { cause: closed ? CLOSED_CAUSE : 'review_budget_exhausted', key: (JSON.parse(linked.value) as RepairReport).key,
     storageKey: linked.key, stored: linked }
     : intents.find(intent => intent.cause === (merge ? MERGE_CAUSE : closed ? CLOSED_CAUSE : implementation ? implementationCause : qualifying?.cause)) ?? intents.find(intent => intent.stored)
+  if (prePrOverride) intent = prePrOverride
   if (!intent) return pendingMerge || !observation.pull ? null : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
   const { cause, key, storageKey, stored } = intent
   const implementationReport = cause === IMPLEMENTATION_PUBLICATION_CAUSE
-    || cause === IMPLEMENTATION_CAUSE && key === chainBasis([cause, chain.id])
+    || cause === IMPLEMENTATION_CAUSE && (stored ? (JSON.parse(stored.value) as RepairReport).pull === null : observation.pull === null)
   const label = cause === CLOSED_CAUSE ? 'Closed PR continuation' : cause === MERGE_CAUSE ? 'Merge submission'
     : cause === IMPLEMENTATION_PUBLICATION_CAUSE ? 'Implementation publication'
     : cause === IMPLEMENTATION_CAUSE ? implementationReport ? 'Implementation hold' : 'Repair hold' : 'Repair exhaustion'
@@ -904,6 +1046,18 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     && [original.invocation, original.call].every(id => body.split(/[^A-Za-z0-9:_-]+/).includes(id))
     && /\b(?:implementation|publication) (?:remains |is )uncertain\b/i.test(body)
     && /\b(?:no|missing|without|lacks)[^.\n]{0,120}\b(?:push (?:result|outcome|evidence)|publication receipt)\b/i.test(body)
+    : undefined
+  // A blocked-by remedy for a new pre-PR failure verifies by its failing file
+  // and test case. The remedy predates the hold, so it cannot carry the new
+  // marker or Call; a file mention alone leaves ownership unresolved.
+  const prePrRemedy = cause === IMPLEMENTATION_CAUSE && implementationReport && implementation
+    ? (() => {
+        const failure = prePrFileAndTest(implementation.invocation.evidence?.error)
+        return failure ? (body: string, author: string) =>
+          [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
+          && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
+          : undefined
+      })()
     : undefined
   if (report && implementationReport && getBehaviorChainSettings().seedMode === 'label') {
     const fresh = await verify()
@@ -955,6 +1109,46 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       if (successor) return successor
     }
     let existing = await reconcileRepairReport(chain.repository, marker, null)
+    // A new pre-PR failure after Resume adopts its blocked-by remedy when one
+    // markerless open issue verifies the current failing file and test case.
+    // An unavailable or ambiguous owner read stays pending; it never counts
+    // as no owner. A file mention alone leaves ownership unresolved.
+    if (!existing && cause === IMPLEMENTATION_CAUSE && implementationReport && key !== chainBasis([cause, chain.id])) {
+      const failure = prePrFileAndTest(implementation!.invocation.evidence?.error)
+      if (!failure) return `${label} reporting pending: current Call ${implementation!.call} failure identity is unavailable during remedy lookup; prior report preserves its hold; inspect the current Call before explicitly resuming`
+      const deps = (fresh.prerequisites?.evidence?.[0] ?? null) as { repo?: unknown, number?: unknown,
+        found?: unknown, complete?: unknown, prerequisites?: unknown } | null
+      if (!fresh.prerequisites || !deps || String(deps.repo ?? '').toLowerCase() !== chain.repository.toLowerCase()
+        || deps.number !== chain.issue || deps.found !== true || deps.complete !== true || !Array.isArray(deps.prerequisites)) {
+        return `${label} reporting pending: blocked-by evidence is unavailable or incomplete for ${chain.id}; cannot establish an existing remedy for ${failure.file}; inspect the current Call before explicitly resuming`
+      }
+      const blockedBy = deps.prerequisites as Array<{ repo?: unknown, number?: unknown }>
+      if (blockedBy.some(entry => !entry || typeof entry !== 'object' || String((entry as { repo?: unknown }).repo ?? '').toLowerCase() !== chain.repository.toLowerCase()
+        || !Number.isSafeInteger((entry as { number?: unknown }).number) || Number((entry as { number?: unknown }).number) < 1
+        || Number((entry as { number?: unknown }).number) === chain.issue)) {
+        return `${label} reporting pending: blocked-by evidence for ${chain.id} is invalid or self-referential; cannot establish an existing remedy for ${failure.file}; inspect the current Call before explicitly resuming`
+      }
+      if (blockedBy.length) {
+        const verifier = (body: string, author: string) =>
+          [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
+          && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
+        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string }> = []
+        for (const entry of blockedBy) {
+          const number = Number((entry as { number: number }).number)
+          try {
+            const candidate = await reconcileRepairReport(chain.repository, marker, number, false, verifier)
+            if (candidate) candidates.push(candidate)
+          } catch (error) {
+            return `${label} reporting pending: existing remedy #${number} read is unavailable or ambiguous (${error instanceof Error ? error.message : String(error)}); cannot establish an owner for ${failure.file}; inspect the current Call before explicitly resuming`
+          }
+        }
+        const open = candidates.filter(candidate => candidate.state === 'open')
+        if (open.length > 1) {
+          return `${label} reporting pending: multiple existing remedies match ${failure.file} (${open.map(candidate => `#${candidate.number}`).join(', ')}); cannot establish a unique owner; inspect the current Call before explicitly resuming`
+        }
+        if (open.length === 1) existing = open[0]
+      }
+    }
     if (!existing && linkedReport) {
       const { stdout } = await runFile('github-interface', ['--issue-comments', String(chain.issue), '--repository', chain.repository,
         '--token-user', chain.author], { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
@@ -1133,7 +1327,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     : ''
   const publicationAction = cause === IMPLEMENTATION_PUBLICATION_CAUSE
     ? `Original Call ${original!.call} publication remains uncertain: reconcile its missing pre-push no-write checkpoint or conclusive push result. ` : ''
-  return confirmReport(db, journal, chain, report, label, allowed, source, linkedReport, publicationAction)
+  return confirmReport(db, journal, chain, report, label, allowed, source, linkedReport ?? prePrRemedy, publicationAction)
 }
 
 async function confirmReport(db: Database, journal: BehaviorChainJournal,
