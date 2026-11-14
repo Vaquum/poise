@@ -506,7 +506,12 @@ its own instead of refusing with dirty_unowned.
   `poise.release` (the commit `deploy/lib.sh` built it from) and `poise.base`
   (a digest of the files that build the system around it:
   `deploy/runtime/Dockerfile`, `entrypoint.sh`, `install-clis.sh`,
-  `supervisor.mjs` and `install-release.sh`).
+  `supervisor.mjs`, `resource-witness.mjs` and `install-release.sh`, plus the
+  locked `node_modules/playwright-core` version and integrity from
+  `package-lock.json`). That package supplies Chromium's revision and browser
+  system dependencies. An unrelated dependency change keeps the same base;
+  a Playwright identity change takes the drained replacement path. Images from
+  before this browser identity was included take one replacement on introduction.
 - **The supervisor.** `entrypoint.sh` becomes `supervisor.mjs`, which runs
   Poise from `~/.poise/releases/current` when that release is installed for
   its base, and from the image's own release otherwise. When Poise exits with
