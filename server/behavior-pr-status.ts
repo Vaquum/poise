@@ -3,7 +3,7 @@
 // CI and merge-queue state, and a one-line current blocker.
 //
 // Read-only by construction: datastore `view` reads (cached 60 s), pure
-// behavior_seen/dead-letter SELECTs, meta reads, and the in-memory
+// behavior_seen/dead-letter SELECTs, meta reads, cached Caller history and the in-memory
 // merge-candidate cache the existing merge-prs tick fills, or canonical
 // journal projections for chain-owned PRs. No Caller
 // invocation, no GitHub request, and no claim, retry, incident,
@@ -13,6 +13,7 @@
 // `sinceRestart`).
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { classifyBehaviorDiagnostic } from '../src/behavior-failure-cause'
+import { getCachedAgentLogSnapshot, quarantinedLogMayMatch } from './agent'
 import { countReviewRounds, listGreyCiPendingHeads, listLiveReviewClaims, listPrReviewStates } from './db'
 import { getOrganizations } from './organizations'
 import { prAccounts } from './pr-accounts'
@@ -54,6 +55,7 @@ export type PrBlockerId = 'not_eligible' | 'held' | 'review_running' | 'awaiting
 export interface PrStatusHeld {
   behavior: string
   code: string
+  detail?: string
   /** Incident creation, ISO. */
   since: string
   nextRetryAt?: string
@@ -138,7 +140,13 @@ export function computePrBlocker(input: BlockerInput): ComputedBlocker {
 
   const [strongest, ...restHeld] = input.held
   if (strongest) {
-    for (const other of restHeld) details.push(`also held: ${other.behavior} ${other.code} since ${shortTime(other.since)}`)
+    if (strongest.detail) details.push(`${strongest.behavior}: ${strongest.detail}`)
+    if (input.liveClaim && input.currentHead
+      && input.liveClaim.expectedHead?.toLowerCase() === input.currentHead.toLowerCase()) {
+      details.push(`review running: ${input.liveClaim.key} on ${shortHead(input.liveClaim.expectedHead)}`)
+      for (const other of input.liveClaim.others) details.push(`also running: ${other}`)
+    }
+    for (const other of restHeld) details.push(`also held: ${other.behavior} ${other.code} since ${shortTime(other.since)}${other.detail ? `: ${other.detail}` : ''}`)
     const retry = strongest.nextRetryAt ? `, retry ${shortTime(strongest.nextRetryAt)}` : ''
     return done('held', `held: ${strongest.behavior} ${strongest.code} since ${shortTime(strongest.since)}${retry}`,
       `held:${strongest.behavior}:${strongest.code}`)
@@ -269,7 +277,8 @@ export interface PrStatusRow {
   verdict: (PrStatusVerdict & { onCurrentHead: boolean | null }) | null
   ci: { state: string | null, head: string | null, asOf: string | null } | { state: 'unknown', reason: string }
   queue: { state: PrStatusQueueState, entryId: string | null, since: string | null,
-    attribution?: 'accepted-response' | 'observed', invocationId?: string }
+    attribution?: 'accepted-response' | 'observed', invocationId?: string,
+    disposition?: string, integrationBase?: string | null, integrationHead?: string | null }
   blocker: { id: PrBlockerId, line: string, since: string, sinceRestart: boolean, details: string[] }
   flags: { age: boolean, staleBlocker: boolean }
   eligibility: { refusal: string | null, skippedBy: string[] }
@@ -413,7 +422,8 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
   const reviewStates = listPrReviewStates(inventory.map(({ pr }) => pr.number))
   const liveClaims = listLiveReviewClaims()
   const greyHeads = listGreyCiPendingHeads()
-  const incidents = getBehaviorDiagnosticIncidents(null)
+  const snapshot = getCachedAgentLogSnapshot()
+  const incidents = getBehaviorDiagnosticIncidents(snapshot)
   const skips = new Map(SKIPPABLE_BEHAVIORS.map((behavior) =>
     [behavior, new Set(getRepositorySkips(behavior).map((repo) => repo.toLowerCase()))] as const))
 
@@ -580,18 +590,38 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
         const textCode = classifyBehaviorDiagnostic(incident.error).code
         if (textCode !== 'unknown') code = textCode
       }
-      // A target may have been launched again. Only this incident's Call can
-      // supply launch evidence; disagreement with a head-pinned target stays held.
+      // Recovery can release and reuse a headless launch. Only the original
+      // Call/correlation can recover its head; conflicting or possible-write
+      // evidence must keep the hold.
       const review = incident.behavior === 'review-new-prs' || incident.behavior === 'approve-prs'
       const targetHead = /(?:@|\/)head=([a-f0-9]{40})(?=$|[/:])/i.exec(incident.target)?.[1].toLowerCase()
       const launch = incident.callId ? states.find((state) => state.key === incident.behavior
         && state.target === incident.target && state.callId === incident.callId) : undefined
       const launchHead = launch?.expectedHead?.toLowerCase()
-      const head = targetHead ?? launchHead
+      const calls = snapshot?.entries.filter((row) => (!!incident.callId && row.id === incident.callId)
+        || (!!incident.correlationId && row.correlation_id === incident.correlationId)) ?? []
+      const call = calls.length === 1 ? calls[0] : undefined
+      const callerHead = call?.expected_head?.toLowerCase()
+      const head = targetHead ?? launchHead ?? callerHead
       const consistent = (!launch || (!!launchHead && (!targetHead || targetHead === launchHead)
         && (!launch.headSha || launch.headSha.toLowerCase() === launchHead)
         && (!incident.actor || launch.actor?.toLowerCase() === incident.actor.toLowerCase())
         && (!incident.source || launch.source === incident.source)))
+        && calls.length <= 1 && (!call || (call.id === incident.callId
+          && !!incident.correlationId && call.correlation_id === incident.correlationId
+          && call.repo === incident.repo && String(call.pr_id) === String(incident.pr)
+          && call.behavior === (incident.behavior === 'review-new-prs' ? 'pr_review' : 'pr_approve')
+          && !!incident.actor && call.actor?.toLowerCase() === incident.actor.toLowerCase()
+          && incident.source === `poise:${incident.behavior}` && call.source === incident.source
+          && callerHead === head && call.status === 'failed'
+          && call.action === 'not_started' && call.outcome === 'preflight_failed'
+          && !call.head_sha && call.review_id == null && call.review_comments == null && call.receipts == null
+          && !/could not prove a safe recovery/.test(call.error)))
+        && !snapshot?.quarantined.some((row) => quarantinedLogMayMatch(row, {
+          id: incident.callId, correlationId: incident.correlationId,
+          repo: incident.repo, prId: String(incident.pr),
+          behavior: incident.behavior === 'review-new-prs' ? 'pr_review' : 'pr_approve',
+        }))
         && incidentKey({ repo: null, pr: null, target: incident.target }) === key
       if (review && liveOnCurrentHead && !quarantined && code !== 'invalid_agent_result'
         && consistent && head && /^[a-f0-9]{40}$/.test(head) && head !== currentHead) {
@@ -601,6 +631,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       held.push({
         behavior: incident.behavior,
         code,
+        detail: incident.error,
         since: incident.createdAt,
         ...(incident.nextRetryAt ? { nextRetryAt: incident.nextRetryAt } : {}),
       })
@@ -623,7 +654,18 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       mergePrsEnabled, mergePrsPaused, mergeRetryAt, greyPending,
       evidenceFresh: cacheUsable, evidenceWhy,
     })
-    computed.details = [...computed.details, ...historical].slice(0, 8)
+    const checkDetails = scoped(() => ([
+      ['review-new-prs', `${target}:check`],
+      ['review-new-prs', `${target}:secondary:check`],
+      ['review-new-prs', `${target}:tertiary:check`],
+      ['approve-prs', `${target}:check`],
+    ] as const).flatMap(([behavior, checkTarget]) => {
+      const failure = getBehaviorFailureState(behavior, checkTarget)
+      if (!failure) return []
+      const retry = Date.parse(failure.nextRetryAt) > now ? 'at' : 'due since'
+      return [`${behavior} check failed for ${checkTarget}: ${failure.error ?? 'cause unrecorded'}; revision unverified; retry ${retry} ${failure.nextRetryAt}`]
+    }))
+    computed.details = [...computed.details, ...checkDetails, ...historical].slice(0, 8)
 
     const tracked = trackBlocker(key, computed.id, computed.key, asOf)
 

@@ -5,7 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from contextlib import nullcontext, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,9 +13,13 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+
 import agent_interface as api
 from agent_interface import issue_review, native_namespace, review_budget, review_receipt, resource_ownership
+from github_interface import cli as github_cli, interface as github_api
 from github_interface.behaviors import pr_review
+from github_interface.behaviors import issue_work
 
 CALL = "a" * 32
 HEAD = "b" * 40
@@ -123,14 +127,48 @@ class ManagedReceipts(TestCase):
 
     def test_publication_helper_refuses_foreign_scope_parent_or_remaining_worker(self):
         self.active_publication()
-        for parent, namespace, pids in ((9, "pid:[91]", [1, 2, 3]), (2, "pid:[92]", [1, 2, 3]), (2, "pid:[91]", [1, 2, 3, 4])):
-            scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=lambda: {"pids": pids})
+        for helper, parent, namespace, pids, reason in (
+                (2, 2, "pid:[91]", [1, 2], "helper_pid"),
+                (3, 9, "pid:[91]", [1, 2, 3], "helper_parent"),
+                (3, 2, "pid:[92]", [1, 2, 3], "helper_namespace"),
+                (3, 2, "pid:[91]", [1, 3], "namespace_members"),
+                (3, 2, "pid:[91]", [1, 2, 3, 4], "namespace_busy")):
+            scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(return_value={"pids": pids}))
             with self.subTest(parent=parent, namespace=namespace, pids=pids), \
                     patch.object(native_namespace, "active", return_value=None), \
                     patch.object(resource_ownership, "original_scope", return_value=scope), \
-                    patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=parent), \
-                    patch.object(os, "readlink", return_value=namespace), self.assertRaises(RuntimeError):
+                    patch.object(os, "getpid", return_value=helper), patch.object(os, "getppid", return_value=parent), \
+                    patch.object(os, "readlink", return_value=namespace), \
+                    patch.object(review_receipt.time, "monotonic", side_effect=[0, 0, 0, 0, 2]), \
+                    self.assertRaisesRegex(RuntimeError, reason):
                 review_receipt.work_publication(HEAD, start_replies=True)
+            if reason.startswith("helper_"):
+                scope.read.assert_not_called()
+        self.assertFalse(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
+
+    def test_executed_helper_waits_only_for_extra_members_with_reads_bounded_by_remaining_time(self):
+        self.active_publication()
+        scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(side_effect=[
+            {"pids": [1, 2, 3, 4]}, {"pids": [1, 2, 3]}]))
+        with patch.object(native_namespace, "active", return_value=None), \
+                patch.object(resource_ownership, "original_scope", return_value=scope), \
+                patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=2), \
+                patch.object(os, "readlink", return_value="pid:[91]"), \
+                patch.object(review_receipt.time, "monotonic", side_effect=[0, 0.2, 0.25, 0.3, 0.4, 0.5]):
+            review_receipt.work_publication(HEAD, start_replies=True)
+        self.assertEqual([read.kwargs["timeout_seconds"] for read in scope.read.call_args_list], [1.8, 1.6])
+        self.assertTrue(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
+
+    def test_executed_helper_rejects_idle_evidence_arriving_after_the_settlement_deadline(self):
+        self.active_publication()
+        scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(return_value={"pids": [1, 2, 3]}))
+        with patch.object(native_namespace, "active", return_value=None), \
+                patch.object(resource_ownership, "original_scope", return_value=scope), \
+                patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=2), \
+                patch.object(os, "readlink", return_value="pid:[91]"), \
+                patch.object(review_receipt.time, "monotonic", side_effect=[0, 0, 2.1]), \
+                self.assertRaisesRegex(RuntimeError, "namespace_read_timeout"):
+            review_receipt.work_publication(HEAD, start_replies=True)
         self.assertFalse(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
 
     def test_unacknowledged_issue_comment_is_never_reclassified_as_no_write(self):
@@ -179,6 +217,141 @@ class AtomicWorkLimits(TestCase):
     def run_behavior(self, pull=None, expected_head=None, correlation_id="00000000-0000-4000-8000-000000000001"):
         api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
                             correlation_id, "fixture-model", "poise/issue-7", pull=pull, expected_head=expected_head)
+
+    def test_same_head_merge_at_validation_or_publication_settles_through_native_receipts(self):
+        repo = Path(__file__).resolve().parents[3]
+        output = repo / "test-results"
+        output.mkdir(exist_ok=True)
+        with TemporaryDirectory(prefix="merged-repair-contract-", dir=output) as work:
+            root = Path(work)
+            env = {"PATH": os.environ["PATH"], "HOME": str(self.path.parent), "TMPDIR": work}
+            build = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"),
+                                    str(repo / "tests/fixtures/behavior-fence-contract.ts"), "--bundle", "--platform=node",
+                                    "--packages=external", "--format=esm", "--target=node22", f"--outfile={root / 'contract.mjs'}"],
+                                   cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            for scenario, deleted in (("validate", False), ("validate", True), ("publish", False), ("publish", True),
+                                      ("refused", True), ("read-failed", False)):
+                with self.subTest(scenario=scenario, deleted=deleted):
+                    modes, commands = [], []
+                    original_interface = issue_review.interface
+                    client = AsyncMock(token="private-token")
+
+                    def pull():
+                        merged = scenario != "refused" and (scenario != "publish" or modes[-1] == "publish")
+                        return {"number": 3, "state": "closed" if merged or scenario == "refused" else "open",
+                                "merged": merged, "merged_at": "2026-11-13T20:51:13Z" if merged else None,
+                                "merge_commit_sha": "d" * 40, "user": {"login": "author"},
+                                "body": "<!-- poise-chain example/repo#7 -->",
+                                "head": {"ref": "poise/issue-7", "sha": HEAD, "repo": {"full_name": "example/repo"}}}
+
+                    async def get(path):
+                        if path == "/repos/example/repo":
+                            return {"full_name": "example/repo", "default_branch": "main"}
+                        if path.endswith("/pulls/3"):
+                            if scenario == "read-failed":
+                                request = httpx.Request("GET", "https://api.github.com" + path)
+                                raise httpx.ReadError("repair PR read unavailable private-token", request=request)
+                            return pull()
+                        self.assertEqual(path, "/repos/example/repo/issues/7")
+                        return {"state": "closed" if pull()["state"] == "closed" else "open"}
+
+                    async def paginate(path, params=None):
+                        if path.endswith("/comments"):
+                            return [{"id": 17}]
+                        return [pull()] if params["state"] == "all" else []
+
+                    async def graph(*_args):
+                        return {"repository": {"ref": None if deleted and pull()["merged"] else {
+                            "target": {"oid": HEAD, "message": "Original repair head"}},
+                            "defaultBranchRef": {"target": {"oid": "d" * 40}},
+                            "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+
+                    client.get.side_effect, client.paginate.side_effect, client.graphql.side_effect = get, paginate, graph
+
+                    def interface(*args, **kwargs):
+                        if args[0] != "--issue-work":
+                            return {"review_threads": [{"root_comment_id": 17, "is_resolved": False}]}
+                        mode = args[args.index("--mode") + 1]
+                        modes.append(mode)
+                        if mode == "prepare":
+                            return {"outcome": "prepared", "checkout_head": HEAD}
+                        return original_interface(*args, **kwargs)
+
+                    def command(args, **_kwargs):
+                        stdout, stderr, code = StringIO(), StringIO(), 0
+                        with patch.object(sys, "argv", args), redirect_stdout(stdout), redirect_stderr(stderr):
+                            try:
+                                github_cli.main()
+                            except SystemExit as stopped:
+                                code = stopped.code
+                        # Caller must still ignore arbitrary stderr outside its envelope.
+                        return SimpleNamespace(returncode=code, communicate=lambda **_kwargs: (
+                            stdout.getvalue(), "private raw stderr\n" + stderr.getvalue()))
+
+                    def git(args, *_args):
+                        commands.append(args[3:])
+                        return {("branch", "--show-current"): "poise/issue-7",
+                                ("remote", "get-url", "origin"): "https://github.com/example/repo.git",
+                                ("rev-parse", "HEAD"): HEAD, ("status", "--porcelain"): " M candidate.txt"}[tuple(args[3:])]
+
+                    def worker(_lease, _args, **kwargs):
+                        (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                            "commitMessage": "fix: seed", "title": "fix: seed", "body": "Completed repair",
+                            "replies": [{"commentId": 17, "body": "Fixed the finding and checked the regression."}]}))
+                        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                    correlation = f"merged-repair-{scenario}-{deleted}"
+
+                    def execute():
+                        # Exercise the CLI finalizer using the existing v1
+                        # library boundary, without a physical provider.
+                        with patch.object(api, "_native_cli", False):
+                            self.run_behavior(3, HEAD, correlation)
+
+                    with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                            patch.object(issue_review, "interface", side_effect=interface), \
+                            patch.object(issue_review.subprocess, "Popen", side_effect=command), \
+                            patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                            patch.object(issue_review, "_terminal_failure", return_value=None), \
+                            patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                            patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                            patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                            patch.object(github_api, "GitHubClient", return_value=client), \
+                            patch.object(issue_work, "_run", side_effect=git), \
+                            patch.object(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source",
+                                                      "poise:behavior-chain", "--correlation-id", correlation]), \
+                            patch.object(api, "_main", side_effect=execute), \
+                            patch.object(issue_work, "work_publication") as checkpoint, redirect_stdout(StringIO()):
+                        if scenario in {"refused", "read-failed"}:
+                            with self.assertRaises(RuntimeError):
+                                api.main()
+                        else:
+                            api.main()
+                    call, = [row for row in api.logs() if row["correlation_id"] == correlation]
+                    self.assertIsNotNone(call["resources_settled_at"])
+                    if scenario in {"refused", "read-failed"}:
+                        self.assertEqual((call["status"], call["action"], call["outcome"]), ("failed", "not_started", "preflight_failed"))
+                        self.assertEqual(call["diagnostic"]["operation"], "issue_work.validate")
+                        self.assertEqual(call["diagnostic"]["severity"], "error")
+                        self.assertIn("no longer an open issue" if scenario == "refused" else "GET /repos/example/repo/pulls/3", call["error"])
+                    else:
+                        self.assertEqual((call["status"], call["action"], call["outcome"], call["head_sha"]),
+                                         ("superseded", None, "superseded", HEAD))
+                        self.assertIsNone(call["diagnostic"])
+                    for private in ("private-token", "private raw stderr"):
+                        self.assertNotIn(private, json.dumps(call))
+                    self.assertEqual(modes, ["prepare", "validate", "publish"] if scenario == "publish" else ["prepare", "validate"])
+                    self.assertEqual(bool(commands), scenario == "publish")
+                    checkpoint.assert_not_called()
+                    client.post.assert_not_awaited()
+                    client.patch.assert_not_awaited()
+                    wire = root / "call.json"
+                    wire.write_text(json.dumps([call]))
+                    consumed = subprocess.run(["node", str(root / "contract.mjs"), str(wire),
+                                               "atomic-work-failed" if scenario in {"refused", "read-failed"} else "atomic-merged-repair"],
+                                              cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(consumed.returncode, 0, consumed.stderr)
 
     def test_verified_relay_no_result_instructions_hand_the_exact_candidate_to_normal_publication(self):
         for pull, exit_code, reason in (
@@ -912,6 +1085,245 @@ class AtomicWorkLimits(TestCase):
         self.assertEqual((status, code, action), ("failed", "atomic_work_blocked", "not_started"))
         self.assertEqual(json.loads(artifact)["ci_blocker"], ci)
         self.assertIsNone(plan)
+
+    def test_pre_pr_shared_test_block_retains_only_independently_verified_original_base_evidence(self):
+        dependency = {"base": HEAD, "run": 41, "baselineRun": 42,
+                      "remediation": "https://github.com/example/repo/issues/1530"}
+        proof = {**dependency, "verified": True, "runAttempt": 1, "baselineAttempt": 1,
+                 "failures": [{"file": "tests/test-relay.test.ts", "test": "warning array", "cause": "expected []"}]}
+        for index, mode in enumerate(("verified", "unverified", "wrong base", "unavailable")):
+            verified = mode == "verified"
+            with self.subTest(mode=mode):
+                commands = []
+
+                def interface(*args, **_kwargs):
+                    commands.append(args[0])
+                    if args[0] == "--issue-work":
+                        self.assertEqual(args[args.index("--mode") + 1], "prepare")
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+                    self.assertEqual(args[0], "--chain-seed")
+                    self.assertEqual(json.loads(args[args.index("--test-dependency-json") + 1]), dependency)
+                    if mode == "unavailable":
+                        raise RuntimeError("original CI artifacts could not be read")
+                    return {"test_dependency": {**proof, "verified": verified}}
+
+                def worker(_lease, _args, **kwargs):
+                    (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                        "blocked": "Original test failed on the implementation base",
+                        "testDependency": {**dependency, "base": "c" * 40} if mode == "wrong base" else dependency}))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                        patch.object(issue_review, "interface", side_effect=interface), \
+                        patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                        patch.object(issue_review, "_terminal_failure", return_value=None), \
+                        patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                        patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                        patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                        self.assertRaisesRegex(ValueError, "Original test failed"):
+                    self.run_behavior(correlation_id=f"00000000-0000-4000-8000-00000000000{index + 2}")
+                with sqlite3.connect(self.path) as conn:
+                    status, code, action, artifact, plan = conn.execute(
+                        "select status,error_code,action,artifact,action_plan from calls order by rowid desc limit 1").fetchone()
+                self.assertEqual(commands, ["--issue-work"] if mode == "wrong base" else ["--issue-work", "--chain-seed"])
+                self.assertEqual((status, code, action), ("failed", "atomic_work_blocked", "not_started"))
+                self.assertEqual(json.loads(artifact).get("test_dependency"), proof if verified else None)
+                self.assertIsNone(plan)
+
+    def test_queue_ci_blocker_requires_the_original_integration_workflow_and_failed_attempt(self):
+        integration, base = "d" * 40, "c" * 40
+        ci = {"action": "list_failing_ci", "repository": "example/repo", "pull_number": 3, "head_sha": HEAD, "failing": []}
+        queue = {"head_sha": HEAD, "queue_removals": [{"id": "removed", "reason": "failed_checks", "beforeCommit": {"oid": integration}}]}
+        for mode in ("verified", "refailed", "rerun-succeeded", "rerun-running", "rerun-running-first", "wrong-head",
+                     "wrong-ref", "wrong-parent", "unknown-run", "wrong-event", "missing-attempt", "pending", "missing-job",
+                     "contradictory-success"):
+            with self.subTest(mode=mode):
+                check = {"type": "check_run", "name": "Caller", "state": "completed", "conclusion": "failure",
+                         "check_run_id": 41, "log_id": 42, "run_id": 40, "head_sha": integration,
+                         "url": "https://github.com/example/repo/actions/runs/40/job/42", "summary": "x" * 65536}
+                run = {"id": 40, "workflow_id": 1, "run_attempt": 1, "event": "merge_group", "head_sha": integration}
+                packet = {**ci, "ref": integration, "parents": [base, HEAD], "failing": [check], "runs": [run]}
+                if mode == "refailed":
+                    run.update(run_attempt=2, status="completed", conclusion="failure")
+                if mode == "rerun-succeeded":
+                    run.update(run_attempt=2, status="completed", conclusion="success")
+                if mode == "rerun-running":
+                    run.update(run_attempt=2, status="in_progress", conclusion=None)
+                if mode == "rerun-running-first":
+                    run.update(status="in_progress", conclusion=None)
+                if mode == "contradictory-success":
+                    run.update(status="completed", conclusion="success")
+                if mode == "wrong-head":
+                    packet["head_sha"] = base
+                if mode == "wrong-ref":
+                    packet["ref"] = base
+                if mode == "wrong-parent":
+                    packet["parents"] = [base, integration]
+                if mode == "unknown-run":
+                    packet["runs"] = []
+                if mode == "wrong-event":
+                    run["event"] = "pull_request"
+                if mode == "missing-attempt":
+                    del run["run_attempt"]
+                if mode == "pending":
+                    check["state"] = "in_progress"
+                if mode == "missing-job":
+                    check["log_id"] = None
+                with patch.object(issue_review, "interface", return_value=packet) as read:
+                    if mode.startswith("wrong-") and mode != "wrong-event":
+                        with self.assertRaisesRegex(ValueError, "admitted candidate and base"):
+                            api.atomic_work._ci_only_blocker(ci, queue, HEAD, "author")
+                        continue
+                    blocker = api.atomic_work._ci_only_blocker(ci, queue, HEAD, "author")
+                read.assert_called_once_with("--list-failing-ci", "3", "--repository", "example/repo", "--token-user", "author", "--ref", integration)
+                expected = {"verified": 1, "refailed": 2, "rerun-succeeded": 1, "rerun-running": 1, "rerun-running-first": 1}.get(mode)
+                self.assertEqual("queue" in blocker, expected is not None)
+                self.assertNotIn("summary", json.dumps(blocker))
+                if expected is not None:
+                    self.assertEqual(blocker["queue"], {"removal": "removed", "integration": integration, "base": base,
+                        "failures": [{"name": "Caller", "check": 41, "job": 42, "run": 40, "workflow": 1, "attempt": expected,
+                                      "url": check["url"]}]})
+
+    def test_queue_ci_blocker_keeps_verified_failure_alongside_pending_rerun(self):
+        integration, base = "d" * 40, "c" * 40
+        ci = {"action": "list_failing_ci", "repository": "example/repo", "pull_number": 3, "head_sha": HEAD, "failing": []}
+        queue = {"head_sha": HEAD, "queue_removals": [{"id": "removed", "reason": "failed_checks", "beforeCommit": {"oid": integration}}]}
+        for mode in ("same-run", "new-run", "rerun-first", "distinct-workflow", "distinct-name", "malformed-pending"):
+            with self.subTest(mode=mode):
+                check = {"type": "check_run", "name": "Caller", "state": "completed", "conclusion": "failure",
+                         "check_run_id": 41, "log_id": 42, "run_id": 40, "head_sha": integration,
+                         "url": "https://github.com/example/repo/actions/runs/40/job/42"}
+                run = {"id": 40, "workflow_id": 1, "run_attempt": 1, "event": "merge_group", "head_sha": integration}
+                rerun = {"id": 41, "workflow_id": 1, "run_attempt": 1, "event": "merge_group",
+                         "head_sha": integration, "status": "in_progress", "conclusion": None}
+                pending = {"type": "check_run", "name": "Caller", "state": "in_progress", "conclusion": None,
+                           "check_run_id": 43, "log_id": 44, "run_id": 41, "head_sha": integration,
+                           "url": "https://github.com/example/repo/actions/runs/41/job/44"}
+                if mode == "same-run":
+                    run.update(run_attempt=2, status="in_progress", conclusion=None)
+                    pending.update(run_id=40, url="https://github.com/example/repo/actions/runs/40/job/44")
+                    packet = {**ci, "ref": integration, "parents": [base, HEAD], "failing": [check, pending], "runs": [run]}
+                else:
+                    if mode == "distinct-workflow":
+                        rerun["workflow_id"] = 2
+                    if mode == "distinct-name":
+                        pending["name"] = "Other"
+                    if mode == "malformed-pending":
+                        pending["log_id"] = None
+                    failing = [pending, check] if mode == "rerun-first" else [check, pending]
+                    packet = {**ci, "ref": integration, "parents": [base, HEAD], "failing": failing, "runs": [run, rerun]}
+                with patch.object(issue_review, "interface", return_value=packet):
+                    blocker = api.atomic_work._ci_only_blocker(ci, queue, HEAD, "author")
+                retained = mode in {"same-run", "new-run", "rerun-first"}
+                self.assertEqual("queue" in blocker, retained)
+                if retained:
+                    self.assertEqual(blocker["queue"]["failures"],
+                                     [{"name": "Caller", "check": 41, "job": 42, "run": 40, "workflow": 1,
+                                       "attempt": 1, "url": check["url"]}])
+
+    def test_failed_queue_blocker_drops_partial_shared_proof_but_keeps_integration_failures(self):
+        integration, base = "d" * 40, "c" * 40
+        ci = {"action": "list_failing_ci", "repository": "example/repo", "pull_number": 3, "head_sha": HEAD, "failing": []}
+        queue = {"head_sha": HEAD, "queue_removals": [{"id": "removed", "reason": "failed_checks", "beforeCommit": {"oid": integration}}]}
+        check = {"type": "check_run", "name": "Caller", "state": "completed", "conclusion": "failure",
+                 "check_run_id": 41, "log_id": 42, "run_id": 40, "head_sha": integration,
+                 "url": "https://github.com/example/repo/actions/runs/40/job/42"}
+        run = {"id": 40, "workflow_id": 1, "run_attempt": 1, "event": "merge_group", "head_sha": integration}
+        packet = {**ci, "ref": integration, "parents": [base, HEAD], "failing": [check], "runs": [run]}
+        for index, shared in enumerate((False, True)):
+            with self.subTest(shared=shared):
+                dependency = {"head": HEAD, "removal": "removed", "integration": integration, "base": base,
+                              "remediation": "https://github.com/example/repo/issues/99", "allShared": shared,
+                              "failures": [{"check": 41, "name": "Caller", "run": 40, "workflow": 1,
+                                            "evidence": "AssertionError: original fixture did not complete"}]}
+
+                def interface(*args, **_kwargs):
+                    if args[0] == "--issue-work":
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+                    if args[0] == "--list-failing-ci":
+                        return packet if "--ref" in args else ci
+                    return {"--pr-review": {"review_threads": []}, "--pull-action-state": queue}[args[0]]
+
+                def worker(_lease, _args, **kwargs):
+                    (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                        "blocked": {"cause": "ci_only", "reason": "The supplied unit job failed"},
+                        "ciDependency": {"head": HEAD}}))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                        patch.object(issue_review, "interface", side_effect=interface), \
+                        patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                        patch.object(issue_review, "_terminal_failure", return_value=None), \
+                        patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                        patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                        patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                        patch.object(api.atomic_work, "_verify_ci_dependency", return_value=dependency), \
+                        self.assertRaisesRegex(ValueError, "The supplied unit job failed"):
+                    self.run_behavior(pull=3, expected_head=HEAD,
+                                      correlation_id=f"00000000-0000-4000-8000-0000000000{index + 2:02d}"[-36:])
+                with sqlite3.connect(self.path) as conn:
+                    artifact = json.loads(conn.execute(
+                        "select artifact from calls order by rowid desc limit 1").fetchone()[0])
+                blocker = artifact["ci_blocker"]
+                self.assertIn("queue", blocker)
+                self.assertEqual(blocker["queue"]["failures"][0]["check"], 41)
+                self.assertEqual("ci_dependency" in blocker, shared)
+                if shared:
+                    self.assertNotIn("evidence", json.dumps(blocker["ci_dependency"]))
+
+    def test_relay_dependency_uses_original_caller_binding_and_retained_runner_receipts(self):
+        for index, missing in enumerate((False, True)):
+            dependency = {"source": "relay", "base": HEAD, "run": "1" * 32, "baselineRun": "2" * 32,
+                          "remediation": "https://github.com/example/repo/issues/1530"}
+            captured, verified = {}, {}
+
+            def interface(*args, **_kwargs):
+                if args[0] == "--issue-work":
+                    return {"outcome": "prepared", "checkout_head": HEAD}
+                actual = json.loads(args[args.index("--test-dependency-json") + 1])
+                self.assertEqual(actual["capture"], captured)
+                self.assertEqual(actual["relay"], {name: {"payload": name, "signature": "runner signature"}
+                                                 for name in ("original", "baseline")})
+                verified.update(actual, verified=True, runAttempt=1, baselineAttempt=1,
+                                failures=[{"file": "tests/test-relay.test.ts", "test": "warning", "cause": "expected []"}])
+                return {"test_dependency": verified}
+
+            def worker(_lease, _args, **kwargs):
+                captured.update(json.loads(kwargs["env"]["POISE_TEST_BINDING"]))
+                for key, name in (("run", "original"), ("baselineRun", "baseline")):
+                    if missing and name == "original":
+                        continue
+                    receipt = Path(kwargs["env"]["POISE_TEST_EVIDENCE_DIR"]) / f"{dependency[key]}.json"
+                    receipt.write_text(json.dumps({"payload": name, "signature": "runner signature"}))
+                (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                    "blocked": "Original relay assertion failed", "testDependency": {**dependency,
+                    "capture": {"call": "worker-selected"}, "relay": {"original": "worker text"}}}))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def execute():
+                # Exercise the CLI finalizer with the existing library scope;
+                # native namespace admission has its own contract tests.
+                with patch.object(api, "_native_cli", False):
+                    self.run_behavior(correlation_id=f"00000000-0000-4000-8000-00000000001{index}")
+
+            with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                    patch.object(issue_review, "interface", side_effect=interface), \
+                    patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                    patch.object(issue_review, "_terminal_failure", return_value=None), \
+                    patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                    patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                    patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                    patch.object(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source", "poise:behavior-chain"]), \
+                    patch.object(api, "_main", side_effect=execute), \
+                    self.assertRaisesRegex(ValueError, "Original relay assertion failed"):
+                api.main()
+            with sqlite3.connect(self.path) as conn:
+                call, artifact, settled = conn.execute("select id,artifact,resources_settled_at from calls order by rowid desc limit 1").fetchone()
+            artifact = json.loads(artifact)
+            self.assertEqual(captured["call"], call)
+            self.assertEqual(artifact["test_capture"], captured)
+            self.assertEqual(artifact.get("test_dependency"), None if missing else verified)
+            self.assertIsNotNone(settled)
 
     def test_ci_only_blocker_drops_check_summaries_to_fit_the_receipt_limit(self):
         failing = [{"type": "check_run", "name": f"unit-{index}", "state": "completed", "conclusion": "failure",

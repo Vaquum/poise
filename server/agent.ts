@@ -25,15 +25,15 @@ import { getHeadSha, getPrAuthor } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
 import { needsClaude, randomDrawStillValid, reviewChoice } from './review-model'
-import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
+import { claudeSubscriptionEnvironment, isExpectedFailure, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic, diagnosticFailure } from './logging'
 import { getModelSettings, requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { resolveReviewCheckout } from './review-checkout'
-import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogPage, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
+import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogPage, parseAgentLogRow, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
 import type { AgentLogParseReply, AgentLogParseRequest } from './agent-log-worker'
-import type { AgentLogIdentity, AgentLogSnapshot, LogEntry } from './agent-log-parse'
+import type { AgentLogIdentity, AgentLogSnapshot, LogEntry, QuarantinedAgentLog } from './agent-log-parse'
 
 export { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, quarantinedLogMayMatch, scopedAgentLogs } from './agent-log-parse'
 export type {
@@ -98,6 +98,8 @@ interface AgentLogRead {
   waiters: Set<AgentLogWaiter>
   started: boolean
   settled: boolean
+  /** The lane's generation when this read started. */
+  generation?: number
 }
 
 interface AgentLogLane {
@@ -105,16 +107,67 @@ interface AgentLogLane {
   source: string
   running: AgentLogRead | null
   queued: AgentLogRead | null
-  cached: { snapshot: AgentLogSnapshot, expiresAt: number } | null
+  cached: { snapshot: AgentLogSnapshot, expiresAt: number, readAt: number } | null
   /** The latest read failed: the last snapshot no longer answers a reader at once. */
   failed?: boolean
+  /** Bumped when the lane's calls changed under it (a stop): a read started
+   *  before answers only its own waiters and never becomes the last snapshot. */
+  generation?: number
 }
 
 const AGENT_LOG_SNAPSHOT_TTL_MS = 5_000
+/** How old a running snapshot the running views take at once, read again
+ *  behind the answer: under load, starting agent-interface takes seconds, and
+ *  every open view polls the running lane. */
+export const RUNNING_SNAPSHOT_SERVED_MS = 30_000
 
+// History leaves out each call's progress events, the largest field: no
+// reader of the whole history uses them (a call's own view reads them by its
+// page, its id or the running read). A Caller from before the flag answers
+// with its usage, and history is read whole, as before.
 const historyAgentLogLane: AgentLogLane = {
-  args: ['--logs'], source: 'agent-interface --logs', running: null, queued: null, cached: null,
+  args: ['--logs', '--without-progress'], source: 'agent-interface --logs', running: null, queued: null, cached: null,
 }
+const FULL_HISTORY_ARGS: readonly string[] = ['--logs']
+let historyArgs: readonly string[] = historyAgentLogLane.args
+
+// The whole history, held between reads and brought up to date with only the
+// calls Caller numbered as changed since (agent-interface --logs
+// --changed-after): every refresh used to dump, transfer and parse every call
+// ever made, which grows without bound. A Caller whose answer is the bare
+// whole history, or its usage, is read whole as before.
+interface HeldCall {
+  seq: number
+  /** The row as Caller printed it; dropped once it parsed into an entry,
+   *  kept while quarantined, whose record names its position. */
+  row: unknown
+  index: number
+  parsed: { entry: LogEntry } | { quarantined: QuarantinedAgentLog } | null
+}
+interface HeldHistory { cursor: number, calls: Map<number, HeldCall>, loadedAt: number }
+interface ChangedHistoryPage {
+  rows: Array<{ rowid: number, seq: number, row: unknown }>
+  cursor: number
+  more: boolean
+  order: number[]
+  newest: number
+  /** Every running call as the page read it: its row changes with the clock
+   *  alone (its elapsed time), so no change number marks it. */
+  running: Array<{ rowid: number, seq: number, row: unknown }>
+}
+let heldHistory: HeldHistory | null = null
+/** False once this Caller answered a changed read with the whole history or its usage. */
+let changedHistoryReads = true
+/** Rows per changed-call page: its JSON is read on the server's thread, so a
+ *  first load after a restart comes in parts of a few megabytes. */
+const CHANGED_HISTORY_PAGE_ROWS = 2000
+/** Pages one read may take: the first load of a long history, with room. */
+const CHANGED_HISTORY_MAX_PAGES = 1000
+/** The held history is read whole again past this age, so nothing a change
+ *  number missed can outlive it. */
+const HELD_HISTORY_RELOAD_MS = 30 * 60_000
+/** Parsing yields the server's thread past this long. */
+const HISTORY_PARSE_SLICE_MS = 8
 
 let historyReadFailure: { id: string, firstFailureAt: string, failedReads: number } | null = null
 
@@ -128,11 +181,19 @@ const selectedAgentLogLanes = new Map<string, AgentLogLane>()
 // Production never calls it; in-flight reads are untouched.
 export function resetAgentLogCache(): void {
   historyAgentLogLane.cached = null
+  historyArgs = historyAgentLogLane.args
+  heldHistory = null
+  changedHistoryReads = true
   runningAgentLogLane.cached = null
   for (const [key, lane] of selectedAgentLogLanes) {
     lane.cached = null
     if (!lane.running && !lane.queued) selectedAgentLogLanes.delete(key)
   }
+}
+
+/** Retained history only: never starts a read or reuses evidence after a failed read. */
+export function getCachedAgentLogSnapshot(): AgentLogSnapshot | null {
+  return historyAgentLogLane.failed ? null : historyAgentLogLane.cached?.snapshot ?? null
 }
 
 // Shaped like runFile's own abort rejection, minus the child-kill fields:
@@ -151,15 +212,18 @@ export async function fetchAgentLogSnapshot(
   return laneAgentLogSnapshot(historyAgentLogLane, options, readHistoryAgentLogSnapshot)
 }
 
+/** Running calls. `lastObserved` answers at once from a snapshot read within
+ *  `lastObservedMs` and reads it again behind the answer; an older one is
+ *  read now. */
 export async function fetchRunningAgentLogSnapshot(
-  options: { signal?: AbortSignal, fresh?: boolean } = {},
+  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean, lastObservedMs?: number } = {},
 ): Promise<AgentLogSnapshot> {
   return laneAgentLogSnapshot(runningAgentLogLane, options, readRunningAgentLogSnapshot)
 }
 
 async function laneAgentLogSnapshot(
   lane: AgentLogLane,
-  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean },
+  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean, lastObservedMs?: number },
   read: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
 ): Promise<AgentLogSnapshot> {
   // A caller that is already gone never joins work it cannot use.
@@ -168,12 +232,15 @@ async function laneAgentLogSnapshot(
   // A reader that takes the last snapshot gets it at once, past its time, and
   // the lane reads again behind it.
   // A refresh that failed is reported by the next read, never hidden behind the last snapshot.
-  if (options.lastObserved && !options.fresh && lane.cached && !lane.failed) {
+  if (options.lastObserved && !options.fresh && lane.cached && !lane.failed
+    && (options.lastObservedMs === undefined || Date.now() - lane.cached.readAt <= options.lastObservedMs)) {
     if (!lane.running) startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
     return lane.cached.snapshot
   }
+  // A read started before the lane's calls changed is not joined: the next one is.
+  const current = lane.running !== null && lane.running.generation === (lane.generation ?? 0)
   const target = lane.running
-    ? (!options.fresh ? lane.running : (lane.queued ?? createLaneAgentLogRead(lane)))
+    ? (!options.fresh && current ? lane.running : (lane.queued ?? createLaneAgentLogRead(lane)))
     : startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
   return new Promise<AgentLogSnapshot>((resolve, reject) => {
     const waiter: AgentLogWaiter = { signal: options.signal, onAbort: () => {}, resolve, reject }
@@ -215,11 +282,15 @@ function startLaneAgentLogRead(
   readSnapshot: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
 ): AgentLogRead {
   read.started = true
+  read.generation = lane.generation ?? 0
   lane.running = read
   readSnapshot(read.controller.signal).then(
     (snapshot) => {
-      lane.cached = { snapshot, expiresAt: Date.now() + AGENT_LOG_SNAPSHOT_TTL_MS }
-      lane.failed = false
+      if (read.generation === (lane.generation ?? 0)) {
+        const readAt = Date.now()
+        lane.cached = { snapshot, expiresAt: readAt + AGENT_LOG_SNAPSHOT_TTL_MS, readAt }
+        lane.failed = false
+      }
       settleLaneAgentLogRead(lane, read, { snapshot }, readSnapshot)
     },
     (error) => {
@@ -280,13 +351,124 @@ function copyAgentLogError(error: unknown): unknown {
   return copy
 }
 
+/** A changed-call read's page, or null when the answer is no page: then it is
+ *  what a Caller without the read printed for it, its whole history, and is
+ *  decoded as one, with that read's own errors. */
+function parseChangedHistoryPage(stdout: string): ChangedHistoryPage | null {
+  let value: unknown
+  try { value = JSON.parse(stdout.trim()) } catch { return null }
+  const page = value as Partial<ChangedHistoryPage> | null
+  const count = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) >= 0
+  const calls = (items: unknown): boolean => Array.isArray(items)
+    && items.every((item) => item !== null && typeof item === 'object' && count(item.rowid) && item.rowid > 0 && count(item.seq))
+  if (!page || typeof page !== 'object' || Array.isArray(page) || !calls(page.rows) || !count(page.cursor)
+    || typeof page.more !== 'boolean' || !Array.isArray(page.order) || !page.order.every((rowid) => count(rowid) && rowid > 0)
+    || !count(page.newest) || (page.running !== undefined && !calls(page.running))) {
+    return null
+  }
+  return { ...page, running: page.running ?? [] } as ChangedHistoryPage
+}
+
+/** The whole history from the held calls in Caller's order, parsed as one
+ *  whole read would parse it: a call is parsed again when it changed, or when
+ *  it is quarantined and its position moved. */
+async function assembleHeldHistory(held: HeldHistory, order: readonly number[], signal: AbortSignal): Promise<AgentLogSnapshot> {
+  const entries: LogEntry[] = []
+  const quarantined: QuarantinedAgentLog[] = []
+  let slice = performance.now()
+  for (let index = 0; index < order.length; index++) {
+    const call = held.calls.get(order[index])!
+    if (!call.parsed || ('quarantined' in call.parsed && call.index !== index)) {
+      if (performance.now() - slice > HISTORY_PARSE_SLICE_MS) {
+        await new Promise((resolve) => setImmediate(resolve))
+        signal.throwIfAborted()
+        slice = performance.now()
+      }
+      call.parsed = parseAgentLogRow(call.row, index)
+      call.index = index
+      if ('entry' in call.parsed) {
+        Object.freeze(call.parsed.entry)
+        call.row = null
+      } else Object.freeze(call.parsed.quarantined)
+    }
+    if ('entry' in call.parsed) entries.push(call.parsed.entry)
+    else quarantined.push(call.parsed.quarantined)
+  }
+  entries.reverse()
+  // Each new row froze as it parsed; the arrays and the snapshot freeze here.
+  Object.freeze(entries)
+  Object.freeze(quarantined)
+  return Object.freeze({ entries, quarantined })
+}
+
+/** The whole history through changed-call reads, or the whole history Caller
+ *  printed instead (it reads no changes), or null when it does not know the
+ *  read. */
+async function readChangedHistory(signal: AbortSignal): Promise<{ snapshot: AgentLogSnapshot } | { stdout: string } | null> {
+  const source = 'agent-interface --logs --changed-after'
+  const now = Date.now()
+  let held = heldHistory && now - heldHistory.loadedAt < HELD_HISTORY_RELOAD_MS ? heldHistory : null
+  // A replaced database, or a call the held history lacks, is read from 0 once.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const reading: HeldHistory = held ?? { cursor: 0, calls: new Map(), loadedAt: now }
+    let order: number[] | null = null
+    for (let pages = 0; ; pages++) {
+      if (pages >= CHANGED_HISTORY_MAX_PAGES) throw new Error(`${source} did not reach the newest change`)
+      let stdout: string
+      try {
+        ({ stdout } = await spawnAgentLogRead(['--logs', '--without-progress', '--changed-after', String(reading.cursor),
+          '--limit', String(CHANGED_HISTORY_PAGE_ROWS)], signal))
+      } catch (error) {
+        if (!signal.aborted && callerUsageError(error)) return null
+        throw error
+      }
+      const page = parseChangedHistoryPage(stdout)
+      if (!page) return { stdout }
+      if (page.newest < reading.cursor) break
+      for (const item of page.rows) {
+        if (reading.calls.get(item.rowid)?.seq !== item.seq) reading.calls.set(item.rowid, { seq: item.seq, row: item.row, index: -1, parsed: null })
+      }
+      // Running calls are taken as this page read them, changed or not.
+      for (const item of page.running) reading.calls.set(item.rowid, { seq: item.seq, row: item.row, index: -1, parsed: null })
+      reading.cursor = page.cursor
+      if (!page.more) {
+        order = page.order
+        break
+      }
+    }
+    // Calls are never deleted: the order names every held call, and nothing else.
+    if (order && order.length === reading.calls.size && order.every((rowid) => reading.calls.has(rowid))) {
+      heldHistory = reading
+      return { snapshot: await assembleHeldHistory(reading, order, signal) }
+    }
+    held = null
+    heldHistory = null
+  }
+  throw new Error(`${source} returned a history that does not add up`)
+}
+
 async function readHistoryAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapshot> {
   const startedAt = Date.now()
-  let stdout: string
+  let stdout = ''
   let snapshot: AgentLogSnapshot
   try {
-    ({ stdout } = await spawnAgentLogRead(historyAgentLogLane.args, signal))
-    snapshot = await decodeAgentLogSnapshot(stdout, historyAgentLogLane.source, signal)
+    const changed = changedHistoryReads ? await readChangedHistory(signal) : null
+    if (changed && 'snapshot' in changed) snapshot = changed.snapshot
+    else {
+      // This Caller reads no changes: it printed the whole history, or knows no such read.
+      changedHistoryReads = false
+      if (changed) stdout = changed.stdout
+      else {
+        try {
+          ({ stdout } = await spawnAgentLogRead(historyArgs, signal))
+        } catch (error) {
+          if (historyArgs === FULL_HISTORY_ARGS || !callerUsageError(error)) throw error
+          historyArgs = FULL_HISTORY_ARGS
+          ;({ stdout } = await spawnAgentLogRead(historyArgs, signal))
+        }
+      }
+      snapshot = await decodeAgentLogSnapshot(stdout, historyAgentLogLane.source, signal)
+    }
   } catch (error) {
     if (!signal.aborted) {
       historyReadFailure ??= { id: randomUUID(), firstFailureAt: new Date().toISOString(), failedReads: 0 }
@@ -310,7 +492,7 @@ async function readHistoryAgentLogSnapshot(signal: AbortSignal): Promise<AgentLo
     historyReadFailure = null
   }
   observeAgentSnapshot(snapshot)
-  warnAgentLogCap(stdout, snapshot.entries.length + snapshot.quarantined.length)
+  if (stdout) warnAgentLogCap(stdout, snapshot.entries.length + snapshot.quarantined.length)
   return snapshot
 }
 
@@ -341,16 +523,21 @@ function spawnAgentLogRead(args: readonly string[], signal: AbortSignal | undefi
     timeoutMs: 30_000,
     maxOutputBytes: AGENT_LOG_READ_CAP_BYTES,
     signal,
-    reportFailure: args !== historyAgentLogLane.args,
+    reportFailure: args !== historyAgentLogLane.args && args !== FULL_HISTORY_ARGS && !args.includes('--changed-after'),
   }))
 }
 
 // An older Caller answers the new flags with its usage text. Name the fix;
 // anything else is a real failure and passes through untouched.
+/** Caller answered with its usage text: it does not know these flags. */
+function callerUsageError(error: unknown): boolean {
+  const stderr = (error as { stderr?: unknown } | null)?.stderr
+  return typeof stderr === 'string' && stderr.includes('usage:')
+}
+
 function callerUpdateError(args: readonly string[], error: unknown): Error | null {
   if (args.length < 2) return null
-  const stderr = (error as { stderr?: unknown } | null)?.stderr
-  if (typeof stderr !== 'string' || !stderr.includes('usage:')) return null
+  if (!callerUsageError(error)) return null
   const feature = args.includes('--status') ? 'running-only'
     : args.includes('--limit') ? 'paged' : 'selected'
   return new Error(`Update Caller: ${feature} log reads are unavailable`, { cause: error })
@@ -584,16 +771,35 @@ function warnAgentLogCap(stdout: string, rows: number): void {
 
 // Fetch one response body by the full 32-hex call id. agent-interface also
 // accepts prefixes, but those become ambiguous as the log grows.
-export async function fetchAgentResponse(callId: string): Promise<{ id: string, body: string }> {
+export type AgentResponse = { id: string, body: string }
+  | { id: string, disposition: 'unavailable', reason: string }
+
+export async function fetchAgentResponse(callId: string, readerPurpose: string): Promise<AgentResponse> {
   if (!/^[0-9a-fA-F]{32}$/.test(callId)) {
     throw new Error('invalid agent call id')
   }
-  const { stdout } = await runFile(CLI, ['--read-response', callId], {
-    cwd: agentCwd(),
-    timeoutMs: 30_000,
-    maxOutputBytes: 32 * 1024 * 1024,
-  })
-  return { id: callId, body: stdout }
+  const unavailable = (stdout: string): Extract<AgentResponse, { disposition: string }> | null => {
+    try {
+      const value = JSON.parse(stdout) as { id?: unknown, disposition?: unknown, reason?: unknown }
+      return value?.id === callId.toLowerCase() && value.disposition === 'unavailable'
+        && typeof value.reason === 'string' && value.reason.length > 0
+        ? { id: callId, disposition: 'unavailable', reason: value.reason } : null
+    } catch { return null }
+  }
+  try {
+    const { stdout } = await runFile(CLI, ['--read-response', callId], {
+      cwd: agentCwd(), timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024,
+      callId, readerPurpose,
+      expected: readerPurpose === 'history' ? { codes: [3], stderr: /^$/, stdout: value => unavailable(value) !== null } : undefined,
+    })
+    return { id: callId, body: stdout }
+  } catch (error) {
+    if (isExpectedFailure(error)) {
+      const result = unavailable((error as { stdout: string }).stdout)
+      if (result) return result
+    }
+    throw error
+  }
 }
 
 export async function fetchAgentReasoning(callId: string): Promise<{ id: string, body: string }> {
@@ -619,6 +825,12 @@ export async function stopAgentJob(callId: string): Promise<StopResult> {
   const value = result as Record<string, unknown>
   if (typeof value?.id !== 'string' || typeof value.stopped !== 'boolean' || typeof value.status !== 'string') {
     throw new Error('Update Caller: stopping a run is unavailable')
+  }
+  // A stopped run must not stay in the running views' last snapshot, nor
+  // come back with a read that started before it stopped.
+  if (value.stopped) {
+    runningAgentLogLane.cached = null
+    runningAgentLogLane.generation = (runningAgentLogLane.generation ?? 0) + 1
   }
   return { id: value.id, stopped: value.stopped, status: value.status, error_code: typeof value.error_code === 'string' ? value.error_code : null }
 }

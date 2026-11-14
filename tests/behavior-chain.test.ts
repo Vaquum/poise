@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
-import { chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
+import { behaviorChainAttention, CHAIN_ATTENTION_DELAY_MS, chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
@@ -256,6 +256,64 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
   })
 
+  it('repairs a first conflicting PR before spending review slots, then requires every review and the normal merge gates on the new head', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    obs.prReviewers.push({ ...REVIEWER, slot: 'secondary' })
+    Object.assign(obs.pull!, { conflict: true, reviewIds: [], reviewReceipts: [] })
+    const repair = decideBehaviorChain(current, obs, NOW)
+    expect(repair).toMatchObject({ kind: 'invoke', behavior: 'repair-pr', actor: 'author', reviewer: REVIEWER,
+      basis: chainBasis(['repair', HEAD, [], true, false, false, 0, obs.pull!.reviewRevision, obs.issue.revision]) })
+    if (repair.kind !== 'invoke') throw new Error('expected conflict repair')
+    current = finish(journal, current, 'conflict-repair', 'repair-pr', repair.basis,
+      { status: 'completed', action: 'published', outcome: 'published', head_sha: NEXT })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('repair-pr finished') })
+    obs.publication.head_sha = NEXT; obs.publication.head_invocation = 'conflict-repair'
+    obs.pull!.head = NEXT; obs.pull!.conflict = false
+    obs.pull!.reviewRevision = 'repaired-findings'
+    for (const [index, reviewer] of obs.prReviewers.entries()) {
+      const basis = chainBasis(['pr', NEXT, CONTEXT])
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr', basis,
+        reviewer: { slot: reviewer.slot } })
+      const id = `repaired-${reviewer.slot}`
+      current = finish(journal, current, id, 'review-pr', basis,
+        { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 30 + index, head_sha: NEXT }, reviewer.slot)
+      obs.pull!.reviewIds.push(30 + index)
+      obs.pull!.reviewReceipts.push({ id: 30 + index, head: NEXT, state: 'COMMENTED', invocation: chainBasis(id).slice(0, 32),
+        submittedAt: NOW, response: reviewResponse(chainBasis(id).slice(0, 32), NEXT) })
+    }
+    obs.pull!.pending = true
+    expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'exact-head CI is still running' })
+    obs.pull!.pending = false
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+    obs.pull!.approved = true; obs.pull!.unresolved = 1
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'resolve-threads' })
+    obs.pull!.unresolved = 0
+    expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'native repository readiness gates are not satisfied' })
+    obs.pull!.ready = true
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
+    obs.pull!.queueEntry = 'repaired-queue-entry'
+    expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'native merge queue owns entry repaired-queue-entry' })
+  })
+
+  it.each([
+    ['started', 'review-pr is started'], ['uncertain', 'review-pr is uncertain'],
+    ['held', 'operator hold'], ['queue', 'native merge queue owns'], ['stale', 'observations need refreshing'],
+  ])('preserves the %s guard before conflict repair or PR review', (guard, reason) => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    Object.assign(obs.pull!, { conflict: true, reviewIds: [], reviewReceipts: [] })
+    if (guard === 'started' || guard === 'uncertain') {
+      current = record(journal, current, { type: 'invocation.admitted', invocation: invocation('owned-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT])) })
+      current = record(journal, current, { type: 'invocation.started', invocationId: 'owned-review' })
+      if (guard === 'uncertain') current = record(journal, current, { type: 'invocation.uncertain', invocationId: 'owned-review', reason: 'verdict unavailable' })
+    }
+    if (guard === 'held') current = record(journal, current, { type: 'chain.held', reason: 'operator hold' })
+    if (guard === 'queue') obs.pull!.queueEntry = 'existing-entry'
+    if (guard === 'stale') obs.checkedAt = NOW - 120_001
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining(reason) })
+  })
+
   it('merges a ready pull request without making its outdated threads a prerequisite', () => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
@@ -312,14 +370,47 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'complete', mergeSha: MERGE })
   })
 
-  it.each([false, true])('requires diagnosis, baseline recovery when shared=%s, and approval before a fresh integration attempt', (shared) => {
+  it('surfaces an unmergeable queue entry after 24 hours without resetting attention age on polls or restart', () => {
+    const { db, journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    Object.assign(obs.pull!, { approved: true, checksState: 'SUCCESS', queueEntry: 'entry',
+      queueEntryDetails: { id: 'entry', state: 'UNMERGEABLE', base: NEXT, head: null } })
+    current = record(journal, current, { type: 'chain.observed', observation: structuredClone(obs) })
+    const decision = decideBehaviorChain(current, obs, NOW)
+    expect(decision).toMatchObject({ kind: 'wait', reason: expect.stringContaining('UNMERGEABLE; cause unknown') })
+    if (decision.kind !== 'wait') throw new Error('expected queue wait')
+    current = record(journal, current, { type: 'chain.waiting', reason: decision.reason })
+    for (const elapsed of [CHAIN_ATTENTION_DELAY_MS - 1, CHAIN_ATTENTION_DELAY_MS, CHAIN_ATTENTION_DELAY_MS + 1000]) {
+      obs.checkedAt = NOW + elapsed
+      current = journal.append(chain.id, `poll-${elapsed}`, current.sequence, { type: 'chain.observed', observation: structuredClone(obs) }, obs.checkedAt)
+      const attention = behaviorChainAttention(journal, obs.checkedAt)
+      if (elapsed < CHAIN_ATTENTION_DELAY_MS) expect(attention).toEqual([])
+      else expect(attention[0]).toMatchObject({ progressAt: NOW, ageMs: elapsed,
+        evidence: { state: 'fresh', gates: expect.arrayContaining(['Queue UNMERGEABLE; cause unknown']) },
+        nextAction: 'Queue UNMERGEABLE needs attention; cause unknown. Await GitHub queue resolution or removal; GitHub retains ownership' })
+    }
+    const before = behaviorChainAttention(journal, obs.checkedAt)
+    const recovered = new BehaviorChainJournal(db); recovered.rebuild()
+    expect(behaviorChainAttention(recovered, obs.checkedAt)).toEqual(before)
+    expect(recovered.read(chain.id)!.held).toBeNull()
+  })
+
+  it.each([{ shared: false, reason: 'failed_checks' }, { shared: true, reason: 'failed_checks' }, { shared: false, reason: 'merge_conflict' }])(
+    'requires diagnosis, baseline recovery when shared=$shared, and approval after $reason before a fresh integration attempt', ({ shared, reason }) => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
     current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
       { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
     current = finish(journal, current, 'queue', 'merge-pr', 'queue-basis', { status: 'completed', outcome: 'enqueued', head_sha: HEAD }, null)
     obs.pull!.approved = true; obs.pull!.ready = true
-    obs.pull!.queueRemoval = { id: 'failed-integration', reason: 'failed_checks', at: NOW, actor: null }
+    obs.pull!.queueEntry = 'unmergeable-entry'
+    obs.pull!.queueEntryDetails = { id: 'unmergeable-entry', state: 'UNMERGEABLE', base: NEXT, head: null }
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('UNMERGEABLE; cause unknown') })
+    obs.pull!.queueEntry = null; obs.pull!.queueEntryDetails = null
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('removal evidence') })
+    obs.pull!.queueRemoval = { id: 'failed-integration', reason, at: NOW, actor: null }
     const repair = decideBehaviorChain(current, obs, NOW)
     expect(repair).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
     if (repair.kind !== 'invoke') throw new Error('expected repair')
@@ -422,6 +513,149 @@ describe('native admission and recovery', () => {
       readActionResult: async () => { throw new Error('unexpected native response read') },
       fenceClosedTarget: async () => { throw new Error('unexpected closed-target fence') }, wake: () => {}, ...overrides }
   }
+
+  function admissionQueue() {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    const { db, journal, chain } = setup()
+    const observations = new Map<string, ChainObservation>()
+    const obs = observation(); obs.issueReviewers = []
+    observations.set(chain.id, obs)
+    const slots = new CheckSemaphore(() => 1)
+    const calls: LogEntry[] = [], launches: string[] = []
+    let release: (() => void) | null = null
+    const seed = (number: number) => {
+      const id = chainIdentity(chain.repository, number)
+      const next = journal.append(id, `seed:${number}`, 0, { type: 'chain.admitted', repository: chain.repository,
+        issue: number, branch: `poise/issue-${number}`, author: chain.author, reviewer: chain.reviewer }, NOW)
+      observations.set(id, structuredClone(obs))
+      return next
+    }
+    const call = (current: BehaviorChain, pending: ChainInvocation): LogEntry => ({ id: chainBasis(pending.id).slice(0, 32),
+      correlation_id: pending.id, source: 'poise:behavior-chain', actor: pending.actor, repo: current.repository,
+      pr_id: String(current.issue), behavior: 'implement_issue', model: pending.model!, session_id: null, prompt: '',
+      started_at: new Date(NOW).toISOString(), time_elapsed: '1s', completed_at: null, status: 'running',
+      head_sha: null, expected_head: null, response: null, error: '', action: null, outcome: null,
+      resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: null })
+    const native = operations({ available: () => slots.available('behavior'), capacity: () => slots.laneCapacity('behavior'),
+      observe: async current => ({ ...structuredClone(observations.get(current.id)!), checkedAt: Date.now() }),
+      readInvocations: async () => ({ entries: calls, quarantined: [] }),
+      request: async current => ({ command: 'agent-interface', argv: ['--model', REVIEWER.model, current.id], cwd: '/fixture' }),
+      launch: async pending => {
+        const current = journal.read(pending.request.argv.at(-1)!)!
+        expect(release).toBeNull()
+        release = slots.tryAcquire('behavior')
+        expect(release).not.toBeNull()
+        launches.push(current.id); calls.push(call(current, pending))
+        return true
+      } })
+    const complete = (entry: LogEntry) => Object.assign(entry, { status: 'completed', action: 'no_changes', outcome: 'no_changes',
+      completed_at: new Date(NOW).toISOString(), resources_settled_at: new Date(NOW).toISOString() })
+    const finishLaunch = () => {
+      const entry = calls.at(-1)!
+      complete(entry)
+      const current = journal.read(launches.at(-1)!)!
+      record(journal, current, { type: 'invocation.settled', invocationId: entry.correlation_id!, callId: entry.id,
+        outcome: 'no_changes', evidence: { status: 'completed', outcome: 'no_changes',
+          resource_ownership: entry.resource_ownership, resources_settled_at: entry.resources_settled_at } })
+      release!(); release = null
+    }
+    return { db, journal, chain, observations, slots, calls, launches, seed, call, native, complete, finishLaunch }
+  }
+
+  it.each(['semaphore', 'journal'] as const)('gives an older implementation the freed %s slot across cursor pages and restart', async gate => {
+    const queue = admissionQueue()
+    const { db, journal, chain, native, launches } = queue
+    let release: (() => void) | null = null, busyCall: LogEntry | null = null
+    if (gate === 'semaphore') release = queue.slots.tryAcquire('behavior')!
+    else {
+      let busy = queue.seed(1)
+      busy = record(journal, busy, { type: 'invocation.admitted', invocation: invocation('busy', 'implement-issue', chainBasis(['issue', observation().issue.revision])) })
+      busy = record(journal, busy, { type: 'invocation.started', invocationId: 'busy' })
+      busyCall = queue.call(busy, busy.invocations[0]); queue.calls.push(busyCall)
+    }
+    let runtime = new BehaviorChainRuntime(journal, native)
+    await runtime.run()
+    expect(journal.read(chain.id)!.waiting).toBe(gate === 'semaphore'
+      ? 'waiting for the shared native behavior capacity' : 'shared native invocation capacity is occupied')
+    for (let turn = 0; turn < 3; turn++) {
+      // Each release has another full page of later issues before #7. Without
+      // global ordering they consume every release and the cursor never gets #7.
+      for (let index = 0; index < 100; index++) queue.seed(1000 + turn * 100 + index)
+      expect(journal.reconcilable(turn ? `example/repo#${999 + turn * 100}` : '', NOW, false).map(item => item.id)).not.toContain(chain.id)
+      if (turn === 0) {
+        release?.(); release = null
+        if (busyCall) queue.complete(busyCall) // Reconciliation frees this slot inside the next page.
+      } else queue.finishLaunch()
+      await Promise.all([runtime.run(), runtime.run()])
+      expect(launches).toHaveLength(turn + 1)
+      if (turn === 0) {
+        expect(launches).toEqual([chain.id])
+        journal.rebuild()
+        runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
+        await runtime.run()
+        expect(launches).toEqual([chain.id])
+      }
+    }
+    expect(launches.filter(id => id === chain.id)).toHaveLength(1)
+    expect(launches.slice(1).every(id => id !== chain.id)).toBe(true)
+  })
+
+  it.each(['unchanged', 'hold-resume', 'basis', 'behavior', 'slot', 'eligibility', 'permission'] as const)(
+    'ages only the current eligible capacity-wait episode: %s', async change => {
+      const queue = admissionQueue()
+      const { journal, chain, native, observations, launches } = queue
+      const release = queue.slots.tryAcquire('behavior')!
+      let runtime = new BehaviorChainRuntime(journal, native)
+      await runtime.run()
+      const later = queue.seed(change === 'unchanged' ? 6 : 8)
+      await runtime.run()
+      const obs = observations.get(chain.id)!
+      let permitted = true
+      native.permitted = current => current.id !== chain.id || permitted
+      if (change === 'hold-resume') {
+        const held = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'operator hold' })
+        record(journal, held, { type: 'chain.resumed' })
+      } else {
+        if (change === 'basis') obs.issue.revision = 'changed seed'
+        if (change === 'behavior') obs.issueReviewers = [REVIEWER]
+        if (change === 'slot') obs.implementer = { ...REVIEWER, slot: 'secondary' }
+        if (change === 'eligibility') obs.issue.eligible = false
+        if (change === 'permission') permitted = false
+        // More than one journal history page of unchanged checks cannot renew age.
+        for (let check = 0; check < (change === 'unchanged' ? 101 : 1); check++) await runtime.run()
+        if (change === 'permission') expect(journal.read(chain.id)!.waiting).toContain('disabled or held')
+        obs.issue.eligible = true; permitted = true
+      }
+      journal.rebuild()
+      runtime = new BehaviorChainRuntime(journal, native)
+      release()
+      await runtime.run()
+      expect(launches).toEqual([change === 'unchanged' ? chain.id : later.id])
+    })
+
+  it.each(['ineligible', 'held', 'backoff', 'changed basis'] as const)(
+    'leaves the slot usable when a fresh check of the oldest waiter is %s', async cause => {
+      const queue = admissionQueue()
+      const { journal, chain, native, observations, launches } = queue
+      const release = queue.slots.tryAcquire('behavior')!
+      const runtime = new BehaviorChainRuntime(journal, native)
+      await runtime.run()
+      const later = queue.seed(6)
+      await runtime.run()
+      if (cause === 'ineligible') observations.get(chain.id)!.issue.eligible = false
+      if (cause === 'changed basis') observations.get(chain.id)!.issue.revision = 'fresh changed seed'
+      if (cause === 'held') record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person hold' })
+      const request = native.request
+      const prepared: string[] = []
+      native.request = async (current, ...args) => {
+        prepared.push(current.id)
+        return current.id === chain.id && cause === 'backoff' ? null : request(current, ...args)
+      }
+      release()
+      await runtime.run()
+      expect(launches).toEqual([later.id])
+      expect(prepared).toEqual(cause === 'backoff' ? [chain.id, later.id] : [later.id])
+    })
 
   it('rechecks a settled shared failure on the existing tick across restart and honors operator holds', async () => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
@@ -802,7 +1036,7 @@ describe('native admission and recovery', () => {
     completed = true
     await runtime.run()
     expect(launched).toEqual(['review-issue', 'implement-issue'])
-    expect(observations).toBe(2)
+    expect(observations).toBe(3) // Includes the implementation's final admission read.
   })
 
   it('commits authority before launch, coalesces duplicate ticks and rechecks controls after preparation', async () => {

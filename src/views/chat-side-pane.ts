@@ -47,7 +47,7 @@ function ensureShell(): void {
     + '<span class="chat-pane-state" aria-live="polite"></span>'
     + '<button type="button" class="chat-pane-back" hidden></button>'
     + '<button type="button" class="chat-pane-open">Open in Chat</button>'
-    + `<button class="chat-close" aria-label="Close chat">${ICON_CLOSE}</button></header>`
+    + `<button class="chat-close" aria-label="Close chat" data-tooltip>${ICON_CLOSE}</button></header>`
     + '<div class="chat-side-surface"></div>'
   document.body.appendChild(panelEl)
   titleEl = panelEl.querySelector('.chat-title')!

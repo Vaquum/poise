@@ -112,6 +112,7 @@ export async function stopReviewCheckoutPruning(): Promise<void> {
 
 export async function resolveReviewCheckout(
   owner: string, repo: string, number: number, actor: string, head: string, signal?: AbortSignal,
+  reportFailure = true,
 ): Promise<string> {
   if (!/^[A-Za-z0-9-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo) || repo === '.' || repo === '..'
     || !/^[A-Za-z0-9-]+$/.test(actor) || !Number.isSafeInteger(number) || number < 1
@@ -122,7 +123,7 @@ export async function resolveReviewCheckout(
     // below, which keeps failing closed on it.
     const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const { stdout } = await runFile('github-interface', ['--local-checkout-path', owner, repo], {
-      signal, timeoutMs: 30_000, maxOutputBytes: 1024 * 1024,
+      signal, reportFailure, timeoutMs: 30_000, maxOutputBytes: 1024 * 1024,
       expected: { codes: [1], stderr: new RegExp(`^error: checkout not found under .*: ${escaped(owner)}/${escaped(repo)}\\s*$`) },
     })
     const result = JSON.parse(stdout) as { action?: unknown, repository?: unknown, path?: unknown }
@@ -154,9 +155,9 @@ export async function resolveReviewCheckout(
   // Local git shares the machine with agent turns; it gets the same timeout as
   // other review CLI calls so load alone cannot fail verification.
   const verify = async (cwd: string): Promise<void> => {
-    const origin = await runFile('git', ['remote', 'get-url', 'origin'], { cwd, signal, timeoutMs: 30_000 })
-    const commit = await runFile('git', ['rev-parse', 'HEAD'], { cwd, signal, timeoutMs: 30_000 })
-    const status = await runFile('git', ['status', '--porcelain'], { cwd, signal, timeoutMs: 30_000 })
+    const origin = await runFile('git', ['remote', 'get-url', 'origin'], { cwd, signal, reportFailure, timeoutMs: 30_000 })
+    const commit = await runFile('git', ['rev-parse', 'HEAD'], { cwd, signal, reportFailure, timeoutMs: 30_000 })
+    const status = await runFile('git', ['status', '--porcelain'], { cwd, signal, reportFailure, timeoutMs: 30_000 })
     if (origin.stdout.trim().toLowerCase() !== remote.toLowerCase()
       || commit.stdout.trim() !== head || status.stdout.trim()) throw new Error('Managed review checkout differs from the expected repository/head or has local changes')
   }
@@ -177,14 +178,14 @@ export async function resolveReviewCheckout(
       await mkdir(dirname(checkout), { recursive: true, mode: 0o700 })
       // Provisioned as the reviewer, who must be able to read the repository.
       const { stdout } = await runFile('github-interface', ['--checkout-repo', `${owner}/${repo}`, '--path', checkout, '--token-user', actor], {
-        signal, timeoutMs: 30_000, maxOutputBytes: 1024 * 1024,
+        signal, reportFailure, timeoutMs: 30_000, maxOutputBytes: 1024 * 1024,
       })
       const result = JSON.parse(stdout) as { action?: unknown, repository?: unknown, path?: unknown }
       if (result?.action !== 'checkout_repo' || result.repository !== `${owner}/${repo}`
         || result.path !== checkout) throw new Error('github-interface --checkout-repo returned malformed state')
       // Caller owns network/authentication. Pin locally using only the history
       // Caller fetched; a fork commit absent from that history fails closed.
-      await runFile('git', ['checkout', '--quiet', '--detach', head], { cwd: checkout, signal, timeoutMs: 30_000 })
+      await runFile('git', ['checkout', '--quiet', '--detach', head], { cwd: checkout, signal, reportFailure, timeoutMs: 30_000 })
       await verify(checkout)
       signal?.throwIfAborted()
       await rename(checkout, path)

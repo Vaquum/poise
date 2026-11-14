@@ -37,7 +37,7 @@ _READINESS_QUERY = """
           headRefOid
           reviewDecision
           mergeQueue { id }
-          mergeQueueEntry { id }
+          mergeQueueEntry { id state baseCommit { oid } headCommit { oid } }
           reviews(first: 100) {
             pageInfo { hasNextPage }
             nodes {

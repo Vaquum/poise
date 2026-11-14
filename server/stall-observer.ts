@@ -8,7 +8,7 @@
 // more are kept, with SQL literals masked.
 import Database from 'better-sqlite3'
 import { readFileSync } from 'node:fs'
-import { availableParallelism, loadavg } from 'node:os'
+import { availableParallelism, freemem, loadavg, totalmem } from 'node:os'
 import { PerformanceObserver, constants, performance } from 'node:perf_hooks'
 import { getHeapStatistics } from 'node:v8'
 import { Worker } from 'node:worker_threads'
@@ -213,7 +213,11 @@ function hostSnapshot() {
       memory: parsePressure(readKernel('/sys/fs/cgroup/memory.pressure')),
       io: parsePressure(readKernel('/sys/fs/cgroup/io.pressure')),
     },
-    memoryMb: { current: memoryCurrent === null ? null : mb(Number(memoryCurrent)), high: limitMb(memoryHigh), max: limitMb(memoryMax) },
+    // The system's own memory and what it reports free. Where the cgroup files
+    // are absent (gVisor), these are the sandbox's: its total is the limit,
+    // and mapped file pages count as used.
+    memoryMb: { current: memoryCurrent === null ? null : mb(Number(memoryCurrent)), high: limitMb(memoryHigh), max: limitMb(memoryMax),
+      total: mb(totalmem()), available: mb(freemem()) },
     // How often the container went over its memory limits: past `high`, the
     // kernel slows its allocations; at `max`, it reclaims or kills.
     memoryEvents: parseKeyed(readKernel('/sys/fs/cgroup/memory.events')),

@@ -6,7 +6,7 @@ import { getBehaviorChainSettings, getSettings } from './settings'
 import { getBehaviorChainCapacity, getBehaviorChainRuntimeHealth } from './behaviors'
 import { behaviorCutoverBlockers } from './behavior-cutover'
 import type { BehaviorChain, ChainEvent } from './behavior-chain-store'
-import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact } from './behavior-chain-summary'
+import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact, behaviorChainWorkImpacts } from './behavior-chain-summary'
 import { nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 
 function reply(res: ServerResponse, status: number, value: unknown): void {
@@ -26,7 +26,7 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
   try {
     const params = new URL(url, 'http://localhost').searchParams
     const journal = behaviorChainJournal()
-    const summary = (chain: BehaviorChain) => behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) })
+    const summary = (chain: BehaviorChain) => behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) }, journal)
     const cutover = () => ({ ...journal.cutover(), support: nativeCleanupSupport(),
       blockers: journal.cutover().mode === 'draining' ? behaviorCutoverBlockers() : [] })
     if (req.method === 'GET') {
@@ -42,8 +42,9 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
           })) {
           throw new HttpError(400, 'valid Call or correlation identity is required')
         }
-        const impacts = calls.map((callId, index) => behaviorChainWorkImpact(journal, callId, correlations[index]))
-        return reply(res, 200, batch ? { impacts } : { impact: impacts[0] })
+        return reply(res, 200, batch
+          ? { impacts: behaviorChainWorkImpacts(journal, calls.map((callId, index) => ({ callId, correlationId: correlations[index] }))) }
+          : { impact: behaviorChainWorkImpact(journal, calls[0], correlations[0]) })
       }
       const id = params.get('id')
       if (id) {
@@ -59,7 +60,9 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
             ...('outcome' in event ? { outcome: event.outcome } : {}),
             ...(event.type === 'chain.resumed' ? { recovery: event.recovery ?? null } : {}),
             ...('evidence' in event ? { callId: 'callId' in event ? event.callId : event.evidence.nativeCallId ?? event.evidence.callId ?? null,
-              evidence: { diagnostic: event.evidence.diagnostic } } : {}) }
+              evidence: { diagnostic: event.evidence.diagnostic,
+                ...(event.type === 'chain.merged' && typeof event.evidence.review_complete === 'boolean'
+                  ? { review_complete: event.evidence.review_complete } : {}) } } : {}) }
         })
         return reply(res, 200, { chain: summary(chain), events, next: rows.length === 20 ? rows.at(-1)!.sequence : null,
           cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })

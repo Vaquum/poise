@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import checkoutSuperseded from './fixtures/review-checkout-superseded.json'
+import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture, datastoreHealthOutput } from './behaviors-runtime-fixture'
 
 describe('review outcome evidence and registration', () => {
@@ -91,6 +92,94 @@ describe('review outcome evidence and registration', () => {
     expect(modules.database.listBehaviorDeadLetters()).toEqual([])
     expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
   })
+
+  it.each(['unclaimed', 'pending', 'incomplete', 'unavailable', 'stopped'] as const)(
+    'retains the legacy publication refusal across head changes, ticks and restart (%s)', async (evidence) => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-11-13T12:00:00Z'))
+      const launched = await launchReviewBeforeCrash()
+      const call = agentLog({ id: 'c'.repeat(32), status: 'failed', action: null, outcome: null,
+        review_id: null, review_policy: 'bounded-v1', error_code: 'review_budget_exhausted',
+        error: 'Review reached its total time limit; needs attention; could not prove a safe recovery',
+        model: 'opus-5-xhigh', started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+        expected_head: launched.expectedHead, actor: launched.actor, source: launched.source,
+        correlation_id: launched.correlationId })
+      fixture.agentLogs = [call]
+      let { database: db, behaviors: runtime } = launched
+      expect(db.linkBehaviorLaunchCallOwned('review-new-prs', launched.target, launched.correlationId, String(call.id))).toBe(true)
+      const error = evidence === 'stopped' ? REVIEW_BUDGET_STOPPED : String(call.error)
+      db.setBehaviorLaunchErrorOwned('review-new-prs', launched.target, launched.correlationId, error)
+      db.recordBehaviorDeadLetter(db.listBehaviorLaunchClaims('review-new-prs')[0], error)
+      db.completeSeenOwned('review-new-prs', launched.target, launched.correlationId)
+      const failureKey = `behavior_review_new_prs_failure:${launched.target}`
+      db.setMeta(failureKey, JSON.stringify({ kind: 'worker', consecutiveFailures: 2,
+        firstFailureAtMs: Date.now() - 60_000, lastFailureAtMs: Date.now() - 60_000,
+        nextRetryAtMs: Date.now() - 1, error: call.error, callId: call.id,
+        diagnostic: { severity: 'warning', code: 'review_budget_exhausted' } }))
+      await resetLogCache()
+      await runtime.runEnabledBehaviorsOnce()
+      const failure = db.getMeta(failureKey)
+      const history = db.db.prepare('SELECT * FROM behavior_dead_letters').all()
+      const held = db.getFailedBehaviorLaunch('review-new-prs', launched.target)
+      const reviews = [
+        { id: 91, state: 'DISMISSED', commit: HEAD_SHA },
+        { id: 92, state: 'APPROVED', commit: NEXT_HEAD_SHA },
+      ]
+      arrangeCli(false, false, { headSha: NEXT_HEAD_SHA,
+        ...(evidence === 'pending' ? { reviewerReviewIdsSince: [], reviewerPendingReviews: 1 }
+          : evidence === 'incomplete' ? { reviewerReviewsSince: 2, reviewerLatestState: 'APPROVED', reviewerLatestCommit: NEXT_HEAD_SHA }
+            : { reviewerReviewsSinceItems: reviews }) })
+      if (evidence === 'unavailable') {
+        const read = mocks.runFile.getMockImplementation()!
+        mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+          if (command === 'github-interface' && args[0] === '--review-activity-since') throw new Error('review inventory unavailable')
+          return read(command, args, options)
+        })
+      }
+      await runtime.runEnabledBehaviorsOnce()
+      const reason = evidence === 'pending' ? 'Pending publication: 1 pending reviews'
+        : evidence === 'incomplete' ? 'Publication evidence incomplete: 2 reviews since Call start, review identities unavailable'
+          : evidence === 'unavailable' ? 'Publication evidence unavailable: review inventory unavailable'
+            : 'Unclaimed publication: 2 reviews not attributed to this Call'
+      const verify = async () => {
+        const snapshot = await (await import('../server/agent')).fetchAgentLogSnapshot()
+        for (const observed of [snapshot, null]) {
+          const incident = runtime.getBehaviorDiagnosticIncidents(observed).find((row) => row.callId === call.id)!
+          expect(incident.error).toContain(reason)
+          expect(incident.error).toContain(`Call ${call.id} (correlation ${launched.correlationId})`)
+          expect(incident.error).toContain(`original head ${HEAD_SHA}; observed head ${NEXT_HEAD_SHA}`)
+          expect(incident.diagnostic.severity).toBe('warning')
+          if (evidence === 'stopped') expect(incident.nextRetryAt).toBeUndefined()
+          if (evidence === 'unclaimed' || evidence === 'stopped') {
+            for (const review of reviews) expect(incident.error).toContain(`${review.id} ${review.state} on ${review.commit}`)
+          }
+        }
+        expect(db.getFailedBehaviorLaunch('review-new-prs', launched.target)).toEqual(held)
+        expect(db.db.prepare('SELECT * FROM behavior_dead_letters').all()).toEqual(history)
+        expect(db.getMeta(failureKey)).toBe(failure)
+        expect(fixture.agentLogs).toEqual([call])
+        expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+        const status = await import('../server/behavior-pr-status')
+        const reply = await status.readPrStatus(50)
+        expect(reply.rows[0].blocker.id).toBe('held')
+        expect(reply.rows[0].blocker.details.join(' ')).toContain(reason)
+      }
+      await verify()
+      ;({ database: db, behaviors: runtime } = await restartModules())
+      await verify()
+      runtime.startBehaviorsRuntime()
+      await runtime.runEnabledBehaviorsOnce()
+      await runtime.runEnabledBehaviorsOnce()
+      await verify()
+      if (evidence === 'unclaimed') {
+        Object.assign(call, { action: 'not_started', outcome: 'preflight_failed', error_code: 'review_provider_exit' })
+        await resetLogCache()
+        await runtime.runEnabledBehaviorsOnce()
+        expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+        expect(mocks.spawnDetached.mock.calls[1][1]).toEqual(expect.arrayContaining(['--expected-head', NEXT_HEAD_SHA]))
+        expect(runtime.getBehaviorDiagnosticIncidents(null).map((row) => row.error).join(' ')).not.toContain('Legacy review retry held')
+      }
+    })
 
   it.each((['review-new-issues', 'review-new-prs', 'approve-prs'] as const).flatMap((key) =>
     (['active', 'failed'] as const).map((state) => ({ key, state }))))(

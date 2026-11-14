@@ -37,6 +37,9 @@ data, under the same authority, limits and freshness contract, with no
 additional Caller or GitHub collection. An empty or stale filtered result
 must not establish that no work is running; check `health` for pending,
 dropped, gaps and stale coverage.
+The store indexes the case-insensitive repository and target number, so sparse
+and absent target lookups seek within that target. Opening an existing store
+adds this index without changing its identities, coverage or cursors.
 Start with a list request without a cursor. Its `watermark` is a changes cursor;
 follow `nextCursor` until null, then consume changes from that watermark.
 List pages freeze their creation boundary. Apply upserts by increasing record
@@ -130,12 +133,27 @@ churn during integration never masquerades as the blocker. A vanished queue
 entry reads as a removal without inventing its cause. Flags are display
 only and never raise alerts or influence execution.
 
+Legacy rows also include live PR-scoped review and approval check failures in
+`blocker.details`, ahead of historical details, with their recorded target, lane,
+review slot, reason and retry time. Their revision is unverified. An uncleared
+retry reads as due at and after its timestamp; clearing the scheduler failure,
+including through a successful no-op, removes the detail without changing blocker precedence.
+
+Legacy review incidents show an automatic retry time only for an exact, validated
+no-action Call eligible under the scheduler's existing failure and timeout-stop
+rules. A stored failure timer alone grants no retry. Unresolved publication holds
+retain the original Call and recovery refusal, or the next action to inspect that
+Call and reconcile publication, without changing stored evidence or timestamps.
+
 For legacy PRs, a live review on the verified current head can move past-revision
 review failures into `blocker.details`, retaining their head, cause and time.
-Attribution uses full-SHA targets or launch evidence matching the incident's
-behavior, target and Call ID; a newer launch on the same target supplies no
-identity for an older incident. Current-head, conflicting or unattributable holds
-and PR-wide quarantine keep precedence. Without usable merge-candidate head
+Attribution uses full-SHA targets, matching launch evidence, or already-cached
+Caller history matching the original Call/correlation, repository/PR, behavior,
+actor and source after its launch is released. A newer launch on the same target
+supplies no identity for an older incident. Current-head, conflicting,
+unreadable or unattributable holds, ambiguous publication and PR-wide quarantine
+keep precedence. A same-head model stop stays primary while a live review on
+that head appears alongside it in `blocker.details`. Without usable merge-candidate head
 evidence and a matching live claim, retained incidents remain held. The row's
 ledger link keeps the original evidence accessible; execution gates are unchanged.
 
@@ -176,9 +194,11 @@ V2 uses the decision path's two-minute observation-freshness bound. Missing or
 unrecognized check rollups stay unknown; an empty failing-check list is not
 proof of success. Held/uncertain ownership remains visible even when PR state
 is stale. A legitimately owned model invocation remains the current phase with
-its age while the runtime intentionally skips GitHub re-observation; those old
-facets remain unknown without falsely marking the collector stale. Missing
-observations remain distinct. Other stale chain evidence marks reply health
+its age. Running PR reviews refresh open PR evidence on the existing two-minute
+boundary, so queue admission can surface in work diagnostics before review settles.
+Other owned invocations skip GitHub re-observation; those old facets remain unknown
+without falsely marking the collector stale. Missing observations remain distinct.
+Other stale chain evidence marks reply health
 stale. Current phase switches/pauses, the chain admission pause and the release
 barrier remain meaningful; recorded holds and policy refusals are retained. A contradictory
 journal or ambiguous ownership fails the existing endpoint with 503 instead of
@@ -332,10 +352,15 @@ removing SQLite files before the abandoned worker exited.
 
 Retention targets 30 days from meaningful updates, bounded by 10,000 instances,
 30,000 changes, 32 MiB accounted metadata, a 64 MiB main database, at most
-32 attempts per root and 4 KiB per record. Terminal direct no-write firings are
-pruned first under pressure. Capacity can shorten history; uncertain-work
-removal records a gap. Root eviction removes its children. The rollback journal
-can add approximately 65 MiB; the independent health journal is at most 8 KiB.
+32 attempts per root and 4 KiB per record. Age pruning removes only settled
+terminal roots whose children are also settled and terminal. Under pressure,
+those roots are pruned ahead of unresolved work and its parents, with settled
+direct no-write firings first. The attempt cap preserves each slot's latest
+attempt and removes older settled terminal attempts before unresolved ones.
+These priorities also apply to existing records on reopen. Capacity can shorten
+history; unresolved-work removal records a gap. Root eviction removes its
+children. The rollback journal can add approximately 65 MiB; the independent
+health journal is at most 8 KiB.
 Consumers must respect health, removals and 410 resync responses rather than
 assuming a fixed retention period.
 

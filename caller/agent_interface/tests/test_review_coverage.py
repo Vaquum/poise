@@ -45,7 +45,7 @@ class TestReviewCoverage(TestCase):
         self.stack.enter_context(patch.object(review_activity_since, "get_review_activity", side_effect=self.history))
         self.stack.enter_context(patch.object(review_repository, "prepare", return_value=nullcontext(
             SimpleNamespace(root=Path(self.directory.name), prompt=lambda: ""))))
-        self.stack.enter_context(patch.object(structured_review, "ReviewWatch", return_value=nullcontext(None)))
+        self.stack.enter_context(patch.object(structured_review, "ReviewWatch", return_value=nullcontext(SimpleNamespace(check_closed=lambda: None))))
         self.stack.enter_context(patch.object(structured_review.subprocess, "run", side_effect=self.command))
         for module in (approve_pr, request_changes, reviewed_clean):
             self.stack.enter_context(patch.object(module, "get_pull", side_effect=lambda *_args: self.pull()))

@@ -1,4 +1,5 @@
 import { environmentSecrets, normalize, redact, scopePrefix, type DiagnosticInput, type LogEvent } from './contract.js'
+import { issueReviewSuperseded } from './caller-outcome.js'
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
@@ -10,15 +11,24 @@ const number = (value: unknown) => typeof value === 'number' && Number.isFinite(
 export function callerDiagnostic(value: unknown, workspace: string): DiagnosticInput | null {
   const row = object(value)
   if (!row || !text(row.id) || !/^[a-f0-9]{32}$/.test(String(row.id))) return null
-  if (row.outcome === 'superseded' || ['stopped', 'stopping'].includes(String(row.error_code))) return null
+  if (row.outcome === 'superseded' || issueReviewSuperseded(row) || ['stopped', 'stopping'].includes(String(row.error_code))) return null
   const raw = object(row.diagnostic)
-  const priorWarning = raw?.version === 1 && raw.severity === 'warning' && row.status === 'failed'
+  const rawContext = object(raw?.context) ?? raw
+  // A planned handoff is terminal evidence, not a prior preparation warning.
+  // Its source stays Error until the separate work read confirms a successor.
+  const handoff = raw?.version === 1 && raw.source === 'caller' && raw.operation === 'provider.review'
+    && raw.phase === 'analysis' && raw.outcome === 'handoff' && rawContext?.submission === 'none'
+    && row.status === 'failed' && row.error_code === 'review_budget_exhausted'
+    && ['pr_review', 'pr_approve'].includes(String(row.behavior)) && !row.evidence_unavailable
+  const priorWarning = !handoff && raw?.version === 1 && raw.severity === 'warning' && row.status === 'failed'
     ? { version: 1, severity: 'warning', operation: text(raw.operation), phase: text(raw.phase),
       message: text(raw.message), stderr: text(raw.stderr), stderr_truncated: raw.stderr_truncated === true } : null
   const diagnostic = raw && raw.version === 1 && !priorWarning ? raw : null
   const context = object(diagnostic?.context) ?? diagnostic ?? {}
   const unavailable = text(row.evidence_unavailable)
   const error = text(row.error) ?? unavailable ?? ''
+  const detail = text(context.message)
+  const message = error || detail || 'Caller reported a process failure without a cause'
   if (/pull-request head or base changed (?:while building review packet|before checkout|during checkout)\b|pull-request head changed(?: [a-z ]+)?: expected [a-f0-9]{40}, got [a-f0-9]{40}/.test(error)) return null
   // Review verdicts alone are routine; recorded failure evidence takes precedence.
   if (!diagnostic && !error && !row.error_code && !priorWarning) return null
@@ -32,17 +42,18 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
     && /\b(?:GitHub|HTTP)\s*5\d\d\b|\b(?:httpx\.(?:ReadTimeout|ConnectTimeout|ConnectError)|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN)\b/.test(error)
   return {
     id: 'caller:' + row.id, time: text(row.completed_at), source: unavailable && !row.error && !diagnostic ? 'collection' : 'caller', component: text(row.behavior) ?? 'agent-interface',
-    level: unavailable && !row.error && !diagnostic ? 'warning' : diagnostic?.severity === 'warning' ? 'warning' : diagnostic?.severity === 'error' ? 'error' : heldRepair || transient || ['overloaded', 'rate_limit', 'authentication_failed', 'interrupted'].includes(String(row.error_code)) ? 'warning' : 'error',
-    operation: unavailable && !row.error && !diagnostic ? 'caller.evidence_unavailable' : text(diagnostic?.operation) || text(row.behavior) || 'call.failed', phase: text(diagnostic?.phase), workspace,
+    level: handoff ? 'error' : unavailable && !row.error && !diagnostic ? 'warning' : diagnostic?.severity === 'warning' ? 'warning' : diagnostic?.severity === 'error' ? 'error' : heldRepair || transient || ['overloaded', 'rate_limit', 'authentication_failed', 'interrupted'].includes(String(row.error_code)) ? 'warning' : 'error',
+    operation: handoff ? 'provider.review.handoff' : unavailable && !row.error && !diagnostic ? 'caller.evidence_unavailable' : text(diagnostic?.operation) || text(row.behavior) || 'call.failed', phase: text(diagnostic?.phase), workspace,
     repository, pr, target: repository && pr ? `${repository}#${pr}` : repository,
     account: text(row.actor), reviewer: text(row.actor), behavior: text(row.behavior), callId: String(row.id),
     correlationId: text(row.correlation_id), container: text(context.container), release: text(context.release),
-    message: error || text(context.message) || 'Caller reported a process failure without a cause',
+    message, cause: detail?.trim() && detail !== message ? [detail] : [],
     stderr: text(diagnostic?.stderr), stack: text(context.stack), truncated: diagnostic?.stderr_truncated === true,
     exitCode: number(context.exit_code), signal: number(context.signal) ?? text(context.signal),
     timeoutMs: number(context.timeout_seconds) === null ? null : Number(context.timeout_seconds) * 1000,
     errno: number(context.errno) ?? text(context.errno), resources: object(diagnostic?.filesystem) ?? {},
     context: { model: text(row.model), errorCode: text(row.error_code), outcome: text(row.outcome), action: text(row.action),
+      ...(handoff ? { submission: 'none' } : {}),
       expectedHead: text(row.expected_head), observedHead: text(row.head_sha), executable: text(context.executable),
       resolvedExecutable: text(context.resolved_executable), cwd: text(context.cwd), elapsedMs: number(context.elapsed_ms),
       startedAt: text(row.started_at_precise) ?? text(row.started_at), source: text(row.source),

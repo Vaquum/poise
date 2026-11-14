@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import { LedgerError, type LedgerAdmission, type LedgerCaller, type LedgerOutcome, type LedgerPolicy, type LedgerRecord } from '../server/behavior-ledger-contract'
 
@@ -337,7 +337,22 @@ describe('behavior firing ledger store', () => {
     db.capture(admission('other-repo', { admissionKey: 'other-repo', repository: 'other/project', number: 7 }))
     db.capture(admission('mixed-case', { admissionKey: 'mixed-case', repository: 'Acme/Project', number: 7 }))
     complete(db, 'target-1')
+    const prepared = vi.spyOn(Database.prototype, 'prepare')
     const page = db.read({ operation: 'list', repository: 'acme/project', number: 7, limit: 100 })
+    const sql = prepared.mock.calls.find(([sql]) => sql.startsWith('SELECT * FROM ledger_instances WHERE creation_seq'))?.[0]
+    prepared.mockRestore()
+    expect(sql).toBeDefined()
+    const check = new Database(db.path, { readonly: true })
+    try {
+      // Explain the SQL the list actually prepared, including its range and
+      // ordering. Both target expressions must constrain the index seek.
+      for (const [repository, number] of [['acme/project', 7], ['acme/project', 999], ['missing/project', 7]] as const) {
+        const plan = check.prepare<unknown[], { detail: string }>(`EXPLAIN QUERY PLAN ${sql}`).all(0, 8, repository, number, 101)
+        expect(plan.map(row => row.detail)).toEqual([
+          expect.stringContaining('SEARCH ledger_instances USING INDEX ledger_target (<expr>=? AND <expr>=? AND rowid>? AND rowid<?)'),
+        ])
+      }
+    } finally { check.close() }
     expect(page.status).toBe(200)
     expect(page.body.records).toHaveLength(4)
     expect(page.body.records!.every((record) => record.target.repository.toLowerCase() === 'acme/project' && record.target.number === 7)).toBe(true)
@@ -418,6 +433,72 @@ describe('behavior firing ledger store', () => {
     expect(records(db).filter((record) => record.behavior === 'merge-prs' && record.kind === 'firing')).toHaveLength(1)
   })
 
+  it.each(['panel', 'direct'] as const)('preserves a completed but unsettled %s and its lineage before settled work under pressure', (kind) => {
+    const db = store({ maxInstances: 5 })
+    db.capture(admission('unsettled', kind === 'direct'
+      ? { behavior: 'merge-prs', source: 'poise:merge-prs', plannedSlots: [], slot: undefined } : {}))
+    db.capture({ type: 'result', nativeId: 'unsettled', state: 'completed', activity: 'unknown', outcome: 'waiting' })
+    if (kind === 'panel') { db.capture(admission('retry')); complete(db, 'retry') }
+    const retained = records(db)
+    expect(retained[0]).toMatchObject({ state: 'completed', activity: 'unknown' })
+    clock += 1000
+    db.capture(admission('settled', { admissionKey: 'settled' })); complete(db, 'settled')
+    const settled = records(db).filter(record => !retained.some(prior => prior.id === record.id))
+    clock += 1000
+    db.capture(admission('incoming', { admissionKey: 'incoming' }))
+    const current = records(db)
+    expect(current.filter(record => retained.some(prior => prior.id === record.id))).toEqual(retained)
+    expect(current.some(record => settled.some(prior => prior.id === record.id))).toBe(false)
+    expect(current.filter(record => record.parentId !== null).every(record => current.some(parent => parent.id === record.parentId))).toBe(true)
+    expect(db.health()).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
+    expect(db.health().instances).toBeLessThanOrEqual(5)
+  })
+
+  it.each(['instances', 'bytes', 'age'] as const)('protects unresolved persisted evidence and parent links at the %s bound on reopen', (bound) => {
+    const db = store()
+    db.capture(admission('uncertain-direct', { admissionKey: 'uncertain-direct', behavior: 'merge-prs', source: 'poise:merge-prs', plannedSlots: [], slot: undefined }))
+    db.capture({ type: 'result', nativeId: 'uncertain-direct', state: 'completed', activity: 'unknown', outcome: 'waiting' })
+    db.capture(admission('held'))
+    db.capture({ type: 'result', nativeId: 'held', state: 'held', activity: 'settled' })
+    db.capture(admission('retry')); complete(db, 'retry')
+    const retained = records(db)
+    // A parent's selected slot can be completed/settled while an older child is nonterminal.
+    expect(retained.find(record => record.behavior === 'review-new-prs' && record.kind === 'firing'))
+      .toMatchObject({ state: 'completed', activity: 'settled' })
+    db.capture(admission('settled', { admissionKey: 'settled' })); complete(db, 'settled')
+    db.close()
+    const legacy = new Database(db.path)
+    let retainedBytes: number
+    try {
+      // Reproduce the state-only flags written by the previous implementation.
+      legacy.exec(`UPDATE ledger_instances SET terminal = json_extract(payload,'$.state') IN ('completed','failed','superseded'),
+        no_write = json_extract(payload,'$.behavior') = 'merge-prs' AND json_extract(payload,'$.outcome') = 'waiting'`)
+      const rowBytes = legacy.prepare('SELECT bytes FROM ledger_instances WHERE id=?')
+      retainedBytes = retained.reduce((sum, record) => sum + (rowBytes.get(record.id) as { bytes: number }).bytes, 0)
+    } finally { legacy.close() }
+    clock += 1001
+    const reopened = store(bound === 'instances' ? { maxInstances: retained.length }
+      : bound === 'bytes' ? { maxBytes: retainedBytes + 512 } : { retentionMs: 1000 }, db.path)
+    expect(records(reopened)).toEqual(retained)
+    expect(reopened.health()).toMatchObject({ status: 'ok', instances: retained.length, dropped: 0, gaps: [] })
+  })
+
+  it('makes a root eligible when its older nonterminal child settles without changing the panel summary', () => {
+    const db = store({ maxInstances: 5 })
+    db.capture(admission('active', { admissionKey: 'active' }))
+    const active = records(db)
+    db.capture(admission('held'))
+    db.capture({ type: 'result', nativeId: 'held', state: 'held', activity: 'settled' })
+    db.capture(admission('retry')); complete(db, 'retry')
+    const root = records(db).find(record => record.kind === 'firing' && record.id !== active[0].id)!
+    db.capture({ type: 'result', nativeId: 'held', state: 'failed', activity: 'settled' })
+    expect(db.read({ operation: 'get', id: root.id }).body.record).toEqual(root)
+    db.capture(admission('incoming', { admissionKey: 'incoming' }))
+    expect(records(db).slice(0, 2)).toEqual(active)
+    expect(db.read({ operation: 'get', id: root.id }).status).toBe(410)
+    expect(db.health()).toMatchObject({ status: 'ok', instances: 4, dropped: 0, gaps: [] })
+  })
+
   it('retains a confirmed enqueue write ahead of waiting observations under pressure', () => {
     const db = store({ maxInstances: 4 })
     direct(db, 'enqueue-1', 'enqueued')
@@ -445,6 +526,32 @@ describe('behavior firing ledger store', () => {
     expect(all).toHaveLength(4)
     expect(all[0]).toMatchObject({ omittedAttempts: 3, state: 'completed' })
     expect(new Set(all.map((record) => record.id)).size).toBe(4)
+  })
+
+  it('caps settled redundant attempts before unresolved evidence while preserving latest slots and explicit gaps', () => {
+    const db = store({ maxAttempts: 3 })
+    db.capture(admission('unsettled', { plannedSlots: ['primary', 'secondary'] }))
+    db.capture({ type: 'result', nativeId: 'unsettled', state: 'unknown', activity: 'unknown' })
+    db.capture(admission('settled')); complete(db, 'settled')
+    db.capture(admission('secondary', { slot: 'secondary' })); complete(db, 'secondary')
+    const before = records(db)
+    const root = before[0]
+    const unsettled = before.find(record => record.refs.some(ref => ref.identity === 'unsettled'))!
+    const settled = before.find(record => record.refs.some(ref => ref.identity === 'settled'))!
+    const secondary = before.find(record => record.refs.some(ref => ref.identity === 'secondary'))!
+    db.capture(admission('incoming'))
+    expect(db.read({ operation: 'get', id: unsettled.id }).body.record).toEqual(unsettled)
+    expect(db.read({ operation: 'get', id: secondary.id }).body.record).toEqual(secondary)
+    expect(db.read({ operation: 'get', id: settled.id }).status).toBe(410)
+    expect(records(db)[0]).toMatchObject({ id: root.id, omittedAttempts: 1, activity: 'unknown' })
+    expect(db.health()).toMatchObject({ status: 'ok', instances: 4, dropped: 0, gaps: [] })
+    // With no redundant settled attempt left, the cap must expose the lost evidence.
+    db.capture(admission('overflow'))
+    expect(db.read({ operation: 'get', id: unsettled.id }).status).toBe(410)
+    expect(db.read({ operation: 'get', id: secondary.id }).body.record).toEqual(secondary)
+    expect(records(db)[0]).toMatchObject({ id: root.id, omittedAttempts: 2, activity: 'unknown' })
+    expect(db.read({ operation: 'list', parent: root.id }).body.records).toHaveLength(3)
+    expect(db.health()).toMatchObject({ status: 'incomplete', instances: 4, dropped: 0, gaps: [expect.objectContaining({ reason: 'eviction' })] })
   })
 
   it('does not extend retention through heartbeats and keeps settled terminal evidence settled', () => {

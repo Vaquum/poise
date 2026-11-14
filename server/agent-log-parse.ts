@@ -451,10 +451,19 @@ export function parseAgentLogList(list: unknown[]): AgentLogSnapshot {
   const entries: LogEntry[] = []
   const quarantined: QuarantinedAgentLog[] = []
   list.forEach((value, index) => {
-    try { entries.push(validateLogEntry(value, index)) }
-    catch (error) { quarantined.push(quarantineLogEntry(value, index, error)) }
+    const parsed = parseAgentLogRow(value, index)
+    if ('entry' in parsed) entries.push(parsed.entry)
+    else quarantined.push(parsed.quarantined)
   })
   return { entries: entries.reverse(), quarantined }
+}
+
+/** One whole-history row, parsed as parseAgentLogList parses the row at
+ *  `index`: a valid entry, or its quarantine record. Only a quarantine record
+ *  depends on the index. */
+export function parseAgentLogRow(value: unknown, index: number): { entry: LogEntry } | { quarantined: QuarantinedAgentLog } {
+  try { return { entry: validateLogEntry(value, index) } }
+  catch (error) { return { quarantined: quarantineLogEntry(value, index, error) } }
 }
 
 // Decode one bounded history page. Strict envelope: a bare row array is a

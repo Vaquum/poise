@@ -1,3 +1,6 @@
+import { lstat } from 'node:fs/promises'
+import { delimiter } from 'node:path'
+import { accountLoginsStrict } from './accounts/logins'
 import {
   claudeSubscriptionEnvironment,
   CLAUDE_SUBSCRIPTION_CLI,
@@ -153,6 +156,20 @@ function errorStdout(error: unknown): string | null {
   return Buffer.isBuffer(value) ? value.toString('utf8') : null
 }
 
+/** A failed executable check cannot distinguish absence from a broken launcher. */
+async function optionalClaudeAbsent(launchPath: string): Promise<boolean> {
+  if (accountLoginsStrict().claude) return false
+  for (const directory of launchPath.split(delimiter)) {
+    // Append without resolving: the kernel follows a symlinked PATH segment
+    // before `..`, while resolve()/join() collapse `..` lexically first.
+    const candidate = directory ? `${directory}/claude` : 'claude'
+    try { await lstat(candidate); return false } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+  return true
+}
+
 function isDefinitiveAuthFailure(error: unknown): boolean {
   const text = failureText(error)
   // GitHub-attributed failures (a gh 401 from inside an agent turn) say
@@ -231,6 +248,7 @@ export class ClaudeAuthMonitor {
   private liveFailureCount = 0
   private nextLiveAttemptAtMs: number | null = null
   private lastLiveFailure: string | null = null
+  private observedSignIn = false
 
   constructor(options: ClaudeAuthMonitorOptions = {}) {
     this.run = options.runFile ?? defaultRunFile
@@ -451,6 +469,7 @@ export class ClaudeAuthMonitor {
     preserveSigningIn: boolean,
   ): Promise<ClaudeAuthSnapshot> {
     const previousStatus = this.status
+    const launchPath = process.env.PATH ?? '/usr/bin:/bin'
     let local: LocalAuthStatus | null = null
     let localError: unknown
     try {
@@ -471,8 +490,21 @@ export class ClaudeAuthMonitor {
       localError = error
       const stdout = errorStdout(error)
       if (stdout !== null) local = parseStatusJson(stdout)
-      // Exit 1 is quiet only when the answer establishes a sign-in requirement.
-      if (isExpectedFailure(error) && local?.ready !== false) diagnosticFailure('claude.auth.status', error)
+      if (isExpectedFailure(error) && local?.ready !== false) {
+        let absent = false
+        let configurationError: string | undefined
+        // The wrapper turns spawn ENOENT into exit 1; a missing interpreter
+        // does the same, so require independent account and launcher evidence.
+        if (!this.observedSignIn && !stdout?.trim()
+          && /^\[poise\] Claude subscription command failed: spawn claude ENOENT$/m.test(failureText(error))) {
+          try {
+            absent = await optionalClaudeAbsent(launchPath)
+          } catch (cause) {
+            configurationError = cause instanceof Error ? cause.message : String(cause)
+          }
+        }
+        if (!absent) diagnosticFailure('claude.auth.status', error, { configurationError })
+      }
     }
 
     if (generation !== this.stateGeneration) return this.snapshot()
@@ -506,6 +538,7 @@ export class ClaudeAuthMonitor {
       return this.snapshot()
     }
 
+    this.observedSignIn = true
     this.authMethod = local.authMethod
     this.subscriptionType = local.subscriptionType
     const now = this.clock.now()

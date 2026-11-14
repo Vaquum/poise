@@ -17,11 +17,14 @@ LIMIT = 4096
 class TestCodexReviewStaging(TestCase):
     def run_review(self, text, failure=None):
         messages, commands, timeouts = [], [], []
+        clock = SimpleNamespace(now=0.0)
 
         def turn(command, **kwargs):
             messages.append(kwargs["input"])
             commands.append(command)
             timeouts.append(kwargs["timeout"])
+            if failure == "deadline":
+                clock.now += kwargs["timeout"]
             schema = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
             stage = schema["properties"].get("received", {}).get("enum", [None])[0]
             result = {"received": stage} if stage else {"assessment": ASSESSMENT, "action": "approve", "comments": []}
@@ -43,15 +46,21 @@ class TestCodexReviewStaging(TestCase):
             return SimpleNamespace(returncode=1 if failure == "provider_failure" and not stage else 0,
                                    stdout="\n".join(json.dumps(event) for event in events), stderr="failed")
 
-        watch = SimpleNamespace(run=turn)
+        watch = SimpleNamespace(run=turn, check_closed=lambda: None)
         receipt = json.dumps({"action": "approved_pr", "review_id": 91, "head_sha": "a" * 40})
         with patch.object(structured_review, "CODEX_MAX_INPUT_CHARS", LIMIT), \
+                patch.object(structured_review, "monotonic", lambda: clock.now), \
                 patch.object(structured_review, "ReviewWatch", return_value=nullcontext(watch)), \
                 patch.object(structured_review.subprocess, "run",
                              return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit:
             if failure:
-                with self.assertRaises(atoms.AgentPreflightError):
+                with self.assertRaises(structured_review.review_budget.ReviewLimitError if failure == "deadline"
+                                       else atoms.AgentPreflightError) as error:
                     self.review(text)
+                if failure == "deadline":
+                    self.assertEqual(error.exception.code, "review_budget_exhausted")
+                    self.assertEqual(error.exception.diagnostic["phase"], "overall")
+                    self.assertEqual(error.exception.diagnostic["submission"], "none")
                 submit.assert_not_called()
             else:
                 self.assertIn('"review_id": 91', self.review(text))
@@ -96,6 +105,6 @@ class TestCodexReviewStaging(TestCase):
 
     def test_incomplete_or_untrusted_staging_never_publishes(self):
         for failure in ("wrong_ack", "boolean_ack", "early_verdict", "missing_thread", "changed_thread",
-                        "native_tool", "provider_failure"):
+                        "native_tool", "provider_failure", "deadline"):
             with self.subTest(failure=failure):
                 self.run_review("x" * (LIMIT + 1), failure)

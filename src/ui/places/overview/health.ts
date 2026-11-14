@@ -45,7 +45,7 @@ function sourceRow(source: HealthSource): string {
   const rects = parts.map((part) => { const w = (part.until - part.since) / total * 100; const rect = `<rect class="hb-${part.state}" x="${x}" width="${w}" height="6"/>`; x += w; return rect }).join('')
   const share = (state: string) => Math.round(parts.filter((part) => part.state === state).reduce((sum, part) => sum + part.until - part.since, 0) / total * 100)
   const words = (['covered', 'gap', 'unknown'] as const).filter((state) => share(state)).map((state) => `${share(state)}% ${state === 'gap' ? 'gaps' : state}`).join(', ')
-  return `<li>${name}<svg class="hbar" viewBox="0 0 100 6" preserveAspectRatio="none" role="img" aria-label="${esc(words)}"><title>${esc(words)}</title>${rects}</svg></li>`
+  return `<li>${name}<svg class="hbar" viewBox="0 0 100 6" preserveAspectRatio="none" role="img" aria-label="${esc(words)}" data-help="${esc(words)}">${rects}</svg></li>`
 }
 
 export function mountHealth(ctx: PartContext, box: HTMLElement, find: RightFilter): void {

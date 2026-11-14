@@ -47,6 +47,23 @@ describe('owned source boundaries', () => {
     expect(records[0]).toMatchObject({ workspace: 'bob', visibility: 'infrastructure', context: { method: 'GET', route: '/api/chat' } })
   })
 
+  it.each([0, 189628338659, Number.MAX_SAFE_INTEGER])('retains valid workspace disk byte counts including %s', (value) => {
+    const event = normalize(gatewayDiagnostic('warn', 'disk.workspace.over_budget', { handle: 'alice', bytes: value, budget: value }))
+    expect(event).toMatchObject({ severity: 'warning', workspace: 'alice', visibility: 'infrastructure', context: { bytes: value, budget: value } })
+    expect(gatewayDiagnostic('warn', 'proxy.failed', { handle: 'alice', bytes: value, budget: value }).context).not.toHaveProperty('bytes')
+  })
+
+  it.each([undefined, null, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, '189628338659', '', true, {}])(
+    'leaves invalid workspace disk counts unknown independently: %j', (value) => {
+      for (const key of ['bytes', 'budget']) {
+        const other = key === 'bytes' ? 'budget' : 'bytes'
+        const event = normalize(gatewayDiagnostic('warn', 'disk.workspace.over_budget', { handle: 'alice', [key]: value, [other]: 0 }))!
+        expect(event.context).not.toHaveProperty(key)
+        expect(event.context[other]).toBe(0)
+      }
+    },
+  )
+
   it('commits delivery checkpoints atomically, preserves stable replay and scopes delivery cursors', () => {
     const directory = mkdtempSync(join(tmpdir(), 'poise-delivery-')); directories.push(directory)
     const path = join(directory, 'history.db'); const store = new DiagnosticStore(path)

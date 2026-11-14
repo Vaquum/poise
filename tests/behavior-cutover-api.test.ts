@@ -4,9 +4,12 @@ import { db, getMeta, setMeta, closeDatabase } from '../server/db'
 import { behaviorChainJournal } from '../server/behavior-chain-journal'
 import type { BehaviorChain, ChainEvent } from '../server/behavior-chain-store'
 import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
-import { chainSummaryFixture } from './fixtures/behavior-chain-summary'
+import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
+import { chainSummaryFixture, mergedReviewFixture, type MergedReviewCase } from './fixtures/behavior-chain-summary'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
 import { parseProcessDiagnostic } from '../server/process-diagnostic'
+import { eventWords, readChain, readJournalPage, taskState, timelineLines } from '../src/ui/places/observe/chains'
+import { readFrom } from '../src/ui/places/observe/journal'
 
 const native = vi.hoisted(() => ({ support: { status: 'supported', error: null as string | null } }))
 vi.mock('../server/native-cleanup-support', () => ({
@@ -76,41 +79,100 @@ it('reports durable cutover through the real HTTP handler and refuses stale or i
   } finally { await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())) }
 })
 
-it('keeps a confirmed merge with an open review obligation readable while refusing futile admission controls', async () => {
+it('projects confirmed merges without obsolete queue waits while retaining original evidence and refusing admission controls', async () => {
   const journal = behaviorChainJournal()
+  const queueWait = 'native merge queue owns entry MQE_original'
   let pending = journal.append('api/repo#7', 'pending-seed', 0, { type: 'chain.admitted', repository: 'api/repo', issue: 7,
     branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' })
-  pending = journal.append(pending.id, 'pending-merge', pending.sequence, { type: 'chain.merged', mergeSha: 'a'.repeat(40),
-    evidence: { repository: pending.repository, pull_number: 17, merged: true, merge_sha: 'a'.repeat(40), review_complete: false } })
+  pending = journal.append(pending.id, 'pending-original', pending.sequence, { type: 'invocation.admitted', invocation: {
+    id: 'pending-original', behavior: 'repair-pr', actor: pending.author, model: 'fixture', slot: 'primary', basis: 'original',
+    admittedAt: Date.now(), request: { command: 'agent-interface', cwd: '/fixture', argv: [], nativeResources: 2 } } })
+  pending = journal.append(pending.id, 'pending-uncertain', pending.sequence, { type: 'invocation.uncertain',
+    invocationId: 'pending-original', reason: 'original response missing' })
+  pending = journal.append(pending.id, 'pending-queue', pending.sequence, { type: 'chain.waiting', reason: queueWait })
+  pending = journal.append(pending.id, 'pending-hold', pending.sequence, { type: 'chain.held', reason: 'original evidence missing' })
   let complete = journal.append('api/repo#8', 'complete-seed', 0, { type: 'chain.admitted', repository: 'api/repo', issue: 8,
     branch: 'poise/issue-8', author: 'author', reviewer: 'reviewer' })
+  complete = journal.append(complete.id, 'complete-queue', complete.sequence, { type: 'chain.waiting', reason: queueWait })
   complete = journal.append(complete.id, 'complete-merge', complete.sequence, { type: 'chain.merged', mergeSha: 'b'.repeat(40),
     evidence: { repository: complete.repository, pull_number: 18, merged: true, merge_sha: 'b'.repeat(40) } })
+  const historical = journal.history(complete.id)
+  journal.rebuild()
   const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('server did not bind')
   const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  const clearSharedLists = () => fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
   try {
+    const queued = await (await fetch(`${base}?state=active`)).json()
+    const queuedDetail = await (await fetch(`${base}?id=${encodeURIComponent(pending.id)}`)).json()
+    expect(queued.chains).toEqual([expect.objectContaining({ id: pending.id, waiting: queueWait, mergeSha: null })])
+    expect(queuedDetail.chain).toMatchObject({ waiting: queueWait, mergeSha: null })
+    pending = journal.append(pending.id, 'pending-merge', pending.sequence, { type: 'chain.merged', mergeSha: 'a'.repeat(40),
+      evidence: { repository: pending.repository, pull_number: 17, merged: true, merge_sha: 'a'.repeat(40), review_complete: false } })
+    const before = journal.history(pending.id)
+    await clearSharedLists()
     const active = await (await fetch(`${base}?state=active`)).json()
-    expect(active.chains).toEqual([expect.objectContaining({ id: pending.id, mergeSha: 'a'.repeat(40), reviewPending: true })])
+    expect(active.chains).toEqual([expect.objectContaining({ id: pending.id, waiting: null, mergeSha: 'a'.repeat(40), reviewPending: true })])
     expect(active.attention).toEqual([expect.objectContaining({ id: pending.id, nextAction:
       'Reconcile original pre-merge review evidence; no new invocation can start after merge' })])
     const merged = await (await fetch(`${base}?state=merged`)).json()
-    expect(merged.chains).toEqual([expect.objectContaining({ id: complete.id, mergeSha: 'b'.repeat(40), reviewPending: null, reviewStatus: 'not-recorded' })])
+    expect(merged.chains).toEqual([expect.objectContaining({ id: complete.id, waiting: null, mergeSha: 'b'.repeat(40), reviewPending: null, reviewStatus: 'not-recorded' })])
+    const historicalDetail = await (await fetch(`${base}?id=${encodeURIComponent(complete.id)}`)).json()
+    expect(historicalDetail.chain).toEqual(merged.chains[0])
     expect(journal.read(complete.id)).not.toHaveProperty('reviewPending')
     const detail = await (await fetch(`${base}?id=${encodeURIComponent(pending.id)}`)).json()
+    expect(detail.chain).toEqual(active.chains[0])
+    expect(detail.chain).toMatchObject({ waiting: null, held: pending.held, reviewPending: true, reviewStatus: 'pending',
+      reconciliation: { waitingForResourceRelease: true },
+      invocations: [{ id: 'pending-original', state: 'uncertain', outcome: 'original response missing' }] })
+    expect(detail.events).toContainEqual(expect.objectContaining({ type: 'chain.waiting', reason: queueWait }))
     expect(detail.chain.reviewPending).toBe(true)
+    const pendingPage = readJournalPage(detail)
+    const pendingMerge = pendingPage.events.find(event => event.type === 'chain.merged')!
+    expect(pendingMerge.reviewComplete).toBe(false)
+    expect(eventWords(pendingMerge, new Map()).text).toBe('Merged')
+    expect(taskState(pendingPage.chain!)).toEqual({ state: 'waiting', reason: 'Merged as aaaaaaa · review evidence pending' })
+    const legacy = await (await fetch(`${base}?id=${encodeURIComponent(complete.id)}`)).json()
+    expect(legacy.events.at(-1).evidence).not.toHaveProperty('review_complete')
+    const legacyPage = readJournalPage(legacy)
+    expect(legacyPage.chain).toMatchObject({ reviewPending: null, reviewStatus: 'not-recorded' })
+    expect(legacyPage.events.at(-1)).not.toHaveProperty('reviewComplete')
+    expect(eventWords(legacyPage.events.at(-1)!, new Map()).text).toBe('Merged')
     const canonical = journal.read(pending.id)!
+    expect(canonical).toEqual(pending)
     expect(detail.chain).toEqual(behaviorChainSummary(canonical, { at: journal.reconciliationAt(canonical) }))
-    const before = journal.history(pending.id)
     for (const operation of ['hold', 'resume']) {
       const response = await fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: pending.id, sequence: pending.sequence, operation }) })
       expect(response.status).toBe(409)
       expect((await response.json()).error).toContain('original receipt reconciliation only')
     }
+    journal.rebuild()
+    expect(journal.read(pending.id)).toEqual(pending)
+    expect(journal.read(complete.id)).toEqual(complete)
     expect(journal.history(pending.id)).toEqual(before)
+    expect(journal.history(complete.id)).toEqual(historical)
+    complete = journal.append(complete.id, 'complete-review', complete.sequence, { type: 'chain.merged', mergeSha: complete.mergeSha!,
+      evidence: { repository: complete.repository, pull_number: 18, merged: true, merge_sha: complete.mergeSha, review_complete: true } })
+    const resourceWait = 'Invocation pending-original has contradictory resource-release evidence; ownership remains held'
+    pending = journal.append(pending.id, 'pending-resource', pending.sequence, { type: 'chain.waiting', reason: resourceWait })
+    const resources = journal.history(pending.id)
+    await clearSharedLists()
+    const resourceList = await (await fetch(`${base}?state=active`)).json()
+    const resourceDetail = await (await fetch(`${base}?id=${encodeURIComponent(pending.id)}`)).json()
+    expect(resourceDetail.chain).toEqual(resourceList.chains[0])
+    expect(resourceDetail.chain).toMatchObject({ waiting: resourceWait, held: pending.held, reviewPending: true,
+      reconciliation: detail.chain.reconciliation, invocations: detail.chain.invocations })
+    const reviewedList = await (await fetch(`${base}?state=merged`)).json()
+    const reviewedDetail = await (await fetch(`${base}?id=${encodeURIComponent(complete.id)}`)).json()
+    expect(reviewedDetail.chain).toEqual(reviewedList.chains[0])
+    expect(reviewedDetail.chain).toMatchObject({ waiting: null, reviewPending: false, reviewStatus: 'complete' })
+    expect(journal.read(pending.id)).toEqual(pending)
+    expect(journal.read(complete.id)).toEqual(complete)
+    expect(journal.history(pending.id)).toEqual(resources)
+    await clearSharedLists()
   } finally { await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())) }
 })
 
@@ -143,6 +205,63 @@ it('shares the production summary and historical rebuild contract with browser p
   expect(chainSummaryFixture('pending-no-invocation').chains[0]).toMatchObject({ reviewStatus: 'pending', reviewPending: true, invocations: [] })
   expect(chainSummaryFixture('complete').chains[0]).toMatchObject({ reviewStatus: 'complete', reviewPending: false })
   expect(chainSummaryFixture('historical').chains[0]).toMatchObject({ reviewStatus: 'not-recorded', reviewPending: null })
+})
+
+it('retains unmet native clearance on completed merged list/detail reads across expiry and rebuild, without rewriting receipts', async () => {
+  const journal = behaviorChainJournal()
+  const cases: MergedReviewCase[] = ['requested-changes', 'clean', 'native-approval', 'late-native-approval', 'late-review',
+    'missing-basis', 'changed-context', 'changed-head', 'missing-panel', 'incomplete-panel']
+  const now = Date.now()
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now)
+  const chains = cases.map((mode, index) => mergedReviewFixture(journal, 1635 + index, mode))
+  for (const [index, chain] of chains.entries()) {
+    if (!['requested-changes', 'clean', 'native-approval', 'late-native-approval'].includes(cases[index])) continue
+    const observation = chain.observation as ChainObservation
+    expect(decideBehaviorChain(chain, observation, observation.checkedAt, {
+      before: journal.preMergeObservation(chain.id, observation.pull!.mergedAt!) as ChainObservation | null,
+      firstMerged: journal.firstMergedObservation(chain.id) as ChainObservation | null,
+    })).toEqual({ kind: 'complete', mergeSha: 'c'.repeat(40) })
+  }
+  const history = db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').all()
+  journal.rebuild()
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  try {
+    for (const time of [now + 10_001, now + 120_001]) {
+      clock.mockReturnValue(time)
+      const merged = await (await fetch(`${base}?state=merged`)).json()
+      for (const [index, chain] of chains.entries()) {
+        expect(journal.read(chain.id)).toEqual(chain)
+        expect(merged.attention.map((entry: { id: string }) => entry.id)).not.toContain(chain.id)
+        const listed = merged.chains.find((entry: { id: string }) => entry.id === chain.id)
+        const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
+        expect(listed).toBeDefined()
+        expect(detail.chain).toEqual(listed)
+        expect(listed).toMatchObject({ mergeSha: 'c'.repeat(40), reviewPending: false, reviewStatus: 'complete', invocationCount: chain.invocations.length })
+        expect(listed.invocations).toHaveLength(20)
+        expect(listed.invocations.every((entry: { behavior: string }) => entry.behavior === 'repair-pr')).toBe(true)
+        const warning = listed.mergedReviewWarning
+        if (cases[index] === 'requested-changes' || cases[index] === 'late-native-approval') {
+          expect(warning).toMatchObject({ head: 'a'.repeat(40), reviews: [{ id: 91, head: 'a'.repeat(40), submittedAt: now - 7000,
+            verdict: 'Changes requested: retain the original native review clearance after merge.',
+            url: `https://github.com/acme/repo/pull/${chain.issue + 1}#pullrequestreview-91` }],
+          githubApproval: { id: 93, head: 'a'.repeat(40), submittedAt: now - 4000,
+            url: `https://github.com/acme/repo/pull/${chain.issue + 1}#pullrequestreview-93`, client: 'unknown' } })
+          expect(taskState(readChain(listed))).toEqual({ state: 'done', reason: 'Merged as ccccccc · native review clearance unmet' })
+        } else expect(warning).toBeNull()
+      }
+    }
+    journal.rebuild()
+    expect(db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').all()).toEqual(history)
+    for (const chain of chains) expect(journal.read(chain.id)).toEqual(chain)
+  } finally {
+    await fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    clock.mockRestore()
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
 })
 
 it('retains the original failed native Call and diagnostic in list and History without rewriting uncertainty', async () => {
@@ -336,7 +455,6 @@ it('batches exact work-impact lookups through the existing classifier without ch
   const at = Date.now() - 10_000
   const call = '4'.repeat(32), correlation = '5'.repeat(32), other = '6'.repeat(32)
   const fixture = loggingWorkFixture(journal, 'api/impact', 7, correlation, call, at)
-  fixture.append({ type: 'chain.held', reason: 'independent hold' }, at + 4000)
   const completed = loggingWorkFixture(journal, 'api/impact', 8, other, other, at)
   completed.append({ type: 'chain.merged', mergeSha: 'c'.repeat(40), evidence: { repository: 'api/impact', pull_number: 108,
     merged: true, merge_sha: 'c'.repeat(40), review_complete: true } }, at + 4000)
@@ -351,8 +469,12 @@ it('batches exact work-impact lookups through the existing classifier without ch
     for (const [callId, correlationId] of [[call, correlation], ['', other], ['7'.repeat(32), ''], [call, other]]) {
       params.append('callId', callId); params.append('correlationId', correlationId)
     }
+    const batchLookup = vi.spyOn(journal, 'forInvocations')
+    const singleLookup = vi.spyOn(journal, 'forInvocation')
     const response = await fetch(`${base}?${params}`)
     expect(response.status).toBe(200)
+    expect(batchLookup).toHaveBeenCalledTimes(1)
+    expect(singleLookup).not.toHaveBeenCalled()
     expect(await response.json()).toEqual({ impacts: [behaviorChainWorkImpact(journal, call, correlation),
       behaviorChainWorkImpact(journal, null, other), null, null] })
     const single = await (await fetch(`${base}?callId=${call}&correlationId=${correlation}`)).json()
@@ -362,12 +484,75 @@ it('batches exact work-impact lookups through the existing classifier without ch
       expect((await fetch(`${base}?${query}`)).status).toBe(400)
     }
     const bounded = new URLSearchParams({ batch: '1' })
-    for (let index = 0; index < 100; index++) { bounded.append('callId', call); bounded.append('correlationId', '') }
+    for (let index = 0; index < 100; index++) {
+      bounded.append('callId', index ? index.toString(16).padStart(32, '0') : call)
+      bounded.append('correlationId', '')
+    }
     const full = await fetch(`${base}?${bounded}`)
     expect(full.status).toBe(200)
-    expect((await full.json()).impacts).toHaveLength(100)
+    expect((await full.json()).impacts).toEqual([behaviorChainWorkImpact(journal, call, null), ...Array(99).fill(null)])
     bounded.append('callId', call); bounded.append('correlationId', '')
     expect((await fetch(`${base}?${bounded}`)).status).toBe(400)
     expect([journal.history(fixture.chain.id), journal.history(completed.chain.id)]).toEqual(before)
+    const appendedId = '8'.repeat(32)
+    fixture.append({ type: 'invocation.admitted', invocation: { ...fixture.chain.invocations[0], id: appendedId, admittedAt: at + 5000 } }, at + 5000)
+    fixture.append({ type: 'invocation.reconciled', invocationId: appendedId,
+      evidence: { nativeCallId: '7'.repeat(32), callId: '7'.repeat(32) } }, at + 6000)
+    const withInvocation = await (await fetch(`${base}?${params}`)).json()
+    expect(withInvocation.impacts[2]).toMatchObject({ invocationId: appendedId, stage: 'repair-pr: admitted' })
+    expect(withInvocation.impacts[2]).toEqual(behaviorChainWorkImpact(journal, '7'.repeat(32), null))
+    fixture.append({ type: 'chain.held', reason: 'independent hold' }, at + 7000)
+    const afterAppend = journal.history(fixture.chain.id)
+    const refreshed = await (await fetch(`${base}?${params}`)).json()
+    expect(refreshed.impacts[0]).toMatchObject({ impact: 'blocked', nextAction: expect.stringContaining('independent hold') })
+    expect(refreshed.impacts[0]).toEqual(behaviorChainWorkImpact(journal, call, correlation))
+    expect([journal.history(fixture.chain.id), journal.history(completed.chain.id)]).toEqual([afterAppend, before[1]])
+  } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+})
+
+it('keeps merge confirmation and original review completion distinct across history pages and settlement links', async () => {
+  const journal = behaviorChainJournal()
+  const at = Date.now() - 60_000
+  let chain = journal.append('api/history#1564', 'history-seed', 0, { type: 'chain.admitted', repository: 'api/history', issue: 1564,
+    branch: 'poise/issue-1564', author: 'author', reviewer: 'reviewer' }, at)
+  for (let index = 0; index < 18; index++) chain = journal.append(chain.id, `history-wait-${index}`, chain.sequence,
+    { type: 'chain.waiting', reason: 'exact-head CI is still running' }, at + index + 1)
+  const evidence = { repository: chain.repository, pull_number: 1565, merged: true, merge_sha: 'd'.repeat(40), callId: 'c'.repeat(32) }
+  const merged = journal.append(chain.id, 'history-merge', chain.sequence, { type: 'chain.merged', mergeSha: evidence.merge_sha,
+    evidence: { ...evidence, review_complete: false } }, at + 1000)
+  chain = journal.append(chain.id, 'history-review-complete', merged.sequence, { type: 'chain.merged', mergeSha: evidence.merge_sha,
+    evidence: { ...evidence, review_complete: true } }, at + 1324)
+  const before = journal.history(chain.id)
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains?id=${encodeURIComponent(chain.id)}`
+  const read = async (after: number) => {
+    const response = await fetch(`${base}&after=${after}`)
+    expect(response.status).toBe(200)
+    return readJournalPage(await response.json())
+  }
+  try {
+    const first = await read(0)
+    expect(first.events).toHaveLength(20)
+    expect(first.next).toBe(merged.sequence)
+    expect(first.events.at(-1)).toMatchObject({ type: 'chain.merged', reviewComplete: false })
+    // The latest summary already knows completion; the earlier event must still say Merged.
+    expect(first.chain).toMatchObject({ mergeSha: evidence.merge_sha, reviewPending: false, reviewStatus: 'complete' })
+    const second = await read(first.next!)
+    expect(second.next).toBeNull()
+    expect(second.events).toHaveLength(1)
+    expect(second.events[0]).toMatchObject({ type: 'chain.merged', reviewComplete: true })
+    const lines = timelineLines([...first.events, ...second.events], null).filter(line => line.event.type === 'chain.merged')
+    expect(lines.map(({ event, folded }) => ({ sequence: event.sequence, at: event.at, folded, ...eventWords(event, new Map()) }))).toEqual([
+      { sequence: chain.sequence, at: at + 1324, folded: 1, kind: 'event', text: 'Original review evidence complete', call: evidence.callId },
+      { sequence: merged.sequence, at: at + 1000, folded: 1, kind: 'event', text: 'Merged', call: evidence.callId },
+    ])
+    const linked = await readFrom(read, merged.sequence)
+    expect(linked.events).toEqual(second.events)
+    expect(eventWords(linked.events[0], new Map()).text).toBe('Original review evidence complete')
+    expect(journal.history(chain.id)).toEqual(before)
+    expect(journal.read(chain.id)).toEqual(chain)
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })

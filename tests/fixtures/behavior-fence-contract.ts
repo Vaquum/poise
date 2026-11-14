@@ -15,8 +15,9 @@ import { BehaviorResourceRecovery } from '../../server/behavior-chain-resource-r
 
 const wire = readFileSync(process.argv[2], 'utf8')
 const mode = process.argv[3] ?? 'fence'
-assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked', 'atomic-work-failed', 'ancestor-recovery'].includes(mode))
+assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked', 'atomic-work-failed', 'atomic-merged-repair', 'ancestor-recovery'].includes(mode))
 const atomic = mode.startsWith('atomic-')
+const mergedRepair = mode === 'atomic-merged-repair'
 const blocked = mode === 'atomic-work-blocked'
 const open = blocked || mode === 'atomic-work-failed'
 const ancestorRecovery = mode === 'ancestor-recovery'
@@ -56,7 +57,13 @@ try {
     discover: async () => [], ownsRepository: () => true, readInvocations: async () => parseAgentLogStdout(wire, 'actual native receipt'),
     observe: async () => ({ checkedAt: Date.now(), existingPulls: [], issue: { open, eligible: open, revision: 'closed', commentIds: [] },
       issueReviewers: [reviewer], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer,
-      publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null }),
+      publication: { pull_number: mergedRepair ? 3 : null, head_sha: mergedRepair ? call.head_sha : null, head_invocation: null,
+        state: mergedRepair ? 'closed' : null, merged: mergedRepair, merge_sha: mergedRepair ? 'd'.repeat(40) : null },
+      pull: mergedRepair ? { number: 3, head: call.head_sha!, headSince: Date.now() - 1000, state: 'closed', draft: false,
+        merged: true, mergeSha: 'd'.repeat(40), mergedAt: Date.now(), queueEntry: null, queueRemoval: null,
+        changesRequested: false, unresolved: 0, approved: false, ready: false, reviewIds: [], reviewReceipts: [],
+        reviewRevision: 'revision', reviewContext: 'c'.repeat(64), greyRuns: [], pending: false,
+        failing: [], conflict: false, behind: false } : null }),
     available: () => blocked, capacity: () => 1, permitted: () => blocked, received: () => {}, request: forbidden, launch: forbidden,
     perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {} }
   if (atomic) {
@@ -65,6 +72,7 @@ try {
     await new BehaviorChainRuntime(journal, operations).run()
     assert.equal(journal.read(id)!.invocations[0].state, 'uncertain')
     assert.deepEqual(journal.read(id)!.invocations[0].evidence?.diagnostic ?? null, call.diagnostic)
+    if (mergedRepair) assert.equal(journal.read(id)!.mergeSha, null)
     if (blocked) assert.equal(journal.read(id)!.held, call.error)
     assert.deepEqual(journal.reservedResources(), { ...reservation, unaccounted: 0 })
     journal.rebuild()
@@ -124,13 +132,19 @@ try {
     diskBytes: pending ? reservation.diskBytes : 0, unaccounted: 0 })
   const events = journal.history(id)
   if (atomic) {
-    const outcome = mode === 'atomic-provider-timeout' ? 'atomic_work_execution_budget_exhausted' : 'preflight_failed'
+    const outcome = mergedRepair ? 'superseded' : mode === 'atomic-provider-timeout' ? 'atomic_work_execution_budget_exhausted' : 'preflight_failed'
     assert.equal(current.invocations[0].outcome, outcome)
-    assert.equal(current.invocations[0].evidence?.outcome, 'preflight_failed')
+    assert.equal(current.invocations[0].evidence?.outcome, mergedRepair ? 'superseded' : 'preflight_failed')
     assert.deepEqual(current.invocations[0].evidence?.diagnostic ?? null, call.diagnostic)
     const settled = events.map(row => JSON.parse(row.payload)).find(event => event.type === 'invocation.settled')
     assert.equal(settled.outcome, outcome)
     assert.deepEqual(settled.evidence.diagnostic ?? null, call.diagnostic)
+    if (mergedRepair) {
+      assert.equal(call.action, null)
+      assert.equal(call.head_sha, call.expected_head)
+      assert.equal(current.mergeSha, 'd'.repeat(40))
+      assert.equal(current.invocations.length, 1)
+    }
     if (mode === 'atomic-work-failed') {
       assert.equal(current.held, null)
       assert.equal(call.error_code, 'atomic_work_failed')

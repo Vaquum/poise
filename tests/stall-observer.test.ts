@@ -51,6 +51,8 @@ it('reports memory, the event loop and the file-I/O probe alongside', () => {
   // kernel's counters where the system has them (Linux), null where not.
   expect(snapshot.host.cpus).toBeGreaterThan(0)
   expect(snapshot.host.loadAvg).toHaveLength(3)
+  expect(snapshot.host.memoryMb.total).toBeGreaterThan(0)
+  expect(snapshot.host.memoryMb.available).toBeLessThanOrEqual(snapshot.host.memoryMb.total)
   expect(snapshot.host.process.userCpuMs).toBeGreaterThan(0)
   if (process.platform === 'linux') expect(snapshot.host.mainThread?.ranMs).toBeGreaterThan(0)
   else expect(snapshot.host.mainThread).toBeNull()

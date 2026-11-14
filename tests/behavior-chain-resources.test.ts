@@ -5,6 +5,7 @@ import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, ty
 import { parseResourceOwnership } from '../server/behavior-resource-receipt'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorResourceRecovery } from '../server/behavior-chain-resource-recovery'
+import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import type { Organization } from '../server/organizations'
 import { completedReviewCall } from './review-response-fixture'
@@ -67,6 +68,57 @@ function bounded(memory = '10', reservation = '6'): void {
 }
 
 describe('durable behavior resource reservations', () => {
+  it('keeps a stale issue review’s ownership until release, then reviews the replacement revision', async () => {
+    const { journal, chain } = setup()
+    const admitted = invocation('stale-review', RESERVATION)
+    record(journal, chain, { type: 'invocation.admitted', invocation: admitted })
+    const call = { ...completedReviewCall(chain.repository, chain.issue, 'a'.repeat(40), chain.reviewer),
+      behavior: 'issue_review', source: 'poise:behavior-chain', correlation_id: admitted.id, model: admitted.model,
+      status: 'failed', error_code: 'issue_revision_changed', error: 'seed issue changed during review; no comments posted',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, expected_head: null, review_id: null,
+      artifact: { phase: 'reviewing', resource_root: '/owned/stale-review' }, receipts: null, issue_revision: 'a'.repeat(64),
+      resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: null as string | null }
+    const original = structuredClone(call), launch = vi.fn(async () => true)
+    const next = observation()
+    next.issue.revision = 'b'.repeat(64)
+    const runtime = new BehaviorChainRuntime(journal, operations({ launch, observe: async () => next,
+      readInvocations: async () => parseAgentLogStdout(JSON.stringify([call]), 'stale issue review') }))
+    expect(callerDiagnostic(call, 'local')).toBeNull()
+    expect(call).toEqual(original)
+    await runtime.run()
+    expect(journal.reservedResources()).toEqual({ ...RESERVATION, unaccounted: 0 })
+    expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+    expect(launch).not.toHaveBeenCalled()
+    call.resources_settled_at = new Date().toISOString()
+    await runtime.run()
+    const current = journal.read(chain.id)!
+    expect(current.invocations).toHaveLength(2)
+    expect(current.invocations[0]).toMatchObject({ state: 'settled', outcome: 'preflight_failed',
+      evidence: { issue_revision: original.issue_revision, resource_ownership: original.resource_ownership,
+        resources_settled_at: call.resources_settled_at, error_code: 'issue_revision_changed' } })
+    expect(current.invocations[1]).toMatchObject({ behavior: 'review-issue', basis: chainBasis(['issue', next.issue.revision]), state: 'started' })
+    expect(launch).toHaveBeenCalledOnce()
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    expect(journal.history(chain.id)).toEqual(history)
+    expect(journal.read(chain.id)).toEqual(current)
+  })
+
+  it('keeps a stale issue review with ownership cleanup failure visible in Logging', () => {
+    const { chain } = setup()
+    const call = { ...completedReviewCall(chain.repository, chain.issue, 'a'.repeat(40), chain.reviewer),
+      behavior: 'issue_review', source: 'poise:behavior-chain', correlation_id: 'stale-ownership', model: 'fixture-model',
+      status: 'failed', error_code: 'issue_revision_changed', error: 'seed issue changed during review; no comments posted',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, expected_head: null, review_id: null,
+      artifact: { phase: 'reviewing', resource_root: '/owned/stale-review' }, receipts: null, issue_revision: 'a'.repeat(64),
+      resource_ownership: { version: 1, roots: [], errors: [{ cause: 'deletion denied', path: null, at: 1 }] },
+      resources_settled_at: null as string | null }
+    expect(callerDiagnostic(call, 'local')).toMatchObject({ level: 'error', message: call.error })
+    const feed = { id: call.id, behavior: 'issue_review', status: 'failed', error_code: 'issue_revision_changed',
+      action: 'not_started', outcome: 'preflight_failed', error: call.error, ownership_error: 'ownership_failed' }
+    expect(callerDiagnostic(feed, 'local')).toMatchObject({ level: 'error', message: call.error })
+  })
+
   it.each(['merged', 'held', 'settled'])("recovers only physical resources for a %s chain without admission or external actions", async mode => {
     const { journal, chain } = setup()
     const admitted = { ...invocation('original', RESERVATION), request: { command: 'agent-interface' as const,

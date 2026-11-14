@@ -58,6 +58,12 @@ export function gatewayDiagnostic(level: string, operation: string, fields: Reco
   const context = Object.fromEntries(['method', 'route', 'upstream', 'durationMs', 'requestId', 'container', 'release', 'limit', 'free', 'total', 'errno', 'code', 'disconnect',
     'phase', 'bytesSent', 'timeoutSeconds', 'activeChatTurns', 'runningCallerCalls', 'backgroundWork']
     .map((key) => [key, fields[key] ?? null]))
+  if (operation === 'disk.workspace.over_budget') {
+    for (const key of ['bytes', 'budget']) {
+      const value = fields[key]
+      if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) context[key] = value
+    }
+  }
   const cause = typeof fields.error === 'string' ? fields.error.replace(/\/(?:home|Users)\/[^\s:'"<>]+/g, '[private path]').replace(/https?:\/\/[^\s]+/g, '[upstream URL]') : null
   return { source: 'gateway', level, operation, workspace: shared ? workspace : null, visibility: shared && workspace ? 'infrastructure' : 'operator',
     message: cause ? `${operation}: ${cause}` : operation, context: shared ? context : { ...context, causeUnavailable: cause === null },

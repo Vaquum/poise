@@ -8,6 +8,8 @@ import { join, resolve } from 'node:path'
 import { build } from 'esbuild'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FAILED_START_MS, openNamespaceWitness, supervisor, UPDATE_EXIT_CODE } from '../deploy/runtime/supervisor.mjs'
+import { DiagnosticStore } from '../gateway/src/diagnostics/store'
+import { hasShutdownDiagnostic, recordRuntimeDiagnostic } from '../server/runtime-diagnostic'
 import { gatewayKeys, serviceEnvironment } from './service-fixture'
 
 // The workspace supervisor (deploy/runtime/supervisor.mjs): which release it
@@ -36,14 +38,15 @@ async function pointer(name, value) {
   await writeFile(join(home, '.poise', 'releases', name), `${value}\n`)
 }
 
-function supervise(diagnostic, nativeControlFactory = null) {
+function supervise(diagnostic, nativeControlFactory = null, shutdownDiagnostic = null) {
   return supervisor({
     home,
     diagnostic,
+    shutdownDiagnostic,
     nativeControlFactory,
     image: IMAGE,
     base: 'B',
-    env: { HOME: home, PATH: `${home}/.local/bin:/opt/caller/venv/bin:/usr/bin:/bin` },
+    env: { HOME: home, PATH: `${home}/.local/bin:/opt/caller/venv/bin:/usr/bin:/bin`, POISE_SHUTDOWN_DIAGNOSTIC_ID: '0'.repeat(32) },
     start: (release, env) => {
       const child = new FakeChild()
       started.push({ release, env, child })
@@ -227,6 +230,119 @@ it('records native supervisor failure facts and omits planned switches and shutd
   const stopping = supervise((input) => records.push(input)); const stopped = stopping.run()
   const third = await nth(2); stopping.stop('SIGTERM'); third.child.exit(0)
   await stopped; expect(records).toHaveLength(1)
+})
+
+describe('shutdown diagnostic correlation', () => {
+  let options
+  let emitted
+  beforeEach(() => {
+    emitted = []
+    options = { path: join(home, '.poise', 'logging.db'), workspace: 'octocat', write: (event) => emitted.push(event) }
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  })
+  const run = () => supervise((input) => recordRuntimeDiagnostic(input, options), null,
+    (id, release) => hasShutdownDiagnostic(id, release, options))
+  const shutdown = (launch, input = {}) => recordRuntimeDiagnostic({ id: launch.env.POISE_SHUTDOWN_DIAGNOSTIC_ID,
+    correlationId: launch.env.POISE_SHUTDOWN_DIAGNOSTIC_ID, release: launch.release.name,
+    source: 'poise', component: 'production', operation: 'process.shutdown', level: 'error',
+    message: 'Production shutdown rejected', cause: ['runtime_stop: cleanup refused'], exitCode: 1, ...input },
+  { ...options, workspace: input.workspace ?? options.workspace })
+  const retained = () => {
+    const store = new DiagnosticStore(options.path, undefined, Date.now, true)
+    try { return store.query({ workspace: options.workspace, operator: false }).events }
+    finally { store.close() }
+  }
+
+  it.each([[1, null, 1], [null, 'SIGKILL', 137]])('links a retained shutdown Error to actual exit %s/%s', async (code, signal, result) => {
+    const instance = run(); const running = instance.run(); const first = await nth(0)
+    const id = first.env.POISE_SHUTDOWN_DIAGNOSTIC_ID
+    expect(id).toMatch(/^[a-f0-9]{32}$/)
+    expect(id).not.toBe('0'.repeat(32))
+    const shutdownId = shutdown(first)
+    first.child.exit(code, signal)
+    expect(await running).toBe(result)
+    const events = retained()
+    expect(events).toHaveLength(2)
+    expect(events.filter((event) => event.severity === 'error')).toEqual([expect.objectContaining({ id: shutdownId,
+      operation: 'process.shutdown', correlationId: id, cause: ['runtime_stop: cleanup refused'] })])
+    expect(events.find((event) => event.operation === 'workspace.exit')).toMatchObject({ severity: 'warning',
+      correlationId: id, exitCode: code, signal, release: 'r1' })
+    expect(new Set(events.map((event) => event.id)).size).toBe(2)
+  })
+
+  it.each([
+    ['missing', null],
+    ['another launch', { id: 'b'.repeat(32) }],
+    ['another release', { release: 'r0' }],
+    ['another owner', { workspace: 'another' }],
+    ['another source', { source: 'caller' }],
+    ['another operation', { operation: 'process.fatal' }],
+    ['another component', { component: 'other' }],
+    ['a Warning', { level: 'warning' }],
+    ['an unlinked record', { correlationId: null }],
+  ])('keeps an independent exit Error with %s shutdown evidence', async (_name, input) => {
+    const instance = run(); const running = instance.run(); const first = await nth(0)
+    if (input) shutdown(first, input)
+    first.child.exit(9)
+    expect(await running).toBe(9)
+    expect(retained().filter((event) => event.operation === 'workspace.exit')).toEqual([expect.objectContaining({
+      severity: 'error', correlationId: null, exitCode: 9, signal: null })])
+  })
+
+  it('does not reuse the first failed shutdown for a second crash of the same release', async () => {
+    await install('r2', 'B'); await pointer('current', 'r2')
+    const instance = run(); const running = instance.run(); const first = await nth(0)
+    shutdown(first)
+    await pointer('next', 'r2')
+    first.child.exit(1)
+    const second = await nth(1)
+    expect(second.release).toEqual(first.release)
+    expect(second.env.POISE_SHUTDOWN_DIAGNOSTIC_ID).not.toBe(first.env.POISE_SHUTDOWN_DIAGNOSTIC_ID)
+    clock += FAILED_START_MS
+    second.child.exit(9)
+    expect(await running).toBe(9)
+    expect(retained()).toHaveLength(3)
+    expect(retained().filter((event) => event.operation === 'workspace.exit')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ severity: 'warning', exitCode: 1, correlationId: first.env.POISE_SHUTDOWN_DIAGNOSTIC_ID }),
+      expect.objectContaining({ severity: 'error', exitCode: 9, correlationId: null }),
+    ]))
+    expect(started).toHaveLength(2)
+    expect(existsSync(join(home, '.poise', 'releases', 'r2', 'failed'))).toBe(false)
+  })
+
+  it('does not trust a returned event ID or emitted envelope after persistence fails', async () => {
+    const instance = run(); const running = instance.run(); const first = await nth(0)
+    vi.spyOn(DiagnosticStore.prototype, 'append').mockImplementationOnce(() => { throw new Error('shutdown persistence unavailable') })
+    const id = shutdown(first)
+    expect(id).toMatch(/^evt_/)
+    expect(emitted).toEqual(expect.arrayContaining([expect.objectContaining({ id, operation: 'process.shutdown' })]))
+    first.child.exit(1)
+    expect(await running).toBe(1)
+    expect(retained()).toEqual([expect.objectContaining({ severity: 'error', operation: 'workspace.exit', correlationId: null })])
+  })
+
+  it('keeps supervision and an independent exit Error when the diagnostic store is unreadable', async () => {
+    const instance = run(); const running = instance.run(); const first = await nth(0)
+    shutdown(first)
+    vi.spyOn(DiagnosticStore.prototype, 'lookup').mockImplementationOnce(() => { throw new Error('diagnostic read unavailable') })
+    first.child.exit(1)
+    expect(await running).toBe(1)
+    expect(console.error).toHaveBeenCalledWith('poise-runtime: diagnostic reporting unavailable: Error')
+    expect(retained().find((event) => event.operation === 'workspace.exit')).toMatchObject({ severity: 'error', correlationId: null })
+  })
+
+  it('keeps a successful release switch and container stop quiet in the retained store', async () => {
+    const store = new DiagnosticStore(options.path); store.close()
+    const instance = run(); const running = instance.run(); const first = await nth(0)
+    await install('r2', 'B'); await pointer('next', 'r2')
+    first.child.exit(UPDATE_EXIT_CODE)
+    const second = await nth(1)
+    expect(second.release.name).toBe('r2')
+    expect((await readFile(join(home, '.poise', 'releases', 'current'), 'utf8')).trim()).toBe('r2')
+    instance.stop('SIGTERM'); second.child.exit(0)
+    expect(await running).toBe(0)
+    expect(retained()).toEqual([])
+  })
 })
 
 it('retains actual spawn errors without letting a diagnostic reporter change supervision', async () => {

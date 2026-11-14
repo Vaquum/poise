@@ -24,6 +24,13 @@ export interface ChainSupersession {
   recovery: { id: number } | null
 }
 
+interface ReviewReceipt { id: number, head: string, submittedAt: number, url: string }
+export interface MergedReviewWarning {
+  head: string
+  reviews: Array<ReviewReceipt & { verdict: string }>
+  githubApproval: (ReviewReceipt & { client: 'unknown' }) | null
+}
+
 export interface ChainRow {
   id: string
   repository: string
@@ -34,6 +41,7 @@ export interface ChainRow {
   mergeSha: string | null
   reviewPending: boolean | null
   reviewStatus: 'pending' | 'complete' | 'not-recorded'
+  mergedReviewWarning: MergedReviewWarning | null
   supersession: ChainSupersession | null
   reconciliation: { nextObservationAt: number | null, waitingForOriginalResponse: boolean, waitingForResourceRelease: boolean } | null
   pullNumber: number | null
@@ -62,6 +70,7 @@ export interface ChainCapacity {
   error: string | null
   modelInvocationLimit: number | null
   reservedModelInvocations: number | null
+  retainedModelInvocations: number | null
   mode: string | null
   enabled: boolean | null
   intake: { seedMode: string, label: string | null } | null
@@ -84,6 +93,7 @@ export interface JournalEvent {
   reason: string | null
   outcome: string | null
   callId: string | null
+  reviewComplete?: boolean
   diagnostic: { operation?: string, phase?: string, stderr?: string | null, context?: Record<string, unknown> } | null
 }
 
@@ -98,6 +108,21 @@ function invocation(value: unknown): ChainInvocation {
   if (!object(value) || typeof value.id !== 'string' || typeof value.behavior !== 'string' || typeof value.state !== 'string') return incomplete('an invocation')
   return { id: value.id, behavior: value.behavior, state: value.state, callId: text(value.callId), model: text(value.model),
     slot: text(value.slot), outcome: text(value.outcome), admittedAt: count(value.admittedAt) }
+}
+
+function reviewReceipt(value: unknown): ReviewReceipt {
+  if (!object(value) || !Number.isSafeInteger(value.id) || typeof value.head !== 'string'
+    || typeof value.submittedAt !== 'number' || !Number.isFinite(value.submittedAt) || typeof value.url !== 'string') return incomplete('a review receipt')
+  return { id: Number(value.id), head: value.head, submittedAt: value.submittedAt, url: value.url }
+}
+
+function mergedReviewWarning(value: unknown): MergedReviewWarning | null {
+  if (value == null) return null
+  if (!object(value) || typeof value.head !== 'string' || !Array.isArray(value.reviews) || !value.reviews.length) return incomplete('merged review clearance')
+  return { head: value.head, reviews: value.reviews.map(review => {
+    if (!object(review) || typeof review.verdict !== 'string') return incomplete('a retained review verdict')
+    return { ...reviewReceipt(review), verdict: review.verdict }
+  }), githubApproval: value.githubApproval == null ? null : { ...reviewReceipt(value.githubApproval), client: 'unknown' } }
 }
 
 export function readChain(value: unknown): ChainRow {
@@ -115,6 +140,7 @@ export function readChain(value: unknown): ChainRow {
     held: text(value.held), waiting: text(value.waiting), mergeSha: text(value.mergeSha),
     reviewPending: typeof value.reviewPending === 'boolean' ? value.reviewPending : null,
     reviewStatus: value.reviewStatus === 'pending' || value.reviewStatus === 'complete' ? value.reviewStatus : 'not-recorded',
+    mergedReviewWarning: mergedReviewWarning(value.mergedReviewWarning),
     supersession,
     reconciliation: object(r) ? { nextObservationAt: count(r.nextObservationAt), waitingForOriginalResponse: r.waitingForOriginalResponse === true, waitingForResourceRelease: r.waitingForResourceRelease === true } : null,
     pullNumber: Number.isSafeInteger(value.pullNumber) ? Number(value.pullNumber) : null,
@@ -146,6 +172,7 @@ export function readChainsPage(value: unknown): ChainsPage {
   const capacity = object(value.capacity) ? {
     status: value.capacity.status === 'available' ? 'available' as const : 'unavailable' as const, error: text(value.capacity.error),
     modelInvocationLimit: count(value.capacity.modelInvocationLimit), reservedModelInvocations: count(value.capacity.reservedModelInvocations),
+    retainedModelInvocations: count(value.capacity.retainedModelInvocations),
     mode: text(value.capacity.mode), enabled: typeof value.capacity.enabled === 'boolean' ? value.capacity.enabled : null,
     intake: object(value.capacity.intake) ? { seedMode: String(value.capacity.intake.seedMode), label: text(value.capacity.intake.label) } : null,
   } : null
@@ -168,7 +195,8 @@ export function readJournalPage(value: unknown): { chain: ChainRow | null, event
     if (!object(e) || !Number.isSafeInteger(e.sequence) || !Number.isFinite(e.at) || typeof e.type !== 'string') return incomplete('a journal event')
     const evidence = object(e.evidence) && object(e.evidence.diagnostic) ? e.evidence.diagnostic as JournalEvent['diagnostic'] : null
     return { sequence: Number(e.sequence), at: Number(e.at), type: e.type, invocationId: text(e.invocationId), reason: text(e.reason),
-      outcome: text(e.outcome), callId: text(e.callId), diagnostic: evidence }
+      outcome: text(e.outcome), callId: text(e.callId), diagnostic: evidence,
+      ...(object(e.evidence) && typeof e.evidence.review_complete === 'boolean' ? { reviewComplete: e.evidence.review_complete } : {}) }
   })
   return { chain: object(value.chain) ? readChain(value.chain) : null, events, next: value.next === null ? null : Number(value.next) }
 }
@@ -231,6 +259,7 @@ export function taskState(chain: ChainRow): { state: StateKey, reason: string } 
   }
   if (chain.mergeSha) {
     if (chain.reviewPending) return { state: 'waiting', reason: `Merged as ${sha(chain.mergeSha)} · review evidence pending` }
+    if (chain.mergedReviewWarning) return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · native review clearance unmet` }
     if (chain.reviewStatus === 'not-recorded') return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · pre-merge review completion not recorded` }
     return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)}` }
   }
@@ -290,7 +319,7 @@ export function eventWords(event: JournalEvent, invocations: ReadonlyMap<string,
     case 'chain.held': return { kind: 'hold', text: event.reason === 'New invocations held by the person' ? 'Held by you: no new invocations' : `Held: ${reasonWords(event.reason ?? 'no reason recorded')}`, call: null }
     case 'chain.waiting': return { kind: 'event', text: `Waiting: ${reasonWords(event.reason ?? 'no reason recorded')}`, call: null }
     case 'chain.resumed': return { kind: 'event', text: 'Resumed', call: null }
-    case 'chain.merged': return { kind: 'event', text: 'Merged', call }
+    case 'chain.merged': return { kind: 'event', text: event.reviewComplete === true ? 'Original review evidence complete' : 'Merged', call }
     case 'chain.superseded': return { kind: 'event', text: 'Superseded by a merge that covered it', call }
     case 'invocation.admitted': return { kind: 'run', text: 'A step was admitted', call: null }
     case 'invocation.started': return { kind: 'run', text: `${step} started${by ? ` · ${by}` : ''}`, call }

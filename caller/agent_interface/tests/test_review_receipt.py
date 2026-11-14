@@ -1002,3 +1002,70 @@ class TestDuplicatePrevention(TestCase):
                 result = api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
                                               receipt=receipt("reviewed_clean", 92), call_id="me")
                 self.assertEqual(result["outcome"], "clean")
+
+
+class TestRetainedVerdictDurability(TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(patch.stopall)
+        patch.object(api, "DB", Path(self.directory.name) / "calls.sqlite3").start()
+        patch.object(api, "RESPONSES", Path(self.directory.name) / "responses").start()
+        api.init_db()
+        self.call_id = uuid4().hex
+        review_receipt.bind(api.DB, self.call_id)
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("insert into calls (id, started_at, status, actor, behavior) values (?, 0, 'running', 'bit-mis', 'pr_review')",
+                         (self.call_id,))
+            conn.execute("update calls set artifact=? where id=?", (json.dumps({'phase': 'reviewing'}), self.call_id))
+        review_receipt.prepare_response(json.dumps({"repository": "o/r", "pull_number": 12, "head_sha": HEAD,
+            "pull": {"base": {"sha": "b" * 40}, "title": "Review ordering", "body": "Retain assessment."}}), "fixture")
+
+    def verdict(self, body):
+        return {"assessment": dict(ASSESSMENT), "action": "request_changes",
+                "comments": [{"path": "a.py", "line": 1, "side": "RIGHT", "body": body}]}
+
+    def response_path(self):
+        with sqlite3.connect(api.DB) as conn:
+            return conn.execute("select response_path from calls where id=?", (self.call_id,)).fetchone()[0]
+
+    def test_second_retention_failure_keeps_first_verdict(self):
+        first = self.verdict("[p1] First retained finding.")
+        review_receipt.retain_verdict(first, HEAD)
+        path = self.response_path()
+        self.assertTrue(path)
+        saved = Path(path).read_text()
+        self.assertEqual(json.loads(saved), first)
+        with patch.object(os, "fsync", side_effect=OSError("simulated storage failure")):
+            with self.assertRaises(OSError):
+                review_receipt.retain_verdict(self.verdict("[p1] Second remapped finding."), HEAD)
+        self.assertEqual(self.response_path(), path)
+        self.assertEqual(Path(path).read_text(), saved)
+        self.assertEqual(json.loads(Path(path).read_text()), first)
+
+    def test_finish_failure_keeps_retained_verdict_and_reference(self):
+        first = self.verdict("[p1] First retained finding.")
+        review_receipt.retain_verdict(first, HEAD)
+        path = self.response_path()
+        saved = Path(path).read_text()
+        with patch.object(Path, "write_text", side_effect=OSError("simulated storage failure")), \
+                patch.object(api.caller_store, "write_response_text", side_effect=OSError("simulated storage failure"),
+                             create=True):
+            api.finish(self.call_id, "completed", response="final receipt", outcome="clean",
+                       action="reviewed_clean", head_sha=HEAD)
+        with sqlite3.connect(api.DB) as conn:
+            row = conn.execute("select status, response_path, diagnostic from calls where id=?",
+                               (self.call_id,)).fetchone()
+        self.assertEqual(row[0], "completed")
+        self.assertEqual(row[1], path)
+        self.assertEqual(Path(row[1]).read_text(), saved)
+        self.assertIn("persist_failed", row[2])
+
+    def test_response_write_is_atomic(self):
+        target = api.RESPONSES / f"{self.call_id}.txt"
+        target.write_text("first")
+        with patch.object(os, "replace", side_effect=OSError("simulated replace failure")):
+            with self.assertRaises(OSError):
+                api.caller_store.write_response_text(target, api.RESPONSES, "second")
+        self.assertEqual(target.read_text(), "first")
+        self.assertEqual([entry.name for entry in api.RESPONSES.iterdir()], [target.name])

@@ -5,6 +5,7 @@ import { BEHAVIOR_RESOURCE_VARIABLES, type Config } from './config.js'
 import type { ContainerDetails, ContainerMount, ContainerSpec, ContainerSummary, DockerClient, TaskSpec } from './docker.js'
 import type { GatewayKeys } from './keys.js'
 import { errorMessage, type LogFields, type Logger } from './log.js'
+import { isUnreachable } from './proxy.js'
 import type { Store } from './store.js'
 import { workspaceKey, workspaceRelayUrl } from './test-relay.js'
 import { WORKSPACE_RESOLV_CONF } from './workspace-dns.js'
@@ -328,6 +329,19 @@ export class Orchestrator {
     return this.updating.get(handle)?.release ?? null
   }
 
+  /** A reset belongs to a known switch only once a fresh probe cannot reach the old server or finds its replacement. */
+  async restartingForUpdate(handle: string, login: string): Promise<boolean> {
+    const release = this.updatingTo(handle)
+    if (release === null) return false
+    this.markNotReady(handle)
+    try {
+      const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+      return health.ok && health.release === release && this.updatingTo(handle) === release
+    } catch (error) {
+      return isUnreachable(error as NodeJS.ErrnoException) && this.updatingTo(handle) === release
+    }
+  }
+
   /** Whether the workspace answers its health check; a refused connection just means it is not up yet. */
   async readiness(handle: string, login: string): Promise<Readiness> {
     let health: ServiceHealth
@@ -495,9 +509,10 @@ export class Orchestrator {
         try {
           // A running workspace on the same base takes a new release in place: only Poise restarts, and the
           // agents it started keep running. Anything else needs a new container.
+          // Its inherited labels survive a rebuild that makes the original image unavailable for inspection.
           let fallback: ImageRelease | null = null
           if (reason === 'outdated image' && details.State.Running && target && this.changedSetting(details) === null
-            && imageRelease(await docker.imageLabels(details.Image))?.base === target.base) {
+            && imageRelease(details.Config.Labels ?? null)?.base === target.base) {
             const updated = await this.updateInPlace(handle, login, target)
             if (updated === true) continue
             if (updated === 'unreachable') fallback = target
@@ -505,7 +520,7 @@ export class Orchestrator {
           if (details.State.Running && await this.cleanupStillHeld(handle, login)) continue
           await this.upgrade(handle, login, imageId, reason, target, fallback)
         } catch (error) {
-          log.error('workspace.upgrade.failed', { handle, error: errorMessage(error) })
+          log.error('workspace.upgrade.failed', { handle, container: summary.Id, error: errorMessage(error) })
           store.noteWorkspaceError(handle, `upgrade failed: ${errorMessage(error)}`)
         }
       }
@@ -692,7 +707,7 @@ export class Orchestrator {
   private async installTestOffload(handle: string): Promise<void> {
     const { config, docker, keys, log, store } = this.deps
     const env = config.testRelay
-      ? [`POISE_TEST_RELAY_URL=${workspaceRelayUrl(config, handle)}`, `POISE_TEST_RELAY_KEY=${workspaceKey(keys.privateKey, handle)}`]
+      ? [`POISE_TEST_RELAY_URL=${workspaceRelayUrl(config, handle)}`, `POISE_TEST_RELAY_KEY=${workspaceKey(keys.privateKey, handle)}`, `POISE_TEST_LIMIT_SECONDS=${config.testRelay.limitSeconds}`]
       : []
     try {
       const code = await docker.runTask(`poise-test-offload-${handle}`, this.homeTask(handle, 'install-test-offload', INSTALL_TEST_OFFLOAD, [], env))
@@ -790,10 +805,26 @@ export class Orchestrator {
     let sawDown = false
     let lastCounts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null = null
     let recreated = false
+    let originalId: string | null = null
+    const owned = (details: ContainerDetails | null | undefined): boolean =>
+      details?.Config?.Labels?.['poise.managed'] === 'true' && details.Config.Labels['poise.workspace'] === handle
+    const releaseOriginalDrain = async (reason: string): Promise<void> => {
+      await this.withLock(handle, async () => {
+        try {
+          const current = await this.deps.docker.inspectContainer(workspaceNames(handle).container)
+          if (!originalId || current?.Id !== originalId || !owned(current)) return
+        } catch (error) {
+          this.deps.log.warn('workspace.drain.release.failed', { handle, container: originalId, reason,
+            error: `cannot verify the original drain container: ${errorMessage(error)}` })
+          return
+        }
+        await this.releaseDrain(handle, login, reason)
+      })
+    }
     // Whether a drain POST left the gateway, visible even when drain() throws before returning.
     const dispatched = { value: false }
     const abortUnknown = async (reason = 'the drain timed out without confirmed admission and idleness'): Promise<void> => {
-      await this.releaseDrain(handle, login, reason)
+      await releaseOriginalDrain(reason)
       // A failed admission is a deferred update, not routine: it warns so the owner can see it.
       this.deps.log.warn('workspace.upgrade.aborted', { handle, reason,
         activeChatTurns: lastCounts?.activeChatTurns ?? null,
@@ -811,6 +842,14 @@ export class Orchestrator {
             this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'the container no longer exists' })
             return 'skipped'
           }
+          if (originalId !== null && details.Id !== originalId) {
+            this.lifecycle('workspace.upgrade.skipped', handle, { container: details.Id, reason: 'the drained container was replaced' })
+            return 'skipped'
+          }
+          if (typeof details.Id !== 'string' || !details.Id || !owned(details)) {
+            throw new Error(`cannot upgrade ${container}: container identity or workspace ownership is unconfirmed`)
+          }
+          originalId = details.Id
           if (!this.outdated(details, imageId)) {
             this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already up to date' })
             return 'skipped'
@@ -861,11 +900,46 @@ export class Orchestrator {
           if (running) {
             if (retainedCleanup) this.deps.log.warn('workspace.upgrade.cleanup-retained', { handle, callId: retainedCleanup.callId,
               cleanupReason: retainedCleanup.reason, retainedCalls: retainedCleanup.retainedCalls })
-            await docker.stopContainer(container)
+            try {
+              await docker.stopContainer(details.Id)
+            } catch (error) {
+              // A failed response proves neither termination nor continued ownership of the reusable name.
+              const [oldResult, currentResult] = await Promise.allSettled([
+                docker.inspectContainer(details.Id), docker.inspectContainer(container),
+              ])
+              const old = oldResult.status === 'fulfilled' ? oldResult.value : undefined
+              const current = currentResult.status === 'fulfilled' ? currentResult.value : undefined
+              const evidence = [oldResult, currentResult].map((result, index) => {
+                const reference = index === 0 ? details.Id : container
+                if (result.status === 'rejected') return `${reference}: inspection failed: ${errorMessage(result.reason)}`
+                const value = result.value
+                return value === null ? `${reference}: absent (Docker 404)`
+                  : `${reference}: id=${value?.Id ?? 'unknown'}, status=${value?.State?.Status ?? 'unknown'}, running=${value?.State?.Running ?? 'unknown'}, owned=${owned(value)}`
+              }).join('; ')
+              const failure = `${errorMessage(error)}; ${evidence}`
+              const stopped = old?.Id === details.Id && owned(old) && old.State?.Running === false
+                && ['exited', 'dead'].includes(old.State?.Status)
+              if (stopped && current?.Id === details.Id && owned(current) && current.State?.Running === false
+                  && ['exited', 'dead'].includes(current.State?.Status)) {
+                this.deps.log.warn('workspace.upgrade.stop.reconciled', { handle, container: details.Id, error: failure })
+              } else if ((stopped || old === null) && current?.Id && current.Id !== details.Id && owned(current)
+                  && current.State?.Running === true && current.State.Status === 'running' && !this.outdated(current, imageId)) {
+                let health: ServiceHealth
+                try { health = await this.serviceCall(handle, login, 'GET', '/api/service/health') }
+                catch (healthError) { throw new Error(`${failure}; replacement health failed: ${errorMessage(healthError)}`) }
+                if (!health.ok || (target && health.release !== target.release)) {
+                  throw new Error(`${failure}; replacement has not confirmed the intended release ${target?.release ?? imageId}`)
+                }
+                this.deps.log.warn('workspace.upgrade.stop.reconciled', { handle, container: details.Id, error: failure })
+                this.lifecycle('workspace.upgrade.skipped', handle, { container: current.Id, release: health.release,
+                  reason: 'a replacement is already serving the intended image and settings' })
+                return 'skipped'
+              } else throw new Error(failure)
+            }
             stoppedAt = this.deps.now()
             this.lifecycle('workspace.container.stopped', handle, { reason: 'upgrade' })
           }
-          await docker.removeContainer(container)
+          await docker.removeContainer(details.Id)
           this.lifecycle('workspace.container.removed', handle, { reason: 'upgrade' })
           await docker.createContainer(container, this.containerSpec(handle, login))
           this.lifecycle('workspace.container.created', handle, { image: this.deps.config.runtimeImage })
@@ -887,7 +961,7 @@ export class Orchestrator {
         })
         if (outcome === 'done') return
         if (outcome === 'skipped') {
-          if (drainAttempted && !recreated) await this.releaseDrain(handle, login, 'the upgrade was skipped after a drain')
+          if (drainAttempted && !recreated) await releaseOriginalDrain('the upgrade was skipped after a drain')
           return
         }
         if (outcome === 'abort-unknown') {
@@ -908,7 +982,7 @@ export class Orchestrator {
         const result = await this.drain(handle, login, deadline, dispatched, fallback)
         this.upgradingPhase = 'upgrade'
         if (result.recovered) {
-          await this.releaseDrain(handle, login, 'the workspace recovered on the target release')
+          await releaseOriginalDrain('the workspace recovered on the target release')
           this.updating.delete(handle)
           this.stuckWarned.delete(handle)
           return
@@ -938,7 +1012,7 @@ export class Orchestrator {
       }
     } catch (error) {
       drainAttempted = drainAttempted || dispatched.value
-      if (drainAttempted && !recreated) await this.releaseDrain(handle, login, 'the upgrade failed')
+      if (drainAttempted && !recreated) await releaseOriginalDrain('the upgrade failed')
       throw error
     } finally {
       this.upgradingHandle = null
@@ -1046,7 +1120,7 @@ export class Orchestrator {
       return this.withLock(handle, async () => {
         const details = await this.deps.docker.inspectContainer(workspaceNames(handle).container)
         return details?.State.Running === true && this.changedSetting(details) === null
-          && imageRelease(await this.deps.docker.imageLabels(details.Image))?.base === fallback.base
+          && imageRelease(details.Config.Labels ?? null)?.base === fallback.base
       })
     }
     // Original cleanup may be permanently held after controller loss. It must not subject Chat

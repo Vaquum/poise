@@ -925,7 +925,7 @@ class Onboarding {
     this.root.innerHTML = `
       <div class="ob-dialog" role="dialog" aria-modal="true" aria-labelledby="ob-title" aria-describedby="ob-intro">
         <header class="ob-head">
-          <div class="ob-rail" aria-hidden="true">${STEPS.slice(0, -1).map((step) => `<span class="ob-rail-step" data-step="${step.id}" title="${escapeHtml(step.name)}"></span>`).join('')}</div>
+          <div class="ob-rail" aria-hidden="true">${STEPS.slice(0, -1).map((step) => `<span class="ob-rail-step" data-step="${step.id}" data-help="${escapeHtml(step.name)}"></span>`).join('')}</div>
           <div class="ob-meta"><span class="ob-count"></span><button type="button" class="ob-later">Finish later</button></div>
           <h2 class="ob-title" id="ob-title" tabindex="-1"></h2>
           <p class="ob-intro" id="ob-intro"></p>

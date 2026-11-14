@@ -89,6 +89,9 @@ def test_remediation_review_submission(tmp_path, monkeypatch, model, action, sco
         gate_path = None
         receipt_path = str(tmp_path / "review.json")
 
+        def check_closed(self):
+            return None
+
         def __enter__(self):
             return self
 

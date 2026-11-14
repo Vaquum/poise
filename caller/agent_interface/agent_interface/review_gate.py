@@ -46,15 +46,15 @@ def submission_gate(path: str | None):
         yield SubmissionSeal(gate)
 
 
-def cancel_when_idle(path: str) -> bool:
+def cancel_when_idle(path: str, *, allow_submitted: bool = False) -> bool:
     with open(path, "r+") as gate:
         try:
             fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return False
-        if "submitted" in gate.read():
-            # A sealed submission already posted: cancellation stops the
-            # remaining provider work, never the posted action itself.
+        if "submitted" in gate.read() and not allow_submitted:
+            # Head changes keep the posted action's completion path. Closure
+            # may stop remaining analysis once this submission has finished.
             return False
         gate.write("cancelled\n")
         gate.flush()

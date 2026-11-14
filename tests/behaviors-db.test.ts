@@ -442,6 +442,35 @@ describe('behavior database lifecycle', () => {
       WHERE retired_at IS NULL`).pluck().get()).toBe(1)
   })
 
+  it('settles a closed pull request\'s historical firings from its own launches, never every dead letter kept', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const { db } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const settle = `SELECT seen.target FROM behavior_seen AS seen
+      CROSS JOIN behavior_dead_letters AS dead
+        ON dead.behavior = seen.key AND dead.target = seen.target
+        AND dead.correlation_id = seen.launch_correlation_id AND dead.call_id = seen.launch_call_id
+      WHERE seen.launch_repo = ? AND seen.launch_pr = ?
+        AND seen.key IN ('review-new-prs', 'approve-prs') AND seen.claim_id = ''
+        AND seen.launch_error IS NOT NULL AND seen.launch_outcome IS NULL
+        AND dead.retired_at IS NOT NULL AND dead.resolution = 'superseded'
+        AND dead.resolution_evidence LIKE '%"open":false%'
+      ORDER BY dead.retired_at ASC, dead.id ASC`
+    const dead = db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, correlation_id, call_id, error, created_at,
+      retired_at, resolution, resolution_evidence)
+      VALUES (?, 'review-new-prs', ?, 'acme/repo', ?, ?, ?, 'failed', '2026-09-24T07:00:00.000Z', '2026-09-25T07:00:00.000Z', ?, '{"open":false}')`)
+    for (let i = 0; i < 40; i++) dead.run(`retired-${i}`, `acme/repo#${i}`, i, `corr-${i}`, `call-${i}`, i === 7 ? 'superseded' : 'closed')
+    db.prepare(`INSERT INTO behavior_seen(key, target, seen_at, claim_id, launch_repo, launch_pr, launch_requested_at, launch_call_id,
+      launch_correlation_id, launch_error) VALUES ('review-new-prs', 'acme/repo#7', '2026-09-24T06:00:00.000Z', '', 'acme/repo', 7,
+      '2026-09-24T06:00:00.000Z', 'call-7', 'corr-7', 'failed')`).run()
+    expect(db.prepare(settle).pluck().all('acme/repo', 7)).toEqual(['acme/repo#7'])
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${settle}`).all('acme/repo', 7) as Array<{ detail: string }>).map((row) => row.detail).join('\n')
+    expect(plan).toMatch(/SEARCH seen USING INDEX idx_behavior_seen_target/)
+    expect(plan).toMatch(/SEARCH dead USING INDEX idx_behavior_dead_letters_superseded/)
+    // The index holds the superseded dead letter alone, never the other retired ones.
+    expect(db.prepare(`SELECT count(*) FROM behavior_dead_letters INDEXED BY idx_behavior_dead_letters_superseded
+      WHERE retired_at IS NOT NULL AND resolution = 'superseded'`).pluck().get()).toBe(1)
+  })
+
   it('persists quarantine occupancy independently of the invalid result and never loses running uncertainty', async () => {
     tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
     const path = join(tempRoot, 'cache.db')

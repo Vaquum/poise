@@ -168,6 +168,13 @@ from the following eligibility sweep. The two behaviors run concurrently, so
 approval may observe the still-owned review before reconciliation settles it.
 The test keeps its no-overlap and exactly-one-approval assertions.
 
+The retained Caller-history issue-review regression uses 6,276 rows and responses
+larger than 96 MiB. It clears inspected mock results and snapshot observations
+before the second large read and again before outage recovery so Vitest does not
+retain earlier responses and decoded snapshots alongside fresh reads. A retained-byte
+guard before the second read rejects either preceding payload; the existing guard
+also bounds mock data still held after recovery.
+
 ## Agents' suites
 
 On a deployment with a test relay, a suite an agent starts in a workspace runs on a disposable test box, not beside Poise ([Agents' test suites](Operating.md#agents-test-suites)). `tests/test-offload.test.ts` runs the real hooks, runner, relay and box script against a stand-in for Render's API.

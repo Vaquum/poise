@@ -5,12 +5,34 @@ import { tmpdir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 
 const fixture = vi.hoisted(() => ({ wrapper: '' }))
-vi.mock('../server/process', async (original) => ({
-  ...await original<typeof import('../server/process')>(),
-  get CLAUDE_SUBSCRIPTION_CLI() { return fixture.wrapper },
-}))
+vi.mock('../server/process', async (original) => {
+  const actual = await original<typeof import('../server/process')>()
+  return {
+    ...actual,
+    get CLAUDE_SUBSCRIPTION_CLI() { return fixture.wrapper },
+    async runFile(command: string, args: readonly string[], options: RunFileOptions = {}) {
+      // Two sequential account probes and the refresh must finish before the test deadline.
+      const timeoutMs = Math.min(options.timeoutMs ?? 2_000, 2_000)
+      try {
+        return await actual.runFile(command, args, { ...options, timeoutMs, killSignal: 'SIGKILL' })
+      } catch (error) {
+        const failure = error as Error & { code?: string | number, signal?: string, stdout?: string, stderr?: string }
+        const secrets = [...environmentSecrets(), ...environmentSecrets(options.env ?? {})]
+        const detail = (value: string) => redact(value, secrets).slice(0, 1_024)
+        console.error('Installed model-refresh fixture subprocess failed', {
+          step: detail([command, ...args].join(' ')), timeoutMs,
+          message: detail(String(error)), code: failure.code, signal: failure.signal,
+          stdout: detail(failure.stdout ?? ''), stderr: detail(failure.stderr ?? ''),
+        })
+        throw error
+      }
+    },
+  }
+})
+import { environmentSecrets, redact } from '../gateway/src/diagnostics/redaction.mjs'
+import { invalidateAccounts } from '../server/accounts'
 import { refreshModelCatalog } from '../server/models-refresh'
-import { runFile, scrubbedChildEnvironment, claudeSubscriptionEnvironment } from '../server/process'
+import { runFile, scrubbedChildEnvironment, claudeSubscriptionEnvironment, type RunFileOptions } from '../server/process'
 import { setMeta } from '../server/db'
 import { DailyModelRefresh } from '../server/service/model-refresh'
 
@@ -27,13 +49,14 @@ beforeEach(async () => {
   reportPath = join(root, 'report.json')
   await mkdir(bin, { recursive: true })
   await mkdir(join(root, 'providers'))
+  await mkdir(join(root, 'host'))
   // A dropped override must land inside this fixture, never the real Caller.
   await cp(resolve('scripts'), join(poise, 'scripts'), { recursive: true })
   await cp(resolve('gateway/src/diagnostics'), join(poise, 'gateway/src/diagnostics'), { recursive: true })
   await symlink(resolve('node_modules'), join(poise, 'node_modules'), 'dir')
   fixture.wrapper = join(poise, 'scripts', 'claude-subscription.mjs')
   const provider = `#!${process.execPath}\nconsole.log('1.0.0')\n`
-  for (const name of ['claude', 'codex', 'grok', 'agy', 'muse']) await writeFile(join(root, 'providers', name), provider, { mode: 0o700 })
+  for (const name of ['claude', 'codex', 'gh', 'grok', 'agy', 'muse']) await writeFile(join(root, 'providers', name), provider, { mode: 0o700 })
   caller = `#!${process.execPath}
 import fs from 'node:fs';
 const keys = ['CALLER_BIN_ROOT', 'AGENT_INTERFACE_ROOT', 'AGENT_INTERFACE_DATA_DIR', 'CLAUDE_CLI', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'JEV_API_KEY'];
@@ -45,11 +68,12 @@ console.log(JSON.stringify({ families: ${JSON.stringify(families)} }));
   for (const [name, value] of Object.entries({
     HOME: root, CALLER_BIN_ROOT: bin, AGENT_INTERFACE_ROOT: poise,
     AGENT_INTERFACE_DATA_DIR: join(root, 'data'), POISE_MODEL_CATALOG_REPORT: reportPath,
-    PATH: [join(root, 'providers'), dirname(process.execPath), '/usr/bin', '/bin'].join(delimiter),
+    PATH: [join(root, 'providers'), join(root, 'host'), dirname(process.execPath), '/usr/bin', '/bin'].join(delimiter),
     ANTHROPIC_API_KEY: 'conflicting-api-key', ANTHROPIC_AUTH_TOKEN: 'conflicting-auth',
     ANTHROPIC_BASE_URL: 'https://conflicting.invalid', CLAUDE_CODE_OAUTH_TOKEN: 'conflicting-oauth',
     JEV_API_KEY: 'unrelated-secret', OPENAI_API_KEY: 'allowed-model-key',
   })) vi.stubEnv(name, value)
+  invalidateAccounts()
 })
 afterEach(async () => { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }) })
 
@@ -62,12 +86,32 @@ async function assertCaller(report: Record<string, unknown>, selected = bin): Pr
 }
 
 it('manual refresh reaches the installed release through the real scrubbed child boundary', async () => {
+  const hostGhCalled = join(root, 'host-gh-called')
+  await writeFile(join(root, 'host', 'gh'), `#!${process.execPath}
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(hostGhCalled)}, 'called');
+setTimeout(() => process.exit(9), 20_000);
+`, { mode: 0o700 })
   expect(existsSync(join(poise, 'caller', '.venv'))).toBe(false)
   await assertCaller(await refreshModelCatalog())
+  expect(existsSync(hostGhCalled)).toBe(false)
   const { env } = JSON.parse(await readFile(join(root, 'called.json'), 'utf8'))
   expect(env).toMatchObject({ CALLER_BIN_ROOT: bin, AGENT_INTERFACE_ROOT: poise,
     AGENT_INTERFACE_DATA_DIR: join(root, 'data'), CLAUDE_CLI: fixture.wrapper, OPENAI_API_KEY: 'allowed-model-key' })
   for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'JEV_API_KEY']) expect(env).not.toHaveProperty(name)
+})
+
+it('fixture subprocess timeouts identify the step with bounded, redacted evidence', async () => {
+  const script = join(root, 'stalled-step.mjs')
+  await writeFile(script, "process.stderr.write('conflicting-api-key\\n' + 'x'.repeat(4_000)); setInterval(() => {}, 1_000);\n")
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+  await expect(runFile(process.execPath, [script], { timeoutMs: 15 * 60_000 })).rejects.toThrow('Command timed out after 2000ms')
+  expect(log).toHaveBeenCalledExactlyOnceWith('Installed model-refresh fixture subprocess failed', expect.objectContaining({
+    step: `${process.execPath} ${script}`, timeoutMs: 2_000, signal: 'SIGKILL',
+    stderr: expect.stringMatching(/^\[redacted\]\nx+$/),
+  }))
+  expect(log.mock.calls[0][1].stderr).toHaveLength(1_024)
+  expect(JSON.stringify(log.mock.calls)).not.toContain('conflicting-api-key')
 })
 
 it('the scheduled refresh uses the same installed Caller', async () => {

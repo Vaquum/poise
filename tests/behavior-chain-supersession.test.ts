@@ -12,19 +12,23 @@ const HEAD = 'a'.repeat(40), MERGE = 'b'.repeat(40)
 const databases: Database.Database[] = []
 afterEach(() => { for (const db of databases.splice(0)) db.close(); vi.useRealTimers() })
 
-function setup(held: string | null = null) {
+function setup(held: string | null = null, remediation = false) {
   const db = new Database(':memory:'); databases.push(db)
   const journal = new BehaviorChainJournal(db)
   let chain = journal.append('example/repo#943', 'seed', 0, { type: 'chain.admitted', repository: 'example/repo', issue: 943,
     branch: 'poise/issue-943', author: 'author', reviewer: 'reviewer' })
   if (held) chain = journal.append(chain.id, 'hold', chain.sequence, { type: 'chain.held', reason: held })
   const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
-  const coverage = { verified: true, failures: [{ id: 1, sha: 'c'.repeat(40), attempt: 1, url: 'https://github.com/example/repo/actions/runs/1' }],
+  const coverage = remediation ? { kind: 'empty_integration', verified: true, base: MERGE,
+    integration: { tree: 'c'.repeat(40), baseTree: 'c'.repeat(40), mergeBase: 'd'.repeat(40) },
+    covering: [{ number: 940, mergeSha: MERGE, url: 'https://github.com/example/repo/pull/940' }], duplicate: { number: 946, head: HEAD } }
+    : { verified: true, failures: [{ id: 1, sha: 'c'.repeat(40), attempt: 1, url: 'https://github.com/example/repo/actions/runs/1' }],
     recovery: { id: 2, sha: MERGE, attempt: 1, url: 'https://github.com/example/repo/actions/runs/2' },
     covering: [{ number: 940, mergeSha: MERGE, url: 'https://github.com/example/repo/pull/940' }], duplicate: { number: 946, head: HEAD } }
-  const obs: ChainObservation = { checkedAt: Date.now(), issue: { open: false, eligible: true, revision: 'reported-failure', commentIds: [1] },
+  const obs: ChainObservation = { checkedAt: Date.now(), issue: { open: remediation, eligible: true, revision: 'reported-failure', commentIds: [1] },
     issueReviewers: [reviewer], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer, existingPulls: [],
-    publication: { pull_number: 946, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null }, fullSuite: coverage,
+    publication: { pull_number: 946, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    ...(remediation ? { remediation: coverage } : { fullSuite: coverage }),
     pull: { number: 946, head: HEAD, headSince: Date.now(), state: 'open', draft: false, merged: false, mergeSha: null, queueEntry: null,
       queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false, reviewIds: [], reviewReceipts: [],
       reviewRevision: 'review', greyRuns: [], pending: false, failing: [], conflict: true, behind: false } }
@@ -65,7 +69,7 @@ it('reconciles an existing automatic closure hold, closes once and rebuilds dist
   expect(journal.read(chain.id)?.supersession).toBeUndefined()
   await runtime.run()
   const current = journal.read(chain.id)!
-  expect(() => nativeActionReceipt(current, current.invocations[0], { ...result, state: 'open' })).toThrow('original full-suite coverage')
+  expect(() => nativeActionReceipt(current, current.invocations[0], { ...result, state: 'open' })).toThrow('original verified coverage')
   expect(current).toMatchObject({ held: null, mergeSha: null, supersession: { verified: true,
     covering: [{ number: 940, mergeSha: MERGE }], duplicate: { number: 946, head: HEAD }, failures: [{ id: 1 }], recovery: { id: 2 } } })
   expect(behaviorChainSummary(current).supersession).toEqual(current.supersession)
@@ -81,6 +85,56 @@ it('reconciles an existing automatic closure hold, closes once and rebuilds dist
   expect(reopened.history(chain.id)).toEqual(events)
   expect(operations.perform).toHaveBeenCalledTimes(1)
   expect(operations.launch).not.toHaveBeenCalled()
+})
+
+it('retires a queued remediation when a covering merge lands, retaining the source hold and outstanding work', async () => {
+  const { db, journal, chain, obs, operations } = setup(null, true)
+  let source = journal.append('example/repo#1608', 'source', 0, { type: 'chain.admitted', repository: chain.repository,
+    issue: 1608, branch: 'poise/issue-1608', author: chain.author, reviewer: chain.reviewer })
+  source = journal.append(source.id, 'source-hold', source.sequence, { type: 'chain.held', reason: 'original preflight hold; source work remains' })
+  obs.issueReviewers = []
+  obs.pull!.queueEntry = 'original-queue-entry'
+  obs.remediation!.verified = false
+  const observe = operations.observe
+  operations.observe = async current => current.id === source.id ? { ...obs, checkedAt: Date.now(), remediation: undefined,
+    pull: null, publication: { ...obs.publication, pull_number: null, head_sha: null } } : observe(current)
+  const runtime = new BehaviorChainRuntime(journal, operations)
+  await runtime.run()
+  expect(journal.read(chain.id)?.waiting).toContain('native merge queue owns entry')
+  expect(operations.perform).not.toHaveBeenCalled()
+  obs.remediation!.verified = true
+  await runtime.run()
+  expect(operations.perform).toHaveBeenCalledTimes(1)
+  await runtime.run()
+  expect(journal.read(chain.id)).toMatchObject({ mergeSha: null, supersession: obs.remediation,
+    invocations: [{ behavior: 'retire-pr', state: 'settled', evidence: { nativeActionReceipt: { result: { outcome: 'closed' } } } }] })
+  expect(journal.read(source.id)).toMatchObject({ held: source.held, mergeSha: null, invocations: [] })
+  expect(journal.read(source.id)?.supersession).toBeUndefined()
+  const reopened = new BehaviorChainJournal(db)
+  reopened.rebuild()
+  expect(reopened.read(chain.id)?.supersession).toEqual(obs.remediation)
+  expect(operations.launch).not.toHaveBeenCalled()
+})
+
+it('keeps independent work and incomplete or stale remediation coverage under ordinary gates', () => {
+  const { chain, obs } = setup(null, true)
+  obs.issueReviewers = []
+  obs.prReviewers = []
+  obs.pull!.conflict = false
+  obs.remediation!.verified = false
+  expect(decideBehaviorChain(chain, obs, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+  obs.remediation!.verified = true
+  const first = decideBehaviorChain(chain, obs, Date.now())
+  expect(first).toMatchObject({ kind: 'invoke', behavior: 'retire-pr' })
+  obs.remediation!.base = 'e'.repeat(40)
+  const changed = decideBehaviorChain(chain, obs, Date.now())
+  expect(changed).toMatchObject({ kind: 'invoke', behavior: 'retire-pr' })
+  if (first.kind === 'invoke' && changed.kind === 'invoke') expect(changed.basis).not.toBe(first.basis)
+  obs.pull!.head = 'f'.repeat(40)
+  obs.publication.head_sha = obs.pull!.head
+  expect(decideBehaviorChain(chain, obs, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+  obs.pull!.queueEntry = 'queued-independent-work'
+  expect(decideBehaviorChain(chain, obs, Date.now())).toMatchObject({ kind: 'wait', reason: expect.stringContaining('native merge queue') })
 })
 
 it('preserves a person’s hold and keeps independent or changed-head work visible for a decision', async () => {
@@ -129,8 +183,8 @@ it('waits for an active original and its native release before closing, then wai
   expect(journal.read(chain.id)?.supersession).toEqual(obs.fullSuite)
 })
 
-it('retains a lost close response as uncertain across closed observations, sweeps and rebuild', async () => {
-  const { db, journal, chain, obs, operations } = setup()
+it.each([false, true])('retains a lost close response as uncertain across closed observations, sweeps and rebuild (remediation=%s)', async remediation => {
+  const { db, journal, chain, obs, operations } = setup(null, remediation)
   operations.perform = vi.fn(async () => { throw new Error('native close response lost') })
   await new BehaviorChainRuntime(journal, operations).run()
   obs.pull!.state = 'closed'

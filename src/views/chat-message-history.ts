@@ -58,7 +58,7 @@ export function createMessageHistory(input: HTMLTextAreaElement, handlers: Histo
       row.setAttribute('role', 'option')
       const label = historyLabel(entry)
       row.textContent = label
-      row.title = label
+      row.dataset.help = label
       list.appendChild(row)
     })
     count.textContent = entries.length ? String(entries.length) : ''

@@ -88,7 +88,7 @@ export function deployCardHtml(ctx: DeployCardContext): string {
   const target = change && status ? revertTarget(change, status) : null
   const actions: string[] = []
   if (target) {
-    actions.push(`<button type="button" class="chat-card-btn chat-deploy-revert" data-change="${escapeHtml(target.changeId)}" data-release="${escapeHtml(target.expectedReleaseId)}" title="Restore the previous release (${escapeHtml(change?.previousReleaseId || 'retained locally')}); no confirmation"${ctx.reverting ? ' disabled' : ''}>${ctx.reverting ? 'Reverting…' : 'Revert'}</button>`)
+    actions.push(`<button type="button" class="chat-card-btn chat-deploy-revert" data-change="${escapeHtml(target.changeId)}" data-release="${escapeHtml(target.expectedReleaseId)}" data-help="Restore the previous release (${escapeHtml(change?.previousReleaseId || 'retained locally')}); no confirmation"${ctx.reverting ? ' disabled' : ''}>${ctx.reverting ? 'Reverting…' : 'Revert'}</button>`)
   }
   const evidence = safeHttpUrl(status?.recoveryUrl)
   if (evidence) actions.push(`<a class="chat-deploy-evidence" href="${escapeHtml(evidence)}" target="_blank" rel="noopener noreferrer">View evidence</a>`)

@@ -393,8 +393,8 @@ it('settles an uncertain published partial review with its incomplete dispositio
   let chain = journal.append('example/repo#7', 'seed', 0, { type: 'chain.admitted', repository: 'example/repo', issue: 7,
     branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' })
   const call = completedReviewCall(chain.repository, 21, HEAD, chain.reviewer)
-  const response = { ...(call.artifact!.review_response as Record<string, unknown>), coverage: 'incomplete' }
-  const context = (response as { context_sha: string }).context_sha
+  const response = { ...(call.artifact!.review_response as { context_sha: string }), coverage: 'incomplete' }
+  const context = response.context_sha
   const obs = observation()
   Object.assign(obs.pull!, { reviewContext: context, reviewIds: [call.review_id!], reviewReceipts: [{
     id: call.review_id!, head: HEAD, state: 'CHANGES_REQUESTED', invocation: call.id, response,
