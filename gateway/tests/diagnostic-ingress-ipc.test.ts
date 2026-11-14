@@ -28,9 +28,10 @@ async function writer() {
   cleanups.push(async () => { await server.close(); runtime.stop(); rmSync(directory, { recursive: true, force: true }) })
   return { directory, path, socket, runtime }
 }
-function cli(directory: string, command: string | string[], payload: string | ((hello: Record<string, unknown>) => string)) {
+function cli(directory: string, command: string | string[], payload: string | ((hello: Record<string, unknown>) => string), ordered = false) {
+  const preload = ordered ? ['--import', resolve('tests/fixtures/ingress-client-order.mjs')] : []
   return new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-    const child = spawn(process.execPath, ['dist/diagnostics/cli.js', ...(typeof command === 'string' ? [command] : command)], { env: { ...process.env, POISE_GATEWAY_DATA: directory, POISE_DOMAIN: 'poise.test' }, stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn(process.execPath, [...preload, 'dist/diagnostics/cli.js', ...(typeof command === 'string' ? [command] : command)], { env: { ...process.env, POISE_GATEWAY_DATA: directory, POISE_DOMAIN: 'poise.test' }, stdio: ['pipe', 'pipe', 'pipe'] })
     const lines: Array<Record<string, unknown>> = []; let pending = '', error = ''
     const timer = setTimeout(() => { child.kill(); reject(new Error('Compiled ingress CLI stalled')) }, 10_000)
     child.stderr.on('data', (chunk: Buffer) => { error += chunk.toString() })
@@ -153,7 +154,7 @@ it('retries busy deadline and recovery observations through the compiled CLI wit
   expect(read().events.find((event) => event.id === first.id)).toEqual({ ...first, occurrences: 2 })
 })
 
-it('exhausts only deployment contention retries and leaves other ingress commands single-attempt', async () => {
+it('exhausts only deployment contention retries when the compiled client writes before reading its refusal', async () => {
   const w = await writer(), held = createConnection(w.socket)
   held.on('error', () => held.destroy())
   await once(held, 'connect'); held.write('ingress-stream\n'); await once(held, 'data')
@@ -163,8 +164,12 @@ it('exhausts only deployment contention retries and leaves other ingress command
     return Reflect.apply(end, this, args)
   })
   try {
-    await expect(cli(w.directory, ['deployment', 'a'.repeat(40) + '.BUSY01', 'alice', '600', '600', new Date().toISOString(), 'false'], '{"ok":true,"draining":true}')).rejects.toThrow('Ingress writer is busy')
+    await expect(cli(w.directory, ['deployment', 'a'.repeat(40) + '.BUSY01', 'alice', '600', '600', new Date().toISOString(), 'false'], '{"ok":true,"draining":true}', true)).rejects.toThrow('Ingress writer is busy')
     expect(refusals).toBe(5)
+    const trace = readFileSync(join(w.directory, 'client-order.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, string>)
+    const frame = trace[0].frame
+    expect(frame).toContain('deployment\n')
+    expect(trace).toEqual(Array.from({ length: 5 }, () => [{ frame }, { write: 'ok' }, { reply: '{"error":"Ingress writer is busy"}\n' }]).flat())
     for (const command of ['ingress', 'ingress-stream']) {
       await expect(cli(w.directory, command, 'null')).rejects.toThrow()
       expect(refusals).toBe(command === 'ingress' ? 6 : 7)
@@ -224,17 +229,36 @@ it('reports bounded redacted invalid-payload and storage causes without retrying
   } finally { observed.mockRestore() }
 })
 
-it('does not retry an ambiguous disconnect after sending a deployment frame', async () => {
+it.each([
+  ['bare EPIPE', null, 'write EPIPE'],
+  ['missing reply', '', 'Ingress acknowledgement is incomplete'],
+  ['truncated busy reply', '{"error":"Ingress writer is busy"', 'Ingress acknowledgement is incomplete'],
+  ['unterminated busy reply', '{"error":"Ingress writer is busy"}', 'Ingress acknowledgement is incomplete'],
+  ['acceptance before busy', '{"accepted":true}\n{"error":"Ingress writer is busy"}\n', 'Ingress writer is busy'],
+  ['acceptance with busy', '{"error":"Ingress writer is busy","accepted":true}\n', 'Ingress writer is busy'],
+  ['acceptance after busy', '{"error":"Ingress writer is busy"}\n{"accepted":true}\n', 'Invalid ingress acknowledgement'],
+  ['incomplete acceptance after busy', '{"error":"Ingress writer is busy"}\n{"accepted":', 'Ingress acknowledgement is incomplete'],
+] as const)('does not retry a deployment after %s', async (_name, reply, error) => {
   const directory = mkdtempSync(join(tmpdir(), 'poise-ingress-disconnect-'))
   let connections = 0
   const server = createServer({ allowHalfOpen: true }, (socket) => {
     connections++
-    socket.resume(); socket.once('end', () => socket.destroy())
+    socket.on('error', () => socket.destroy())
+    // An unread, unframed byte holds EOF behind the real failed client write.
+    if (reply === null) { socket.end(' ', () => socket.destroy()); return }
+    socket.resume()
+    // Deliver a second response separately so a first busy line is insufficient.
+    const split = reply.indexOf('\n')
+    if (reply.startsWith('{"error":"Ingress writer is busy"}\n') && reply.length > split + 1) {
+      socket.write(reply.slice(0, split + 1))
+      setTimeout(() => socket.end(reply.slice(split + 1)), 100)
+    } else socket.once('end', () => socket.end(reply))
   })
   await new Promise<void>((resolve) => server.listen(join(directory, 'logging.ingress.sock'), resolve))
   cleanups.push(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); rmSync(directory, { recursive: true, force: true }) })
-  await expect(cli(directory, ['deployment', 'a'.repeat(40) + '.LOST01', 'alice', '600', '600', new Date().toISOString(), 'false'], '{"ok":true,"draining":true}')).rejects.toThrow('Ingress acknowledgement is incomplete')
+  await expect(cli(directory, ['deployment', 'a'.repeat(40) + '.LOST01', 'alice', '600', '600', new Date().toISOString(), 'false'], '{"ok":true,"draining":true}', true)).rejects.toThrow(error)
   expect(connections).toBe(1)
+  if (reply === null) expect(readFileSync(join(directory, 'client-order.jsonl'), 'utf8')).toContain('{"write":"EPIPE"}')
 })
 
 it('keeps completed pauses closed and rejects malformed deployment evidence at the private boundary', async () => {
@@ -291,7 +315,7 @@ it('handles a write error on a refused second client while the first transaction
   } finally { fault.mockRestore(); first.destroy(); second.destroy() }
 })
 
-it('closes refused half-open clients without waiting for their input EOF', async () => {
+it.each(['deadline', 'shutdown'] as const)('bounds refused half-open clients on %s', async (bound) => {
   const w = await writer(), first = createConnection(w.socket)
   first.on('error', () => first.destroy())
   await once(first, 'connect'); first.write('ingress-stream\n')
@@ -302,6 +326,7 @@ it('closes refused half-open clients without waiting for their input EOF', async
     if (args[0] === '{"error":"Ingress writer is busy"}\n') refused.push(this)
     return Reflect.apply(end, this, args)
   })
+  if (bound === 'deadline') vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
   const clients = Array.from({ length: 8 }, () => {
     const client = createConnection({ path: w.socket, allowHalfOpen: true })
     client.on('error', () => client.destroy()); client.resume()
@@ -310,10 +335,12 @@ it('closes refused half-open clients without waiting for their input EOF', async
   try {
     await vi.waitFor(() => {
       expect(refused).toHaveLength(clients.length)
-      expect(refused.every((socket) => socket.destroyed)).toBe(true)
     })
     expect(first.destroyed).toBe(false)
-  } finally { observed.mockRestore(); first.destroy(); for (const client of clients) client.destroy() }
+    if (bound === 'deadline') await vi.advanceTimersByTimeAsync(30_000)
+    else await cleanups.pop()!()
+    await vi.waitFor(() => expect(refused.every((socket) => socket.destroyed)).toBe(true))
+  } finally { vi.useRealTimers(); observed.mockRestore(); first.destroy(); for (const client of clients) client.destroy() }
 })
 
 it('preserves an edge message until canonical normalization can mark its truncation', async () => {

@@ -34,6 +34,7 @@ export async function relayIngress(path: string, command: 'ingress' | 'ingress-s
     for (let attempt = 0; ; attempt++) {
       const socket = createConnection({ path, signal: controller.signal })
       let reply = '', size = 0, lines = 0, busy = false
+      let refusal: Error | null = null
       socket.on('data', (chunk: Buffer) => {
         try {
           reply += chunk.toString('utf8')
@@ -42,11 +43,14 @@ export async function relayIngress(path: string, command: 'ingress' | 'ingress-s
           while ((end = reply.indexOf('\n')) >= 0) {
             const line = reply.slice(0, end); reply = reply.slice(end + 1)
             const value: unknown = JSON.parse(line)
-            if (!value || typeof value !== 'object') { socket.destroy(new Error('Invalid ingress acknowledgement')); return }
+            if (refusal || !value || typeof value !== 'object') { socket.destroy(new Error('Invalid ingress acknowledgement')); return }
             if ('error' in value) {
-              busy = command === 'deployment' && lines === 0 && Object.keys(value).length === 1 && value.error === 'Ingress writer is busy'
               const cause = typeof value.error === 'string' ? redact(value.error, environmentSecrets()).slice(0, 512) : 'Invalid ingress refusal'
-              socket.destroy(new Error('Gateway refused ingress delivery: ' + cause)); return
+              const error = new Error('Gateway refused ingress delivery: ' + cause)
+              if (command === 'deployment' && lines === 0 && Object.keys(value).length === 1 && value.error === 'Ingress writer is busy') {
+                refusal = error; continue
+              }
+              socket.destroy(error); return
             }
             write(line); lines++
           }
@@ -56,10 +60,8 @@ export async function relayIngress(path: string, command: 'ingress' | 'ingress-s
         await once(socket, 'connect')
         const ended = once(socket, 'end')
         if (frame) {
-          // Read an immediate busy refusal before writing to its closed peer.
-          await Promise.all([ended, delay(0, undefined, { signal: controller.signal }).then(() => {
-            if (!socket.destroyed) socket.end(frame)
-          })])
+          socket.end(frame)
+          await ended
         } else {
           socket.write(command + '\n')
           await Promise.all([ended, pipeline(Readable.from(stdin), new Transform({ transform(chunk: Buffer, _encoding, done) {
@@ -67,6 +69,7 @@ export async function relayIngress(path: string, command: 'ingress' | 'ingress-s
             done(size > (command === 'ingress-stream' ? 1024 * 1024 : 64 * 1024) ? new Error('Ingress input exceeds its bound') : null, chunk)
           } }), socket, { signal: controller.signal })])
         }
+        if (refusal && !reply) { busy = true; throw refusal }
         if (reply || lines !== (command === 'ingress-stream' && size ? 2 : 1)) throw new Error('Ingress acknowledgement is incomplete')
         return
       } catch (error) {
@@ -92,11 +95,17 @@ export async function startIngressSocket(runtime: DiagnosticRuntime, path: strin
     try { unlinkSync(path) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
   let active: Socket | null = null
+  const refused = new Set<Socket>()
   const server = createServer({ allowHalfOpen: true }, (socket) => {
     socket.on('error', () => socket.destroy())
     const deadline = setTimeout(() => socket.destroy(new Error('Ingress connection exceeded 30 seconds')), 30_000)
     socket.once('close', () => clearTimeout(deadline))
-    if (active) { socket.end('{"error":"Ingress writer is busy"}\n', () => socket.destroy()); return }
+    if (active) {
+      refused.add(socket); socket.once('close', () => refused.delete(socket))
+      // Closing the read side here can turn the client's write into EPIPE and
+      // discard our unread refusal. Drain until its EOF or the existing deadline.
+      socket.resume(); socket.end('{"error":"Ingress writer is busy"}\n'); return
+    }
     active = socket
     void (async () => {
       // The default readable iterator destroys the duplex socket at input EOF,
@@ -130,7 +139,7 @@ export async function startIngressSocket(runtime: DiagnosticRuntime, path: strin
     try { chmodSync(path, 0o600); runtime.ownCoverage('external-ingress', configured); resolve() }
     catch (error) { server.close(); reject(error) }
   }) })
-  return { close: () => new Promise<void>((resolve, reject) => { active?.destroy(); server.close((error) => error ? reject(error) : resolve()) }) }
+  return { close: () => new Promise<void>((resolve, reject) => { active?.destroy(); for (const socket of refused) socket.destroy(); server.close((error) => error ? reject(error) : resolve()) }) }
 }
 
 /** Diagnostics storage can fail without withholding login and workspace routing. */
