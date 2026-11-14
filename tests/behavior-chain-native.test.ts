@@ -902,6 +902,7 @@ it('reads the seed issue, comments and publication inspection in one native proc
     unresolved: 0, approved: true, ready: true, reviewIds: [], reviewRevision: '', reviewReceipts: [], greyRuns: [],
     pending: false, failing: [], conflict: false, behind: false } },
   { kind: 'invoke', behavior: 'retire-pr', basis: chainBasis(['retire', remediation]), actor: 'author', reviewer: null, reason: 'covered' }, 'retirement')
+  if (!request) throw new Error('retirement must prepare a native close request')
   expect(request.argv).toEqual(['--issue-work', '7', '--mode', 'retire', '--branch', chain.branch, '--pull-number', '21',
     '--coverage-json', JSON.stringify(remediation), '--expected-head', HEAD, '--token-user', 'author'])
 })
