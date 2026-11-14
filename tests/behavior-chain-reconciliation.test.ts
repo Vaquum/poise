@@ -941,12 +941,16 @@ it.each([1, 4])('alternates saturated active and due passes across runtime repla
   })
   const reportHold = vi.fn<NonNullable<ChainRuntimeOperations['reportHold']>>(async () => null)
   const native = operations({ observe, reportHold })
+  // With one held PR only the first two sweeps per runtime stay saturated;
+  // later sweeps are cursor-limited (one active plus one due). The populated
+  // due backlog keeps every sweep saturated to prove active progress too.
+  const passes = heldCount === 1 ? 2 : 4
   for (let replacement = 0; replacement < 2; replacement++) {
     const retained = new BehaviorChainJournal(db)
     retained.rebuild()
     const runtime = new BehaviorChainRuntime(retained, native)
     const before = observe.mock.calls.length
-    for (let pass = 0; pass < 4; pass++) {
+    for (let pass = 0; pass < passes; pass++) {
       vi.setSystemTime(Date.now() + 120_000)
       const began = Date.now(), offset = observe.mock.calls.length
       await runtime.run()
