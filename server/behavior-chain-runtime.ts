@@ -247,10 +247,26 @@ function capacityWait(reason: string): boolean {
     || reason.startsWith('shared native resource budget is exhausted: ') || reason.startsWith('insufficient behavior resource headroom: ')
 }
 
+function admissionDecision(chain: BehaviorChain, observation: ChainObservation, now: number): Extract<ChainDecision, { kind: 'invoke' }> | null {
+  let decision: ChainDecision
+  try {
+    decision = decideBehaviorChain(chain, observation, now)
+  } catch (error) {
+    // Undecodable history (for example a deferred sweep's checkedAt-only
+    // record) dates no episode.
+    if (error instanceof TypeError) return null
+    throw error
+  }
+  return decision.kind === 'invoke' ? decision : null
+}
+
 function admissionDecisionBasis(chain: BehaviorChain, observation: ChainObservation, now: number): string | null {
-  const decision = decideBehaviorChain(chain, observation, now)
-  return decision.kind === 'invoke'
-    ? chainBasis([decision.behavior, decision.basis, decision.actor, decision.reviewer]) : null
+  const decision = admissionDecision(chain, observation, now)
+  return decision ? chainBasis([decision.behavior, decision.basis, decision.actor, decision.reviewer]) : null
+}
+
+function admissionNeedsModel(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
+  return admissionDecision(chain, observation, now)?.reviewer != null
 }
 
 export class MissingPublicationPlanError extends Error {
@@ -439,7 +455,10 @@ export class BehaviorChainRuntime {
       const conflicted = new Set<string>()
       const waiters = this.journal.capacityWaiters().flatMap(chain => {
         const sequence = this.capacityWaitSequence(chain)
-        return sequence === null ? [] : [{ chain, sequence }]
+        if (sequence === null) return []
+        const observation = chain.observation as ChainObservation | null
+        const model = !!observation && admissionNeedsModel(chain, observation, observation.checkedAt)
+        return [{ chain, sequence, model }]
       }).sort((a, b) => a.sequence - b.sequence)
       const offered = new Set<string>()
       const visited = new Set<string>()
@@ -630,9 +649,13 @@ export class BehaviorChainRuntime {
                 }
                 if (work[index].priority !== null && this.capacityWaitSequence(chain) !== work[index].priority) continue
                 // Model work and direct actions share resource reservations.
-                // Offer older waiters before either prepares new work.
+                // Offer older waiters before either prepares new work. Older
+                // model waiters yield without observation while model capacity
+                // is unavailable, so runnable direct work is still reached.
+                const modelAvailable = this.operations.available() && this.journal.modelCapacityAvailable(this.operations.capacity())
                 const older = waiters.filter(waiter => !offered.has(waiter.chain.id)
-                  && waiter.sequence < (work[index].priority ?? Infinity))
+                  && waiter.sequence < (work[index].priority ?? Infinity)
+                  && (modelAvailable || !waiter.model))
                 if (older.length) {
                   work.splice(index + 1, 0, ...older.map(waiter => ({ chain: waiter.chain, priority: waiter.sequence, cursor: false })),
                     { chain, priority: work[index].priority, cursor: false })

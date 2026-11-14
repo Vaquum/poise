@@ -268,7 +268,8 @@ place across changing shortage reasons and byte counts, while changed work,
 other waits and Hold/Resume reset it. Each candidate
 passes fresh observation and the existing permission, provider, resource and
 atomic admission gates. An older candidate that cannot run leaves the slot for
-later eligible work. The reconciliation cursors, interactive reserve and
+later eligible work. Older model waiters yield without observation while model
+capacity is unavailable, so runnable direct work is still reached. The reconciliation cursors, interactive reserve and
 publication/merge gates remain unchanged; no worker or polling loop is added.
 Known closed PRs and closed seeds use the same native-only resource wait for
 their blocked model behaviors. A closed seed alone does not defer PR review or

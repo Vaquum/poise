@@ -172,6 +172,25 @@ describe('durable resource admission order', () => {
     expect(queue.journal.liveModelInvocationCount()).toBe(0)
   })
 
+  it('runs newer direct work without observing older model waiters while model slots are unavailable', async () => {
+    const queue = resourceQueue('memory', 'headroom')
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.journal.capacityWaiters().map(current => current.id)).toEqual([queue.chain.id])
+    const direct = queue.add(1000, true)
+    for (let index = 1; index < 100; index++) queue.add(1000 + index)
+    expect(queue.journal.reconcilable('', Date.now(), false).map(current => current.id)).not.toContain(queue.chain.id)
+    queue.release()
+    queue.ops.available = () => false
+    const observed: string[] = []
+    const observe = queue.ops.observe
+    queue.ops.observe = async current => { observed.push(current.id); return observe(current) }
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.launches).toEqual([direct.id])
+    expect(observed).toContain(direct.id)
+    expect(observed).not.toContain(queue.chain.id)
+    expect(queue.journal.reservedResources()).toEqual({ ...queue.reservation, unaccounted: 0 })
+  })
+
   it.each(['basis', 'slot'] as const)('records a fresh resource wait after a %s change with identical shortage text', async change => {
     const queue = resourceQueue('memory', 'headroom')
     const runtime = new BehaviorChainRuntime(queue.journal, queue.ops)
