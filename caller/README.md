@@ -96,6 +96,19 @@ proof and the delivered recovery on the current implementation base. See
 [pre-PR recovery](../docs/Behavior-chain.md#bounded-reconciliation) for admission
 and evidence limits. Relay prose and digests alone remain actionable holds.
 
+For new Calls, `source: "relay"` would identify the original and clean-base
+completed relay run IDs, but recovery is currently held for #1619: the suite UID
+owns the report files, so candidate code can replace them before signing.
+Caller supplies its own retained Call/capture binding and reads the signed runner
+receipts saved by the hook; worker-supplied receipt text cannot replace them.
+The gateway would authenticate both complete assertion inventories. A distinct run
+at the same HEAD is insufficient: the baseline must independently match a clean
+prepared-base source capture. Direct Vitest commands, wrappers, other runners,
+canceled/incomplete results and evidence overflow all retain the hold until the
+runner establishes the inventory independently. The same delivered-fix and
+full-suite CI validation gates would apply, including every duplicate parameter
+under a failing title.
+
 ## Accounts
 
 No GitHub account is fixed in Caller. Each `github-interface` behavior acts as

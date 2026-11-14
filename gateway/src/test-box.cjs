@@ -4,10 +4,14 @@
 // Its output and exit code are what the agent gets, so everything that goes wrong here says so and exits with 125.
 'use strict'
 const { spawn, spawnSync } = require('node:child_process')
-const { accessSync, chmodSync, constants: { W_OK }, existsSync, openSync, readFileSync } = require('node:fs')
-const { dirname, join } = require('node:path')
+const { createHash } = require('node:crypto')
+const { accessSync, chmodSync, chownSync, constants: { W_OK }, createReadStream, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readlinkSync, statSync, writeFileSync } = require('node:fs')
+const { basename, dirname, join, relative } = require('node:path')
 const { constants } = require('node:os')
+const { pipeline } = require('node:stream/promises')
 const { setTimeout: sleep } = require('node:timers/promises')
+const { pathToFileURL } = require('node:url')
+const { createGunzip } = require('node:zlib')
 
 const [specPath, treePath, root = '/'] = process.argv.slice(2)
 // A real box unpacks at the root and has a system to start. Tests name a folder instead.
@@ -124,7 +128,114 @@ function ranOutOfMemory() {
   return BOX_OUT_OF_MEMORY.test(spawnSync('dmesg', { encoding: 'utf8' }).stdout ?? '')
 }
 
-function runSuite(spec, env) {
+function git(cwd, ...args) {
+  // Unpacking runs as the suite user, so this must too when root; otherwise run as self (tests, jobs).
+  const identity = process.getuid?.() === 0 ? asUser : {}
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...identity })
+  if (result.status !== 0) throw new Error('test capture git identity is unavailable')
+  return result.stdout
+}
+
+/** Read the captured files, without trusting the uploaded index's dirty flags. */
+function sourceCapture(cwd) {
+  const top = git(cwd, 'rev-parse', '--show-toplevel').trim()
+  const base = git(top, 'rev-parse', 'HEAD').trim()
+  const origin = git(top, 'remote', 'get-url', 'origin').trim()
+  const repository = /^(?:https:\/\/github.com\/|git@github.com:)([\w.-]+\/[\w.-]+?)(?:\.git)?$/.exec(origin)?.[1]
+  if (!repository) throw new Error('test capture repository is unavailable')
+  const expected = git(top, 'ls-tree', '-rz', 'HEAD').split('\0').filter(Boolean).sort()
+  const actual = [...new Set(git(top, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean))].map(path => {
+    const file = join(top, path)
+    if (!existsSync(file) && !lstatSafe(file)) return `missing\t${path}`
+    const stat = lstatSync(file)
+    if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error('test capture contains an unsupported source entry')
+    const data = stat.isSymbolicLink() ? Buffer.from(readlinkSync(file)) : readFileSync(file)
+    const mode = stat.isSymbolicLink() ? '120000' : stat.mode & 0o111 ? '100755' : '100644'
+    const blob = createHash('sha1').update(`blob ${data.length}\0`).update(data).digest('hex')
+    return `${mode} blob ${blob}\t${path}`
+  }).sort()
+  return { top, base, repository, source: createHash('sha256').update(JSON.stringify(actual)).digest('hex'),
+    clean: JSON.stringify(actual) === JSON.stringify(expected) }
+}
+
+function lstatSafe(path) {
+  try { return lstatSync(path) } catch (error) { if (error.code === 'ENOENT') return null; throw error }
+}
+
+/** Only a directly invoked Vitest run has a fully accounted assertion result.
+ * Wrappers and other runners keep their existing hold rather than guessing
+ * whether another command, setup error or missing report also failed.
+ */
+function assertionReporter(spec) {
+  // Held for #1619: the suite UID owns these files, so candidate code can
+  // replace them before signing. Preserve the hold until the runner establishes
+  // the inventory independently. No reporter is injected; suites run as before.
+  return null
+  if (!spec.capture || !spec.binding || !spec.reportTo) return null
+  const cli = /^(vitest|vitest\.mjs)$/.test(basename(spec.argv[0])) ? spec.argv[0]
+    : /^(?:node|nodejs)$/.test(basename(spec.argv[0])) && /^(vitest|vitest\.mjs)$/.test(basename(spec.argv[1] ?? '')) ? spec.argv[1] : null
+  if (!cli || spec.argv.some(word => /^(?:--watch|--ui|--coverage|--reporter|--outputFile)(?:=|$)/.test(word))) return null
+  const directory = mkdtempSync('/tmp/poise-assertions-')
+  if (onBox) chownSync(directory, 10001, 10001)
+  const report = join(directory, 'result.json'), completion = join(directory, 'complete.json')
+  const reporter = join(directory, 'reporter.mjs')
+  const reporters = pathToFileURL(require.resolve('vitest/reporters', { paths: [dirname(cli)] })).href
+  writeFileSync(reporter, `import { JsonReporter } from ${JSON.stringify(reporters)};
+import { writeFileSync } from 'node:fs';
+export default class extends JsonReporter {
+  constructor() { super({ outputFile: ${JSON.stringify(report)} }); }
+  async onTestRunEnd(modules, errors, reason) {
+    await super.onTestRunEnd(modules);
+    const setupFailed = task => task.type === 'suite' && (task.result?.errors?.length || task.tasks?.some(setupFailed));
+    writeFileSync(${JSON.stringify(completion)}, JSON.stringify({ errors: errors.length, reason,
+      setupFailed: modules.some(module => setupFailed(module.task)) }));
+  }
+}`)
+  spec.argv.push('--reporter=default', `--reporter=${reporter}`)
+  return { report, completion }
+}
+
+function assertionResult(reporter, capture) {
+  // Held for #1619 alongside assertionReporter: even a directly supplied
+  // reporter path is candidate-controlled, so no inventory is trusted.
+  return null
+  if (!reporter || !existsSync(reporter.report) || !existsSync(reporter.completion)
+    || statSync(reporter.report).size > 16 * 1024 * 1024) return null
+  const complete = JSON.parse(readFileSync(reporter.completion, 'utf8'))
+  const report = JSON.parse(readFileSync(reporter.report, 'utf8'))
+  if (complete.errors !== 0 || complete.reason !== 'failed' || complete.setupFailed !== false
+    || report.success !== false || report.snapshot?.failure || report.numPendingTestSuites > 0) return null
+  const failures = [], counts = new Map()
+  let total = 0
+  for (const file of report.testResults) {
+    if (!['passed', 'failed'].includes(file.status) || file.message) return null
+    let failed = 0
+    const path = relative(capture.top, file.name)
+    if (!path || path.startsWith('..')) return null
+    for (const test of file.assertionResults) {
+      if (!['passed', 'failed', 'pending', 'todo', 'skipped'].includes(test.status)
+        || !Array.isArray(test.failureMessages) || test.failureMessages.some(message => typeof message !== 'string')) return null
+      const key = JSON.stringify([path, test.fullName])
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+      total++
+      if (test.status !== 'failed') continue
+      const cause = test.failureMessages.join('\n').replaceAll(capture.top, '$CHECKOUT')
+      if (!cause.trim()) return null
+      failures.push({ file: path, test: test.fullName, cause, causeDigest: createHash('sha256').update(cause).digest('hex') })
+      failed++
+    }
+    if ((file.status === 'failed') !== (failed > 0)) return null
+  }
+  if (!failures.length || failures.length > 100 || report.numFailedTests !== failures.length || report.numTotalTests !== total) return null
+  const keys = new Set(failures.map(item => JSON.stringify([item.file, item.test])))
+  const totals = [...counts].filter(([key]) => keys.has(key)).map(([key, total]) => {
+    const [file, test] = JSON.parse(key)
+    return { file, test, total }
+  })
+  return { failures, totals }
+}
+
+function runSuite(spec, env, capture, reporter) {
   let tail = ''
   let lastOutput = Date.now()
   const child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, env, stdio: ['ignore', 'pipe', 'pipe'], ...asUser })
@@ -149,7 +260,24 @@ function runSuite(spec, env) {
       while (!closed && Date.now() - lastOutput < QUIET_MS) await sleep(50)
       const status = code ?? 128 + (constants.signals[signal] ?? 0)
       if (status !== 0 && (OUT_OF_MEMORY.test(tail) || (onBox && ranOutOfMemory()))) fail('this suite is too big for its test box: it ran out of memory')
-      else process.stdout.write('', () => process.stderr.write('', () => process.exit(status)))
+      else {
+        if (status === 1 && closed && capture && reporter) {
+          try {
+            const assertions = assertionResult(reporter, capture)
+            if (assertions) {
+              const { top, ...identity } = capture
+              const body = JSON.stringify({ ...identity, ...assertions, exit: status })
+              if (Buffer.byteLength(body) <= 40 * 1024) await fetch(spec.reportTo.url, { method: 'POST',
+                headers: { authorization: `Bearer ${spec.reportTo.token}` }, body, signal: AbortSignal.timeout(5_000) })
+            }
+          } catch (error) {
+            // Evidence is optional; a missing or unreadable complete result
+            // cannot authorize recovery and never changes the suite's exit.
+            process.stderr.write(`[poise] assertion recovery evidence could not be retained: ${error.message}\n`)
+          }
+        }
+        process.stdout.write('', () => process.stderr.write('', () => process.exit(status)))
+      }
     })()
   })
 }
@@ -161,6 +289,12 @@ async function main() {
   // It arrives in parts, numbered in order.
   const whole = `${treePath}.tgz`
   spawnSync('sh', ['-c', 'cat "$0"/* > "$1" && chmod 644 "$1"', treePath, whole])
+  let candidate = null
+  if (spec.capture) {
+    const hash = createHash('sha256').update(spec.capture.spec)
+    await pipeline(createReadStream(whole), createGunzip(), async chunks => { for await (const chunk of chunks) hash.update(chunk) })
+    candidate = hash.digest('hex')
+  }
   const problem = await unpack(whole)
   if (problem !== null) {
     fail(`unpacking the checkout failed: ${problem}`)
@@ -169,9 +303,19 @@ async function main() {
   await docker
   // Folders with nothing in them travel in no tar.
   spawnSync('mkdir', ['-p', spec.cwd, ...(env.HOME ? [env.HOME] : [])], asUser)
-  runSuite(spec, env)
+  let capture = null, reporter = null
+  if (candidate === spec.capture?.candidate) {
+    try {
+      capture = { ...sourceCapture(spec.cwd), candidate, binding: spec.binding,
+        command: JSON.parse(spec.capture.spec).argv.map(word => word.replaceAll(spec.cwd, '$CHECKOUT')) }
+      reporter = assertionReporter(spec)
+    } catch (error) {
+      process.stderr.write(`[poise] assertion recovery evidence unavailable: ${error.message}\n`)
+    }
+  }
+  runSuite(spec, env, capture, reporter)
 }
 
 // Started as a script on a box; tests require it for what it unpacks with.
 if (require.main === module) main().catch((error) => fail(error.message))
-module.exports = { JOB_UNPACK, onlyImageFolders }
+module.exports = { JOB_UNPACK, onlyImageFolders, sourceCapture, assertionResult }
