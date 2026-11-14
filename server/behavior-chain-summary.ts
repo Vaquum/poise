@@ -1,7 +1,7 @@
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
 import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
-import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
+import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, lastChainQueueInvocation, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
 import { nativeBehavior } from './behavior-chain-runtime'
 import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
@@ -317,7 +317,8 @@ function invocationWorkImpact(journal: BehaviorChainJournal, match: ReturnType<B
       : chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : chain.held ? chain.ciHold
             ? active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
-              : 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
+              : chain.ciHold.queue ? String((chain.observation as ChainObservation | null)?.ciRecovery?.reason || chain.held)
+                : 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
             : `Resolve the hold and explicitly resume: ${chain.held}`
           : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
             : active ? 'Await the original invocation outcome' : chain.mergeSha ? null
@@ -401,12 +402,13 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         && !!queueRemoval && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
         && queueRemoval.reason !== 'merged' && queueRemoval.reason !== 'failed_checks' && queueRemoval.reason !== 'merge_conflict'
       let queueRejectionNeedsRepair = false
+      const queueRecovery = observation && recoveredQueueRepair(chain, observation)
       if (pull && lastQueue?.evidence?.head_sha === pull.head && queueRemoval
         && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
         && (queueRemoval.reason === 'failed_checks' || queueRemoval.reason === 'merge_conflict')) {
         const diagnosis = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr'
           && invocation.evidence?.status === 'completed' && invocation.request.context?.head === pull.head
-          && invocation.request.context.queueRemoval === queueRemoval.id)
+          && invocation.request.context.queueRemoval === queueRemoval.id) ?? queueRecovery
         if (!diagnosis || ((pull.changesRequested || pull.failing.length || pull.conflict || pull.behind)
           && diagnosis.request.context?.reviewRevision !== pull.reviewRevision)) queueRejectionNeedsRepair = true
       }
@@ -448,14 +450,15 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       // Mirroring decideBehaviorChain: an undiagnosed queue rejection holds
       // repair, while a diagnosed one needs independent approve-pr
       // verification on the queue-verification basis before re-enqueueing.
-      let queueVerificationBasis: string | null = null
+      let queueVerificationBasis = queueRecovery && pull
+        ? chainBasis(['queue-recovery', pull.head, pull.queueRemoval?.id, queueRecovery.id, pull.reviewContext]) : null
       if (pull && observation && lastQueue?.evidence?.head_sha === pull.head && queueRemoval
         && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
         && (queueRemoval.reason === 'failed_checks' || queueRemoval.reason === 'merge_conflict') && !queueRejectionNeedsRepair) {
         const diagnosis = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr'
           && invocation.evidence?.status === 'completed' && invocation.request.context?.head === pull.head
           && invocation.request.context.queueRemoval === queueRemoval.id)
-        if (diagnosis) queueVerificationBasis = chainBasis(['queue-verification', pull.head, queueRemoval.id, diagnosis.id])
+        if (diagnosis) queueVerificationBasis ??= chainBasis(['queue-verification', pull.head, queueRemoval.id, diagnosis.id])
       }
       const queueVerificationApproved = !!pull && !!observation && !!queueVerificationBasis
         && chain.invocations.some(invocation => invocation.behavior === 'approve-pr' && invocation.state === 'settled'
@@ -516,7 +519,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : resourceContradicted ? `Hold: Invocation ${resourceContradicted.id} has contradictory resource-release evidence; ownership remains held`
           : chain.held ? chain.ciHold
-            ? 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
+            ? chain.ciHold.queue ? observation?.ciRecovery?.reason || chain.held
+              : 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
             : 'Resolve the durable hold, then explicitly resume the chain'
             : active ? 'Await the original invocation outcome'
               : state !== 'fresh' ? 'Await a fresh, complete chain observation'

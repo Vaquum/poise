@@ -1582,6 +1582,12 @@ update, or admit the existing scoped repair when a fresh conflict on the retaine
 failed head blocks that update, retaining the original Call, resource-release
 proof, repair retry bound and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
+Queue-only CI holds retain their original removal, integration, workflow and
+failed attempt in the existing Caller blocker. Recovery requires later matching
+integration success or independently verified shared-baseline recovery; green
+PR-head checks alone retain the hold. The original no-write Call and native
+resource settlement remain required, and current-head review and current-base
+merge gates still apply under the same [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 For a pre-PR implementation, the existing Caller artifact and seed read can
 instead verify an original CI assertion failure on its exact prepared base, and
 the delivered main recovery with validation of every original failing test and

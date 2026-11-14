@@ -6,7 +6,7 @@ import { agentInterfaceCwd } from './models'
 import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import { chainCiDependency, chainReviewResponse, implementationTestDependency, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { chainCiDependency, chainReviewResponse, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { datastoreViewOrCli } from './datastore-reader'
@@ -420,6 +420,47 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
             const latest = matching.sort((a, b) => Number(b.check_run_id) - Number(a.check_run_id))[0]
             return !!latest && latest.state === 'completed' && latest.conclusion === 'success'
           }) }
+      }
+      const blocked = [...chain.invocations].reverse().find(invocation => queueCiBlocker(invocation)
+        && invocation.request.context?.queueRemoval === observation.pull?.queueRemoval?.id)
+      const queue = blocked && queueCiBlocker(blocked)
+      if (blocked && queue) {
+        const blocker = (blocked.evidence!.artifact as { ci_blocker: Record<string, unknown> }).ci_blocker
+        if (blocker.repository !== chain.repository || blocker.pull_number !== number) throw new Error('CI blocker belongs to another repository or PR')
+        const baselineRecovered = dependency?.invocation.id === blocked.id && dependency.dependency.allShared === true
+          && observation.ciDependency?.recovered === true
+        let recovered = false
+        if (!baselineRecovered) {
+          const integration = await github(chain.repository, ['--list-failing-ci', String(number), '--ref', queue.integration, ...reviewer])
+          if (integration.repository !== chain.repository || integration.pull_number !== number || integration.head_sha !== head
+            || integration.ref !== queue.integration || integration.base_sha !== ci.base_sha || !Array.isArray(integration.parents)
+            || integration.parents[0] !== queue.base || !integration.parents.slice(1).includes(blocked.request.context?.head)
+            || !Array.isArray(integration.checks) || !Array.isArray(integration.runs)) {
+            throw new Error('CI hold recovery differs from the original queue integration or current candidate/base')
+          }
+          const checks = integration.checks.map(item => object(item, 'integration check'))
+          const runs = integration.runs.map(item => object(item, 'integration workflow'))
+          recovered = queue.failures.every(failure => {
+            const matchingRuns = runs.filter(run => run.workflow_id === failure.workflow && run.head_sha === queue.integration
+              && run.event === 'merge_group')
+            if (matchingRuns.some(run => ![run.id, run.run_attempt].every(id => Number.isSafeInteger(id) && Number(id) > 0))) return false
+            const run = matchingRuns.sort((a, b) => Number(b.id) - Number(a.id))[0]
+            if (!run || run.status !== 'completed' || run.conclusion !== 'success') return false
+            const matching = checks.filter(check => check.type === 'check_run' && check.name === failure.name
+              && check.head_sha === queue.integration && Number.isSafeInteger(check.check_run_id)
+              && check.run_id === run.id)
+            const latest = matching.sort((a, b) => Number(b.check_run_id) - Number(a.check_run_id))[0]
+            return !!latest && latest.state === 'completed' && latest.conclusion === 'success'
+              && Number(latest.check_run_id) > failure.check
+              && (Number(run.id) > failure.run || run.id === failure.run && Number.isSafeInteger(run.run_attempt)
+                && Number(run.run_attempt) > failure.attempt)
+          })
+        }
+        observation.ciRecovery = { invocationId: blocked.id, removal: queue.removal, integration: queue.integration,
+          recovered: recovered || baselineRecovered,
+          reason: recovered ? 'Later matching merge-group checks succeeded; current-head review and current-base merge gates still apply'
+            : baselineRecovered ? 'Verified shared-baseline checks recovered; current-head review and current-base merge gates still apply'
+              : `Awaiting later success for merge-group ${queue.integration}: ${queue.failures.map(failure => `${failure.name} (${failure.url})`).join(', ')}; PR-head green checks do not establish recovery` }
       }
       return observation
     },

@@ -287,8 +287,8 @@ it('surfaces a real journal failure even when its message matches a revision con
 })
 
 it.each(['recovery', 'base update', 'base update review', 'operator hold', 'uncertain publication', 'publication receipt',
-  'unreleased resources', 'ambiguous cause', 'missing failure identity'])(
-  'rechecks a CI-only repair hold without duplicate work: %s', async mode => {
+  'unreleased resources', 'ambiguous cause', 'missing failure identity'].flatMap(mode => ['head', 'queue'].map(source => ({ mode, source }))))(
+  'rechecks a $source CI-only repair hold without duplicate work: $mode', async ({ mode, source }) => {
     const recovers = ['recovery', 'base update', 'base update review'].includes(mode)
     const { db, journal } = setup()
     const obs = observation()
@@ -301,12 +301,18 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     record(journal, chain, { type: 'invocation.admitted', invocation: { id, behavior: 'repair-pr', actor: chain.author,
       model: reviewer.model, slot: reviewer.slot, basis: 'failed-ci', admittedAt: NOW - 86_400_000,
       request: { command: 'agent-interface', argv: ['--atomic-work', 'acme/repo#7', '--expected-head', obs.pull!.head],
-        cwd: '/fixture', context: { head: obs.pull!.head, reviewRevision: obs.pull!.reviewRevision } } } })
+        cwd: '/fixture', context: { head: obs.pull!.head, reviewRevision: obs.pull!.reviewRevision, queueRemoval: 'removed' } } } })
+    const queue = { removal: 'removed', integration: 'b'.repeat(40), base: 'c'.repeat(40),
+      failures: [{ name: 'unit', check: 41, job: mode === 'missing failure identity' ? 0 : 42, run: 40, workflow: 1, attempt: 1,
+        url: 'https://github.com/acme/repo/actions/runs/40/job/42' }] }
+    if (source === 'queue') obs.pull!.queueRemoval = { id: queue.removal, reason: 'failed_checks', at: NOW - 1000, actor: null }
     const ci = { action: 'list_failing_ci', repository: chain.repository, pull_number: 17, head_sha: obs.pull!.head,
+      ...(source === 'queue' ? { queue } : {}),
       failing: [{ type: 'check_run', name: 'unit', state: 'completed', conclusion: 'failure', check_run_id: 41,
         log_id: mode === 'missing failure identity' ? 0 : 42, url: 'https://github.com/acme/repo/actions/runs/40/job/42' },
       { type: 'check_run', name: 'build', state: 'in_progress', conclusion: null, check_run_id: 43, log_id: 44,
         url: 'https://github.com/acme/repo/actions/runs/40/job/44' }] }
+    if (source === 'queue') ci.failing = []
     const call: LogEntry = { ...completedReviewCall(chain.repository, 17, obs.pull!.head, chain.author), id: 'a'.repeat(32),
       behavior: 'repair_pr', source: 'poise:behavior-chain', correlation_id: id, status: 'failed',
       action: 'not_started', outcome: 'preflight_failed', head_sha: null, review_id: mode === 'publication receipt' ? 91 : null,
@@ -321,9 +327,9 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
       readInvocations: async () => parseAgentLogStdout(JSON.stringify(calls), 'CI hold regression') })
     let runtime = new BehaviorChainRuntime(journal, native)
     await runtime.run()
-    expect(journal.read(chain.id)!.held).toBe(call.error)
+    expect(journal.read(chain.id)!.held).toContain(call.error)
     const ciHold = ['ambiguous cause', 'missing failure identity', 'publication receipt'].includes(mode) ? undefined
-      : { invocationId: id, callId: call.id, head: ci.head_sha }
+      : { invocationId: id, callId: call.id, head: ci.head_sha, ...(source === 'queue' ? { queue } : {}) }
     expect(journal.read(chain.id)!.ciHold).toEqual(ciHold)
     expect(observe).not.toHaveBeenCalled()
     await runtime.run()
@@ -336,7 +342,7 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     if (mode !== 'unreleased resources') call.resources_settled_at = new Date().toISOString()
     await runtime.run()
     chain = journal.read(chain.id)!
-    expect(chain.held).toBe(call.error)
+    expect(chain.held).toContain(call.error)
     expect(chain.ciHold).toEqual(ciHold)
     expect(chain.invocations[0].state).toBe(['uncertain publication', 'unreleased resources'].includes(mode) ? 'uncertain' : 'settled')
     const failedReceipt = structuredClone(chain.invocations[0])
@@ -361,7 +367,7 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
         Object.assign(obs.pull!, { head: ci.head_sha, ...state })
         vi.setSystemTime(Date.now() + 120_000)
         await runtime.run()
-        expect(journal.read(chain.id)!.held).toBe(call.error)
+        expect(journal.read(chain.id)!.held).toContain(call.error)
         expect(launch).not.toHaveBeenCalled()
         expect(journal.reconciliationAt(journal.read(chain.id)!)).toBe(Date.now() + 120_000)
       }
@@ -370,21 +376,34 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
         vi.setSystemTime(Date.now() + 120_000)
         observe.mockImplementationOnce(async () => ({ ...structuredClone(obs), checkedAt: Date.now() + offset }))
         await runtime.run()
-        expect(journal.read(chain.id)!.held).toBe(call.error)
+        expect(journal.read(chain.id)!.held).toContain(call.error)
       }
       vi.setSystemTime(Date.now() + 120_001)
       observe.mockRejectedValueOnce(new Error('CI evidence unavailable'))
       await expect(runtime.run()).rejects.toThrow('CI evidence unavailable')
-      expect(journal.read(chain.id)!.held).toBe(call.error)
+      expect(journal.read(chain.id)!.held).toContain(call.error)
     }
     if (!recovers) {
       obs.pull!.conflict = true
       vi.setSystemTime(Date.now() + 120_000)
       await runtime.run()
-      expect(journal.read(chain.id)!.held).toBe(call.error)
+      expect(journal.read(chain.id)!.held).toContain(call.error)
       expect(launch).not.toHaveBeenCalled()
     }
     Object.assign(obs.pull!, { checksState: 'SUCCESS', head: ci.head_sha, pending: false, failing: [] })
+    if (source === 'queue') {
+      obs.ciRecovery = { invocationId: id, removal: queue.removal, integration: queue.integration, recovered: true, reason: 'Verified integration recovery' }
+      if (mode === 'recovery') {
+        for (const mismatch of [undefined, { ...obs.ciRecovery, recovered: false }, { ...obs.ciRecovery, invocationId: 'other' },
+          { ...obs.ciRecovery, removal: 'other' }, { ...obs.ciRecovery, integration: 'e'.repeat(40) }]) {
+          observe.mockImplementationOnce(async () => ({ ...structuredClone(obs), checkedAt: Date.now(), ciRecovery: mismatch }))
+          vi.setSystemTime(Date.now() + 120_000)
+          await runtime.run()
+          expect(journal.read(chain.id)!.ciHold).toEqual(ciHold)
+          expect(launch).not.toHaveBeenCalled()
+        }
+      }
+    }
     if (mode !== 'recovery') {
       obs.pull!.head = 'e'.repeat(40)
       obs.publication.head_sha = obs.pull!.head
@@ -396,7 +415,7 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     await runtime.run()
     chain = journal.read(chain.id)!
     if (!recovers) {
-      expect(chain.held).toBe(call.error)
+      expect(chain.held).toContain(call.error)
       expect(chain.invocations).toHaveLength(1)
       expect(launch).not.toHaveBeenCalled()
       return
@@ -409,7 +428,7 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     expect(chain.observation).toMatchObject({ pull: { head: obs.pull!.head } })
     expect(launch).toHaveBeenCalledTimes(1)
     const recovery = journal.history(chain.id).map(row => JSON.parse(row.payload)).filter(event => event.ciRecovery)
-    expect(recovery).toEqual([{ type: 'chain.resumed', ciRecovery: { invocationId: id, callId: call.id, head: ci.head_sha } }])
+    expect(recovery).toEqual([{ type: 'chain.resumed', ciRecovery: ciHold }])
     journal.rebuild()
     runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
     for (let tick = 0; tick < 3; tick++) await runtime.run()

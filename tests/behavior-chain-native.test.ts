@@ -12,7 +12,7 @@ import type { Organization } from '../server/organizations'
 import type { NativeChainHooks } from '../server/behavior-chain-native'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { completedReviewCall } from './review-response-fixture'
-import { behaviorChainAttention, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
+import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), health: vi.fn(async () => {}) }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn() }))
@@ -736,15 +736,31 @@ it.each(['verified', 'edited merge', 'missing proof', 'wrong ref', 'wrong head',
     ])
   })
 
-it.each(['rerun', 'conflict'])('retains a Caller-produced CI-only hold through settlement and restart, then recovers a %s', async mode => {
+it.each(['PR head rerun', 'PR head conflict', 'queue', 'baseline'])('retains a Caller-produced %s CI hold through settlement, restart and verified recovery', async source => {
+  const queued = source === 'queue' || source === 'baseline'
+  const conflictMode = source === 'PR head conflict'
   const failedHead = 'fcea77111bf5842239e81afb5e069b1fafa78fd6'
+  const integration = '5a3763807ae617c534c5e3d28224039cf4ec4946', base = 'c'.repeat(40)
   const failedCheck = { type: 'check_run', name: 'Unit & integration (1)', state: 'completed', conclusion: 'failure',
     check_run_id: 132038286724, log_id: 132038286724,
     url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286724' }
-  const ci = { action: 'list_failing_ci', repository: chain.repository, pull_number: 21, head_sha: failedHead,
-    checks: [failedCheck], failing: [failedCheck], mergeable: true, mergeable_state: 'clean' }
+  const ci = { action: 'list_failing_ci', repository: chain.repository, pull_number: 21, head_sha: failedHead, base_sha: base,
+    checks: queued ? [] : [failedCheck], failing: queued ? [] : [failedCheck], mergeable: true, mergeable_state: 'clean' }
+  const queue = { head_sha: failedHead, queue_removals: [{ id: 'removed', reason: 'failed_checks',
+    createdAt: new Date(Date.now() - 500).toISOString(), actor: null, beforeCommit: { oid: integration } }] }
+  const integrationCheck = { ...failedCheck, head_sha: integration, run_id: 43469739427 }
+  const integrationPacket = { ...ci, ref: integration, parents: [base, failedHead],
+    checks: [integrationCheck], failing: [integrationCheck],
+    runs: [{ id: 43469739427, workflow_id: 1, head_sha: integration, event: 'merge_group', run_attempt: 1,
+      status: 'completed', conclusion: 'failure' }] }
+  const baselineCheck = { ...integrationCheck, head_sha: base, check_run_id: 132038286726, log_id: 132038286726, run_id: 43469739428 }
+  const baseline = { ...ci, ref: base, checks: [baselineCheck], failing: [baselineCheck],
+    runs: [{ id: baselineCheck.run_id, workflow_id: 1, head_sha: base, event: 'push', run_attempt: 1 }] }
+  const dependency = { head: failedHead, removal: 'removed', integration, base, remediation: 'https://github.com/example/repo/issues/99',
+    failures: [{ check: integrationCheck.check_run_id, baselineCheck: baselineCheck.check_run_id,
+      evidence: 'AssertionError: original fixture did not complete' }] }
   let green = false, conflict = false, pending = false, ready = false, head = failedHead, publication: string | null = null
-  let wire = '[]', released = '', reviewers: typeof reviewer[] = []
+  let wire = '[]', released = '', reviewers: typeof reviewer[] = [], integrationMode = 'failed'
   const reviews: LogEntry[] = []
   mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
     if (command === 'agent-interface') {
@@ -756,10 +772,10 @@ it.each(['rerun', 'conflict'])('retains a Caller-produced CI-only hold through s
         issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
         publication: { existing_pulls: [], pull_number: 21, head_sha: head, head_invocation: publication, state: 'open', merged: false, merge_sha: null } },
       '--pull-action-state': { pull_number: 21, state: 'open', head_sha: head, review_context: 'b'.repeat(64),
-        merged: false, queue_entry_id: null, queue_removals: [], my_reviews: reviews.map(review => ({ id: review.review_id,
+        merged: false, queue_entry_id: null, queue_removals: queued ? queue.queue_removals : [], my_reviews: reviews.map(review => ({ id: review.review_id,
           commit_id: head, state: review.action === 'approved' ? 'APPROVED' : 'COMMENTED', invocation_id: review.id,
           review_response: review.artifact!.review_response, submitted_at: review.completed_at })) },
-      '--pr-readiness': { head_sha: head, draft: false, checks_state: pending ? 'PENDING' : green ? 'SUCCESS' : 'FAILURE',
+      '--pr-readiness': { head_sha: head, draft: false, checks_state: pending ? 'PENDING' : green || queued ? 'SUCCESS' : 'FAILURE',
         reviewer_approved_current_head: reviews.some(review => review.action === 'approved'), unresolved_live_conversation_count: 0,
         unresolved_outdated_conversation_count: 0, green: ready, blockers: ['reviewer_not_approved_current_head', ...(green ? [] : ['checks_failed'])] },
       '--list-failing-ci': pending ? { ...ci, head_sha: head, mergeable: true,
@@ -769,6 +785,30 @@ it.each(['rerun', 'conflict'])('retains a Caller-produced CI-only hold through s
         url: 'https://github.com/example/repo/actions/runs/43469739427/job/132038286725' }] }
           : { ...ci, mergeable: conflict ? false : true, mergeable_state: conflict ? 'dirty' : 'clean' },
     }
+    if (argv[0] === '--list-failing-ci' && argv.includes('--ref')) {
+      if (argv[argv.indexOf('--ref') + 1] === 'base') {
+        return { stdout: JSON.stringify({ ...baseline, checks: green ? [{ ...baselineCheck, conclusion: 'success' }] : baseline.checks }) }
+      }
+      const success = { ...integrationCheck, check_run_id: integrationCheck.check_run_id + 10, conclusion: 'success' }
+      const packet = { ...integrationPacket,
+        runs: [{ ...integrationPacket.runs[0], run_attempt: green || integrationMode !== 'failed' ? 2 : 1,
+          conclusion: green ? 'success' : 'failure' }],
+        checks: green && source !== 'baseline' ? [success] : integrationPacket.checks }
+      if (integrationMode === 'stale success') packet.checks = [success, { ...integrationCheck, check_run_id: success.check_run_id + 1 }]
+      if (integrationMode === 'other workflow') {
+        packet.runs.push({ ...packet.runs[0], id: 43469739428, workflow_id: 2 })
+        packet.checks = [integrationCheck, { ...success, run_id: 43469739428 }]
+      }
+      if (integrationMode === 'same attempt') packet.runs[0].run_attempt = 1
+      if (integrationMode === 'pending') packet.checks = [{ ...success, state: 'in_progress' }]
+      if (integrationMode === 'newer pending run' || integrationMode === 'newer failed run') {
+        packet.runs.push({ ...packet.runs[0], id: 43469739428,
+          status: integrationMode === 'newer pending run' ? 'in_progress' : 'completed', conclusion: 'failure' })
+      }
+      if (integrationMode === 'unknown result') packet.runs[0].status = ''
+      if (integrationMode === 'wrong integration') packet.ref = base
+      return { stdout: JSON.stringify(packet) }
+    }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
     return { stdout: JSON.stringify(evidence[argv[0]]) }
   })
@@ -777,7 +817,8 @@ it.each(['rerun', 'conflict'])('retains a Caller-produced CI-only hold through s
   const launch = vi.fn<ChainRuntimeOperations['launch']>(async invocation => {
     if (invocation.behavior === 'repair-pr' && wire === '[]') {
       const receipts = JSON.parse(execFileSync('python3', ['tests/fixtures/ci-only-repair.py'], {
-        input: JSON.stringify({ argv: invocation.request.argv, ci }), encoding: 'utf8', timeout: 10_000,
+        input: JSON.stringify({ argv: invocation.request.argv, ci, ...(queued ? { queue, integration: integrationPacket, baseline,
+          ...(source === 'baseline' ? { dependency } : {}) } : {}) }), encoding: 'utf8', timeout: 10_000,
         env: { ...process.env, PYTHONPATH: resolve('caller/agent_interface') },
       })) as { pending: unknown[], released: unknown[] }
       wire = JSON.stringify(receipts.pending)
@@ -791,6 +832,13 @@ it.each(['rerun', 'conflict'])('retains a Caller-produced CI-only hold through s
     let journal = new BehaviorChainJournal(db)
     journal.append(chain.id, 'seed', 0, { type: 'chain.admitted', repository: chain.repository, issue: chain.issue,
       branch: chain.branch, author: chain.author, reviewer: chain.reviewer })
+    if (queued) {
+      const current = journal.read(chain.id)!
+      const admitted = journal.append(chain.id, 'enqueue', current.sequence, { type: 'invocation.admitted',
+        invocation: { ...mergeInvocation(), admittedAt: Date.now() - 1000 } })
+      journal.append(chain.id, 'enqueued', admitted.sequence, { type: 'invocation.settled', invocationId: 'original-merge',
+        callId: null, outcome: 'enqueued', evidence: { status: 'completed', outcome: 'enqueued', head_sha: failedHead } })
+    }
     let runtime = new BehaviorChainRuntime(journal, operations)
     await runtime.run()
     expect(launch).toHaveBeenCalledTimes(1)
@@ -800,19 +848,25 @@ it.each(['rerun', 'conflict'])('retains a Caller-produced CI-only hold through s
     expect(call).toMatchObject({ status: 'failed', behavior: 'repair_pr', action: 'not_started', head_sha: null,
       error_code: 'atomic_work_blocked', review_id: null, receipts: null,
       artifact: { phase: 'executing', ci_blocker: { action: ci.action, repository: ci.repository,
-        pull_number: ci.pull_number, head_sha: failedHead, failing: [failedCheck] } } })
+        pull_number: ci.pull_number, head_sha: failedHead, failing: ci.failing } } })
+    if (queued) expect(call.artifact?.ci_blocker).toMatchObject({ queue: { removal: 'removed', integration, base,
+      failures: [{ check: integrationCheck.check_run_id, run: 43469739427, workflow: 1, attempt: 1 }] } })
     expect(call.artifact).not.toHaveProperty('plan_sha')
-    const hold = { invocationId: call.correlation_id, callId: call.id, head: failedHead }
+    const retainedQueue = (call.artifact?.ci_blocker as { queue?: NonNullable<BehaviorChain['ciHold']>['queue'] }).queue
+    const hold = { invocationId: call.correlation_id, callId: call.id, head: failedHead, ...(queued ? { queue: retainedQueue } : {}) }
     vi.useFakeTimers()
     vi.setSystemTime(Date.parse(call.completed_at!) + 1000)
     await runtime.run()
-    expect(journal.read(chain.id)).toMatchObject({ held: call.error, ciHold: hold, invocations: [{ state: 'uncertain' }] })
+    expect(journal.read(chain.id)).toMatchObject({ held: queued ? expect.stringContaining(integration) : call.error, ciHold: hold })
+    expect(journal.read(chain.id)!.invocations.at(-1)!.state).toBe('uncertain')
     expect(behaviorChainWorkImpact(journal, call.id, null)?.nextAction).toContain('original invocation receipt')
     wire = released
     await runtime.run()
     const settled = journal.read(chain.id)!
-    expect(settled).toMatchObject({ held: call.error, ciHold: hold, invocations: [{ state: 'settled' }] })
-    const next = 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
+    expect(settled).toMatchObject({ held: queued ? expect.stringContaining(integration) : call.error, ciHold: hold })
+    expect(settled.invocations.at(-1)!.state).toBe('settled')
+    const next = queued ? expect.stringContaining('PR-head green checks do not establish recovery')
+      : 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
     expect(behaviorChainWorkImpact(journal, call.id, null)).toMatchObject({ impact: 'blocked', retryAt: null, nextAction: next })
     expect(behaviorChainAttention(journal)).toMatchObject([{ nextAction: next,
       reconciliation: { nextObservationAt: journal.reconciliationAt(settled), waitingForResourceRelease: false } }])
@@ -823,20 +877,51 @@ it.each(['rerun', 'conflict'])('retains a Caller-produced CI-only hold through s
     expect(journal.read(chain.id)).toEqual(settled)
     await runtime.run()
     expect(journal.history(chain.id)).toEqual(history)
-    green = mode === 'rerun'
-    conflict = mode === 'conflict'
+    if (queued) {
+      expect(behaviorChainSummary(settled).held).toContain(failedCheck.url)
+      const reject = async () => {
+        vi.setSystemTime(Date.now() + 120_000)
+        await runtime.run()
+        expect(journal.read(chain.id)!.ciHold).toEqual(hold)
+        expect(launch).toHaveBeenCalledTimes(1)
+      }
+      await reject() // Green PR-head CI must not release the red integration.
+      if (source === 'queue') {
+        green = true
+        for (const invalid of ['stale success', 'other workflow', 'same attempt', 'pending', 'newer pending run', 'newer failed run', 'unknown result']) { integrationMode = invalid; await reject() }
+        integrationMode = 'wrong integration'
+        vi.setSystemTime(Date.now() + 120_000)
+        await expect(runtime.run()).rejects.toThrow('original queue integration')
+      }
+      integrationMode = 'failed'
+    }
+    green = !conflictMode
+    conflict = conflictMode
     reviewers = [reviewer]
-    vi.setSystemTime(journal.reconciliationAt(settled)!)
+    vi.setSystemTime(Math.max(Date.now(), journal.reconciliationAt(journal.read(chain.id)!)!))
     await runtime.run()
     const recovered = journal.read(chain.id)!
     expect(recovered.held).toBeNull()
     expect(recovered.ciHold).toBeUndefined()
-    expect(recovered.invocations[0]).toEqual(settled.invocations[0])
+    expect(recovered.invocations.slice(0, settled.invocations.length)).toEqual(settled.invocations)
     expect(recovered.invocations.at(-1)).toMatchObject({ behavior: conflict ? 'repair-pr' : 'review-pr', state: 'started' })
     expect(launch).toHaveBeenCalledTimes(2)
     expect(journal.history(chain.id).map(row => JSON.parse(row.payload))).toContainEqual({ type: 'chain.resumed', ciRecovery: hold })
-    expect(recovered.resumedAfterSequence).toBe(settled.resumedAfterSequence)
-    if (mode === 'rerun') return
+    if (!queued) expect(recovered.resumedAfterSequence).toBe(settled.resumedAfterSequence)
+    if (queued) {
+      const current: ChainObservation = { ...recovered.observation as ChainObservation, prReviewers: [] }
+      const readyChain = { ...recovered, invocations: settled.invocations }
+      const approval = decideBehaviorChain(readyChain, current, Date.now())
+      expect(approval).toMatchObject({ kind: 'invoke', behavior: 'approve-pr', reason: expect.stringContaining('queue-rejection') })
+      current.pull = { ...current.pull!, reviewContext: 'd'.repeat(64) }
+      const changedBase = decideBehaviorChain(readyChain, current, Date.now())
+      expect(changedBase).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+      expect(changedBase.kind === 'invoke' && changedBase.basis).not.toBe(approval.kind === 'invoke' && approval.basis)
+      current.prReviewers = [reviewer]
+      expect(decideBehaviorChain(readyChain, current, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+      return
+    }
+    if (!conflictMode) return
     const repair = recovered.invocations.at(-1)!
     expect(repair.request.argv).toEqual(expect.arrayContaining(['--pull-number', '21', '--expected-head', failedHead, '--merge-base']))
     expect(recovered.observation).toMatchObject({ pull: { head: failedHead, conflict: true, failing: [expect.stringContaining('failure')] } })
