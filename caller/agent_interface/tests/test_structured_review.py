@@ -842,7 +842,7 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertEqual(run.error.diagnostic["submission"], "none")
         run.submit.assert_not_called()
 
-    def test_analysis_ceiling_expiring_during_inspection_is_a_handoff(self):
+    def test_analysis_ceiling_expiring_during_inspection_keeps_local_inspection(self):
         from agent_interface.process_diagnostic import command_failure
         clock = SimpleNamespace(now=1000.0)
         model = CATALOG.resolve("grok-4.6-xhigh")
@@ -883,11 +883,11 @@ class TestGrokAnalysisCeiling(TestCase):
                                       1413, repository=repository)
             except review_budget.ReviewLimitError as failure:
                 error = failure
-        self.assertEqual(str(error), GROK_HANDOFF)
+        self.assertEqual(str(error), "Local review repository inspection timed out; incomplete analysis; needs attention")
         self.assertEqual(error.code, "review_budget_exhausted")
-        self.assertEqual(error.diagnostic["operation"], "provider.review")
-        self.assertEqual(error.diagnostic["phase"], "analysis")
-        self.assertEqual(error.diagnostic["outcome"], "handoff")
+        self.assertEqual(error.diagnostic["operation"], "github-interface")
+        self.assertEqual(error.diagnostic["phase"], "provider_analysis")
+        self.assertEqual(error.diagnostic["outcome"], "timed_out")
         self.assertEqual(error.diagnostic["submission"], "none")
         submit.assert_not_called()
 

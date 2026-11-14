@@ -932,6 +932,18 @@ function isFileGroupBudgetExhaustion(call: LogEntry): boolean {
     && call.diagnostic.context.submission === 'none'
 }
 
+// A local inspection that hit the overall or provider-analysis ceiling stays
+// on its revision with its limiting phase. It still counts toward that
+// target's retry stop. Receipts without typed no-submission proof keep the
+// existing safe handling.
+function isLocalInspectionBudgetExhaustion(call: LogEntry): boolean {
+  return call.error_code === 'review_budget_exhausted'
+    && call.diagnostic?.operation === 'github-interface'
+    && (call.diagnostic.phase === 'overall' || call.diagnostic.phase === 'provider_analysis')
+    && call.diagnostic.outcome === 'timed_out'
+    && call.diagnostic.context.submission === 'none'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -941,6 +953,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // diagnostic takes precedence over provider-like text in older errors.
   if (call.diagnostic?.operation === 'github-interface' && call.diagnostic.phase === 'inspection'
     && call.diagnostic.outcome === 'timed_out') return null
+  if (isLocalInspectionBudgetExhaustion(call)) return null
   const account = reviewAccountFailure(call)
   if (account) return account
   const error = String(call.error || '')
@@ -4245,7 +4258,7 @@ function prReviewRetryState(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call))
   const timeouts = calls.filter((call) => call.model === model && budgetExhaustedProvenNoAction(call)
-    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call) || isLocalInspectionBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
   const stopped = timeouts.length >= 2 || retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
     claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head
@@ -4373,7 +4386,7 @@ function ensureBudgetStopHold(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call)
     && call.model === model && budgetExhaustedProvenNoAction(call)
-    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call) || isLocalInspectionBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
     .sort((a, b) => Date.parse(agentCallStartedAt(b)) - Date.parse(agentCallStartedAt(a)))
   const latest = timeouts[0]
