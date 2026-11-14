@@ -65,6 +65,11 @@ work and rechecks the owned head immediately before closing. It returns `closed`
 them. The chain invokes it only through the original native action/resource
 path after settling prior writes and native ownership. See
 [full-suite reconciliation](../docs/Behavior-chain.md#bounded-reconciliation).
+The same retirement action accepts verified empty-integration coverage for
+Poise-generated pre-PR failure remediations, including queued PRs with open
+seeds. `--chain-seed` retains the pinned Git trees and distinct covering merge;
+the close action rechecks the current head and base. Independent work and
+unverified coverage retain ordinary processing. The source issue is untouched.
 
 An atomic repair blocked solely by the supplied head's failed CI can return
 `blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains

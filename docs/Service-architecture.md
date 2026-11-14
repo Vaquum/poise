@@ -368,6 +368,15 @@ children with the hooks while `relay` exists
 ([Agents' test suites](Operating.md#agents-test-suites)). The settings travel this
 way because only a new container would take an environment variable.
 
+The relay retains the last 1,024 retired run IDs, their workspace owners and, for
+jobs, SHA-256 runner-token digests in memory, outside active admission slots.
+After the signed-key and current-access
+checks, the owner's exact `DELETE /runs/:id` returns 204 even while box termination
+is pending. An exact `POST /runs/:id/output` with a constant-time digest match
+returns 410 without processing output or logging a redundant request warning.
+Unknown, evicted and foreign IDs, invalid tokens and other requests retain their
+failure warnings. Run-stop, missing-result and box-termination diagnostics remain independent.
+
 The relay's run admission advertises `dependencyCache: true`. The authenticated
 workspace can send `POST /runs/:id/dependency?sha256=…` between checkout parts
 to insert one cached gzip member in order. An empty request looks up the

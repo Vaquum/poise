@@ -238,13 +238,16 @@ erase that original failure; independent wrapper and invalid-output failures
 remain visible. Resolve uses Warning only for a confirmed no-action transient
 exit with a recorded safe retry. Uncertain outcomes, timeouts and policy
 refusals remain Errors. Separate attempts retain separate event IDs.
-Legacy approval batch reads and the final head check likewise retain one Error
+Legacy approval batch reads, the final head check and checkout preparation retain one Error
 per failed child after recording the scheduler consequence. The fixed primitive,
 phase, checked targets, available expected heads, correlation, original process
 timing/result and recorded retry state travel together. Two failed children
 remain separate even within one sweep correlation; cancellation or failed retry
 bookkeeping cannot erase either cause. These diagnostics do not change backoff,
 launch progress or the exact-head publication checks.
+Checkout failures use phase `checkout` and fixed operations
+`github-interface.local-checkout-path` or `github-interface.checkout-repo`;
+other checkout callers retain default process reporting.
 JavaScript DOMException identity and numeric code are retained in context as
 `exceptionName` and `exceptionCode`, with no process `exitCode`. Actual subprocess
 exit codes remain process evidence, even when the same number names an exception.
@@ -288,6 +291,12 @@ is retained again. This recognition changes neither readiness nor retry policy.
 The gateway retains its separate central `logging.db` in `poise-gateway-data`.
 Existing volume backup/restore snapshots it with the other SQLite databases.
 Gateway warnings/errors are redacted before Docker stdout and retained directly.
+New `disk.workspace.over_budget` Warnings retain measured usage as `context.bytes`
+and the configured threshold as `context.budget`, in bytes, in the existing
+expanded detail. Each count is independently validated as a non-negative safe
+integer; zero is kept, while missing or invalid counts remain unknown without
+coercion. Previously retained entries cannot recover discarded fields.
+Recovery remains `disk.workspace.within_budget` at Info and is not retained.
 Every 15 seconds the independent collector reads bounded Docker logs/lifecycle
 windows for managed workspaces, Poise Compose services and release-install
 tasks. Only validated structured workspace envelopes enter private history;

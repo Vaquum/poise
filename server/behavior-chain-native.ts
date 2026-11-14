@@ -32,7 +32,7 @@ export async function readNativeInvocations(ids: string[], mode: 'strict' | 'res
 }
 export interface NativeChainHooks {
   roster(chainKey: string): Promise<Roster>
-  resolve(decision: Invoke, chainKey: string): Promise<ChainReviewer | null>
+  resolve(decision: Invoke, chainKey: string, chain: BehaviorChain, observation: ChainObservation): Promise<ChainReviewer | null>
   prepare(identities: string[]): Promise<NodeJS.ProcessEnv>
   borrow(): (() => void) | null
   available(): boolean
@@ -178,6 +178,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           state: typeof publication.state === 'string' ? publication.state : null, merged: publication.merged === true,
           merge_sha: publication.merge_sha === null ? null : sha(publication.merge_sha, 'publication') }, pull: null }
       if (seed.full_suite) observation.fullSuite = object(seed.full_suite, 'full-suite recovery')
+      if (seed.remediation) observation.remediation = object(seed.remediation, 'redundant remediation')
       if (testProof && originalTest) {
         const proof = object(seed.test_dependency, 'implementation test dependency')
         if (proof.verified === true && ['base', 'run', 'runAttempt', 'baselineRun', 'baselineAttempt', 'remediation', 'failures',
@@ -422,7 +423,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const note = [await hooks.note(decision.behavior, chain, pull), decision.reason,
         dependency ? `Retained shared baseline CI dependency; keep candidate repairs scoped and do not duplicate its remediation: ${JSON.stringify(dependency.dependency)}` : ''].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
-        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`)
+        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`, chain, observation)
         if (!selected) return null
         const model = ['--model', selected.model, '--recovery-model', selected.recovery]
         if (decision.behavior === 'review-issue') return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: ['--issue-review', `${chain.repository}#${chain.issue}`,
@@ -454,7 +455,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const fixed = ['--expected-head', pull.head, '--token-user', decision.actor]
       if (decision.behavior === 'retire-pr') return { command: 'github-interface', cwd, nativeResources: 2,
         argv: ['--issue-work', String(chain.issue), '--mode', 'retire', '--branch', chain.branch, '--pull-number', String(pull.number),
-          '--coverage-json', JSON.stringify(observation.fullSuite), ...fixed] }
+          '--coverage-json', JSON.stringify(observation.fullSuite ?? observation.remediation), ...fixed] }
       if (decision.behavior === 'resolve-threads') return { command: 'github-interface', cwd, nativeResources: 2, argv: ['--resolve-nonblocking-conversations-if-ready', String(pull.number), '--username', chain.reviewer, ...fixed] }
       if (decision.behavior === 'rerun-grey-ci') {
         const run = pull.greyRuns[0]

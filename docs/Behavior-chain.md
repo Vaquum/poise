@@ -105,12 +105,23 @@ remains eligible; this fence does not change manual Chat binding controls.
 
 Settings → Behaviors contains the chain preference fields, their save/reload actions and the guarded Switch to v2 or Cancel cutover action while applicable. Operational output lives in Observe → Tasks: cutover state and legacy ownership, capacity, the chain list and per-chain journal. The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. Hold/Resume retains the current journal sequence check. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while Tasks is open. Unavailable reads disable writes instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
+Tasks shows workspace-wide occupied model slots and the subset retained for
+uncertain invocations awaiting original resource evidence, independent of list
+pages and organization filters. The capacity response's nullable
+`retainedModelInvocations` uses the occupied count's resource predicate and
+requires an uncertain model invocation; unavailable or missing counts stay
+unknown. Needs attention retains each chain's blocker, next action and journal.
+Verified physical release removes a reservation from both counts even while
+publication remains uncertain and held. These reads change no admission, hold,
+retry or release authority.
+
 History exposes each `chain.merged` event's recorded `evidence.review_complete` boolean. Explicit `true` reads “Original review evidence complete”; `false` or legacy absence reads “Merged”. Each event keeps its own disposition across pages and links, independently of the current chain summary. Legacy absence establishes neither review completion nor a pending obligation.
 
 Notifications lists each delayed or held admitted issue's step,
 progress age, hold, exact-head CI/review gates and next known action, with issue,
 PR links and a Journal evidence action that opens the same journal in Observe → Tasks. Held, uncertain and pending-original-review work
-appears immediately; other active work appears after 24 hours without a verified
+appears immediately, as does a fresh queue/review conflict even while a review is
+running or awaiting capacity; other active work appears after 24 hours without a verified
 advance. Selection covers every active chain page, including unpublished issues
 and merged PRs with pending review evidence, sorted by oldest progress first.
 The clock starts at admission. Canonical history advances it on a newly verified
@@ -204,6 +215,21 @@ Supersession retains the covering merge separately, keeps the duplicate's
 and GitHub evidence links available. Rebuild and restart retain this terminal
 outcome and the original invocation ownership.
 
+Poise-generated pre-PR failure remediations (`implement-issue`,
+`atomic_work_blocked`, with the original repair-report marker) use the same native
+retirement path even while their seed remains open or their PR is queued. Their
+coverage policy is separate: Git must integrate the whole pinned candidate into
+the current default-branch base without conflicts and produce exactly the base
+tree. A distinct merged PR on that base's first-parent history must introduce
+that coverage; a later unrelated merge is not credited. The bounded read examines
+up to 100 base commits and retains the candidate, base, merge base, integration
+tree, and covering merge with its first parent and tree. Retirement revalidates
+this proof and checks both the head and current integration base before closing.
+Changed heads or bases invalidate the decision. Independent changes, conflicts
+or incomplete coverage evidence continue through ordinary gates. Supersession
+keeps the source issue's hold and outstanding work intact; it does not resume or
+complete that source chain.
+
 The existing scheduler selects a normal-work page before a separate due
 reconciliation page under its existing pass budget. Quiescent held or merged
 chains keep their original ownership, but cannot
@@ -234,12 +260,17 @@ journal errors and unreadable native receipts still surface; concurrent exit
 evidence and original invocation correlations and uncertainty are preserved.
 
 Held open PRs are rechecked every two minutes through that same scheduler,
-including after a head change. Fresh queue evidence without the required retained
+including after a head change. Running PR reviews also refresh their open PR
+observation at that two-minute boundary without settling or replacing the original
+invocation. Fresh queue evidence without the required retained
 exact-head/context reviews surfaces a conflict in work diagnostics, naming the
 PR, head and queue entry. The next action directs removal from the queue and
 disabling auto-merge if enabled before reconciling the original review receipts;
 Resume alone cannot stop GitHub merging. Stale or incomplete observations do not
 emit this conflict. The hold and original receipts remain unchanged.
+The conflict stays actionable after a retained changes-requested verdict while
+the queue entry persists. It clears when qualifying review evidence is retained
+without current change requests, or a fresh observation finds the queue entry gone.
 
 Other successful quiescent observations schedule their next read at `checkedAt +
 min(24 hours, max(2 minutes, checkedAt - origin))`. Origin is the recorded actual
@@ -487,6 +518,14 @@ The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
 PR titles, issue-closing references or reply targets fail as unstarted work,
 rather than becoming ambiguous writes that never occurred.
+Validation and publication both return the existing no-write `superseded`
+outcome when GitHub confirms that the original owned PR merged at the repair's
+unchanged head, before rejecting a closed seed. The receipt retains the verified
+PR head even after branch deletion. The existing chain settles it only after
+resource release and records the observed merge. Unverified closures,
+ownership mismatches, contradictory evidence and unavailable reads remain
+errors with bounded, redacted v1 `caller_diagnostic` evidence identifying the
+failed check; arbitrary stderr remains inadmissible.
 After retaining the atomic plan, Caller records `preparing_publication` until
 the publication helper durably changes it to `publishing` before push or replies.
 A failed original still at that no-write checkpoint can become
@@ -591,7 +630,7 @@ breach sample (monotonic completion time). The separate 180-second reclamation
 bound remains unchanged. These component checks do not establish real-provider
 campaign acceptance or forced-container recovery.
 
-Known failures before publication retry with bounded backoff and existing provider fallback. Ambiguous writes retain ownership. Confirmed actual artifacts can settle a lost response; missing receipts cannot justify another write. Partially published review/reply plans that cannot be fully reconciled remain uncertain and visible. They are not silently retried or reported successful. This limitation must be exercised and resolved if encountered in the real validation runs.
+Known failures before publication retry with bounded backoff and existing provider fallback. After two settled native repairs on the current head, repair basis and selected model exhaust their execution budgets before publication, the existing third attempt uses the first eligible alternate in the configured repair candidates. Both original Calls must prove resource release and no publication. With no eligible alternate, ordinary selection remains. The original slot, basis, budget and three-attempt window survive model selection and restart; an alternate timeout reaches the existing hold/report path without a fourth automatic Call. This changes no global provider trip. Ambiguous writes retain ownership. Confirmed actual artifacts can settle a lost response; missing receipts cannot justify another write. Partially published review/reply plans that cannot be fully reconciled remain uncertain and visible. They are not silently retried or reported successful. This limitation must be exercised and resolved if encountered in the real validation runs.
 
 An implementation or repair provider that reaches its execution deadline records
 `atomic_work_execution_budget_exhausted`. Its v1 diagnostic retains the provider,

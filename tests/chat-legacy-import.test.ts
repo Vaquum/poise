@@ -324,7 +324,7 @@ describe('legacy conversation import', () => {
     const conversation = await readLegacyConversation('poise.card.7')
     expect(conversation.turns.map((turn) => turn.prompt)).toEqual(['first question', 'second question'])
     expect(mocks.calls).toEqual([
-      { file: 'agent-interface', args: ['--logs', '--without-progress'] },
+      { file: 'agent-interface', args: ['--logs', '--without-progress', '--changed-after', '0', '--limit', '2000'] },
       { file: 'agent-interface', args: ['--read-response', 'b'.repeat(32)] },
       { file: 'agent-interface', args: ['--read-response', 'a'.repeat(32)] },
     ])

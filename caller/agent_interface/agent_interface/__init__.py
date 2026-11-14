@@ -130,6 +130,26 @@ def init_db():
                      "and (resources_settled_at is null or resource_cleanup is not null)")
         conn.execute("create index if not exists calls_native_resource_pending on calls(id) "
                      "where source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)")
+        # Each insert and update gives its call the next change number, so a
+        # reader asks only for calls changed since the last one it saw
+        # (logs_changed). The triggers live in the file, so every writer, an
+        # older release included, numbers its changes.
+        if "change_seq" not in cols:
+            try:
+                conn.execute("alter table calls add column change_seq integer")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e):
+                    raise
+        conn.execute("create index if not exists calls_change_seq on calls(change_seq)")
+        if conn.execute("select 1 from calls where change_seq is null limit 1").fetchone():
+            conn.execute("update calls set change_seq = rowid where change_seq is null")
+        conn.execute("create trigger if not exists calls_change_insert after insert on calls begin "
+                     "update calls set change_seq = (select coalesce(max(change_seq), 0) + 1 from calls) "
+                     "where rowid = new.rowid; end")
+        conn.execute("create trigger if not exists calls_change_update after update on calls "
+                     "when new.change_seq is old.change_seq begin "
+                     "update calls set change_seq = (select coalesce(max(change_seq), 0) + 1 from calls) "
+                     "where rowid = new.rowid; end")
         duplicates = conn.execute(
             """select correlation_id, count(*) as uses
                from calls
@@ -876,6 +896,47 @@ def logs(status: str | None = None, without_progress: bool = False):
 
 
 LOGS_PAGE_LIMIT_MAX = 1000
+LOGS_CHANGED_LIMIT_MAX = 5000
+
+
+def logs_changed(after: int, limit: int, without_progress: bool = False) -> dict:
+    """The calls changed after change number `after`, in change order: each
+    with its rowid and change number, and its row exactly as the whole history
+    (logs) prints it. Every page also carries the whole history's order, every
+    call's rowid as logs sorts them, and the newest change number, read in the
+    same snapshot as its rows: a reader that holds each call's latest row puts
+    them in that order and has the whole history, without reading the
+    unchanged calls again. A newest number below what the reader saw means
+    the database was replaced, and it reads from 0. A running call's row
+    changes with the clock alone (its elapsed time), so every page also
+    carries every running call as it reads now."""
+    if type(after) is not int or after < 0:
+        raise ValueError("changed logs need a change number of 0 or more")
+    if type(limit) is not int or not 1 <= limit <= LOGS_CHANGED_LIMIT_MAX:
+        raise ValueError(f"changed logs limit must be 1..{LOGS_CHANGED_LIMIT_MAX}")
+    reap_interrupted()
+    with db() as conn:
+        conn.text_factory = _decode_history_text
+        conn.execute("begin")
+        rows = conn.execute(
+            f"select calls.rowid, calls.change_seq, {LOG_ROW_COLUMNS} from calls"
+            " where change_seq > ? order by change_seq limit ?", (after, limit + 1)).fetchall()
+        order = [row[0] for row in conn.execute("select rowid from calls order by started_at, rowid")]
+        newest = conn.execute("select coalesce(max(change_seq), 0) from calls").fetchone()[0]
+        running = conn.execute(
+            f"select calls.rowid, calls.change_seq, {LOG_ROW_COLUMNS} from calls where status='running'").fetchall()
+    more = len(rows) > limit
+    rows = rows[:limit]
+
+    def item(row) -> dict:
+        entry = _full_history_log_row(row)
+        if without_progress:
+            entry.pop("progress", None)
+        return {"rowid": row["rowid"], "seq": row["change_seq"], "row": entry}
+    changed = [item(row) for row in rows]
+    return {"rows": changed, "cursor": changed[-1]["seq"] if changed else after, "more": more, "order": order,
+            "newest": newest, "running": [item(row) for row in running]}
+
 LOGS_LATEST_QUERY = f"""select {LOG_ROW_COLUMNS} from calls
     where behavior=? and source=? and {LOG_OWNER_SQL}=?
       and repo is not null and repo != '' and pr_id is not null and pr_id != ''
@@ -2922,6 +2983,7 @@ behaviors:
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
   --logs --without-progress
+  --logs [--without-progress] --changed-after SEQ --limit 1..5000
   --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
   --diagnostics [after-sequence] [limit-1..10]
   --stop CALL_ID
@@ -3171,6 +3233,16 @@ def _main():
             except ValueError as error:
                 usage(error=str(error))
             print(json.dumps(selected, separators=(",", ":")))
+            return
+        rest = [arg for arg in sys.argv[2:] if arg != "--without-progress"]
+        if rest[:1] == ["--changed-after"]:
+            if len(rest) != 4 or rest[2] != "--limit" or len(sys.argv[2:]) - len(rest) > 1:
+                usage(error="changed logs take --changed-after SEQ --limit N, and --without-progress")
+            try:
+                payload = logs_changed(int(rest[1]), int(rest[3]), "--without-progress" in sys.argv[2:])
+            except ValueError as error:
+                usage(error=str(error))
+            print(json.dumps(payload, separators=(",", ":")))
             return
         if sys.argv[2:] == ["--without-progress"]:
             print(json.dumps(logs(without_progress=True), separators=(",", ":")))

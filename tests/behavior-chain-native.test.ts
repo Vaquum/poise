@@ -876,14 +876,15 @@ it('seeds roster draws and resolutions by the chain seed issue', async () => {
   expect(roster).toHaveBeenCalledWith('example/repo#7')
   const decision = { kind: 'invoke', behavior: 'review-issue', basis: '', actor: 'reviewer', reviewer, reason: '' } as const
   await operations.request(chain, observation, decision, 'test-id')
-  expect(resolve).toHaveBeenCalledWith(decision, 'example/repo#7')
+  expect(resolve).toHaveBeenCalledWith(decision, 'example/repo#7', chain, observation)
 })
 
 it('reads the seed issue, comments and publication inspection in one native process', async () => {
+  const remediation = { kind: 'empty_integration', verified: true, base: 'b'.repeat(40), duplicate: { number: 21, head: HEAD } }
   mocks.runFile.mockClear()
   mocks.runFile.mockImplementation(async () => ({ stdout: JSON.stringify({ repository: 'example/repo', issue_number: 7,
     actor: 'author', branch: 'poise/issue-7', issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
-    publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }) }))
+    publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, remediation }) }))
   const operations = nativeChainOperations({ login: 'example' } as Organization, {
     roster: async () => ({ issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
     resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
@@ -892,9 +893,18 @@ it('reads the seed issue, comments and publication inspection in one native proc
   })
   const observation = await operations.observe(chain)
   expect(observation.issue.commentIds).toEqual([])
+  expect(observation.remediation).toEqual(remediation)
   const native = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')
   expect(native).toHaveLength(1)
   expect(native[0][1]).toEqual(['--chain-seed', '#7', '--branch', 'poise/issue-7', '--token-user', 'author'])
+  const request = await operations.request(chain, { ...observation, pull: { number: 21, head: HEAD, headSince: Date.now(),
+    state: 'open', draft: false, merged: false, mergeSha: null, queueEntry: 'queued', queueRemoval: null, changesRequested: false,
+    unresolved: 0, approved: true, ready: true, reviewIds: [], reviewRevision: '', reviewReceipts: [], greyRuns: [],
+    pending: false, failing: [], conflict: false, behind: false } },
+  { kind: 'invoke', behavior: 'retire-pr', basis: chainBasis(['retire', remediation]), actor: 'author', reviewer: null, reason: 'covered' }, 'retirement')
+  if (!request) throw new Error('retirement must prepare a native close request')
+  expect(request.argv).toEqual(['--issue-work', '7', '--mode', 'retire', '--branch', chain.branch, '--pull-number', '21',
+    '--coverage-json', JSON.stringify(remediation), '--expected-head', HEAD, '--token-user', 'author'])
 })
 
 it('revalidates the retained original test evidence in the bounded seed observation, independently of reporting', async () => {

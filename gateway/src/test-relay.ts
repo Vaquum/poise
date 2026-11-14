@@ -107,6 +107,7 @@ const MAX_TREE_PART_BYTES = 64 * 1024 * 1024
 const MAX_DEPENDENCY_PART_BYTES = 8 * 1024 * 1024
 const UPLOAD_ATTEMPTS = 3
 const RUN_ID = /^[0-9a-f]{32}$/
+const MAX_RETIRED_RUNS = 1024
 // A job's start command names the relay it reports to, and its run.
 const JOB_OWNER = / (\S+)\/instance ([0-9a-f]{32}) /
 // Fetches and runs test-instance.cjs. Render splits a start command at spaces and mangles quotes, so this has
@@ -215,9 +216,22 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** What the logs say a run was, short of anything an argument might hold further on. */
+/** Only executable names and known suite names belong in logs, never argument values or command bodies. */
 function commandLabel(argv: string[]): string {
-  return argv.slice(0, 5).map((word) => word.split('/').at(-1)).join(' ').slice(0, 200)
+  const executable = argv[0].split('/').at(-1) ?? ''
+  const args = executable === 'npm' ? argv.slice(1)
+    : executable === 'node' && /^(npm|npm-cli\.js)$/.test(argv[1]?.split('/').at(-1) ?? '') ? argv.slice(2) : null
+  if (args) {
+    const words: string[] = []
+    for (let index = 0; index < args.length && args[index] !== '--' && words.length < 2; index += 1) {
+      if (/^(--prefix|-C|--workspace|-w)$/.test(args[index])) index += 1
+      else if (!args[index].startsWith('-')) words.push(args[index])
+    }
+    const script = /^(test|t|tst)$/.test(words[0] ?? '') ? 'test'
+      : /^(run|run-script|rum|urn)$/.test(words[0] ?? '') ? words[1] : undefined
+    if (script && ['test', 'test:full', 'test:e2e', 'check', 'lint', 'typecheck', 'typecheck:tests', 'verify'].includes(script)) return `npm run ${script}`
+  }
+  return executable.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64) || 'command'
 }
 
 function redactAssertions(value: unknown, secrets: string[]): unknown {
@@ -229,6 +243,7 @@ function redactAssertions(value: unknown, secrets: string[]): unknown {
 
 export class TestRelay {
   readonly runs = new Map<string, Run>()
+  private readonly retired = new Map<string, { handle: string; tokenDigest: Buffer | null }>()
   private readonly publicKey: KeyObject
   private readonly api: string
   private readonly owner: string
@@ -417,13 +432,21 @@ export class TestRelay {
   /** A warning reaches Poise's diagnostics, which keep only `error` of what a gateway operation says of itself. */
   private runFailed(run: Run, why: string): void {
     this.deps.log.warn('test_relay.run.failed', {
-      id: run.id, handle: run.handle, boxId: run.boxId, error: `${why} (workspace ${run.handle}, command ${commandLabel(run.spec.argv)})`,
+      id: run.id, handle: run.handle, boxId: run.boxId, error: `run ${run.id}, workspace ${run.handle}, command ${commandLabel(run.spec.argv)}: ${why}`,
     })
+  }
+
+  private retire(run: Run): boolean {
+    if (!this.runs.delete(run.id)) return false
+    // Cleanup and late job output can arrive while asynchronous box termination is still pending.
+    this.retired.set(run.id, { handle: run.handle, tokenDigest: run.job ? createHash('sha256').update(run.token).digest() : null })
+    if (this.retired.size > MAX_RETIRED_RUNS) this.retired.delete(this.retired.keys().next().value!)
+    return true
   }
 
   /** Ends a run that will report nothing more. The sweep terminates its box again if this fails. */
   private kill(run: Run, why: string, code = 125): void {
-    if (!this.runs.delete(run.id)) return
+    if (!this.retire(run)) return
     // What an agent or a restart stopped, or a move to a sandbox, is no failure of the runner.
     const failure = code !== 143 && why !== 'the gateway restarted' && why !== 'the workspace went away' && why !== USES_DOCKER
     if (failure) this.runFailed(run, why)
@@ -634,12 +657,25 @@ export class TestRelay {
     if (fromJob) {
       const run = RUN_ID.test(id ?? '') ? this.runs.get(id) : undefined
       // Unknown and ended look alike to a job, which stops at this answer.
-      if (!run || !this.isJob(req, run)) throw new RelayError(410, 'this run is over')
+      if (!run || !this.isJob(req, run)) {
+        const tokenDigest = !run ? this.retired.get(id)?.tokenDigest : null
+        if (req.method === 'POST' && url.pathname === `${TEST_RELAY_PATH}/runs/${id}/output` && tokenDigest
+          && timingSafeEqual(createHash('sha256').update(bearer(req)).digest(), tokenDigest)) {
+          res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
+          return
+        }
+        throw new RelayError(410, 'this run is over')
+      }
       await this.fromJob(req, res, url, run, part)
       return
     }
     const handle = this.presentedHandle(req)
     if (handle === null) throw new RelayError(401, 'this key is not a workspace\'s')
+
+    if (req.method === 'GET' && url.pathname === `${TEST_RELAY_PATH}/runs/probe/output`) {
+      res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
+      return
+    }
 
     if (req.method === 'POST' && !id) {
       const run = await this.createRun(handle, await readLimited(req, MAX_SPEC_BYTES))
@@ -648,7 +684,13 @@ export class TestRelay {
     }
 
     const run = RUN_ID.test(id ?? '') ? this.runs.get(id) : undefined
-    if (!run) throw new RelayError(410, 'this run is over')
+    if (!run) {
+      if (req.method === 'DELETE' && url.pathname === `${TEST_RELAY_PATH}/runs/${id}` && this.retired.get(id)?.handle === handle) {
+        res.writeHead(204).end()
+        return
+      }
+      throw new RelayError(410, 'this run is over')
+    }
     if (handle !== run.handle) throw new RelayError(403, 'this run is another workspace\'s')
 
     if (req.method === 'GET' && part === 'output') {
@@ -707,7 +749,7 @@ export class TestRelay {
       }
       // A run that was ended has ended its response too, and writing to that would bring down the gateway.
       if (this.runs.has(run.id) && run.output && body.length) await write(run.output, body)
-      if (isEnd && this.runs.delete(run.id)) {
+      if (isEnd && this.retire(run)) {
         const code = Number(url.searchParams.get('exit'))
         const noResult = url.searchParams.get('why')
         if (noResult) this.runFailed(run, noResult)
@@ -793,7 +835,7 @@ export class TestRelay {
         if (stream === 'stderr') tail = (tail + data).slice(-OUTPUT_TAIL_CHARS)
         return write(run.output, frame(stream === 'stderr' ? FRAME.stderr : FRAME.stdout, Buffer.from(data)))
       })
-      if (!this.runs.delete(run.id)) return
+      if (!this.retire(run)) return
       const noResult = code === RUNNER_FAILED ? NO_RESULT.exec(tail)?.[1] : undefined
       this.retainAssertions(run, code, noResult)
       if (noResult) this.runFailed(run, noResult)

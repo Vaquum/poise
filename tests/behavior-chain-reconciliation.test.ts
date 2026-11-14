@@ -455,6 +455,104 @@ it('preserves the person hold rather than replacing it with a merge-verification
   expect(journal.read(chain.id)?.held).toBe('New invocations held by the person')
 })
 
+it.each(['clean review', 'changes requested', 'capacity waiting'])(
+  'surfaces fresh queue admission immediately without replacing review ownership: %s', async mode => {
+    const { journal } = setup()
+    let chain = seed(journal)
+    const before = observation()
+    Object.assign(before.publication, { state: 'open', merged: false, merge_sha: null })
+    Object.assign(before.pull!, { state: 'open', merged: false, mergeSha: null, mergedAt: null,
+      approved: true, ready: true, checksState: 'SUCCESS', reviewIds: [99],
+      reviewReceipts: [{ id: 99, head: before.pull!.head, state: 'APPROVED', invocation: null }] })
+    const retained = completedReviewCall(chain.repository, 17, before.pull!.head, chain.reviewer)
+    const retainedAction = mode === 'capacity waiting' ? 'requested_changes' : 'reviewed_clean'
+    chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'retained-review', behavior: 'review-pr',
+      actor: chain.reviewer, model: retained.model, slot: reviewer.slot,
+      basis: chainBasis(['pr', before.pull!.head, before.pull!.reviewContext]), admittedAt: Date.parse(retained.started_at),
+      request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+    chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'retained-review', callId: retained.id,
+      outcome: mode === 'capacity waiting' ? 'changes_requested' : 'clean',
+      evidence: { status: 'completed', action: retainedAction, review_id: retained.review_id, head_sha: retained.head_sha,
+        artifact: retained.artifact, completedAt: NOW, resources_settled_at: retained.completed_at,
+        resource_ownership: { version: 1, roots: [], errors: [] } } })
+    before.pull!.reviewIds.push(91)
+    before.pull!.reviewReceipts.push({ id: 91, head: before.pull!.head,
+      state: mode === 'capacity waiting' ? 'CHANGES_REQUESTED' : 'COMMENTED', invocation: retained.id,
+      response: retained.artifact!.review_response, submittedAt: NOW })
+    if (mode === 'capacity waiting') {
+      before.pull!.head = before.publication.head_sha = 'd'.repeat(40)
+      before.pull!.reviewReceipts[0].head = before.pull!.head
+    } else before.prReviewers.push({ ...reviewer, slot: 'secondary' })
+    chain = record(journal, chain, { type: 'chain.observed', observation: structuredClone(before) })
+    const call: LogEntry = { ...completedReviewCall(chain.repository, 17, before.pull!.head, chain.reviewer),
+      id: 'e'.repeat(32), source: 'poise:behavior-chain', correlation_id: 'running-review', review_id: 92,
+      resource_ownership: { version: 1, roots: [], errors: [] } }
+    call.artifact!.review_response = { ...(call.artifact!.review_response as Record<string, unknown>), invocation_id: call.id }
+    const completed = structuredClone(call)
+    Object.assign(call, { status: 'running', action: null, outcome: null, review_id: null, head_sha: null, completed_at: null, artifact: null })
+    if (mode !== 'capacity waiting') {
+      chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: call.correlation_id!, behavior: 'review-pr',
+        actor: chain.reviewer, model: call.model, slot: 'secondary', basis: chainBasis(['pr', before.pull!.head, before.pull!.reviewContext]),
+        admittedAt: Date.parse(call.started_at), request: { command: 'agent-interface', cwd: '/fixture',
+          argv: ['--pr-review', 'https://github.com/acme/repo/pull/17', '--expected-head', before.pull!.head] } } })
+      chain = record(journal, chain, { type: 'invocation.started', invocationId: call.correlation_id! })
+    } else chain = record(journal, chain, { type: 'chain.waiting', reason: 'waiting for shared invocation capacity' })
+    const original = structuredClone(chain.invocations)
+    const queued = structuredClone(before)
+    queued.pull!.queueEntry = 'external-queue-entry'
+    const observe = vi.fn(async () => ({ ...structuredClone(queued), checkedAt: Date.now() }))
+    const launch = vi.fn(async () => true)
+    const runtime = new BehaviorChainRuntime(journal, operations({ observe, launch, enabled: () => true,
+      available: () => mode !== 'capacity waiting', permitted: () => true,
+      readInvocations: async () => ({ entries: mode === 'capacity waiting' ? [] : [call], quarantined: [] }) }))
+    if (mode !== 'capacity waiting') {
+      vi.setSystemTime(NOW + 119_999)
+      await runtime.run()
+      expect(observe).not.toHaveBeenCalled()
+      vi.setSystemTime(NOW + 120_000)
+    }
+    await runtime.run()
+    expect(observe).toHaveBeenCalledTimes(1)
+    const attention = behaviorChainAttention(journal, Date.now())
+    expect(attention).toHaveLength(1)
+    expect(attention[0].ageMs).toBe(0)
+    expect(attention[0].blocker).toContain('Queue admission conflicts with required retained Poise review evidence')
+    expect(attention[0].evidence.gates).toContain('Current-head approval observed')
+    expect(attention[0].nextAction).toContain(`PR acme/repo#17 head ${queued.pull!.head}, queue entry external-queue-entry`)
+    expect(attention[0].nextAction).toContain('remove it from the merge queue and disable auto-merge if enabled')
+    expect(journal.read(chain.id)).toMatchObject({ held: null, mergeSha: null, invocations: original })
+    for (const time of [Date.now() - 1, Date.now() + 120_001]) expect(behaviorChainAttention(journal, time)).toEqual([])
+    if (mode !== 'capacity waiting') {
+      await runtime.run()
+      expect(observe).toHaveBeenCalledTimes(1)
+      expect(journal.read(chain.id)!.invocations).toEqual(original)
+    }
+    queued.pull!.queueEntry = null
+    vi.setSystemTime(Date.now() + 120_000)
+    await runtime.run()
+    expect(behaviorChainAttention(journal, Date.now())).toEqual([])
+    expect(journal.read(chain.id)!.invocations).toEqual(original)
+    queued.pull!.queueEntry = 'external-queue-entry'
+    vi.setSystemTime(Date.now() + 120_000)
+    await runtime.run()
+    expect(behaviorChainAttention(journal, Date.now())).toHaveLength(1)
+    if (mode !== 'capacity waiting') {
+      Object.assign(call, completed, { completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString() })
+      if (mode === 'changes requested') {
+        call.action = 'requested_changes'; call.outcome = 'changes_requested'
+        queued.pull!.changesRequested = true; queued.pull!.approved = false
+      }
+      queued.pull!.reviewIds.push(92)
+      queued.pull!.reviewReceipts.push({ id: 92, head: queued.pull!.head,
+        state: mode === 'changes requested' ? 'CHANGES_REQUESTED' : 'COMMENTED', invocation: call.id,
+        response: call.artifact!.review_response, submittedAt: Date.now() })
+      await runtime.run()
+      expect(journal.read(chain.id)!.invocations.at(-1)).toMatchObject({ state: 'settled', callId: call.id })
+      expect(behaviorChainAttention(journal, Date.now())).toHaveLength(mode === 'changes requested' ? 1 : 0)
+    }
+    expect(launch).not.toHaveBeenCalled()
+  })
+
 it.each(['missing review', 'changed head', 'changed context', 'missing response', 'missing reviewer', 'retained reviews'])(
   'observes held queue admission before merge through ordinary scheduling: %s', async mode => {
     const { db, journal } = setup()

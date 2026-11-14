@@ -1,5 +1,6 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 import { normalize, type LogEvent } from '../../gateway/src/diagnostics/contract'
+import { gatewayDiagnostic } from '../../gateway/src/diagnostics/collectors'
 import { callerDiagnostic, workspaceEnvelope } from '../../gateway/src/diagnostics/sources'
 
 // Observe in the new interface (#556): Tasks with the chain's evidence,
@@ -43,7 +44,10 @@ const JOURNAL = [
   { sequence: 260, at: NOW - minutes(20), type: 'chain.waiting', reason: 'exact-head CI is still running' },
 ]
 
-interface Served { chainsFail?: boolean, posts?: unknown[], diagnostics?: ReturnType<typeof diagnostic>[] }
+interface Served {
+  chainsFail?: boolean, posts?: unknown[], diagnostics?: ReturnType<typeof diagnostic>[],
+  chains?: typeof CHAINS, attention?: typeof ATTENTION, next?: string, capacity?: Record<string, unknown> | null
+}
 async function serveChains(page: Page, served: Served = {}): Promise<void> {
   await page.route((url) => url.pathname === '/api/behavior-chains', async (route: Route) => {
     const url = new URL(route.request().url())
@@ -61,16 +65,18 @@ async function serveChains(page: Page, served: Served = {}): Promise<void> {
         nextAction: 'Reconcile the original invocation receipt before retrying', journal: '/api/behavior-chains?id=acme%2Fsite%23493&after=159',
       } : null) } })
     }
+    const chains = served.chains ?? CHAINS
     const meta = { cutover: { sequence: 1, mode: 'v2', requestedAt: null, legacyPulls: ['acme/site#471'], support: { status: 'supported', error: null }, blockers: [] },
       settings: { enabled: true, seedMode: 'label', label: 'poise' }, runtime: [],
-      capacity: { status: 'available', error: null, modelInvocationLimit: 8, reservedModelInvocations: 3, mode: 'v2', enabled: true, intake: { seedMode: 'label', label: 'poise' } } }
+      capacity: served.capacity !== undefined ? served.capacity : { status: 'available', error: null, modelInvocationLimit: 8,
+        reservedModelInvocations: 3, retainedModelInvocations: 1, mode: 'v2', enabled: true, intake: { seedMode: 'label', label: 'poise' } } }
     const id = url.searchParams.get('id')
     if (id) {
       const after = Number(url.searchParams.get('after') ?? 0)
       const events = (id === 'acme/site#493' ? JOURNAL : []).filter((e) => e.sequence > after).slice(0, 20)
-      return route.fulfill({ json: { chain: CHAINS.find((c) => c.id === id) ?? null, events, next: events.length === 20 ? events[19].sequence : null, ...meta } })
+      return route.fulfill({ json: { chain: chains.find((c) => c.id === id) ?? null, events, next: events.length === 20 ? events[19].sequence : null, ...meta } })
     }
-    return route.fulfill({ json: { chains: CHAINS, next: null, attention: ATTENTION, ...meta } })
+    return route.fulfill({ json: { chains: served.next ? chains.slice(0, 1) : chains, next: served.next ?? null, attention: served.attention ?? ATTENTION, ...meta } })
   })
 }
 
@@ -160,7 +166,7 @@ const logging = (page: Page) => page.locator('[data-panel="logging"]')
 
 test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest progress first, each saying how long', async ({ page }) => {
   await open(page, '/?view=observe&part=tasks')
-  await expect(tasks(page).locator('[data-ref="tk.status"]')).toContainText('v2 owns new work · 3 of 8 model runs in use, shared with other heavy work')
+  await expect(tasks(page).locator('[data-ref="tk.status"]')).toContainText('v2 owns new work · 3 of 8 model slots occupied across the workspace, shared with other heavy work · 1 retained for unresolved cleanup, awaiting original resource evidence')
   await expect(tasks(page).locator('[data-ref="tk.legacy"]')).toContainText('1 pull request kept by v1 at cutover')
   await expect(tasks(page).locator('.tk-row')).toHaveCount(4)
   await tasks(page).getByRole('button', { name: 'Needs attention 3' }).click()
@@ -180,6 +186,53 @@ test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest 
   await expect(head.locator('[data-ref="side.hold"]')).toContainText('Queue removal requires a decision')
   expect(query(page).chain).toBe('acme/site#501')
 })
+
+test('retained capacity stays workspace-wide beyond page one and attention opens its original evidence', async ({ page }) => {
+  const retained = chain(999, { pullNumber: null, held: 'original cleanup handle missing' }, [
+    { id: 'retained', behavior: 'implement-issue', state: 'uncertain', outcome: 'original resource release unverified' },
+  ])
+  const released = chain(998, { held: 'original publication receipt missing' }, [
+    { id: 'released', behavior: 'implement-issue', state: 'uncertain', outcome: 'original publication receipt missing' },
+  ])
+  const pending = attention(retained, minutes(30), 'original cleanup handle missing; original resource release unverified')
+  pending.nextAction = 'Reconcile the original invocation receipt before any retry'
+  await open(page, '/?view=observe&part=tasks', { chains: [CHAINS[0], released, retained], next: CHAINS[0].id,
+    attention: [attention(released, minutes(20), 'original publication receipt missing'), pending],
+    capacity: { status: 'available', modelInvocationLimit: 8, reservedModelInvocations: 2, retainedModelInvocations: 1 } })
+  const status = tasks(page).locator('[data-ref="tk.status"]')
+  await expect(tasks(page).locator('.tk-row')).toHaveCount(1)
+  await expect(status).toContainText('2 of 8 model slots occupied across the workspace')
+  await expect(status).toContainText('1 retained for unresolved cleanup, awaiting original resource evidence')
+  await page.locator('[data-menu="obv-org-menu"]').click()
+  await page.locator('#obv-org-menu [data-org="umbrella"]').click()
+  await expect(tasks(page).locator('.tk-row')).toHaveCount(0)
+  await expect(status).toContainText('2 of 8 model slots occupied across the workspace')
+  await expect(status).toContainText('1 retained for unresolved cleanup')
+  await page.locator('[data-menu="obv-org-menu"]').click()
+  await page.locator('#obv-org-menu [data-org=""]').click()
+  await tasks(page).getByRole('button', { name: 'Needs attention 2' }).click()
+  await expect(tasks(page).locator('.tk-row')).toHaveCount(2)
+  await tasks(page).locator('.tk-row').filter({ hasText: 'acme/site#999' }).click()
+  await expect(tasks(page).locator('[data-ref="tk.evidence"]')).toContainText(pending.blocker)
+  await expect(tasks(page).locator('[data-ref="tk.evidence"]')).toContainText(pending.nextAction)
+  await expect(tasks(page).locator('[data-ref="side.timeline"]')).toBeVisible()
+  expect(query(page).chain).toBe(retained.id)
+  await expect(status).toContainText('1 retained for unresolved cleanup')
+})
+
+for (const [label, capacity] of [
+  ['absent', null],
+  ['unavailable', { status: 'unavailable', error: 'journal unavailable', reservedModelInvocations: null, retainedModelInvocations: null }],
+  ['missing retained count', { status: 'available', modelInvocationLimit: 8, reservedModelInvocations: 3 }],
+] as const) {
+  test(`capacity evidence is unknown when ${label}`, async ({ page }) => {
+    await open(page, '/?view=observe&part=tasks', { capacity })
+    const status = tasks(page).locator('[data-ref="tk.status"]')
+    await expect(status).toContainText('retained cleanup count unknown')
+    await expect(status).not.toContainText('0 retained')
+    if (label !== 'missing retained count') await expect(status).toContainText('model capacity unavailable')
+  })
+}
 
 test('a notice’s journal link opens the task’s timeline at its step, newest first, with Resume where the hold is', async ({ page }) => {
   const posts: unknown[] = []
@@ -259,6 +312,20 @@ test('Logging’s entry addresses open the exact diagnostic, an incident or say 
 
   await page.goto('/?view=logging&event=evt_nope')
   await expect(logging(page).locator('[data-ref="lg.linked"]')).toContainText('The diagnostic link is invalid.')
+})
+
+test('Logging shows workspace disk usage and budget in the existing Warning detail', async ({ page }) => {
+  const event = normalize(gatewayDiagnostic('warn', 'disk.workspace.over_budget', {
+    handle: 'local', bytes: 189628338659, budget: 53687091200,
+  }), NOW)!
+  await open(page, `/?view=observe&part=logging&event=${event.id}`, { diagnostics: [{ ...event, occurrences: 1 }] })
+  const row = logging(page).locator(`tr[data-ev="${event.id}"]`)
+  await expect(row.locator('[data-ref="lg.severity"]')).toHaveText('Warning')
+  const detail = logging(page).locator(`#lg-detail-${event.id}`)
+  await expect(detail).toBeVisible()
+  const context = detail.locator('.lg-ev', { has: page.getByRole('heading', { name: 'Context · as recorded', exact: true }) }).locator('pre')
+  await expect(context).toContainText('"bytes": 189628338659')
+  await expect(context).toContainText('"budget": 53687091200')
 })
 
 test('Logging keeps review deadline group and budget causes in the existing event detail', async ({ page }) => {

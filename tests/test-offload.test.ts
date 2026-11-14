@@ -12,6 +12,9 @@ import { gzipSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
+import { createLogger } from '../gateway/src/log'
+import { gatewayDiagnostic } from '../gateway/src/diagnostics/collectors'
+import { normalize } from '../gateway/src/diagnostics/contract'
 import { filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
 import { BehaviorChainJournal, chainBasis, type ChainEvent } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
@@ -368,14 +371,20 @@ process.exitCode = 125`)
 
   it('take a Python test runner out of this machine, from any interpreter, and it never runs here', () => {
     const { hooks } = hooked(true)
+    writeFileSync(join(hooks, 'run.mjs'), `console.log(JSON.stringify(process.argv.slice(2)))
+console.error('[poise] fixture sender: relay unavailable')
+process.exitCode = 125`)
     const repo = temp()
     execFileSync('git', ['init', '-q', repo])
     const marker = join(repo, 'ran-here')
     mkdirSync(join(repo, 'pytest'))
+    writeFileSync(join(repo, 'pytest', '__init__.py'), '')
     writeFileSync(join(repo, 'pytest', '__main__.py'), `open(${JSON.stringify(marker)}, 'w')`)
     const result = spawnSync('python3', ['-m', 'pytest', '-q'], { cwd: repo, encoding: 'utf8', env: { ...process.env, PYTHONPATH: hooks } })
     expect(result.status).toBe(125)
-    expect(result.stderr).toContain('[poise]')
+    const args = JSON.parse(result.stdout) as string[]
+    expect(args.slice(args.indexOf('--') + 1)).toEqual(['python3', '-m', 'pytest', '-q'])
+    expect(result.stderr).toContain('[poise] fixture sender: relay unavailable')
     expect(existsSync(marker)).toBe(false)
   })
 
@@ -462,12 +471,15 @@ describe('a suite on a test box', () => {
   let snapshots: Map<string, Snapshot>
   let groups: string[]
   let terminated: string[]
+  let pendingTerminations: ServerResponse[] | null
+  let pendingCancellations: ServerResponse[] | null
   let setups: number
   let setupExit: number
   let setupMs: number
   let listLagMs: number
   let runBoxes: boolean
   let runJobs: boolean
+  let refuseTreeUploads: boolean
   let warnings: Record<string, unknown>[]
   let events: Record<string, unknown>[]
   let runners: { child: ChildProcess; done: Promise<unknown> }[]
@@ -542,6 +554,10 @@ describe('a suite on a test box', () => {
         mkdirSync(dirname(file), { recursive: true })
         const chunks: Buffer[] = []
         for await (const chunk of req) chunks.push(chunk as Buffer)
+        if (refuseTreeUploads && url.searchParams.get('path')?.startsWith('/tmp/poise-tree/')) {
+          res.writeHead(503).end('upload refused')
+          return
+        }
         writeFileSync(file, Buffer.concat(chunks))
         res.writeHead(200).end()
         return
@@ -574,7 +590,8 @@ describe('a suite on a test box', () => {
           job.status = 'canceled'
           job.child?.kill('SIGKILL')
         }
-        res.writeHead(job ? 200 : 404).end()
+        if (pendingCancellations) pendingCancellations.push(res)
+        else res.writeHead(job ? 200 : 404).end()
         return
       }
       const [, id, action, operation] = /^\/v1\/sandboxes\/([^/]+)\/?([^/]*)\/?(.*)$/.exec(path) ?? []
@@ -601,7 +618,8 @@ describe('a suite on a test box', () => {
         terminated.push(box.id)
         box.status = 'terminated'
         box.child?.kill('SIGKILL')
-        res.writeHead(204).end()
+        if (pendingTerminations) pendingTerminations.push(res)
+        else res.writeHead(204).end()
       } else if (box && action === 'files' && operation === 'upload/token') json(res, 200, { uri: `${renderOrigin}/connect/upload/${box.id}?path=${encodeURIComponent(url.searchParams.get('path') ?? '')}`, method: 'PUT', token: 't' })
       else if (box && action === 'runs' && operation === 'stream/token') json(res, 200, { uri: `${renderOrigin}/connect/run/${box.id}`, method: 'POST', token: 't' })
       else if (box && action === 'snapshots') {
@@ -647,6 +665,8 @@ describe('a suite on a test box', () => {
     snapshots = new Map()
     groups = []
     terminated = []
+    pendingTerminations = null
+    pendingCancellations = null
     setups = 0
     setupExit = 0
     setupMs = 0
@@ -657,6 +677,7 @@ describe('a suite on a test box', () => {
     runners = []
     runBoxes = true
     runJobs = true
+    refuseTreeUploads = false
     render = startRender()
     relayServer = undefined as unknown as Server
   })
@@ -935,6 +956,10 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
     expect(box).toMatchObject({ plan: '1c-2g', timeoutSeconds: 3660, idleTimeoutSeconds: 0 })
     await until(() => terminated.includes(box.id), 'the box to be terminated')
     expect(relay.runs.size).toBe(0)
+    const finished = events.find(({ event, boxId }) => event === 'test_relay.run.finished' && boxId === box.id)
+    expect(finished).toMatchObject({ exit: 7 })
+    expect((await fetch(`${relayUrl}/runs/${finished!.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } })).status).toBe(204)
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   })
 
   it('runs the command exactly as it was typed, with nothing of this workspace\'s hooks', async () => {
@@ -1149,6 +1174,132 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
     expect(relay.runs.size).toBe(0)
   })
 
+  it.each([false, true])('accepts owner cleanup after output closes while termination is pending (termination failure: %s)', async (failed) => {
+    await startAll()
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
+    const { id } = await created.json() as { id: string }
+    const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: `Bearer ${KEY}` } })
+    await until(() => relay.runs.get(id)?.ready === true, 'the box to be ready')
+    const box = runBox()
+    pendingTerminations = []
+    await output.body!.cancel()
+    await until(() => relay.runs.size === 0 && pendingTerminations!.length > 0, 'retirement before termination answers', 3_000)
+    expect(pendingTerminations).toHaveLength(1)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id, error: 'the workspace went away' }))
+    for (let repeat = 0; repeat < 2; repeat += 1) {
+      expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } })).status).toBe(204)
+    }
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+    expect(terminated.filter((boxId) => boxId === box.id)).toHaveLength(1)
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.box.terminate', boxId: box.id }))
+    const [termination] = pendingTerminations
+    pendingTerminations = null
+    if (failed) termination.destroy()
+    else termination.writeHead(204).end()
+    await until(() => [...events, ...warnings].some(({ event, boxId }) => boxId === box.id && event === (failed ? 'test_relay.box.terminate.failed' : 'test_relay.box.terminate')), 'the termination diagnostic', 3_000)
+    if (failed) expect(warnings).toContainEqual({ event: 'test_relay.box.terminate.failed', boxId: box.id, error: 'fetch failed' })
+    else expect(events).toContainEqual({ event: 'test_relay.box.terminate', boxId: box.id, status: 204 })
+  })
+
+  it.each([false, true])('discards authenticated late output while job cancellation is pending (cancellation failure: %s)', async (failed) => {
+    runJobs = false
+    await startAll({ baseService: 'crn-test' })
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
+    const { id } = await created.json() as { id: string }
+    const run = relay.runs.get(id)!
+    const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: `Bearer ${KEY}` } })
+    await until(() => run.boxId !== null, 'the job to be created')
+    pendingCancellations = []
+    await output.body!.cancel()
+    await until(() => relay.runs.size === 0 && pendingCancellations!.length > 0, 'retirement before cancellation answers', 3_000)
+    expect(pendingCancellations).toHaveLength(1)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id, error: 'the workspace went away' }))
+    const write = vi.spyOn(run.output!, 'write')
+    const body = Buffer.concat([Buffer.from([1, 0, 0, 0, 4]), Buffer.from('late')])
+    const response = await fetch(`${relayUrl}/runs/${id}/output?seq=1&end=1&exit=0`, {
+      method: 'POST', headers: { authorization: `Bearer ${run.token}` }, body: new Uint8Array(body),
+    })
+    expect(response.status).toBe(410)
+    expect(await response.text()).toBe('this run is over')
+    expect(write).not.toHaveBeenCalled()
+    expect(run.received).toBe(0)
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', id }))
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.job.cancel', jobId: run.boxId }))
+    const [cancellation] = pendingCancellations
+    pendingCancellations = null
+    if (failed) cancellation.destroy()
+    else cancellation.writeHead(200).end()
+    await until(() => [...events, ...warnings].some(({ event, jobId }) => jobId === run.boxId && event === (failed ? 'test_relay.job.cancel.failed' : 'test_relay.job.cancel')), 'the cancellation diagnostic', 3_000)
+    if (failed) expect(warnings).toContainEqual({ event: 'test_relay.job.cancel.failed', jobId: run.boxId, error: 'fetch failed' })
+    else expect(events).toContainEqual({ event: 'test_relay.job.cancel', jobId: run.boxId, status: 200 })
+  })
+
+  it('limits retirement evidence to owner cleanup and authenticated late output, and evicts it without occupying admission slots', async () => {
+    let allowed = true
+    await startAll({ maxRuns: 1, baseService: 'crn-test', isWorkspace: (handle) => handle === 'bob' || (handle === 'alice' && allowed) })
+    const headers = { authorization: `Bearer ${KEY}` }
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: '{"argv":["x"],"cwd":"/","env":{}}' })
+    const { id } = await created.json() as { id: string }
+    const token = relay.runs.get(id)!.token
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+
+    const otherHeaders = { authorization: `Bearer ${workspaceKey(privateKey, 'bob')}` }
+    const otherCreated = await fetch(`${relayUrl}/runs`, { method: 'POST', headers: otherHeaders, body: '{"argv":["x"],"cwd":"/","env":{}}' })
+    const otherId = (await otherCreated.json() as { id: string }).id
+    const otherToken = relay.runs.get(otherId)!.token
+    expect((await fetch(`${relayUrl}/runs/${otherId}`, { method: 'DELETE', headers: otherHeaders })).status).toBe(204)
+    expect((await fetch(`${relayUrl}/runs/${id}/output`, { method: 'POST', headers: { authorization: `Bearer ${token}` } })).status).toBe(410)
+    expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+
+    const forged = workspaceKey(generateKeyPairSync('ed25519').privateKey, 'alice')
+    for (const [method, path, key, status] of [
+      ['DELETE', `/runs/${id}`, '', 401],
+      ['DELETE', `/runs/${id}`, forged, 401],
+      ['DELETE', `/runs/${id}`, workspaceKey(privateKey, 'bob'), 410],
+      ['DELETE', `/runs/${'0'.repeat(32)}`, KEY, 410],
+      ['DELETE', `/runs/${id}/`, KEY, 410],
+      ['DELETE', `/runs/${id}/extra`, KEY, 410],
+      ['GET', `/runs/${id}/output`, KEY, 410],
+      ['POST', `/runs/${id}/lease`, KEY, 410],
+      ['POST', `/runs/${id}/output`, '', 410],
+      ['POST', `/runs/${id}/output`, 'wrong-token', 410],
+      ['POST', `/runs/${id}/output`, KEY, 410],
+      ['POST', `/runs/${id}/output`, otherToken, 410],
+      ['POST', `/runs/${'0'.repeat(32)}/output`, token, 410],
+      ['POST', `/runs/${id}/output/`, token, 410],
+      ['POST', `/runs/${id}/output/extra`, token, 410],
+      ['GET', `/runs/${id}/spec`, token, 410],
+      ['GET', `/runs/${id}/tree`, token, 410],
+      ['POST', `/runs/${id}/docker`, token, 410],
+    ] as const) {
+      const from = warnings.length
+      const response = await fetch(`${relayUrl}${path}`, { method, headers: { authorization: `Bearer ${key}` } })
+      expect(response.status).toBe(status)
+      await response.text()
+      expect(warnings.slice(from)).toContainEqual({ event: 'test_relay.request.failed', method, path: `${TEST_RELAY_PATH}${path}`, status,
+        error: status === 401 ? 'this key is not a workspace\'s' : 'this run is over' })
+    }
+    allowed = false
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(401)
+    allowed = true
+    let latest = id
+    for (let count = 0; count < 1024; count += 1) {
+      const response = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: '{"argv":["x"],"cwd":"/","env":{}}' })
+      expect(response.status).toBe(201)
+      latest = (await response.json() as { id: string }).id
+      expect((await fetch(`${relayUrl}/runs/${latest}`, { method: 'DELETE', headers })).status).toBe(204)
+    }
+    expect(relay.runs.size).toBe(0)
+    expect((await fetch(`${relayUrl}/runs/${latest}`, { method: 'DELETE', headers })).status).toBe(204)
+    expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(410)
+    expect(warnings).toContainEqual({ event: 'test_relay.request.failed', method: 'DELETE', path: `${TEST_RELAY_PATH}/runs/${id}`, status: 410, error: 'this run is over' })
+    expect((await fetch(`${relayUrl}/runs/${id}/output`, { method: 'POST', headers: { authorization: `Bearer ${token}` } })).status).toBe(410)
+    expect(warnings).toContainEqual({ event: 'test_relay.request.failed', method: 'POST', path: `${TEST_RELAY_PATH}/runs/${id}/output`, status: 410, error: 'this run is over' })
+  })
+
   it('destroys the box when the agent’s side goes quiet with its connection open', async () => {
     await startAll({ leaseMs: 300 })
     const { child, done } = suite(repository(), [process.execPath, '-e', 'console.log("up"); setInterval(() => {}, 1000)'])
@@ -1219,6 +1370,7 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
       expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([expect.objectContaining({ exit: 0 })])
       expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: originalId, error: 'the gateway restarted' }))
       expect(terminated).toContain(interrupted.id)
+      expect(warnings.filter(({ event, method, path }) => event === 'test_relay.request.failed' && method === 'GET' && path === `${TEST_RELAY_PATH}/runs/probe/output`)).toEqual([])
 
       // Model publication/remote observations only after the real runner's fresh complete result.
       append({ type: 'invocation.settled', invocationId: 'implementation', callId: 'implementation', outcome: 'published',
@@ -1552,25 +1704,87 @@ ${stderr}`
     expect(warnings.filter(({ event }) => event === 'test_relay.run.failed')).toEqual([])
   })
 
-  it('tells a suite too big for its memory from one that failed, and sends the agent to CI', async () => {
-    await startAll()
-    // The background sweep can warn before the run fails.
-    warnings.push({ event: 'test_relay.sweep.failed', error: 'unrelated sweep failure' })
-    const script = `console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
-    const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
-    expect(code).toBe(125)
-    expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
-    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
-    expect(stderr).toContain('let CI run the tests')
-    // Choosing tests is no job of an agent's.
-    expect(stderr).not.toContain('name a')
-    // Poise hears of it too, with what it needs to find the suite.
-    const [warning] = warnings.filter(({ event }) => event === 'test_relay.run.failed')
-    expect(warning.event).toBe('test_relay.run.failed')
-    expect(warning.error).toContain('this suite is too big for its test box: it ran out of memory')
-    expect(warning.error).toContain('workspace alice')
-    expect(warning.error).toContain('command node -e')
+  it('labels npm command structure without treating arbitrary script names or interpreter bodies as suites', async () => {
+    runJobs = false
+    await startAll({ baseService: 'crn-test' })
+    const cases: [string[], string][] = [
+      [['npm', 'test', '--', 'private-argument'], 'npm run test'],
+      [['npm', '--prefix=private-prefix', '-w', 'private-workspace', 'run', 'test:e2e', '--', 'private-argument'], 'npm run test:e2e'],
+      [['node', '/lib/npm-cli.js', '-C', 'private-prefix', '--workspace=private-workspace', 'run', 'check'], 'npm run check'],
+      [['node', '/bin/npm', 'run', 'check', '--', 'private-argument'], 'npm run check'],
+      [['npm', 'run', 'test-private-argument'], 'npm'],
+      [['sh', '-c', 'npm run check\nprivate-script', 'npm', 'run', 'check'], 'sh'],
+      [['node', '-e', 'private-script', '/lib/npm-cli.js', 'run', 'check'], 'node'],
+      [['python3', '-c', 'private-script', 'npm', 'run', 'check'], 'python3'],
+      [[`/tmp/${'x'.repeat(80)}\nprivate-name`], 'x'.repeat(64)],
+    ]
+    const headers = { authorization: `Bearer ${KEY}` }
+    for (const [argv, command] of cases) {
+      const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: JSON.stringify({ argv, cwd: '/', env: {} }) })
+      const { id } = await created.json() as { id: string }
+      const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers })
+      await until(() => events.some((event) => event.event === 'test_relay.run.created' && event.id === id), 'the labelled run to be created')
+      expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+      await output.arrayBuffer()
+      for (const event of ['test_relay.run.created', 'test_relay.run.killed']) expect(events).toContainEqual(expect.objectContaining({ event, id, command }))
+    }
+    expect(JSON.stringify({ events, warnings })).not.toContain('private-')
   })
+
+  it.each([null, 'crn-test'])('keeps memory warnings correlatable without logging command bodies with base service %s', async (baseService) => {
+    const lines: string[] = []
+    const diagnostics: ReturnType<typeof normalize>[] = []
+    const log = createLogger((line) => lines.push(line), (level, operation, fields) => diagnostics.push(normalize(gatewayDiagnostic(level, operation, fields))))
+    await startAll({ baseService, log })
+    // The background sweep can warn before the run fails.
+    log.warn('test_relay.sweep.failed', { error: 'unrelated sweep failure' })
+    const secret = 'opaque-relay-value-7zQ4mN8p'
+    expect(JSON.stringify(process.env)).not.toContain(secret)
+    const script = `const privateValue = '${secret}'\nconsole.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
+    const shell = `private_value='${secret}'\nprintf '%s\\n' 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory' >&2\nexit 134`
+    const repo = repository()
+    mkdirSync(join(repo, 'gateway'))
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ private: true, workspaces: ['gateway'] }))
+    writeFileSync(join(repo, 'gateway', 'package.json'), JSON.stringify({ name: 'gateway', scripts: { check: `"${process.execPath}" oom.cjs` } }))
+    writeFileSync(join(repo, 'gateway', 'oom.cjs'), script)
+    const commands: [string[], string][] = [
+      [[process.execPath, '-e', script, secret], 'node'],
+      [['/bin/sh', '-c', shell, 'private-shell-argument', secret], 'sh'],
+      [[process.execPath, realpathSync(join(dirname(process.execPath), 'npm')), '--prefix', repo, '--workspace', 'gateway', 'run', 'check', '--', secret], 'npm run check'],
+    ]
+    const headers = { authorization: `Bearer ${KEY}` }
+    for (const [argv, label] of commands) {
+      const { code, stderr } = await suite(repo, argv).done
+      expect(code).toBe(125)
+      expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
+      expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+      expect(stderr).toContain('let CI run the tests')
+      expect(stderr).not.toContain('name a')
+      const id = /, run ([a-f0-9]{32})/.exec(stderr)![1]
+      const message = `run ${id}, workspace alice, command ${label}: this suite is too big for its test box: it ran out of memory`
+      const records = lines.map((line) => JSON.parse(line))
+      expect(records).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', level: 'warn', id, error: message }))
+      for (const event of ['test_relay.run.created', 'test_relay.run.finished']) {
+        expect(records).toContainEqual(expect.objectContaining({ event, id, command: label, ...(event.endsWith('finished') ? { exit: 125 } : {}) }))
+      }
+      expect(diagnostics).toContainEqual(expect.objectContaining({ operation: 'test_relay.run.failed', severity: 'warning', visibility: 'operator',
+        workspace: null, message: `test_relay.run.failed: ${message}` }))
+      expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers })).status).toBe(204)
+
+      // Cancellation uses the same formatter, before any command has executed.
+      const created = await fetch(`${relayUrl}/runs`, { method: 'POST', headers, body: JSON.stringify({ argv, cwd: repo, env: {} }) })
+      const stopped = await created.json() as { id: string }
+      const output = await fetch(`${relayUrl}/runs/${stopped.id}/output`, { headers })
+      await until(() => lines.some((line) => { const record = JSON.parse(line); return record.event === 'test_relay.run.created' && record.id === stopped.id }), 'the cancelled run to be created')
+      expect((await fetch(`${relayUrl}/runs/${stopped.id}`, { method: 'DELETE', headers })).status).toBe(204)
+      await output.arrayBuffer()
+      expect(lines.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: stopped.id, command: label }))
+      unpacked = temp()
+    }
+    const output = JSON.stringify({ lines, diagnostics })
+    for (const excluded of [secret, 'const privateValue', 'private_value=', 'private-shell-argument', 'console.error', 'oom.cjs', repo]) expect(output).not.toContain(excluded)
+    expect(lines.map((line) => JSON.parse(line)).filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+  }, 20_000)
 
   it('fails loud when the box dies without a word', async () => {
     await startAll()
@@ -1584,6 +1798,22 @@ ${stderr}`
     expect(code).toBe(125)
     expect(stderr).toContain('no test result')
     expect(stderr).toContain('says nothing about your code')
+    const admission = /, run ([a-f0-9]{32})/.exec(stderr)
+    expect(admission).not.toBeNull()
+    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![1],
+      error: expect.stringContaining('the stream from the box ended before the command did') }))
+  })
+
+  it('warns when the checkout upload fails', async () => {
+    refuseTreeUploads = true
+    await startAll()
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done
+    expect(code).toBe(125)
+    expect(stderr).toContain('no test result: sending the checkout to the box failed:')
+    const admission = /, run ([a-f0-9]{32})/.exec(stderr)
+    expect(admission).not.toBeNull()
+    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![1],
+      error: expect.stringContaining('with HTTP 503: upload refused') }))
   })
 
   it('keeps a healthy run whose box took long to get, however far Render\'s list lags', async () => {
@@ -1689,7 +1919,7 @@ ${stderr}`
       config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', baseService: null, jobPlan: 'plan-crn-005', limitSeconds: 3600, maxRuns },
       privateKey,
       origin: () => relayOrigin,
-      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: (event: string, fields: Record<string, unknown>) => { warnings.push({ event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
@@ -1714,6 +1944,37 @@ ${stderr}`
     setupExit = 0
     expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
     expect(snapshots.size).toBe(1)
+  })
+
+  it('answers only the authenticated recovery probe without a failure warning or admitting a run', async () => {
+    await startAll()
+    const probe = '/runs/probe/output'
+    const reply = await fetch(`${relayUrl}${probe}`, { headers: { authorization: `Bearer ${KEY}` } })
+    expect(reply.status).toBe(410)
+    expect(reply.headers.get('content-type')).toBe('text/plain; charset=utf-8')
+    expect(await reply.text()).toBe('this run is over')
+    expect(relay.runs.size).toBe(0)
+    expect(warnings.filter(({ event, path }) => event === 'test_relay.request.failed' && path === `${TEST_RELAY_PATH}${probe}`)).toEqual([])
+
+    const forged = workspaceKey(generateKeyPairSync('ed25519').privateKey, 'alice')
+    for (const [method, path, key, status] of [
+      ['GET', probe, '', 401],
+      ['GET', probe, forged, 401],
+      ['GET', `/runs/${'0'.repeat(32)}/output`, KEY, 410],
+      ['GET', `${probe}/extra`, KEY, 410],
+      ['GET', `${probe}/`, KEY, 410],
+      ['HEAD', probe, KEY, 410],
+      ['POST', probe, KEY, 410],
+      ['GET', '/runs/probe/spec', KEY, 410],
+    ] as const) {
+      const from = warnings.length
+      const response = await fetch(`${relayUrl}${path}`, { method, headers: key ? { authorization: `Bearer ${key}` } : {} })
+      expect(response.status).toBe(status)
+      await response.text()
+      expect(warnings.slice(from)).toContainEqual({ event: 'test_relay.request.failed', method, path: `${TEST_RELAY_PATH}${path}`, status,
+        error: status === 401 ? 'this key is not a workspace\'s' : 'this run is over' })
+    }
+    expect(relay.runs.size).toBe(0)
   })
 
   it('accepts only a workspace\'s key, and each workspace only its own run', async () => {
@@ -1747,8 +2008,11 @@ ${stderr}`
     const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
     const { id } = await created.json() as { id: string }
     for (const authorization of [`Bearer ${KEY}`, `Bearer ${'0'.repeat(64)}`, '']) {
-      expect((await fetch(`${relayUrl}/runs/${id}/spec`, { headers: { authorization } })).status).toBe(410)
-      expect((await fetch(`${relayUrl}/runs/${id}/docker`, { method: 'POST', headers: { authorization } })).status).toBe(410)
+      for (const [method, part] of [['GET', 'spec'], ['POST', 'docker']]) {
+        const path = `/runs/${id}/${part}`
+        expect((await fetch(`${relayUrl}${path}`, { method, headers: { authorization } })).status).toBe(410)
+        expect(warnings).toContainEqual({ event: 'test_relay.request.failed', method, path: `${TEST_RELAY_PATH}${path}`, status: 410, error: 'this run is over' })
+      }
     }
     expect(relay.runs.has(id)).toBe(true)
     expect((await fetch(`${relayUrl}/instance`)).status).toBe(200)
@@ -1808,6 +2072,19 @@ describe('a job unpacking', () => {
 })
 
 describe('what a box starts from', () => {
+  it('provisions the workspace Python as the default interpreter for npm children', () => {
+    const runtime = readFileSync('deploy/runtime/Dockerfile', 'utf8')
+    const setup = readFileSync('gateway/src/test-box-setup.sh', 'utf8')
+    const uv = /ghcr.io\/astral-sh\/uv:([^ ]+)/.exec(runtime)?.[1]
+    const python = /RUN uv python install ([^ ]+)/.exec(runtime)?.[1]
+    const directory = /UV_PYTHON_INSTALL_DIR=([^ ]+)/.exec(runtime)?.[1]
+    expect(setup).toContain(`https://astral.sh/uv/${uv}/install.sh`)
+    expect(setup).toContain('UV_UNMANAGED_INSTALL=/usr/local/bin')
+    expect(setup).toContain(`UV_PYTHON_INSTALL_DIR=${directory} UV_PYTHON_BIN_DIR=/usr/local/bin uv python install --default ${python}`)
+    // The checkout's own interpreter lands on these paths, unpacked as uid 10001.
+    expect(setup).toContain('chown -R 10001:10001 /opt/python')
+  })
+
   it('has the Chromium this repository\'s Playwright expects', () => {
     const lock = JSON.parse(readFileSync('package-lock.json', 'utf8')) as { packages: Record<string, { version: string }> }
     expect(readFileSync('gateway/src/test-box-setup.sh', 'utf8')).toContain(`playwright@${lock.packages['node_modules/@playwright/test'].version} install`)

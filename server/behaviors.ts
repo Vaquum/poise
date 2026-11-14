@@ -89,6 +89,7 @@ import {
   renewPrOperationOwned,
   setBehaviorLaunchErrorOwned,
   setMeta as databaseSetMeta,
+  writeObservation,
   type BehaviorAgentLaunch,
   type BehaviorLaunchClaim,
   type CompletedApprovalBasisLaunch,
@@ -1714,17 +1715,23 @@ function settleClosedTargetFirings(results: DeadLetterReconcileResult[]): void {
 // launch are read. A reopened PR skips. The incident's retirement stamp is
 // the stable completion time so repeats settle to the same record.
 function settleClosedTargetHistoricalFirings(closed: ReadonlySet<string>): void {
-  const rows = cachedStatement(db, `
+  // Read from each closed pull request's own launches (idx_behavior_seen_target)
+  // to their superseded dead letters (idx_behavior_dead_letters_superseded);
+  // CROSS JOIN keeps that order, which SQLite would otherwise reverse.
+  // Dead letters are kept forever, and reading all of them for every closed
+  // pull request took 80-160 ms on production.
+  const select = cachedStatement(db, `
     SELECT seen.key AS behavior, seen.target AS target,
       seen.launch_repo AS repo, seen.launch_pr AS pr,
       seen.launch_correlation_id AS correlation_id, seen.launch_call_id AS call_id,
       dead.resolution_evidence AS resolution_evidence, dead.retired_at AS retired_at
     FROM behavior_seen AS seen
-    JOIN behavior_dead_letters AS dead
+    CROSS JOIN behavior_dead_letters AS dead
       ON dead.behavior = seen.key AND dead.target = seen.target
       AND dead.correlation_id = seen.launch_correlation_id
       AND dead.call_id = seen.launch_call_id
-    WHERE seen.key IN ('review-new-prs', 'approve-prs')
+    WHERE seen.launch_repo = ? AND seen.launch_pr = ?
+      AND seen.key IN ('review-new-prs', 'approve-prs')
       AND seen.claim_id = ''
       AND seen.launch_error IS NOT NULL
       AND seen.launch_outcome IS NULL
@@ -1732,7 +1739,11 @@ function settleClosedTargetHistoricalFirings(closed: ReadonlySet<string>): void 
       AND dead.resolution = 'superseded'
       AND dead.resolution_evidence LIKE '%"open":false%'
     ORDER BY dead.retired_at ASC, dead.id ASC
-  `).all() as Array<{
+  `)
+  const rows = [...closed].flatMap((ref) => {
+    const match = /^(.+)#(\d+)$/.exec(ref)
+    return match ? select.all(match[1], Number(match[2])) : []
+  }) as Array<{
     behavior: string, target: string, repo: string | null, pr: number | null,
     correlation_id: string | null, call_id: string | null,
     resolution_evidence: string, retired_at: string,
@@ -2997,8 +3008,8 @@ function reconcileClosedTargetIncidents(): Promise<void> {
   return pass
 }
 
-async function localCheckoutPath(owner: string, repo: string, number: number, head: string, actor: string): Promise<string> {
-  return resolveReviewCheckout(owner, repo, number, actor, head, behaviorSignal())
+async function localCheckoutPath(owner: string, repo: string, number: number, head: string, actor: string, reportFailure = true): Promise<string> {
+  return resolveReviewCheckout(owner, repo, number, actor, head, behaviorSignal(), reportFailure)
 }
 
 async function currentHeadSha(
@@ -4890,7 +4901,8 @@ async function fireApprove(
     return false
   }
   attachCheckSlotToClaim(claimId, checkSlot)
-  const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
+  const pwd = await withNoticeDiagnosticIdentity({ ...diagnosticIdentity()!, phase: 'checkout' },
+    () => localCheckoutPath(owner, repo, pr.number, expectedHead, actor, false))
   const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor, accounts)
   // The final lookup runs first: the gates below catch anything that changed
   // while it was out, including role swaps during the lookup itself. A Random
@@ -5066,8 +5078,11 @@ function approveCheckFresh(pr: DatastorePr, snapshot: ApproveCheckSnapshot): boo
   }
 }
 
+// A watermark the gate can lose: a commit lost to a power cut only checks the
+// pull request again, so it never waits for the disk on the server's thread
+// (up to 0.8 s on production).
 function recordApproveCheck(pr: DatastorePr, snapshot: ApproveCheckSnapshot): void {
-  setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() }))
+  writeObservation(() => setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() })))
 }
 
 // A dismissed approval that never gets re-selected is invisible without a
@@ -6806,7 +6821,10 @@ async function tickRerunGreyCi(): Promise<void> {
   // The scan completed: per-target failures above are recorded individually,
   // and this stamp proves the behavior itself is alive. A stale stamp with no
   // failures is a silent stop, not a quiet queue.
-  setMeta('behavior_rerun_grey_ci_last_success', new Date().toISOString())
+  // What the page shows as the last scan, written by every tick: a commit lost
+  // to a power cut only shows the tick before, so it never waits for the disk
+  // on the server's thread (up to 0.8 s on production).
+  writeObservation(() => setMeta('behavior_rerun_grey_ci_last_success', new Date().toISOString()))
 }
 
 // ── Close old pull requests ────────────────────────────────────────────
@@ -8238,6 +8256,7 @@ export interface BehaviorChainCapacity {
   status: 'available' | 'unavailable'
   error: string | null
   reservedModelInvocations: number | null
+  retainedModelInvocations: number | null
   modelInvocationLimit: number
   enabled: boolean | null
   mode: 'v1' | 'draining' | 'v2' | null
@@ -8259,7 +8278,7 @@ export function getBehaviorChainCapacity(): BehaviorChainCapacity {
     const admission = readBehaviorResourceAdmission()
     const mode = journal.cutover().mode
     return { status: 'available', error: null, modelInvocationLimit, processLocal,
-      reservedModelInvocations: usage.modelInvocations, mode,
+      reservedModelInvocations: usage.modelInvocations, retainedModelInvocations: usage.retainedModelInvocations, mode,
       enabled: settings.enabled && mode === 'v2' && nativeCleanupSupport().status === 'supported',
       resources: { budget: admission?.budget ?? null,
         reserved: { memoryBytes: usage.reservations.memoryBytes, diskBytes: usage.reservations.diskBytes },
@@ -8267,7 +8286,7 @@ export function getBehaviorChainCapacity(): BehaviorChainCapacity {
       intake: { seedMode: settings.seedMode, label: settings.seedMode === 'label' ? settings.label : null } }
   } catch (error) {
     return { status: 'unavailable', error: error instanceof Error ? error.message : String(error),
-      modelInvocationLimit, processLocal, reservedModelInvocations: null, mode: null, enabled: null, intake: null, resources: null }
+      modelInvocationLimit, processLocal, reservedModelInvocations: null, retainedModelInvocations: null, mode: null, enabled: null, intake: null, resources: null }
   }
 }
 
@@ -8311,7 +8330,7 @@ async function runBehaviorChains(): Promise<void> {
     }
     const operations = nativeChainOperations(org, {
       roster,
-      async resolve(decision, chainKey) {
+      async resolve(decision, chainKey, chain, observation) {
         if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
           const place = decision.behavior === 'review-issue' ? 'issue_review' : 'pr_review'
           const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), place, `${chainKey}:${place}:panel`)
@@ -8331,10 +8350,32 @@ async function runBehaviorChains(): Promise<void> {
         const slots = resolveSlots(catalog, getModelSettings().slots)
         const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
         const ordered = stored === 'random' ? [...MODEL_SLOTS] : MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(selected.slot))
+        const attempts = chain.invocations.filter(invocation => invocation.behavior === 'repair-pr' && invocation.basis === decision.basis
+          && invocation.slot === decision.reviewer?.slot && invocation.admissionSequence > chain.resumedAfterSequence
+          && invocation.evidence?.status !== 'deferred')
+        const exhausted = decision.behavior === 'repair-pr' && attempts.length === 2 && attempts.every(invocation => {
+          const evidence = invocation.evidence
+          const artifact = evidence?.artifact as Record<string, unknown> | null | undefined
+          const argv = invocation.request.argv
+          return invocation.state === 'settled' && !!invocation.callId && invocation.actor === decision.actor
+            && invocation.model === selected.model && invocation.slot === selected.slot
+            && invocation.request.context?.head === observation.pull?.head
+            && invocation.request.context?.reviewRevision === observation.pull?.reviewRevision
+            && argv.includes('--expected-issue-revision') && argv[argv.indexOf('--expected-issue-revision') + 1] === observation.issue.revision
+            && evidence?.status === 'failed' && evidence.action === 'not_started' && evidence.outcome === 'preflight_failed'
+            && evidence.error_code === 'atomic_work_execution_budget_exhausted'
+            && artifact?.phase === 'executing'
+            && [artifact.plan_sha, artifact.publication_head, artifact.replies_started, artifact.publication, artifact.result,
+              artifact.receipts, evidence.receipts, evidence.review_id, evidence.head_sha, evidence.publicationPlan,
+              evidence.publicationResume, evidence.publicationReceipt, evidence.nativeActionReceipt].every(value => value == null)
+            && resourceReleaseProven(evidence, true)
+        })
         const candidates = [selected.model, ...ordered.map((slot) => slots[slot])]
-        const model = candidates.find((identity) => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
+          .filter(identity => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
+        // Spend the existing final attempt on an alternate without changing its retry slot or basis.
+        const model = (exhausted ? candidates.find(identity => identity !== selected.model) : null) ?? candidates[0]
         if (!model || !claimReviewerTripProbe(model)) return null
-        const slot = stored === 'random' ? (MODEL_SLOTS.find((candidate) => slots[candidate] === model) ?? selected.slot) : selected.slot
+        const slot = stored === 'random' && !exhausted ? (MODEL_SLOTS.find((candidate) => slots[candidate] === model) ?? selected.slot) : selected.slot
         return { slot, model, recovery: model }
       },
       async prepare(identities) {
@@ -8979,21 +9020,48 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
 export function getBehaviorDiagnosticIncidents(snapshot: AgentLogSnapshot | null) {
   const scoped = () => {
     const failed = BEHAVIOR_KEYS.flatMap((behavior) => failedBehaviorLaunches(behavior))
-    return behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot,
-      [...BEHAVIOR_KEYS.flatMap((behavior) => listBehaviorLaunchClaims(behavior)), ...failed])
-    // A held row shows when its automatic retry runs: the failure clock for
-    // this exact attempt, never a newer attempt's clock on an older row.
+    const launches = [...BEHAVIOR_KEYS.flatMap((behavior) => listBehaviorLaunchClaims(behavior)), ...failed]
+    return behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot, launches)
+    // A failure clock identifies an attempt, but does not authorize its retry.
     .map((incident): typeof incident & { nextRetryAt?: string } => {
       const stopped = incident.error === REVIEW_BUDGET_STOPPED
       const launch = failed.find((claim) => claim.key === incident.behavior && claim.target === incident.target
         && claim.launchCallId === incident.callId && claim.launchCorrelationId === incident.correlationId
         && !claim.launchQuarantine)
       const refusal = launch && getMeta(`${META_PREFIX}review_recovery:${launch.key}:${launch.target}:${launch.launchCallId}:${launch.launchCorrelationId}`)
-      const current = refusal ? { ...incident, error: `${incident.error} ${refusal}` } : incident
+      const unresolved = snapshot?.entries.some((call) => call.id === incident.callId && call.action === null && call.outcome === null)
+        || snapshot?.quarantined.some((call) => call.id === incident.callId)
+      const current = refusal ? { ...incident, error: `${incident.error} ${refusal}` }
+        : launch && unresolved && !stopped && (incident.behavior === 'review-new-prs' || incident.behavior === 'approve-prs')
+          ? { ...incident, error: `${incident.error} Publication disposition unverified for Call ${incident.callId}. Inspect the original Call and reconcile publication before retrying.` } : incident
       if (stopped || !incident.callId
         || !(BEHAVIOR_KEYS as readonly string[]).includes(incident.behavior)) return current
       const failure = readBehaviorFailure(incident.behavior as BehaviorKey, incident.target)
       if (failure?.callId !== incident.callId) return current
+      if (incident.behavior === 'review-new-prs' || incident.behavior === 'approve-prs') {
+        const call = snapshot?.entries.find((row) => row.id === incident.callId)
+        if (!snapshot || !call || !unambiguousAgentCall(snapshot, call)
+          || call.behavior !== upstreamBehavior(incident.behavior)
+          || !incident.repo || incident.pr === null || call.repo !== incident.repo || String(call.pr_id) !== String(incident.pr)
+          || !incident.actor || call.actor?.toLowerCase() !== incident.actor.toLowerCase()
+          || incident.source !== `poise:${incident.behavior}` || call.source !== incident.source
+          || !incident.correlationId || call.correlation_id !== incident.correlationId
+          || !call.expected_head || !SHA_PATTERN.test(call.expected_head) || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase())
+          || call.action !== 'not_started' || call.outcome !== 'preflight_failed'
+          || !postedNothing(call) || call.review_comments != null || refusal
+          || launches.some((claim) => (claim.launchCallId === call.id || claim.launchCorrelationId === call.correlation_id)
+            && (claim.key !== incident.behavior || claim.target !== incident.target
+              || claim.launchQuarantine || claim.launchExpectedHead !== call.expected_head
+              || claim.launchActor.toLowerCase() !== call.actor?.toLowerCase() || claim.launchRepo !== call.repo
+              || String(claim.launchPr) !== String(call.pr_id) || claim.launchBehavior !== call.behavior
+              || claim.launchSource !== call.source || claim.launchCorrelationId !== call.correlation_id
+              || claim.launchCallId !== call.id || !Number.isFinite(Date.parse(claim.launchRequestedAt))
+              || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)))
+          || call.error_code === 'invalid_agent_result' || call.error_code === 'review_packet_too_large'
+          || boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call)
+          || prReviewRetryState(snapshot, incident.behavior, incident.repo, incident.pr, call.expected_head,
+            incident.actor, call.model, incident.target).stopped) return current
+      }
       return { ...current, nextRetryAt: new Date(failure.nextRetryAtMs).toISOString() }
     })
   }

@@ -399,13 +399,51 @@ it('keeps durable model reservations visible after replacing the process-local s
   current = record(journal, current, { type: 'invocation.uncertain', invocationId: 'surviving-model', reason: 'native process ownership unresolved' })
   runtime.setBehaviorCheckSlots(new CheckSemaphore(() => 4))
   expect(runtime.getBehaviorCheckSlots().stats().running).toBe(0)
-  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'available', reservedModelInvocations: 1,
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'available', reservedModelInvocations: 1, retainedModelInvocations: 1,
     modelInvocationLimit: 3, enabled: true, mode: 'v2', intake: { seedMode: 'label', label: 'work-ready' },
     processLocal: { behaviorRunning: 0 }, resources: { unaccounted: 1 } })
   record(journal, current, { type: 'invocation.reconciled', invocationId: 'surviving-model',
     evidence: { resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
-  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 0 })
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 0, retainedModelInvocations: 0 })
   expect(journal.read(chain.id)!.invocations[0].state).toBe('uncertain')
+})
+
+it('counts retained cleanup across pages without counting released publication uncertainty or changing holds', async () => {
+  const { runtime, journal, chain, obs } = await setup()
+  const invocation = { id: 'live', behavior: 'repair-pr' as const, actor: chain.author, model: 'fixture', slot: 'primary',
+    basis: 'repair', admittedAt: Date.now(), request: { command: 'agent-interface' as const, cwd: '/fixture', argv: [], nativeResources: 2 as const } }
+  const live = record(journal, chain, { type: 'invocation.admitted', invocation })
+  record(journal, live, { type: 'invocation.started', invocationId: invocation.id })
+  for (let issue = 1000; issue < 1101; issue++) journal.append(chainIdentity(pr.repo, issue), `seed-${issue}`, 0, {
+    type: 'chain.admitted', repository: pr.repo, issue, branch: `poise/issue-${issue}`, author: chain.author, reviewer: chain.reviewer })
+  const release = { resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } }
+  for (const issue of [998, 999]) {
+    let target = journal.append(chainIdentity(pr.repo, issue), `seed-${issue}`, 0, { type: 'chain.admitted', repository: pr.repo,
+      issue, branch: `poise/issue-${issue}`, author: chain.author, reviewer: chain.reviewer })
+    target = record(journal, target, { type: 'chain.observed', observation: { ...obs, pull: null,
+      publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } } })
+    target = record(journal, target, { type: 'invocation.admitted', invocation: { ...invocation, id: `uncertain-${issue}` } })
+    target = record(journal, target, { type: 'invocation.uncertain', invocationId: `uncertain-${issue}`, reason: 'original publication receipt missing' })
+    if (issue === 998) target = record(journal, target, { type: 'invocation.resources_reconciled', invocationId: `uncertain-${issue}`, evidence: release })
+    record(journal, target, { type: 'chain.held', reason: 'original publication receipt missing' })
+  }
+  let retained = journal.read(chainIdentity(pr.repo, 999))!
+  expect(journal.page().map(entry => entry.id)).not.toContain(retained.id)
+  const before = journal.history(retained.id)
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 2, retainedModelInvocations: 1 })
+  expect(journal.liveModelInvocationCount()).toBe(2)
+  expect(journal.modelCapacityAvailable(2)).toBe(false)
+  expect(journal.history(retained.id)).toEqual(before)
+  retained = record(journal, retained, { type: 'invocation.reconciled', invocationId: 'uncertain-999',
+    evidence: { ...release, resource_ownership: { version: 1, roots: [], errors: [], process_pending: true } } })
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 2, retainedModelInvocations: 1 })
+  journal.rebuild()
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 2, retainedModelInvocations: 1 })
+  record(journal, retained, { type: 'invocation.resources_reconciled', invocationId: 'uncertain-999', evidence: release })
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 1, retainedModelInvocations: 0 })
+  for (const issue of [998, 999]) expect(journal.read(chainIdentity(pr.repo, issue))).toMatchObject({
+    held: 'original publication receipt missing', invocations: [{ state: 'uncertain', outcome: 'original publication receipt missing' }] })
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
 })
 
 it('reports budget exhaustion from the same reservation snapshot that refuses another admission', async () => {
@@ -439,14 +477,14 @@ it('keeps a full durable ceiling distinct from an empty in-memory semaphore and 
     processLocal: { behaviorRunning: 0, allRunning: 0 } })
   expect(journal.modelCapacityAvailable(1)).toBe(false)
   vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', 'invalid')
-  try { expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'unavailable', reservedModelInvocations: null }) }
+  try { expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'unavailable', reservedModelInvocations: null, retainedModelInvocations: null }) }
   finally { vi.unstubAllEnvs() }
 })
 
 it('reports unavailable capacity as unknown instead of free', async () => {
   const { db, runtime, chain } = await setup()
   db.db.prepare("UPDATE behavior_chain_current SET state = json_set(state, '$.held', 'unrecorded change') WHERE chain_id = ?").run(chain.id)
-  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'unavailable', reservedModelInvocations: null, enabled: null })
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'unavailable', reservedModelInvocations: null, retainedModelInvocations: null, enabled: null })
 })
 
 it('looks up a target beside 1,000 historical chains without loading their projections', async () => {
