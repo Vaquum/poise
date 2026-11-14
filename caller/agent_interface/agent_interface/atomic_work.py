@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -284,7 +285,10 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                                       *(["--merge-base"] if merge_base else []), seconds=1800)
     if prepared.get("outcome") != "prepared":
         return prepared
-    record({"phase": "prepared", "prepared": prepared})
+    test_capture = {"call": call_id, "nonce": secrets.token_hex(32), "repository": repo, "base": prepared["checkout_head"]}
+    record({"phase": "prepared", "prepared": prepared, "test_capture": test_capture})
+    test_evidence = work / "test-evidence"
+    test_evidence.mkdir(mode=0o700)
     evidence = {}
     required_reply_ids: set[int] = set()
     if pull is not None:
@@ -345,7 +349,9 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "testDependency: {base: prepared.checkout_head, run: original producing CI run ID, baselineRun: a distinct CI run ID "
         "on that exact base, remediation: existing repository GitHub issue URL}. Caller independently reads the complete "
         "assertion artifacts and requires every original failure/cause on the exact base. Keep blocked as the concrete string. "
-        "Do not use this for candidate-specific failures, other blockers, or relay output without authoritative original CI evidence. "
+        "Relay assertion proof is currently held for #1619: candidate-controlled reports cannot authorize recovery. "
+        "Do not use source 'relay'; worker text and historical relay output cannot substitute. "
+        "Do not use the CI dependency for candidate-specific failures or other blockers. "
         'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
         "Use a string for every other blocker, including missing evidence, a product decision or uncertain publication. "
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
@@ -353,6 +359,8 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
     )
     progress.stage("preparing_provider", "Preparing the atomic provider command")
     args, stdin, env = issue_review.command(model, instruction, checkout, work, seconds, UNATTENDED)
+    env = dict(os.environ if env is None else env)
+    env.update(POISE_TEST_BINDING=json.dumps(test_capture), POISE_TEST_EVIDENCE_DIR=str(test_evidence))
     lease = checkout_lock.Lease(str(checkout), call_id, f"atomic behavior {repo}#{number} ({call_id[:8]})", owner_kind="caller:repair-pr" if pull else "caller:implement-issue")
     with checkout_lock.interruptible():
         progress.stage("acquiring_checkout", "Acquiring the atomic checkout lease")
@@ -400,6 +408,17 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                             or dependency.get("remediation") == f"https://github.com/{repo}/issues/{number}":
                         raise AtomicWorkBlocked(f"{blocked}; test dependency does not identify the original checkout base and external remediation")
                     try:
+                        if dependency.get("source") == "relay":
+                            receipts = {}
+                            for key, name in (("run", "original"), ("baselineRun", "baseline")):
+                                ident = dependency.get(key)
+                                if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{32}", ident):
+                                    raise ValueError("relay dependency requires original completed runner IDs")
+                                path = test_evidence / f"{ident}.json"
+                                if path.stat().st_size > 48 * 1024:
+                                    raise ValueError("relay assertion receipt is oversized")
+                                receipts[name] = json.loads(path.read_text())
+                            dependency = {**dependency, "capture": test_capture, "relay": receipts}
                         verified = issue_review.interface("--chain-seed", f"#{number}", "--repository", repo, "--branch", branch,
                                                           "--token-user", actor, "--test-dependency-json", json.dumps(dependency))
                     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:

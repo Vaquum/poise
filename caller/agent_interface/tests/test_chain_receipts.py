@@ -1184,6 +1184,60 @@ class AtomicWorkLimits(TestCase):
                         "failures": [{"name": "Caller", "check": 41, "job": 42, "run": 40, "workflow": 1, "attempt": expected,
                                       "url": check["url"]}]})
 
+    def test_relay_dependency_uses_original_caller_binding_and_retained_runner_receipts(self):
+        for index, missing in enumerate((False, True)):
+            dependency = {"source": "relay", "base": HEAD, "run": "1" * 32, "baselineRun": "2" * 32,
+                          "remediation": "https://github.com/example/repo/issues/1530"}
+            captured, verified = {}, {}
+
+            def interface(*args, **_kwargs):
+                if args[0] == "--issue-work":
+                    return {"outcome": "prepared", "checkout_head": HEAD}
+                actual = json.loads(args[args.index("--test-dependency-json") + 1])
+                self.assertEqual(actual["capture"], captured)
+                self.assertEqual(actual["relay"], {name: {"payload": name, "signature": "runner signature"}
+                                                 for name in ("original", "baseline")})
+                verified.update(actual, verified=True, runAttempt=1, baselineAttempt=1,
+                                failures=[{"file": "tests/test-relay.test.ts", "test": "warning", "cause": "expected []"}])
+                return {"test_dependency": verified}
+
+            def worker(_lease, _args, **kwargs):
+                captured.update(json.loads(kwargs["env"]["POISE_TEST_BINDING"]))
+                for key, name in (("run", "original"), ("baselineRun", "baseline")):
+                    if missing and name == "original":
+                        continue
+                    receipt = Path(kwargs["env"]["POISE_TEST_EVIDENCE_DIR"]) / f"{dependency[key]}.json"
+                    receipt.write_text(json.dumps({"payload": name, "signature": "runner signature"}))
+                (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                    "blocked": "Original relay assertion failed", "testDependency": {**dependency,
+                    "capture": {"call": "worker-selected"}, "relay": {"original": "worker text"}}}))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def execute():
+                # Exercise the CLI finalizer with the existing library scope;
+                # native namespace admission has its own contract tests.
+                with patch.object(api, "_native_cli", False):
+                    self.run_behavior(correlation_id=f"00000000-0000-4000-8000-00000000001{index}")
+
+            with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                    patch.object(issue_review, "interface", side_effect=interface), \
+                    patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                    patch.object(issue_review, "_terminal_failure", return_value=None), \
+                    patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                    patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                    patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                    patch.object(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source", "poise:behavior-chain"]), \
+                    patch.object(api, "_main", side_effect=execute), \
+                    self.assertRaisesRegex(ValueError, "Original relay assertion failed"):
+                api.main()
+            with sqlite3.connect(self.path) as conn:
+                call, artifact, settled = conn.execute("select id,artifact,resources_settled_at from calls order by rowid desc limit 1").fetchone()
+            artifact = json.loads(artifact)
+            self.assertEqual(captured["call"], call)
+            self.assertEqual(artifact["test_capture"], captured)
+            self.assertEqual(artifact.get("test_dependency"), None if missing else verified)
+            self.assertIsNotNone(settled)
+
     def test_ci_only_blocker_drops_check_summaries_to_fit_the_receipt_limit(self):
         failing = [{"type": "check_run", "name": f"unit-{index}", "state": "completed", "conclusion": "failure",
                     "check_run_id": 41 + index, "log_id": 42 + index,

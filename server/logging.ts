@@ -125,12 +125,22 @@ async function collectCaller(): Promise<void> {
     for (const row of page.events) {
       const input = callerDiagnostic(row, workspace)
       if (input) {
-        while (runtime.health().queued) if (!runtime.flush()) break
+        // Let maintenance HTTP requests progress between durable 100-event batches.
+        while (runtime.health().queued) {
+          if (!runtime.flush()) break
+          if (runtime.health().queued) await new Promise<void>((resolve) => setImmediate(resolve))
+        }
         if (!diagnostic(input)) throw new Error('Caller diagnostic delivery is buffered or unavailable')
-        while (runtime.health().queued) if (!runtime.flush()) break
+        while (runtime.health().queued) {
+          if (!runtime.flush()) break
+          if (runtime.health().queued) await new Promise<void>((resolve) => setImmediate(resolve))
+        }
       }
     }
-    while (runtime.health().queued) if (!runtime.flush()) break
+    while (runtime.health().queued) {
+      if (!runtime.flush()) break
+      if (runtime.health().queued) await new Promise<void>((resolve) => setImmediate(resolve))
+    }
     // Do not acknowledge a Caller completion until its durable local transaction succeeds.
     if (runtime.health().error || runtime.health().queued) throw new Error('Caller diagnostic checkpoint waits for durable ingestion')
     sequence = page.cursor

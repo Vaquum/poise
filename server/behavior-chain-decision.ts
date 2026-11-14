@@ -66,15 +66,26 @@ export function implementationTestDependency(invocation: ChainInvocation) {
   const evidence = invocation.evidence
   const artifact = evidence?.artifact as Record<string, unknown> | undefined
   const prepared = artifact?.prepared as Record<string, unknown> | undefined
-  const proof = artifact?.test_dependency as { verified: boolean, base: string, run: number, runAttempt: number,
-    baselineRun: number, baselineAttempt: number, remediation: string, failures: Array<{ file: string, test: string, cause: string }> } | undefined
+  const proof = artifact?.test_dependency as { verified: boolean, base: string, run: number | string, runAttempt: number,
+    baselineRun: number | string, baselineAttempt: number, remediation: string, source?: string,
+    capture?: { call: string, nonce: string, repository: string, base: string }, candidate?: string, baselineCapture?: string,
+    relay?: { original: { payload: string, signature: string }, baseline: { payload: string, signature: string } },
+    failures: Array<{ file: string, test: string, cause: string }> } | undefined
+  const relay = proof?.source === 'relay'
+  const validRuns = relay ? [proof.run, proof.baselineRun].every(id => typeof id === 'string' && /^[a-f0-9]{32}$/.test(id))
+    && proof.capture?.call === invocation.callId && chainBasis(proof.capture) === chainBasis(artifact?.test_capture)
+    && proof.capture?.base === proof.base && /^[a-f0-9]{64}$/.test(proof.capture.nonce)
+    && [proof.candidate, proof.baselineCapture].every(digest => typeof digest === 'string' && /^[a-f0-9]{64}$/.test(digest))
+    && proof.candidate !== proof.baselineCapture
+    && [proof.relay?.original, proof.relay?.baseline].every(receipt => typeof receipt?.payload === 'string' && typeof receipt.signature === 'string')
+    : proof && [proof.run, proof.baselineRun].every(id => Number.isSafeInteger(id) && Number(id) > 0)
   if (invocation.behavior !== 'implement-issue' || evidence?.status !== 'failed' || evidence.action !== 'not_started'
     || evidence.outcome !== 'preflight_failed' || evidence.error_code !== 'atomic_work_blocked' || artifact?.phase !== 'executing'
     || [artifact.plan_sha, artifact.publication_head, artifact.replies_started, artifact.publication, artifact.result,
       artifact.receipts, evidence.receipts, evidence.review_id, evidence.head_sha, evidence.publicationPlan,
       evidence.publicationResume, evidence.publicationReceipt, evidence.nativeActionReceipt].some(value => value != null)
     || !proof || proof.verified !== true || !/^[a-f0-9]{40}$/.test(proof.base) || prepared?.checkout_head !== proof.base
-    || ![proof.run, proof.runAttempt, proof.baselineRun, proof.baselineAttempt].every(id => Number.isSafeInteger(id) && id > 0)
+    || !validRuns || ![proof.runAttempt, proof.baselineAttempt].every(id => Number.isSafeInteger(id) && id > 0)
     || proof.run === proof.baselineRun || typeof proof.remediation !== 'string'
     || !Array.isArray(proof.failures) || !proof.failures.length || proof.failures.some(failure =>
       !failure || typeof failure.file !== 'string' || !failure.file || typeof failure.test !== 'string' || !failure.test

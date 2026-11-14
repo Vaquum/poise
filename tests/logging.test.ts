@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import Database from 'better-sqlite3'
 import { diagnostic, diagnosticFailure, diagnosticPage, fatalDiagnostic, loggingRuntime, startLogging, stopLogging } from '../server/logging'
 import { runFile } from '../server/process'
 import * as processes from '../server/process'
@@ -300,6 +301,34 @@ it('checkpoints Caller completions after quarantining evidence above the local s
   expect(run).toHaveBeenCalledWith('agent-interface', ['--diagnostics', '0', '3'], expect.any(Object))
   expect(loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false })).events.some((event) => event.message === 'later precise cause')).toBe(true)
   expect(loggingRuntime()!.health().rejected).toBeGreaterThan(0)
+})
+
+it('preserves the Caller checkpoint on sink failure and durably accepts its replay before recovery', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+  vi.spyOn(processes, 'runFile').mockResolvedValue({ stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 3,
+    hasMore: false, backfillPending: false, events: [{ id: 'b'.repeat(32), error: 'replayed Caller cause' }] }), stderr: '' })
+  start()
+  loggingRuntime()!.query(() => undefined)
+  const control = new Database(join(directory, 'logging.db'))
+  try {
+    control.exec("CREATE TRIGGER fail_caller BEFORE INSERT ON log_events WHEN NEW.source='caller' BEGIN SELECT RAISE(FAIL, 'fixture durable sink unavailable'); END")
+    for (let i = 0; i < 150; i++) diagnostic({ id: 'pending-' + i, level: 'error', operation: 'pending.failure', message: 'pending cause' })
+    await vi.waitFor(() => expect(loggingRuntime()!.health().sources.find(source => source.id === 'caller')?.error).toContain('checkpoint waits for durable ingestion'))
+    expect(() => readFileSync(join(directory, 'logging.db.caller'))).toThrow()
+    expect(loggingRuntime()!.query(db => db.query({ workspace: 'alice', operator: false }, { source: 'caller' })).total).toBe(0)
+    control.exec('DROP TRIGGER fail_caller')
+    await vi.advanceTimersByTimeAsync(15_000)
+    await vi.waitFor(() => {
+      expect(loggingRuntime()!.health().sources.find(source => source.id === 'caller')?.error).toBeNull()
+      expect(JSON.parse(readFileSync(join(directory, 'logging.db.caller'), 'utf8')).cursor).toBe(3)
+    })
+    expect(loggingRuntime()!.query(db => db.query({ workspace: 'alice', operator: false }, { source: 'caller' })).events).toEqual([
+      expect.objectContaining({ message: 'replayed Caller cause' }),
+    ])
+    expect(loggingRuntime()!.health().sources.find(source => source.id === 'caller')).toMatchObject({
+      status: 'partial', currentStatus: 'connected', error: null, gaps: [expect.objectContaining({ to: expect.any(String) })],
+    })
+  } finally { await stopLogging(); control.close(); vi.useRealTimers() }
 })
 
 it('redacts bare encoded and decoded Git credentials supplied only through command-specific configuration', async () => {

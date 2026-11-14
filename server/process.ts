@@ -1,6 +1,6 @@
 import { environmentSecrets } from '../gateway/src/diagnostics/redaction.mjs'
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, delimiter, join } from 'node:path'
@@ -28,9 +28,6 @@ export const AGENT_RIPGREP_CONFIG = fileURLToPath(new URL(
 ))
 // Bounds Go runtimes only; every other child ignores it.
 export const AGENT_GOMAXPROCS = '2'
-// An agent's shell tool waits for a suite on a test box too, starting one included. The default
-// outlasts the box's time limit (POISE_TEST_LIMIT_SECONDS), so the agent hears why from the box.
-const TEST_OFFLOAD_SHELL_TIMEOUTS = [['BASH_DEFAULT_TIMEOUT_MS', '600000'], ['BASH_MAX_TIMEOUT_MS', '3600000']] as const
 
 export function assertProcessArgSize(value: string, label = 'argument'): void {
   if (Buffer.byteLength(value, 'utf8') > MAX_PROCESS_ARG_BYTES) {
@@ -400,10 +397,24 @@ function applyAgentToolDefaults(env: NodeJS.ProcessEnv, overrides: NodeJS.Proces
 // a test runner does anything but carry on. Off until the gateway installs them into the home volume.
 function applyTestOffload(env: NodeJS.ProcessEnv): void {
   const hooks = join(homedir(), '.poise', 'test-offload')
-  if (!existsSync(join(hooks, 'relay'))) return
+  // One read: the release installer may remove relay to disable offload at any moment.
+  let installed: string
+  try {
+    installed = readFileSync(join(hooks, 'relay'), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  // Older installed relays have only URL/key. Keep their nine-minute command budget.
+  const limit = installed.trimEnd().split('\n')[2] ?? '540'
+  if (!/^\d+$/.test(limit) || Number(limit) < 1 || Number(limit) > 3540) {
+    throw new Error('POISE_TEST_LIMIT_SECONDS must be a whole number from 1 to 3540')
+  }
   env.PYTHONPATH = [hooks, env.PYTHONPATH].filter(Boolean).join(delimiter)
   env.NODE_OPTIONS = [`--require "${join(hooks, 'hook.cjs')}"`, env.NODE_OPTIONS].filter(Boolean).join(' ')
-  for (const [key, value] of TEST_OFFLOAD_SHELL_TIMEOUTS) env[key] ??= value
+  // The relay gets time to report exhaustion and request cleanup before the shell stops it.
+  env.BASH_DEFAULT_TIMEOUT_MS ??= String((Number(limit) + 60) * 1000)
+  env.BASH_MAX_TIMEOUT_MS ??= '3600000'
 }
 
 function abortError(signal: AbortSignal, killSignal: NodeJS.Signals): Error {

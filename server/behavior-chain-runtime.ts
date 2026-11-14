@@ -761,7 +761,7 @@ export class BehaviorChainRuntime {
     const resourceStopped = ['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable', 'resource_receipt_unavailable'].includes(call.error_code || '')
     const workBlocked = call.error_code === 'atomic_work_blocked'
     const ciHold = workBlocked ? ciOnlyHold(invocation, call) : undefined
-    const testHold = !chain.testRecovery && workBlocked && implementationTestDependency({ ...invocation, evidence: receipt(call) })
+    const testHold = !chain.testRecovery && workBlocked && implementationTestDependency({ ...invocation, callId: call.id, evidence: receipt(call) })
       ? { invocationId: invocation.id, callId: call.id } : undefined
     if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held',
       reason: ciHold?.queue ? `${call.error}; merge-group ${ciHold.queue.integration}: ${ciHold.queue.failures.map(failure => `${failure.name} (${failure.url})`).join(', ')}; awaiting later matching integration success or verified shared-baseline recovery` : call.error,

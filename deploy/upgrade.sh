@@ -20,7 +20,7 @@ image_base() {
 # What the gateway will do with each workspace now that IMAGE is new, said the
 # moment the image is built: the gateway may start on one right after.
 plan_workspaces() {
-  local image=$1 image_id ids lines handle id running drain base outdated=0
+  local image=$1 image_id ids lines handle id running container_base drain base outdated=0
   image_id=$(docker image inspect --format '{{.Id}}' "$image")
   base=$(image_base "$image")
   drain=$(env_value POISE_DRAIN_TIMEOUT)
@@ -30,12 +30,13 @@ plan_workspaces() {
     return
   fi
   # shellcheck disable=SC2086 # one argument per container ID
-  lines=$(docker inspect --format '{{index .Config.Labels "poise.workspace"}} {{.Image}} {{.State.Running}}' $ids)
-  while read -r handle id running; do
+  lines=$(docker inspect --format '{{index .Config.Labels "poise.workspace"}} {{.Image}} {{.State.Running}} {{index .Config.Labels "poise.base"}}' $ids)
+  while read -r handle id running container_base; do
     if [ "$id" = "$image_id" ]; then continue; fi
     if [ $outdated -eq 0 ]; then say "These workspaces run an older image; the gateway recreates each on $image:"; fi
     outdated=$((outdated + 1))
-    if [ "$running" = true ] && [ -n "$base" ] && [ "$(image_base "$id")" = "$base" ]; then
+    # The container's inherited base label survives a rebuild that makes its original image unavailable.
+    if [ "$running" = true ] && [ -n "$base" ] && [ "$container_base" = "$base" ]; then
       say "  $handle: running. The gateway installs the new release in it, and Poise restarts on it alone within seconds, once no Chat turn runs; agents carry on."
     elif [ "$running" = true ]; then
       say "  $handle: running. The gateway drains it first: it takes no new work and finishes what runs, for at most ${drain:-5400} seconds."
