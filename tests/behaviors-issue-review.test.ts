@@ -510,6 +510,24 @@ api.finish(sys.argv[1], 'completed', action='commented', outcome='commented')
     expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 
+  it('settles a review superseded by seed closure without publication or hold', async () => {
+    const { behaviors, database } = await start()
+    issues = [issue(452)]
+    await behaviors.runEnabledBehaviorsOnce()
+    agentLogs = [finished(`${REPO}#452`, { status: 'superseded', action: null, outcome: 'superseded',
+      error: 'seed issue closed during review; no comments posted', error_code: 'review_target_closed', receipts: null })]
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(1)
+    expect(database.listBehaviorLaunchClaims(KEY)).toEqual([])
+    expect(database.hasSeen(KEY, `${REPO}#452`)).toBe(true)
+    expect(database.listBehaviorDeadLetters()).toEqual([])
+    expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'superseded', outcome: 'review_target_closed' }))
+  })
+
   it('lets another issue run while one reviewer waits to retry, including after restart', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-10-02T06:00:00Z'))

@@ -52,7 +52,7 @@ export interface BehaviorChain {
   held: string | null
   ciHold?: { invocationId: string, callId: string, head: string, queue?: QueueCiBlocker }
   testHold?: { invocationId: string, callId: string, sequence: number }
-  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string }
+  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string, recheck?: string }
   repairRecovery?: { report: number, key: string, holdSequence: number, head: string, basis: string, slot: string,
     diagnosis: string, note: string, admission?: string }
   waiting: string | null
@@ -130,7 +130,19 @@ const RECHECK_AT_SQL = `CASE
   WHEN json_extract(state, '$.observation.checkedAt') IS NULL THEN 0
   WHEN json_extract(state, '$.ciHold') IS NOT NULL OR json_extract(state, '$.testHold') IS NOT NULL
     OR (json_extract(state, '$.held') IS NOT NULL AND json_extract(state, '$.mergeSha') IS NULL
-      AND json_extract(state, '$.observation.pull.state') = 'open') THEN json_extract(state, '$.observation.checkedAt') + 120000
+      AND json_extract(state, '$.observation.pull.state') = 'open')
+    OR (json_extract(state, '$.mergeSha') IS NULL AND json_type(state, '$.observation.pull') = 'null'
+      AND json_extract(state, '$.invocations[#-1].behavior') = 'implement-issue'
+      AND json_extract(state, '$.invocations[#-1].state') = 'settled'
+      AND json_extract(state, '$.invocations[#-1].admissionSequence') > json_extract(state, '$.resumedAfterSequence')
+      AND json_extract(state, '$.invocations[#-1].evidence.error_code') = 'atomic_work_blocked'
+      AND json_extract(state, '$.held') = json_extract(state, '$.invocations[#-1].evidence.error')
+      AND (json_extract(state, '$.waiting') LIKE 'Work-failure reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Stage: implement-issue.% Next action: inspect the implementation Call, address the blocker, then explicitly Resume. Implementation hold reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold report pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold report creation is unconfirmed;%'))
+    THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,
     json_extract(state, '$.observation.checkedAt') - coalesce(json_extract(state, '$.observation.pull.mergedAt'),
       json_extract(state, '$.invocations[0].admittedAt'), 0))) END`
@@ -175,8 +187,20 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
       next.repairRecovery = recovery
     } else if (!event.ciRecovery && !event.testRecovery) delete next.repairRecovery
     if (event.testRecovery) {
-      if (!next.held || !next.testHold || next.testRecovery || event.testRecovery.admission
-        || chainBasis(event.testRecovery.hold) !== chainBasis(next.testHold)
+      const recovery = event.testRecovery
+      const proof = next.observation?.testDependency as { invocationId?: string, verified?: boolean, recovered?: boolean, recheck?: string,
+        recovery?: { merge: string, base: string } } | undefined
+      const original = next.invocations.at(-1)
+      const rechecked = !next.testHold && recovery.recheck && /^[a-f0-9]{64}$/.test(recovery.recheck)
+        && proof?.recheck === recovery.recheck && proof.verified === true && proof.recovered === true
+        && proof.recovery?.merge === recovery.merge && proof.recovery.base === recovery.base
+        && proof.invocationId === recovery.hold.invocationId && original?.id === recovery.hold.invocationId
+        && original.behavior === 'implement-issue' && original.callId === recovery.hold.callId && original.state === 'settled'
+        && original.evidence?.status === 'failed' && original.evidence.action === 'not_started' && resourceReleaseProven(original.evidence, true)
+        && next.held === original.evidence?.error && recovery.hold.sequence > next.resumedAfterSequence
+        && recovery.hold.sequence <= current.sequence
+      if (!next.held || next.testRecovery || recovery.admission
+        || (!rechecked && chainBasis(recovery.hold) !== chainBasis(next.testHold ?? null))
         || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
       next.testRecovery = event.testRecovery
     } else if (!event.ciRecovery && !event.repairRecovery) delete next.testRecovery

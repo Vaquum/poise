@@ -506,7 +506,12 @@ its own instead of refusing with dirty_unowned.
   `poise.release` (the commit `deploy/lib.sh` built it from) and `poise.base`
   (a digest of the files that build the system around it:
   `deploy/runtime/Dockerfile`, `entrypoint.sh`, `install-clis.sh`,
-  `supervisor.mjs` and `install-release.sh`).
+  `supervisor.mjs`, `resource-witness.mjs` and `install-release.sh`, plus the
+  locked `node_modules/playwright-core` version and integrity from
+  `package-lock.json`). That package supplies Chromium's revision and browser
+  system dependencies. An unrelated dependency change keeps the same base;
+  a Playwright identity change takes the drained replacement path. Images from
+  before this browser identity was included take one replacement on introduction.
 - **The supervisor.** `entrypoint.sh` becomes `supervisor.mjs`, which runs
   Poise from `~/.poise/releases/current` when that release is installed for
   its base, and from the image's own release otherwise. When Poise exits with
@@ -1579,8 +1584,8 @@ and its native close receipt; summaries expose that evidence separately from
 `mergeSha`. Original writes and native resources must settle first. Unclear or
 independent work remains open with its decision visible. The existing Caller
 action performs head-checked retirement; a lost close response stays uncertain.
-The normal-work page precedes due quiescent
-reconciliation; observation failures remain reported after unrelated progress.
+The normal-work and due quiescent reconciliation pages alternate first use of
+the shared sweep budget; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
 operation or authority; a deliberate wait keeps GitHub facets unknown without
@@ -1604,8 +1609,13 @@ the delivered main recovery with validation of every original failing test and
 case. Relay assertions remain held for #1619 until the runner establishes their
 inventory independently of candidate-controlled reports.
 The journal admits one fresh implementation for that automatic hold and recovery
-commit, independently of report publishing. Missing original evidence and later
-operator holds retain their authority; no gateway route or new poller is added.
+commit, independently of report publishing. An incomplete original assertion can
+instead use the saved automatic hold report and linked delivered fixture fix for
+one persisted clean-base recheck, requiring reproduction on the old base and an
+executed pass on the corrected base. This uses the same single-retry admission
+and normal validation gates, as defined in [bounded reconciliation](Behavior-chain.md#bounded-reconciliation).
+Unverified rechecks and later operator holds retain their authority; no gateway
+route or new poller is added.
 
 The first `/api/behavior-chains` list page also includes read-only `attention`
 across all active chain pages. It joins durable progress age, holds, exact-head
@@ -1668,6 +1678,10 @@ Poise's existing log decoder validates the fence's exact terminal no-effect
 shape and native resource-release timestamp before the journal can settle its
 reservation. Closed-target native resource waits are separate from public
 GitHub recheck times; unrelated open-PR review/approval stays eligible.
+An in-flight managed issue review whose final live seed read observes closure
+settles superseded without a PR head or publication plan. The reader accepts this
+unattempted receipt while retaining its original resource-release requirement;
+[Issue review](Issue-review.md) defines the publication race and reconciliation.
 Managed native admissions recheck the bounded receipt reader at their final
 launch, action and publication boundaries. Its independent diagnostics retain
 the first typed SQLite cause and affected workspace; confirmed integrity failure

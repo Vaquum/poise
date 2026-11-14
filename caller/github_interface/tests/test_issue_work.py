@@ -21,6 +21,9 @@ class PublicationScope(TestCase):
                         {"title": "feat: one\nfix: two"}, {"body": "Fixes #8"}):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 publication_metadata({**valid, **changed}, "example/repo", 7, creating=True)
+            if "message" in changed:
+                with self.subTest(changed=changed, creating=False), self.assertRaises(ValueError):
+                    publication_metadata({**valid, **changed}, "example/repo", 7, creating=False)
 
     def test_only_the_actual_seed_may_be_closed_by_publication_or_recovery(self):
         publication_body("Implements the change. Closes #7", "example/repo", 7)
@@ -348,11 +351,12 @@ class ReviewReplyReceipts(IsolatedAsyncioTestCase):
         self.assertEqual(read.await_count, 5)
         client.post.assert_not_awaited()
 
-    async def test_existing_pr_completion_posts_the_original_reply_without_using_the_unused_repair_title(self):
+    async def test_existing_pr_completion_posts_the_original_reply_without_using_the_unused_repair_metadata(self):
         client = AsyncMock()
         head = "b" * 40
+        title, body = "fix: implement seed", "Original description.\n\nCloses #7\n\n<!-- poise-chain example/repo#7 -->"
         pull = {"number": 3, "state": "open", "head": {"ref": "poise/issue-7", "sha": head, "repo": {"full_name": "example/repo"}},
-                "user": {"login": "author"}, "body": "<!-- poise-chain example/repo#7 -->"}
+                "user": {"login": "author"}, "title": title, "body": body}
         client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"}, {"state": "open"}]
         client.paginate.side_effect = [[pull], [], [{"id": 17}]]
         client.graphql.return_value = {"repository": {"ref": {"target": {"oid": head, "message": f"fix: repair\n\nPoise-Invocation: {CALL}"}},
@@ -360,12 +364,15 @@ class ReviewReplyReceipts(IsolatedAsyncioTestCase):
         client.post.return_value = {"id": 18}
         with patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
             result = await run(client, {"repository": "example/repo", "token_user": "author", "issue": 7, "branch": "poise/issue-7",
-                "mode": "complete", "expected_head": head, "invocation_id": CALL, "title": "Repair outcomes", "body": "Actual repair",
+                "mode": "complete", "expected_head": head, "invocation_id": CALL, "title": "Repair outcomes", "body": "Also fixes #8",
                 "replies_json": '[{"commentId":17,"body":"Fixed the actual finding."}]'})
         checkpoint.assert_called_once_with(head, start_replies=True)
-        self.assertEqual(result["reply_receipts"][0]["comment_id"], 18)
-        client.post.assert_awaited_once()
-        self.assertIn("/comments/17/replies", client.post.call_args.args[0])
+        self.assertEqual((result["outcome"], result["head_sha"], result["head_invocation"]), ("published", head, CALL))
+        self.assertEqual(result["reply_receipts"], [{"comment_id": 18, "in_reply_to_id": 17, "url": None}])
+        client.post.assert_awaited_once_with("/repos/example/repo/pulls/3/comments/17/replies", json={
+            "body": f"Fixed the actual finding.\n\n<!-- poise-reply {CALL} 17 -->"})
+        client.patch.assert_not_awaited()
+        self.assertEqual((pull["title"], pull["body"]), (title, body))
 
     async def test_posts_the_model_answer_on_the_original_finding_and_reconciles_lost_reply(self):
         client = AsyncMock()
@@ -441,6 +448,62 @@ class FirstPublicationPrerequisites(IsolatedAsyncioTestCase):
             raise AssertionError(f"unexpected git {args}")
         mock.side_effect = run
         return mock
+
+    async def test_existing_pr_validate_and_publish_ignore_unused_foreign_closure_and_preserve_metadata(self):
+        self.graph["repository"]["ref"] = {"target": {"oid": self.base, "message": f"fix: original\n\nPoise-Invocation: {CALL}"}}
+        title, body = "fix: implement seed", "Original description.\n\nCloses #7\n\n<!-- poise-chain example/repo#7 -->"
+        pull = {"number": 3, "state": "open", "title": title, "body": body,
+                "html_url": "https://github.com/example/repo/pull/3", "user": {"login": "author"},
+                "head": {"ref": "poise/issue-7", "sha": self.base, "repo": {"full_name": "example/repo"}}}
+        for mode, dirty, outcome in (("validate", " M file", "validated"),
+                                     ("publish", " M file", "published"), ("publish", "", "no_changes")):
+            with self.subTest(mode=mode, dirty=dirty):
+                head = "b" * 40 if mode == "publish" and dirty else self.base
+                client = self._client()
+                client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"}, {"state": "open"},
+                                          {**pull, "head": {**pull["head"], "sha": head}}]
+                client.paginate.side_effect = [[pull], [], [{"id": 17}]]
+                client.post.return_value = {"id": 18}
+                with patch('github_interface.behaviors.issue_work._run') as git, \
+                        patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
+                    git.side_effect = ["poise/issue-7", "https://github.com/example/repo.git", self.base, dirty] + (
+                        ["", "", head, ""] if mode == "publish" and dirty else [])
+                    result = await run(client, {**self.payload, "mode": mode, "expected_head": self.base,
+                                               "title": "Repair outcomes", "body": "Also fixes #8",
+                                               "replies_json": '[{"commentId":17,"body":"Fixed the actual finding."}]'})
+                self.assertEqual((result["outcome"], result["head_sha"]), (outcome, head))
+                self.assertEqual((pull["title"], pull["body"]), (title, body))
+                client.patch.assert_not_awaited()
+                if mode == "validate":
+                    self.assertTrue(result["has_changes"])
+                    checkpoint.assert_not_called()
+                    client.post.assert_not_awaited()
+                else:
+                    checkpoint.assert_any_call(head)
+                    checkpoint.assert_any_call(head, start_replies=True)
+                    self.assertEqual(result["reply_receipts"], [{"comment_id": 18, "in_reply_to_id": 17, "url": None}])
+                    client.post.assert_awaited_once_with("/repos/example/repo/pulls/3/comments/17/replies", json={
+                        "body": f"Fixed the actual finding.\n\n<!-- poise-reply {CALL} 17 -->"})
+                    if dirty:
+                        self.assertIn(["git", "-C", "/tmp/repo", "commit", "-m", f"fix: implement seed\n\nPoise-Invocation: {CALL}"],
+                                      [call.args[0] for call in git.call_args_list])
+                        self.assertEqual(git.call_args.args[0][-3:], ["push", "origin", "HEAD:refs/heads/poise/issue-7"])
+
+    async def test_first_pr_validate_publish_and_completion_reject_foreign_closure_before_writes(self):
+        self.graph["repository"]["ref"] = {"target": {"oid": self.base, "message": f"fix: implement\n\nPoise-Invocation: {CALL}"}}
+        for mode in ("validate", "publish", "complete"):
+            with self.subTest(mode=mode):
+                client = self._client()
+                with patch('github_interface.behaviors.issue_work._run') as git, \
+                        patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
+                    self._git(git)
+                    with self.assertRaisesRegex(ValueError, "only its seed issue"):
+                        await run(client, {**self.payload, "mode": mode, "body": "Also fixes #8", "expected_head": self.base})
+                self.assertEqual([call.args[0][3:] for call in git.call_args_list],
+                                 [] if mode == "complete" else [["branch", "--show-current"], ["remote", "get-url", "origin"]])
+                checkpoint.assert_not_called()
+                client.post.assert_not_awaited()
+                client.patch.assert_not_awaited()
 
     async def test_late_edge_without_title_or_body_edit_defers_without_push_or_pr(self):
         self.graph["repository"]["issue"]["blockedBy"] = {

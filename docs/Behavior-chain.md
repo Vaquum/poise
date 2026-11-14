@@ -246,8 +246,14 @@ or incomplete coverage evidence continue through ordinary gates. Supersession
 keeps the source issue's hold and outstanding work intact; it does not resume or
 complete that source chain.
 
-The existing scheduler selects a normal-work page before a separate due
-reconciliation page under its existing pass budget. Quiescent held or merged
+The existing scheduler alternates which of the normal-work and due
+reconciliation pages gets first use of the shared 45-second sweep budget,
+advancing that choice even when the budget is exhausted. Each populated pass
+gets first use within two sweeps, including after runtime replacement. The
+budget is checked between work units; an admitted observation still reaches
+its recovery or report evaluation. A chain is not visited again by the later
+page in that sweep; explicit capacity-waiter retries remain eligible.
+Quiescent held or merged
 chains keep their original ownership, but cannot
 consume the normal-work page. Native model/resource receipts are still read
 while an original model lacks resource-release proof, including after a merge;
@@ -350,7 +356,7 @@ the original Call failed and returns to ordinary review, independent approval
 of the queue diagnosis, and fresh current-base native merge-queue gates.
 
 A pre-PR implementation can recover through the same bounded observation even
-with failure reporting disabled. Its original Caller artifact must retain
+with failure reporting disabled. The original-run proof path requires its Caller artifact to retain
 `test_dependency`: independently verified assertion evidence tying the original
 producing run to `prepared.checkout_head`, plus a distinct failing run on that
 exact base. CI proof requires both completed main runs' complete full-suite
@@ -384,6 +390,38 @@ source revision and implementation slot must remain eligible, with the original
 failed/no-publication receipt and positive resource release. A fresh seed read
 must show no pushed branch, PR or competing work; this is checked again after
 provider preparation at admission.
+
+When the original assertion run did not finish, a saved automatic implementation
+hold report can instead authorize one fresh clean-base recheck. Its saved source,
+Call, implementation basis/slot and hold sequence must still match the current
+failed-before-publication receipt and released resources. The current report and
+its author/reviewer comments identify a unique delivered remediation of the named
+test. The recheck verifies ancestry and a change to that fixture, installs the
+locked dependencies on each pinned base, and runs the exact reported Vitest case
+on the old base and corrected current base. The old case must fail with a complete
+actionable assertion; the corrected case must pass. Completed reporting must
+account for every selected case and exclude interruptions, unhandled errors and
+file/setup errors. Historical worker output stays diagnostic evidence only.
+
+The single-slot recovery incident uses the same 750 ms delay after observing
+first output and before interrupting the relay on both bases. The memory-warning
+incident uses 6650 ms before each command on both bases, retaining its 20-second
+case deadlines and all three command variants after the fixture split. These
+temporary observation conditions preserve assertions and production code. Other
+reported tests run unchanged. The completion reporter must witness the injected
+observation on both bases. A passing old case cannot prove a shared failure.
+
+The existing report saves intent before checkout or execution and retains the
+outcome. Restart and repeated observations do not rerun an interrupted or failed
+recheck or reuse a pass for a different base. If the base advances after a
+passing recheck, a later sweep can check the new base once the same remediation
+is verified on it. Checkout and each dependency install have a
+120-second bound, each suite a 90-second bound, and Git reads a 30-second bound;
+suites use one worker without retries. An unverified correction or failed recheck
+states its blocker on the existing hold. A successful recheck feeds the same
+single-retry admission below, with source, publication, resources, controls and
+the pinned corrected base checked again after preparation. The new implementation
+still runs normal full required validation, review and CI.
 
 The automatic hold carries its original journal sequence. An operator Hold,
 including one with identical text, removes that recovery identity. The existing
@@ -575,6 +613,10 @@ The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
 PR titles, issue-closing references or reply targets fail as unstarted work,
 rather than becoming ambiguous writes that never occurred.
+PR title and body checks apply only when creating a PR, including first-PR
+completion after an interrupted publish. Repairs retain the required proposed
+title/body fields for the atomic plan but preserve existing PR metadata; their
+unused body does not undergo the issue-closing check.
 Validation and publication both return the existing no-write `superseded`
 outcome when GitHub confirms that the original owned PR merged at the repair's
 unchanged head, before rejecting a closed seed. The receipt retains the verified
@@ -770,7 +812,10 @@ The worker's `ciDependency` output must identify the exact candidate, latest
 queue removal, failed merge-group commit and its base, failing check/run,
 existing remediation, and a specific cause excerpt verified in both integration
 and exact-base job logs from the same workflow. Green PR checks, another PR's
-failure or a remediation link alone provide no such proof. Missing evidence
+failure or a remediation link alone provide no such proof. Comparison copies of
+the excerpt and both logs remove only ANSI SGR styling; matching stays literal,
+the raw excerpt size bound and original evidence stay intact, and the 20-character
+minimum applies to visible text. Missing evidence
 remains unresolved; candidate-specific failures still require normal repair.
 
 An unchanged, verified shared failure settles as `no_changes` with that
@@ -937,6 +982,12 @@ when retained, or explicit unavailability requiring a fresh reproduction. This
 inspection preserves the earlier failed capture independently of later untested
 edits and grants no publication, retry or approval authority.
 
+While reporting remains unfinished for the current automatic pre-PR hold, the
+existing deferred scheduler rechecks at `checkedAt + 2 minutes`, regardless of
+implementation age. This covers verification before reservation and reconciliation
+of an unconfirmed creation intent without another POST. A verified report or terminal
+disposition returns to the ordinary quiescent cadence; operator holds retain it.
+
 These pre-PR implementation-hold reports require explicit triage before their
 own implementation can prepare or start. A posted issue review alone cannot
 authorize implementation. Through the existing guarded `/api/behavior-chains`
@@ -978,6 +1029,43 @@ open, eligible seed must still verify no pushed branch, bound PR or competing li
 is the new cause plus the source chain. It uses the same explicit triage and admission gate with its
 three original Calls; missing or `source-only` waits, only a current `distinct-fix` passes. A single
 timeout with retry remaining and any write evidence do not qualify.
+
+PR review deadline reports (`review_budget_exhausted`, legacy or durable) require
+the same triage before their own implementation can prepare or start. A posted
+issue review alone cannot authorize implementation. Read `GET
+/api/behavior-chains?id=OWNER/REPO%23N` for the report chain's current sequence
+and `reviewReport` binding (`key`, `source`, `pull`, `head`, `holdSequence`
+— null for legacy PR-scoped reports, the hold event for durable chain reports —
+`attempts` as invocation/call pairs, `revision`, `disposition`), then POST the
+same `{ id, sequence, operation: "report-disposition", binding, disposition }`
+with that exact binding value. `implementationReport` keeps its single
+invocation/call shape for pre-PR reports. Triage must identify an independently
+implementable, verified defect to select `distinct-fix`; source-review-only
+diagnoses select `source-only`. The control verifies the publishing account and
+report marker, the reviewed title/body revision and native posted-review receipt,
+and the source: durable binds the exact original hold event, review-pr
+invocations, basis, slot and sole PR ownership; legacy binds the PR-scoped key,
+configured ownership and that no chain owns the PR. It persists the disposition
+inside the existing report intent and records the diagnosis and next action in
+waiting reasons on the report chain and, for durable, the source chain. Liveness
+goes in those reasons only; the report body is never edited. Labels, comment
+wording and closure supply no disposition.
+
+At admission, missing or stale review dispositions wait visibly, even when new
+report publishing is disabled. `source-only` starts no report implementation and
+leaves the original exact-head review obligation and explicit retry path intact.
+Only a current `distinct-fix` can pass through the ordinary implementation gates.
+Durable admission re-verifies the source through a fresh observation and the
+qualifying review attempts (exact head, basis, slot and Calls) with sole
+ownership; legacy re-verifies the marker, configured ownership, that no chain
+owns the PR, and that the report is unchanged. A review ownership change
+(legacy↔durable cutover, a different chain owning the PR), Resume, a replacement
+Hold, different Calls, a changed report revision or a new head invalidates the
+old binding. Original review Calls prove no-submission and resource release, not
+publication. No recovery is added: retry stays explicit and automatic retry stays
+stopped. Admitted-but-unlaunched report implementations retire as
+`launch_deferred`; launched work settles through its original receipts under the
+original reconciliation and publication fences.
 
 For `repair-pr`, `atomic_work_blocked` also qualifies one settled original Call
 under its matching active automatic hold after the last Resume. The same

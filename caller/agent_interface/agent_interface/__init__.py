@@ -1452,8 +1452,16 @@ def run_issue_review(
                 fail(issue_review.InvalidReview("the review has no comment for the requested issue"),
                      issue_review.InvalidReview.code)
             try:
-                if expected_issue_revision and issue_review.revision(issue_review._issue(repo, number, actor)) != observed_revision:
-                    fail(ValueError("seed issue changed during review; no comments posted"), "issue_revision_changed", preflight=True)
+                if expected_issue_revision or source.startswith("poise:"):
+                    latest = issue_review._issue(repo, number, actor)
+                    if source.startswith("poise:") and latest["state"] == "closed":
+                        ended_at = finish(id_, "superseded", outcome="superseded", error_code=REVIEW_TARGET_CLOSED_CODE,
+                                          error="seed issue closed during review; no comments posted")
+                        print(json.dumps({**stamp_, "model": name, "completed_at": utc_stamp(ended_at),
+                                          "action": None, "outcome": "superseded", "error_code": REVIEW_TARGET_CLOSED_CODE}, indent=2))
+                        return
+                    if expected_issue_revision and issue_review.revision(latest) != observed_revision:
+                        fail(ValueError("seed issue changed during review; no comments posted"), "issue_revision_changed", preflight=True)
                 if source == "poise:behavior-chain":
                     digest = persist_action_plan(id_, {"kind": "issue_review", "posts": posts, "model": name, "issue_revision": observed_revision})
                     with db() as conn:
@@ -1887,6 +1895,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         try:
             if source == "poise:behavior-chain" and pull is None:
                 failed_source.discard_unless_failed(DB, id_)
+                failed_source.discard_deadline_unless_failed(DB, id_)
         finally:
             if source == "poise:behavior-chain":
                 resource_ownership.cleanup_remaining(DB, id_)

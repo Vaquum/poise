@@ -1130,7 +1130,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   fits(provisionalRecord(target, filled, parts.title))
 
   const open = (headRepo: string, branch: string, update: boolean, base: string) => openPullRequest(session, upstream.fullName, {
-    title: update ? `Update: ${title}` : title,
+    title: /^(?:feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(?:\([^\n)]+\))?!?: .+$/.test(title) ? title : `docs: ${update ? 'Update: ' : ''}${title}`,
     body: [
       `Published from Poise by @${session.me}.`,
       '',

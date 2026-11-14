@@ -265,26 +265,38 @@ $(head -n 10 <<<"$changes")"
 }
 
 # The base a workspace image's releases run on: a digest of the files that
-# build the system around Poise. A workspace takes a new image of the same
-# base in place; a new base recreates its container.
+# build the system around Poise and the locked Playwright package that supplies
+# Chromium and its system dependencies. A new base recreates the container.
 runtime_base() {
-  (cd "$root/deploy/runtime" && cat Dockerfile entrypoint.sh install-clis.sh supervisor.mjs resource-witness.mjs install-release.sh) \
-    | sha256sum | cut -c1-16
+  local playwright
+  playwright=$(docker run --rm --network none -i --entrypoint node "$(guard_parser_image)" -e '
+const lock = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const { version, integrity } = lock.packages["node_modules/playwright-core"];
+if (![version, integrity].every(value => typeof value === "string" && value.length > 0)) {
+  throw new Error("package-lock.json must lock playwright-core version and integrity");
+}
+process.stdout.write(JSON.stringify([version, integrity]));
+' < "$root/package-lock.json") || return 1
+  {
+    (cd "$root/deploy/runtime" && cat Dockerfile entrypoint.sh install-clis.sh supervisor.mjs resource-witness.mjs install-release.sh)
+    printf '%s\n' "$playwright"
+  } | sha256sum | cut -c1-16
 }
 
 # Builds the workspace image as IMAGE and, for a commit SHA, also as
 # <IMAGE without its tag>:<SHA>. Its release is the commit, or a development
 # build's own name.
 build_runtime_image() {
-  local image=$1 sha=$2 tags=(--tag "$1") name=$1 release
+  local image=$1 sha=$2 tags=(--tag "$1") name=$1 release base
   if [ -n "$sha" ]; then
     if [[ ${image##*/} == *:* ]]; then name=${image%:*}; fi
     tags+=(--tag "$name:$sha")
   fi
   release=${sha:-development-$(date -u +%Y%m%d%H%M%S)}
+  base=$(runtime_base) || die "cannot fingerprint the workspace runtime from $root/package-lock.json."
   say "Building the workspace image $image${sha:+ at $sha}. The first build takes several minutes."
   docker build --file "$root/deploy/runtime/Dockerfile" --build-arg "POISE_SOURCE_SHA=$sha" \
-    --build-arg "POISE_RELEASE=$release" --build-arg "POISE_BASE=$(runtime_base)" "${tags[@]}" "$root"
+    --build-arg "POISE_RELEASE=$release" --build-arg "POISE_BASE=$base" "${tags[@]}" "$root"
 }
 
 # Render's API for the test jobs' image, through Node in the image this deploy

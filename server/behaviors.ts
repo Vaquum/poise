@@ -8004,6 +8004,25 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       renewSeenOwned(claim.key, claim.target, claim.claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
       continue
     }
+    if (status === 'superseded'
+      && call.outcome === 'superseded'
+      && call.error_code === 'review_target_closed'
+      && call.action === null
+      && call.head_sha === null
+      && call.receipts == null
+      && Number.isFinite(Date.parse(call.completed_at || ''))
+      && unambiguousAgentCall(snapshot, call)) {
+      // Caller proved seed closure, not a no-publication outcome. Keep
+      // the terminal launch and Caller receipt evidence; do not release
+      // its seen marker or infer that a conflicting worker stopped.
+      if (completeClaimSafely(claim, call.error || 'review target closed')) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'superseded', activity: 'settled', stateSource: 'native',
+          outcome: 'review_target_closed', completedAt: call.completed_at })
+        clearBehaviorFailureKeepHold(ISSUES_KEY, claim.target)
+      }
+      continue
+    }
     const message = `unrecognized agent call status "${status || 'missing'}"`
     if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message, claim.target)
   }

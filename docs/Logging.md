@@ -26,6 +26,16 @@ Logging event. Unknown levels or invalid source timestamps produce visible
 collection warnings with the original source identity. Notification colors and
 successful change-request reviews do not determine technical severity.
 
+For future collection, a failed `pr_approve` with
+`approval_blocked_unresolved_conversations` is Warning only when the complete
+original flat Caller Error envelope records `provider.review`, `submitting`,
+`exit`, `submission: blocked` and explicitly untruncated stderr, with the original
+`not_started` / `preflight_failed` result and null executed head. Missing or
+conflicting evidence, publication receipts and process or cleanup failures retain
+their authoritative severity. The shared source classification governs storage,
+delivery, filters, counts and export; retained events remain immutable. Approval,
+backoff and resource gates are unchanged.
+
 Repair preflight refusals are retained as Warnings when a failed `repair_pr`
 Call has `not_started` / `preflight_failed`, no executed head, and either
 `atomic_work_blocked` or `atomic_work_failed` with the exact cause

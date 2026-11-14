@@ -2,13 +2,17 @@
 import asyncio
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from shutil import copyfile
 from tempfile import TemporaryDirectory
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -759,8 +763,107 @@ def test_atomic_preflight_failure_survives_native_receipt_and_logging(database, 
         assert json.loads(consumed.stdout) == {"accepted": 1, "settled": 1, "reservations": 0}
 
 
+def completed_pytest_then_no_result(directory, setup):
+    """Real pytest and offload client; only the remote transport is a stand-in."""
+    repo = Path(__file__).resolve().parents[3]
+    work, hooks = directory / "pytest-gate", directory / "hooks"
+    work.mkdir()
+    hooks.mkdir()
+    paths = ["caller/agent_interface/tests", "caller/github_interface/tests", "caller/github_datastore/tests"]
+    for name in paths:
+        (work / name).mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(work)], check=True)
+    secret = "completed-pytest-credential-sentinel"
+    folded = "folded-opaque-value-outside-env"
+    # One failure line past the client's 64 KiB bound: its head must still
+    # carry the folded-header state to the continuation line.
+    pad = "P" * 70000
+    test = paths[0] + "/test_codex_credentials.py::TestToken::test_credentials_are_redacted_before_cli_serialization[retained response]"
+    fixture = ("import pytest\n@pytest.fixture\ndef broken():\n"
+               f"    raise RuntimeError('first setup cause {secret}\\nAuthorization: Bearer {pad}\\n  {folded}')\n"
+               "class TestToken:\n"
+               "    @pytest.mark.parametrize('body', ['retained response'])\n"
+               "    def test_credentials_are_redacted_before_cli_serialization(self, broken, body):\n        pass\n") if setup else (
+                   "import pytest\nclass TestToken:\n"
+                   "    @pytest.mark.parametrize('body', ['retained response'])\n"
+                   "    def test_credentials_are_redacted_before_cli_serialization(self, body):\n"
+                   f"        assert 1 == 2, 'first assertion cause {secret}\\nAuthorization: Bearer {pad}\\n  {folded}'\n")
+    (work / paths[0] / "test_codex_credentials.py").write_text(fixture + "\ndef test_later_failure():\n    assert False, 'later unrelated cause'\n")
+    # Pytest emits this after its detailed reports and short test summary.
+    (work / "conftest.py").write_text("def pytest_terminal_summary(terminalreporter):\n"
+                                     "    terminalreporter.write_line('console noise ' * 40000)\n")
+    environment = {"PATH": os.environ["PATH"], "HOME": str(directory), "TEST_API_KEY": secret}
+    suite = subprocess.run([sys.executable, "-m", "pytest", *paths], cwd=work, env=environment,
+                           capture_output=True, text=True, timeout=30)
+    assert suite.returncode == 1, suite.stdout + suite.stderr
+    assert len(suite.stdout) > 400000 and test in suite.stdout
+    header = next(line for line in suite.stdout.splitlines() if line.startswith("E ") and "Authorization: Bearer" in line)
+    assert len(header) > 64 * 1024, "the fixture must drive the oversized-header path"
+    for name in ("run.mjs", "redaction.mjs"):
+        copyfile(repo / "scripts/test-offload" / name, hooks / name)
+    original_run, later_run = "d" * 32, "e" * 32
+    relay_reason = "[poise] no test result: later attempt expired. This says nothing about your code. Skip local tests for this work"
+
+    def frame(kind, value):
+        payload = value.encode()
+        return bytes([kind]) + len(payload).to_bytes(4, "big") + payload
+
+    class Relay(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            self.send_response(201)
+            self.end_headers()
+            self.wfile.write(json.dumps({"id": original_run if len(admitted) == 0 else later_run}).encode())
+            admitted.append(self.path)
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            if original_run in self.path:
+                # Split output frames arbitrarily, as the real relay does.
+                output = frame(1, suite.stdout) + frame(2, suite.stderr) + frame(3, str(suite.returncode))
+                for start in range(0, len(output), 1777):
+                    self.wfile.write(output[start:start + 1777])
+            else:
+                self.wfile.write(frame(4, chr(124) + "later attempt expired"))
+
+    admitted = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Relay)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    (hooks / "relay").write_text(f"http://127.0.0.1:{server.server_port}\nfixture-key\n")
+    command = ["node", str(hooks / "run.mjs"), "--", sys.executable, "-m", "pytest", *paths]
+    try:
+        completed = subprocess.run(command, cwd=work, env=environment, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, timeout=30)
+        assert completed.returncode == suite.returncode, completed.stdout[-4096:]
+        identity = re.search(r"candidate ([a-f0-9]{64}), suite .*, run ([a-f0-9]{32})", completed.stdout)
+        assert identity and identity[2] == original_run
+        # What the worker can see after its tool truncates the console.
+        visible = completed.stdout[-4096:]
+        assert "checkout sent" not in visible and "suite python" not in visible
+        summary = visible[visible.index("[poise] completed Caller pytest failure:"):].strip()
+        assert len(summary) < 2600 and secret not in summary and "[redacted]" in summary
+        assert folded not in summary, "a folded header continuation is a credential even outside the environment secrets"
+        (work / paths[0] / "test_codex_credentials.py").write_text("# a later candidate\n")
+        later = subprocess.run(command, cwd=work, env=environment, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=30)
+        assert later.returncode == 124 and relay_reason in later.stdout
+        assert later_run in later.stdout and "completed Caller pytest failure:" not in later.stdout
+        later_candidate = re.search(r"candidate ([a-f0-9]{64}), suite .*, run", later.stdout)[1]
+        assert later_candidate != identity[1]
+        return summary + "; Later attempt: " + later.stdout, identity[1], original_run, test, secret, relay_reason, folded
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.parametrize("database", ["/dev/shm" if sys.platform == "linux" else None], indirect=True)
-@pytest.mark.parametrize("observed", ["assertion", "timeout", "marker", "none"])
+@pytest.mark.parametrize("observed", ["assertion", "timeout", "marker", "none", "completed_assertion", "completed_setup"])
 def test_atomic_failure_then_relay_timeout_survives_checkout_reclamation(database, monkeypatch, decode_failure, observed):
     candidate, run = "c" * 64, "d" * 32
     excerpt = "AssertionError: expected 1 to equal 2"
@@ -813,6 +916,11 @@ def test_atomic_failure_then_relay_timeout_survives_checkout_reclamation(databas
     blocked = reason if failed else (
         f"FAIL {test}; assertion details unavailable; captured candidate unavailable; producing run unavailable; {relay}"
         if observed == "marker" else None)
+    if observed.startswith("completed_"):
+        blocked, candidate, run, test, secret, relay, folded = completed_pytest_then_no_result(database, observed == "completed_setup")
+        excerpt = "RuntimeError: first setup cause" if observed == "completed_setup" else "first assertion cause"
+    else:
+        folded = "folded-opaque-value-outside-env"
     publication = {"commitMessage": "fix: seed", "title": "fix: seed", "replies": [], "blocked": blocked,
                    "body": f"fixture validation: {relay} Local verification is incomplete; required CI and review remain mandatory."}
     modes, instructions, checkouts = [], [], []
@@ -841,8 +949,8 @@ def test_atomic_failure_then_relay_timeout_survives_checkout_reclamation(databas
         return ["fixture"], "", {}
 
     def worker(_lease, _args, **kwargs):
-        # Stand in for the worker's reported observations, never scrape its raw
-        # output. The real relay's failure-then-timeout is covered in test-offload.
+        # The stand-in worker copies its visible completion summary first, as
+        # instructed. Native Caller never scrapes the provider's raw output.
         (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps(publication, ensure_ascii=False))
         return SimpleNamespace(returncode=0, stdout="private provider output", stderr="private provider stderr")
 
@@ -892,14 +1000,19 @@ def test_atomic_failure_then_relay_timeout_survives_checkout_reclamation(databas
     event, = api.diagnostics()["events"]
     assert event["diagnostic"] == evidence and "evidence_unavailable" not in event
     assert len(json.dumps(event).encode()) <= 64 * 1024
-    expected = (excerpt, test, candidate, run, relay) if failed else (
+    expected = (excerpt, test, candidate, run, relay) if (failed or observed.startswith("completed_")) else (
         f"FAIL {test}", "assertion details unavailable", "captured candidate unavailable", "producing run unavailable", relay)
     for item in expected:
         assert item in evidence["stderr"]
     if failed:
         assert excerpt not in stored["error"] and evidence["stderr"].index(excerpt) > 500
         assert evidence["stderr"].index(excerpt) < evidence["stderr"].index(relay)
-    for private in (secret, "opaque-credential-", "summary-cutoff", "private provider"):
+    if observed.startswith("completed_"):
+        assert evidence["stderr"].startswith("[poise] completed Caller pytest failure:")
+        assert evidence["stderr"].index(run) < evidence["stderr"].index("e" * 32)
+        assert evidence["stderr"].index(excerpt) < evidence["stderr"].index(relay)
+        assert len(evidence["stderr"]) <= 4096
+    for private in (secret, folded, "opaque-credential-", "summary-cutoff", "private provider"):
         assert private not in json.dumps(stored) + json.dumps(event)
 
 

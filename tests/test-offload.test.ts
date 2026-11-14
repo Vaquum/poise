@@ -280,8 +280,8 @@ describe('installing it into a home volume', () => {
     const hooks = join(home, '.poise', 'test-offload')
     expect(readFileSync(join(hooks, 'relay'), 'utf8')).toBe('https://alice.example/api/link/test-relay\nalice.signed\n540\n')
     expect(statSync(join(hooks, 'relay')).mode & 0o777).toBe(0o600)
-    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
-    expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'relay', 'run.mjs', 'sitecustomize.py'])
+    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs', 'redaction.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
+    expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'redaction.mjs', 'relay', 'run.mjs', 'sitecustomize.py'])
     // Ahead of a first start, whose entrypoint leaves a ~/.poise it finds as it is.
     expect(statSync(join(home, '.poise')).mode & 0o777).toBe(0o700)
   })
@@ -290,7 +290,7 @@ describe('installing it into a home volume', () => {
     const home = temp()
     install(home, { POISE_TEST_RELAY_URL: 'https://alice.example', POISE_TEST_RELAY_KEY: 'k' })
     install(home)
-    expect(readdirSync(join(home, '.poise', 'test-offload')).sort()).toEqual(['hook.cjs', 'run.mjs', 'sitecustomize.py'])
+    expect(readdirSync(join(home, '.poise', 'test-offload')).sort()).toEqual(['hook.cjs', 'redaction.mjs', 'run.mjs', 'sitecustomize.py'])
   })
 
   it('leaves nothing behind where it was never on', () => {
@@ -303,7 +303,7 @@ describe('installing it into a home volume', () => {
 describe('the hooks at work', () => {
   function hooked(relay: boolean): { hooks: string; env: NodeJS.ProcessEnv } {
     const hooks = temp()
-    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
+    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs', 'redaction.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
     // Nothing listens there: a suite that reaches for its instance fails at once, and one that does not runs.
     if (relay) writeFileSync(join(hooks, 'relay'), 'http://127.0.0.1:9/api/link/test-relay\nk\n')
     // Without the npm script this very test may be running under.
@@ -614,13 +614,16 @@ describe('a suite on a test box', () => {
         return
       }
       if (service && jobAction === 'cancel') {
+        if (pendingCancellations) {
+          pendingCancellations.push(res)
+          return
+        }
         const job = jobs.get(jobId)
         if (job) {
           job.status = 'canceled'
           job.child?.kill('SIGKILL')
         }
-        if (pendingCancellations) pendingCancellations.push(res)
-        else res.writeHead(job ? 200 : 404).end()
+        res.writeHead(job ? 200 : 404).end()
         return
       }
       const [, id, action, operation] = /^\/v1\/sandboxes\/([^/]+)\/?([^/]*)\/?(.*)$/.exec(path) ?? []
@@ -685,7 +688,7 @@ describe('a suite on a test box', () => {
     relayUrl = `${relayOrigin}${TEST_RELAY_PATH}`
     relay.start()
     hooks = temp()
-    for (const file of ['run.mjs', 'hook.cjs', 'sitecustomize.py']) copyFileSync(join(SOURCE, file), join(hooks, file))
+    for (const file of ['run.mjs', 'hook.cjs', 'sitecustomize.py', 'redaction.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
     writeFileSync(join(hooks, 'relay'), `${relayUrl}\n${KEY}\n`)
     unpacked = temp()
   }
@@ -1496,17 +1499,28 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect(failed ? warnings : events).toContainEqual(diagnostic)
   })
 
-  it.each([false, true])('discards authenticated late output while job cancellation is pending (cancellation failure: %s)', async (failed) => {
+  it.each(['success', 'failure', 'timeout'] as const)('keeps one cancellation in flight through an orphan sweep and discards authenticated late output (cancellation: %s)', async (outcome) => {
     runJobs = false
-    await startAll({ baseService: 'crn-test' })
+    // Run sweeps explicitly so each finishes while the cancellation response is still held.
+    await startAll({ baseService: 'crn-test', sweepMs: 60_000 })
     const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
     const { id } = await created.json() as { id: string }
     const run = relay.runs.get(id)!
     const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: `Bearer ${KEY}` } })
     await until(() => run.boxId !== null, 'the job to be created')
+    const job = jobs.get(run.boxId!)!
+    const foreign = { ...job, id: 'job-foreign', startCommand: job.startCommand.replace(relayUrl, `https://alice.elsewhere.example${TEST_RELAY_PATH}`) }
+    jobs.set(foreign.id, foreign)
+    const requests = vi.spyOn(globalThis, 'fetch')
+    const cancelUrl = `${renderOrigin}/v1/services/crn-test/jobs/${job.id}/cancel`
+    const deadline = new AbortController()
+    const timeout = outcome === 'timeout' ? vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(deadline.signal) : null
     pendingCancellations = []
     await output.body!.cancel()
     await until(() => relay.runs.size === 0 && pendingCancellations!.length > 0, 'retirement before cancellation answers', 3_000)
+    await relay['sweep'](Date.now(), true)
+    expect(job.status).toBe('running')
+    expect(requests.mock.calls.filter(([url]) => String(url).endsWith('/cancel')).map(([url]) => url)).toEqual([cancelUrl])
     expect(pendingCancellations).toHaveLength(1)
     expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id, error: 'the workspace went away' }))
     const write = vi.spyOn(run.output!, 'write')
@@ -1522,12 +1536,23 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
     expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.job.cancel', jobId: run.boxId }))
     const [cancellation] = pendingCancellations
-    pendingCancellations = null
-    if (failed) cancellation.destroy()
+    if (outcome === 'timeout') {
+      expect(timeout).toHaveBeenCalledWith(10_000)
+      deadline.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+    } else if (outcome === 'failure') cancellation.destroy()
     else cancellation.writeHead(200).end()
+    const failed = outcome !== 'success'
     await until(() => [...events, ...warnings].some(({ event, jobId }) => jobId === run.boxId && event === (failed ? 'test_relay.job.cancel.failed' : 'test_relay.job.cancel')), 'the cancellation diagnostic', 3_000)
-    if (failed) expect(warnings).toContainEqual({ event: 'test_relay.job.cancel.failed', jobId: run.boxId, error: 'fetch failed' })
-    else expect(events).toContainEqual({ event: 'test_relay.job.cancel', jobId: run.boxId, status: 200 })
+    if (failed) {
+      expect(warnings).toContainEqual({ event: 'test_relay.job.cancel.failed', jobId: run.boxId, error: outcome === 'timeout' ? 'The operation was aborted due to timeout' : 'fetch failed' })
+      expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.job.cancel', jobId: run.boxId }))
+    } else expect(events).toContainEqual({ event: 'test_relay.job.cancel', jobId: run.boxId, status: 200 })
+    expect(job.status).toBe('running')
+    pendingCancellations = null
+    await relay['sweep'](Date.now(), true)
+    await until(() => job.status === 'canceled', 'a later sweep to retry cancellation', 3_000)
+    expect(requests.mock.calls.filter(([url]) => String(url).endsWith('/cancel')).map(([url]) => url)).toEqual([cancelUrl, cancelUrl])
+    expect(foreign.status).toBe('running')
   })
 
   it('limits retirement evidence to owner cleanup and authenticated late output, and evicts it without occupying admission slots', async () => {
@@ -1832,22 +1857,71 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
   })
 
-  it('keeps the full rerun within the remaining command budget', async () => {
+  it.each([0, 4_000])('keeps the full rerun within the remaining command budget (setup delayed %i ms)', async (setupDelay) => {
+    setupMs = setupDelay
     await startAll()
-    const started = Date.now()
-    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 2500)'], { BASH_DEFAULT_TIMEOUT_MS: '3500' })
-    await new Promise((done) => { run.child.stdout?.once('data', done) })
-    await new Promise((done) => setTimeout(done, 500))
+    const control = temp()
+    const clock = join(control, 'clock.cjs')
+    const time = join(control, 'time')
+    const observed = join(control, 'observed')
+    writeFileSync(time, '0')
+    // Hold only the runner's lifetime timer. Cancellation, refresh and rearming retain their due times.
+    writeFileSync(clock, `if (process.argv[1]?.endsWith('/run.mjs')) {
+      const fs = require('node:fs')
+      const now = () => Number(fs.readFileSync(${JSON.stringify(time)}, 'utf8'))
+      const timeout = global.setTimeout, cancel = global.clearTimeout
+      const timers = new Map()
+      global.setTimeout = (callback, ms, ...args) => {
+        if (ms !== 3500) return timeout(callback, ms, ...args)
+        const timer = timeout(() => {}, 2147483647)
+        const pending = { due: now() + ms, fire: () => callback(...args) }
+        timer.refresh = () => { pending.due = now() + ms; return timer }
+        timers.set(timer, pending)
+        return timer
+      }
+      global.clearTimeout = (timer) => { timers.delete(timer); return cancel(timer) }
+      setInterval(() => {
+        const at = now()
+        for (const [timer, pending] of timers) {
+          if (pending.due <= at) { clearTimeout(timer); pending.fire() }
+        }
+        fs.writeFileSync(${JSON.stringify(observed)}, String(at))
+      }, 10)
+    }`)
+    // A held suite exits when its fake box is terminated, including after a failed assertion.
+    const run = suite(repository(), [process.execPath, '-e', 'const parent = process.ppid; console.log("started"); setInterval(() => { if (process.ppid !== parent) process.exit(0) }, 25)'], {
+      BASH_DEFAULT_TIMEOUT_MS: '3500', NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require "${clock}"`].filter(Boolean).join(' '),
+    })
+    let output = ''
+    run.child.stdout?.on('data', (chunk) => { output += chunk })
+    const advance = async (at: number) => {
+      writeFileSync(time, String(at))
+      await until(() => existsSync(observed) && readFileSync(observed, 'utf8') === String(at), 'the runner clock to advance', 5_000)
+    }
+    await until(() => output === 'started\n', 'the first suite to start')
+    const original = [...relay.runs.keys()][0]
+    expect(original).toMatch(/^[a-f0-9]{32}$/)
+    await advance(1_000)
     relay.stop()
     await startAll2()
+    await until(() => relay.runs.size === 1, 'the replacement run to be admitted')
+    const replacement = [...relay.runs.keys()][0]
+    expect(replacement).not.toBe(original)
+    await until(() => output === 'started\nstarted\n', 'the replacement suite to start')
+    await advance(3_499)
+    expect(run.child.exitCode).toBeNull()
+    expect(relay.runs.has(replacement)).toBe(true)
+    await advance(3_500)
+    await until(() => run.child.exitCode !== null, 'the original deadline to stop the replacement suite', 5_000)
     const { code, stdout, stderr } = await run.done
     expect(code).toBe(124)
     expect(stdout).toBe('started\nstarted\n')
-    expect(stderr).toContain('total time budget')
-    expect(Date.now() - started).toBeLessThan(5500)
+    expect(stderr).toContain('no test result: the test offload exhausted its total time budget')
     expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
-    await until(() => relay.runs.size === 0, 'the timed-out run to be retired')
-  })
+    await until(() => !relay.runs.has(replacement), 'the timed-out replacement run to be retired')
+    expect(relay.runs.size).toBe(0)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: replacement }))
+  }, 30_000)
 
   it('gives up when the relay never recovers', async () => {
     await startAll()
@@ -1975,16 +2049,26 @@ ${stderr}`
   it('recovers when the restart reaches the upload before its fail frame is read', async () => {
     await startAll()
     const repo = repository()
-    let held: { req: IncomingMessage; res: ServerResponse } | null = null
+    // Only the fixture copy acknowledges the upload handler, after its callback returns.
+    const runnerPath = join(hooks, 'run.mjs')
+    const runnerSource = readFileSync(runnerPath, 'utf8')
+    expect(runnerSource).toContain('uploadError = error')
+    writeFileSync(runnerPath, runnerSource.replace('uploadError = error', `uploadError = error
+            queueMicrotask(() => { if (error?.status === 410) say('fixture: upload 410 handled') })`))
+    const held: { upload: { req: IncomingMessage; res: ServerResponse } | null; output: ServerResponse | null } = { upload: null, output: null }
     let heldOnce = false
     let failFrame: Buffer | null = null
     let failEnd = false
+    let admissions = 0
+    const order: string[] = []
     const releaser: { release: (() => void) | null } = { release: null }
     const inner = relayServer.listeners('request').slice()
     relayServer.removeAllListeners('request')
     relayServer.on('request', (req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url ?? '/', 'http://relay')
+      if (req.method === 'POST' && url.pathname === `${TEST_RELAY_PATH}/runs`) admissions += 1
       if (req.method === 'GET' && url.pathname.endsWith('/output')) {
+        held.output = res
         const write = res.write.bind(res)
         const end = res.end.bind(res)
         res.write = ((chunk: any, ...args: any[]) => {
@@ -1999,40 +2083,73 @@ ${stderr}`
           return (end as (...a: any[]) => ServerResponse)(...args)
         }) as typeof res.end
         releaser.release = () => {
-          if (failFrame) (write as (c: Buffer) => void)(failFrame)
+          if (failFrame) {
+            order.push('restart frame released')
+            write(failFrame)
+          }
           failFrame = null
           if (failEnd) (end as () => void)()
           failEnd = false
         }
       } else if (req.method === 'POST' && url.pathname.endsWith('/tree') && !heldOnce) {
         heldOnce = true
-        held = { req, res }
+        held.upload = { req, res }
         req.resume()
         return
       }
       for (const listener of inner) (listener as (req: IncomingMessage, res: ServerResponse) => void)(req, res)
     })
     const run = suite(repo, [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 300)'])
-    await until(() => held !== null, 'the upload to start')
-    relay.stop()
-    await until(() => failFrame !== null, 'the restart frame to be queued')
-    const pending = held as unknown as { req: IncomingMessage; res: ServerResponse }
-    held = null
-    pending.res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
-    pending.req.resume()
-    // Let the runner process the upload 410 before the restart frame arrives: the old code
-    // aborts the output here and never recovers.
-    await new Promise((done) => setTimeout(done, 200))
-    releaser.release?.()
-    await startAll2()
-    const { code, stdout, stderr } = await run.done
-    expect(code).toBe(0)
-    expect(stdout).toBe('started\ncomplete\n')
-    expect(stderr).toContain('interrupted validation')
-    expect(stderr).toContain('no test result: the gateway restarted')
-    expect(stderr).not.toContain('Skip local tests')
-    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)
-  })
+    let notices = ''
+    run.child.stderr?.on('data', (chunk) => {
+      notices += chunk
+      if (notices.includes('fixture: upload 410 handled') && !order.includes('upload 410 handled')) order.push('upload 410 handled')
+    })
+    let runnerClosed = false
+    void run.done.then(() => { runnerClosed = true })
+    try {
+      await until(() => held.upload !== null, 'the upload to start', 10_000)
+      const originalId = [...relay.runs.keys()][0]
+      expect(originalId).toMatch(/^[a-f0-9]{32}$/)
+      relay.stop()
+      await until(() => failFrame !== null, 'the restart frame to be queued', 10_000)
+      held.upload!.res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
+      await until(() => order.includes('upload 410 handled'), `the client's upload 410 handler\n${notices}`, 10_000)
+      expect(failFrame).not.toBeNull()
+      expect(order).toEqual(['upload 410 handled'])
+      releaser.release!()
+      await startAll2()
+      relayServer.prependListener('request', (req: IncomingMessage) => {
+        if (req.method === 'POST' && req.url === `${TEST_RELAY_PATH}/runs`) admissions += 1
+      })
+      await until(() => runnerClosed, `the recovered suite to finish\n${notices}`, 35_000)
+      const { code, stdout, stderr } = await run.done
+      expect(code, stderr).toBe(0)
+      expect(stdout).toBe('started\ncomplete\n')
+      expect(order).toEqual(['upload 410 handled', 'restart frame released'])
+      const captured = /candidate ([a-f0-9]{64}), suite .+, run ([a-f0-9]{32})/.exec(stderr)
+      expect(captured?.[2]).toBe(originalId)
+      const finished = events.filter((event) => event.event === 'test_relay.run.finished')
+      expect(finished).toEqual([expect.objectContaining({ exit: 0 })])
+      expect(finished[0].id).not.toBe(originalId)
+      expect(stderr).toContain(`relay recovered; rerunning candidate ${captured![1]} as run ${finished[0].id}`)
+      expect(stderr).toContain('interrupted validation')
+      expect(stderr).toContain('no test result: the gateway restarted')
+      expect(stderr).not.toContain('Skip local tests')
+      expect(admissions).toBe(2)
+      expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: originalId, error: 'the gateway restarted' }))
+      expect(relay.runs.size).toBe(0)
+      expect(suiteBoxes()).toHaveLength(2)
+    } finally {
+      releaser.release?.()
+      held.output?.destroy()
+      held.upload?.res.destroy()
+      held.upload?.req.destroy()
+      if (!runnerClosed) run.child.kill('SIGKILL')
+      await until(() => runnerClosed, 'the runner to close after cleanup', 3_000)
+    }
+    // Three 10 s phase bounds, 35 s for recovery/completion and 3 s for cleanup.
+  }, 80_000)
 
   it('says nothing of memory when a suite that mentions it passes', async () => {
     await startAll()

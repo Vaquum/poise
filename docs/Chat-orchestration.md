@@ -6,6 +6,9 @@ give them the context they need.” Every provider receives the same Poise
 control command in its native prompt and runs it through its native shell.
 No model or provider credential is added. Safe mode still governs native tools.
 
+Shared guidance on every turn requires Conventional Commits PR titles in every
+repository, including ordinary chats and workers with saved `/worker` snippets.
+
 The command discovers itself with `{"operation":"help"}`. Its connection file
 identifies the calling chat; a request cannot impersonate another chat by
 putting a different sender in its JSON. The private per-chat credential

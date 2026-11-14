@@ -894,7 +894,7 @@ describe('storage status cache', () => {
     await maintenance.runStorageMaintenance({ now, chatRoot, stateRoot, home, trim: async () => null, claims: () => [] })
     release()
     const first = await pending
-    expect(first.stale).toBe(false)
+    expect(first).toMatchObject({ stale: true, complete: false, error: expect.stringContaining('maintenance') })
     const second = await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
     expect(second).not.toBe(first)
     expect(scripted.calls()).toBe(2)
