@@ -737,6 +737,19 @@ describe('Claude status diagnostics through the process helper', () => {
     expect(failures()).toMatchObject([{ operation: 'claude.auth.status', exitCode: 1, stderr: expect.stringContaining('spawn claude ENOENT') }])
   })
 
+  it('follows a symlinked PATH segment past .. like the launcher does', async () => {
+    await rm(join(root, 'bin', 'claude'))
+    await mkdir(join(root, 'tools', 'bin'), { recursive: true })
+    await mkdir(join(root, 'tools', 'current'), { recursive: true })
+    await symlink(join(root, 'missing-claude'), join(root, 'tools', 'bin', 'claude'))
+    await mkdir(join(root, 'opt'), { recursive: true })
+    await symlink(join(root, 'tools', 'current'), join(root, 'opt', 'link'))
+    // Lexically this is root/opt/bin (absent); the kernel follows the symlink first to root/tools/bin.
+    vi.stubEnv('PATH', `${join(root, 'opt', 'link')}/../bin${delimiter}${join(root, 'bin')}`)
+    await expect(new ClaudeAuthMonitor().check()).resolves.toMatchObject({ status: 'unavailable' })
+    expect(failures()).toMatchObject([{ operation: 'claude.auth.status', exitCode: 1, stderr: expect.stringContaining('spawn claude ENOENT') }])
+  })
+
   it('retains the Error when launcher absence cannot be established on the launch PATH', async () => {
     await rm(join(root, 'bin', 'claude'))
     const notDirectory = join(root, 'not-directory')

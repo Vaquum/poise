@@ -1,5 +1,5 @@
 import { lstat } from 'node:fs/promises'
-import { delimiter, resolve } from 'node:path'
+import { delimiter } from 'node:path'
 import { accountLoginsStrict } from './accounts/logins'
 import {
   claudeSubscriptionEnvironment,
@@ -160,7 +160,10 @@ function errorStdout(error: unknown): string | null {
 async function optionalClaudeAbsent(launchPath: string): Promise<boolean> {
   if (accountLoginsStrict().claude) return false
   for (const directory of launchPath.split(delimiter)) {
-    try { await lstat(resolve(directory, 'claude')); return false } catch (error) {
+    // Append without resolving: the kernel follows a symlinked PATH segment
+    // before `..`, while resolve()/join() collapse `..` lexically first.
+    const candidate = directory ? `${directory}/claude` : 'claude'
+    try { await lstat(candidate); return false } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
   }
