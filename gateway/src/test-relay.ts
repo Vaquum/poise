@@ -217,7 +217,7 @@ function commandLabel(argv: string[]): string {
 
 export class TestRelay {
   readonly runs = new Map<string, Run>()
-  private readonly retired = new Map<string, string>()
+  private readonly retired = new Map<string, { handle: string; tokenDigest: Buffer | null }>()
   private readonly publicKey: KeyObject
   private readonly api: string
   private readonly owner: string
@@ -412,8 +412,8 @@ export class TestRelay {
 
   private retire(run: Run): boolean {
     if (!this.runs.delete(run.id)) return false
-    // Cleanup can arrive while asynchronous box termination is still pending.
-    this.retired.set(run.id, run.handle)
+    // Cleanup and late job output can arrive while asynchronous box termination is still pending.
+    this.retired.set(run.id, { handle: run.handle, tokenDigest: run.job ? createHash('sha256').update(run.token).digest() : null })
     if (this.retired.size > MAX_RETIRED_RUNS) this.retired.delete(this.retired.keys().next().value!)
     return true
   }
@@ -580,7 +580,15 @@ export class TestRelay {
     if (fromJob) {
       const run = RUN_ID.test(id ?? '') ? this.runs.get(id) : undefined
       // Unknown and ended look alike to a job, which stops at this answer.
-      if (!run || !this.isJob(req, run)) throw new RelayError(410, 'this run is over')
+      if (!run || !this.isJob(req, run)) {
+        const tokenDigest = !run ? this.retired.get(id)?.tokenDigest : null
+        if (req.method === 'POST' && url.pathname === `${TEST_RELAY_PATH}/runs/${id}/output` && tokenDigest
+          && timingSafeEqual(createHash('sha256').update(bearer(req)).digest(), tokenDigest)) {
+          res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
+          return
+        }
+        throw new RelayError(410, 'this run is over')
+      }
       await this.fromJob(req, res, url, run, part)
       return
     }
@@ -600,7 +608,7 @@ export class TestRelay {
 
     const run = RUN_ID.test(id ?? '') ? this.runs.get(id) : undefined
     if (!run) {
-      if (req.method === 'DELETE' && url.pathname === `${TEST_RELAY_PATH}/runs/${id}` && this.retired.get(id) === handle) {
+      if (req.method === 'DELETE' && url.pathname === `${TEST_RELAY_PATH}/runs/${id}` && this.retired.get(id)?.handle === handle) {
         res.writeHead(204).end()
         return
       }
