@@ -646,7 +646,7 @@ export class BehaviorChainRuntime {
               } else {
                 const reason = decision.kind === 'wait' ? decision.reason : !this.operations.enabled() ? 'behavior chain admissions are paused'
                   : `${decision.behavior} is disabled or held by its behavior controls`
-                if (reason !== chain.waiting) this.append(chain, { type: 'chain.waiting', reason })
+                if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
               }
             } catch (error) {
               if (!(error instanceof BehaviorChainRevisionConflict)) throw error
