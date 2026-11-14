@@ -1130,6 +1130,16 @@ export class BehaviorChainRuntime {
     if (invocation.state === 'admitted' && invocation.behavior === 'implement-issue' && this.operations.implementationAdmission) {
       const gate = await this.operations.implementationAdmission(chain, observation)
       if (gate.reason) {
+        // A pre-disposition admission cannot launch without triage, and its
+        // unsettled state would block that triage; retire it so the owner can
+        // supply a disposition, keeping the visible wait.
+        if (!invocation.request.implementationSource) {
+          const settled = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
+            evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
+          if (settled.waiting !== gate.reason) this.append(settled, { type: 'chain.waiting', reason: gate.reason })
+          this.operations.wake()
+          return
+        }
         if (chain.waiting !== gate.reason) this.append(chain, { type: 'chain.waiting', reason: gate.reason })
         return
       }

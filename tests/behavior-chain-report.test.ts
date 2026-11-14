@@ -806,10 +806,46 @@ it('does not restart a pre-existing admitted report implementation without a dis
   await new BehaviorChainRuntime(journal, ops).run()
   expect(fixture.launch).not.toHaveBeenCalled()
   const current = journal.read(report.id)!
-  expect(current.invocations.find(item => item.id === 'stale-implement')).toMatchObject({ behavior: 'implement-issue', state: 'admitted' })
+  expect(current.invocations.find(item => item.id === 'stale-implement')).toMatchObject({ behavior: 'implement-issue', state: 'settled', outcome: 'launch_deferred' })
   expect(current.waiting).toContain('awaits a current explicit')
   expect(posts()).toHaveLength(1)
 })
+
+it.each(['source-only', 'distinct-fix'] as const)(
+  'allows triage after retiring a pre-existing admitted report implementation without a disposition (%s)', async kind => {
+    const { db, journal } = setup()
+    const fixture = await reviewedImplementationReport(db, journal)
+    let report = journal.read('acme/repo#99')!
+    const observation = await fixture.overrides.observe(report)
+    record(journal, report, { type: 'invocation.admitted', invocation: { id: 'stale-implement', behavior: 'implement-issue',
+      basis: chainBasis(['issue', observation.issue.revision]), actor: 'author', model: 'fixture', slot: reviewer.slot,
+      admittedAt: NOW - 60_000, request: { command: 'agent-interface', cwd: '/fixture',
+        argv: ['--atomic-work', report.id, '--model', 'fixture', '--expected-issue-revision', observation.issue.revision] } } })
+    const ops = operations(db, journal, { ...fixture.overrides, readInvocations: async () => ({ entries: [], quarantined: [] }) })
+    await new BehaviorChainRuntime(journal, ops).run()
+    expect(fixture.launch).not.toHaveBeenCalled()
+    report = journal.read(report.id)!
+    expect(report.invocations.find(item => item.id === 'stale-implement')).toMatchObject({ state: 'settled', outcome: 'launch_deferred' })
+    await setImplementationReportDisposition(db, journal, report, report.sequence, implementationReportBinding(db, report), {
+      kind, review: fixture.review, commentId: 700,
+      diagnosis: kind === 'distinct-fix' ? 'A distinct verified defect in main requires a repository fix.'
+        : 'The failing test exists only in the unpublished source candidate.',
+      nextAction: kind === 'distinct-fix' ? 'Implement that distinct fix.' : 'Inspect the original Call before explicit Resume.' })
+    fixture.request.mockClear(); fixture.launch.mockClear()
+    await new BehaviorChainRuntime(journal, ops).run()
+    const current = journal.read(report.id)!
+    if (kind === 'distinct-fix') {
+      expect(fixture.launch).toHaveBeenCalledOnce()
+      expect(current.invocations.at(-1)).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+      expect(current.invocations.at(-1)?.request.implementationSource).toMatchObject({ id: 'acme/repo#7' })
+    } else {
+      expect(fixture.request).not.toHaveBeenCalled()
+      expect(fixture.launch).not.toHaveBeenCalled()
+      expect(current.waiting).toContain('source-only disposition')
+      expect(journal.read('acme/repo#7')?.waiting).toContain('failing test exists only')
+    }
+    expect(posts()).toHaveLength(1)
+  })
 
 it('retires a pre-disposition admitted report implementation once a distinct-fix is verified', async () => {
   const { db, journal } = setup()
