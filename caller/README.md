@@ -46,7 +46,12 @@ reads its state and linked closing PRs, including closed PRs. It returns
 verified on that exact base by GitHub's commit comparison; missing or incomplete
 evidence returns an explicit unverified reason. The result retains the base, PR
 number and merge SHA. [Dependency waits](../docs/Behavior-chain.md#handoffs-and-outcomes)
-preserve ordinary chain holds and admission gates.
+preserve ordinary chain holds and admission gates. Before the first push,
+`--issue-work --mode publish` re-verifies those same live prerequisites on
+`--starting-head` (the prepared candidate base, not current main); a new
+unresolved dependency or incomplete evidence returns `prerequisite_wait`
+without committing, pushing or opening a PR. Already pushed branches still
+reconcile through `--mode complete`.
 `github-interface --list-failing-ci PR --repository OWNER/REPO --ref SHA`
 includes the exact commit's checks, parent SHAs and workflow identities while
 retaining the current candidate head. `--ref base` reads the current base.

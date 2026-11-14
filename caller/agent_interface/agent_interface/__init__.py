@@ -1853,11 +1853,18 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                     failure = retain_native_failure(id_, error, diagnostic=failure)
                     raise
             outcome = result.get("outcome")
-            if outcome not in {"published", "no_changes", "superseded"}:
+            if outcome not in {"published", "no_changes", "superseded", "prerequisite_wait"}:
                 raise RuntimeError("atomic behavior returned no publication outcome")
-            status = "superseded" if outcome == "superseded" else "completed"
-            finish(id_, status, response=json.dumps(result), outcome=outcome, head_sha=result.get("head_sha"),
-                   action=None if outcome == "superseded" else outcome)
+            if outcome == "prerequisite_wait":
+                if pull is not None or artifact.get("phase") != "prerequisite_wait" \
+                        or artifact.get("publication_head") is not None or artifact.get("replies_started") is not None \
+                        or artifact.get("result") is not None or result.get("head_sha") is not None:
+                    raise RuntimeError("prerequisite wait lacks its proven no-write receipt")
+                finish(id_, "completed", response=json.dumps(result), outcome=outcome, head_sha=None, action="not_started")
+            else:
+                status = "superseded" if outcome == "superseded" else "completed"
+                finish(id_, status, response=json.dumps(result), outcome=outcome, head_sha=result.get("head_sha"),
+                       action=None if outcome == "superseded" else outcome)
             print(json.dumps({"id": id_, "behavior": behavior, "actor": actor, "source": source,
                               "correlation_id": correlation_id, "model": spec.identity, "artifact": artifact, **result}))
     except BaseException as error:
@@ -1868,7 +1875,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         with db() as conn:
             row = conn.execute("select error_code from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
-        no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline"}
+        no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline", "prerequisite_wait"}
         finish(id_, "failed", error="Stopped by user" if stopped else failure_message or str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
                action="not_started" if no_publication else None,
