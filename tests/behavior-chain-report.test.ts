@@ -873,6 +873,50 @@ it('retires a pre-disposition admitted report implementation once a distinct-fix
   expect(posts()).toHaveLength(1)
 })
 
+it('retires a source-bound admitted report implementation when the report revision changes before recovery', async () => {
+  const { db, journal } = setup()
+  const fixture = await reviewedImplementationReport(db, journal)
+  let report = journal.read('acme/repo#99')!
+  await setImplementationReportDisposition(db, journal, report, report.sequence, implementationReportBinding(db, report), {
+    kind: 'distinct-fix', review: fixture.review, commentId: 700,
+    diagnosis: 'A distinct verified defect in main requires a repository fix.', nextAction: 'Implement that distinct fix.' })
+  report = journal.read(report.id)!
+  const source = journal.read('acme/repo#7')!
+  const observation = await fixture.overrides.observe(report)
+  record(journal, report, { type: 'invocation.admitted', invocation: { id: 'bound-implement', behavior: 'implement-issue',
+    basis: chainBasis(['issue', observation.issue.revision]), actor: 'author', model: 'fixture', slot: reviewer.slot,
+    admittedAt: NOW - 60_000, request: { command: 'agent-interface', cwd: '/fixture',
+      argv: ['--atomic-work', report.id, '--model', 'fixture', '--expected-issue-revision', observation.issue.revision],
+      implementationSource: { id: source.id, sequence: source.sequence } } } })
+  // A crash leaves the source-bound admission pending; the report revision changes before recovery.
+  remote[0].body += '\nChanged report before recovery.'
+  const ops = operations(db, journal, { ...fixture.overrides, readInvocations: async () => ({ entries: [], quarantined: [] }) })
+  await new BehaviorChainRuntime(journal, ops).run()
+  expect(fixture.launch).not.toHaveBeenCalled()
+  report = journal.read(report.id)!
+  expect(report.invocations.find(item => item.id === 'bound-implement'))
+    .toMatchObject({ state: 'settled', outcome: 'launch_deferred' })
+  expect(report.waiting).toContain('awaits a current explicit')
+  // The retired admission no longer blocks a new review and replacement disposition.
+  const revised = await fixture.overrides.observe(report)
+  report = record(journal, report, { type: 'invocation.admitted', invocation: { id: 'recovery-review', behavior: 'review-issue',
+    actor: 'reviewer', basis: chainBasis(['issue', revised.issue.revision]), model: 'fixture', slot: reviewer.slot,
+    admittedAt: NOW, request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+  record(journal, report, { type: 'invocation.settled', invocationId: 'recovery-review', callId: 'c'.repeat(32), outcome: 'commented',
+    evidence: { status: 'completed', action: 'commented', issue_revision: revised.issue.revision,
+      receipts: [{ issue: report.id, comment_id: 700, author: 'reviewer' }],
+      resources_settled_at: new Date(NOW).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  report = journal.read(report.id)!
+  await setImplementationReportDisposition(db, journal, report, report.sequence, implementationReportBinding(db, report), {
+    kind: 'distinct-fix', review: 'recovery-review', commentId: 700,
+    diagnosis: 'A distinct verified defect in main requires a repository fix.', nextAction: 'Implement that distinct fix.' })
+  fixture.request.mockClear(); fixture.launch.mockClear()
+  await new BehaviorChainRuntime(journal, ops).run()
+  expect(fixture.launch).toHaveBeenCalledOnce()
+  expect(journal.read(report.id)?.invocations.at(-1)).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+  expect(posts()).toHaveLength(1)
+})
+
 it('blocks implementation when the report acknowledgement was lost and publishing is disabled', async () => {
   const { db, journal } = setup()
   const fixture = await reviewedImplementationReport(db, journal)
