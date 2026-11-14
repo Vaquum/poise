@@ -414,7 +414,16 @@ Caller revalidates the behind predicate on fresh head-pinned reads and sends the
 expected SHA to GitHub's update-branch endpoint. Anything else blocking, and a
 branch that caught up on its own, report `not_ready`. It reports `updated`,
 `not_ready`, or `superseded`; an update is not a merge and leaves Last triggered
-alone. A per-account cursor advances before each batch read and each merge attempt, so
+alone. A terminal branch-update failure identifies the initial REST read, GraphQL
+readiness read, final head read or possible PUT in the existing diagnostic.
+Only a confirmed CLI failure before the PUT proves no write: that attempt is
+`failed`/`settled` in the ledger. Its event, retry and direct run retain the same
+attempt identity and failed stage. A transient read failure is a Warning only
+after retry persistence succeeds and automatic retry remains eligible; cancellation,
+blocked work and bookkeeping failures retain Error. A possible PUT or a killed
+process without terminal proof stays Error/unknown, even after a later attempt
+updates the branch. Existing retry bounds and expected-head protections apply.
+A per-account cursor advances before each batch read and each merge attempt, so
 a scan cut short by its deadline resumes beyond the blocked batch or candidate.
 Ten blocked PRs in one account add 60 GraphQL queries per hour at the one-minute
 cadence. Each successful merge adds three REST reads, one GraphQL query and one
