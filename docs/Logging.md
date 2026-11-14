@@ -307,6 +307,9 @@ Workspace backfill reads three durable events per authenticated maintenance
 page and commits its checkpoint only with central persistence. Replacement or
 removal of the source does not delete central records. Query/collection outages
 never become empty successful reads.
+Caller ingestion yields between its existing 100-event persistence batches so
+queued maintenance requests can run within the collector's five-second complete
+response budget. Its completion checkpoint still waits for durable local ingestion.
 
 The gateway reads native host kernel and `docker.service` Warning-or-higher
 journal records using `journalctl`, with a durable native cursor. Compose mounts
