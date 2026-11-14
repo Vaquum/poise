@@ -371,24 +371,44 @@ describe('Poise in service mode', () => {
     const checkpointPath = join(home, '.poise', 'logging.db.caller')
     const checkpoint = () => existsSync(checkpointPath) ? JSON.parse(readFileSync(checkpointPath, 'utf8')).cursor as number : null
     const before = checkpoint()
-    let clientStarted = 0, elapsed = 0, queuedAtHandler = 0, checkpointAtHandler: number | null = null
+    let clientStarted = 0, elapsed = 0, handlerWaitMs = 0, pageMs = 0, queuedAtHandler = 0, checkpointAtHandler: number | null = null
     let flushMs = 0, maxFlushMs = 0, batches = 0
+    let appendMs = 0, coverageMs = 0, measuring = false
+    const store = source.query(db => db)
+    const append = store.append.bind(store), coverage = store.coverage.bind(store), delivery = store.delivery.bind(store)
+    const appending = vi.spyOn(store, 'append').mockImplementation((events) => {
+      const started = performance.now()
+      try { return append(events) } finally { if (measuring) appendMs += performance.now() - started }
+    })
+    const covering = vi.spyOn(store, 'coverage').mockImplementation((value) => {
+      const started = performance.now()
+      try { return coverage(value) } finally { if (measuring) coverageMs += performance.now() - started }
+    })
+    const paging = vi.spyOn(store, 'delivery').mockImplementation((...args) => {
+      const started = performance.now()
+      try { return delivery(...args) } finally { if (measuring) pageMs += performance.now() - started }
+    })
     const flush = source.flush.bind(source)
     const flushing = vi.spyOn(source, 'flush').mockImplementation(() => {
       const started = performance.now(), result = flush(), duration = performance.now() - started
-      flushMs += duration; maxFlushMs = Math.max(maxFlushMs, duration); batches++
+      if (measuring) { flushMs += duration; maxFlushMs = Math.max(maxFlushMs, duration); batches++ }
       return result
     })
     const deliver = central.deliver.bind(central)
     vi.spyOn(central, 'deliver').mockImplementation((...args) => {
-      elapsed = performance.now() - clientStarted
-      expect(args[0].length).toBeLessThanOrEqual(3)
+      if (args[1] === 'workspace:' + HANDLE) {
+        elapsed = performance.now() - clientStarted
+        measuring = false
+        expect(args[0].length).toBeGreaterThan(0)
+        expect(args[0].length).toBeLessThanOrEqual(3)
+      }
       return deliver(...args)
     })
     const peer = (req: IncomingMessage) => {
       if (req.headers.host !== PUBLIC_HOST) return
       Object.defineProperty(req.socket, 'remoteAddress', { value: GATEWAY_PEER, configurable: true })
-      if (req.url === '/api/service/diagnostics') {
+      if (req.url?.split('?')[0] === '/api/service/diagnostics') {
+        handlerWaitMs = performance.now() - clientStarted
         queuedAtHandler = source.localSnapshot().queued
         checkpointAtHandler = checkpoint()
       }
@@ -399,6 +419,8 @@ describe('Poise in service mode', () => {
     const context = new Context({ ...h.context.deps, config: { ...h.config, domain: 'poise.example.test' },
       keys: { privateKey: gateway.privateKey, publicKeyBase64: gateway.publicKey }, upstream: () => {
         clientStarted = performance.now()
+        flushMs = 0; maxFlushMs = 0; batches = 0; appendMs = 0; coverageMs = 0; pageMs = 0
+        handlerWaitMs = 0; queuedAtHandler = 0; checkpointAtHandler = null; measuring = true
         queueMicrotask(() => releaseCaller({ stdout: JSON.stringify(callerPage), stderr: '' }))
         return { host: '127.0.0.1', port }
       } })
@@ -406,26 +428,42 @@ describe('Poise in service mode', () => {
     vi.spyOn(h.context.deps.docker, 'diagnosticRead').mockResolvedValue(Buffer.alloc(0))
     const collector = new EnvironmentCollectors(central, h.context.deps.docker, context)
     const workers: Worker[] = []
+    const heartbeats = new Int32Array(new SharedArrayBuffer(8 * Int32Array.BYTES_PER_ELEMENT))
     try {
       // Concurrent CLI/test processes compete for CPU with the workspace event loop.
-      await Promise.all(Array.from({ length: 8 }, () => new Promise<void>((resolve, reject) => {
-        const worker = new Worker(`const { parentPort } = require('node:worker_threads');
-          const until = Date.now() + 60_000; parentPort.postMessage('ready'); while (Date.now() < until) {}`, { eval: true })
+      await Promise.all(Array.from({ length: 8 }, (_, index) => new Promise<void>((resolve, reject) => {
+        const worker = new Worker(`const { parentPort, workerData } = require('node:worker_threads');
+          const beats = new Int32Array(workerData.beats); parentPort.postMessage('ready');
+          parentPort.once('message', () => { parentPort.postMessage('running');
+            for (;;) { const until = Date.now() + 10; while (Date.now() < until) {} Atomics.add(beats, workerData.index, 1) }
+          })`,
+        { eval: true, workerData: { beats: heartbeats.buffer, index } })
         workers.push(worker); worker.once('message', () => resolve()); worker.once('error', reject)
       })))
       source.flush()
+      // Populate the backlog before contention so fixture construction cannot
+      // consume the case deadline before the delivery measurement starts.
       for (let i = 0; i < 7000; i++) expect(logging.diagnostic({ id: 'loaded-' + i, level: 'error', operation: 'loaded.failure',
         message: 'Concurrent workspace diagnostic backlog', stack: 'frame\n'.repeat(100) })).not.toBeNull()
       expect(source.localSnapshot().queued).toBe(7000)
-      collector.start()
-      await vi.waitFor(() => expect(central.health().sources.some(row => row.id === 'workspace:' + HANDLE)).toBe(true), { timeout: 30_000 })
-      await collector.stop()
+      await Promise.all(workers.map(worker => new Promise<void>((resolve) => {
+        worker.once('message', () => resolve()); worker.postMessage('start')
+      })))
+      const committed = () => source.query(db => db.query({ workspace: HANDLE, operator: false }, { search: 'Concurrent workspace diagnostic backlog' })).total
+      for (let page = 0; page < 2; page++) {
+        const committedBefore = committed(), beatsBefore = Array.from(heartbeats)
+        const cursor = central.query(db => db.checkpoint('workspace:' + HANDLE))
+        collector.start()
+        await vi.waitFor(() => expect(central.query(db => db.checkpoint('workspace:' + HANDLE))).not.toBe(cursor), { timeout: 30_000 })
+        console.info(`[diagnostic delivery] response=${elapsed.toFixed(0)}ms, handlerWait=${handlerWaitMs.toFixed(0)}ms, page=${pageMs.toFixed(0)}ms, flushes=${batches}, totalFlush=${flushMs.toFixed(0)}ms, maxFlush=${maxFlushMs.toFixed(0)}ms, append=${appendMs.toFixed(0)}ms, coverage=${coverageMs.toFixed(0)}ms, queuedAtHandler=${queuedAtHandler}`)
+        expect(elapsed).toBeLessThan(5000)
+        expect(queuedAtHandler).toBeGreaterThan(0)
+        expect(checkpointAtHandler).toBe(before)
+        expect(committed()).toBeGreaterThan(committedBefore)
+        expect(beatsBefore.every((beat, index) => Atomics.load(heartbeats, index) > beat)).toBe(true)
+        await collector.stop()
+      }
       await Promise.all(workers.map(worker => worker.terminate()))
-      console.info(`[diagnostic delivery] response=${elapsed.toFixed(0)}ms, flushes=${batches}, totalFlush=${flushMs.toFixed(0)}ms, maxFlush=${maxFlushMs.toFixed(0)}ms, queuedAtHandler=${queuedAtHandler}`)
-      expect(central.query(db => db.checkpoint('workspace:' + HANDLE))).not.toBeNull()
-      expect(elapsed).toBeLessThan(5000)
-      expect(queuedAtHandler).toBeGreaterThan(0)
-      expect(checkpointAtHandler).toBe(before)
       await vi.waitFor(() => expect(checkpoint()).toBe(3), { timeout: 30_000 })
       expect(source.query(db => db.query({ workspace: HANDLE, operator: false }, { source: 'caller', search: 'loaded Caller diagnostic cause' })).total).toBe(1)
       expect((await send('GET', '/api/service/diagnostics', fromGateway('admin'))).status).toBe(200)
@@ -435,7 +473,7 @@ describe('Poise in service mode', () => {
     } finally {
       await Promise.all(workers.map(worker => worker.terminate()))
       await collector.stop(); await logging.stopLogging()
-      server.off('request', peer); flushing.mockRestore(); run.mockRestore(); stderr.mockRestore()
+      server.off('request', peer); flushing.mockRestore(); appending.mockRestore(); covering.mockRestore(); paging.mockRestore(); run.mockRestore(); stderr.mockRestore()
       central.stop(); context.agent.destroy(); await h.close()
       vi.stubEnv('POISE_LOG_QUEUE_EVENTS', previousEvents); vi.stubEnv('POISE_LOG_QUEUE_BYTES', previousBytes)
       logging.startLogging()

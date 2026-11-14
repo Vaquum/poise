@@ -297,7 +297,7 @@ it('checkpoints Caller completions after quarantining evidence above the local s
   vi.stubEnv('POISE_LOG_QUEUE_EVENTS', '1')
   start()
   vi.mocked(process.stderr.write).mockImplementation(() => { throw new Error('fixture forwarding unavailable') })
-  await vi.waitFor(() => expect(JSON.parse(readFileSync(join(directory, 'logging.db.caller'), 'utf8'))).toMatchObject({ streamId: 'a'.repeat(32), cursor: 3 }))
+  await vi.waitFor(() => expect(JSON.parse(readFileSync(join(directory, 'logging.db.caller'), 'utf8'))).toMatchObject({ streamId: 'a'.repeat(32), cursor: 3 }), { timeout: 5000 })
   expect(run).toHaveBeenCalledWith('agent-interface', ['--diagnostics', '0', '3'], expect.any(Object))
   expect(loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false })).events.some((event) => event.message === 'later precise cause')).toBe(true)
   expect(loggingRuntime()!.health().rejected).toBeGreaterThan(0)

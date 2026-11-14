@@ -86,7 +86,7 @@ describe('review worker exit diagnostics', () => {
 
       worker.collector.events = [worker.timeout]
       await vi.advanceTimersByTimeAsync(15_000)
-      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
       await worker.logging.stopLogging()
       // A lost checkpoint replays the same retained completion after restart.
       writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
@@ -120,7 +120,7 @@ describe('review worker exit diagnostics', () => {
       // Periodic --diagnostics truncates the same error to 8,192 characters.
       worker.collector.events = [{ ...worker.timeout, error: fullError.slice(0, 8192) }]
       await vi.advanceTimersByTimeAsync(15_000)
-      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
       await worker.logging.stopLogging()
       writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
       worker.logging.startLogging()
@@ -152,7 +152,7 @@ describe('review worker exit diagnostics', () => {
       // UTF-16 units; only the code-point truncation replays exactly.
       worker.collector.events = [{ ...worker.timeout, error: truncated }]
       await vi.advanceTimersByTimeAsync(15_000)
-      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
       await worker.logging.stopLogging()
       writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
       worker.logging.startLogging()
@@ -189,7 +189,7 @@ describe('review worker exit diagnostics', () => {
       worker.collector.events = [{ ...worker.timeout, error: envelopeError, diagnostic: null,
         evidence_unavailable: 'Stored process diagnostic exceeds the bounded metadata envelope' }]
       await vi.advanceTimersByTimeAsync(15_000)
-      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
       await worker.logging.stopLogging()
       writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
       worker.logging.startLogging()
@@ -269,7 +269,7 @@ describe('review worker exit diagnostics', () => {
       worker.collector.events = [{ ...worker.timeout, error: envelopeError, diagnostic: null,
         evidence_unavailable: 'Stored process diagnostic exceeds the bounded metadata envelope' }]
       await vi.advanceTimersByTimeAsync(15_000)
-      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
       await worker.logging.stopLogging()
       writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
       worker.logging.startLogging()
@@ -367,7 +367,7 @@ describe('review worker exit diagnostics', () => {
 
       worker.collector.events = [call]
       await vi.advanceTimersByTimeAsync(15_000)
-      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
       await worker.logging.stopLogging()
       writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
       worker.logging.startLogging()
