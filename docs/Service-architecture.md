@@ -1454,9 +1454,11 @@ reconnect/provider-verification evidence; these optional fields do not change
 reducer state or old event hashes. Ambiguous older events stay unknown. See
 [System health](Analytics.md#system-health).
 
-New implementation admission also consumes Caller's captured forward GitHub
+New implementation admission also consumes Caller's complete live forward GitHub
 prerequisites and verified delivery on the implementation base through the
-existing chain sweep. [Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
+existing chain sweep, including a final observation after awaited request
+preparation. The mirror health gate remains required.
+[Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
 dependency wait; no gateway route, journal event or poller is added.
 
 The workspace's existing `/api/behavior-chains` controls also expose an explicit
@@ -1534,7 +1536,9 @@ declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 The same reconciliation can release a CI-only hold after a proven clean base
-update, retaining the original Call, resource-release proof and remaining gates
+update, or admit the existing scoped repair when a fresh conflict on the retained
+failed head blocks that update, retaining the original Call, resource-release
+proof, repair retry bound and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 For a pre-PR implementation, the existing Caller artifact and seed read can
 instead verify an original CI assertion failure on its exact prepared base and
@@ -1740,7 +1744,8 @@ configured-account issue publisher and datastore intake. An explicit per-reposit
 opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review timeout exhaustion, including retained legacy review/approval stops
 from their existing reconciliation independently of model readiness or v2 mode,
-verified automatic implementation holds before a PR,
+verified automatic implementation holds before a PR and terminal repair holds
+before publication,
 terminal uncertain implementation publication,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
@@ -1762,6 +1767,9 @@ fresh source verification after preparation. Diagnosis and next action persist
 on the held source through the existing report metadata and journal waits.
 This adds no retry or checkout-retention authority; see
 [report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
+Terminal repair reports require the matching automatic hold, settled original Call,
+positive release and unchanged open PR head and repair basis, without possible
+publication effects. They preserve repair ownership and exclude CI-only recovery holds.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,

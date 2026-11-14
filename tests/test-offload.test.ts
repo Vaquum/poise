@@ -358,15 +358,22 @@ process.exitCode = 125`)
   })
 
   it('leave the steps of an npm script that stays here, as `npm run build` runs its typecheck, and take npx\'s', () => {
-    const { env } = hooked(true)
+    const { env, hooks } = hooked(true)
+    writeFileSync(join(hooks, 'run.mjs'), `console.log(JSON.stringify(process.argv.slice(2)))
+console.error('[poise] fixture sender: relay unavailable')
+process.exitCode = 125`)
     const repo = temp()
     execFileSync('git', ['init', '-q', repo])
     writeFileSync(join(repo, 'tsc'), 'console.log("ran here")')
     const result = attempt([join(repo, 'tsc'), '--noEmit'], { ...env, npm_lifecycle_event: 'build' }, repo)
     expect(result.status).toBe(0)
     expect(result.stdout).toBe('ran here\n')
-    expect(attempt([join(repo, 'tsc'), '--noEmit'], { ...env, npm_lifecycle_event: 'npx' }, repo).status).toBe(125)
-    expect(attempt([join(repo, 'tsc'), '--noEmit'], { ...env, npm_lifecycle_event: 'check' }, repo).status).toBe(125)
+    for (const event of ['npx', 'check']) {
+      const intercepted = attempt([join(repo, 'tsc'), '--noEmit'], { ...env, npm_lifecycle_event: event }, repo)
+      expect(intercepted.status).toBe(125)
+      const args = JSON.parse(intercepted.stdout) as string[]
+      expect(args.slice(args.indexOf('--') + 1)).toEqual([process.execPath, join(repo, 'tsc'), '--noEmit'])
+    }
   })
 
   it('take a Python test runner out of this machine, from any interpreter, and it never runs here', () => {
