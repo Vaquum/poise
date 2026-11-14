@@ -72,7 +72,7 @@ it('reconciles an existing automatic closure hold, closes once and rebuilds dist
   expect(() => nativeActionReceipt(current, current.invocations[0], { ...result, state: 'open' })).toThrow('original verified coverage')
   expect(current).toMatchObject({ held: null, mergeSha: null, supersession: { verified: true,
     covering: [{ number: 940, mergeSha: MERGE }], duplicate: { number: 946, head: HEAD }, failures: [{ id: 1 }], recovery: { id: 2 } } })
-  expect(behaviorChainSummary(current).supersession).toEqual(current.supersession)
+  expect(behaviorChainSummary(current, journal).supersession).toEqual(current.supersession)
   expect(journal.active()).toEqual([])
   expect(journal.page()).toHaveLength(1)
   expect(journal.forPull(chain.repository, 946)?.id).toBe(chain.id)

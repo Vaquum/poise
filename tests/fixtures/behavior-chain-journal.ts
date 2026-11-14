@@ -28,3 +28,21 @@ export const historicalJournals = [
     '0fb16c1d7432b03c615502be2c076eebde4d1be54228ab57a3d8d71ead4f1f19',
   ] },
 ]
+
+// Frozen with the unmodified reducer at 762e5ea635f9eb2f28c573d7affbb85263b9382b.
+export const resumedWaitJournal: { events: ChainEvent[], hashes: string[] } = {
+  events: [
+    historicalEvents[0],
+    { type: 'chain.waiting', reason: 'Worker blocked; explicitly Resume. Report https://github.com/Historical/Repo/issues/99' },
+    { type: 'chain.held', reason: 'Worker blocked' },
+    { type: 'chain.resumed' },
+    { type: 'chain.observed', observation: { checkedAt: 1_800_000_000_004 } },
+  ],
+  hashes: [
+    '90cd457aae65076093df890ebb753785734aac2d88b9472d04212eb313e224c2',
+    'b01911d5f60ae2afc127b233a9a4371d05307019adcc0c90230ad104eb0deb26',
+    '343704e82c1563aeb9d1c78b143f2a72964b5d0dcd9bb6f102d31ba980dd6f80',
+    '3be67c37b7d994bb9760cd4273f1469bf8051939a4be7582aab0294f2c91b81a',
+    '9f0ee929cc15349e4371769d10e1aabafe171c631196baf0ff828a5a2c701e6d',
+  ],
+}

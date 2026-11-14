@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
-import { chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
+import { behaviorChainSummary, chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
@@ -857,6 +857,7 @@ describe('native admission and recovery', () => {
     let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
     current = record(journal, current, { type: 'chain.resumed' })
     expect(current.waiting).toBe(JSON.parse(firstWait.payload).reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
     const restarted = new BehaviorChainJournal(db); restarted.rebuild()
     expect(restarted.read(chain.id)).toEqual(current)
 
@@ -866,6 +867,7 @@ describe('native admission and recovery', () => {
     expect(waits()[0]).toEqual(firstWait)
     expect(waits()[1].payload).toBe(firstWait.payload)
     expect(waits()[1].sequence).toBeGreaterThan(current.resumedAfterSequence)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(JSON.parse(firstWait.payload).reason)
     await runtime.run()
     await new BehaviorChainRuntime(restarted, ops).run()
     expect(waits()).toHaveLength(2)

@@ -42,7 +42,7 @@ try {
   const runtime = new BehaviorChainRuntime(journal, operations)
   await runtime.run()
   assert.equal(journal.read(chain.id)!.invocations[0].state, 'uncertain', 'a refusal cannot release resources')
-  assert.equal(behaviorChainSummary(journal.read(chain.id)!).invocations[0].callId, call.id)
+  assert.equal(behaviorChainSummary(journal.read(chain.id)!, journal).invocations[0].callId, call.id)
   operations.readInvocations = async () => snapshot
   operations.enabled = () => data.submission === 'uncertain'
   await runtime.run()
@@ -53,11 +53,11 @@ try {
   assert.deepEqual(current.invocations[0].evidence?.diagnostic ?? null, call.diagnostic)
   if (data.submission === null) {
     assert.equal(current.invocations[0].outcome, 'enqueued')
-    assert.equal(behaviorChainSummary(current).invocations[0].nativeAction?.attribution, 'accepted-response')
+    assert.equal(behaviorChainSummary(current, journal).invocations[0].nativeAction?.attribution, 'accepted-response')
   }
   const events = journal.history(chain.id)
   journal.rebuild()
   assert.deepEqual(journal.history(chain.id), events)
   assert.deepEqual(journal.read(chain.id), current)
-  process.stdout.write(JSON.stringify(behaviorChainSummary(current)))
+  process.stdout.write(JSON.stringify(behaviorChainSummary(current, journal)))
 } finally { db.close() }

@@ -247,6 +247,13 @@ function invocationHead(invocation: ChainInvocation): string | null {
   return typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value : null
 }
 
+/** Resume retains waiting in hashed reducer state. Only a newer wait event
+ * makes it current again; an observation alone cannot renew it. */
+export function currentChainWaiting(journal: BehaviorChainJournal, chain: BehaviorChain, waitingSequence?: number): string | null {
+  if (!chain.waiting || !chain.resumedAfterSequence) return chain.waiting
+  return (waitingSequence ?? chainProgress(journal, chain.id).waitingSequence) > chain.resumedAfterSequence ? chain.waiting : null
+}
+
 /** Read-only incident annotation, independent of attention's age/active filters. */
 export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: string | null, correlationId: string | null): LoggingWorkImpact | null {
   const match = journal.forInvocation(callId, correlationId)
@@ -256,7 +263,8 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
   let recovered = progress.failureSequence !== null && progress.sequence > progress.failureSequence
   const active = chain.invocations.find(item => item.state !== 'settled')
   const last = chain.invocations.at(-1)
-  const waiting = progress.waitingSequence > progress.sequence ? chain.waiting : null
+  const currentWaiting = currentChainWaiting(journal, chain, progress.waitingSequence)
+  const waiting = progress.waitingSequence > progress.sequence ? currentWaiting : null
   const contradicted = chain.invocations.some(item => !!item.evidence && resourceReleaseContradicted(item.evidence))
   const blocked = !!chain.held || chain.reviewPending === true || active?.state === 'uncertain' || contradicted
   const diagnostic = invocation.evidence?.diagnostic as ProcessDiagnostic | null | undefined
@@ -288,7 +296,7 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
   // turning green mid-backoff) but not a new head: match the preserved note
   // against the live last invocation on an unchanged head.
   const backoffHead = exactPull(chain.observation as ChainObservation | null)?.head ?? null
-  if (!blocked && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`
+  if (!blocked && !active && last && currentWaiting === `${last.behavior} is in native failure backoff`
     && progress.waitingHead === backoffHead) {
     const attempts = chain.invocations.filter(item => item.behavior === last.behavior && item.basis === last.basis
       && item.slot === last.slot && item.state === 'settled' && item.evidence?.status !== 'deferred'
@@ -314,7 +322,8 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
             : `Resolve the hold and explicitly resume: ${chain.held}`
           : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
             : active ? 'Await the original invocation outcome' : chain.mergeSha ? null
-              : retryAt !== null ? 'Automatic retry eligible after backoff, subject to existing admission gates' : waiting,
+              : retryAt !== null ? 'Automatic retry eligible after backoff, subject to existing admission gates'
+                : waiting || (chain.resumedAfterSequence > 0 ? 'Await the next observation or admission under existing gates' : null),
     journal: `/api/behavior-chains?${new URLSearchParams({ id: chain.id, after: String(Math.max(0, progress.sequence - 1)) })}` }
 }
 
@@ -335,6 +344,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       const cached = cache.get(chain.id)
       const progress = cached?.revision === chain.sequence ? cached.progress : chainProgress(journal, chain.id)
       cache.set(chain.id, { revision: chain.sequence, progress })
+      const waiting = currentChainWaiting(journal, chain, progress.waitingSequence)
       const active = chain.invocations.find(invocation => invocation.state !== 'settled')
       const ageMs = Math.max(0, now - progress.at)
       const observation = chain.observation as ChainObservation | null
@@ -576,9 +586,9 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                                                   ? mergeCompleted
                                                     ? 'Await the merge verified artifact or changed input; merge-pr already completed for this head'
                                                     : 'Merge or enqueue through merge-pr under native head-pinned repository gates'
-                                                  : chain.waiting || 'Await the next invocation under existing admission gates'
+                                                  : waiting || 'Await the next invocation under existing admission gates'
       let retryAt: number | null = null
-      if (!chain.held && !chain.reviewPending && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`) {
+      if (!chain.held && !chain.reviewPending && !active && last && waiting === `${last.behavior} is in native failure backoff`) {
         const attempts = chain.invocations.filter(invocation => invocation.behavior === last.behavior && invocation.basis === last.basis
           && invocation.slot === last.slot && invocation.state === 'settled' && invocation.evidence?.status !== 'deferred'
           && invocation.admissionSequence > chain.resumedAfterSequence)
@@ -592,12 +602,12 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       entries.push({ id: chain.id, repository: chain.repository, issue: chain.issue,
         pullNumber: observation?.publication?.pull_number ?? null,
         step: active ? `${active.behavior}: ${active.state}` : chain.reviewPending ? 'Merged; review evidence pending'
-          : !chain.held ? chain.waiting || (pull ? 'PR merge gates' : 'Issue admission')
+          : !chain.held ? waiting || (pull ? 'PR merge gates' : 'Issue admission')
           : last ? `${last.behavior}: ${last.outcome ?? last.state}` : 'Issue admission',
         progressAt: progress.at, ageMs,
         blocker: preview([queueReviewConflict ? 'Queue admission conflicts with required retained Poise review evidence' : null,
           chain.held, active?.state === 'uncertain' ? active.outcome || 'Original receipt unverified' : null,
-          chain.reviewPending ? 'Original pre-merge review evidence pending' : null, chain.waiting].filter(Boolean).join('; ')
+          chain.reviewPending ? 'Original pre-merge review evidence pending' : null, waiting].filter(Boolean).join('; ')
           || 'No verified progress for at least 24 hours'),
         evidence: { state, checkedAt: observation?.checkedAt ?? null, gates: gates.map(preview) },
         nextAction: preview(next), retryAt,
@@ -616,12 +626,13 @@ export function chainWaitsForResourceRelease(chain: BehaviorChain): boolean {
     && !(typeof invocation.evidence?.resources_settled_at === 'string' && Number.isFinite(Date.parse(invocation.evidence.resources_settled_at))))
 }
 
-/** Pure wire projection, shared by the HTTP handler and isolated browser fixtures. */
-export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at: number | null }) {
+/** Wire projection, shared by the HTTP handler and isolated browser fixtures. */
+export function behaviorChainSummary(chain: BehaviorChain, journal: BehaviorChainJournal, reconciliation?: { at: number | null }) {
   const publication = chain.observation?.publication as { pull_number?: number | null } | undefined
+  const waiting = currentChainWaiting(journal, chain)
   return { id: chain.id, repository: chain.repository, issue: chain.issue, branch: chain.branch, author: chain.author, reviewer: chain.reviewer,
     sequence: chain.sequence, held: chain.held,
-    waiting: chain.mergeSha && chain.waiting?.startsWith('native merge queue owns entry ') ? null : chain.waiting,
+    waiting: chain.mergeSha && waiting?.startsWith('native merge queue owns entry ') ? null : waiting,
     mergeSha: chain.mergeSha,
     supersession: chain.supersession ?? null,
     reviewPending: chain.reviewPending ?? null,
