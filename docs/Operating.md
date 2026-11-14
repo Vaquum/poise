@@ -1247,8 +1247,10 @@ starts a stopped workspace on its owner's next visit. The script checks Docker's
 inventory before and after each volume. A failed inventory or safety check
 removes the entire new backup directory, including
 archives already completed. Live `runc` volumes still support the nightly command
-above without stopping the gateway. A busy or locked SQLite snapshot aborts the
-backup; it never falls back to copying that live database's files.
+above without stopping the gateway. Any failed SQLite snapshot, including an
+unreadable database or a busy or locked snapshot, aborts the backup and removes
+the entire new backup directory. The error names the database path and SQLite
+cause; it never falls back to copying that database's files.
 
 ## Live Caller diagnostics under gVisor
 
