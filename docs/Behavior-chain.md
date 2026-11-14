@@ -690,6 +690,11 @@ unattempted checkpoint do not acquire this recovery authority.
 The executed publication helper verifies its original controller and PID
 namespace, its direct Caller parent and the absence of any other worker before
 reserving replies. It cannot inherit an in-memory Python scope across exec.
+Only extra namespace members receive the existing two-second settlement window;
+each controller read is bounded by the time remaining. Reservation requires
+exactly PID 1, PID 2 and the original helper. Identity mismatches, persistent
+members and namespace read timeouts or I/O failures retain distinct bounded
+reasons through the existing diagnostic, with replies still unattempted.
 After a repair publishes the current head and all required fresh reviews
 complete, answered conversations proceed to independent approval rather than
 another repair solely because the original thread is still unresolved. A new
