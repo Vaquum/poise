@@ -1737,7 +1737,8 @@ configured-account issue publisher and datastore intake. An explicit per-reposit
 opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review timeout exhaustion, including retained legacy review/approval stops
 from their existing reconciliation independently of model readiness or v2 mode,
-verified automatic implementation holds before a PR,
+verified automatic implementation holds before a PR and terminal repair holds
+before publication,
 terminal uncertain implementation publication,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
@@ -1750,6 +1751,9 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Terminal repair reports require the matching automatic hold, settled original Call,
+positive release and unchanged open PR head and repair basis, without possible
+publication effects. They preserve repair ownership and exclude CI-only recovery holds.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,
