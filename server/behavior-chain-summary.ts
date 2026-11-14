@@ -355,6 +355,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
           || !chain.invocations.some(invocation => invocation.state === 'settled' && invocation.evidence?.status === 'completed'
             && ['reviewed_clean', 'approved'].includes(String(invocation.evidence.action))
             && chainReviewResponse(chain, invocation, observation, now)))
+      const queueUnmergeable = state === 'fresh' && !!pull?.queueEntry && pull.queueEntryDetails?.id === pull.queueEntry
+        && pull.queueEntryDetails.state === 'UNMERGEABLE'
       if (!queueReviewConflict && !chain.held && !chain.reviewPending && active?.state !== 'uncertain' && ageMs < CHAIN_ATTENTION_DELAY_MS) continue
       const gates = pull ? [
         `Head ${pull.head.slice(0, 12)}`,
@@ -367,6 +369,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         ...(pull.behind ? ['Native policy requires a base update'] : []),
         ...(pull.readinessBlockers ?? []),
         ...(pull.queueEntry ? ['Native queue owns the candidate; merge completion unverified'] : []),
+        ...(queueUnmergeable ? ['Queue UNMERGEABLE; cause unknown'] : []),
         ...(queueReviewConflict ? ['Queue admission conflicts with required retained Poise review evidence'] : []),
       ] : [observation?.pull ? 'Exact-head PR evidence incomplete; merge gates unverified'
         : 'No verified PR evidence; merge completion unverified']
@@ -527,7 +530,9 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                     : observation && needsIssueReview(chain, observation) ? 'Review the current seed issue through review-issue'
                     : observation && unpublishedMissingReceipt ? 'Hold: seed branch exists without this chain’s native publication receipt; a decision is required'
                     : observation && unpublishedNoChanges ? 'Hold: implementation returned no changes and produced no pull request; a decision is required'
-                    : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
+                    : pull?.queueEntry ? queueUnmergeable
+                      ? 'Queue UNMERGEABLE needs attention; cause unknown. Await GitHub queue resolution or removal; GitHub retains ownership'
+                      : 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
                       : dismissedApproval && pull
                       ? `Hold: approval ${dismissedApproval.id} was dismissed on the current head; a decision is required`
                       : queueAwaitingRemoval && pull

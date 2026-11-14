@@ -50,12 +50,14 @@ export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org:
   const newerQueue = !!originalQueue && !!observation && responseAt > observation.checkedAt && responseAt <= now
     && now - responseAt <= CHAIN_OBSERVATION_MAX_AGE_MS
   const entry = fresh && pull?.queueEntry ? pull.queueEntry : newerQueue ? String(queueProof!.result.queue_entry_id) : null
+  const disposition = fresh && !newerQueue && entry && pull?.queueEntryDetails?.id === entry ? pull.queueEntryDetails : null
   const participation = lastChainQueueInvocation(chain)
   const ejected = fresh && !entry && !!pull?.queueRemoval && participation?.evidence?.head_sha === pull.head
     && pull.queueRemoval.at >= participation.admittedAt && pull.queueRemoval.reason !== 'merged'
   const queue: PrStatusRow['queue'] = { state: entry ? 'queued' : ejected ? 'ejected' : fresh ? 'not_queued' : 'unknown',
     entryId: entry, since: entry ? new Date(newerQueue ? responseAt : observation!.checkedAt).toISOString()
-      : ejected ? new Date(pull!.queueRemoval!.at).toISOString() : null }
+      : ejected ? new Date(pull!.queueRemoval!.at).toISOString() : null,
+    ...(disposition ? { disposition: disposition.state, integrationBase: disposition.base, integrationHead: disposition.head } : {}) }
   const queueAttributed = !!entry && !!enqueueOwner
   if (entry) {
     queue.attribution = queueAttributed ? 'accepted-response' : 'observed'
@@ -77,6 +79,7 @@ export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org:
   else if (eligibility.refusal) set('not_eligible', `v2 ${eligibility.refusal}`, `refusal:${eligibility.refusal}`)
   else if (!fresh) line = observationState === 'missing' ? 'v2 observation missing; awaiting the first canonical PR observation'
     : 'v2 observation stale; current PR state is unverified'
+  else if (entry && disposition?.state === 'UNMERGEABLE') set('blocked', 'v2 queue UNMERGEABLE; cause unknown; GitHub retains ownership', `queue:${entry}:UNMERGEABLE:${queue.attribution}`)
   else if (entry) set('in_queue', queueAttributed ? 'v2 enqueue accepted for the original invocation; awaiting native integration'
     : 'v2 observed in native queue; enqueue mutation is not attributed', `queue:${entry}:${queue.attribution}`)
   else if (ejected) set('awaiting_author', `v2 queue rejected the candidate: ${pull!.queueRemoval!.reason ?? 'unknown reason'}`, `queue-removal:${pull!.queueRemoval!.id}`)
