@@ -22,6 +22,9 @@ export interface ChainRuntimeOperations {
   observe(chain: BehaviorChain): Promise<ChainObservation>
   /** Also reports terminal uncertain publications and merges without a chain hold. */
   reportHold?(chain: BehaviorChain): Promise<string | null>
+  implementationAdmission?(chain: BehaviorChain, observation: ChainObservation): Promise<{
+    reason: string | null, source?: { id: string, sequence: number }
+  }>
   recoverReport?(chain: BehaviorChain, observation: ChainObservation): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
@@ -288,6 +291,7 @@ export class BehaviorChainRuntime {
     const current = this.current(chain)
     const accounts = this.operations.accounts()
     return current.invocations.some(candidate => candidate.id === invocation.id && candidate.state !== 'settled')
+      && (!invocation.request.implementationSource || this.journal.read(invocation.request.implementationSource.id)?.sequence === invocation.request.implementationSource.sequence)
       && !closedChainTarget(current, current.observation as ChainObservation | null, invocation.behavior)
       && !current.held && this.operations.enabled() && accounts.author.toLowerCase() === current.author.toLowerCase() && accounts.reviewer.toLowerCase() === current.reviewer.toLowerCase()
       && this.operations.permitted(current, { kind: 'invoke', behavior: invocation.behavior, actor: invocation.actor,
@@ -530,6 +534,13 @@ export class BehaviorChainRuntime {
                 firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
               } : undefined
               const decision = decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
+              if (decision.kind === 'invoke' && decision.behavior === 'implement-issue' && this.operations.implementationAdmission) {
+                const gate = await this.operations.implementationAdmission(chain, observation)
+                if (gate.reason) {
+                  if (chain.waiting !== gate.reason) this.append(chain, { type: 'chain.waiting', reason: gate.reason })
+                  continue
+                }
+              }
               if (chain.held && decision.kind === 'wait' && this.operations.reportHold && await this.reportHold(chain)) continue
               if ((decision.kind === 'supersede' || decision.kind === 'invoke' && decision.behavior === 'retire-pr') && automaticClosureHold(chain.held)) {
                 chain = this.append(chain, { type: 'chain.resumed' })
@@ -669,11 +680,22 @@ export class BehaviorChainRuntime {
                   const redecided = decideBehaviorChain(chain, fresh, Date.now())
                   if (redecided.kind !== 'invoke' || redecided.behavior !== decision.behavior || redecided.basis !== decision.basis) {
                     if (redecided.kind === 'wait' && chain.waiting !== redecided.reason) this.append(chain, { type: 'chain.waiting', reason: redecided.reason })
+                    // A report revision changed during preparation also invalidates its disposition; surface that explicitly.
+                    const gate = await this.operations.implementationAdmission?.(chain, fresh)
+                    if (gate?.reason && chain.waiting !== gate.reason) this.append(chain, { type: 'chain.waiting', reason: gate.reason })
                     continue
                   }
                   if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
                 }
                 phase = 'invocation-admission'
+                const gate = decision.behavior === 'implement-issue'
+                  ? await this.operations.implementationAdmission?.(chain, observation) : undefined
+                if (gate?.reason) {
+                  if (chain.waiting !== gate.reason) this.append(chain, { type: 'chain.waiting', reason: gate.reason })
+                  continue
+                }
+                if (gate?.source) request = { ...request, implementationSource: gate.source }
+                if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
                 const admitted = this.journal.admitInvocation(chain, randomUUID(), { id, behavior: decision.behavior, basis: decision.basis,
                   actor: decision.actor, model: request.command === 'agent-interface' ? request.argv[request.argv.indexOf('--model') + 1] : null, slot: decision.reviewer?.slot ?? null,
                   ...(resources ? { reservation: resources.reservation } : {}),
@@ -1160,6 +1182,27 @@ export class BehaviorChainRuntime {
       this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
         reason: 'native process exited without a durable Call receipt; its exit evidence must be reconciled before another effect' })
       return
+    }
+    if (invocation.state === 'admitted' && invocation.behavior === 'implement-issue' && this.operations.implementationAdmission) {
+      const gate = await this.operations.implementationAdmission(chain, observation)
+      if (gate.reason) {
+        // A blocked admission cannot launch, and its unsettled state would
+        // block the new review and replacement disposition required to
+        // progress; retire it, keeping the visible wait.
+        const settled = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
+          evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
+        if (settled.waiting !== gate.reason) this.append(settled, { type: 'chain.waiting', reason: gate.reason })
+        this.operations.wake()
+        return
+      }
+      // An admission that predates source binding cannot carry its launch
+      // precondition; retire it so a fresh admission binds the current source.
+      if (gate.source && !invocation.request.implementationSource) {
+        this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
+          evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
+        this.operations.wake()
+        return
+      }
     }
     if (invocation.state === 'admitted') await this.start(chain, invocation)
   }

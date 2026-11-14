@@ -8,6 +8,8 @@ import { behaviorCutoverBlockers } from './behavior-cutover'
 import type { BehaviorChain, ChainEvent } from './behavior-chain-store'
 import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact, behaviorChainWorkImpacts } from './behavior-chain-summary'
 import { nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
+import { db } from './db'
+import { implementationReportBinding, setImplementationReportDisposition } from './behavior-chain-report'
 
 function reply(res: ServerResponse, status: number, value: unknown): void {
   res.statusCode = status; res.setHeader('Content-Type', 'application/json'); endJson(res, JSON.stringify(value))
@@ -64,7 +66,7 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
                 ...(event.type === 'chain.merged' && typeof event.evidence.review_complete === 'boolean'
                   ? { review_complete: event.evidence.review_complete } : {}) } } : {}) }
         })
-        return reply(res, 200, { chain: summary(chain), events, next: rows.length === 20 ? rows.at(-1)!.sequence : null,
+        return reply(res, 200, { chain: summary(chain), implementationReport: implementationReportBinding(db, chain), events, next: rows.length === 20 ? rows.at(-1)!.sequence : null,
           cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })
       }
       const after = params.get('after') || ''
@@ -99,11 +101,16 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
     }
     if (!body || typeof body !== 'object' || !('id' in body) || typeof body.id !== 'string'
       || !('sequence' in body) || !Number.isSafeInteger(body.sequence) || !('operation' in body)
-      || !['hold', 'resume'].includes(String(body.operation))) throw new HttpError(400, 'id, current sequence and hold/resume operation are required')
+      || !['hold', 'resume', 'report-disposition'].includes(String(body.operation))) throw new HttpError(400, 'id, current sequence and hold/resume/report-disposition operation are required')
     const chain = journal.read(body.id)
     if (!chain) throw new HttpError(404, 'behavior chain not found')
     if (chain.mergeSha) throw new HttpError(409, 'Merged chains permit original receipt reconciliation only; new invocations cannot resume')
     if (chain.supersession) throw new HttpError(409, 'Superseded chains are terminal; new invocations cannot resume')
+    if (body.operation === 'report-disposition') {
+      await setImplementationReportDisposition(db, journal, chain, Number(body.sequence),
+        'binding' in body ? body.binding : null, 'disposition' in body ? body.disposition : null)
+      return reply(res, 200, { chain: summary(journal.read(chain.id)!), implementationReport: implementationReportBinding(db, chain) })
+    }
     const operation = body.operation
     const next = journal.append(chain.id, randomUUID(), Number(body.sequence), operation === 'hold'
       ? { type: 'chain.held', reason: 'New invocations held by the person' } : { type: 'chain.resumed', recovery: { origin: 'operator' } })
