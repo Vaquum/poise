@@ -579,7 +579,9 @@ issue then approve. It must submit nothing when filing fails.
 
 A governed review admits up to 3,000,000 UTF-8 prompt bytes. Diff generation
 is capped at 2,850,000 bytes and the serialized packet at 2,950,000 bytes,
-leaving room for context and policy. Existing bulk-data compaction rules still
+leaving room for context and policy. JSON remains required regardless of its
+name or size, including during compaction, unless an existing exclusion identifies
+it as installed dependency content. Other bulk-data and archive exclusions still
 apply. These byte limits do not guarantee that an input fits a provider's token
 window. Claude receives the whole packet in one call.
 
