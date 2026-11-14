@@ -1,13 +1,14 @@
 // @vitest-environment node
 // Agents' test suites run on disposable test boxes: these run the real hooks, runner, relay and box
 // script, with only Render itself replaced. docs/Operating.md, "Agents' test suites".
-import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash, generateKeyPairSync } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { runInNewContext } from 'node:vm'
 import { gzipSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
@@ -1970,6 +1971,111 @@ ${stderr}`
     expect(relay.runs.has(id)).toBe(true)
     expect((await fetch(`${relayUrl}/instance`)).status).toBe(200)
     expect(await (await fetch(`${relayUrl}/instance/box`)).text()).toBe(readFileSync('gateway/src/test-box.cjs', 'utf8'))
+  })
+})
+
+describe('a test box\'s kernel memory evidence', () => {
+  const oldKill = '[ 1.000] Out of memory: Killed process 42 (private-task)\n'
+  const freshKill = '[ 2.000] Out of memory: Killed process 43 (private-task)\n'
+
+  async function run(kind: string, before: string | null, after: string | null, status: number) {
+    const nativeRequire = createRequire(import.meta.url)
+    const observations: string[] = []
+    let exited = false
+    let stdout = ''
+    let stderr = ''
+    const sample = () => {
+      observations.push('sample')
+      return exited ? after : before
+    }
+    // Keep root='/' so both production kernel branches run. Replace only the kernel observations and uid switch;
+    // the real suite still writes to its pipes and exits before the runner drains output.
+    const code = await new Promise<number>((done) => {
+      runInNewContext(`${readFileSync('gateway/src/test-box.cjs', 'utf8')}\nrunSuite(spec, {})`, {
+        require: (name: string) => {
+          if (name === 'node:timers/promises') return {
+            setTimeout: (ms: number) => {
+              observations.push('drain')
+              return new Promise<void>((resolve) => setTimeout(resolve, ms))
+            },
+          }
+          if (name === 'node:fs') return {
+            readFileSync: (path: string) => {
+              expect(path).toBe('/sys/fs/cgroup/memory.events')
+              const value = sample()
+              if (value === null) throw new Error('memory.events unavailable')
+              return value
+            },
+            constants: {},
+          }
+          if (name === 'node:child_process') return {
+            spawn: (file: string, args: string[], options: SpawnOptions) => {
+              expect(options).toMatchObject({ uid: 10001, gid: 10001 })
+              observations.push('spawn')
+              const child = spawn(file, args, { ...options, uid: undefined, gid: undefined })
+              child.prependOnceListener('exit', () => { exited = true; observations.push('exit') })
+              return child
+            },
+            spawnSync: (file: string) => {
+              expect(file).toBe('dmesg')
+              const value = sample()
+              return value === null ? { status: 1, stdout: oldKill } : { status: 0, stdout: value }
+            },
+          }
+          return nativeRequire(name)
+        },
+        module: { exports: {} },
+        process: {
+          argv: [], env: kind === 'job' ? { POISE_TEST_JOB: '1' } : {}, exit: done,
+          stdout: { write: (chunk: Buffer | string, callback?: () => void) => { stdout += chunk; callback?.(); return true } },
+          stderr: { write: (chunk: Buffer | string, callback?: () => void) => { stderr += chunk; callback?.(); return true } },
+        },
+        spec: { argv: [process.execPath, '-e', `console.log('suite stdout'); console.error('suite stderr'); process.exit(${status})`], cwd: process.cwd() },
+      })
+    })
+    expect(stdout).toBe('suite stdout\n')
+    expect(stderr).toContain('suite stderr\n')
+    expect(stderr).not.toContain('private-task')
+    return { code, stderr, observations }
+  }
+
+  describe.each([
+    { kind: 'job', clear: 'oom_kill 0\n', old: 'oom_kill 1\n', fresh: 'oom_kill 2\n' },
+    { kind: 'sandbox', clear: '[ 0.000] booted\n', old: oldKill, fresh: oldKill + freshKill },
+  ])('$kind', ({ kind, clear, old, fresh }) => {
+    it.each([
+      ['unchanged pre-existing kill', old, old, 7, 7],
+      ['no kill', clear, clear, 7, 7],
+      ['fresh kill', old, fresh, 7, 125],
+      ['first kill', clear, fresh, 7, 125],
+      ['unavailable baseline', null, old, 7, 7],
+      ['unavailable final observation', old, null, 7, 7],
+      ['unavailable observations', null, null, 7, 7],
+      ['passing suite with a fresh kill', old, fresh, 0, 0],
+      ['removed old evidence', old, clear, 7, 7],
+    ] as const)('preserves or classifies the suite result with %s', async (_label, before, after, status, expected) => {
+      const result = await run(kind, before, after, status)
+      expect(result.code).toBe(expected)
+      expect(result.observations.slice(0, 4)).toEqual(['sample', 'spawn', 'exit', 'sample'])
+      expect(result.observations.filter((event) => event === 'sample')).toHaveLength(2)
+      if (expected === 125) expect(result.stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
+      else expect(result.stderr).toBe('suite stderr\n')
+    })
+  })
+
+  it.each([
+    ['unrelated kernel text', oldKill + '[ 2.000] device ready\n', 7],
+    ['a container memory kill', oldKill + '[ 2.000] Memory cgroup out of memory: Killed process 43\n', 7],
+    ['a fresh kernel kill after unrelated text', oldKill + '[ 2.000] device ready\n' + freshKill, 125],
+  ] as const)('only counts new matching sandbox records with %s', async (_label, after, expected) => {
+    expect((await run('sandbox', oldKill, after, 7)).code).toBe(expected)
+  })
+
+  it.each([
+    ['oom_kill invalid\n', 'oom_kill 1\n'],
+    ['oom_kill 1\n', 'oom_kill invalid\n'],
+  ])('preserves a failure with a malformed job observation: %s -> %s', async (before, after) => {
+    expect((await run('job', before, after, 7)).code).toBe(7)
   })
 })
 
