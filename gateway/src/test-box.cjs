@@ -129,7 +129,8 @@ function ranOutOfMemory() {
 }
 
 function git(cwd, ...args) {
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+  // Unpacking runs as the suite user, so this must too; root trips Git's ownership check on sandboxes.
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...asUser })
   if (result.status !== 0) throw new Error('test capture git identity is unavailable')
   return result.stdout
 }
@@ -165,6 +166,10 @@ function lstatSafe(path) {
  * whether another command, setup error or missing report also failed.
  */
 function assertionReporter(spec) {
+  // Held for #1619: the suite UID owns these files, so candidate code can
+  // replace them before signing. Preserve the hold until the runner establishes
+  // the inventory independently. No reporter is injected; suites run as before.
+  return null
   if (!spec.capture || !spec.binding || !spec.reportTo) return null
   const cli = /^(vitest|vitest\.mjs)$/.test(basename(spec.argv[0])) ? spec.argv[0]
     : /^(?:node|nodejs)$/.test(basename(spec.argv[0])) && /^(vitest|vitest\.mjs)$/.test(basename(spec.argv[1] ?? '')) ? spec.argv[1] : null
@@ -190,6 +195,9 @@ export default class extends JsonReporter {
 }
 
 function assertionResult(reporter, capture) {
+  // Held for #1619 alongside assertionReporter: even a directly supplied
+  // reporter path is candidate-controlled, so no inventory is trusted.
+  return null
   if (!reporter || !existsSync(reporter.report) || !existsSync(reporter.completion)
     || statSync(reporter.report).size > 16 * 1024 * 1024) return null
   const complete = JSON.parse(readFileSync(reporter.completion, 'utf8'))

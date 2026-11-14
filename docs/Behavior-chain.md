@@ -278,22 +278,25 @@ with failure reporting disabled. Its original Caller artifact must retain
 `test_dependency`: independently verified assertion evidence tying the original
 producing run to `prepared.checkout_head`, plus a distinct failing run on that
 exact base. CI proof requires both completed main runs' complete full-suite
-artifacts. Relay proof instead requires gateway-authenticated completed Vitest
-assertions bound to the original Call's retained random capture binding. The box
-independently hashes the uploaded archive and actual source files before execution;
-the baseline must have a distinct capture and source digest and match the clean
-prepared base, independently of its uploaded index. Matching HEAD alone cannot
-make a dirty candidate into its baseline.
+artifacts. Relay proof would require gateway-authenticated completed Vitest
+assertions bound to the original Call's retained random capture binding, but
+recovery is currently held for #1619: the suite UID owns the report files, so
+candidate code can replace them before signing. The box independently hashes the
+uploaded archive and actual source files before execution; the baseline would need
+a distinct capture and source digest and match the clean prepared base,
+independently of its uploaded index. Matching HEAD alone cannot make a dirty
+candidate into its baseline.
 
-Both paths compare the complete failure multiset and retain every case count
+Both paths would compare the complete failure multiset and retain every case count
 under a failing title, including passing duplicate parameters. Mixed or non-test
 failures, missing/incomplete results, overflow, changed original evidence and
-worker diagnosis alone keep the hold. Relay proof currently supports direct
-Vitest commands, with runner-owned reporting of assertion, setup and unhandled
-errors; wrappers and other runners retain their hold. The gateway signs evidence
-only after genuine completion and returns it before deleting the run. Caller
-authenticates and retains those bounded, redacted receipts before checkout cleanup,
-then the existing seed observation revalidates them. A log, archive digest alone,
+worker diagnosis alone keep the hold. Relay inventories, including direct Vitest
+commands with runner-owned reporting of assertion, setup and unhandled errors,
+all retain their hold until the runner establishes them independently; wrappers
+and other runners retain theirs. The gateway would sign evidence only after
+genuine completion and return it before deleting the run. Caller would authenticate
+and retain those bounded, redacted receipts before checkout cleanup, then the
+existing seed observation would revalidate them. A log, archive digest alone,
 canceled run or historical output without this provenance grants no recovery.
 In particular, #1505 remains held when its original evidence is unavailable.
 

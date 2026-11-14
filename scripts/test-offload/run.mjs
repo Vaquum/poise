@@ -400,7 +400,12 @@ async function main(args) {
         else if (type === FRAME.evidence && binding && process.env.POISE_TEST_EVIDENCE_DIR && payload.length <= 48 * 1024) {
           // Only the gateway can authenticate this receipt. Caller checks it
           // independently and retains it before reclaiming this directory.
-          writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, `${id}.json`), payload, { flag: 'wx', mode: 0o600 })
+          try {
+            writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, `${id}.json`), payload, { flag: 'wx', mode: 0o600 })
+          } catch (error) {
+            // A failed receipt must not replace the suite's genuine exit with a no-result handoff.
+            say(`assertion recovery evidence could not be retained: ${error.message}`)
+          }
         }
         else if (type === FRAME.fail) failure = { code: payload[0], message: payload.subarray(1).toString() }
         else if (type === FRAME.ready && !upload) {

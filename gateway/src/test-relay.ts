@@ -699,12 +699,17 @@ export class TestRelay {
         return
       }
       run.received = seq
+      const isEnd = url.searchParams.get('end') === '1'
+      if (isEnd && this.runs.has(run.id)) {
+        // The final body carries the exit frame; retain evidence first so the
+        // hook receives the receipt before it stops on exit (sandboxes already do).
+        this.retainAssertions(run, Number(url.searchParams.get('exit')), url.searchParams.get('why'))
+      }
       // A run that was ended has ended its response too, and writing to that would bring down the gateway.
       if (this.runs.has(run.id) && run.output && body.length) await write(run.output, body)
-      if (url.searchParams.get('end') === '1' && this.runs.delete(run.id)) {
+      if (isEnd && this.runs.delete(run.id)) {
         const code = Number(url.searchParams.get('exit'))
         const noResult = url.searchParams.get('why')
-        this.retainAssertions(run, code, noResult)
         if (noResult) this.runFailed(run, noResult)
         this.deps.log.info('test_relay.run.finished', {
           id: run.id, handle: run.handle, jobId: run.boxId, command: commandLabel(run.spec.argv), exit: code, seconds: Math.round((this.deps.now() - run.created) / 1000),

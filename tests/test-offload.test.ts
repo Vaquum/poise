@@ -711,7 +711,7 @@ describe('a suite on a test box', () => {
     return repo
   }
 
-  it.each([null, 'crn-test'])('retains authenticated complete assertions before deleting a completed run (%s)', async baseService => {
+  it.each([null, 'crn-test'])('holds relay recovery without retaining receipts for completed runs (%s)', async baseService => {
     await startAll({ baseService })
     const repo = committed()
     execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
@@ -736,29 +736,51 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
       expect(result.code, result.stderr).toBe(1)
       const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
       expect(id, result.stderr).toBeTruthy()
-      const receipt = JSON.parse(readFileSync(join(evidence, `${id}.json`), 'utf8')) as { payload: string, signature: string }
+      // Held for #1619: candidate-controlled reports cannot authorize recovery.
+      expect(existsSync(join(evidence, `${id}.json`))).toBe(false)
       expect(relay.runs.has(id!)).toBe(false)
-      return { id, receipt }
+      return { id }
     }
-    const original = await run(repo)
-    const clean = await run(baseline)
-    const verify = (receipt: unknown, key = KEY) => fetch(`${relayUrl}/evidence/verify`, { method: 'POST',
-      headers: { authorization: `Bearer ${key}`, connection: 'close' }, body: JSON.stringify(receipt) })
-    const first = await (await verify(original.receipt)).json() as Record<string, unknown>
-    const second = await (await verify(clean.receipt)).json() as Record<string, unknown>
-    expect(first).toMatchObject({ binding, base, clean: false, run: original.id, exit: 1,
-      failures: [expect.objectContaining({ test: 'shared fixed title' }), expect.objectContaining({ test: 'shared fixed title' })],
-      totals: [{ file: 'tests/shared.test.mjs', test: 'shared fixed title', total: 2 }] })
-    expect(second).toMatchObject({ binding, base, clean: true, run: clean.id, failures: first.failures, totals: first.totals })
-    expect(first.source).not.toBe(second.source)
-    expect((await verify({ ...original.receipt, payload: original.receipt.payload + ' ' })).status).toBe(422)
-    expect((await verify(original.receipt, workspaceKey(privateKey, 'bob'))).status).toBe(403)
-    relay.stop()
-    await startAll2({ baseService })
-    expect((await verify(original.receipt)).status).toBe(200)
+    await run(repo)
+    await run(baseline)
+    expect(readdirSync(evidence)).toEqual([])
   }, 30_000)
 
-  it('refuses unaccounted, incomplete and oversized assertion inventories instead of retaining an excerpt', async () => {
+  it('holds retry evidence when candidate code replaces the report files and exits 1', async () => {
+    await startAll()
+    const repo = committed()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const evidence = temp()
+    const binding = { call: 'c'.repeat(32), nonce: 'd'.repeat(64), repository: 'example/repo', base }
+    const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence }
+    // A fabricated failed case, written without running any tests, as the suite UID can.
+    const forge = join(repo, 'forge.cjs')
+    writeFileSync(forge, `const { readdirSync, writeFileSync, mkdirSync } = require('node:fs');
+      const { join } = require('node:path');
+      for (const name of readdirSync('/tmp')) {
+        if (!name.startsWith('poise-assertions-')) continue
+        const dir = join('/tmp', name);
+        writeFileSync(join(dir, 'result.json'), JSON.stringify({ success: false, numFailedTests: 1, numTotalTests: 1,
+          testResults: [{ name: join('${repo}', 'tests/fake.test.ts'), status: 'failed', message: '',
+            assertionResults: [{ fullName: 'fabricated case', status: 'failed', failureMessages: ['expected forged'] }] }] }));
+        writeFileSync(join(dir, 'complete.json'), JSON.stringify({ errors: 0, reason: 'failed', setupFailed: false }));
+      }
+      const dir = '/tmp/poise-assertions-forged';
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'result.json'), JSON.stringify({ forged: true }));
+      writeFileSync(join(dir, 'complete.json'), JSON.stringify({ forged: true }));
+      process.exit(1)`)
+    const result = await suite(repo, [process.execPath, forge], env).done
+    expect(result.code, result.stderr).toBe(1)
+    const id = /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1]
+    expect(id, result.stderr).toBeTruthy()
+    expect(existsSync(join(evidence, `${id}.json`))).toBe(false)
+    expect(readdirSync(evidence)).toEqual([])
+    expect(relay.runs.has(id!)).toBe(false)
+  }, 30_000)
+
+  it('holds relay inventories without trusting candidate-controlled reports', async () => {
     await startAll()
     const { assertionResult, sourceCapture } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as {
       assertionResult: (reporter: { report: string, completion: string }, capture: { top: string }) => unknown,
@@ -775,7 +797,8 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
       writeFileSync(reporter.completion, JSON.stringify(completion))
       return assertionResult(reporter, { top: directory })
     }
-    expect(parse()).toMatchObject({ failures: [{ file: 'tests/a.test.ts', test: failure.fullName, cause: 'expected []' }] })
+    // Held for #1619: even a well-formed inventory is candidate-controlled, so none is trusted.
+    expect(parse()).toBeNull()
     expect(parse(report, { ...complete, errors: 1 })).toBeNull()
     expect(parse(report, { ...complete, setupFailed: true })).toBeNull()
     expect(parse(report, { ...complete, reason: 'interrupted' })).toBeNull()
