@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -19,9 +19,12 @@ import type { Organization } from '../server/organizations'
 import { completedReviewCall } from './review-response-fixture'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), settings: { enabled: true, seedMode: 'label', label: 'poise' },
+  recheck: vi.fn(),
   accounts: { me: 'author', agentAccount: 'reviewer' }, database: null as Database.Database | null,
   journal: null as BehaviorChainJournal | null }))
-vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn(), MAX_PROCESS_ARG_BYTES: 64 * 1024 }))
+vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn(), MAX_PROCESS_ARG_BYTES: 64 * 1024,
+  isExpectedFailure: (error: { expected?: boolean }) => error?.expected === true }))
+vi.mock('../server/behavior-chain-test-recheck', () => ({ recheckImplementationTest: mocks.recheck }))
 vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? mocks.accounts.me : null,
   get db() { return mocks.database },
   writeObservation: (write: () => unknown) => write() }))
@@ -389,6 +392,243 @@ function operations(db: Database.Database, journal: BehaviorChainJournal, overri
 const posts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1] === 'repos/acme/repo/issues')
 const labelPosts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1].endsWith('/labels') && call[1].includes('POST'))
 const reports = (db: Database.Database) => db.prepare("SELECT value FROM meta WHERE key LIKE 'behavior_chain_repair_report:%'").all() as { value: string }[]
+
+// #1782's blocker, including its location, missing original assertion and later
+// truncated timeout. None of that historical output proves the shared cause.
+const INCIDENT_1778 = 'atomic behavior blocked: npm run check first failed at tests/test-offload.test.ts > a suite on a test box > recovers mid-suite when only one suite may run (tests/test-offload.test.ts:1856): Error: STACK_TRACE_ERROR. Actionable assertion details are unavailable in the first-failure record. Captured candidate digest: 07735295ec5b89c66059e5fe41134cc2cf2bb31b31025dbe15e95e23c5dd2b2f; original producing relay run: ed71f964d37bccfa95a490ed4edb8cbe. Subsequently the command exited 124 with \'[poise] no '
+
+it('reproduces both named fixture conditions without changing assertions or deadlines', async () => {
+  const { recheckFixture } = await vi.importActual<typeof import('../server/behavior-chain-test-recheck')>('../server/behavior-chain-test-recheck')
+  const test = 'a suite on a test box > recovers mid-suite when only one suite may run'
+  const old = `  it('recovers mid-suite when only one suite may run', async () => {
+    await startAll({ maxRuns: 1 })
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 300)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relay.stop()
+    await startAll2({ maxRuns: 1 })
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(0)
+    expect(stdout).toBe('started\\nstarted\\ncomplete\\n')
+  })
+  it('next', () => {})`
+  const injected = recheckFixture(old, test)
+  const removeObservation = (source: string) => source.replace("console.info('poise fixture recheck observation')\n      ", '')
+  expect(removeObservation(injected.source).replace('await new Promise((done) => setTimeout(done, 750))\n      ', '')).toBe(old)
+  const current = readFileSync(resolve('tests/test-offload.test.ts'), 'utf8')
+  expect(removeObservation(recheckFixture(current, test).source)).toBe(current)
+  const memory = 'a suite on a test box > keeps memory warnings correlatable without logging command bodies with base service null'
+  const delayed = recheckFixture(current, memory)
+  expect(delayed.names).toEqual([memory, ...['node', 'sh', 'npm run check'].map(command => `${memory} and command ${command}`)])
+  expect(removeObservation(delayed.source).replace('await new Promise((done) => setTimeout(done, 6650))\n      ', '')).toBe(current)
+  expect(recheckFixture(current, 'another reported test')).toEqual({ source: current, names: ['another reported test'], condition: 'unmodified reported test', observations: 0 })
+})
+
+it.each(['unrelated', 'skipped', 'inconclusive', 'unhandled', 'unaccounted', 'duplicate', 'pending duplicate', 'missing memory command', 'missing timing observation', 'no assertion'])(
+  'rejects %s recheck results instead of admitting from a passing job', async mode => {
+    const { recheckResults } = await vi.importActual<typeof import('../server/behavior-chain-test-recheck')>('../server/behavior-chain-test-recheck')
+    const name = 'a suite on a test box > recovers mid-suite when only one suite may run'
+    const assertion = { ancestorTitles: ['a suite on a test box'], title: name.split(' > ')[1], status: 'passed', failureMessages: [] as string[] }
+    const result = { success: true, completion: { reason: 'passed', errors: 0, observations: 0 }, numTotalTests: 1, numPassedTests: 1, numFailedTests: 0,
+      numPendingTests: 0, numTodoTests: 0, numFailedTestSuites: 0, testResults: [{ name: '/clean/tests/test-offload.test.ts', message: '', assertionResults: [assertion] }] }
+    expect(recheckResults(JSON.stringify(result), '/clean', [name], false)).toEqual({ tests: [name], failure: '' })
+    let names = [name]
+    if (mode === 'unrelated') assertion.title = 'a different test'
+    if (mode === 'skipped') { assertion.status = 'skipped'; result.numPassedTests = 0; result.numPendingTests = 1 }
+    if (mode === 'inconclusive') result.completion.reason = 'interrupted'
+    if (mode === 'unhandled') result.completion.errors = 1
+    if (mode === 'unaccounted') result.numTotalTests = 2
+    if (mode === 'duplicate') { result.testResults[0].assertionResults.push(assertion); result.numTotalTests++; result.numPassedTests++ }
+    if (mode === 'pending duplicate') { result.testResults[0].assertionResults.push({ ...assertion, status: 'pending' }); result.numTotalTests++; result.numPendingTests++ }
+    if (mode === 'missing memory command') names = ['old memory test', name, 'sh case', 'npm case']
+    if (mode === 'no assertion') { assertion.status = 'failed'; result.success = false; result.numFailedTests = 1; result.numPassedTests = 0; result.completion.reason = 'failed' }
+    expect(() => recheckResults(JSON.stringify(result), '/clean', names, mode === 'no assertion', undefined,
+      mode === 'missing timing observation' ? 1 : 0)).toThrow()
+  })
+
+it.each([false, true])('runs independent pinned clean bases and rejects an unreproduced old failure (%s)', async oldPassed => {
+  const { recheckImplementationTest } = await vi.importActual<typeof import('../server/behavior-chain-test-recheck')>('../server/behavior-chain-test-recheck')
+  const old = 'a'.repeat(40), base = 'b'.repeat(40), merge = 'c'.repeat(40), file = 'tests/fixture.test.ts'
+  const visits: string[] = []
+  let cwd = '', pinned = ''
+  mocks.runFile.mockImplementation(async (command: string, argv: string[], options: { cwd: string, timeoutMs: number }) => {
+    expect(options.timeoutMs).toBeLessThanOrEqual(120_000)
+    if (command === 'github-interface') {
+      expect(argv.slice(0, 2)).toEqual(['--checkout-repo', 'acme/repo'])
+      cwd = argv[3]; mkdirSync(join(cwd, 'tests'), { recursive: true })
+      symlinkSync(resolve('node_modules'), join(cwd, 'node_modules'), 'dir')
+    } else {
+      expect(options.cwd).toBe(cwd)
+      if (command === 'git' && argv[0] === 'checkout') {
+        pinned = argv.at(-1)!; visits.push(pinned)
+        writeFileSync(join(cwd, file), `// clean source ${pinned}\nimport { describe, it, expect } from 'vitest'\n`
+          + `describe('fixture', () => { it('has a shared failure', () => { expect(${pinned === old && !oldPassed ? 1 : 2}).toBe(2) }) })`)
+      }
+      if (command === 'node') {
+        expect(readFileSync(join(cwd, file), 'utf8')).toContain(`// clean source ${pinned}`)
+        expect(readFileSync(argv.at(-1)!, 'utf8')).toContain('completion = { reason, errors: errors.length, observations: this.observations }')
+        expect(argv).toContain('--maxWorkers=1')
+        expect(argv).toContain('--retry=0')
+        try {
+          return { stdout: execFileSync(process.execPath, argv, { cwd, encoding: 'utf8', timeout: 5000 }), stderr: '' }
+        } catch (error) {
+          if ((error as { status?: number }).status === 1) Object.assign(error as object, { expected: true, code: 1 })
+          throw error
+        }
+      }
+    }
+    return { stdout: command === 'git' && argv[0] === 'diff' ? 'fixture correction' : '', stderr: '' }
+  })
+  const run = recheckImplementationTest('acme/repo', 'author', old, base, merge, file, 'fixture > has a shared failure')
+  if (oldPassed) await expect(run).rejects.toThrow('was not reproduced')
+  else await expect(run).resolves.toMatchObject({ old: { base: old, failure: expect.stringContaining('expected 1 to be 2') },
+    current: { base, tests: ['fixture > has a shared failure'] } })
+  expect(visits).toEqual(oldPassed ? [old] : [old, base])
+  expect(mocks.runFile.mock.calls.filter(([command, argv]) => command === 'git' && argv[0] === 'clean')).toHaveLength(visits.length)
+  expect(existsSync(cwd)).toBe(false)
+})
+
+it.each(['recover', 'memory recovery', 'restart before admission', 'failed recheck', 'interrupted recheck', 'operator hold', 'changed source',
+  'ineligible', 'closed source', 'unsettled resources', 'possible publication', 'branch', 'PR', 'competing work',
+  'changed during recheck', 'changed during preparation', 'missing review'])(
+  'revalidates the persisted #1778/#1782 incident once through normal admission: %s', async mode => {
+    const { db, journal } = setup()
+    mocks.accounts = { me: 'mikkokotila', agentAccount: 'bit-mis' }
+    const memory = mode === 'memory recovery', number = memory ? 1754 : 1778, reportNumber = memory ? 99 : 1782, remedy = memory ? 1747 : 1765
+    const repository = 'autonomio/poise', id = `${repository}#${number}`, call = memory ? 'f'.repeat(32) : '15b20584dcea402faeb94959a0e7f699'
+    const old = 'd45773e5250787a9c6c6efea1fa320f986145237', base = 'e'.repeat(40), merge = 'c'.repeat(40)
+    const test = 'a suite on a test box > ' + (memory ? 'keeps memory warnings correlatable without logging command bodies with base service null'
+      : 'recovers mid-suite when only one suite may run')
+    const blocker = memory ? `atomic behavior blocked: npm run check first failed at tests/test-offload.test.ts > ${test} (tests/test-offload.test.ts:2055): Test timed out in 20000ms.` : INCIDENT_1778
+    let chain = journal.append(id, `seed-${number}`, 0, { type: 'chain.admitted', repository, issue: number,
+      branch: `poise/issue-${number}`, author: 'mikkokotila', reviewer: 'bit-mis' }, NOW - 600_000)
+    const obs = { ...unpublished(), prerequisites: { wait: null, base, evidence: [] } }
+    const basis = chainBasis(['issue', obs.issue.revision])
+    chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: '851e78f6-847a-4f1e-82da-e2592def4f4f',
+      behavior: 'implement-issue', basis, actor: chain.author, model: reviewer.model, slot: reviewer.slot, admittedAt: NOW - 300_000,
+      request: { command: 'agent-interface', cwd: '/fixture', argv: ['--expected-issue-revision', obs.issue.revision] } } })
+    chain = record(journal, chain, { type: 'chain.held', reason: blocker })
+    const holdSequence = chain.sequence
+    chain = record(journal, chain, { type: 'invocation.settled', invocationId: chain.invocations[0].id, callId: call,
+      outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+        error_code: 'atomic_work_blocked', error: blocker, completedAt: NOW - 120_000,
+        resources_settled_at: mode === 'unsettled resources' ? null : new Date(NOW - 100_000).toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [], ...(mode === 'unsettled resources' ? { process_pending: true } : {}) },
+        artifact: { phase: 'executing', ...(mode === 'possible publication' ? { plan_sha: 'f'.repeat(64) } : {}), prepared: { repository, issue_number: number, actor: chain.author, branch: chain.branch,
+          checkout_head: old, head_sha: null, pull_number: null } } } })
+    const original = structuredClone(chain.invocations[0])
+    expect(chain.testHold).toBeUndefined()
+    const key = chainBasis(['atomic_work_blocked', id]), storageKey = `behavior_chain_repair_report:${key}`
+    if (!memory) expect(key).toBe('365a7d93e304f4fc15a0d1658cc60e718998ea59e25c42ad490fa896f3ef9e0b')
+    const report = { key, source: id, pull: null, holdSequence, heldAt: NOW - 60_000, head: null, basis, slot: reviewer.slot,
+      attempts: [{ invocation: original.id, call, completedAt: NOW - 120_000 }], issueNumber: reportNumber }
+    db.prepare('INSERT INTO meta(key,value) VALUES (?,?)').run(storageKey, JSON.stringify(report))
+    mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
+      const number = Number(argv[1]), delivery = argv.includes('--delivery-base')
+      return { stderr: '', stdout: JSON.stringify({ repository, issue_number: number,
+        ...(argv[0] === '--issue-comments' ? { comments: [{ author: 'bit-mis', body: `#${remedy} owns that test; use its existing repair.` }] }
+          : delivery ? { verified: number === remedy, base_sha: base, merge_sha: merge }
+            : { issue: { body: number === reportNumber
+              ? `<!-- poise-repair-exhaustion:${key} -->\nSource: ${id}; hold event ${holdSequence}; basis ${basis}; slot primary.\n${blocker}\nCaller ${call}`
+              : 'tests/test-offload.test.ts: ' + (memory ? 'keeps memory warnings correlatable without logging command bodies'
+                : 'recovers mid-suite when only one suite may run'), user: { login: 'mikkokotila' } } }) }) }
+    })
+    mocks.recheck.mockReset()
+    mocks.recheck.mockImplementation(async () => {
+      if (mode === 'failed recheck') throw new Error('old-base recheck passed; shared failure was not reproduced')
+      if (mode === 'changed during recheck') record(journal, journal.read(id)!, { type: 'chain.held', reason: INCIDENT_1778 })
+      return { old: { base: old, tests: [test], failure: 'AssertionError: expected stdout to contain two started lines' },
+        current: { base, tests: memory ? ['node', 'sh', 'npm run check'].map(command => `${test} and command ${command}`) : [test] },
+        condition: memory ? '6650 ms before each memory-warning command' : '750 ms after first output, before relay interruption' }
+    })
+    if (mode === 'interrupted recheck') db.prepare('UPDATE meta SET value=? WHERE key=?').run(JSON.stringify({ ...report,
+      recheck: { remedy: 1765, base, merge, state: 'running' } }), storageKey)
+    if (mode === 'operator hold') chain = record(journal, chain, { type: 'chain.held', reason: INCIDENT_1778 })
+    if (mode === 'changed source') obs.issue.revision = 'new revision'
+    if (mode === 'ineligible') obs.issue.eligible = false
+    if (mode === 'closed source') obs.issue.open = false
+    if (mode === 'branch') obs.publication.head_sha = 'b'.repeat(40)
+    if (mode === 'PR') obs.publication.pull_number = 1871
+    if (mode === 'competing work') obs.existingPulls = ['https://github.com/autonomio/poise/pull/1871']
+    if (mode === 'missing review') obs.issueReviewers = [reviewer]
+    let permitted = mode !== 'restart before admission'
+    const launch = vi.fn(async () => true)
+    const ops = operations(db, journal, { accounts: () => ({ author: 'mikkokotila', reviewer: 'bit-mis' }), discover: async () => [],
+      available: () => true, permitted: (_chain, decision) => permitted && decision.behavior === 'implement-issue', observe: async () => ({ ...structuredClone(obs), checkedAt: Date.now() }),
+      launch, request: async () => {
+        if (mode === 'changed during preparation') obs.existingPulls = ['https://github.com/autonomio/poise/pull/1871']
+        return { command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] }
+      } })
+    ops.recoverReport = (current, observation) => recoverReportedRepair(db, journal, current, observation, ops.observe, () => true)
+    let runtime = new BehaviorChainRuntime(journal, ops)
+    await runtime.run()
+    if (mode === 'restart before admission') {
+      expect(journal.read(id)).toMatchObject({ held: null, testRecovery: { recheck: key } })
+      expect(launch).not.toHaveBeenCalled()
+      permitted = true
+    }
+    journal.rebuild()
+    runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), ops)
+    for (let tick = 0; tick < 3; tick++) { vi.setSystemTime(Date.now() + 86_400_000); await runtime.run() }
+    expect(launch).toHaveBeenCalledTimes(['recover', 'memory recovery', 'restart before admission'].includes(mode) ? 1 : 0)
+    expect(mocks.recheck).toHaveBeenCalledTimes(['recover', 'memory recovery', 'restart before admission', 'failed recheck', 'changed during recheck',
+      'changed during preparation', 'missing review'].includes(mode) ? 1 : 0)
+    if (mocks.recheck.mock.calls.length) expect(mocks.recheck.mock.calls[0]).toEqual([repository, 'mikkokotila', old, base, merge, 'tests/test-offload.test.ts', test])
+    if (!['unsettled resources', 'possible publication'].includes(mode)) expect(journal.read(id)?.invocations[0]).toEqual(original)
+    const retained = JSON.parse((db.prepare('SELECT value FROM meta WHERE key=?').get(storageKey) as { value: string }).value)
+    const { recheck, ...unchanged } = retained
+    expect(unchanged).toEqual(report)
+    if (mode === 'failed recheck') {
+      expect(recheck).toMatchObject({ state: 'failed', reason: expect.stringContaining('shared failure was not reproduced') })
+      expect(journal.read(id)?.waiting).toContain('shared failure was not reproduced')
+    }
+  })
+
+it('lets a later CI-only hold resume past a retained pre-PR report', async () => {
+  const { db, journal } = setup()
+  const id = 'acme/repo#7'
+  let chain = journal.append(id, 'seed:7', 0, { type: 'chain.admitted', repository: 'acme/repo', issue: 7,
+    branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' }, NOW - 600_000)
+  const pre = unpublished()
+  chain = record(journal, chain, { type: 'chain.observed', observation: { ...pre, checkedAt: NOW - 600_000 } })
+  const basis = chainBasis(['issue', pre.issue.revision])
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-implement',
+    behavior: 'implement-issue', basis, actor: chain.author, slot: reviewer.slot, model: reviewer.model,
+    admittedAt: NOW - 300_000, request: { command: 'agent-interface', cwd: '/fixture',
+      argv: ['--expected-issue-revision', pre.issue.revision] } } })
+  chain = record(journal, chain, { type: 'chain.held', reason: INCIDENT_1778 })
+  const holdSequence = chain.sequence
+  const callId = '15b20584dcea402faeb94959a0e7f699'
+  chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'original-implement', callId,
+    outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'atomic_work_blocked', error: INCIDENT_1778, completedAt: NOW - 120_000,
+      artifact: { phase: 'executing', prepared: { repository: 'acme/repo', issue_number: 7, actor: chain.author,
+        branch: chain.branch, checkout_head: HEAD, head_sha: null, pull_number: null } },
+      resources_settled_at: new Date(NOW - 100_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  const key = chainBasis(['atomic_work_blocked', id])
+  db.prepare('INSERT INTO meta(key,value) VALUES (?,?)').run(`behavior_chain_repair_report:${key}`, JSON.stringify({ key,
+    source: id, pull: null, holdSequence, heldAt: NOW - 60_000, head: null, basis, slot: reviewer.slot,
+    attempts: [{ invocation: 'original-implement', call: callId, completedAt: NOW - 120_000 }], issueNumber: 99 }))
+  chain = record(journal, chain, { type: 'chain.resumed', recovery: { origin: 'operator' } })
+  const obs = observation()
+  chain = record(journal, chain, { type: 'chain.observed', observation: { ...obs, checkedAt: NOW - 60_000 } })
+  const repairCall = '09bfede268214c4caa6e0237f99e5f17'
+  const repairError = 'atomic behavior blocked: CI failed'
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'repair-1', behavior: 'repair-pr',
+    basis: chainBasis(['repair', HEAD]), actor: chain.author, slot: reviewer.slot, model: reviewer.model,
+    admittedAt: NOW - 30_000, request: { command: 'agent-interface', cwd: '/fixture',
+      context: { head: HEAD, reviewRevision: obs.pull!.reviewRevision },
+      argv: ['--pull-number', '21', '--expected-head', HEAD, '--expected-issue-revision', obs.issue.revision] } } })
+  chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'repair-1', callId: repairCall,
+    outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'atomic_work_blocked', error: repairError, completedAt: NOW - 20_000,
+      artifact: { phase: 'executing', prepared: { checkout_head: HEAD } },
+      resources_settled_at: new Date(NOW - 10_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  chain = record(journal, chain, { type: 'chain.held', reason: repairError,
+    ciHold: { invocationId: 'repair-1', callId: repairCall, head: HEAD } })
+  const result = await recoverReportedRepair(db, journal, chain, { ...obs, checkedAt: Date.now() }, async () => obs, () => true)
+  expect(result).toBeNull()
+  expect(mocks.recheck).not.toHaveBeenCalled()
+})
 
 async function diagnosedRepair(path = ':memory:', diagnosticText?: string, reviewOnly = false) {
   const { db, journal } = setup(path)

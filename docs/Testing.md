@@ -192,6 +192,9 @@ rerun share the original command budget. A journal/decision fixture continues
 from the fresh complete result through exact-head review, CI, readiness and merge
 observations without Resume; it performs no live GitHub actions and retains the
 interrupted attempt as missing a result.
+Caller's native-receipt regression also feeds completed pytest assertion and
+setup-error output through the client, truncates the worker's console, and checks
+the original persisted diagnostic after a different run returns no result.
 
 ## Agent tool CPU defaults
 

@@ -1579,8 +1579,8 @@ and its native close receipt; summaries expose that evidence separately from
 `mergeSha`. Original writes and native resources must settle first. Unclear or
 independent work remains open with its decision visible. The existing Caller
 action performs head-checked retirement; a lost close response stays uncertain.
-The normal-work page precedes due quiescent
-reconciliation; observation failures remain reported after unrelated progress.
+The normal-work and due quiescent reconciliation pages alternate first use of
+the shared sweep budget; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
 operation or authority; a deliberate wait keeps GitHub facets unknown without
@@ -1604,8 +1604,13 @@ the delivered main recovery with validation of every original failing test and
 case. Relay assertions remain held for #1619 until the runner establishes their
 inventory independently of candidate-controlled reports.
 The journal admits one fresh implementation for that automatic hold and recovery
-commit, independently of report publishing. Missing original evidence and later
-operator holds retain their authority; no gateway route or new poller is added.
+commit, independently of report publishing. An incomplete original assertion can
+instead use the saved automatic hold report and linked delivered fixture fix for
+one persisted clean-base recheck, requiring reproduction on the old base and an
+executed pass on the corrected base. This uses the same single-retry admission
+and normal validation gates, as defined in [bounded reconciliation](Behavior-chain.md#bounded-reconciliation).
+Unverified rechecks and later operator holds retain their authority; no gateway
+route or new poller is added.
 
 The first `/api/behavior-chains` list page also includes read-only `attention`
 across all active chain pages. It joins durable progress age, holds, exact-head

@@ -280,8 +280,8 @@ describe('installing it into a home volume', () => {
     const hooks = join(home, '.poise', 'test-offload')
     expect(readFileSync(join(hooks, 'relay'), 'utf8')).toBe('https://alice.example/api/link/test-relay\nalice.signed\n540\n')
     expect(statSync(join(hooks, 'relay')).mode & 0o777).toBe(0o600)
-    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
-    expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'relay', 'run.mjs', 'sitecustomize.py'])
+    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs', 'redaction.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
+    expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'redaction.mjs', 'relay', 'run.mjs', 'sitecustomize.py'])
     // Ahead of a first start, whose entrypoint leaves a ~/.poise it finds as it is.
     expect(statSync(join(home, '.poise')).mode & 0o777).toBe(0o700)
   })
@@ -290,7 +290,7 @@ describe('installing it into a home volume', () => {
     const home = temp()
     install(home, { POISE_TEST_RELAY_URL: 'https://alice.example', POISE_TEST_RELAY_KEY: 'k' })
     install(home)
-    expect(readdirSync(join(home, '.poise', 'test-offload')).sort()).toEqual(['hook.cjs', 'run.mjs', 'sitecustomize.py'])
+    expect(readdirSync(join(home, '.poise', 'test-offload')).sort()).toEqual(['hook.cjs', 'redaction.mjs', 'run.mjs', 'sitecustomize.py'])
   })
 
   it('leaves nothing behind where it was never on', () => {
@@ -303,7 +303,7 @@ describe('installing it into a home volume', () => {
 describe('the hooks at work', () => {
   function hooked(relay: boolean): { hooks: string; env: NodeJS.ProcessEnv } {
     const hooks = temp()
-    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
+    for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs', 'redaction.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
     // Nothing listens there: a suite that reaches for its instance fails at once, and one that does not runs.
     if (relay) writeFileSync(join(hooks, 'relay'), 'http://127.0.0.1:9/api/link/test-relay\nk\n')
     // Without the npm script this very test may be running under.
@@ -688,7 +688,7 @@ describe('a suite on a test box', () => {
     relayUrl = `${relayOrigin}${TEST_RELAY_PATH}`
     relay.start()
     hooks = temp()
-    for (const file of ['run.mjs', 'hook.cjs', 'sitecustomize.py']) copyFileSync(join(SOURCE, file), join(hooks, file))
+    for (const file of ['run.mjs', 'hook.cjs', 'sitecustomize.py', 'redaction.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
     writeFileSync(join(hooks, 'relay'), `${relayUrl}\n${KEY}\n`)
     unpacked = temp()
   }
@@ -1857,22 +1857,71 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
   })
 
-  it('keeps the full rerun within the remaining command budget', async () => {
+  it.each([0, 4_000])('keeps the full rerun within the remaining command budget (setup delayed %i ms)', async (setupDelay) => {
+    setupMs = setupDelay
     await startAll()
-    const started = Date.now()
-    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 2500)'], { BASH_DEFAULT_TIMEOUT_MS: '3500' })
-    await new Promise((done) => { run.child.stdout?.once('data', done) })
-    await new Promise((done) => setTimeout(done, 500))
+    const control = temp()
+    const clock = join(control, 'clock.cjs')
+    const time = join(control, 'time')
+    const observed = join(control, 'observed')
+    writeFileSync(time, '0')
+    // Hold only the runner's lifetime timer. Cancellation, refresh and rearming retain their due times.
+    writeFileSync(clock, `if (process.argv[1]?.endsWith('/run.mjs')) {
+      const fs = require('node:fs')
+      const now = () => Number(fs.readFileSync(${JSON.stringify(time)}, 'utf8'))
+      const timeout = global.setTimeout, cancel = global.clearTimeout
+      const timers = new Map()
+      global.setTimeout = (callback, ms, ...args) => {
+        if (ms !== 3500) return timeout(callback, ms, ...args)
+        const timer = timeout(() => {}, 2147483647)
+        const pending = { due: now() + ms, fire: () => callback(...args) }
+        timer.refresh = () => { pending.due = now() + ms; return timer }
+        timers.set(timer, pending)
+        return timer
+      }
+      global.clearTimeout = (timer) => { timers.delete(timer); return cancel(timer) }
+      setInterval(() => {
+        const at = now()
+        for (const [timer, pending] of timers) {
+          if (pending.due <= at) { clearTimeout(timer); pending.fire() }
+        }
+        fs.writeFileSync(${JSON.stringify(observed)}, String(at))
+      }, 10)
+    }`)
+    // A held suite exits when its fake box is terminated, including after a failed assertion.
+    const run = suite(repository(), [process.execPath, '-e', 'const parent = process.ppid; console.log("started"); setInterval(() => { if (process.ppid !== parent) process.exit(0) }, 25)'], {
+      BASH_DEFAULT_TIMEOUT_MS: '3500', NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require "${clock}"`].filter(Boolean).join(' '),
+    })
+    let output = ''
+    run.child.stdout?.on('data', (chunk) => { output += chunk })
+    const advance = async (at: number) => {
+      writeFileSync(time, String(at))
+      await until(() => existsSync(observed) && readFileSync(observed, 'utf8') === String(at), 'the runner clock to advance', 5_000)
+    }
+    await until(() => output === 'started\n', 'the first suite to start')
+    const original = [...relay.runs.keys()][0]
+    expect(original).toMatch(/^[a-f0-9]{32}$/)
+    await advance(1_000)
     relay.stop()
     await startAll2()
+    await until(() => relay.runs.size === 1, 'the replacement run to be admitted')
+    const replacement = [...relay.runs.keys()][0]
+    expect(replacement).not.toBe(original)
+    await until(() => output === 'started\nstarted\n', 'the replacement suite to start')
+    await advance(3_499)
+    expect(run.child.exitCode).toBeNull()
+    expect(relay.runs.has(replacement)).toBe(true)
+    await advance(3_500)
+    await until(() => run.child.exitCode !== null, 'the original deadline to stop the replacement suite', 5_000)
     const { code, stdout, stderr } = await run.done
     expect(code).toBe(124)
     expect(stdout).toBe('started\nstarted\n')
-    expect(stderr).toContain('total time budget')
-    expect(Date.now() - started).toBeLessThan(5500)
+    expect(stderr).toContain('no test result: the test offload exhausted its total time budget')
     expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
-    await until(() => relay.runs.size === 0, 'the timed-out run to be retired')
-  })
+    await until(() => !relay.runs.has(replacement), 'the timed-out replacement run to be retired')
+    expect(relay.runs.size).toBe(0)
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: replacement }))
+  }, 30_000)
 
   it('gives up when the relay never recovers', async () => {
     await startAll()

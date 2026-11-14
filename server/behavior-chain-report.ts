@@ -15,6 +15,7 @@ import { runFile } from './process'
 import type { ProcessDiagnostic } from './process-diagnostic'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { isServiceMode, readServiceConfig } from './service/config'
+import { recheckImplementationTest, type TestRecheckResult } from './behavior-chain-test-recheck'
 
 export const REMEDIATION_SCOPE = `Minimal, clinical interventions all the way. Get in, get out, do the thing that actually has to be done, never expand it beyond that. Keep asking "is this truly the cleanest and simplest and least intrusive way to get this done" and do it that way and only that way. Don't let others come expand it, let them come make it cleaner.`
 
@@ -46,6 +47,7 @@ interface RepairReport {
   attempts: Array<{ invocation: string, call: string, completedAt: number }>
   issueNumber: number | null
   adopted?: boolean
+  recheck?: { remedy: number, merge: string, base: string, state: 'running' | 'failed' | 'passed', reason?: string, result?: TestRecheckResult }
   disposition?: { kind: 'source-only' | 'distinct-fix' | 'existing-remedy', revision: string, review: string, commentId: number,
     diagnosis: string, nextAction: string, remedy?: number }
 }
@@ -1131,6 +1133,8 @@ export function repairReportImplementationFence(db: Database, chain: BehaviorCha
 export async function recoverReportedRepair(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
   allowed: () => boolean): Promise<string | null> {
+  const implementation = await recoverReportedImplementation(db, journal, chain, observation, verify, allowed)
+  if (implementation !== undefined) return implementation
   const fence = repairReportImplementationFence(db, chain, 'implement-issue')
   if (fence) {
     // Pending review work and started work must still settle through the
@@ -1282,7 +1286,8 @@ function escapePrePrRegExp(value: string): string {
 
 function prePrTestCase(error: string, file: string): string | null {
   const found = new Set<string>()
-  for (const match of error.matchAll(new RegExp(`\\b${escapePrePrRegExp(file)}\\s*>\\s*([^:\\n]+?)\\s*:`, 'g'))) {
+  const withoutLocation = error.replaceAll(new RegExp(`\\s*\\(${escapePrePrRegExp(file)}:\\d+\\)(?=\\s*:)`, 'g'), '')
+  for (const match of withoutLocation.matchAll(new RegExp(`\\b${escapePrePrRegExp(file)}\\s*>\\s*([^:\\n]+?)\\s*:`, 'g'))) {
     const test = match[1].trim()
     if (!test) return null
     found.add(test)
@@ -1292,7 +1297,7 @@ function prePrTestCase(error: string, file: string): string | null {
 }
 
 function prePrFailureExcerpt(error: string, file: string, test: string): string | null {
-  const matches = [...error.matchAll(new RegExp(`\\b${escapePrePrRegExp(file)}\\s*>\\s*${escapePrePrRegExp(test)}\\s*:\\s*`, 'g'))]
+  const matches = [...error.matchAll(new RegExp(`\\b${escapePrePrRegExp(file)}\\s*>\\s*${escapePrePrRegExp(test)}(?:\\s*\\(${escapePrePrRegExp(file)}:\\d+\\))?\\s*:\\s*`, 'g'))]
   if (matches.length !== 1 || matches[0].index === undefined) return null
   let excerpt = error.slice(matches[0].index + matches[0][0].length)
   const cut = excerpt.search(/Captured candidate/i)
@@ -1347,6 +1352,122 @@ function prePrReports(db: Database, chainId: string) {
     .all(PREFIX + '*', chainId) as Array<{ key: string, value: string }>
   return rows.map(row => ({ storageKey: row.key, value: row.value, report: JSON.parse(row.value) as RepairReport }))
     .filter(candidate => candidate.report.attempts.length === 1)
+}
+
+async function recoverReportedImplementation(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
+  observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
+  allowed: () => boolean): Promise<string | null | undefined> {
+  if (chain.testHold || chain.testRecovery?.admission || chain.mergeSha || chain.supersession) return undefined
+  const reports = prePrReports(db, chain.id)
+  if (!reports.length || !chain.held && !chain.testRecovery?.recheck) return undefined
+  const pending = (reason: string) => `Implementation fixture recheck: ${reason}; implementation remains unadmitted pending verified recovery or explicit Resume`
+  const accounts = getSettings()
+  if (!allowed() || !getBehaviorChainSettings().enabled || accounts.me.toLowerCase() !== chain.author.toLowerCase()
+    || accounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) return pending('admissions are disabled or configured accounts changed')
+  const original = chain.invocations.at(-1), evidence = original?.evidence
+  // A retained pre-PR report must not fence later PR work. Only a current
+  // pre-PR implement-issue hold without a typed CI hold can recheck.
+  if (original?.behavior !== 'implement-issue' || observation.pull !== null || chain.ciHold) return undefined
+  const diagnosis = qualifyingImplementationHold(db, { ...chain, held: chain.held ?? String(evidence?.error ?? '') }, observation, Date.now())
+  const matching = reports.filter(({ report }) => report.issueNumber !== null && report.holdSequence === diagnosis?.hold.sequence
+    && report.heldAt === diagnosis.hold.at && report.attempts[0].invocation === original?.id && report.attempts[0].call === original.callId
+    && report.basis === original.basis && report.slot === original.slot)
+  if (diagnosis && !matching.length) return undefined
+  if (matching.length !== 1 || !diagnosis || !original || !evidence) return pending('the saved automatic hold, Call or released no-publication receipt no longer matches')
+  const saved = matching[0], report = saved.report
+  const prepared = (evidence.artifact as { prepared?: Record<string, unknown> }).prepared
+  const base = observation.prerequisites?.base
+  const failure = prePrFileAndTest(evidence.error)
+  if (!prepared || prepared.repository !== chain.repository || prepared.issue_number !== chain.issue
+    || prepared.branch !== chain.branch || prepared.actor !== chain.author || prepared.head_sha !== null || prepared.pull_number !== null
+    || typeof prepared.checkout_head !== 'string' || !/^[a-f0-9]{40}$/.test(prepared.checkout_head)
+    || original.basis !== chainBasis(['issue', observation.issue.revision]) || original.slot !== observation.implementer.slot
+    || !original.request.argv.includes('--expected-issue-revision')
+    || original.request.argv[original.request.argv.indexOf('--expected-issue-revision') + 1] !== observation.issue.revision
+    || !observation.issue.eligible || !base || !/^[a-f0-9]{40}$/.test(base) || observation.prerequisites?.wait
+    || !failure || chain.invocations.some(invocation => !resourceReleaseProven(invocation.evidence ?? {}, true))
+    || chain.testRecovery && chain.testRecovery.recheck !== report.key) return pending('source revision, eligibility, fixture identity, base or resources are unverified')
+  if (report.recheck?.state === 'running') return pending('the one saved recheck is in flight or was interrupted; it will not be relaunched')
+  if (report.recheck?.state === 'failed') return pending(report.recheck.reason || 'the one saved recheck failed')
+  const read = async (number: number, delivery = false) => {
+    const { stdout } = await runFile('github-interface', ['--read-issue', String(number), ...(delivery ? ['--delivery-base', base] : []),
+      '--repository', chain.repository, '--token-user', chain.author], { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
+    const result = JSON.parse(stdout) as { repository: string, issue_number: number, verified?: boolean, base_sha?: string, merge_sha?: string,
+      issue?: { body: string, user: { login: string }, pull_request?: unknown } }
+    if (result.repository?.toLowerCase() !== chain.repository.toLowerCase() || result.issue_number !== number) throw new Error('fixture remedy read belongs to another source')
+    return result
+  }
+  const remote = (await read(report.issueNumber!)).issue
+  if (!remote || !remote.body?.includes(`<!-- poise-repair-exhaustion:${report.key} -->`)
+    || !remote.body.includes(`Source: ${chain.id}; hold event ${report.holdSequence}; basis ${report.basis};`)
+    || !remote.body.includes(original.callId!)) return pending('the current report no longer binds the original hold and Call')
+  let remedy = report.recheck?.remedy
+  let merge = report.recheck?.merge
+  if (!remedy) {
+    const { stdout } = await runFile('github-interface', ['--issue-comments', String(report.issueNumber), '--repository', chain.repository,
+      '--token-user', chain.author], { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
+    const comments = JSON.parse(stdout) as { repository: string, issue_number: number, comments: Array<{ author: string, body: string }> }
+    if (comments.repository?.toLowerCase() !== chain.repository.toLowerCase() || comments.issue_number !== report.issueNumber
+      || !Array.isArray(comments.comments) || comments.comments.some(comment => typeof comment.author !== 'string' || typeof comment.body !== 'string')) {
+      throw new Error('fixture remedy comments are incomplete')
+    }
+    const text = [remote.body, ...comments.comments.filter(comment => [chain.author.toLowerCase(), chain.reviewer.toLowerCase()]
+      .includes(comment.author.toLowerCase())).map(comment => comment.body)].join('\n')
+    const repository = escapePrePrRegExp(chain.repository)
+    const numbers = [...new Set([report.issueNumber!, ...[...text.matchAll(new RegExp(`https://github\\.com/${repository}/issues/([1-9][0-9]*)\\b|(?<![\\w/])#([1-9][0-9]*)\\b`, 'g'))]
+      .map(match => Number(match[1] ?? match[2]))])].filter(number => number !== chain.issue)
+    if (numbers.length > 10) return pending('linked remediation references exceed the bounded read')
+    const remedies: Array<{ number: number, merge: string }> = []
+    const title = failure.test.split(' > ').at(-1)!.replace(/ with base service (?:null|crn-test)$/, '')
+    for (const number of numbers) {
+      const issue = number === report.issueNumber ? remote : (await read(number)).issue
+      if (!issue || issue.pull_request || !issue.body?.includes(failure.file) || !issue.body.includes(title)) continue
+      const delivery = await read(number, true)
+      if (delivery.verified === true && delivery.base_sha === base && typeof delivery.merge_sha === 'string'
+        && /^[a-f0-9]{40}$/.test(delivery.merge_sha)) remedies.push({ number, merge: delivery.merge_sha })
+    }
+    if (remedies.length !== 1) return pending('one linked correction of the reported fixture is not verified on the current base')
+    remedy = remedies[0].number; merge = remedies[0].merge
+  } else {
+    const delivery = await read(remedy, true)
+    if (report.recheck?.base !== base || delivery.verified !== true || delivery.base_sha !== base || delivery.merge_sha !== merge) {
+      return pending('the pinned corrected base or linked remediation changed after the one recheck')
+    }
+  }
+  if (!report.recheck) {
+    report.recheck = { remedy, merge: merge!, base, state: 'running' }
+    // Intent wins before checkout or execution. A lost process/outcome cannot
+    // turn the next scheduler read into another expensive recheck.
+    if (journal.read(chain.id)?.sequence !== chain.sequence || !allowed()) return pending('source or admission controls changed before recheck')
+    const intent = JSON.stringify(report)
+    if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(intent, saved.storageKey, saved.value).changes !== 1) {
+      return pending('another observation owns the saved recheck')
+    }
+    try {
+      const result = await recheckImplementationTest(chain.repository, chain.author, prepared.checkout_head, base, merge!, failure.file, failure.test)
+      report.recheck = { ...report.recheck, state: 'passed', result }
+    } catch (error) {
+      report.recheck = { ...report.recheck, state: 'failed', reason: behaviorErrorMessage(error, 2000) }
+    }
+    if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(JSON.stringify(report), saved.storageKey, intent).changes !== 1) {
+      return pending('the saved recheck outcome conflicts with its intent')
+    }
+    chain = journal.read(chain.id)!
+    return recoverReportedImplementation(db, journal, chain, await verify(chain), verify, allowed)
+  }
+  const result = report.recheck.result
+  if (report.recheck.state !== 'passed' || !result || result.old.base !== prepared.checkout_head || result.current.base !== base
+    || !result.old.failure || !result.current.tests.length) return pending('the saved recheck has no complete old failure and corrected pass')
+  if (!allowed() || journal.read(chain.id)?.sequence !== chain.sequence) return pending('admission controls or the automatic hold changed')
+  const recovered: ChainObservation = { ...observation, testDependency: { invocationId: original.id, verified: true, recovered: true,
+    recheck: report.key, recovery: { merge: merge!, base, run: { ...result } } } }
+  const recovery = { hold: { invocationId: original.id, callId: original.callId!, sequence: report.holdSequence! },
+    merge: merge!, base, recheck: report.key }
+  const decision = decideBehaviorChain({ ...chain, held: null, testRecovery: recovery }, recovered, Date.now())
+  if (decision.kind !== 'invoke' || decision.behavior !== 'implement-issue') return pending(`normal implementation gates: ${'reason' in decision ? decision.reason : 'source is complete'}`)
+  chain = journal.append(chain.id, randomUUID(), chain.sequence, { type: 'chain.observed', observation: recovered })
+  if (!chain.testRecovery) journal.append(chain.id, randomUUID(), chain.sequence, { type: 'chain.resumed', testRecovery: recovery })
+  return null
 }
 
 /** Runs only on the existing reconciliation opportunity. The existing meta

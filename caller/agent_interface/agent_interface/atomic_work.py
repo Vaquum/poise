@@ -363,6 +363,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "and other blockers remain blockers; do not relabel them as relay no-results. "
         "Before cleanup, put the worker-reported first actionable assertion/failure excerpt, suite/test identifier, "
         "captured candidate digest and producing run ID in the existing blocked string, ahead of any later relay timeout explanation. "
+        "For the Caller pytest gate, copy its bounded 'completed Caller pytest failure:' summary first in blocked. "
         "Use the relay's captured candidate digest, which includes uncommitted edits; checkout_head is only the starting HEAD. "
         "Retain the run ID of the attempt that produced the failure. If only a failed-test marker was observed, "
         "say assertion details are unavailable; say when candidate or run identity is unavailable too. "
