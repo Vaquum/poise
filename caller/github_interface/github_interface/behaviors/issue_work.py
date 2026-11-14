@@ -179,7 +179,9 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
     while True:
         graph = await client.graphql("""query($owner:String!,$repo:String!,$ref:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){
           ref(qualifiedName:$ref){target{oid ... on Commit{message}}} defaultBranchRef{name target{oid}}
-          issue(number:$number){closedByPullRequestsReferences(first:100,after:$cursor){pageInfo{hasNextPage endCursor}
+          issue(number:$number){blockedBy(first:100){totalCount pageInfo{hasNextPage}
+            nodes{number repository{nameWithOwner}}
+          } closedByPullRequestsReferences(first:100,after:$cursor){pageInfo{hasNextPage endCursor}
             nodes{number url repository{nameWithOwner} headRefName}
           }}
         }}""", {"owner": owner, "repo": repo, "ref": f"refs/heads/{branch}", "number": issue_number, "cursor": cursor})
@@ -207,6 +209,23 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
     result["existing_pulls"] = [reference["url"] for reference in references
                                 if reference["repository"]["nameWithOwner"].lower() != target.lower()
                                 or reference["headRefName"] != branch]
+    connection = source["issue"].get("blockedBy")
+    nodes = connection.get("nodes") if isinstance(connection, dict) else None
+    page = connection.get("pageInfo") if isinstance(connection, dict) else None
+    complete = isinstance(nodes, list) and len(nodes) <= 100 \
+        and type(connection.get("totalCount")) is int and connection["totalCount"] == len(nodes) \
+        and isinstance(page, dict) and page.get("hasNextPage") is False
+    prerequisites = []
+    for node in nodes if isinstance(nodes, list) else []:
+        dependency_repo = node.get("repository") if isinstance(node, dict) else None
+        name = dependency_repo.get("nameWithOwner") if isinstance(dependency_repo, dict) else None
+        if not isinstance(node, dict) or type(node.get("number")) is not int or node["number"] < 1 \
+                or not isinstance(name, str) or not name:
+            complete = False
+        elif name.lower() == target.lower():
+            prerequisites.append({"repo": name.lower(), "number": node["number"]})
+    result["prerequisites"] = {"repo": target, "number": issue_number, "found": True,
+                               "complete": complete, "prerequisites": prerequisites}
     # GitHub can omit stacked PRs from both closing-reference connections.
     closing = re.compile(
         r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:"
