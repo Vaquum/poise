@@ -386,6 +386,37 @@ function reviewed(journal: BehaviorChainJournal, chain: BehaviorChain, obs: Chai
       head_sha: HEAD, completedAt: Date.parse(call.completed_at!), artifact: call.artifact } })
 }
 
+it('settles an uncertain published partial review with its incomplete disposition', async () => {
+  const db = new Database(':memory:')
+  databases.push(db)
+  const journal = new BehaviorChainJournal(db)
+  let chain = journal.append('example/repo#7', 'seed', 0, { type: 'chain.admitted', repository: 'example/repo', issue: 7,
+    branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' })
+  const call = completedReviewCall(chain.repository, 21, HEAD, chain.reviewer)
+  const response = { ...(call.artifact!.review_response as { context_sha: string }), coverage: 'incomplete' }
+  const context = response.context_sha
+  const obs = observation()
+  Object.assign(obs.pull!, { reviewContext: context, reviewIds: [call.review_id!], reviewReceipts: [{
+    id: call.review_id!, head: HEAD, state: 'CHANGES_REQUESTED', invocation: call.id, response,
+    submittedAt: Date.parse(call.completed_at!),
+  }] })
+  chain = journal.append(chain.id, 'review-admit', chain.sequence, { type: 'invocation.admitted', invocation: {
+    id: 'review', behavior: 'review-pr', basis: chainBasis(['pr', HEAD, context]), actor: chain.reviewer,
+    model: 'fixture', slot: 'primary', admittedAt: Date.parse(call.started_at),
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['review-pr', '21', '--expected-head', HEAD] },
+  } })
+  // The native call published the partial review, then failed before reporting it.
+  chain = journal.append(chain.id, 'review-failed', chain.sequence, { type: 'invocation.reconciled', invocationId: 'review',
+    evidence: { status: 'failed', outcome: 'failed', callId: call.id, completedAt: Date.parse(call.completed_at!),
+      resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] },
+      artifact: { review_response: response } } })
+  chain = journal.append(chain.id, 'review-uncertain', chain.sequence, { type: 'invocation.uncertain', invocationId: 'review',
+    reason: 'submission response lost' })
+  await new BehaviorChainRuntime(journal, operations(obs, { permitted: () => false })).run()
+  expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'settled', outcome: 'incomplete',
+    evidence: { status: 'completed', action: 'requested_changes', outcome: 'incomplete', review_id: call.review_id } })
+})
+
 it.each(['receipt', 'settlement'])('keeps original ownership when the %s journal write fails after an accepted mutation', async (boundary) => {
   const { db, journal, chain } = setup('merge-pr', false)
   const obs = observation()

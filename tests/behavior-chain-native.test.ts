@@ -207,7 +207,7 @@ it('preserves actual review identities, responses and times after an external me
   const completedAt = Date.now() - 5000
   const response = { repository: 'example/repo', pull_number: 21, head_sha: HEAD, context_sha: 'b'.repeat(64),
     reviewer: 'reviewer', invocation_id: 'c'.repeat(32), model: 'fixture', completed_at: completedAt,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
     if (argv[0] === '--chain-seed') return { stdout: JSON.stringify({ repository: 'example/repo', issue_number: 7,

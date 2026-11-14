@@ -162,6 +162,7 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
   if (!pull || !evidence || !review || !invocation.callId || !invocation.model || !pull.reviewContext
     || !validReviewResponse(response, { repository: chain.repository, number: pull.number, head: pull.head,
       actor: invocation.actor, callId: invocation.callId, model: invocation.model, context: pull.reviewContext,
+      incompleteFindings: evidence.action === 'requested_changes' && evidence.outcome === 'incomplete',
       recoveryModel: recoveryIndex >= 0 ? invocation.request.argv[recoveryIndex + 1] : null,
       startedAt: invocation.admittedAt, completedAt: Number(evidence.completedAt) }, now)
     || chainBasis(response) !== chainBasis(review.response) || typeof review.submittedAt !== 'number' || !Number.isFinite(review.submittedAt)

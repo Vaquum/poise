@@ -50,7 +50,7 @@ function finish(journal: BehaviorChainJournal, chain: BehaviorChain, id: string,
 function reviewResponse(callId: string, head = HEAD) {
   return { repository: 'Example/Repo', pull_number: 21, head_sha: head, context_sha: CONTEXT,
     invocation_id: callId, reviewer: 'reviewer', model: 'fixture-model', completed_at: NOW,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
 }
 function reviewed(journal: BehaviorChainJournal, chain: BehaviorChain, obs: ChainObservation, slot = 'primary', comment = 17): BehaviorChain {
@@ -165,6 +165,21 @@ describe('authoritative behavior journal', () => {
 })
 
 describe('completion-driven atomic behavior decisions', () => {
+  it('retains receipted partial findings for repair without granting merge clearance', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'requested_changes', outcome: 'incomplete', review_id: 27, head_sha: HEAD })
+    const response = { ...reviewResponse(chainBasis('pr-review').slice(0, 32)), coverage: 'incomplete' }
+    current.invocations.at(-1)!.evidence!.artifact = { review_response: response }
+    Object.assign(obs.pull!.reviewReceipts[0], { state: 'CHANGES_REQUESTED', response })
+    obs.pull!.changesRequested = true
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+    obs.pull!.changesRequested = false; obs.pull!.approved = true; obs.pull!.ready = true
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'hold',
+      reason: 'merge requires a retained substantive final-context review response' })
+  })
+
   it('keeps acknowledgements pending and rejects metadata, late and superseded response coverage', () => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
     let current = reviewed(journal, chain, obs)
@@ -179,6 +194,16 @@ describe('completion-driven atomic behavior decisions', () => {
     const valid = structuredClone(current)
     valid.invocations.at(-1)!.evidence!.artifact = { review_response: reviewResponse(chainBasis(first.id).slice(0, 32)) }
     expect(decideBehaviorChain(valid, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+    for (const coverage of ['incomplete', null, true, {}]) {
+      const partial = structuredClone(valid)
+      const response = { ...reviewResponse(chainBasis(first.id).slice(0, 32)), coverage }
+      partial.invocations.at(-1)!.evidence!.artifact = { review_response: response }
+      const bounded = structuredClone(obs)
+      bounded.pull!.reviewReceipts[0].response = response
+      expect(decideBehaviorChain(partial, bounded, NOW)).toMatchObject({ kind: 'hold' })
+      bounded.pull!.approved = true; bounded.pull!.ready = true
+      expect(decideBehaviorChain(partial, bounded, NOW)).toMatchObject({ kind: 'hold' })
+    }
     const late = structuredClone(valid)
     late.invocations.at(-1)!.evidence!.completedAt = NOW + 1
     expect(decideBehaviorChain(late, obs, NOW)).toMatchObject({ kind: 'hold' })

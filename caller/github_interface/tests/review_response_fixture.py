@@ -12,7 +12,7 @@ def response(pull, repo="acme/app", number=7, actor="review-bot"):
     return {"repository": repo, "pull_number": number, "head_sha": pull["head"]["sha"],
             "context_sha": context_sha(pull), "reviewer": actor, "invocation_id": "c" * 32,
             "model": "fixture", "completed_at": int(time.time() * 1000) - 3000,
-            "assessment": ASSESSMENT, "review_id": 91}
+            "coverage": "complete", "assessment": ASSESSMENT, "review_id": 91}
 
 
 def published_review(value):

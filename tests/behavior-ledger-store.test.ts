@@ -225,6 +225,15 @@ describe('behavior firing ledger store', () => {
     expect(records(db)[0].state).toBe('pending')
   })
 
+  it('retains incomplete coverage on a published change request', () => {
+    const db = store()
+    db.capture(admission())
+    db.capture(caller('claim-1', { action: 'requested_changes', outcome: 'incomplete' }))
+    expect(records(db)[0]).toMatchObject({ state: 'completed', outcome: 'incomplete' })
+    complete(db, 'claim-1', 'incomplete')
+    expect(records(db)[0]).toMatchObject({ state: 'completed', outcome: 'incomplete', stateSource: 'native' })
+  })
+
   it('creates no lineage for results without a known correlation', () => {
     const db = store()
     db.capture({ type: 'result', nativeId: 'never-admitted', state: 'completed', activity: 'settled',

@@ -245,7 +245,7 @@ comments(first: 100) {
 }
 """
 REVIEW_REQUEST_FIELDS = "requestedReviewer { ... on User { login } }"
-REVIEW_ACTIVITY_FIELDS = "id databaseId author { login } state submittedAt updatedAt commit { oid }"
+REVIEW_ACTIVITY_FIELDS = "id databaseId author { login } state body submittedAt updatedAt commit { oid }"
 
 
 async def list_review_threads(

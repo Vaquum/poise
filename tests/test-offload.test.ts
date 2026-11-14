@@ -1694,7 +1694,7 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
       expect(decideBehaviorChain(chain, obs, now)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
       const callId = '1'.repeat(32)
       const response = { repository: 'Example/Repo', pull_number: 21, head_sha: head, context_sha: context, invocation_id: callId,
-        reviewer: 'reviewer', model: reviewer.model, completed_at: now,
+        reviewer: 'reviewer', model: reviewer.model, completed_at: now, coverage: 'complete',
         assessment: { verdict: 'Fixture candidate passes review.', reviewed_context: 'Fixture exact-head diff.', limitations: 'No live GitHub actions.' } }
       append({ type: 'invocation.admitted', invocation: { id: 'review', behavior: 'review-pr', basis: chainBasis(['pr', head, context]),
         actor: 'reviewer', model: reviewer.model, slot: reviewer.slot, admittedAt: now, request: { command: 'agent-interface', argv: [], cwd: repo } } })

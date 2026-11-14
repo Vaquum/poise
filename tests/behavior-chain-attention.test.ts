@@ -1050,7 +1050,7 @@ it('directs a fully verified approved head to merge-pr', () => {
   const callId = chainBasis('review-988').slice(0, 32)
   const response = { repository: 'autonomio/poise', pull_number: 988, reviewer: 'reviewer', model: 'fixture',
     invocation_id: callId, head_sha: head, context_sha: 'b'.repeat(64), completed_at: admittedAt + 40_000,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
     issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
@@ -1229,7 +1229,7 @@ it('waits for the merge artifact instead of repeating merge-pr', () => {
   const callId = chainBasis('review-990').slice(0, 32)
   const response = { repository: 'autonomio/poise', pull_number: 990, reviewer: 'reviewer', model: 'fixture',
     invocation_id: callId, head_sha: head, context_sha: 'b'.repeat(64), completed_at: admittedAt + 40_000,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   const mergeBasis = chainBasis(['merge', head, null])
   const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],

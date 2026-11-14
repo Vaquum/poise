@@ -28,6 +28,16 @@ function recordCompletedApprovalRound(
 }
 
 describe('review-round cap', () => {
+  it.each(['incomplete', null])('does not dispatch approval from an unproven clean prefix: %s', async (coverage) => {
+    arrangeCli(false)
+    const { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user'); db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { coverage })
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
   it('is off unless set', async () => {
     const { behaviors: runtime } = await loadModules()
     expect(runtime.getReviewCap()).toBeNull()

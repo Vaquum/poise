@@ -138,7 +138,13 @@ their existing independent retry handling.
 
 `review-new-prs` accepts either one atomic `requested_changes` review or the
 authoritative `reviewed_clean` outcome. `approve-prs` accepts one head-pinned
-approval or one atomic change request. An unresolved finding whose location became
+approval or one atomic change request. Both legacy and durable-chain clearance
+require the controller's complete source coverage in the retained response.
+Capacity omissions cannot grant clean, approval, merge or later baseline
+authority; partial findings retain their review receipts with an incomplete
+outcome. [Caller coverage](../caller/agent_interface/README.md#staged-and-follow-up-reviews)
+defines the disposition and declared exclusions.
+An unresolved finding whose location became
 outdated can be reaffirmed without another inline comment when the reviewer
 confirms it still blocks the supplied head. The same review body retains each
 reaffirmed thread's root-comment permalink and finding text, including alongside
