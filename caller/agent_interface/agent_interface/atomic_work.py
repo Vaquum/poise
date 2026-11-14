@@ -379,6 +379,10 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
     args, stdin, env = issue_review.command(model, instruction, checkout, work, seconds, UNATTENDED)
     env = dict(os.environ if env is None else env)
     env.update(POISE_TEST_BINDING=json.dumps(test_capture), POISE_TEST_EVIDENCE_DIR=str(test_evidence))
+    if os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") == call_id and pull is None:
+        # Unlike the receipt binding, this grants only private source inspection;
+        # worker tests must still not register resources against their parent.
+        env["AGENT_INTERFACE_FAILED_SOURCE_CALL"] = call_id
     lease = checkout_lock.Lease(str(checkout), call_id, f"atomic behavior {repo}#{number} ({call_id[:8]})", owner_kind="caller:repair-pr" if pull else "caller:implement-issue")
     with checkout_lock.interruptible():
         progress.stage("acquiring_checkout", "Acquiring the atomic checkout lease")

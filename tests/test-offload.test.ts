@@ -9,7 +9,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { runInNewContext } from 'node:vm'
-import { gzipSync } from 'node:zlib'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
@@ -1084,6 +1084,58 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
     expect((await fetch(`${relayUrl}/runs/${finished!.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } })).status).toBe(204)
     expect(warnings.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   })
+
+  it('hands Caller the failed run archive before deleting it, despite a later edit under the same HEAD', async () => {
+    await startAll()
+    const repo = committed()
+    const retained = temp()
+    const bin = temp()
+    const original = `console.log('candidate A loaded'); setTimeout(() => { require('node:assert/strict').equal(1, 2) }, 500)\n`
+    writeFileSync(join(repo, 'candidate.test.cjs'), original)
+    writeFileSync(join(bin, 'agent-interface'), `#!${process.execPath}
+const fs = require('node:fs'), path = require('node:path');
+if (process.argv[2] !== '--capture-failed-source') process.exit(9);
+fs.copyFileSync(process.argv[3], path.join(process.env.FIXTURE_RETENTION, 'tree'));
+fs.copyFileSync(process.argv[4], path.join(process.env.FIXTURE_RETENTION, 'spec'));
+fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stringify(process.argv.slice(5)));
+`, { mode: 0o700 })
+    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+    const run = suite(repo, [process.execPath, 'candidate.test.cjs'], {
+      PATH: `${bin}:${process.env.PATH}`, FIXTURE_RETENTION: retained, AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+    })
+    let observed = ''
+    run.child.stdout?.on('data', chunk => { observed += chunk })
+    await until(() => observed.includes('candidate A loaded'), 'candidate A to run')
+    writeFileSync(join(repo, 'candidate.test.cjs'), '// untested candidate B\n')
+    const result = await run.done
+    expect(result.code).toBe(1)
+    expect(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' })).toBe(head)
+    const archive = readFileSync(join(retained, 'tree'))
+    const specification = readFileSync(join(retained, 'spec'))
+    // The runner hashes the specification plus the uncompressed tar stream.
+    const tree = archive[0] === 0x1f && archive[1] === 0x8b ? gunzipSync(archive) : archive
+    const candidate = createHash('sha256').update(specification).update(tree).digest('hex')
+    const [digest, id, exit] = JSON.parse(readFileSync(join(retained, 'identity'), 'utf8')) as string[]
+    expect(digest).toBe(candidate)
+    expect(exit).toBe('1')
+    expect(result.stderr).toContain(`candidate ${candidate}, suite node candidate.test.cjs, run ${id}`)
+    expect(execFileSync('tar', ['-xOf', join(retained, 'tree'), join(repo, 'candidate.test.cjs').slice(1)], { encoding: 'utf8' })).toBe(original)
+    expect(result.stderr).not.toContain('failed source capture unavailable')
+  })
+
+  it('keeps a completed nonzero suite result when source capture outlasts the remaining budget', async () => {
+    await startAll()
+    const repo = committed()
+    const bin = temp()
+    // A slow capture must not let the suite budget replace the genuine failure with a no-result handoff.
+    writeFileSync(join(bin, 'agent-interface'), '#!/bin/sh\nsleep 6\nexit 0\n', { mode: 0o700 })
+    const result = await suite(repo, [process.execPath, '-e', 'process.exit(1)'], {
+      PATH: `${bin}:${process.env.PATH}`, BASH_DEFAULT_TIMEOUT_MS: '5000', AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+    }).done
+    expect(result.code).toBe(1)
+    expect(result.stderr).not.toContain('no test result')
+    expect(result.stderr).not.toContain('total time budget')
+  }, 30_000)
 
   it('runs the command exactly as it was typed, with nothing of this workspace\'s hooks', async () => {
     await startAll()

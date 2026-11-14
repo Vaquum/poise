@@ -39,6 +39,41 @@ still reject absence; it grants no publication or retry authority. Failed reads
 retain the exact Call ID and reader purpose. Native receipt digest verification
 continues to use the original response bytes before the CLI's trailing newline.
 
+# Inspecting failed unpublished source
+
+For a managed `implement_issue`, the test-offload runner hands Caller the original
+archive and command specification after a completed nonzero suite exit, before
+deleting that archive. Caller verifies their combined candidate digest and
+checkout binding, then retains only changes against the prepared base: tracked
+files (including deletions) and new source files present in that archive. Ignored
+dependencies, Git metadata and other untracked files are excluded. Symlinks retain
+their target text without following it. Unsupported or mismatched captures are
+unavailable; no cleanup-time diff substitutes for them.
+
+The first failed capture is bounded to 2 MiB including its JSON/base64 encoding,
+in a mode-0600 file under the owning workspace's `incident-recovery` directory.
+It uses existing 30-day incident-artifact expiry, also enforced on reads. The
+ordinary managed checkout and process cleanup still runs. Only a settled,
+failed implementation with no publication attempt keeps the evidence; a later
+successful implementation discards it. Exported `artifact.failed_source` contains
+only validated availability, candidate/run/base identities, size, digest and
+expiry, or a fixed unavailable reason. It never contains source bytes or paths.
+
+The existing linked remediation report exposes availability and the command
+`agent-interface --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID`. This returns
+the private file location, never its contents, only inside the owning workspace
+to a running implementation Call for that report's issue, repository and actor.
+The original no-publication receipt, positive resource release, exact capture
+identity, private file permissions and digest must still match. Missing, expired,
+oversized, tampered or unauthorized evidence returns unavailable and requires a
+fresh reproduction. Historical deleted artifacts are not recovered.
+
+The retained capture can explain an earlier failure; edits made after it still
+require fresh validation. Source contents stay out of GitHub, notifications and
+logs. Inspection grants no publication, retry or approval authority. The blocked
+Call and captured bytes are bound evidence; the worker's diagnosis remains
+worker-reported and does not establish a defect on main.
+
 # Stopping a run
 
 Every local call records its supervisor PID and available kernel start/epoch
