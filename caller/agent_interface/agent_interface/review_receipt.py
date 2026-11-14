@@ -249,10 +249,34 @@ def work_publication(head: str, *, start_replies: bool = False) -> None:
                     # github-interface is an executed child, so it cannot
                     # inherit Caller's in-memory scope. Verify its original
                     # kernel boundary and that only this helper remains.
-                    scope = resource_ownership.original_scope(Path(database), call_id, ownership)
-                    if os.getpid() <= 2 or os.getppid() != 2 or os.readlink("/proc/self/ns/pid") != scope.binding["namespace"] \
-                            or set(scope.read()["pids"]) != {1, 2, os.getpid()}:
-                        raise RuntimeError("planned replies lack their original idle native helper")
+                    refusal = "planned replies lack their original idle native helper"
+                    try:
+                        scope = resource_ownership.original_scope(Path(database), call_id, ownership)
+                        helper = os.getpid()
+                        if helper <= 2:
+                            raise RuntimeError(f"{refusal}: helper_pid")
+                        if os.getppid() != 2:
+                            raise RuntimeError(f"{refusal}: helper_parent")
+                        if os.readlink("/proc/self/ns/pid") != scope.binding["namespace"]:
+                            raise RuntimeError(f"{refusal}: helper_namespace")
+                        expected = {1, 2, helper}
+                        deadline = time.monotonic() + native_namespace.SETTLE_SECONDS
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise RuntimeError(f"{refusal}: namespace_busy")
+                            members = set(scope.read(timeout_seconds=min(native_namespace.CONTROL_SECONDS, remaining))["pids"])
+                            if time.monotonic() > deadline:
+                                raise RuntimeError(f"{refusal}: namespace_read_timeout")
+                            if members == expected:
+                                break
+                            if not expected.issubset(members):
+                                raise RuntimeError(f"{refusal}: namespace_members")
+                            time.sleep(min(0.005, max(0, deadline - time.monotonic())))
+                    except TimeoutError as error:
+                        raise RuntimeError(f"{refusal}: namespace_read_timeout") from error
+                    except OSError as error:
+                        raise RuntimeError(f"{refusal}: namespace_read_io") from error
                 elif scope.key["callId"] != call_id:
                     raise RuntimeError("planned replies lack their original active native ownership")
                 else:

@@ -265,6 +265,13 @@ export function createTasks(ctx: PartContext): ObservePart {
       if (a.nextAction) rows.push(['Next', `${esc(a.nextAction)}${a.retryAt ? ` · ${esc(clockTime(a.retryAt))}` : ''}`])
     }
     const recheck = a?.reconciliation.nextObservationAt ?? chain.reconciliation?.nextObservationAt ?? null
+    const warning = chain.mergedReviewWarning
+    if (warning) {
+      rows.push(['Native review clearance', `Unmet at merge on head ${esc(warning.head)}. Original review responses are complete; no qualifying favorable native response preceded the merge.`])
+      for (const review of warning.reviews) rows.push(['Retained native review', `${external(review.url, 'Changes requested', 'lnk')}: ${esc(review.verdict)}`])
+      const approval = warning.githubApproval
+      if (approval) rows.push(['Later GitHub approval', `${external(approval.url, `Review #${approval.id}`, 'lnk')} · head ${esc(approval.head)} · submitted ${esc(new Date(approval.submittedAt).toISOString())} · submitting client unknown`])
+    }
     if (recheck && recheck > now) rows.push(['Evidence recheck', `${esc(clockTime(recheck))}. A recheck never retries held work.`])
     if (chain.reconciliation?.waitingForOriginalResponse) rows.push(['Original response', 'Required: GitHub reads cannot settle this step.'])
     if (chain.reconciliation?.waitingForResourceRelease || a?.reconciliation.waitingForResourceRelease) rows.push(['Resources', 'Their release is unverified; reconciliation goes on and its memory and disk stay reserved.'])

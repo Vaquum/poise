@@ -1,8 +1,68 @@
 import Database from 'better-sqlite3'
-import { BehaviorChainJournal, type PublicationPlanCondition } from '../../server/behavior-chain-store'
+import { BehaviorChainJournal, chainBasis, type ChainEvent, type PublicationPlanCondition } from '../../server/behavior-chain-store'
 import { behaviorChainAttention, behaviorChainSummary } from '../../server/behavior-chain-summary'
 import { CheckSemaphore } from '../../server/check-semaphore'
 import type { ChainObservation } from '../../server/behavior-chain-decision'
+import type { ReviewResponse } from '../../server/review-response'
+import { completedReviewCall } from '../review-response-fixture'
+
+export type MergedReviewCase = 'requested-changes' | 'clean' | 'native-approval' | 'late-native-approval' | 'late-review'
+  | 'missing-basis' | 'changed-context' | 'changed-head' | 'missing-panel' | 'incomplete-panel'
+
+/** Already-completed merge with the native review outside the summary's last 20 invocations. */
+export function mergedReviewFixture(journal: BehaviorChainJournal, issue: number, mode: MergedReviewCase = 'requested-changes') {
+  const now = Date.now()
+  const head = 'a'.repeat(40), mergeSha = 'c'.repeat(40), context = 'b'.repeat(64)
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  let chain = journal.append(`acme/repo#${issue}`, `seed-${issue}`, 0, { type: 'chain.admitted', repository: 'acme/repo', issue,
+    branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' }, now - 20_000)
+  const record = (event: ChainEvent, at = now) => { chain = journal.append(chain.id, `${issue}:${chain.sequence}`, chain.sequence, event, at) }
+  const observation: ChainObservation = { checkedAt: now - 10_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: issue + 1, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: issue + 1, head, headSince: now - 20_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: 'MQE_original', queueRemoval: null, changesRequested: false, unresolved: 0, approved: true, ready: true,
+      reviewIds: [], reviewRevision: 'review', reviewContext: context, reviewReceipts: [], greyRuns: [],
+      checksState: 'SUCCESS', pending: false, failing: [], conflict: false, behind: false } }
+  if (mode === 'missing-panel') observation.prReviewers = []
+  if (mode === 'incomplete-panel') observation.prReviewers.push({ ...reviewer, slot: 'secondary' })
+  if (mode !== 'missing-basis') record({ type: 'chain.observed', observation: structuredClone(observation) }, observation.checkedAt)
+  const review = (id: number, action: 'requested_changes' | 'reviewed_clean' | 'approved', at: number) => {
+    const call = completedReviewCall(chain.repository, issue + 1, head, chain.reviewer)
+    const callId = chainBasis([issue, id]).slice(0, 32)
+    const response = structuredClone(call.artifact!.review_response) as ReviewResponse
+    response.invocation_id = callId; response.completed_at = at - 1000
+    if (action === 'requested_changes') response.assessment.verdict = 'Changes requested: retain the original native review clearance after merge.'
+    record({ type: 'invocation.admitted', invocation: { id: `review-${id}`, behavior: action === 'approved' ? 'approve-pr' : 'review-pr',
+      actor: chain.reviewer, model: reviewer.model, slot: reviewer.slot, basis: chainBasis(['pr', head, context]), admittedAt: at - 2000,
+      request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } }, at - 2000)
+    record({ type: 'invocation.settled', invocationId: `review-${id}`, callId, outcome: action,
+      evidence: { status: 'completed', action, review_id: id, head_sha: head, completedAt: at, artifact: { review_response: response } } }, at)
+    observation.pull!.reviewIds.push(id)
+    observation.pull!.reviewReceipts.push({ id, head, state: action === 'approved' ? 'APPROVED' : action === 'requested_changes' ? 'CHANGES_REQUESTED' : 'COMMENTED',
+      invocation: callId, response, submittedAt: at })
+  }
+  review(91, mode === 'clean' ? 'reviewed_clean' : 'requested_changes', now - (mode === 'late-review' ? 1000 : 7000))
+  if (mode === 'native-approval' || mode === 'late-native-approval') review(92, 'approved', now - (mode === 'native-approval' ? 5000 : 1000))
+  observation.pull!.reviewIds.push(93)
+  observation.pull!.reviewReceipts.push({ id: 93, head, state: 'APPROVED', invocation: null, submittedAt: now - 4000 })
+  for (let index = 0; index < 21; index++) {
+    const id = `other-${issue}-${index}`
+    record({ type: 'invocation.admitted', invocation: { id, behavior: 'repair-pr', actor: chain.author, model: 'fixture', slot: 'primary',
+      basis: id, admittedAt: now - 500, request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+    record({ type: 'invocation.settled', invocationId: id, callId: null, outcome: 'no_changes', evidence: { status: 'completed', action: 'no_changes' } })
+  }
+  Object.assign(observation, { checkedAt: now })
+  Object.assign(observation.publication, { state: 'closed', merged: true, merge_sha: mergeSha })
+  Object.assign(observation.pull!, { state: 'closed', merged: true, mergeSha, mergedAt: now - 3000, queueEntry: null })
+  if (mode === 'changed-context') observation.pull!.reviewContext = 'd'.repeat(64)
+  if (mode === 'changed-head') observation.pull!.head = 'd'.repeat(40)
+  record({ type: 'chain.observed', observation: structuredClone(observation) })
+  record({ type: 'chain.merged', mergeSha, evidence: { repository: chain.repository, pull_number: issue + 1,
+    merged: true, merge_sha: mergeSha, review_complete: true } })
+  return chain
+}
 
 /** UI regression fixture: real isolated journal and production wire mapper,
  * never a behavior run or acceptance artifact. No global server DB is imported. */

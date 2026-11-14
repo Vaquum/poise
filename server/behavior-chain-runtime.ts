@@ -248,6 +248,13 @@ export class BehaviorChainRuntime {
     }
   }
 
+  /** Resume retains waiting in hashed reducer state; a still-blocking reason
+   * starts a new wait episode on its first observed sweep after Resume. */
+  private renewsWait(chain: BehaviorChain, reason: string): boolean {
+    return chain.waiting !== reason || (chain.resumedAfterSequence > 0
+      && this.journal.history(chain.id, chain.resumedAfterSequence, 1)[0]?.sequence === chain.sequence)
+  }
+
   /** Durable-budget wait reason for one more reservation, or null when the
    *  budget holds it. Unknown ownership never reads as free. */
   private resourceWaitReason(resources: BehaviorResourceAdmission): string | null {
@@ -538,18 +545,18 @@ export class BehaviorChainRuntime {
                 if (resources) {
                   const exhausted = this.resourceWaitReason(resources)
                   if (exhausted) {
-                    if (chain.waiting !== exhausted) this.append(chain, { type: 'chain.waiting', reason: exhausted })
+                    if (this.renewsWait(chain, exhausted)) this.append(chain, { type: 'chain.waiting', reason: exhausted })
                     continue
                   }
                   try {
                     const cramped = headroomShortfall((this.operations.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)
                     if (cramped) {
-                      if (chain.waiting !== cramped) this.append(chain, { type: 'chain.waiting', reason: cramped })
+                      if (this.renewsWait(chain, cramped)) this.append(chain, { type: 'chain.waiting', reason: cramped })
                       continue
                     }
                   } catch (error) {
                     const reason = error instanceof Error ? error.message : String(error)
-                    if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                    if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
                     continue
                   }
                 }
@@ -584,9 +591,7 @@ export class BehaviorChainRuntime {
                 }
                 if (!request) {
                   const reason = `${decision.behavior} is waiting for native provider backoff`
-                  // Resume retains waiting; its first observed sweep starts a new episode.
-                  if (chain.waiting !== reason || (chain.resumedAfterSequence > 0
-                    && this.journal.history(chain.id, chain.resumedAfterSequence, 1)[0]?.sequence === chain.sequence)) {
+                  if (this.renewsWait(chain, reason)) {
                     this.append(chain, { type: 'chain.waiting', reason })
                   }
                   continue
@@ -609,14 +614,17 @@ export class BehaviorChainRuntime {
                 // Preparation can await provider/auth/configuration. Recheck admission
                 // at the last boundary, before committing authority for an effect.
                 if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
-                if (decision.behavior === 'implement-issue' && chain.testRecovery && !chain.testRecovery.admission) {
+                if (decision.behavior === 'implement-issue') {
                   const fresh = await this.operations.observe(chain)
                   chain = this.append(chain, { type: 'chain.observed', observation: fresh })
-                  if (!recoveredImplementation(chain, fresh, Date.now()) || fresh.prerequisites?.wait !== null) continue
-                  // The recovered decision is stale when a required review no
-                  // longer posts; re-decide on the fresh observation.
+                  if (chain.testRecovery && !chain.testRecovery.admission && !recoveredImplementation(chain, fresh, Date.now())) continue
+                  // Dependencies can change without an issue revision, including
+                  // while request preparation awaited. Retain their ordinary wait.
                   const redecided = decideBehaviorChain(chain, fresh, Date.now())
-                  if (redecided.kind !== 'invoke' || redecided.behavior !== decision.behavior || redecided.basis !== decision.basis) continue
+                  if (redecided.kind !== 'invoke' || redecided.behavior !== decision.behavior || redecided.basis !== decision.basis) {
+                    if (redecided.kind === 'wait' && chain.waiting !== redecided.reason) this.append(chain, { type: 'chain.waiting', reason: redecided.reason })
+                    continue
+                  }
                   if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
                 }
                 phase = 'invocation-admission'
