@@ -10,6 +10,7 @@ import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact, 
 import { nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { db } from './db'
 import { implementationReportBinding, reviewReportBinding, setImplementationReportDisposition } from './behavior-chain-report'
+import { openWorkBindings } from './chat/control-store'
 
 function reply(res: ServerResponse, status: number, value: unknown): void {
   res.statusCode = status; res.setHeader('Content-Type', 'application/json'); endJson(res, JSON.stringify(value))
@@ -21,9 +22,9 @@ function reply(res: ServerResponse, status: number, value: unknown): void {
 // share that work; a change made through this API clears it at once.
 const LIST_REUSE_MS = 10_000
 let listReuse = new Map<string, { at: number, chains: unknown[], next: string | null }>()
-let attentionReuse: { at: number, value: unknown } | null = null
+let attentionReuse: { at: number, chatInstance: string | null, value: unknown } | null = null
 
-export async function handleBehaviorChains(req: IncomingMessage, res: ServerResponse, url: string): Promise<void> {
+export async function handleBehaviorChains(req: IncomingMessage, res: ServerResponse, url: string, chatInstance: string | null = null): Promise<void> {
   let clearAfter = false
   try {
     const params = new URL(url, 'http://localhost').searchParams
@@ -81,7 +82,11 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
         page = { at: now, chains: chains.map(summary), next: chains.length === 100 ? chains.at(-1)!.id : null }
         listReuse.set(key, page)
       }
-      if (!after && (!attentionReuse || now - attentionReuse.at >= LIST_REUSE_MS)) attentionReuse = { at: now, value: behaviorChainAttention(journal) }
+      if (!after && (!attentionReuse || now - attentionReuse.at >= LIST_REUSE_MS || attentionReuse.chatInstance !== chatInstance)) {
+        const owners = chatInstance ? openWorkBindings(chatInstance) : []
+        const chats = new Map(owners.map(({ target, session, role }) => [target, { kind: 'chat' as const, session, manager: role === 'manager' }]))
+        attentionReuse = { at: now, chatInstance, value: behaviorChainAttention(journal, now, chats) }
+      }
       return reply(res, 200, { chains: page.chains, next: page.next,
         ...(!after ? { attention: attentionReuse!.value } : {}),
         cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })

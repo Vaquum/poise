@@ -1617,6 +1617,9 @@ across all active chain pages. It joins durable progress age, holds, exact-head
 merge gates and the next known retry/intervention, including pending original
 review obligations after merge. The existing journal history supplies the clock;
 unchanged polls cannot refresh it. Stale/incomplete evidence stays explicit.
+Entries can include a read-only `nudge` with the type of next step, its
+description, a verified prerequisite, and a current Chat or open PR link when
+available. Chat bindings are read within the active workspace instance.
 This adds no observation, scheduler, event type, scope or execution authority.
 [Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
 

@@ -10,7 +10,7 @@ import { $, esc } from '../../dom'
 import { placeHref } from '../../address'
 import { term } from '../../registry'
 import {
-  KIND_WORDS, LEGACY_PULL, PHASES, REPOSITORY, age, attentionOrder, eventWords, failureWords, isActive,
+  KIND_WORDS, LEGACY_PULL, PHASES, REPOSITORY, age, attentionOrder, attentionRoot, eventWords, failureWords, isActive,
   phaseOf, readChain, readChainsPage, readJournalPage, reasonWords, stepEvent, taskState, timelineLines,
   type AttentionRow, type ChainInvocation, type ChainRow, type ChainsPage,
 } from './chains'
@@ -181,7 +181,11 @@ export function createTasks(ctx: PartContext): ObservePart {
 
   // ---------- The list ----------
   function rows(): Array<{ chain: ChainRow | null, attention: AttentionRow | null }> {
-    if (which === 'attention') return attention.map((a) => ({ chain: byId(a.id) ?? null, attention: a }))
+    if (which === 'attention') {
+      const entries = new Map(attention.map((entry) => [entry.id, entry]))
+      return attention.filter((a) => search || open === a.id || attentionRoot(a.id, entries) === a.id)
+        .map((a) => ({ chain: byId(a.id) ?? null, attention: a }))
+    }
     return chains.map((chain) => ({ chain, attention: attentionFor(chain.id) ?? null }))
   }
   function matches(row: { chain: ChainRow | null, attention: AttentionRow | null }): boolean {
@@ -262,7 +266,21 @@ export function createTasks(ctx: PartContext): ObservePart {
       rows.push(['Last verified advance', `${esc(age(now - a.progressAt))} ago · ${esc(clockTime(a.progressAt))} · it needs attention`])
       if (a.blocker && a.blocker !== chain.held) rows.push(['What holds it', esc(a.blocker)])
       if (a.evidence.gates.length) rows.push(['Evidence on its head', `${esc(a.evidence.gates.join(' · '))}${a.evidence.state !== 'fresh' ? ` <span class="note is-warn">${esc(a.evidence.state)} evidence${a.evidence.checkedAt ? `, read ${esc(clockTime(a.evidence.checkedAt))}` : ''}</span>` : ''}`])
-      if (a.nextAction) rows.push(['Next', `${esc(a.nextAction)}${a.retryAt ? ` · ${esc(clockTime(a.retryAt))}` : ''}`])
+      if (a.nudge) {
+        const nudge = a.nudge
+        const entries = new Map(attention.map((entry) => [entry.id, entry]))
+        const root = attentionRoot(chain.id, entries)
+        const affected = attention.filter((entry) => entry.id !== chain.id && attentionRoot(entry.id, entries) === chain.id)
+        const taskLink = (id: string) => `<a class="lnk" href="${esc(partHref('tasks', { which: 'attention', chain: id }, back))}">${esc(id)}</a>`
+        if (root !== chain.id) rows.push(['Root blocker', taskLink(root)])
+        if (affected.length) rows.push(['Waiting on this', affected.map((entry) => taskLink(entry.id)).join(' · ')])
+        const work = failure ? null : nudge.work
+        rows.push(['Ownership', work?.kind === 'chat'
+          ? `<a class="lnk" href="${esc(placeHref(work.manager ? 'manager' : 'chat', { chat: work.manager ? null : work.session, back: 'observe' }))}">${work.manager ? 'Open the Manager' : 'Open the bound Chat'}</a>`
+          : work?.kind === 'pull' ? external(work.url, 'Open the linked pull request') : 'Ownership unverified'])
+        rows.push(['Next', failure ? 'Current next step unverified.'
+          : `${esc(nudge.action)}${nudge.prerequisite ? ` ${taskLink(nudge.prerequisite)}` : ''}${a.retryAt ? ` · ${esc(clockTime(a.retryAt))}` : ''}`])
+      } else if (a.nextAction) rows.push(['Next', `${esc(a.nextAction)}${a.retryAt ? ` · ${esc(clockTime(a.retryAt))}` : ''}`])
     }
     const recheck = a?.reconciliation.nextObservationAt ?? chain.reconciliation?.nextObservationAt ?? null
     const warning = chain.mergedReviewWarning
@@ -272,7 +290,7 @@ export function createTasks(ctx: PartContext): ObservePart {
       const approval = warning.githubApproval
       if (approval) rows.push(['Later GitHub approval', `${external(approval.url, `Review #${approval.id}`, 'lnk')} · head ${esc(approval.head)} · submitted ${esc(new Date(approval.submittedAt).toISOString())} · submitting client unknown`])
     }
-    if (recheck && recheck > now) rows.push(['Evidence recheck', `${esc(clockTime(recheck))}. A recheck never retries held work.`])
+    if (recheck && recheck > now) rows.push(['Evidence recheck', `${esc(clockTime(recheck))}. Poise checks for new evidence.`])
     if (chain.reconciliation?.waitingForOriginalResponse) rows.push(['Original response', 'Required: GitHub reads cannot settle this step.'])
     if (chain.reconciliation?.waitingForResourceRelease || a?.reconciliation.waitingForResourceRelease) rows.push(['Resources', 'Their release is unverified; reconciliation goes on and its memory and disk stay reserved.'])
     if (chain.supersession && REPOSITORY.test(chain.repository)) {
@@ -313,7 +331,7 @@ export function createTasks(ctx: PartContext): ObservePart {
     patchContent(head, `<div class="tk-d-h"><h3>${esc(identity(chain.repository, chain.issue, chain.pullNumber))}</h3><p class="t-gloss">${links} · driven by the behaviors</p></div>
       <div class="tk-d-rail">${railHTML(chain)}</div>
       <p class="tk-d-s"><span class="st" data-state="${state}" data-ref="state">${esc(term(`state.${state}`))}</span> ${esc(reason)}</p>
-      ${chain.held ? `<p class="tk-hold" data-ref="side.hold">${esc(reasonWords(chain.held))}. The chain waits for your decision; Resume ends the hold.</p>` : ''}
+      ${chain.held ? `<p class="tk-hold" data-ref="side.hold">${esc(reasonWords(chain.held))}</p>` : ''}
       ${evidenceHTML(chain)}
       <div class="tk-acts">${controlHTML(chain)}${/^[\w.-]+\/[\w.-]+$/.test(chain.repository) ? `<a class="lnk" href="${esc(onBoard(card))}" data-ref="tk.board">See it on Board</a>` : ''}</div>
       ${note && note.id === chain.id ? `<p class="tk-act-note${note.tone === 'failed' ? ' is-failed' : ''}" role="status">${esc(note.text)}</p>` : ''}`)
