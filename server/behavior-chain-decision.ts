@@ -270,7 +270,8 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   }
   if (pull.queueEntry) {
     const entry = pull.queueEntryDetails?.id === pull.queueEntry ? pull.queueEntryDetails : null
-    return { kind: 'wait', reason: `native merge queue owns entry ${pull.queueEntry}; queue ${entry?.state ?? 'disposition unknown'}${entry?.state === 'UNMERGEABLE' ? '; cause unknown' : ''}` }
+    if (!entry) return { kind: 'wait', reason: `native merge queue owns entry ${pull.queueEntry}` }
+    return { kind: 'wait', reason: `native merge queue owns entry ${pull.queueEntry}; queue ${entry.state}${entry.state === 'UNMERGEABLE' ? '; cause unknown' : ''}` }
   }
   const dismissed = pull.reviewReceipts.find((review) => review.head === pull.head && review.state === 'DISMISSED'
     && chain.invocations.some((invocation) => invocation.behavior === 'approve-pr' && invocation.callId === review.invocation))

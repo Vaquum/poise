@@ -268,7 +268,7 @@ describe('completion-driven atomic behavior decisions', () => {
     obs.pull!.ready = true
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
     obs.pull!.queueEntry = 'repaired-queue-entry'
-    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('native merge queue owns') })
+    expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'native merge queue owns entry repaired-queue-entry' })
   })
 
   it.each([
