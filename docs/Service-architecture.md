@@ -628,8 +628,13 @@ its own instead of refusing with dirty_unowned.
   only for a known switch whose fresh health probe cannot reach the workspace
   or finds it healthy on the requested release. A healthy old release keeps
   the ordinary 502. The reset invalidates cached readiness, so recovery freshly
-  verifies `/api/service/health` on the requested release. `proxy.failed` retains
-  its Error with request and requested-release evidence; no request is replayed.
+  verifies `/api/service/health` on the requested release. `proxy.failed` is one
+  Warning only after the retryable update response is produced; unverified
+  resets, interrupted mutations and unanswered failures retain an Error.
+  Request, requested release and actual response disposition are retained in
+  diagnostics (`disconnect` records the status/disposition or an unanswered
+  response). Failed rollout evidence remains in the existing rollout diagnostics;
+  no request is replayed.
 - **Everything else.** An image of another base, a workspace started without
   the supervisor, or a changed container setting still gets a new container,
   drained first ([Deployment](#deployment)). The gateway makes the new image's
