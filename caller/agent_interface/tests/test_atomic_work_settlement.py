@@ -1,4 +1,4 @@
-"""Real provider/gate/lease regression with a namespace-reader stand-in."""
+"""Real provider/gate/lease regression with a namespace-reader stand-in, plus typed provider-result settlement."""
 import json
 import os
 import signal
@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -114,3 +115,112 @@ raise SystemExit({provider_exit})
                 kill(int(helper_file.read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+CANARY = "canary-secret-9f2c7d4e1a"
+TAIL_MARKER = "TAIL-MARKER-7f3a9c"
+REUSE_CORE = "Your refresh token could not be refreshed because it was already used."
+# The canary sits inside the retained cause to prove redaction; the tail
+# marker sits past truncation to prove the raw stream does not leak.
+REUSE_MESSAGE = f"{REUSE_CORE} Refresh failed with Bearer {CANARY}; " + "padding " * 80 + TAIL_MARKER
+GENERIC_MESSAGE = "refresh token request failed: connection reset by peer"
+GITHUB_MESSAGE = "GitHub 401 Unauthorized"
+SETTLEMENT_HEAD = "b" * 40
+
+
+def _codex_stdout(message):
+    return json.dumps({"type": "turn.failed", "error": {"message": message}}) + "\n"
+
+
+@pytest.mark.parametrize("pull", [None, 3], ids=["implement", "repair"])
+@pytest.mark.parametrize("returncode,message,provider,typed", [
+    (1, REUSE_MESSAGE, "codex", True),
+    (0, REUSE_MESSAGE, "codex", True),
+    (-9, REUSE_MESSAGE, "codex", True),
+    (1, GENERIC_MESSAGE, "codex", False),
+    (1, GITHUB_MESSAGE, "codex", False),
+    (1, REUSE_MESSAGE, "muse", False),
+])
+def test_atomic_codex_rejection_is_typed(tmp_path, monkeypatch, capsys, pull, returncode, message, provider, typed):
+    call_id = "c" * 32
+    work = tmp_path / "atomic-rejection"
+    work.mkdir(mode=0o700)
+    # A decoy publication the failure must never read: the rejection raises
+    # before publication.json is touched.
+    (work / "publication.json").write_text(json.dumps({
+        "commitMessage": "fix: decoy", "title": "fix: decoy", "body": "must not publish",
+        "replies": [], "blocked": None}))
+    records, modes, stop_calls, cwd_calls, checks = [], [], [], [], []
+    lease = MagicMock()
+    lease.held = True
+
+    def interface(*args, **kwargs):
+        if args[0] == "--issue-work":
+            mode = args[args.index("--mode") + 1]
+            modes.append(mode)
+            (work / "repo").mkdir(exist_ok=True)
+            return {"outcome": "prepared", "checkout_head": SETTLEMENT_HEAD}
+        if args[0] == "--list-failing-ci":
+            return {"failing": []}
+        if args[0] == "--pr-review":
+            return {"review_threads": []}
+        if args[0] == "--pull-action-state":
+            return {}
+        raise AssertionError(f"unexpected interface call: {args[0]}")
+
+    def run_gated(_lease, _args, **kwargs):
+        return SimpleNamespace(returncode=returncode, stdout=_codex_stdout(message), stderr="")
+
+    # The provider result is faked; classification, redaction, the diagnostic
+    # envelope and the release calls it runs after are all real.
+    monkeypatch.setattr(atomic_work.issue_review, "packet", lambda *args: {"issue": {"state": "open"}})
+    monkeypatch.setattr(atomic_work.issue_review, "command", lambda *args: (["fixture"], "", {}))
+    monkeypatch.setattr(atomic_work.issue_review, "interface", interface)
+    monkeypatch.setattr(atomic_work.issue_review, "stop_leftovers", lambda root: stop_calls.append(root))
+    monkeypatch.setattr(atomic_work.issue_review, "_cwd_pids",
+                        lambda *args, **kwargs: cwd_calls.append((args, kwargs)) or [])
+    monkeypatch.setattr(atomic_work.checkout_lock, "run_gated", run_gated)
+    monkeypatch.setattr(atomic_work.checkout_lock, "Lease", lambda *args, **kwargs: lease)
+    monkeypatch.setattr(resource_ownership, "binding", lambda: ("db", call_id))
+    monkeypatch.setattr(resource_ownership, "process_check", lambda *args, **kwargs: checks.append((args, kwargs)))
+
+    kwargs = {} if pull is None else {"pull": pull, "expected_head": SETTLEMENT_HEAD}
+    with pytest.raises(Exception) as failure:
+        atomic_work.run(SimpleNamespace(provider=provider), "example/repo", 7, "fix/rejection",
+                        "author", work, call_id, records.append, **kwargs)
+    error = failure.value
+    # Process release ran before the raise; publication never started.
+    assert stop_calls == [work]
+    assert cwd_calls == [((work,), {"require_complete": True})]
+    assert checks == [(("db", call_id), {"complete": True})]
+    lease.acquire.assert_called_once_with(atomic_work.checkout_lock.ACQUIRE_WAIT_SECONDS)
+    lease.release.assert_called_once_with()
+    assert modes == ["prepare"]
+    assert [record["phase"] for record in records] == ["prepared", "executing", "resources_unknown", "executing"]
+    captured = capsys.readouterr()
+    if typed:
+        assert isinstance(error, atomic_work.issue_review.ProviderFailure)
+        assert error.code == "authentication_failed"
+        assert "already used" in str(error)
+        assert CANARY not in str(error)
+        assert TAIL_MARKER not in str(error)
+        diagnostic = error.diagnostic
+        assert diagnostic["operation"] == "provider.atomic_work"
+        assert diagnostic["phase"] == "provider_execution"
+        assert diagnostic["outcome"] == ("signal" if returncode < 0 else "exit")
+        assert diagnostic["stderr"] == str(error)
+        assert diagnostic["provider"] == "codex"
+        assert diagnostic["exit_code"] == (returncode if returncode > 0 else None)
+        assert diagnostic["signal"] == (-returncode if returncode < 0 else None)
+        assert diagnostic["submission"] == "none"
+        assert CANARY not in json.dumps(diagnostic)
+        assert TAIL_MARKER not in json.dumps(diagnostic)
+    else:
+        # Generic crashes, GitHub failures and other providers keep the
+        # existing untyped failure; the outer diagnostic still redacts them.
+        assert type(error) is RuntimeError
+        assert getattr(error, "code", None) is None
+        assert getattr(error, "diagnostic", None) is None
+        assert message[:50] in str(error)
+    assert CANARY not in captured.out + captured.err
+    assert TAIL_MARKER not in captured.out + captured.err
