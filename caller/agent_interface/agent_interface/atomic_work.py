@@ -414,7 +414,20 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             progress.stage("validating_provider_result", "Checking the atomic provider result")
             terminal = issue_review._terminal_failure(model.provider, done.stdout)
             if done.returncode or terminal:
-                raise RuntimeError(terminal or issue_review.provider_error(done.stdout, done.stderr) or f"provider exited {done.returncode}")
+                raw = terminal or issue_review.provider_error(done.stdout, done.stderr) or f"provider exited {done.returncode}"
+                # Classify the provider's own cause before credential redaction can
+                # hide natural-language words such as "token was".
+                if model.provider == "codex" and atoms.credential_rejected(raw):
+                    error = atoms.bounded_cause(raw)
+                    raise issue_review.ProviderFailure(
+                        error, "authentication_failed",
+                        diagnostic_envelope(operation="provider.atomic_work", phase="provider_execution",
+                                            outcome="signal" if done.returncode < 0 else "exit",
+                                            stderr=error, provider=model.provider,
+                                            exit_code=done.returncode if done.returncode > 0 else None,
+                                            signal=-done.returncode if done.returncode < 0 else None,
+                                            submission="none"))
+                raise RuntimeError(raw)
             progress.stage("reading_publication", "Reading bounded publication metadata")
             if not output.is_file() or output.stat().st_size > 64 * 1024:
                 raise AtomicWorkFailed("atomic behavior returned no bounded publication metadata")
