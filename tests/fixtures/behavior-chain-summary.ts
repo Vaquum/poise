@@ -111,7 +111,7 @@ export function chainSummaryFixture(state: 'unmerged' | 'pending-active' | 'pend
     const before = journal.history(chain.id)
     journal.rebuild()
     const current = journal.read(chain.id)!
-    const summary = behaviorChainSummary(current, { at: journal.reconciliationAt(current) })
+    const summary = behaviorChainSummary(current, journal, { at: journal.reconciliationAt(current) })
     const semaphore = new CheckSemaphore(() => 4)
     const processSlots = semaphore.stats()
     if (JSON.stringify(journal.history(chain.id)) !== JSON.stringify(before)) throw new Error('summary fixture changed historical authority')
@@ -156,7 +156,7 @@ export function delayedChainFixture(journal: BehaviorChainJournal, now: number) 
       reason: `repair-pr failed before publication three times: ${index < 2 ? 'incomplete review replies' : 'required CI shard failed'}` }, checkedAt + 5 * 60_000)
     journal.append(chain.id, `poll-${issue}`, chain.sequence, { type: 'chain.observed', observation: { ...observation, checkedAt: now } }, now)
   }
-  return { chains: journal.page().map(chain => behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) })),
+  return { chains: journal.page().map(chain => behaviorChainSummary(chain, journal, { at: journal.reconciliationAt(chain) })),
     attention: behaviorChainAttention(journal, now), next: null, runtime: [],
     cutover: { mode: 'v2', sequence: 0, legacyPulls: [], blockers: [], support: { status: 'supported', error: null } } }
 }

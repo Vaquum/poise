@@ -10,7 +10,7 @@ import { nativeChainOperations } from '../server/behavior-chain-native'
 import { behaviorChainSummary } from '../server/behavior-chain-summary'
 import { setProcessFailureObserver } from '../server/process'
 import type { Organization } from '../server/organizations'
-import { historicalEvents, historicalJournals } from './fixtures/behavior-chain-journal'
+import { historicalEvents, historicalJournals, resumedWaitJournal } from './fixtures/behavior-chain-journal'
 
 const TARGET = 'historical/repo#7'
 const opened: Database.Database[] = []
@@ -148,7 +148,7 @@ else { process.stderr.write('Forbidden fixture operation: ' + op); process.exit(
   expect(launch).toHaveBeenCalledTimes(1)
   expect(journal.read('historical/repo#8')?.invocations[0]).toMatchObject({ state: 'uncertain',
     outcome: expect.stringContaining('without a durable Call receipt') })
-  expect(behaviorChainSummary(absent).invocations[0].evidence?.publicationPlan).toEqual(condition)
+  expect(behaviorChainSummary(absent, journal).invocations[0].evidence?.publicationPlan).toEqual(condition)
 
   for (const [mode, message, observed] of [
     ['database', 'Command failed (1)', true], ['wrong-exit', 'Command failed (2)', true],
@@ -256,6 +256,23 @@ it.each(['unchanged', 'findings', 'head', 'execution-budget'])('requires Resume 
   expect(reopened.journal.read(TARGET)!.invocations).toHaveLength(4)
   expect(launches[0].request.context).toEqual({ head: observation.pull!.head, reviewRevision: observation.pull!.reviewRevision })
   expect(launches[0].basis === first.basis).toBe(changed === 'unchanged' || exhausted)
+})
+
+it('replays a pre-change Resume without exposing its retained wait or changing immutable hashes', () => {
+  const { db, journal } = database()
+  const { hashes, events } = resumedWaitJournal
+  retain(db, hashes, events)
+  const original = authority(db)
+  journal.rebuild()
+  const current = journal.read(TARGET)!
+  expect(current).toMatchObject({ held: null, resumedAfterSequence: 4, waiting: expect.stringContaining('explicitly Resume') })
+  expect(chainBasis(current)).toBe(hashes.at(-1))
+  expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+  const restarted = new BehaviorChainJournal(db)
+  restarted.rebuild()
+  expect(restarted.read(TARGET)).toEqual(current)
+  expect(behaviorChainSummary(restarted.read(TARGET)!, restarted).waiting).toBeNull()
+  expect(authority(db)).toEqual(original)
 })
 
 describe.each(historicalJournals)('journal compatibility from $revision', ({ hashes, reservationPresent }) => {

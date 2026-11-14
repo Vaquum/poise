@@ -106,6 +106,28 @@ it('does not let an earlier successful rollup hide a later same-head failing che
   expect(reply.rows[0]).toMatchObject({ ci: { state: 'FAILURE' }, blocker: { id: 'ci_failing' } })
 })
 
+it('omits a pre-Resume wait from PR status without hiding fresh waits or review and admission gates', async () => {
+  const { runtime, journal, chain, obs, status } = await setup()
+  const reason = 'Old blocker; explicitly Resume. Report https://github.com/example/repo/issues/99'
+  Object.assign(obs.pull!, { pending: false, checksState: 'SUCCESS' })
+  let current = record(journal, chain, { type: 'chain.observed', observation: obs })
+  current = record(journal, current, { type: 'chain.waiting', reason })
+  current = record(journal, current, { type: 'chain.held', reason: 'automatic hold' })
+  current = record(journal, current, { type: 'chain.resumed' })
+  const read = async () => (await status.readPrStatus(50)).rows[0]
+  const resumed = await read()
+  expect(resumed.blocker.id).toBe('awaiting_review')
+  expect(resumed.blocker.details).not.toContain(reason)
+  current = record(journal, current, { type: 'chain.observed', observation: { ...obs, checkedAt: Date.now() } })
+  expect((await read()).blocker).toEqual(resumed.blocker)
+  current = record(journal, current, { type: 'chain.waiting', reason })
+  expect((await read()).blocker).toMatchObject({ id: 'blocked', line: `v2 waiting: ${reason}` })
+  expect((await read()).blocker.details).toContain(reason)
+  runtime.setEnabled('review-new-prs', false)
+  expect((await read()).blocker.line).toContain('review-new-prs is disabled')
+  expect(journal.read(chain.id)).toEqual(current)
+})
+
 it.each(['stale', 'future'])('keeps %s observations unknown instead of reporting zero completed reviews or green CI', async (kind) => {
   const { status, obs } = await setup()
   const now = kind === 'stale' ? obs.checkedAt + 121_000 : obs.checkedAt - 1
@@ -163,7 +185,7 @@ it.each(['merged', 'closed-pr', 'closed-seed'] as const)('distinguishes immediat
   const before = journal.history(chain.id)
   expect(journal.reconcilable('', now, false).map(row => row.id)).toContain(chain.id)
   expect(journal.reconciliationAt(current)).toBeNull()
-  expect(behaviorChainSummary(current, { at: journal.reconciliationAt(current) }).reconciliation).toMatchObject({
+  expect(behaviorChainSummary(current, journal, { at: journal.reconciliationAt(current) }).reconciliation).toMatchObject({
     nextObservationAt: null, waitingForOriginalResponse: false, waitingForResourceRelease: true })
   const reply = await status.readPrStatus(50, now)
   expect(reply.health.status).toBe('ok')
@@ -184,7 +206,7 @@ it.each(['review-pr', 'approve-pr'] as const)('keeps open-PR %s observation elig
   current = record(journal, current, { type: 'chain.observed', observation: obs })
   const before = journal.history(chain.id)
   expect(journal.reconciliationAt(current)).toBe(0)
-  expect(behaviorChainSummary(current, { at: 0 }).reconciliation).toEqual({ nextObservationAt: 0, waitingForOriginalResponse: false })
+  expect(behaviorChainSummary(current, journal, { at: 0 }).reconciliation).toEqual({ nextObservationAt: 0, waitingForOriginalResponse: false })
   expect(journal.reconcilable('', Date.now(), false).map(row => row.id)).toContain(chain.id)
   expect(journal.liveModelInvocationCount()).toBe(1)
   expect(journal.history(chain.id)).toEqual(before)
@@ -298,7 +320,7 @@ it.each(['enqueued', 'in_queue'] as const)('distinguishes the original %s respon
   const row = (await status.readPrStatus(50)).rows[0]
   expect(row.queue).toMatchObject({ state: 'queued', attribution: outcome === 'enqueued' ? 'accepted-response' : 'observed' })
   expect(row.blocker.line).toContain(outcome === 'enqueued' ? 'enqueue accepted' : 'enqueue mutation is not attributed')
-  const summary = behaviorChainSummary(current)
+  const summary = behaviorChainSummary(current, journal)
   expect(summary.invocations[0].nativeAction).toMatchObject({
     attribution: outcome === 'enqueued' ? 'accepted-response' : 'observed-no-action', queueEntryId: 'real-entry',
   })
@@ -344,7 +366,7 @@ it('preserves the original enqueue attribution after a later no-action observati
   record(journal, current, { type: 'chain.observed', observation: obs })
   const row = (await status.readPrStatus(50)).rows[0]
   expect(row.queue).toMatchObject({ state: 'queued', entryId: 'original-entry', attribution: 'accepted-response', invocationId: 'queue-enqueued' })
-  expect(behaviorChainSummary(current).invocations[1].nativeAction?.attribution).toBe('observed-no-action')
+  expect(behaviorChainSummary(current, journal).invocations[1].nativeAction?.attribution).toBe('observed-no-action')
 })
 
 it('keeps a paused chain and a legacy PR under their respective status rules', async () => {

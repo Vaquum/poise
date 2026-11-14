@@ -3,8 +3,8 @@ import { afterAll, beforeEach, expect, it, vi } from 'vitest'
 import { db, getMeta, setMeta, closeDatabase } from '../server/db'
 import { behaviorChainJournal } from '../server/behavior-chain-journal'
 import type { BehaviorChain, ChainEvent } from '../server/behavior-chain-store'
-import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
+import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 import { chainSummaryFixture, mergedReviewFixture, type MergedReviewCase } from './fixtures/behavior-chain-summary'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
 import { parseProcessDiagnostic } from '../server/process-diagnostic'
@@ -142,7 +142,7 @@ it('projects confirmed merges without obsolete queue waits while retaining origi
     expect(eventWords(legacyPage.events.at(-1)!, new Map()).text).toBe('Merged')
     const canonical = journal.read(pending.id)!
     expect(canonical).toEqual(pending)
-    expect(detail.chain).toEqual(behaviorChainSummary(canonical, { at: journal.reconciliationAt(canonical) }))
+    expect(detail.chain).toEqual(behaviorChainSummary(canonical, journal, { at: journal.reconciliationAt(canonical) }))
     for (const operation of ['hold', 'resume']) {
       const response = await fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: pending.id, sequence: pending.sequence, operation }) })
@@ -196,6 +196,77 @@ it('preserves exact-sequence Hold and Resume for unmerged ownership', async () =
     expect(resume.status).toBe(200)
     expect((await resume.json()).chain.held).toBeNull()
     expect(journal.read(chain.id)?.invocations).toEqual([])
+  } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+})
+
+it.each([false, true])('projects a resumed wait as history while preserving original native ownership (uncertain=%s)', async uncertain => {
+  const journal = behaviorChainJournal()
+  const issue = uncertain ? 1705 : 1704
+  const reason = 'Worker sandbox Python blocker; explicitly Resume. Report https://github.com/api/repo/issues/99'
+  let chain = journal.append(`api/repo#${issue}`, `resume-seed-${issue}`, 0, { type: 'chain.admitted', repository: 'api/repo', issue,
+    branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' })
+  const record = (event: ChainEvent) => { chain = journal.append(chain.id, `${chain.id}:${chain.sequence}`, chain.sequence, event) }
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const observation: ChainObservation = { checkedAt: Date.now(), existingPulls: [], pull: null,
+    issue: { open: true, eligible: true, revision: 'seed', commentIds: [] }, issueReviewers: [], prReviewers: [],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }
+  record({ type: 'chain.observed', observation })
+  const invocation = { id: `original-resume-${issue}`, behavior: 'implement-issue' as const, actor: chain.author,
+    model: 'fixture', slot: 'primary', basis: 'seed', admittedAt: Date.now(), reservation: { memoryBytes: 6, diskBytes: 3 },
+    request: { command: 'agent-interface' as const, cwd: '/fixture', argv: [], nativeResources: 2 as const } }
+  record({ type: 'invocation.admitted', invocation })
+  if (uncertain) record({ type: 'invocation.uncertain', invocationId: invocation.id, reason: 'original Call and resource release remain unverified' })
+  else record({ type: 'invocation.settled', invocationId: invocation.id, callId: 'a'.repeat(32), outcome: 'preflight_failed',
+    evidence: { status: 'failed', action: 'not_started', resources_settled_at: new Date().toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] } } })
+  record({ type: 'chain.held', reason: 'automatic implementation hold' })
+  record({ type: 'chain.waiting', reason })
+  const original = journal.history(chain.id)
+  const invocations = structuredClone(chain.invocations)
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  const post = (body: unknown) => fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  try {
+    await post({})
+    const held = await (await fetch(base)).json()
+    expect(held.chains.find((item: { id: string }) => item.id === chain.id).waiting).toBe(reason)
+    const response = await post({ id: chain.id, sequence: chain.sequence, operation: 'resume' })
+    expect(response.status).toBe(200)
+    const resumed = await response.json()
+    expect(resumed.chain).toMatchObject({ held: null, waiting: null, invocationCount: 1 })
+    const list = await (await fetch(base)).json()
+    const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
+    expect(list.chains.find((item: { id: string }) => item.id === chain.id)).toEqual(resumed.chain)
+    expect(detail.chain).toEqual(resumed.chain)
+    expect(detail.events).toContainEqual(expect.objectContaining({ type: 'chain.waiting', reason }))
+    expect(taskState(readJournalPage(detail).chain!).state).toBe(uncertain ? 'blocked' : 'idle')
+    if (uncertain) {
+      expect(taskState(readJournalPage(detail).chain!).reason).toContain('original Call and resource release')
+      expect(list.attention.find((item: { id: string }) => item.id === chain.id)).toMatchObject({
+        nextAction: 'Reconcile the original invocation receipt before any retry' })
+    }
+    chain = journal.read(chain.id)!
+    expect(chain.waiting).toBe(reason)
+    expect(chain.invocations).toEqual(invocations)
+    const boundary = chain.resumedAfterSequence
+    record({ type: 'chain.observed', observation: { ...observation, checkedAt: Date.now() } })
+    expect((await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()).chain.waiting).toBeNull()
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(chain)
+    expect(journal.history(chain.id).slice(0, original.length)).toEqual(original)
+    if (uncertain) {
+      expect(decideBehaviorChain(chain, observation, Date.now())).toMatchObject({ kind: 'wait', reason: expect.stringContaining('native outcome must settle first') })
+      expect(journal.admitInvocation(chain, `replacement-${issue}`, { ...invocation, id: `replacement-${issue}` }, 3)).toBeNull()
+      expect(journal.reservedResources().memoryBytes).toBeGreaterThanOrEqual(6)
+      expect(journal.read(chain.id)!.invocations).toEqual(invocations)
+    }
+    record({ type: 'chain.waiting', reason })
+    expect(chain.sequence).toBeGreaterThan(boundary)
+    expect((await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()).chain.waiting).toBe(reason)
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })
 
@@ -389,7 +460,7 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
       expect(all.chains).toContainEqual(expect.objectContaining({ id: chain.id, mergeSha: null, reviewStatus: 'not-recorded' }))
       expect(merged.chains.map((row: { id: string }) => row.id)).not.toContain(chain.id)
       const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
-      expect(detail.chain).toEqual(behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) }))
+      expect(detail.chain).toEqual(behaviorChainSummary(chain, journal, { at: journal.reconciliationAt(chain) }))
       expect(detail.events.map((event: { type: string }) => event.type)).toEqual(before[index].map(row => JSON.parse(row.payload).type))
       expect(journal.read(chain.id)).toEqual(chain)
       expect(journal.history(chain.id)).toEqual(before[index])

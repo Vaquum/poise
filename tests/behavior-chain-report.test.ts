@@ -1004,7 +1004,7 @@ it('keeps the implementation blocker and dated report disposition between ordina
     const current = journal.read(chain.id)!
     expect(current).toMatchObject({ held: original.held, invocations: original.invocations,
       resumedAfterSequence: original.resumedAfterSequence, author: original.author, reviewer: original.reviewer, branch: original.branch })
-    const summary = behaviorChainSummary(current, { at: journal.reconciliationAt(current) })
+    const summary = behaviorChainSummary(current, journal, { at: journal.reconciliationAt(current) })
     expect(summary.waiting?.startsWith(prefix)).toBe(true)
     expect(reports(db)).toEqual(intent)
     expect(posts()).toHaveLength(1)
@@ -1054,6 +1054,43 @@ it('keeps the implementation blocker and dated report disposition between ordina
   expect(closed.waiting).toContain(`Historical Implementation hold report ${report.html_url} (last verified ${new Date(next).toISOString()}; not live status) is closed; no replacement will be created`)
   expect(closed.waiting).not.toContain('admitted as')
   expect(closed.waiting).not.toContain('remediation is held')
+  expect(remote).toEqual([{ ...report, state: 'closed' }])
+
+  const beforeResume = journal.history(chain.id)
+  let resumed = record(journal, journal.read(chain.id)!, { type: 'chain.resumed', recovery: { origin: 'operator' } })
+  const boundary = resumed.resumedAfterSequence
+  expect(behaviorChainSummary(resumed, journal)).toMatchObject({ held: null, waiting: null, invocations: closed.invocations })
+  expect(resumed.waiting).toBe(closed.waiting)
+  expect(behaviorChainWorkImpact(journal, call.id, call.correlation_id!)?.nextAction)
+    .toBe('Await the next observation or admission under existing gates')
+  resumed = record(journal, resumed, { type: 'chain.observed', observation: { ...fresh, checkedAt: Date.now() } })
+  expect(behaviorChainSummary(resumed, journal).waiting).toBeNull()
+  const retained = journal.history(chain.id)
+  journal.rebuild()
+  expect(journal.read(chain.id)).toEqual(resumed)
+  expect(journal.history(chain.id)).toEqual(retained)
+  expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBeNull()
+  expect(retained.slice(0, beforeResume.length)).toEqual(beforeResume)
+
+  resumed = record(journal, resumed, { type: 'chain.waiting', reason: closed.waiting! })
+  expect(behaviorChainSummary(resumed, journal).waiting).toBe(closed.waiting)
+  expect(decideBehaviorChain(resumed, { ...fresh, checkedAt: Date.now() }, Date.now())).toEqual({
+    kind: 'wait', reason: 'GitHub prerequisite evidence is missing' })
+  fresh.prerequisites = { wait: null, base: HEAD, evidence: [] }
+  const launch = vi.fn(async () => true)
+  await new BehaviorChainRuntime(journal, operations(db, journal, {
+    observe, available: () => true, permitted: source => source.id === chain.id,
+    request: async () => ({ command: 'agent-interface', cwd: '/fixture', argv: ['--atomic-work', chain.id, '--model', reviewer.model] }), launch,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }),
+  })).run()
+  const nextAdmission = journal.read(chain.id)!
+  expect(launch).toHaveBeenCalledTimes(1)
+  expect(nextAdmission.invocations).toHaveLength(2)
+  expect(nextAdmission.invocations[0]).toEqual(original.invocations[0])
+  expect(nextAdmission.invocations[1].admissionSequence).toBeGreaterThan(boundary)
+  expect(behaviorChainSummary(nextAdmission, journal).waiting).toBeNull()
+  expect(reports(db)).toEqual(intent)
+  expect(posts()).toHaveLength(1)
   expect(remote).toEqual([{ ...report, state: 'closed' }])
 })
 

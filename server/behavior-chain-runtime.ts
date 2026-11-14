@@ -257,6 +257,25 @@ export class BehaviorChainRuntime {
     }
   }
 
+  /** Resume retains waiting in hashed reducer state; a still-blocking reason
+   * starts a new wait episode on the first sweep that reaches it after Resume,
+   * even when an observation-only sweep (such as a capacity-fairness deferral)
+   * intervened. Later sweeps deduplicate against the fresh event. */
+  private renewsWait(chain: BehaviorChain, reason: string): boolean {
+    if (chain.waiting !== reason) return true
+    if (chain.resumedAfterSequence <= 0) return false
+    let after = chain.resumedAfterSequence
+    while (true) {
+      const events = this.journal.history(chain.id, after)
+      for (const row of events) {
+        const event = JSON.parse(row.payload) as ChainEvent
+        if (event.type === 'chain.waiting' && event.reason === reason) return false
+      }
+      if (events.length < 100) return true
+      after = events.at(-1)!.sequence
+    }
+  }
+
   /** Durable-budget wait reason for one more reservation, or null when the
    *  budget holds it. Unknown ownership never reads as free. */
   private resourceWaitReason(resources: BehaviorResourceAdmission): string | null {
@@ -557,18 +576,18 @@ export class BehaviorChainRuntime {
                 if (resources) {
                   const exhausted = this.resourceWaitReason(resources)
                   if (exhausted) {
-                    if (chain.waiting !== exhausted) this.append(chain, { type: 'chain.waiting', reason: exhausted })
+                    if (this.renewsWait(chain, exhausted)) this.append(chain, { type: 'chain.waiting', reason: exhausted })
                     continue
                   }
                   try {
                     const cramped = headroomShortfall((this.operations.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)
                     if (cramped) {
-                      if (chain.waiting !== cramped) this.append(chain, { type: 'chain.waiting', reason: cramped })
+                      if (this.renewsWait(chain, cramped)) this.append(chain, { type: 'chain.waiting', reason: cramped })
                       continue
                     }
                   } catch (error) {
                     const reason = error instanceof Error ? error.message : String(error)
-                    if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                    if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
                     continue
                   }
                 }
@@ -598,14 +617,12 @@ export class BehaviorChainRuntime {
                   if (firstWait !== undefined && Date.now() - firstWait > DATASTORE_MAX_AGE_SECONDS * 1000) {
                     throw new Error(`${error.message}; indexing delay exceeds ${DATASTORE_MAX_AGE_SECONDS} seconds`)
                   }
-                  if (chain.waiting !== error.message) this.append(chain, { type: 'chain.waiting', reason: error.message })
+                  if (this.renewsWait(chain, error.message)) this.append(chain, { type: 'chain.waiting', reason: error.message })
                   continue
                 }
                 if (!request) {
                   const reason = `${decision.behavior} is waiting for native provider backoff`
-                  // Resume retains waiting; its first observed sweep starts a new episode.
-                  if (chain.waiting !== reason || (chain.resumedAfterSequence > 0
-                    && this.journal.history(chain.id, chain.resumedAfterSequence, 1)[0]?.sequence === chain.sequence)) {
+                  if (this.renewsWait(chain, reason)) {
                     this.append(chain, { type: 'chain.waiting', reason })
                   }
                   continue
@@ -675,7 +692,7 @@ export class BehaviorChainRuntime {
               } else {
                 const reason = decision.kind === 'wait' ? decision.reason : !this.operations.enabled() ? 'behavior chain admissions are paused'
                   : `${decision.behavior} is disabled or held by its behavior controls`
-                if (reason !== chain.waiting) this.append(chain, { type: 'chain.waiting', reason })
+                if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
               }
             } catch (error) {
               if (!(error instanceof BehaviorChainRevisionConflict)) throw error

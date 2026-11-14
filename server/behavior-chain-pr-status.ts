@@ -1,12 +1,12 @@
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
-import { chainBasis, type BehaviorChain, type ChainInvocation } from './behavior-chain-store'
+import { chainBasis, type BehaviorChain, type BehaviorChainJournal, type ChainInvocation } from './behavior-chain-store'
 import { attributedNativeAction, matchingNativeActionReceipt, type NativeActionReceipt } from './behavior-chain-action'
-import { chainWaitsForResourceRelease } from './behavior-chain-summary'
+import { chainWaitsForResourceRelease, currentChainWaiting } from './behavior-chain-summary'
 import type { PrBlockerId, PrStatusRow, PrStatusVerdict } from './behavior-pr-status'
 import type { DatastorePr } from './behaviors'
 
 /** Presentation only: no observation collection, admission or effect. */
-export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org: string | null, now: number, enabled: boolean,
+export function projectChainPrStatus(chain: BehaviorChain, journal: BehaviorChainJournal, pr: DatastorePr, org: string | null, now: number, enabled: boolean,
   pauses: string[] = [], eligibility: PrStatusRow['eligibility'] = { refusal: null, skippedBy: [] }, recheckAt?: number | null) {
   const preview = (text: string) => text.length <= 1024 ? text : `${text.slice(0, 1023)}…`
   const observation = chain.observation as ChainObservation | null
@@ -14,6 +14,7 @@ export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org:
   const fresh = !!pull && !!observation && Number.isFinite(observation.checkedAt)
     && observation.checkedAt <= now && now - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
   const active = chain.invocations.find((invocation) => invocation.state !== 'settled')
+  const waiting = currentChainWaiting(journal, chain)
   const waitingForResourceRelease = chainWaitsForResourceRelease(chain)
   const ownedWorking = !!active && active.model !== null && active.state !== 'uncertain' && !active.evidence?.resources_settled_at
   const scheduled = recheckAt !== undefined && !!(chain.held || chain.mergeSha || chain.supersession || waitingForResourceRelease) && (recheckAt === null || recheckAt > now)
@@ -89,7 +90,7 @@ export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org:
   else if (pull!.behind) set('behind', 'v2 native policy requires a base update', `behind:${pull!.head}`)
   else if (pull!.changesRequested) set('awaiting_author', 'v2 current-head review findings require repair', `review:${pull!.head}:${pull!.reviewRevision}`)
   else if (pull!.unresolved) set('unresolved_threads', `v2 ${pull!.unresolved} review conversations remain unresolved`, `threads:${pull!.head}:${pull!.unresolved}`)
-  else if (chain.waiting) set('blocked', `v2 waiting: ${chain.waiting}`, `waiting:${chain.waiting}`)
+  else if (waiting) set('blocked', `v2 waiting: ${waiting}`, `waiting:${waiting}`)
   else if (!pull!.approved || !reviews.length) set('awaiting_review', 'v2 waiting for a qualifying current-head review and approval', `review:${pull!.head}`)
   else if (pull!.ready) set('approved_not_enqueued', 'v2 native readiness is green; awaiting the next chain invocation', `ready:${pull!.head}`)
   else set('blocked', `v2 readiness blocked: ${pull!.readinessBlockers?.join(', ') || 'awaiting verified native readiness'}`, `readiness:${pull!.head}`)
@@ -114,7 +115,7 @@ export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org:
         ...(active ? [`Original invocation ${active.id} admitted ${Math.max(0, Math.floor((now - active.admittedAt) / 60_000))} minute(s) ago`] : []),
         ...(active?.outcome ? [active.outcome] : []), ...(chain.held ? [chain.held] : []),
         ...pauses, ...(eligibility.refusal ? [eligibility.refusal] : []),
-        ...(chain.waiting ? [chain.waiting] : []), ...(!fresh ? [waitingForResourceRelease ? 'Original native resource release remains unverified; Caller reconciliation continues while GitHub observation is deferred'
+        ...(waiting ? [waiting] : []), ...(!fresh ? [waitingForResourceRelease ? 'Original native resource release remains unverified; Caller reconciliation continues while GitHub observation is deferred'
           : ownedWorking ? 'GitHub re-observation is skipped while the original native invocation owns its work'
           : scheduled ? recheckAt === null ? 'The original action response is required; GitHub reads cannot settle this invocation'
             : `Original evidence recheck scheduled for ${new Date(recheckAt!).toISOString()}; GitHub facets remain unverified`

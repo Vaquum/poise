@@ -484,7 +484,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       const skippable = phaseKey && (SKIPPABLE_BEHAVIORS as readonly string[]).includes(phaseKey) ? phaseKey as SkippableBehavior : null
       const refusal = skippable && observation?.pull ? scoped(() => pullRequestRefusal(pullRequestPolicy(skippable), chain.repository, pr.number,
         { author: chain.author, status: observation.pull!.state, draft: observation.pull!.draft })) : null
-      const projected = projectChainPrStatus(chain, pr, org, now, chainAdmissionsEnabled, pauses,
+      const projected = projectChainPrStatus(chain, behaviorChainJournal(), pr, org, now, chainAdmissionsEnabled, pauses,
         { refusal, skippedBy: skippable && skips.get(skippable)?.has(pr.repo.toLowerCase()) ? [skippable] : [] },
         behaviorChainJournal().reconciliationAt(chain))
       const tracked = trackBlocker(key, projected.row.blocker.id, projected.key, asOf)

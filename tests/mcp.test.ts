@@ -287,7 +287,12 @@ conn.close()
   const append = (chain: BehaviorChain, event: ChainEvent) => journal.append(chain.id, randomUUID(), chain.sequence, event)
   const admit = (number: number) => journal.append(`acme/repo#${number}`, randomUUID(), 0, { type: 'chain.admitted',
     repository: 'Acme/Repo', issue: number, branch: `poise/issue-${number}`, author: 'author', reviewer: 'reviewer' })
-  const delayed = admit(2)
+  let delayed = admit(2)
+  delayed = append(delayed, { type: 'invocation.admitted', invocation: { id: 'failed-implementation', behavior: 'implement-issue', basis: 'issue',
+    actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 60_000,
+    request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
+  delayed = append(delayed, { type: 'invocation.settled', invocationId: 'failed-implementation', callId: 'd'.repeat(32), outcome: 'preflight_failed',
+    evidence: { status: 'failed', action: 'not_started' } })
   append(delayed, { type: 'chain.waiting', reason: 'Model capacity is reserved by existing work' })
   for (const number of [3, 4]) {
     let chain = admit(number)
@@ -400,6 +405,18 @@ conn.close()
     expect(reads.mock.calls.map(call => call[0])).toEqual(['acme/repo#1', 'acme/repo#2'])
     expect(pages).not.toHaveBeenCalled()
     expect(receipts.mock.calls.map(call => call[0])).toEqual([1, 2].map(number => ({ operation: 'list', repository: 'Acme/Repo', number, limit: 5 })))
+    let resumed = append(journal.read(delayed.id)!, { type: 'chain.held', reason: 'implementation hold' })
+    resumed = append(resumed, { type: 'chain.resumed' })
+    expect((await work({ repository: 'acme/repo', issue: 2 })).items[0]).toMatchObject({ stage: 'waiting', blocker: null })
+    resumed = append(resumed, { type: 'chain.observed', observation: { checkedAt: Date.now() } })
+    const resumedHistory = journal.history(resumed.id)
+    journal.rebuild()
+    expect((await work({ repository: 'acme/repo', issue: 2 })).items[0]).toMatchObject({ stage: 'waiting', blocker: null })
+    expect(journal.history(resumed.id)).toEqual(resumedHistory)
+    expect(journal.read(resumed.id)!.waiting).toBe('Model capacity is reserved by existing work')
+    append(resumed, { type: 'chain.waiting', reason: 'Model capacity is reserved by existing work' })
+    expect((await work({ repository: 'acme/repo', issue: 2 })).items[0]).toMatchObject({
+      stage: 'delayed', blocker: 'Model capacity is reserved by existing work' })
     run.mockClear(); reads.mockClear(); receipts.mockClear()
     const second = await work({ repository: 'acme/repo', label: 'poise', limit: 2, cursor: first.nextCursor })
     expect(second.items.map(item => [item.issue, item.stage, item.reviewStatus, item.mergeSha])).toEqual([

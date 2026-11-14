@@ -105,6 +105,12 @@ remains eligible; this fence does not change manual Chat binding controls.
 
 Settings → Behaviors contains the chain preference fields, their save/reload actions and the guarded Switch to v2 or Cancel cutover action while applicable. Operational output lives in Observe → Tasks: cutover state and legacy ownership, capacity, the chain list and per-chain journal. The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. Hold/Resume retains the current journal sequence check. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while Tasks is open. Unavailable reads disable writes instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
+After Resume, a wait recorded before its journal boundary is history rather than
+current status. Until a new wait or invocation, Tasks awaits the next observation;
+observation-only events cannot revive the old wait. A fresh wait with identical
+text is current. The original blocker and linked report remain in History, and
+original Call/resource blockers and review/admission gates still apply.
+
 Tasks shows workspace-wide occupied model slots and the subset retained for
 uncertain invocations awaiting original resource evidence, independent of list
 pages and organization filters. The capacity response's nullable
