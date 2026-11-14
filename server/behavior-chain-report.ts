@@ -524,6 +524,10 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
   allowed: () => boolean): Promise<string | null> {
   const fence = repairReportImplementationFence(db, chain, 'implement-issue')
   if (fence) {
+    // Pending review work and started work must still settle through the
+    // runtime's receipt-only recovery; only unstarted ordinary implementation stays fenced.
+    if (chain.invocations.some(invocation => invocation.state !== 'settled'
+      && (invocation.state !== 'admitted' || invocation.behavior === 'review-issue'))) return null
     const decision = decideBehaviorChain(chain, observation, Date.now())
     return decision.kind === 'invoke' && decision.behavior === 'review-issue' ? null : fence
   }

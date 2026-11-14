@@ -383,6 +383,59 @@ it.each([true, false])('requires an actionable native review diagnosis for a rep
   expect(journal.read('acme/repo#99')!.waiting).toContain('ordinary report implementation is fenced')
 })
 
+it('recovers a failed report review after its verified diagnosis to admit the source repair', async () => {
+  const { db, journal } = setup()
+  let source = exhausted(journal, BUDGET_ERRORS, 7, 21, BUDGET_CODE, true)
+  fresh = observation()
+  fresh.pull!.conflict = true
+  source = record(journal, source, { type: 'chain.observed', observation: { ...fresh, checkedAt: NOW - 120_000 } })
+  await operations(db, journal).reportHold!(source)
+  let diagnostic = journal.append('acme/repo#99', 'diagnostic-seed', 0, { type: 'chain.admitted', repository: source.repository,
+    issue: 99, branch: 'poise/issue-99', author: source.author, reviewer: source.reviewer }, NOW - 60_000)
+  const reportObservation = unpublished()
+  const callId = 'd'.repeat(32)
+  const text = (`TS2352 at tests/behavior-chain-action-recovery.test.ts:397: context_sha is missing. PR #21 head ${HEAD}. `
+    + 'Retain context_sha in the typed response when adding coverage; the faulty test exists only on the source PR branch.')
+  priorComments = [{ id: 123, author: source.reviewer, body: `${text}\n<!-- agent-interface issue-review call=${callId} -->` }]
+  reportObservation.issue.commentIds = [123]
+  reportObservation.reviewPublication = { callId, complete: true, issueRevision: reportObservation.issue.revision,
+    receipts: [{ issue: diagnostic.id, comment_id: 123, author: source.reviewer, url: null }] }
+  diagnostic = record(journal, diagnostic, { type: 'chain.observed', observation: { ...reportObservation, checkedAt: NOW - 600_000 } })
+  diagnostic = record(journal, diagnostic, { type: 'invocation.admitted', invocation: {
+    id: 'diagnosis', behavior: 'review-issue', basis: chainBasis(['issue', reportObservation.issue.revision]),
+    actor: source.reviewer, model: reviewer.model, slot: reviewer.slot, admittedAt: NOW - 60_000,
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--issue-review', diagnostic.id,
+      '--expected-issue-revision', reportObservation.issue.revision] } } })
+  diagnostic = record(journal, diagnostic, { type: 'invocation.reconciled', invocationId: 'diagnosis', evidence: {
+    status: 'failed', action: 'not_started', outcome: 'preflight_failed', error: 'native failure', callId,
+    artifact: { phase: 'posting_issue_reviews', plan_sha: 'e'.repeat(64) },
+    resources_settled_at: new Date(NOW - 20_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] },
+    completedAt: NOW - 30_000 } })
+  diagnostic = record(journal, diagnostic, { type: 'invocation.uncertain', invocationId: 'diagnosis',
+    reason: 'native publication may have happened; reconcile the original invocation against GitHub' })
+  const native = nativeChainOperations({ login: 'acme' } as Organization, {
+    roster: async () => fresh, resolve: async () => reviewer, prepare: async () => ({}), borrow: () => null,
+    available: () => true, capacity: () => 3, permitted: () => true, note: () => 'original seed instructions', severity: () => 'p2',
+    received: () => {}, reviews: async () => '', existing: async () => new Set(), wake: () => {},
+  })
+  const observe = async (chain: BehaviorChain) => chain.issue === source.issue
+    ? { ...fresh, checkedAt: Date.now() } : { ...reportObservation, checkedAt: Date.now() }
+  const recoverReport = (chain: BehaviorChain, obs: ChainObservation) => recoverReportedRepair(db, journal, chain, obs, observe, () => true)
+  const launch = vi.fn(async () => true)
+  const ops = operations(db, journal, { discover: async () => [], observe, recoverReport, available: () => true,
+    permitted: (chain, decision) => !repairReportImplementationFence(db, chain, decision.behavior), request: native.request, launch })
+  const runtime = new BehaviorChainRuntime(journal, ops)
+  await runtime.run()
+  expect(journal.read(diagnostic.id)!.invocations[0]).toMatchObject({ state: 'settled', callId,
+    evidence: { status: 'completed', action: 'commented' } })
+  await runtime.run()
+  const current = journal.read(source.id)!
+  expect(launch).toHaveBeenCalledTimes(1)
+  expect(current.invocations).toHaveLength(4)
+  expect(current.repairRecovery).toMatchObject({ report: 99, head: HEAD })
+  expect(journal.read(diagnostic.id)!.waiting).toContain('ordinary report implementation is fenced')
+})
+
 it('hands the #1669 branch-only diagnosis to the original exact-head repair, then retains normal review and CI gates', async () => {
   const { db, journal, source, diagnostic, ops, launch } = await diagnosedRepair()
   const originals = source.invocations
