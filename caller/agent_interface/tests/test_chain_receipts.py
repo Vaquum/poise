@@ -127,14 +127,48 @@ class ManagedReceipts(TestCase):
 
     def test_publication_helper_refuses_foreign_scope_parent_or_remaining_worker(self):
         self.active_publication()
-        for parent, namespace, pids in ((9, "pid:[91]", [1, 2, 3]), (2, "pid:[92]", [1, 2, 3]), (2, "pid:[91]", [1, 2, 3, 4])):
-            scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=lambda: {"pids": pids})
+        for helper, parent, namespace, pids, reason in (
+                (2, 2, "pid:[91]", [1, 2], "helper_pid"),
+                (3, 9, "pid:[91]", [1, 2, 3], "helper_parent"),
+                (3, 2, "pid:[92]", [1, 2, 3], "helper_namespace"),
+                (3, 2, "pid:[91]", [1, 3], "namespace_members"),
+                (3, 2, "pid:[91]", [1, 2, 3, 4], "namespace_busy")):
+            scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(return_value={"pids": pids}))
             with self.subTest(parent=parent, namespace=namespace, pids=pids), \
                     patch.object(native_namespace, "active", return_value=None), \
                     patch.object(resource_ownership, "original_scope", return_value=scope), \
-                    patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=parent), \
-                    patch.object(os, "readlink", return_value=namespace), self.assertRaises(RuntimeError):
+                    patch.object(os, "getpid", return_value=helper), patch.object(os, "getppid", return_value=parent), \
+                    patch.object(os, "readlink", return_value=namespace), \
+                    patch.object(review_receipt.time, "monotonic", side_effect=[0, 0, 0, 0, 2]), \
+                    self.assertRaisesRegex(RuntimeError, reason):
                 review_receipt.work_publication(HEAD, start_replies=True)
+            if reason.startswith("helper_"):
+                scope.read.assert_not_called()
+        self.assertFalse(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
+
+    def test_executed_helper_waits_only_for_extra_members_with_reads_bounded_by_remaining_time(self):
+        self.active_publication()
+        scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(side_effect=[
+            {"pids": [1, 2, 3, 4]}, {"pids": [1, 2, 3]}]))
+        with patch.object(native_namespace, "active", return_value=None), \
+                patch.object(resource_ownership, "original_scope", return_value=scope), \
+                patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=2), \
+                patch.object(os, "readlink", return_value="pid:[91]"), \
+                patch.object(review_receipt.time, "monotonic", side_effect=[0, 0.2, 0.25, 0.3, 0.4, 0.5]):
+            review_receipt.work_publication(HEAD, start_replies=True)
+        self.assertEqual([read.kwargs["timeout_seconds"] for read in scope.read.call_args_list], [1.8, 1.6])
+        self.assertTrue(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
+
+    def test_executed_helper_rejects_idle_evidence_arriving_after_the_settlement_deadline(self):
+        self.active_publication()
+        scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(return_value={"pids": [1, 2, 3]}))
+        with patch.object(native_namespace, "active", return_value=None), \
+                patch.object(resource_ownership, "original_scope", return_value=scope), \
+                patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=2), \
+                patch.object(os, "readlink", return_value="pid:[91]"), \
+                patch.object(review_receipt.time, "monotonic", side_effect=[0, 0, 2.1]), \
+                self.assertRaisesRegex(RuntimeError, "namespace_read_timeout"):
+            review_receipt.work_publication(HEAD, start_replies=True)
         self.assertFalse(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
 
     def test_unacknowledged_issue_comment_is_never_reclassified_as_no_write(self):

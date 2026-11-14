@@ -979,7 +979,8 @@ it('revalidates the retained original test evidence in the bounded seed observat
     return { stdout: JSON.stringify({ repository: chain.repository, issue_number: 7, actor: chain.author, branch: chain.branch,
       issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
       publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null,
-        merged: false, merge_sha: null, base_sha: recovery.base }, test_dependency: returned }) }
+        merged: false, merge_sha: null, base_sha: recovery.base,
+        prerequisites: { repo: chain.repository, number: 7, found: true, complete: true, prerequisites: [] } }, test_dependency: returned }) }
   })
   const native = actionOperations()
   expect(await native.observe(held)).toMatchObject({ testDependency: { invocationId: 'original', verified: true, recovered: true, recovery },
@@ -1006,7 +1007,7 @@ it.each([
   await expect(operations.observe(chain)).rejects.toThrow('belongs to another chain or actor')
 })
 
-it('waits for captured #1100 prerequisites through Caller and native runtime, then launches each unheld dependent once', async () => {
+it('rechecks live prerequisites after awaited preparation despite an unchanged issue and empty mirror, then admits each delivered dependent once', async () => {
   directory = mkdtempSync(join(tmpdir(), 'poise-prerequisites-'))
   const db = new Database(':memory:')
   const journal = new BehaviorChainJournal(db)
@@ -1023,7 +1024,9 @@ it('waits for captured #1100 prerequisites through Caller and native runtime, th
       callId: `review-call-${issue}`, outcome: 'commented', evidence: { status: 'completed', action: 'commented', issue_revision: revision,
         receipts: [{ issue: current.id, comment_id: 3, author: 'reviewer' }] } })
   }
-  let mode = 'open'
+  let mode = 'empty'
+  const mirror = { repo: target, found: true, complete: true, prerequisites: [] }
+  const issue = { title: 'Seed', body: '', state: 'open', labels: [], updated_at: '2026-11-10T00:00:00Z' }
   const running: LogEntry[] = []
   const launch = vi.fn<ChainRuntimeOperations['launch']>(async invocation => {
     running.push({ ...completedReviewCall(target, Number(invocation.request.argv[1].split('#')[1]), HEAD, 'author'),
@@ -1033,15 +1036,27 @@ it('waits for captured #1100 prerequisites through Caller and native runtime, th
     return true
   })
   const reportHold = vi.fn(async () => null)
+  const prepare = vi.fn(async () => ({}))
+  const resolveModel = vi.fn(async () => {
+    // Add the edge while native request() is suspended, without a source edit.
+    await Promise.resolve()
+    if (mode === 'empty') mode = 'open'
+    return reviewer
+  })
+  mocks.runFile.mockClear()
   mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
     if (command === 'github-interface' && argv[0] === '--chain-seed') {
-      const issue = Number(argv[1].slice(1))
-      return { stdout: JSON.stringify({ repository: target, issue_number: issue, actor: 'author', branch: `poise/issue-${issue}`,
-        issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [{ id: 3 }],
+      const number = Number(argv[1].slice(1))
+      const incomplete = ['absent', 'truncated', 'missing-page', 'malformed', 'missing-item'].includes(mode)
+      return { stdout: JSON.stringify({ repository: target, issue_number: number, actor: 'author', branch: `poise/issue-${number}`,
+        issue, comments: [{ id: 3 }],
         publication: { existing_pulls: [], pull_number: null, head_sha: null, base_sha: HEAD,
-          head_invocation: null, state: null, merged: false, merge_sha: null } }) }
+          head_invocation: null, state: null, merged: false, merge_sha: null,
+          ...(mode === 'absent' ? {} : { prerequisites: { repo: target, number, found: mode !== 'missing-item', complete: !incomplete,
+            prerequisites: ['empty', 'cross-repo'].includes(mode) ? [] : [{ repo: target, number: 1100 }] } }) } }) }
     }
-    if (command === 'github-datastore' || command === 'github-interface' && argv[0] === '--read-issue') {
+    if (command === 'github-datastore') return { stdout: JSON.stringify({ ...mirror, number: Number(argv[argv.indexOf('--number') + 1]) }) }
+    if (command === 'github-interface' && argv[0] === '--read-issue') {
       return { stdout: execFileSync('python3', ['tests/fixtures/issue-prerequisites.py'], {
         input: JSON.stringify({ command, argv, mode, db: join(directory, 'capture.sqlite') }), encoding: 'utf8', timeout: 10_000,
         env: { ...process.env, PYTHONPATH: [resolve('caller/github_datastore'), resolve('caller/github_interface'), process.env.PYTHONPATH].filter(Boolean).join(':') },
@@ -1051,7 +1066,7 @@ it('waits for captured #1100 prerequisites through Caller and native runtime, th
   })
   const native = nativeChainOperations({ login: 'autonomio' } as Organization, {
     roster: async () => ({ issueReviewers: [reviewer], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
-    resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
+    resolve: resolveModel, prepare, borrow: () => () => {}, available: () => true,
     capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
     reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
   })
@@ -1068,6 +1083,12 @@ it('waits for captured #1100 prerequisites through Caller and native runtime, th
     }
     expect(launch).not.toHaveBeenCalled()
     expect(reportHold).not.toHaveBeenCalled()
+    expect(resolveModel).toHaveBeenCalledTimes(1)
+    expect(prepare).not.toHaveBeenCalled()
+    expect(journal.read(ids[0])?.observation?.issue).toMatchObject({ revision })
+    expect(issue.updated_at).toBe('2026-11-10T00:00:00Z')
+    expect(mirror).toEqual({ repo: target, found: true, complete: true, prerequisites: [] })
+    expect(mocks.runFile.mock.calls.some(([command]) => command === 'github-datastore')).toBe(false)
     for (const incomplete of ['absent', 'truncated', 'missing-page', 'malformed', 'missing-item']) {
       mode = incomplete
       await expect(runtime.run()).resolves.toBeUndefined()

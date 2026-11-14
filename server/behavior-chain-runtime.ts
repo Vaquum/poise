@@ -635,14 +635,17 @@ export class BehaviorChainRuntime {
                     || fresh.actor !== decision.actor || fresh.reviewer?.slot !== decision.reviewer?.slot) continue
                   if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
                 }
-                if (decision.behavior === 'implement-issue' && chain.testRecovery && !chain.testRecovery.admission) {
+                if (decision.behavior === 'implement-issue') {
                   const fresh = await this.operations.observe(chain)
                   chain = this.append(chain, { type: 'chain.observed', observation: fresh })
-                  if (!recoveredImplementation(chain, fresh, Date.now()) || fresh.prerequisites?.wait !== null) continue
-                  // The recovered decision is stale when a required review no
-                  // longer posts; re-decide on the fresh observation.
+                  if (chain.testRecovery && !chain.testRecovery.admission && !recoveredImplementation(chain, fresh, Date.now())) continue
+                  // Dependencies can change without an issue revision, including
+                  // while request preparation awaited. Retain their ordinary wait.
                   const redecided = decideBehaviorChain(chain, fresh, Date.now())
-                  if (redecided.kind !== 'invoke' || redecided.behavior !== decision.behavior || redecided.basis !== decision.basis) continue
+                  if (redecided.kind !== 'invoke' || redecided.behavior !== decision.behavior || redecided.basis !== decision.basis) {
+                    if (redecided.kind === 'wait' && chain.waiting !== redecided.reason) this.append(chain, { type: 'chain.waiting', reason: redecided.reason })
+                    continue
+                  }
                   if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
                 }
                 phase = 'invocation-admission'

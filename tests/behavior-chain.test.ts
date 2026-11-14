@@ -978,7 +978,7 @@ describe('native admission and recovery', () => {
     completed = true
     await runtime.run()
     expect(launched).toEqual(['review-issue', 'implement-issue'])
-    expect(observations).toBe(2)
+    expect(observations).toBe(3) // Includes the implementation's final admission read.
   })
 
   it('commits authority before launch, coalesces duplicate ticks and rechecks controls after preparation', async () => {

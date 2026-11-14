@@ -34,8 +34,12 @@ whose immutable plan, pushed head, unattempted replies and released worker
 resources are proven. It starts no model and cannot replace that plan.
 Shared baseline CI dependencies use that same atomic repair artifact and the
 existing chain tick ([dependency evidence and recovery](../docs/Behavior-chain.md)).
-Before new implementation, Poise reads `github-datastore view issue-dependencies`
-under the existing freshness gate. For each explicit same-repository prerequisite,
+Before new implementation, Poise reads live `blockedBy` evidence in the existing
+authenticated `--chain-seed` / `--issue-work` GraphQL preflight, bounded to 100
+nodes with a matching total count and complete page. The mirror health gate
+remains required. After awaited request preparation, the same observation and
+decision run again before implementation admission; missing or truncated live
+evidence waits. For each explicit same-repository prerequisite,
 `github-interface --read-issue ISSUE --delivery-base SHA --token-user USER`
 reads its state and linked closing PRs, including closed PRs. It returns
 `verified: true` only for a closed issue with a linked closing PR's merge commit

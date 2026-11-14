@@ -226,10 +226,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       let number = observation.publication.pull_number
       if (number === null && observation.issue.open && !observation.publication.head_sha) {
         await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['implement-issue'])
-        const { stdout } = await runFile('github-datastore', organizationArgs(org,
-          ['view', 'issue-dependencies', '--repo', chain.repository, '--number', String(chain.issue), '--format', 'json']),
-        { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
-        const dependencies = object(JSON.parse(stdout), 'issue prerequisites')
+        const dependencies = object(publication.prerequisites ?? {}, 'live issue prerequisites')
         const base = typeof publication.base_sha === 'string' && /^[0-9a-f]{40}$/.test(publication.base_sha) ? publication.base_sha : null
         const prerequisites: NonNullable<ChainObservation['prerequisites']> = { wait: null, base, evidence: [dependencies] }
         observation.prerequisites = prerequisites
