@@ -984,6 +984,8 @@ An independently authored markerless remedy verified against the source's blocke
 relationship and original failing file and test case retains ordinary intake.
 That path is only for intents the reporter linked as remedies: an issue the
 reporter created stays gated even if its marker is later removed.
+Intents stored before the adoption record verify independence by the
+remedy predating the source hold.
 Through the existing guarded `/api/behavior-chains`
 control, the workspace owner records `source-only` or `distinct-fix`, with a
 diagnosis and next action. Read `GET /api/behavior-chains?id=OWNER/REPO%23N` for

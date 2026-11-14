@@ -136,7 +136,7 @@ export async function reconcileRepairReport(repository: string, marker: string, 
       applied = labels(await request(['api', `repos/${repository}/issues/${issue.number}/labels`, '--method', 'POST', '-f', 'labels[]=poise']))
     }
     return { number: Number(issue.number), url: String(issue.html_url), state: String(issue.state), labels: applied,
-      title: issue.title, body: issue.body }
+      title: issue.title, body: issue.body, created_at: issue.created_at }
   } catch (error) {
     const failure = error as { stderr?: unknown, message?: string }
     const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)

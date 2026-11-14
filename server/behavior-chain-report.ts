@@ -876,6 +876,17 @@ export async function setImplementationReportDisposition(db: Database, journal: 
   }).immediate()
 }
 
+// Scoped intents persisted before the adoption record lack durable creation
+// classification, and a body rewrite can forge markerless remedy evidence.
+// Exemption then requires immutable proof that the linked issue predates
+// its source hold. The reporter files generated reports after the hold;
+// the minute tolerates journal/GitHub clock skew and timestamp rounding.
+function predatesHold(createdAt: unknown, heldAt: number | null): boolean {
+  if (typeof createdAt !== 'string' || typeof heldAt !== 'number' || !Number.isFinite(heldAt)) return false
+  const created = Date.parse(createdAt)
+  return Number.isFinite(created) && created + 60_000 < heldAt
+}
+
 /** Runs at implementation admission even when new report publishing is off. */
 export async function implementationReportAdmission(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, observe: (source: BehaviorChain) => Promise<ChainObservation>) {
@@ -927,13 +938,16 @@ export async function implementationReportAdmission(db: Database, journal: Behav
           const fresh = await observe(source)
           const deps = fresh.prerequisites?.evidence?.[0] as { repo?: unknown, number?: unknown,
             found?: unknown, complete?: unknown, prerequisites?: Array<{ repo?: unknown, number?: unknown }> } | undefined
-          if (issue.state === 'open' && chainBasis([issue.title, issue.body]) === observation.issue.revision
+          const verified = issue.state === 'open' && chainBasis([issue.title, issue.body]) === observation.issue.revision
             && typeof deps?.repo === 'string' && deps.repo.toLowerCase() === source.repository.toLowerCase() && deps.number === source.issue
             && deps.found === true && deps.complete === true && Array.isArray(deps.prerequisites)
             && deps.prerequisites.some(entry => typeof entry?.repo === 'string'
               && entry.repo.toLowerCase() === chain.repository.toLowerCase() && entry.number === chain.issue)
-            && journal.read(source.id)?.sequence === source.sequence) return { reason: null }
-          return { reason: `${wait}: linked remedy source evidence changed` }
+            && journal.read(source.id)?.sequence === source.sequence
+          if (verified && (report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt))) return { reason: null }
+          if (!verified) return { reason: `${wait}: linked remedy source evidence changed` }
+          // A verified pre-record link filed after its hold cannot prove
+          // independent authorship. Fall through to disposition.
         }
       } catch (error) {
         return { reason: `${wait}: verification unavailable: ${behaviorErrorMessage(error instanceof Error ? error.message : String(error), 500)}` }
@@ -1719,7 +1733,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
           && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
           && !body.includes(implementation!.invocation.id) && !body.includes(implementation!.call)
-        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string }> = []
+        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string, created_at: unknown }> = []
         for (const entry of blockedBy) {
           const number = Number((entry as { number: number }).number)
           try {
