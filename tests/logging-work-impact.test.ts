@@ -242,7 +242,7 @@ it('shows only a confirmed same-obligation handoff as Warning through the Loggin
     expect(loggingSeverity(event, impact())).toBe('warning')
     const response = { repository: 'acme/repo', pull_number: 107, head_sha: fixture.head,
       context_sha: fixture.observation.pull!.reviewContext, invocation_id: '7'.repeat(32), reviewer: successor.actor,
-      model: successor.model, completed_at: at + 8000,
+      model: successor.model, completed_at: at + 8000, coverage: 'complete',
       assessment: { verdict: 'The changed validation has no remaining blocking defects.',
         reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
     append({ type: 'invocation.settled', invocationId: successor.id, callId: response.invocation_id, outcome: 'reviewed_clean',

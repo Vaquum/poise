@@ -24,6 +24,7 @@ reads = 0
 assessment = {"verdict": "Inspected the affected behavior and found no blocking defects.",
               "reviewed_context": "Read the pinned diff and its affected callers.", "limitations": "Isolated regression fixture."}
 packet = json.dumps({"repository": "example/repo", "pull_number": 21, "head_sha": head,
+                     "coverage": "complete", "files": [],
                      "pull": {"base": {"sha": "b" * 40}, "title": "Candidate", "body": ""}})
 
 
