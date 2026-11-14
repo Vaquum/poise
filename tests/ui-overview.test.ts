@@ -257,16 +257,29 @@ describe('Answer here’s entries', () => {
 
   it('never puts chain work on you: held or still for four hours it is a fault, moving it is automatic', () => {
     const now = Date.parse('2026-11-13T12:00:00Z')
-    const row = (progressAt: string): ChainAttentionRow => ({ id: 'acme/site#7', repository: 'acme/site', issue: 7, pullNumber: 12, step: 'repair-pr: uncertain', progressAt: Date.parse(progressAt), ageMs: now - Date.parse(progressAt),
+    const row = (progressAt: string, held: string | null, mergeSha: string | null = null): ChainAttentionRow => ({ id: 'acme/site#7', repository: 'acme/site', issue: 7,
+      held, sequence: 9, mergeSha, pullNumber: 12, step: 'repair-pr: uncertain', progressAt: Date.parse(progressAt), ageMs: now - Date.parse(progressAt),
       blocker: 'New invocations held by the person; Original pre-merge review evidence pending', evidence: { state: 'fresh', checkedAt: null, gates: [] }, nextAction: 'Resume', retryAt: null, journal: '/api/behavior-chains?id=acme%2Fsite%237&after=4',
       reconciliation: { nextObservationAt: null, waitingForResourceRelease: false } })
-    const chain = (progressAt: string, held: string | null) => itemEntries([{ id: 'chain:acme/site#7', group: 'needs', tone: 'amber', icon: 'held', title: 'acme/site#7 · repair-pr: uncertain', body: row(progressAt).blocker,
-      source: 'Behavior chain', scope: null, when: progressAt, meta: '', details: [], behaviors: [], notice: null, chainJournal: row(progressAt).journal, chain: row(progressAt) } as NotificationItem], role,
-    new Map([['acme/site#7', { sequence: 5, held }]]), new Map(), now)[0]
+    // The chains map holds only the first page; the hold comes from the attention row past it.
+    const chain = (progressAt: string, held: string | null, mergeSha: string | null = null,
+      chains: ReadonlyMap<string, { sequence: number, held: string | null }> = new Map()) => itemEntries([{ id: 'chain:acme/site#7', group: 'needs', tone: 'amber', icon: 'held', title: 'acme/site#7 · repair-pr: uncertain', body: row(progressAt, held, mergeSha).blocker,
+      source: 'Behavior chain', scope: null, when: progressAt, meta: '', details: [], behaviors: [], notice: null, chainJournal: row(progressAt, held, mergeSha).journal, chain: row(progressAt, held, mergeSha) } as NotificationItem], role,
+    chains, new Map(), now)[0]
     expect(chain('2026-11-13T11:00:00Z', 'New invocations held by the person')).toMatchObject({ group: 'fault', kind: 'Chain held', title: 'New invocations held by the person', detail: 'repair-pr: uncertain',
-      where: 'acme/site #7 → #12', options: [], quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] })
-    expect(chain('2026-11-13T11:00:00Z', null)).toMatchObject({ group: 'auto', kind: 'Behavior chain', quiet: undefined })
+      where: 'acme/site #7 → #12', options: [], quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }],
+      chain: { id: 'acme/site#7', sequence: 9 } })
+    expect(chain('2026-11-13T11:00:00Z', null)).toMatchObject({ group: 'auto', kind: 'Behavior chain', quiet: undefined, chain: undefined })
     expect(chain('2026-11-13T07:59:00Z', null)).toMatchObject({ group: 'fault', kind: 'Chain stuck' })
+    // A merged hold stays a fault but offers no Resume: the API rejects it with 409.
+    expect(chain('2026-11-13T11:00:00Z', 'New invocations held by the person', 'c'.repeat(40))).toMatchObject({ group: 'fault', kind: 'Chain held', quiet: undefined, chain: undefined })
+    // On page one the row still wins over a stale page entry, with its own sequence for Resume.
+    expect(chain('2026-11-13T11:00:00Z', 'New invocations held by the person', null,
+      new Map([['acme/site#7', { sequence: 5, held: null }]]))).toMatchObject({ group: 'fault', kind: 'Chain held',
+      quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }], chain: { id: 'acme/site#7', sequence: 9 } })
+    // ...in both directions: an unheld row beats a stale held page entry.
+    expect(chain('2026-11-13T11:00:00Z', null, null,
+      new Map([['acme/site#7', { sequence: 5, held: 'New invocations held by the person' }]]))).toMatchObject({ group: 'auto', kind: 'Behavior chain', quiet: undefined, chain: undefined })
   })
 
   it('reads pull requests’ status as a failed read when Poise could not read them, keeping what an unread organization had', () => {

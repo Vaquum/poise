@@ -53,7 +53,8 @@ export interface NotificationItem extends EvidenceAttachment {
 }
 
 export interface ChainAttentionRow {
-  id: string, repository: string, issue: number, pullNumber: number | null, step: string, progressAt: number, ageMs: number,
+  id: string, repository: string, issue: number, held: string | null, sequence: number, mergeSha: string | null,
+  pullNumber: number | null, step: string, progressAt: number, ageMs: number,
   blocker: string, evidence: { state: string, checkedAt: number | null, gates: string[] },
   nextAction: string, retryAt: number | null, journal: string,
   reconciliation: { nextObservationAt: number | null, waitingForResourceRelease: boolean }

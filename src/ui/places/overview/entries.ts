@@ -192,20 +192,25 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
     }
     if (item.chainJournal) {
       const step = journalStep(item.chainJournal)
-      const chain = step ? chains.get(step.chain) : undefined
       const row = item.chain
+      // The attention row covers every active page; the chains map only its first 100.
+      const paged = step ? chains.get(step.chain) : undefined
+      const held = row && row.held !== undefined ? row.held : paged?.held ?? null
+      const mergeSha = row?.mergeSha ?? null
+      const sequence = typeof row?.sequence === 'number' ? row.sequence : paged?.sequence
       const progressed = row ? row.progressAt : Date.parse(item.when ?? '')
-      const group: Group = chain?.held || !Number.isFinite(progressed) || now - progressed >= STUCK_MS ? 'fault' : 'auto'
+      const group: Group = held || !Number.isFinite(progressed) || now - progressed >= STUCK_MS ? 'fault' : 'auto'
+      const resume = step && held && !mergeSha && typeof sequence === 'number' ? { id: step.chain, sequence } : undefined
       return [{
-        ...base, id: item.id, source: 'chain', group, kind: chain?.held ? 'Chain held' : group === 'fault' ? 'Chain stuck' : 'Behavior chain',
+        ...base, id: item.id, source: 'chain', group, kind: held ? 'Chain held' : group === 'fault' ? 'Chain stuck' : 'Behavior chain',
         // Its first reason as the title; every reason, and the evidence, under More.
         title: row?.blocker ? firstLine(row.blocker).split('; ')[0] : item.title, detail: row ? row.step : item.meta,
         who: 'the chain', where: row ? `${row.repository} #${row.issue}${row.pullNumber ? ` → #${row.pullNumber}` : ''}` : '', state: GROUP_STATE[group], body: item.body,
-        options: [], quiet: step && chain?.held ? [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] : undefined,
+        options: [], quiet: resume ? [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] : undefined,
         timeline: step ? timelineHref(step.chain, step.after) : undefined, silenceable: false,
-        dismissable: true, dismissWords: chain?.held ? 'hides it until the chain moves; the chain stays held' : 'hides it until the chain moves; nothing is retried',
+        dismissable: true, dismissWords: held ? 'hides it until the chain moves; the chain stays held' : 'hides it until the chain moves; nothing is retried',
         revision: `${item.when}|${item.title}|${item.body}`,
-        chain: step && chain ? { id: step.chain, sequence: chain.sequence } : undefined,
+        chain: resume,
       }]
     }
     // A retry still failing four hours after it began is stuck.
