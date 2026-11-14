@@ -954,10 +954,31 @@ export async function implementationReportAdmission(db: Database, journal: Behav
             && deps.prerequisites.some(entry => typeof entry?.repo === 'string'
               && entry.repo.toLowerCase() === chain.repository.toLowerCase() && entry.number === chain.issue)
             && journal.read(source.id)?.sequence === source.sequence
-          if (verified && (report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt))) return { reason: null }
+          // A lost-ack scoped intent with null issueNumber is invisible to
+          // implementationReport. If its marker was stripped before
+          // reconciliation and a second hold adopted the stripped issue,
+          // exempting here would bypass the original report's disposition.
+          // Block when any such orphan shares the failing file/test and
+          // could have filed this issue.
+          let orphaned = false
+          if (verified && failure) {
+            const file = failure.file, test = failure.test
+            orphaned = unconfirmedImplementationReports(db, chain.repository).some(candidate => {
+              if (candidate.pull !== null || candidate.adopted === true) return false
+              if (candidate.key === chainBasis([IMPLEMENTATION_CAUSE, candidate.source])
+                || candidate.key === chainBasis([IMPLEMENTATION_BUDGET_CAUSE, candidate.source])) return false
+              if (predatesHold(issue.created_at, candidate.heldAt)) return false
+              const origin = journal.read(candidate.source)
+              const original = origin?.invocations.find(item => item.id === candidate.attempts[0]?.invocation)
+              const candidateFailure = prePrFileAndTest(original?.evidence?.error)
+              return !!candidateFailure && candidateFailure.file === file && candidateFailure.test === test
+            })
+          }
+          if (verified && (report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt)) && !orphaned) return { reason: null }
           if (!verified) return { reason: `${wait}: linked remedy source evidence changed` }
-          // A verified pre-record link filed after its hold cannot prove
-          // independent authorship. Fall through to disposition.
+          // A verified pre-record link filed after its hold, or a link an
+          // orphaned lost-ack could own, cannot prove independent
+          // authorship. Fall through to disposition.
         }
       } catch (error) {
         return { reason: `${wait}: verification unavailable: ${behaviorErrorMessage(error instanceof Error ? error.message : String(error), 500)}` }
