@@ -122,10 +122,21 @@ function unpack(whole) {
   })
 }
 
-/** The kernel killed for want of memory: a job's container counts it, and a sandbox's kernel says it. */
-function ranOutOfMemory() {
-  if (asJob) return /^oom_kill [1-9]/m.test(tryRead('/sys/fs/cgroup/memory.events'))
-  return BOX_OUT_OF_MEMORY.test(spawnSync('dmesg', { encoding: 'utf8' }).stdout ?? '')
+/** Keep only counters or record fingerprints, bounded by spawnSync's output limit, never kernel log text. */
+function memoryKills() {
+  if (asJob) {
+    const count = /^oom_kill (\d+)$/m.exec(tryRead('/sys/fs/cgroup/memory.events'))?.[1]
+    return count === undefined ? null : BigInt(count)
+  }
+  const log = spawnSync('dmesg', { encoding: 'utf8' })
+  if (log.status !== 0 || log.error || typeof log.stdout !== 'string') return null
+  return new Set(log.stdout.split('\n').filter((line) => BOX_OUT_OF_MEMORY.test(line))
+    .map((line) => createHash('sha256').update(line).digest('hex')))
+}
+
+function ranOutOfMemory(before, after) {
+  if (before === null || after === null) return false
+  return asJob ? after > before : [...after].some((record) => !before.has(record))
 }
 
 function git(cwd, ...args) {
@@ -238,6 +249,7 @@ function assertionResult(reporter, capture) {
 function runSuite(spec, env, capture, reporter) {
   let tail = ''
   let lastOutput = Date.now()
+  const memoryBefore = onBox ? memoryKills() : null
   const child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, env, stdio: ['ignore', 'pipe', 'pipe'], ...asUser })
   for (const [from, to] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
     from.on('data', (chunk) => {
@@ -253,13 +265,14 @@ function runSuite(spec, env, capture, reporter) {
     process.stderr.write(`[poise] cannot start ${spec.argv[0]} on the test box: ${error.message}\n`, () => process.exit(127))
   })
   child.once('exit', (code, signal) => {
+    const memoryAfter = onBox ? memoryKills() : null
     void (async () => {
       // Its pipes can still hold output, and something it left behind can keep them open forever.
       let closed = false
       child.once('close', () => { closed = true })
       while (!closed && Date.now() - lastOutput < QUIET_MS) await sleep(50)
       const status = code ?? 128 + (constants.signals[signal] ?? 0)
-      if (status !== 0 && (OUT_OF_MEMORY.test(tail) || (onBox && ranOutOfMemory()))) fail('this suite is too big for its test box: it ran out of memory')
+      if (status !== 0 && (OUT_OF_MEMORY.test(tail) || ranOutOfMemory(memoryBefore, memoryAfter))) fail('this suite is too big for its test box: it ran out of memory')
       else {
         if (status === 1 && closed && capture && reporter) {
           try {
