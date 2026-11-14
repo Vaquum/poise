@@ -10,6 +10,7 @@ file-group stages; every stage's findings combine into the single submitted verd
 """
 from __future__ import annotations
 
+import fcntl
 import json
 from collections.abc import Iterator
 from hashlib import sha256
@@ -17,9 +18,10 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from uuid import UUID
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 
 from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, ReviewVerdictError, actor, bounded_cause, expected_head, pr_ref, provider_blocked
 from .atoms import packet as fetch_packet
@@ -486,6 +488,9 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
         except subprocess.TimeoutExpired as error:
             raise timed_out(phase, timeout) from error
+        finally:
+            if model.provider == "codex":
+                codex_propagate(root)
         if initializing:
             group_started = monotonic()
         initializing = False
@@ -749,6 +754,27 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
 
 
 # ── Codex ─────────────────────────────────────────────────────────────
+# Verified against Codex CLI 0.169.0 (deploy/runtime installs
+# @openai/codex@latest unpinned): ChatGPT sign-in lives in
+# $CODEX_HOME/auth.json. A refresh writes the rotated document back to that
+# same file — atomic temp-file + rename (0600) under a flock on
+# $CODEX_HOME/auth.json.lock (bounded 5 s wait), committing only while the
+# stored document is unchanged. A spent refresh token fails the run with
+# "your refresh token was already used". `codex exec --ephemeral` skips
+# only session/thread persistence; authentication still resolves from and
+# persists to $CODEX_HOME/auth.json, exactly as without the flag. There is
+# no supported shared-auth mode that preserves isolation: auth and history
+# share CODEX_HOME, and an atomic rename would sever an auth.json symlink.
+# So each isolated run copies the sign-in in, keeps its own rotation, and
+# copies a rotation back under the CLI's own lock.
+CODEX_AUTH_SNAPSHOT = "codex-auth.snapshot"
+CODEX_COMMIT_WAIT_SECONDS = 5
+
+
+def _codex_original_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
 def codex_environment(root: Path) -> dict:
     env = os.environ.copy()
     for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
@@ -760,13 +786,87 @@ def codex_environment(root: Path) -> dict:
     home = root / "codex-home"
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Preserve sign-in, but do not import personal sessions or configuration.
-    original = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+    original = _codex_original_home()
     auth = original / "auth.json"
     if original.resolve() != home.resolve() and auth.is_file():
-        shutil.copyfile(auth, home / "auth.json")
-        (home / "auth.json").chmod(0o600)
+        target = home / "auth.json"
+        if not target.exists():
+            # Copy once: a later fragment, inspection round or file group
+            # keeps this run's rotated credential instead of re-copying the
+            # older original over it. The snapshot names what was copied so
+            # a rotation can later be told apart from an external sign-in.
+            shutil.copyfile(auth, target)
+            target.chmod(0o600)
+            (root / CODEX_AUTH_SNAPSHOT).write_text(sha256(target.read_bytes()).hexdigest())
     env["CODEX_HOME"] = str(home)
     return env
+
+
+def codex_propagate(root: Path) -> None:
+    """Copy a rotated isolated credential back to the originating sign-in.
+
+    Best-effort: any failure leaves every sign-in untouched, so a review
+    never fails for its credential bookkeeping. Writes only when the CLI
+    rotated this run's copy (isolated differs from the copied snapshot)
+    while the original stayed at that snapshot, under the CLI's own
+    auth.json.lock, so an external sign-in, another Call's propagation or
+    a non-isolated CLI run is never overwritten.
+    """
+    try:
+        home = root / "codex-home"
+        isolated = home / "auth.json"
+        snapshot_file = root / CODEX_AUTH_SNAPSHOT
+        if not snapshot_file.is_file() or not isolated.is_file() or isolated.is_symlink():
+            return
+        expected = snapshot_file.read_text().strip()
+        rotated = isolated.read_bytes()
+        if not expected or sha256(rotated).hexdigest() == expected:
+            return
+        original = _codex_original_home()
+        if original.resolve() == home.resolve():
+            return
+        auth = original / "auth.json"
+        if auth.is_symlink() or not auth.is_file():
+            return
+        try:
+            lock = os.open(original / "auth.json.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return
+        try:
+            deadline = monotonic() + CODEX_COMMIT_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if monotonic() >= deadline:
+                        return
+                    sleep(0.01)
+            try:
+                current = auth.read_bytes()
+            except OSError:
+                return
+            if sha256(current).hexdigest() != expected:
+                return
+            fd, tmp = tempfile.mkstemp(prefix="auth.json.", dir=original)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(rotated)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.rename(tmp, auth)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return
+            snapshot_file.write_text(sha256(rotated).hexdigest())
+        finally:
+            os.close(lock)
+    except (OSError, ValueError):
+        # ValueError is a corrupt snapshot or unreadable text: still skip.
+        return
 
 
 def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, watch: ReviewWatch, timeout: float) -> str:

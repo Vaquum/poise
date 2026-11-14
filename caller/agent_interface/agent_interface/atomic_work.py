@@ -402,6 +402,10 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                                         timeout_seconds=seconds, repository=repo, pr=pull, expected_head=expected_head,
                                         behavior="repair_pr" if pull is not None else "implement_issue",
                                         message=f"Seed issue {repo}#{number}", submission="none")) from error
+            finally:
+                if model.provider == "codex":
+                    from .structured_review import codex_propagate
+                    codex_propagate(work)
             progress.stage("settling_provider_resources", "Verifying atomic provider resource release")
             record({"phase": "resources_unknown", "prepared": prepared})
             issue_review.stop_leftovers(work)
