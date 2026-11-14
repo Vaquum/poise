@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
 import type { LogEntry } from './agent-log-parse'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
-import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal } from './behavior-chain-store'
+import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal, type ChainBehavior } from './behavior-chain-store'
 import { ReviewScopeIndexingError } from './behavior-chain-runtime'
 import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
@@ -484,6 +485,167 @@ function qualifyingImplementationPublication(chain: BehaviorChain, observation: 
     || observation.checkedAt < Date.parse(String(evidence.resources_settled_at))
     || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return null
   return { invocation, call }
+}
+
+function repairExhaustionReports(db: Database, chain: BehaviorChain, reportIssue = false): RepairReport[] {
+  const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ? AND ${reportIssue
+    ? "json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.issueNumber') = ?"
+    : "json_extract(value, '$.source') = ?"}`)
+    .all(PREFIX + '*', reportIssue ? chain.repository.toLowerCase() + '#*' : chain.id,
+      ...(reportIssue ? [chain.issue] : [])) as Array<{ key: string, value: string }>
+  return rows.flatMap(row => {
+    const report = JSON.parse(row.value) as RepairReport
+    if (!['repair_incomplete_replies', 'repair_execution_budget_exhausted']
+      .some(cause => report.key === chainBasis([cause, report.source, report.pull]))) return []
+    if (report.issueNumber === null) return []
+    if (row.key !== PREFIX + report.key || !Number.isSafeInteger(report.issueNumber) || Number(report.issueNumber) < 1
+      || !Number.isSafeInteger(report.holdSequence) || Number(report.holdSequence) < 1
+      || !Number.isSafeInteger(report.pull) || Number(report.pull) < 1 || !/^[a-f0-9]{40}$/.test(report.head ?? '')
+      || !/^[a-f0-9]{64}$/.test(report.basis) || !report.slot || !Array.isArray(report.attempts)) {
+      throw new Error('Repair exhaustion recovery lacks its saved source hold')
+    }
+    return [report]
+  })
+}
+
+/** A saved exhaustion report is diagnostic work, never a replacement owner for
+ * the source PR. This also fences an already-admitted ordinary implementation. */
+export function repairReportImplementationFence(db: Database, chain: BehaviorChain, behavior: ChainBehavior): string | null {
+  if (!['implement-issue', 'publish-issue'].includes(behavior)) return null
+  const reports = repairExhaustionReports(db, chain, true)
+  return reports.length ? `Repair exhaustion report routes diagnosis to its source repair owner ${reports.map(report => report.source).join(', ')}; ordinary report implementation is fenced` : null
+}
+
+/** Reuse the original repair owner and journal admission. A blocked diagnostic
+ * Call proves provenance and no publication, not that its proposed fix is right;
+ * the exact-head repair must validate it through the normal publication gates. */
+export async function recoverReportedRepair(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
+  observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
+  allowed: () => boolean): Promise<string | null> {
+  const fence = repairReportImplementationFence(db, chain, 'implement-issue')
+  if (fence) {
+    // Pending review work and started work must still settle through the
+    // runtime's receipt-only recovery; only unstarted ordinary implementation stays fenced.
+    if (chain.invocations.some(invocation => invocation.state !== 'settled'
+      && (invocation.state !== 'admitted' || invocation.behavior === 'review-issue'))) return null
+    const decision = decideBehaviorChain(chain, observation, Date.now())
+    return decision.kind === 'invoke' && decision.behavior === 'review-issue' ? null : fence
+  }
+  // A merged source has no recovery to pend; ordinary merged-review
+  // reconciliation owns the chain from here.
+  if (chain.mergeSha || observation.pull?.merged) return null
+  if (chain.repairRecovery?.admission || !chain.held && !chain.repairRecovery) return null
+  const reports = repairExhaustionReports(db, chain)
+  if (!reports.length) return null
+  const pending = (reason: string) => `Repair report recovery pending: ${reason}; inspect the report and source Calls before explicitly resuming`
+  if (!enabled(db, chain.repository) || !allowed()) return pending('recovery admissions are disabled')
+  const accounts = getSettings()
+  if (accounts.me.toLowerCase() !== chain.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) {
+    return pending('configured accounts differ from the original repair owner')
+  }
+  const hold = db.prepare(`SELECT sequence, at, json_extract(payload, '$.reason') AS reason FROM behavior_chain_events
+    WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.held' ORDER BY sequence DESC LIMIT 1`)
+    .get(chain.id) as { sequence: number, at: number, reason: string } | undefined
+  const matching = reports.filter(report => report.holdSequence === hold?.sequence && report.heldAt === hold.at
+    && report.head === observation.pull?.head && (!chain.repairRecovery || report.key === chain.repairRecovery.key))
+  if (matching.length !== 1) return pending('the saved automatic hold, source head or unique report no longer matches')
+  const report = matching[0], last = chain.invocations.at(-1)
+  if (chain.mergeSha || chain.supersession || chain.ciHold || !last || last.behavior !== 'repair-pr'
+    || hold!.reason !== `repair-pr failed before publication three times: ${String(last.evidence?.error || 'native failure')}`
+    || chain.held !== null && chain.held !== hold!.reason
+    || chain.held === null && !chain.repairRecovery) return pending('the original automatic repair hold was replaced')
+  const reportChain = journal.read(chainIdentity(chain.repository, report.issueNumber!))
+  if (!reportChain || reportChain.author !== chain.author || reportChain.reviewer !== chain.reviewer) {
+    return pending(`report #${report.issueNumber} has no unambiguous diagnostic owner`)
+  }
+  const freshReport = await verify(reportChain)
+  if (!freshReport.issue.open || !freshReport.issue.eligible || freshReport.pull || freshReport.existingPulls.length
+    || freshReport.publication.pull_number !== null || freshReport.publication.head_sha !== null
+    || freshReport.publication.head_invocation !== null || freshReport.publication.state !== null
+    || freshReport.publication.merged || freshReport.publication.merge_sha !== null
+    || reportChain.mergeSha || reportChain.supersession || reportChain.invocations.some(invocation => invocation.state !== 'settled'
+      || invocation.callId !== null && !resourceReleaseProven(invocation.evidence ?? {}, true))) {
+    return pending(`report #${report.issueNumber} still owns work, publication or unsettled resources`)
+  }
+  const diagnosis = qualifyingImplementationHold(db, reportChain, freshReport, Date.now())
+  const evidence = diagnosis?.invocation.evidence
+  const artifact = evidence?.artifact as { prepared?: Record<string, unknown> } | undefined
+  const prepared = artifact?.prepared
+  const diagnostic = evidence?.diagnostic as ProcessDiagnostic | undefined
+  const implementations = reportChain.invocations.filter(invocation => invocation.behavior === 'implement-issue' || invocation.behavior === 'publish-issue')
+  if (implementations.length && (implementations.length !== 1 || !diagnosis || !prepared
+    || prepared.repository !== chain.repository || prepared.issue_number !== report.issueNumber
+    || prepared.actor !== chain.author || prepared.branch !== reportChain.branch || prepared.pull_number !== null || prepared.head_sha !== null
+    || diagnosis.invocation.request.argv[diagnosis.invocation.request.argv.indexOf('--expected-issue-revision') + 1] !== freshReport.issue.revision
+    || diagnostic?.operation !== 'provider.atomic_work' || diagnostic.outcome !== 'blocked'
+    || diagnostic.context.submission !== 'none' || diagnostic.stderr_truncated !== false)
+    || !implementations.length && reportChain.held) return pending(`report #${report.issueNumber} lacks its original no-publication diagnosis receipt or has a later hold`)
+  const issue = await reconcileRepairReport(chain.repository, `<!-- poise-repair-exhaustion:${report.key} -->`, report.issueNumber)
+  if (!issue || issue.state !== 'open') return pending(`report #${report.issueNumber} is not verified open`)
+  const { stdout } = await runFile('github-interface', ['--issue-comments', String(report.issueNumber), '--repository', chain.repository,
+    '--token-user', chain.author], { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
+  const result = JSON.parse(stdout) as { repository: string, issue_number: number, comments: Array<{ id: number, author: string, body: string }> }
+  if (result.repository?.toLowerCase() !== chain.repository.toLowerCase() || result.issue_number !== report.issueNumber
+    || !Array.isArray(result.comments) || result.comments.some(comment => !Number.isSafeInteger(comment.id) || comment.id < 1
+      || typeof comment.author !== 'string' || typeof comment.body !== 'string')) throw new Error('Repair report diagnosis comments are incomplete')
+  const comments = result.comments.filter(comment => [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(comment.author.toLowerCase()))
+  // Review alone is insufficient: the original comment must name this exact
+  // source PR/head and a concrete code site. The repair validates the diagnosis.
+  const repository = chain.repository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const actionable = (text: unknown): text is string => typeof text === 'string' && text.includes(report.head!)
+    && (new RegExp(`https://github\\.com/${repository}/pull/${report.pull}(?!\\d)`).test(text) || new RegExp(`\\bPR #${report.pull}\\b`, 'i').test(text))
+    && /\b[\w.-]+(?:\/[\w.-]+)*\.[\w]+:\d+\b/.test(text)
+  const reviewed = !implementations.length ? reportChain.invocations.flatMap(invocation => {
+    const evidence = invocation.evidence
+    const receipts = evidence?.receipts as Array<{ issue: string, comment_id: number, author: string }> | undefined
+    if (invocation.behavior !== 'review-issue' || !invocation.callId || invocation.actor !== chain.reviewer
+      || evidence?.status !== 'completed' || evidence.action !== 'commented' || evidence.issue_revision !== freshReport.issue.revision
+      || !Array.isArray(receipts)) return []
+    return comments.filter(comment => comment.author.toLowerCase() === chain.reviewer.toLowerCase()
+      && freshReport.issue.commentIds.includes(comment.id) && actionable(comment.body)
+      && comment.body.includes(`<!-- agent-interface issue-review call=${invocation.callId} -->`)
+      && receipts.some(receipt => receipt && typeof receipt.issue === 'string' && receipt.issue.toLowerCase() === reportChain.id
+        && receipt.comment_id === comment.id && typeof receipt.author === 'string' && receipt.author.toLowerCase() === chain.reviewer.toLowerCase()))
+      .map(comment => ({ call: invocation.callId!, text: comment.body }))
+  }) : []
+  const text = implementations.length ? diagnostic?.stderr : reviewed[0]?.text
+  const call = implementations.length ? diagnosis?.call : reviewed[0]?.call
+  if (!call || !actionable(text)) return pending(`report #${report.issueNumber} lacks an actionable diagnosis pinned to the source PR/head`)
+  const digest = chainBasis([report.key, reportChain.id, call, prepared ?? null,
+    diagnostic ?? null, text, freshReport.issue.revision, comments])
+  if (chain.repairRecovery && chain.repairRecovery.diagnosis !== digest) return pending(`report #${report.issueNumber} diagnosis changed after recovery preparation`)
+  const note = [`Repair-exhaustion diagnosis from ${issue.url}; original diagnostic Call ${call}.`,
+    `Keep source ${chain.id}, branch ${chain.branch}, PR #${report.pull}, head ${report.head} and repair basis ${report.basis}.`,
+    'Original repair Calls prove no publication; diagnostic work and resources are settled. Verify the worker-reported diagnosis on the source PR through normal validation, publication, review and CI.',
+    text, ...comments.map(comment => `Report comment ${comment.id} (${comment.author}):\n${comment.body}`)].join('\n\n')
+  if (Buffer.byteLength(note) > 32 * 1024) return pending('the complete diagnosis exceeds the bounded repair note')
+  const fresh = await verify(chain)
+  const qualifying = qualifyingAttempts(db, { ...chain, held: hold!.reason, repairRecovery: undefined }, fresh, Date.now())
+  const owners = db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE chain_id != ?
+    AND lower(json_extract(state, '$.repository')) = ? AND
+    (json_extract(state, '$.observation.pull.number') = ? OR json_extract(state, '$.observation.publication.pull_number') = ?)`)
+    .all(chain.id, chain.repository.toLowerCase(), report.pull, report.pull)
+  if (!qualifying || !['repair_incomplete_replies', 'repair_execution_budget_exhausted'].includes(qualifying.cause)
+    || report.key !== chainBasis([qualifying.cause, chain.id, report.pull]) || qualifying.decision.basis !== report.basis
+    || qualifying.decision.reviewer?.slot !== report.slot || fresh.pull?.head !== report.head
+    || fresh.pull.state !== 'open' || fresh.pull.merged || fresh.pull.queueEntry || fresh.existingPulls.length
+    || fresh.publication.pull_number !== report.pull || fresh.publication.head_sha !== report.head
+    || fresh.publication.state !== 'open' || fresh.publication.merged || fresh.publication.merge_sha !== null
+    || chainBasis(report.attempts) !== chainBasis(qualifying.attempts.map(invocation => ({ invocation: invocation.id,
+      call: invocation.callId, completedAt: invocation.evidence!.completedAt })))
+    || qualifying.attempts.some(invocation => {
+      const evidence = invocation.evidence!, artifact = evidence.artifact as Record<string, unknown> | null
+      return [artifact?.publication, artifact?.result, artifact?.receipts, evidence.publicationPlan, evidence.publicationResume,
+        evidence.publicationReceipt, evidence.nativeActionReceipt].some(value => value != null)
+    }) || owners.length) return pending('the source PR, repair basis, original receipts or sole ownership no longer verifies')
+  if (!enabled(db, chain.repository) || !allowed() || journal.read(chain.id)?.sequence !== chain.sequence
+    || journal.read(reportChain.id)?.sequence !== reportChain.sequence
+    || getSettings().me !== accounts.me || getSettings().agentAccount !== accounts.agentAccount) return pending('source, diagnosis owner or admission controls changed during verification')
+  let current = journal.append(chain.id, randomUUID(), chain.sequence, { type: 'chain.observed', observation: fresh })
+  if (!current.repairRecovery) current = journal.append(current.id, randomUUID(), current.sequence, { type: 'chain.resumed',
+    repairRecovery: { report: report.issueNumber!, key: report.key, holdSequence: report.holdSequence!, head: report.head!,
+      basis: report.basis, slot: report.slot!, diagnosis: digest, note }, recovery: { origin: 'automatic' } })
+  return null
 }
 
 /** Runs only on the existing reconciliation opportunity. The existing meta

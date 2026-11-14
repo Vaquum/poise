@@ -22,6 +22,7 @@ export interface ChainRuntimeOperations {
   observe(chain: BehaviorChain): Promise<ChainObservation>
   /** Also reports terminal uncertain publications and merges without a chain hold. */
   reportHold?(chain: BehaviorChain): Promise<string | null>
+  recoverReport?(chain: BehaviorChain, observation: ChainObservation): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
   authenticationRejected?(call: LogEntry): void
@@ -464,6 +465,16 @@ export class BehaviorChainRuntime {
                   pull_number: observation.pull.number, merged: true, merge_sha: observation.pull.mergeSha, review_complete: false } })
               }
               if (owned && call?.status === 'running') continue
+              if (this.operations.recoverReport) {
+                const reason = await this.operations.recoverReport(chain, observation)
+                chain = this.current(chain)
+                observation = chain.observation as ChainObservation
+                if (reason) {
+                  if (chain.repairRecovery && !chain.repairRecovery.admission && !chain.held) chain = this.append(chain, { type: 'chain.held', reason })
+                  if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                  continue
+                }
+              }
               const pendingInvocation = chain.invocations.find((invocation) => invocation.state !== 'settled')
               if (pendingInvocation) {
                 phase = 'invocation-recovery'
@@ -609,6 +620,21 @@ export class BehaviorChainRuntime {
                 // Preparation can await provider/auth/configuration. Recheck admission
                 // at the last boundary, before committing authority for an effect.
                 if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
+                if (this.operations.recoverReport && (chain.repairRecovery && !chain.repairRecovery.admission
+                  || decision.behavior === 'implement-issue' || decision.behavior === 'publish-issue')) {
+                  const reason = await this.operations.recoverReport(this.current(chain), observation)
+                  chain = this.current(chain)
+                  if (reason) {
+                    if (chain.repairRecovery && !chain.repairRecovery.admission && !chain.held) chain = this.append(chain, { type: 'chain.held', reason })
+                    if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                    continue
+                  }
+                  observation = chain.observation as ChainObservation
+                  const fresh = decideBehaviorChain(chain, observation, Date.now())
+                  if (fresh.kind !== 'invoke' || fresh.behavior !== decision.behavior || fresh.basis !== decision.basis
+                    || fresh.actor !== decision.actor || fresh.reviewer?.slot !== decision.reviewer?.slot) continue
+                  if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
+                }
                 if (decision.behavior === 'implement-issue') {
                   const fresh = await this.operations.observe(chain)
                   chain = this.append(chain, { type: 'chain.observed', observation: fresh })

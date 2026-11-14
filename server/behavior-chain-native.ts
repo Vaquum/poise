@@ -429,6 +429,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const common = ['--source', 'poise:behavior-chain', '--correlation-id', id, '--actor', decision.actor]
       const dependency = pull && decision.behavior === 'repair-pr' ? chainCiDependency(chain, pull.queueRemoval?.id) : null
       const note = [await hooks.note(decision.behavior, chain, pull), decision.reason,
+        decision.behavior === 'repair-pr' && chain.repairRecovery && !chain.repairRecovery.admission ? chain.repairRecovery.note : '',
         dependency ? `Retained shared baseline CI dependency; keep candidate repairs scoped and do not duplicate its remediation: ${JSON.stringify(dependency.dependency)}` : ''].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
         const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`, chain, observation)

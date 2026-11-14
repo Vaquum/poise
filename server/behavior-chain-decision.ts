@@ -136,6 +136,16 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
   const history = settled(chain, behavior, basis, reviewer?.slot ?? null)
   const successful = [...history].reverse().find(succeeded)
   if (successful) return { kind: 'wait', reason: `${behavior} finished; waiting for its verified artifact or changed input` }
+  if (behavior === 'repair-pr' && chain.repairRecovery) {
+    const recovery = chain.repairRecovery
+    const admitted = chain.invocations.find(invocation => invocation.id === recovery.admission)
+    if (admitted && !succeeded(admitted)) return { kind: 'hold', reason: 'the single repair after report diagnosis failed; inspect its Call before explicitly resuming' }
+    if (!recovery.admission) {
+      if (basis !== recovery.basis || reviewer?.slot !== recovery.slot || actor !== chain.author) return { kind: 'hold',
+        reason: 'repair report diagnosis no longer matches the pinned source repair' }
+      return { kind: 'invoke', behavior, basis, actor, reviewer, reason: 'apply the retained report diagnosis through the original repair owner' }
+    }
+  }
   if (behavior === 'implement-issue' && chain.testRecovery) {
     const original = chain.invocations.find(item => item.id === chain.testRecovery!.hold.invocationId)
     if (chain.testRecovery.admission) return { kind: 'hold', reason: 'the single implementation after verified test recovery was admitted; another attempt requires Resume' }
