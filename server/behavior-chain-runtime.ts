@@ -166,7 +166,8 @@ function recoveredImplementation(chain: BehaviorChain, observation: ChainObserva
   const publication = observation.publication
   if (!hold || chain.mergeSha || chain.supersession || chain.testRecovery?.admission
     || chain.invocations.some(invocation => invocation.state !== 'settled')
-    || !original || original.id !== hold.invocationId || original.callId !== hold.callId || !proof
+    || !original || original.id !== hold.invocationId || original.callId !== hold.callId
+    || !proof && (!chain.testRecovery?.recheck || recovery?.recheck !== chain.testRecovery.recheck)
     || prepared?.repository !== chain.repository || prepared.issue_number !== chain.issue || prepared.branch !== chain.branch
     || prepared.actor !== chain.author || prepared.pull_number !== null || prepared.head_sha !== null
     || chain.held !== null && (!chain.testHold || chain.held !== evidence?.error)
@@ -732,10 +733,20 @@ export class BehaviorChainRuntime {
                 if (decision.behavior === 'implement-issue') {
                   const fresh = await this.operations.observe(chain)
                   chain = this.append(chain, { type: 'chain.observed', observation: fresh })
-                  if (chain.testRecovery && !chain.testRecovery.admission && !recoveredImplementation(chain, fresh, Date.now())) continue
+                  if (chain.testRecovery?.recheck && !chain.testRecovery.admission) {
+                    const reason = await this.operations.recoverReport?.(chain, fresh)
+                    chain = this.current(chain)
+                    if (reason) {
+                      if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                      continue
+                    }
+                  }
+                  const verified = chain.observation as ChainObservation
+                  observation = verified
+                  if (chain.testRecovery && !chain.testRecovery.admission && !recoveredImplementation(chain, verified, Date.now())) continue
                   // Dependencies can change without an issue revision, including
                   // while request preparation awaited. Retain their ordinary wait.
-                  const redecided = decideBehaviorChain(chain, fresh, Date.now())
+                  const redecided = decideBehaviorChain(chain, verified, Date.now())
                   if (redecided.kind !== 'invoke' || redecided.behavior !== decision.behavior || redecided.basis !== decision.basis) {
                     if (redecided.kind === 'wait' && chain.waiting !== redecided.reason) this.append(chain, { type: 'chain.waiting', reason: redecided.reason })
                     // A report revision changed during preparation also invalidates its disposition; surface that explicitly.

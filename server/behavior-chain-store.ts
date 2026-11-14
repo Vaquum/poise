@@ -52,7 +52,7 @@ export interface BehaviorChain {
   held: string | null
   ciHold?: { invocationId: string, callId: string, head: string, queue?: QueueCiBlocker }
   testHold?: { invocationId: string, callId: string, sequence: number }
-  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string }
+  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string, recheck?: string }
   repairRecovery?: { report: number, key: string, holdSequence: number, head: string, basis: string, slot: string,
     diagnosis: string, note: string, admission?: string }
   waiting: string | null
@@ -187,8 +187,20 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
       next.repairRecovery = recovery
     } else if (!event.ciRecovery && !event.testRecovery) delete next.repairRecovery
     if (event.testRecovery) {
-      if (!next.held || !next.testHold || next.testRecovery || event.testRecovery.admission
-        || chainBasis(event.testRecovery.hold) !== chainBasis(next.testHold)
+      const recovery = event.testRecovery
+      const proof = next.observation?.testDependency as { invocationId?: string, verified?: boolean, recovered?: boolean, recheck?: string,
+        recovery?: { merge: string, base: string } } | undefined
+      const original = next.invocations.at(-1)
+      const rechecked = !next.testHold && recovery.recheck && /^[a-f0-9]{64}$/.test(recovery.recheck)
+        && proof?.recheck === recovery.recheck && proof.verified === true && proof.recovered === true
+        && proof.recovery?.merge === recovery.merge && proof.recovery.base === recovery.base
+        && proof.invocationId === recovery.hold.invocationId && original?.id === recovery.hold.invocationId
+        && original.behavior === 'implement-issue' && original.callId === recovery.hold.callId && original.state === 'settled'
+        && original.evidence?.status === 'failed' && original.evidence.action === 'not_started' && resourceReleaseProven(original.evidence, true)
+        && next.held === original.evidence?.error && recovery.hold.sequence > next.resumedAfterSequence
+        && recovery.hold.sequence <= current.sequence
+      if (!next.held || next.testRecovery || recovery.admission
+        || (!rechecked && chainBasis(recovery.hold) !== chainBasis(next.testHold ?? null))
         || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
       next.testRecovery = event.testRecovery
     } else if (!event.ciRecovery && !event.repairRecovery) delete next.testRecovery

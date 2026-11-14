@@ -350,7 +350,7 @@ the original Call failed and returns to ordinary review, independent approval
 of the queue diagnosis, and fresh current-base native merge-queue gates.
 
 A pre-PR implementation can recover through the same bounded observation even
-with failure reporting disabled. Its original Caller artifact must retain
+with failure reporting disabled. The original-run proof path requires its Caller artifact to retain
 `test_dependency`: independently verified assertion evidence tying the original
 producing run to `prepared.checkout_head`, plus a distinct failing run on that
 exact base. CI proof requires both completed main runs' complete full-suite
@@ -384,6 +384,36 @@ source revision and implementation slot must remain eligible, with the original
 failed/no-publication receipt and positive resource release. A fresh seed read
 must show no pushed branch, PR or competing work; this is checked again after
 provider preparation at admission.
+
+When the original assertion run did not finish, a saved automatic implementation
+hold report can instead authorize one fresh clean-base recheck. Its saved source,
+Call, implementation basis/slot and hold sequence must still match the current
+failed-before-publication receipt and released resources. The current report and
+its author/reviewer comments identify a unique delivered remediation of the named
+test. The recheck verifies ancestry and a change to that fixture, installs the
+locked dependencies on each pinned base, and runs the exact reported Vitest case
+on the old base and corrected current base. The old case must fail with a complete
+actionable assertion; the corrected case must pass. Completed reporting must
+account for every selected case and exclude interruptions, unhandled errors and
+file/setup errors. Historical worker output stays diagnostic evidence only.
+
+The single-slot recovery incident uses the same 750 ms delay after observing
+first output and before interrupting the relay on both bases. The memory-warning
+incident uses 6650 ms before each command on both bases, retaining its 20-second
+case deadlines and all three command variants after the fixture split. These
+temporary observation conditions preserve assertions and production code. Other
+reported tests run unchanged. The completion reporter must witness the injected
+observation on both bases. A passing old case cannot prove a shared failure.
+
+The existing report saves intent before checkout or execution and retains the
+outcome. Restart, repeated observations, an interrupted attempt or a newer base
+cannot relaunch that recheck. Checkout and each dependency install have a
+120-second bound, each suite a 90-second bound, and Git reads a 30-second bound;
+suites use one worker without retries. An unverified correction or failed recheck
+states its blocker on the existing hold. A successful recheck feeds the same
+single-retry admission below, with source, publication, resources, controls and
+the pinned corrected base checked again after preparation. The new implementation
+still runs normal full required validation, review and CI.
 
 The automatic hold carries its original journal sequence. An operator Hold,
 including one with identical text, removes that recovery identity. The existing
