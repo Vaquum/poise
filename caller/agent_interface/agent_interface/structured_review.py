@@ -753,6 +753,17 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
 
 
 # ── Codex ─────────────────────────────────────────────────────────────
+# Verified against Codex CLI 0.169.0 (deploy/runtime installs
+# @openai/codex@latest unpinned): ChatGPT sign-in lives in
+# $CODEX_HOME/auth.json; a refresh rewrites that same file (atomic
+# temp-file + rename under $CODEX_HOME/auth.json.lock); `codex exec
+# --ephemeral` still resolves and persists auth there; auth and history
+# share CODEX_HOME, so no supported shared-auth mode preserves isolation.
+# Caller copies the sign-in in once per run and never writes back: the
+# isolated file is worker-writable (issue/atomic run danger-full-access),
+# and same-account forged JSON is indistinguishable from a genuine
+# rotation, so any copy-back could replace the sign-in. Cross-Call
+# persistence stays explicitly unresolved under #1797.
 def codex_environment(root: Path) -> dict:
     env = os.environ.copy()
     for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
@@ -767,8 +778,13 @@ def codex_environment(root: Path) -> dict:
     original = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
     auth = original / "auth.json"
     if original.resolve() != home.resolve() and auth.is_file():
-        shutil.copyfile(auth, home / "auth.json")
-        (home / "auth.json").chmod(0o600)
+        target = home / "auth.json"
+        if not target.exists():
+            # Copy once: a later fragment, inspection round or file group
+            # keeps this run's rotated credential instead of re-copying the
+            # older original over it.
+            shutil.copyfile(auth, target)
+            target.chmod(0o600)
     env["CODEX_HOME"] = str(home)
     return env
 
