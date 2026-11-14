@@ -35,12 +35,19 @@ def interface(*args, **_kwargs):
     if args[0] == "--issue-work":
         assert args[args.index("--mode") + 1] == "prepare"
         return {"outcome": "prepared", "checkout_head": ci["head_sha"]}
-    return {"--list-failing-ci": ci, "--pr-review": {"review_threads": []}, "--pull-action-state": {}}[args[0]]
+    if args[0] == "--list-failing-ci" and "--ref" in args:
+        return request["integration"] if args[-1] == request["integration"]["ref"] else request["baseline"]
+    if args[0] == "--read-failing-ci-log":
+        return {"repository": ci["repository"], "log": request["dependency"]["failures"][0]["evidence"]}
+    if args[0] == "--read-issue":
+        return {"issue": {"number": 99}}
+    return {"--list-failing-ci": ci, "--pr-review": {"review_threads": []}, "--pull-action-state": request.get("queue", {})}[args[0]]
 
 
 def worker(_lease, _args, **kwargs):
     (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
-        "blocked": {"cause": "ci_only", "reason": "The supplied unit job failed"}}))
+        "blocked": {"cause": "ci_only", "reason": "The supplied unit job failed"},
+        **({"ciDependency": request["dependency"]} if request.get("dependency") else {})}))
     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
@@ -66,5 +73,6 @@ with TemporaryDirectory(dir="/dev/shm" if sys.platform == "linux" else None) as 
             pass
         else:
             raise AssertionError("expected a native CI-only repair failure")
-    assert commands == ["--issue-work", "--list-failing-ci", "--pr-review", "--pull-action-state"]
+    assert commands[:4] == ["--issue-work", "--list-failing-ci", "--pr-review", "--pull-action-state"]
+    assert commands.count("--issue-work") == 1  # Preparation only; no publication or validation.
     print(json.dumps({"pending": pending, "released": api.logs()}))

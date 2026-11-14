@@ -36,6 +36,10 @@ export interface ChainInvocation {
   outcome: string | null
   evidence: (Record<string, unknown> & { publicationPlan?: PublicationPlanCondition }) | null
 }
+export interface QueueCiBlocker {
+  removal: string, integration: string, base: string,
+  failures: Array<{ name: string, check: number, job: number, run: number, workflow: number, attempt: number, url: string }>
+}
 export interface BehaviorChain {
   id: string
   repository: string
@@ -45,7 +49,7 @@ export interface BehaviorChain {
   reviewer: string
   sequence: number
   held: string | null
-  ciHold?: { invocationId: string, callId: string, head: string }
+  ciHold?: { invocationId: string, callId: string, head: string, queue?: QueueCiBlocker }
   testHold?: { invocationId: string, callId: string, sequence: number }
   testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string }
   waiting: string | null

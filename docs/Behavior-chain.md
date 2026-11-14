@@ -289,6 +289,22 @@ Work impact and attention describe this automatic CI recheck instead of asking
 for Resume; attention retains the scheduled `reconciliation.nextObservationAt`.
 Unsettled original receipts and resources still require reconciliation first.
 
+When only merge-group CI failed, `ci_blocker.queue` instead retains the verified
+GitHub removal, admitted candidate, integration and first-parent base, and each
+failed check/job, workflow run and attempt. The existing hold and attention
+output name those checks and their links. Green PR-head CI alone cannot release
+this hold. The same bounded observation reads the original integration through
+`--list-failing-ci --ref`: each original obligation needs a later successful
+check in its retained workflow, from a later attempt or run. A stale success,
+same-named check from another workflow, pending or unknown evidence stays held.
+The latest matching workflow run must also have completed successfully.
+Alternatively, a failed no-write Call can retain independently verified
+`ci_dependency` proof inside its blocker and use the existing exact-base
+recovery checks; a remediation link or closure alone grants no recovery.
+Original resource settlement and current-head CI remain required. Recovery keeps
+the original Call failed and returns to ordinary review, independent approval
+of the queue diagnosis, and fresh current-base native merge-queue gates.
+
 A pre-PR implementation can recover through the same bounded observation even
 with failure reporting disabled. Its original Caller artifact must retain
 `test_dependency`: independently read CI assertion evidence tying the original

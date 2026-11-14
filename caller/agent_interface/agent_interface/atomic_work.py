@@ -196,7 +196,7 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
             "allShared": len(used) == len(integration["failing"])}
 
 
-def _ci_only_blocker(ci: object) -> object:
+def _ci_only_blocker(ci: object, queue: dict, head: str, actor: str) -> object:
     # Durable CI-only evidence is the packet identity plus the failed
     # check/job IDs that pin the original run attempt. Full check summaries
     # can exceed the 128 KiB receipt limit and would turn an explicit CI-only
@@ -211,13 +211,44 @@ def _ci_only_blocker(ci: object) -> object:
                 compact.append({key: entry[key] for key in
                                 ("type", "name", "state", "conclusion", "check_run_id", "log_id", "url")
                                 if key in entry})
-    return {
+    blocker = {
         "action": ci.get("action"),
         "repository": ci.get("repository"),
         "pull_number": ci.get("pull_number"),
         "head_sha": ci.get("head_sha"),
         "failing": compact,
     }
+    if failing != [] or ci.get("head_sha") != head:
+        return blocker
+    removals = queue.get("queue_removals", [])
+    removal = removals[-1] if removals else None
+    integration = (removal.get("beforeCommit") or {}).get("oid") if isinstance(removal, dict) else None
+    if queue.get("head_sha") != head or not removal or removal.get("reason") != "failed_checks" \
+            or not isinstance(removal.get("id"), str) or not removal["id"] \
+            or not isinstance(integration, str) or not re.fullmatch(r"[0-9a-f]{40}", integration):
+        return blocker
+    packet = issue_review.interface("--list-failing-ci", str(ci["pull_number"]), "--repository", ci["repository"],
+                                    "--token-user", actor, "--ref", integration)
+    parents = packet.get("parents", [])
+    if packet.get("repository") != ci["repository"] or packet.get("pull_number") != ci["pull_number"] \
+            or packet.get("head_sha") != head or packet.get("ref") != integration \
+            or len(parents) < 2 or head not in parents[1:] or not re.fullmatch(r"[0-9a-f]{40}", str(parents[0])):
+        raise AtomicWorkFailed("CI blocker integration does not contain the admitted candidate and base")
+    failures = []
+    for check in packet.get("failing", []):
+        run = next((run for run in packet.get("runs", []) if run.get("id") == check.get("run_id")), None)
+        if check.get("type") != "check_run" or check.get("head_sha") != integration or check.get("state") != "completed" \
+                or check.get("conclusion") not in {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"} \
+                or not check.get("name") or not check.get("url") or not run or run.get("head_sha") != integration \
+                or run.get("event") != "merge_group" \
+                or any(type(value) is not int or value < 1 for value in
+                       (check.get("check_run_id"), check.get("log_id"), run.get("id"), run.get("workflow_id"), run.get("run_attempt"))):
+            return blocker  # Unknown or pending obligations cannot authorize recovery.
+        failures.append({"name": check["name"], "check": check["check_run_id"], "job": check["log_id"],
+                         "run": run["id"], "workflow": run["workflow_id"], "attempt": run["run_attempt"], "url": check["url"]})
+    if failures:
+        blocker["queue"] = {"removal": removal["id"], "integration": integration, "base": parents[0], "failures": failures}
+    return blocker
 
 
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
@@ -370,7 +401,17 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                         record({"phase": "executing", "prepared": prepared, "test_dependency": proof})
                 if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
                         and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
-                    record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})
+                    try:
+                        blocker = _ci_only_blocker(evidence["ci"], evidence["queue"], expected_head or "", actor)
+                        if publication.get("ciDependency") is not None and isinstance(blocker, dict) and blocker.get("queue"):
+                            dependency = _verify_ci_dependency(publication["ciDependency"], repo, pull, expected_head or "", actor, evidence["queue"])
+                            if dependency["remediation"] in {f"https://github.com/{repo}/issues/{number}", f"https://github.com/{repo}/pull/{pull}"}:
+                                raise AtomicWorkFailed("CI dependency cannot use its own repair as the external remediation")
+                            blocker["ci_dependency"] = {**dependency, "failures": [
+                                {key: value for key, value in failure.items() if key != "evidence"} for failure in dependency["failures"]]}
+                    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+                        raise AtomicWorkBlocked(f"{blocked['reason']}; authoritative queue CI evidence is unavailable: {error}") from error
+                    record({"phase": "executing", "prepared": prepared, "ci_blocker": blocker})
                     blocked = blocked["reason"]
                 raise AtomicWorkBlocked(blocked)
             dependency = None

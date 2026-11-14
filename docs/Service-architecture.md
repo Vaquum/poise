@@ -1533,6 +1533,12 @@ defines the cadence and timestamp units.
 The same reconciliation can release a CI-only hold after a proven clean base
 update, retaining the original Call, resource-release proof and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
+Queue-only CI holds retain their original removal, integration, workflow and
+failed attempt in the existing Caller blocker. Recovery requires later matching
+integration success or independently verified shared-baseline recovery; green
+PR-head checks alone retain the hold. The original no-write Call and native
+resource settlement remain required, and current-head review and current-base
+merge gates still apply under the same [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 For a pre-PR implementation, the existing Caller artifact and seed read can
 instead verify an original CI assertion failure on its exact prepared base and
 the delivered main recovery with validation of the original failing tests.

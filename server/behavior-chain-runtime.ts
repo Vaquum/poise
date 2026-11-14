@@ -3,7 +3,7 @@ import { DATASTORE_MAX_AGE_SECONDS, staleDatastoreFailure } from './datastore-he
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, implementationTestDependency, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -84,7 +84,11 @@ function ciOnlyHold(invocation: ChainInvocation, call: LogEntry): BehaviorChain[
     || !ci || ci.action !== 'list_failing_ci' || ci.repository !== call.repo || ci.pull_number !== Number(call.pr_id)
     || ci.head_sha !== call.expected_head || ci.head_sha !== invocation.request.context?.head
     || typeof ci.head_sha !== 'string' || !/^[0-9a-f]{40}$/i.test(ci.head_sha)
-    || !Array.isArray(ci.failing) || !ci.failing.length) return undefined
+    || !Array.isArray(ci.failing)) return undefined
+  if (ci.queue) {
+    const queue = queueCiBlocker({ ...invocation, evidence: receipt(call) })
+    return queue ? { invocationId: invocation.id, callId: call.id, head: ci.head_sha, queue } : undefined
+  }
   // A job/check identity pins the failed attempt even after the workflow is
   // rerun. Pending checks or a worker's prose alone cannot establish a cause.
   if (!ci.failing.some((check: Record<string, unknown>) => check?.type === 'check_run' && check.state === 'completed'
@@ -110,6 +114,10 @@ function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: n
     && (pull.head === hold.head || observation.ciBaseUpdate?.from === hold.head && observation.ciBaseUpdate.head === pull.head
       && observation.publication.pull_number === pull.number && observation.publication.head_sha === pull.head)
     && pull.checksState === 'SUCCESS' && !pull.pending && pull.failing.length === 0
+    && (!hold.queue || observation.ciRecovery?.invocationId === original.id && observation.ciRecovery.recovered
+      && observation.ciRecovery.removal === hold.queue.removal && observation.ciRecovery.integration === hold.queue.integration
+      && pull.queueRemoval?.id === hold.queue.removal && pull.queueRemoval.reason === 'failed_checks'
+      && chainBasis(queueCiBlocker(original)) === chainBasis(hold.queue))
 }
 
 function recoveredImplementation(chain: BehaviorChain, observation: ChainObservation, now: number): BehaviorChain['testRecovery'] | null {
@@ -739,7 +747,8 @@ export class BehaviorChainRuntime {
     const ciHold = workBlocked ? ciOnlyHold(invocation, call) : undefined
     const testHold = !chain.testRecovery && workBlocked && implementationTestDependency({ ...invocation, evidence: receipt(call) })
       ? { invocationId: invocation.id, callId: call.id } : undefined
-    if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: call.error,
+    if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held',
+      reason: ciHold?.queue ? `${call.error}; merge-group ${ciHold.queue.integration}: ${ciHold.queue.failures.map(failure => `${failure.name} (${failure.url})`).join(', ')}; awaiting later matching integration success or verified shared-baseline recovery` : call.error,
       ...(ciHold ? { ciHold } : {}), ...(testHold ? { testHold } : {}) })
     if (stopped && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: `behavior invocation ${invocation.id} was stopped by the person` })
     if (!nativeResourcesReleased(call)) {
