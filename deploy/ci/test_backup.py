@@ -262,6 +262,20 @@ class BackupTest(unittest.TestCase):
         self.assert_refused(result, state, (GATEWAY,))
         self.assertIn('poise-ws-alice', result.stderr)
 
+    def test_unreadable_database_removes_the_entire_new_backup(self):
+        path = Path(self.volumes[HOME_VOLUME]) / 'cache.db'
+        path.write_bytes(b'SQLite format 3\x00' + bytes(4096))
+
+        result, state = self.backup()
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'{path}: SQLite snapshot failed: file is not a database', result.stderr)
+        self.assertEqual(state['helpers'], [GATEWAY, HOME_VOLUME])
+        self.assertEqual(state['archived'], [GATEWAY])
+        self.assertEqual(list(self.backups.iterdir()), [self.previous], 'a partial backup survived failure')
+        self.assertEqual((self.previous / 'keep').read_text(), 'previous backup')
+        self.assertNotIn('Backed up', result.stdout)
+
     def assert_restorable(self, result, state):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(state['archived'], [GATEWAY, HOME_VOLUME])
