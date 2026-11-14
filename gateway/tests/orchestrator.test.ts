@@ -1454,7 +1454,7 @@ describe('updates in place', () => {
     expect(h.workspace.switches).toEqual(['new-release'])
     await h.close()
 
-    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_WORKSPACE: 'tea-x' } })
+    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_WORKSPACE: 'tea-x', POISE_TEST_LIMIT_SECONDS: '900' } })
     await h.openWorkspace('Alice')
     h.store.noteWorkspace('alice', 'Alice')
     h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })
@@ -1464,7 +1464,7 @@ describe('updates in place', () => {
     await h.orchestrator.upgradePass()
     const env = (offloadTasks()[0].spec as { Env: string[] }).Env
     // The relay's address and this workspace's own key, and never the Render key.
-    expect(env).toEqual(['HOME=/home/poise', expect.stringMatching(/^POISE_TEST_RELAY_URL=https?:\/\/alice\..+\/api\/link\/test-relay$/), expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\.[\w-]+$/)])
+    expect(env).toEqual(['HOME=/home/poise', expect.stringMatching(/^POISE_TEST_RELAY_URL=https?:\/\/alice\..+\/api\/link\/test-relay$/), expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\.[\w-]+$/), 'POISE_TEST_LIMIT_SECONDS=900'])
     expect(env.join('\n')).not.toContain('render-key')
   })
 
