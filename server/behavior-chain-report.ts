@@ -609,7 +609,9 @@ function implementationReport(db: Database, chain: BehaviorChain): RepairReport 
       && report.key !== chainBasis([IMPLEMENTATION_CAUSE, report.source])
       && report.key !== chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source]))
     if (shared) {
-      const generated = reports.filter(report => !report.adopted)
+      // Only an explicit generated record keeps its report gated. Intents
+      // persisted before the record cannot conflict with each other.
+      const generated = reports.filter(report => report.adopted === false)
       if (!generated.length) return null
       if (generated.length === 1) return generated[0]
     }
@@ -903,9 +905,12 @@ export async function implementationReportAdmission(db: Database, journal: Behav
   if (report) {
     const wait = report.pull === null ? implWait : repairWait
     if (report.pull === null && report.key !== chainBasis([IMPLEMENTATION_CAUSE, report.source])
-      && report.key !== chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])) {
-      // Scoped intents can also link an independently authored blocked-by remedy.
-      // Only positive markerless remedy evidence exempts it from report triage.
+      && report.key !== chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])
+      && report.adopted !== false) {
+      // Adopted scoped intents can link an independently authored blocked-by
+      // remedy. Only positive markerless remedy evidence exempts it from
+      // report triage. A generated report stays gated even when its marker
+      // and original invocation and Call are rewritten away.
       const source = boundImplementationSource(db, journal, chain, report)
       const failure = source && prePrFileAndTest(source.invocations.at(-1)?.evidence?.error)
       const attempt = report.attempts[0]
@@ -1686,7 +1691,12 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         completedAt: Number(verifiedMerge!.invocation.evidence!.completedAt) }]
         : verified!.attempts.map(invocation => ({ invocation: invocation.id, call: invocation.callId!, completedAt: Number(invocation.evidence!.completedAt) })),
       issueNumber: existing?.number ?? null,
-      ...(existing && !REPORT_MARKER.test(existing.body) ? { adopted: true as const } : {}) }
+      // Scoped intents record reporter creation versus adoption, so a later
+      // body rewrite cannot turn a generated report into a linked remedy.
+      // Intents persisted before this record predate it and keep body evidence.
+      ...(existing && !REPORT_MARKER.test(existing.body) ? { adopted: true as const }
+        : cause === IMPLEMENTATION_CAUSE && implementationReport && key !== chainBasis([cause, chain.id])
+          ? { adopted: false as const } : {}) }
     // FULL durability precedes the external effect. A competing runtime or a
     // crash after this insert may reconcile, but may never create again.
     if (!enabled(db, chain.repository) || !allowed()) return null

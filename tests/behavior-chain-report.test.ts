@@ -1703,7 +1703,7 @@ it.each([
   expect(intents).toHaveLength(2)
   expect(intents.find(intent => intent.key === originalKey)).toEqual(JSON.parse(originalIntent.value))
   const scoped = intents.find(intent => intent.key !== originalKey)!
-  expect(scoped).toMatchObject({ source: chain.id, pull: null, issueNumber: lost ? null : 100,
+  expect(scoped).toMatchObject({ source: chain.id, pull: null, issueNumber: lost ? null : 100, adopted: false,
     attempts: [{ invocation: next.call.correlation_id, call: next.call.id }] })
   expect(scoped.key).toBe(chainBasis(['atomic_work_blocked', chain.id, next.call.correlation_id, scoped.holdSequence]))
   expect(posts()).toHaveLength(2)
@@ -1749,11 +1749,15 @@ it.each([
       .toContain('awaits a current explicit')
     remote[1] = original
   }
-  // A stripped generated report stays gated even when listed in blockedBy.
+  // A generated report rewritten to omit its marker and original invocation
+  // and Call IDs stays gated even when listed in blockedBy.
   {
     const original = { ...remote[1] }
     const prerequisites = fresh.prerequisites
     remote[1].body = remote[1].body.replace(`<!-- poise-repair-exhaustion:${scoped.key} -->`, '')
+      .split(scoped.attempts[0].invocation).join('').split(scoped.attempts[0].call).join('')
+    expect(remote[1].body).toContain(MEMORY_FILE)
+    expect(remote[1].body).toContain('keeps memory warnings correlatable')
     fresh.prerequisites = prePrPrerequisites([100])
     expect((await implementationReportAdmission(db, journal, report, await fixture.overrides.observe(report), fixture.overrides.observe)).reason)
       .toContain('awaits a current explicit')
@@ -1901,6 +1905,53 @@ it('keeps a shared blocked-by remedy ordinary when two source holds adopt it', a
   expect(posts()).toHaveLength(1)
 })
 
+it('keeps a pre-record shared blocked-by remedy ordinary after upgrade', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pre-pr-legacy-remedy-')); roots.push(root)
+  const path = join(root, 'journal.sqlite')
+  let { db, journal } = setup(path)
+  const { chain, call } = blockedImplementation(journal)
+  call.error = ingressError('a'.repeat(64), 'b'.repeat(32)); call.diagnostic = prePrDiagnostic()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  remote[0].state = 'closed'
+  record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  const next = blockedImplementation(journal)
+  next.call.error = memoryError('c'.repeat(64), 'd'.repeat(32)); next.call.diagnostic = prePrDiagnostic()
+  const remedy = issue(98, `Stabilize ${MEMORY_FILE} keeps memory warnings correlatable without logging command bodies under full validation.`)
+  remedy.labels = [{ name: 'poise' }]; remote.push(remedy)
+  fresh.prerequisites = prePrPrerequisites([98])
+  const overrides = { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [next.call], quarantined: [] }) }
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  const intents = reports(db).map(row => JSON.parse(row.value))
+  expect(intents).toHaveLength(2)
+  const scoped = intents.find(intent => intent.key !== chainBasis(['atomic_work_blocked', chain.id]))!
+  expect(scoped).toMatchObject({ source: chain.id, issueNumber: 98, adopted: true })
+  // Intents persisted before the adoption record lack it; downgrade both.
+  const legacy = JSON.parse(JSON.stringify(scoped))
+  delete legacy.adopted
+  db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(legacy), 'behavior_chain_repair_report:' + scoped.key)
+  const secondKey = chainBasis(['atomic_work_blocked', 'acme/repo#8', 'second-implementation', 5])
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('behavior_chain_repair_report:' + secondKey, JSON.stringify({
+    key: secondKey, source: 'acme/repo#8', pull: null, holdSequence: 5, heldAt: Date.now(), head: null,
+    basis: 'b'.repeat(64), slot: 'primary',
+    attempts: [{ invocation: 'second-implementation', call: 'c'.repeat(32), completedAt: Date.now() }],
+    issueNumber: 98 }))
+  expect(reports(db)).toHaveLength(3)
+  vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  const fixture = await reviewedImplementationReport(db, journal, next.call, 98)
+  expect(fixture.request).toHaveBeenCalledOnce()
+  expect(fixture.launch).toHaveBeenCalledOnce()
+  const admitted = journal.read('acme/repo#98')!.invocations.at(-1)!
+  expect(admitted).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+  expect(admitted.request.implementationSource).toBeUndefined()
+  expect(() => implementationReportBinding(db, journal.read('acme/repo#98')!)).not.toThrow()
+  expect(implementationReportBinding(db, journal.read('acme/repo#98')!)).toBeNull()
+  expect(journal.read(chain.id)).toMatchObject({ held: next.call.error })
+  expect(posts()).toHaveLength(1)
+})
+
 it('keeps a stripped generated report gated when a second source adopts it', async () => {
   const { db, journal } = setup()
   const { chain, call } = blockedImplementation(journal)
@@ -1921,10 +1972,15 @@ it('keeps a stripped generated report gated when a second source adopts it', asy
   const scoped = intents.find(intent => intent.key !== originalKey)!
   expect(scoped).toMatchObject({ source: chain.id, pull: null, issueNumber: 100,
     attempts: [{ invocation: next.call.correlation_id, call: next.call.id }] })
-  expect(scoped.adopted).toBeUndefined()
+  expect(scoped.adopted).toBe(false)
   expect(remote[1].body).toContain(`<!-- poise-repair-exhaustion:${scoped.key} -->`)
-  // Strip the marker, then a second source failing the same file/test adopts the same issue.
+  // Rewrite the marker and original invocation and Call IDs away, then a second
+  // source failing the same file/test adopts the same issue.
   remote[1].body = remote[1].body.replace(`<!-- poise-repair-exhaustion:${scoped.key} -->`, '')
+    .split(scoped.attempts[0].invocation).join('').split(scoped.attempts[0].call).join('')
+  expect(remote[1].body).toContain(MEMORY_FILE)
+  expect(remote[1].body).toContain('keeps memory warnings correlatable')
+  fresh.prerequisites = prePrPrerequisites([100])
   const secondKey = chainBasis(['atomic_work_blocked', 'acme/repo#8', 'second-implementation', 5])
   db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('behavior_chain_repair_report:' + secondKey, JSON.stringify({
     key: secondKey, source: 'acme/repo#8', pull: null, holdSequence: 5, heldAt: Date.now(), head: null,
