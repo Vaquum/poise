@@ -1127,6 +1127,21 @@ export class BehaviorChainRuntime {
         reason: 'native process exited without a durable Call receipt; its exit evidence must be reconciled before another effect' })
       return
     }
+    if (invocation.state === 'admitted' && invocation.behavior === 'implement-issue' && this.operations.implementationAdmission) {
+      const gate = await this.operations.implementationAdmission(chain, observation)
+      if (gate.reason) {
+        if (chain.waiting !== gate.reason) this.append(chain, { type: 'chain.waiting', reason: gate.reason })
+        return
+      }
+      // An admission that predates source binding cannot carry its launch
+      // precondition; retire it so a fresh admission binds the current source.
+      if (gate.source && !invocation.request.implementationSource) {
+        this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
+          evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
+        this.operations.wake()
+        return
+      }
+    }
     if (invocation.state === 'admitted') await this.start(chain, invocation)
   }
 }

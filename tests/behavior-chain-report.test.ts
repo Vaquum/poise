@@ -793,6 +793,69 @@ it('records explicit triage through the existing HTTP chain control and rejects 
   }
 })
 
+it('does not restart a pre-existing admitted report implementation without a disposition', async () => {
+  const { db, journal } = setup()
+  const fixture = await reviewedImplementationReport(db, journal)
+  let report = journal.read('acme/repo#99')!
+  const observation = await fixture.overrides.observe(report)
+  record(journal, report, { type: 'invocation.admitted', invocation: { id: 'stale-implement', behavior: 'implement-issue',
+    basis: chainBasis(['issue', observation.issue.revision]), actor: 'author', model: 'fixture', slot: reviewer.slot,
+    admittedAt: NOW - 60_000, request: { command: 'agent-interface', cwd: '/fixture',
+      argv: ['--atomic-work', report.id, '--model', 'fixture', '--expected-issue-revision', observation.issue.revision] } } })
+  const ops = operations(db, journal, { ...fixture.overrides, readInvocations: async () => ({ entries: [], quarantined: [] }) })
+  await new BehaviorChainRuntime(journal, ops).run()
+  expect(fixture.launch).not.toHaveBeenCalled()
+  const current = journal.read(report.id)!
+  expect(current.invocations.find(item => item.id === 'stale-implement')).toMatchObject({ behavior: 'implement-issue', state: 'admitted' })
+  expect(current.waiting).toContain('awaits a current explicit')
+  expect(posts()).toHaveLength(1)
+})
+
+it('retires a pre-disposition admitted report implementation once a distinct-fix is verified', async () => {
+  const { db, journal } = setup()
+  const fixture = await reviewedImplementationReport(db, journal)
+  let report = journal.read('acme/repo#99')!
+  await setImplementationReportDisposition(db, journal, report, report.sequence, implementationReportBinding(db, report), {
+    kind: 'distinct-fix', review: fixture.review, commentId: 700,
+    diagnosis: 'A distinct verified defect in main requires a repository fix.', nextAction: 'Implement that distinct fix.' })
+  report = journal.read(report.id)!
+  const observation = await fixture.overrides.observe(report)
+  record(journal, report, { type: 'invocation.admitted', invocation: { id: 'stale-implement', behavior: 'implement-issue',
+    basis: chainBasis(['issue', observation.issue.revision]), actor: 'author', model: 'fixture', slot: reviewer.slot,
+    admittedAt: NOW - 60_000, request: { command: 'agent-interface', cwd: '/fixture',
+      argv: ['--atomic-work', report.id, '--model', 'fixture', '--expected-issue-revision', observation.issue.revision] } } })
+  const ops = operations(db, journal, { ...fixture.overrides, readInvocations: async () => ({ entries: [], quarantined: [] }) })
+  await new BehaviorChainRuntime(journal, ops).run()
+  expect(fixture.launch).not.toHaveBeenCalled()
+  expect(journal.read(report.id)?.invocations.find(item => item.id === 'stale-implement'))
+    .toMatchObject({ state: 'settled', outcome: 'launch_deferred' })
+  await new BehaviorChainRuntime(journal, ops).run()
+  expect(fixture.launch).toHaveBeenCalledOnce()
+  const current = journal.read(report.id)!
+  expect(current.invocations.at(-1)).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+  expect(current.invocations.at(-1)?.request.implementationSource).toMatchObject({ id: 'acme/repo#7' })
+  expect(posts()).toHaveLength(1)
+})
+
+it('blocks implementation when the report acknowledgement was lost and publishing is disabled', async () => {
+  const { db, journal } = setup()
+  const fixture = await reviewedImplementationReport(db, journal)
+  const stored = JSON.parse(reports(db)[0].value)
+  stored.issueNumber = null
+  db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(stored), `behavior_chain_repair_report:${stored.key}`)
+  expect(implementationReportBinding(db, journal.read('acme/repo#99')!)).toBeNull()
+  vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  const ops = operations(db, journal, { ...fixture.overrides, readInvocations: async () => ({ entries: [], quarantined: [] }) })
+  await new BehaviorChainRuntime(journal, ops).run()
+  expect(fixture.request).not.toHaveBeenCalled()
+  expect(fixture.launch).not.toHaveBeenCalled()
+  const current = journal.read('acme/repo#99')!
+  expect(current.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
+  expect(current.waiting).toContain('awaits a current explicit')
+  expect(JSON.parse(reports(db)[0].value).issueNumber).toBe(99)
+  expect(posts()).toHaveLength(1)
+})
+
 it.each([false, true])('reports the #1664 terminal repair sequence once without recovery (lost acknowledgement=%s)', async lost => {
   const { db, journal } = setup()
   const { chain, call } = blockedRepair(journal)

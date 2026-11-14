@@ -487,6 +487,18 @@ export function implementationReportBinding(db: Database, chain: BehaviorChain) 
     disposition: report.disposition ?? null } : null
 }
 
+function unconfirmedImplementationReports(db: Database, repository: string): RepairReport[] {
+  const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
+    AND json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.issueNumber') IS NULL`)
+    .all(PREFIX + '*', repository.toLowerCase() + '#*') as Array<{ key: string, value: string }>
+  return rows.flatMap(row => {
+    const report = JSON.parse(row.value) as RepairReport
+    const key = chainBasis([IMPLEMENTATION_CAUSE, report.source])
+    if (row.key === PREFIX + key && report.key !== key) throw new Error('Implementation report conflicts with its durable source intent')
+    return row.key === PREFIX + report.key && report.key === key ? [report] : []
+  })
+}
+
 function boundImplementationSource(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain, report: RepairReport) {
   const source = journal.read(report.source), attempt = report.attempts[0]
   const invocation = source?.invocations.at(-1)
@@ -563,9 +575,30 @@ export async function setImplementationReportDisposition(db: Database, journal: 
 /** Runs at implementation admission even when new report publishing is off. */
 export async function implementationReportAdmission(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, observe: (source: BehaviorChain) => Promise<ChainObservation>) {
-  const report = implementationReport(db, chain)
-  if (!report) return { reason: null }
   const wait = 'Implementation hold report awaits a current explicit source-only or verified distinct-fix disposition'
+  let report = implementationReport(db, chain)
+  if (!report) {
+    // A lost creation acknowledgement leaves the stored intent without its
+    // issue number while GitHub already serves the report to intake. Match
+    // such intents against this chain before allowing implementation.
+    for (const candidate of unconfirmedImplementationReports(db, chain.repository)) {
+      let issue
+      try {
+        issue = await reconcileRepairReport(chain.repository, `<!-- poise-repair-exhaustion:${candidate.key} -->`, chain.issue)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (message.includes('identity differs')) continue
+        return { reason: `${wait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
+      }
+      if (issue?.number === chain.issue) {
+        candidate.issueNumber = chain.issue
+        db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(candidate), PREFIX + candidate.key)
+        report = candidate
+        break
+      }
+    }
+    if (!report) return { reason: null }
+  }
   const disposition = report.disposition
   if (!disposition || !['source-only', 'distinct-fix'].includes(disposition.kind)
     || !dispositionReview(chain, observation, disposition)) return { reason: wait }
