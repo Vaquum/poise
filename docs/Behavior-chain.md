@@ -300,6 +300,16 @@ existing resume event records `ciRecovery`. The normal decision path then
 rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
+When a fresh conflict on the retained failed head prevents a clean base update,
+the same settled receipt and resource proof can instead release the hold for
+the existing `repair-pr --merge-base` path. The ordinary repair, ownership,
+closure and queue guards must permit that repair; an unchanged, merely behind
+or unrelated changed head does not qualify. Automatic release preserves
+`resumedAfterSequence`, so another CI-only failure and hold cannot replenish
+the three-attempt budget on the same repair basis, including after restart.
+The original failed CI receipt remains unchanged and unresolved by admission;
+the published repair still requires fresh head checks, reviews, approval and
+the normal queue gates.
 Work impact and attention describe this automatic CI recheck instead of asking
 for Resume; attention retains the scheduled `reconciliation.nextObservationAt`.
 Unsettled original receipts and resources still require reconciliation first.

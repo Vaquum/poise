@@ -1534,7 +1534,9 @@ declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 The same reconciliation can release a CI-only hold after a proven clean base
-update, retaining the original Call, resource-release proof and remaining gates
+update, or admit the existing scoped repair when a fresh conflict on the retained
+failed head blocks that update, retaining the original Call, resource-release
+proof, repair retry bound and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 For a pre-PR implementation, the existing Caller artifact and seed read can
 instead verify an original CI assertion failure on its exact prepared base and
