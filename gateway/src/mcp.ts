@@ -4,7 +4,7 @@ import { pagePrincipal, postPrincipal } from './auth.js'
 import { signAssertion } from './assertion.js'
 import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
-import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES, isMcpRecordId, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
+import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES, isMcpRecordId, isMcpRepository, mcpRepositoryAllowed, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
 import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
 import { html, page } from './pages.js'
@@ -94,6 +94,7 @@ export class McpGateway {
         <form method="post" action="/mcp/authorize"><input type="hidden" name="csrf" value="${principal.session.csrf}">
         <input type="hidden" name="request" value="${url.searchParams.toString()}">
         <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata</label>
+        <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
         <button name="decision" value="approve">Allow read access</button><button name="decision" value="deny">Deny</button></form></div>`), authorizeHeaders)
     }
     if (url.pathname === '/mcp/authorize' && req.method === 'POST') {
@@ -105,12 +106,15 @@ export class McpGateway {
       if (form.get('decision') === 'deny') target.searchParams.set('error', 'access_denied')
       else {
         if (form.get('decision') !== 'approve') throw new HttpError(400, 'invalid_request')
+        const repository = form.get('repository')?.trim()
+        if (repository && !isMcpRepository(repository)) throw new HttpError(400, 'repository restriction must be owner/repository')
         for (const [key, value] of this.codes) if (value.expires <= ctx.deps.now()) this.codes.delete(key)
         if (this.codes.size >= 256) throw new HttpError(429, 'too_many_requests')
         const code = newSecret()
         this.codes.set(hashSecret(code), { ...auth, expires: ctx.deps.now() + 60_000, redirects: this.grants.redirects(auth.client),
           scope: { resource: this.resource, handle: principal.user.handle, ownerId: principal.user.githubId,
-            ...(form.get('chatMetadata') === '1' ? { chatMetadata: true } : {}) } })
+            ...(form.get('chatMetadata') === '1' ? { chatMetadata: true } : {}),
+            ...(repository ? { repository } : {}) } })
         target.searchParams.set('code', code)
       }
       return redirect(res, target.href, 303)
@@ -150,6 +154,7 @@ export class McpGateway {
         return sendHtml(res, 200, page('Connected agents', html`<div class="card"><h1>Connected agents</h1><p>Read grants for ${principal.user.login}'s workspace.</p>
           ${grants.map(grant => html`<div><p>Client ${grant.clientId} · ${grant.revokedAt ? 'Revoked' : grant.expiresAt <= ctx.deps.now() ? 'Expired' : 'Active'} · expires ${new Date(grant.expiresAt).toISOString()}</p>
             <p>Allowed tools ${grant.tools.join(', ')}</p>
+            ${grant.repository ? html`<p>Repository ${grant.repository}</p>` : ''}
             <form method="post" action="/mcp/grants"><input type="hidden" name="csrf" value="${principal.session.csrf}">
             <input type="hidden" name="id" value="${grant.grantId}"><button>Revoke</button></form></div>`)}</div>`), ctx.pageHeaders)
       }
@@ -200,6 +205,9 @@ export class McpGateway {
     if (!grant.tools.includes(read.name)) {
       return result({ isError: true, content: [{ type: 'text', text: 'tool not authorized by this grant; reconnect to grant consent' }] })
     }
+    if (read.name === 'poise_work' && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
+      return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
+    }
     const minute = Math.floor(ctx.deps.now() / 60_000)
     for (const [key, value] of this.reads) if (value.minute !== minute && !value.active) this.reads.delete(key)
     const rate = this.reads.get(grant.grantId) ?? { minute, count: 0, active: 0 }
@@ -222,7 +230,8 @@ export class McpGateway {
     if (!(await ctx.deps.orchestrator.readiness(owner.handle, owner.login)).ready) throw new HttpError(503, 'workspace_read_unavailable')
     const target = ctx.deps.upstream(owner.handle), payload = JSON.stringify(read)
     const scope: McpGrantScope = { resource: grant.resource, ownerId: grant.ownerId, handle: grant.handle, grantId: grant.grantId,
-      ...(grant.chatMetadata && grant.tools.includes('poise_get') ? { chatMetadata: true } : {}) }
+      ...(grant.chatMetadata && grant.tools.includes('poise_get') ? { chatMetadata: true } : {}),
+      ...(grant.repository === undefined ? {} : { repository: grant.repository }) }
     const identity = signAssertion(ctx.deps.keys.privateKey, { handle: owner.handle, login: owner.login, scope: 'mcp', mcp: scope }, ctx.deps.now())
     let text: string
     try {
@@ -255,7 +264,8 @@ export class McpGateway {
     }
     const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: grant.tools.filter(tool => tools.includes(tool)) } }
     if (read.name === 'poise_describe') return { ...described,
-      access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString() },
+      access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString(),
+        repository: grant.repository ?? null },
       inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools),
       runbooks: RUNBOOKS, instructions: INSTRUCTIONS }
     if (read.name === 'poise_get') {
@@ -263,6 +273,7 @@ export class McpGateway {
       const record = lookup?.record
       if (!lookup || typeof lookup.observedAt !== 'string' || !Number.isFinite(Date.parse(lookup.observedAt)) || (record !== null && (!record
         || record.kind !== read.arguments.kind || record.id !== read.arguments.id
+        || !mcpRepositoryAllowed(grant, typeof record.repository === 'string' ? record.repository : null)
         || (record.kind === 'timer' && !isMcpRecordId(record.chatId))
         || (record.kind === 'chat' && (!Array.isArray(record.timerIds) || !record.timerIds.every(isMcpRecordId)))))) {
         throw new HttpError(502, 'invalid_workspace_record_scope')

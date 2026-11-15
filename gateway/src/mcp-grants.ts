@@ -49,8 +49,9 @@ export class McpGrants {
   }
   list(ownerId: number): McpGrant[] {
     return (this.db.prepare('SELECT state FROM mcp_grants WHERE owner = ? ORDER BY id LIMIT 100').all(ownerId) as { state: string }[])
-      .map(row => JSON.parse(row.state) as StoredGrant).map(({ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools, chatMetadata }) =>
-        ({ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools: grantedTools(tools, chatMetadata) }))
+      .map(row => JSON.parse(row.state) as StoredGrant).map(({ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools, chatMetadata, repository }) =>
+        ({ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools: grantedTools(tools, chatMetadata),
+          ...(repository === undefined ? {} : { repository }) }))
   }
   create(scope: Omit<McpGrantScope, 'grantId'>, clientId: string, redirects: string[]) {
     this.db.prepare("DELETE FROM mcp_grants WHERE json_extract(state, '$.expiresAt') <= ?").run(this.now())
