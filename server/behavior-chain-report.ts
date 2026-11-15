@@ -907,12 +907,9 @@ export async function setImplementationReportDisposition(db: Database, journal: 
 /** Runs at implementation admission even when new report publishing is off. */
 export async function implementationReportAdmission(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, observe: (source: BehaviorChain) => Promise<ChainObservation>) {
-  if (chain.testRecovery?.triage) {
-    const admission = chain.invocations.find(invocation => invocation.id === chain.testRecovery!.admission)
-    if (!admission || admission.state === 'admitted') {
-      return diagnosedSourceAdmission(db, journal, chain, observation, observe)
-    }
-  }
+  const recovery = chain.testRecovery
+  const recoveringSource = recovery?.triage && (!recovery.admission
+    || chain.invocations.some(item => item.id === recovery.admission && item.state === 'admitted'))
   const implWait = 'Implementation hold report awaits a current explicit source-only or verified distinct-fix disposition'
   const repairWait = 'Repair hold report awaits a current explicit existing-remedy or verified distinct-fix disposition'
   let report = implementationReport(db, chain)
@@ -940,6 +937,7 @@ export async function implementationReportAdmission(db: Database, journal: Behav
   }
   if (report) {
     const wait = report.pull === null ? implWait : repairWait
+    if (recoveringSource) return { reason: `${wait}: this issue is itself a generated report` }
     const disposition = report.disposition
     const allowed = report.pull === null ? ['source-only', 'distinct-fix'] : ['existing-remedy', 'distinct-fix']
     if (!disposition || !allowed.includes(disposition.kind)
@@ -1001,8 +999,9 @@ export async function implementationReportAdmission(db: Database, journal: Behav
         break
       }
     }
-    if (!review) return { reason: null }
+    if (!review) return recoveringSource ? diagnosedSourceAdmission(db, journal, chain, observation, observe) : { reason: null }
   }
+  if (recoveringSource) return { reason: `${reviewWait}: this issue is itself a generated report` }
   const reviewDisposition = review.disposition
   if (!reviewDisposition || !['source-only', 'distinct-fix'].includes(reviewDisposition.kind)
     || !dispositionReview(chain, observation, reviewDisposition)) return { reason: reviewWait }
@@ -1467,8 +1466,8 @@ async function recoverImplementationTriage(db: Database, journal: BehaviorChainJ
   if (source.testHold || source.ciHold || source.testRecovery?.admission || source.mergeSha || source.supersession
     || (!source.held && !source.testRecovery?.triage) || observation.pull || !enabled(db, source.repository) || !allowed() || signal?.aborted) return null
   const exact = prePrReports(db, source.id).filter(({ report }) => report.issueNumber && originalTriageSource(db, source, observation, report))
-  if (exact.length !== 1) return null
-  const saved = exact[0], report = saved.report
+  if (exact.length !== 1 || implementationReport(db, source) || reviewReport(db, source)) return null
+  const report = exact[0].report
   const pending = (reason: string) => `${IMPLEMENTATION_TRIAGE_WAIT} ${reason} (report #${report.issueNumber}, Call ${report.attempts[0].call})`
   if (report.disposition && !report.disposition.triage) return null
   const target = journal.read(chainIdentity(source.repository, report.issueNumber!))

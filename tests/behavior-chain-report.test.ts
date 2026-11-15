@@ -1515,24 +1515,26 @@ it.each(['clean failure', 'candidate-only', 'missing', 'different failure'] as c
     if (mode === 'candidate-only') expect(probes).toEqual([subject(1).trim(), subject(2).trim()])
   })
 
-it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'stale base', 'publication', 'operator hold', 'interrupted'] as const)(
+it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'stale base', 'stale during source preparation',
+  'stale during report preparation', 'publication', 'operator hold', 'interrupted'] as const)(
   'diagnoses the current reviewed pre-PR hold through ordinary admission (%s)', async mode => {
     const root = mkdtempSync(join(tmpdir(), 'implementation-triage-')); roots.push(root)
     const path = join(root, 'journal.sqlite')
     let { db, journal } = setup(path)
+    const sourceOnly = mode === 'source-only' || mode === 'stale during source preparation'
     const capture = { status: 'available', base: HEAD, candidate: 'd'.repeat(64), run: 'c'.repeat(32), bytes: 1024,
       sha256: '6'.repeat(64), expires_at: NOW / 1000 + 86400 }
     const fixture = await reviewedImplementationReport(db, journal, call => {
       call.error = INCIDENT_1855
       call.artifact = { ...call.artifact!, prepared: { repository: 'acme/repo', issue_number: 7, branch: 'poise/issue-7',
         actor: 'author', checkout_head: HEAD, pull_number: null, head_sha: null },
-      ...(mode === 'source-only' ? { failed_source: capture } : {}) }
+      ...(sourceOnly ? { failed_source: capture } : {}) }
       fresh.prerequisites = { wait: null, base: HEAD, evidence: [] }
     })
     const invoke = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, options) => {
       if (command === 'agent-interface') {
-        expect(mode).toBe('source-only')
+        expect(sourceOnly).toBe(true)
         expect(args).toEqual(['--read-failed-source', fixture.call.id, capture.candidate, capture.run, '--diagnosis', expect.stringMatching(/^[a-f0-9]{64}$/)])
         return { stdout: JSON.stringify({ ...capture, path: '/private/fixture-capture' }), stderr: '' }
       }
@@ -1561,11 +1563,11 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'sta
         { file: 'tests/behavior-chain-reconciliation.test.ts',
           test: 'refreshes one held red candidate and reconciles its original Call across restart and another base advance: accepted response',
           message: "expected 'CI failed' to be null" },
-        mode === 'source-only' ? { path: '/private/fixture-capture', call: fixture.call.id, capture } : null, expect.any(AbortSignal))
+        sourceOnly ? { path: '/private/fixture-capture', call: fixture.call.id, capture } : null, expect.any(AbortSignal))
       if (mode === 'stale report') remote[0].body += '\nRevised scope'
       if (mode === 'stale base') fresh.prerequisites!.base = 'e'.repeat(40)
       finish(mode === 'missing evidence' ? { kind: 'inconclusive', reason: missing }
-        : { kind: mode === 'source-only' ? 'source-only' : 'distinct-fix' })
+        : { kind: sourceOnly ? 'source-only' : 'distinct-fix' })
       await waitForImplementationRechecks()
       if (mode === 'interrupted') db.prepare(`UPDATE meta SET value=json_set(value,'$.outcome',NULL)
         WHERE key GLOB 'behavior_chain_implementation_triage:*'`).run()
@@ -1583,6 +1585,14 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'sta
       recoverReport: (target, observation) => recoverReportedRepair(db, journal, target, observation, fixture.overrides.observe, () => true),
     }))
     await waitForImplementationRechecks()
+    if (mode === 'stale during source preparation' || mode === 'stale during report preparation') {
+      const originalRequest = fixture.request.getMockImplementation()!
+      fixture.request.mockImplementation(async (...args) => {
+        const request = await originalRequest(...args)
+        if (args[2].behavior === 'implement-issue') fresh.prerequisites!.base = 'e'.repeat(40)
+        return request
+      })
+    }
     await runtime().run()
     const report = journal.read('acme/repo#99')!
     const current = journal.read(source.id)!
@@ -1613,6 +1623,12 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'sta
       expect(sourceImplementations).toHaveLength(1)
       expect(current.held).toBe(source.held)
       expect(fixture.launch).toHaveBeenCalledOnce()
+    } else if (mode === 'stale during source preparation' || mode === 'stale during report preparation') {
+      expect(fixture.request).toHaveBeenCalledOnce()
+      expect(fixture.launch).not.toHaveBeenCalled()
+      expect(reportImplementations).toHaveLength(0)
+      expect(sourceImplementations).toHaveLength(1)
+      expect(current.testRecovery?.admission).toBeUndefined()
     } else {
       expect(reportImplementations).toHaveLength(0)
       expect(sourceImplementations).toHaveLength(1)
