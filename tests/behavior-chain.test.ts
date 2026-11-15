@@ -4,7 +4,7 @@ import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, ty
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, ReviewScopeIndexingError, implementationPrerequisiteWait, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { behaviorChainAttention, behaviorChainSummary, CHAIN_ATTENTION_DELAY_MS, chainProgress, chainProgressOf } from '../server/behavior-chain-summary'
-import type { LogEntry } from '../server/agent-log-parse'
+import { parseAgentLogList, type LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
 import { reviewContinuationArgs } from '../server/review-continuation'
@@ -578,6 +578,96 @@ describe('native admission and recovery', () => {
       readActionResult: async () => { throw new Error('unexpected native response read') },
       fenceClosedTarget: async () => { throw new Error('unexpected closed-target fence') }, wake: () => {}, ...overrides }
   }
+
+  it.each(['already_queued', 'push_rejected', 'contradictory'])('settles %s only with original no-write evidence and resource release', async kind => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    try {
+      const { journal, chain } = setup()
+      const obs = observation(); pull(obs)
+      obs.pull!.queueEntry = 'external-entry'
+      let current = reviewed(journal, chain, obs)
+      const repair = invocation('original-repair', 'repair-pr', chainBasis(['repair', HEAD]))
+      const callId = 'c'.repeat(32)
+      repair.admittedAt = NOW - 1000
+      repair.request.argv = ['--atomic-work', `${chain.repository}#7`, '--branch', chain.branch, '--pull-number', '21', '--expected-head', HEAD]
+      repair.request.context = { head: HEAD, reviewRevision: 'findings-1', queueRemoval: 'old-removal' }
+      current = record(journal, current, { type: 'chain.observed', observation: obs })
+      current = record(journal, current, { type: 'invocation.admitted', invocation: repair })
+      record(journal, current, { type: 'invocation.started', invocationId: repair.id })
+      const call: LogEntry = { id: callId, correlation_id: repair.id, source: 'poise:behavior-chain', repo: chain.repository,
+        pr_id: '21', actor: chain.author, model: REVIEWER.model, behavior: 'repair_pr', session_id: null, prompt: '',
+        started_at: new Date(NOW - 1000).toISOString(), completed_at: new Date(NOW).toISOString(), time_elapsed: '1s',
+        status: 'completed', action: 'not_started', outcome: 'repair_queue_blocked', head_sha: null, expected_head: HEAD,
+        response: null, error: '', resources_settled_at: null, resource_ownership: { version: 1, roots: [], errors: [] },
+        artifact: { phase: 'repair_queue_blocked', plan_sha: 'a'.repeat(64), prepared: { repository: chain.repository,
+          branch: chain.branch, pull_number: 21, head_sha: HEAD, checkout_head: HEAD }, queue_blocker: {
+          kind: kind === 'contradictory' ? 'push_rejected' : kind,
+          repository: chain.repository, pull_number: 21, ref: `refs/heads/${chain.branch}`, head: HEAD, call_id: callId,
+          checked_at: new Date(NOW - 250).toISOString(),
+          ...(kind === 'already_queued' ? { entry_id: 'external-entry' } : { attempted_head: NEXT, rejection_code: 'GH006' }) },
+        ...(kind === 'already_queued' ? {} : { publication_head: NEXT, replies_started: kind === 'contradictory' }) } }
+      const calls = [call]
+      const launch = vi.fn(async (admission: ChainInvocation) => {
+        calls.push({ ...call, id: 'd'.repeat(32), correlation_id: admission.id, status: 'running', action: null,
+          outcome: null, completed_at: null, artifact: null, resources_settled_at: null })
+        return true
+      })
+      const received = vi.fn()
+      const ops = operations({ launch, received, observe: async () => ({ ...structuredClone(obs), checkedAt: Date.now() }),
+        readInvocations: async () => {
+          const snapshot = parseAgentLogList(calls)
+          expect(snapshot.quarantined).toEqual([])
+          return snapshot
+        } })
+      await new BehaviorChainRuntime(journal, ops).run()
+      expect(journal.read(chain.id)!.invocations.at(-1)).toMatchObject({ state: 'uncertain' })
+      expect(received).not.toHaveBeenCalled()
+      expect(launch).not.toHaveBeenCalled()
+
+      call.resources_settled_at = new Date(NOW).toISOString()
+      await new BehaviorChainRuntime(journal, ops).run()
+      journal.rebuild()
+      current = journal.read(chain.id)!
+      if (kind === 'contradictory') {
+        expect(current.invocations.at(-1)).toMatchObject({ state: 'uncertain', evidence: { queueBlockerConflict: true } })
+        call.artifact!.replies_started = false
+        await new BehaviorChainRuntime(journal, ops).run()
+        expect(journal.read(chain.id)!.invocations.at(-1)).toMatchObject({ state: 'uncertain', evidence: { queueBlockerConflict: true } })
+        expect(launch).not.toHaveBeenCalled()
+        return
+      }
+      expect(current.invocations.at(-1)).toMatchObject({ state: 'settled', callId, outcome: 'repair_queue_blocked',
+        evidence: { status: 'deferred', nativeCallStatus: 'completed', action: 'not_started', head_sha: null,
+          artifact: { plan_sha: 'a'.repeat(64), queue_blocker: { kind } } } })
+      expect(received).toHaveBeenCalledTimes(1)
+      expect(launch).not.toHaveBeenCalled()
+      obs.pull!.queueEntry = null
+      obs.pull!.queueRemoval = { id: 'old-removal', reason: 'failed_checks', at: NOW, actor: null }
+      expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'queue entry disappeared; awaiting GitHub removal evidence' })
+      obs.pull!.queueRemoval = { id: 'new-removal', reason: 'manual', at: NOW, actor: 'maintainer' }
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'hold', reason: expect.stringContaining('manual') })
+
+      clock.mockReturnValue(NOW + 60_000)
+      if (kind === 'push_rejected') {
+        obs.issue.open = false
+        Object.assign(obs.pull!, { state: 'closed', merged: true, mergeSha: MERGE, mergedAt: Date.now(), queueRemoval: null })
+        Object.assign(obs.publication, { state: 'closed', merged: true, merge_sha: MERGE })
+      } else {
+        obs.pull!.queueRemoval.reason = 'failed_checks'
+      }
+      await new BehaviorChainRuntime(journal, ops).run()
+      await new BehaviorChainRuntime(journal, ops).run()
+      current = journal.read(chain.id)!
+      expect(current.invocations.filter(item => item.outcome === 'repair_queue_blocked')).toHaveLength(1)
+      if (kind === 'push_rejected') {
+        expect(current).toMatchObject({ mergeSha: MERGE, reviewPending: true })
+        expect(launch).not.toHaveBeenCalled()
+      } else {
+        expect(current.invocations.at(-1)).toMatchObject({ behavior: 'repair-pr', state: 'started' })
+        expect(launch).toHaveBeenCalledTimes(1)
+      }
+    } finally { clock.mockRestore() }
+  })
 
   it.each(['one slot', 'bounded memory', 'spare slot'] as const)('preserves review admission order across runtimes with %s', async limit => {
     vi.spyOn(Date, 'now').mockReturnValue(NOW)

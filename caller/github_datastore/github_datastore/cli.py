@@ -93,6 +93,7 @@ def main(argv: list[str] | None = None) -> None:
     view_parser.add_argument("--number", type=int)
     view_parser.add_argument("--updated-since-datetime")
     view_parser.add_argument("--created-since-datetime")
+    view_parser.add_argument("--created-before-datetime")
     view_parser.add_argument("--created-at-datetime")
     view_parser.add_argument("--limit", type=int)
     view_parser.add_argument("--review-after", type=int, default=0)
@@ -179,7 +180,8 @@ def run_view(db_path: Path, args: argparse.Namespace) -> str:
     if args.name == "pr":
         return views.pr(**common)
     if args.name == "issue":
-        return views.issue(**common, label=args.label, after_repo=args.after_repo, after_number=args.after_number)
+        return views.issue(**common, label=args.label, after_repo=args.after_repo, after_number=args.after_number,
+                           created_before_datetime=args.created_before_datetime)
     if args.name == "user":
         return views.user(username=args.username, item_type=args.item_type, **common)
     if args.name == "pr-reviews":

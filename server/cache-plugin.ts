@@ -4,6 +4,8 @@ import { localLogging, stopLoggingApi } from './logging-api'
 import { startBehaviorLedger, stopBehaviorLedger } from './behavior-ledger'
 import { handleBehaviorLedger } from './behavior-ledger-http'
 import { handleMcpRead } from './mcp'
+import { handleMcpControl } from './mcp-manager'
+import { handleMcpOwner } from './mcp-owner'
 import { handleBehaviorPrStatus } from './behavior-pr-status'
 import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
@@ -48,7 +50,7 @@ import { workspaceOf } from './extensions/types'
 import { listSessions } from './chat/storage'
 import { handleGoogleApi } from './google/api'
 import { validateGoogleEnvironment } from './google/accounts'
-import { getBehaviorDiagnosticIncidents } from './behaviors'
+import { getBehaviorChainRuntimeHealth, getBehaviorDiagnosticIncidents } from './behaviors'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, setReviewCap as setBehaviorReviewCap, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getReviewCap, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isValidReviewCap, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, getCloseOldPrsLastFired, getCloseOldPrsDays, setCloseOldPrsDays, isValidCloseOldPrsDays, setPaused as setBehaviorPaused, getPausedUntil as getBehaviorPausedUntil, getPausedBy as getBehaviorPausedBy, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceRuntime, stopStorageMaintenanceRuntime, storageStatus } from './storage-maintenance'
@@ -69,7 +71,7 @@ import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
 import { setCallerAccounts } from './process'
 import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, handleSelfUpdateTurnedOff, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
-import { releaseBackgroundPaused } from './release-background'
+import { releaseBackgroundPaused, releaseSwitchPending } from './release-background'
 import { applyServiceEnvironment, readServiceConfig, type ServiceConfig } from './service/config'
 import { DRAINING_ERROR, ServiceControl, handleServiceApi } from './service/control'
 import { countDebate } from './service/caller-calls'
@@ -404,7 +406,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         } catch (err) {
           return json(res, httpStatus(err, 403), { error: (err as Error).message })
         }
-        if (path === '/api/mcp/read') return handleMcpRead(req, res, service, authority)
+        if (path === '/api/mcp/read') return handleMcpRead(req, res, service, authority, chatRuntime?.instance, chatControl?.status().running)
+        if (path === '/api/mcp/manager') return handleMcpControl(req, res, authority, chatControl)
+        if (path === '/api/mcp/owner' && service) return handleMcpOwner(req, res, authority, service.owner)
         if (path === '/api/behavior-ledger/pr-status') {
           return handleBehaviorPrStatus(req, res, url)
         }
@@ -489,13 +493,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (path === '/api/behavior-chains') return handleBehaviorChains(req, res, url, chatRuntime?.instance)
 
         if (url === '/api/health' && req.method === 'GET') {
-          const scheduler = getBehaviorsRuntimeHealth()
           const claudeAuthState = auth.snapshot()
           const [callerRelease, production] = await Promise.all([
             getCallerReleaseHealth(),
             service ? productionUpdaterOff() : getProductionUpdateHealth(),
           ])
           const organizations = getOrganizations()
+          const scheduler = getBehaviorsRuntimeHealth()
           const requiresClaude = () => {
             const enabled = getEnabledMap()
             return enabled['review-new-prs'] || enabled['approve-prs'] || enabled['review-new-issues']
@@ -516,9 +520,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           // `status`, or `scheduler.status`, which the release judge, the
           // browser watcher and the health monitor read as before.
           const split = dependencySnapshot()
+          const releasePauseReason = releaseBackgroundPaused() ? 'drain' : releaseSwitchPending() ? 'switch_pending' : null
+          const followed = new Set(organizations.map(({ login }) => login.toLowerCase()))
           return json(res, healthy ? 200 : 503, {
             status: healthy ? 'ok' : 'degraded',
-            scheduler,
+            scheduler: {
+              ...scheduler,
+              releaseAdmission: { paused: releasePauseReason !== null, reason: releasePauseReason },
+              organizationSweeps: getBehaviorChainRuntimeHealth().filter(({ organization }) => followed.has(organization)),
+            },
             organizations,
             claudeAuth: claudeAuthState,
             callerRelease,

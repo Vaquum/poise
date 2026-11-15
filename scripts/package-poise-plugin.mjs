@@ -15,13 +15,14 @@ export async function packagePoisePlugin(apex, destination) {
   await mkdir(resolve(root, '.agents/plugins'), { recursive: true })
   const json = async (path, value) => writeFile(resolve(root, path), JSON.stringify(value, null, 2) + '\n', { flag: 'wx' })
   await json('plugins/poise/plugin.json', {
-    $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', name: 'poise', version: '1.0.0',
+    $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', name: 'poise', version: '1.3.0',
     description: `Read the Poise work trail at ${origin.origin}`,
   })
+  // Codex desktop rejects extensions on portable MCP servers. The gateway
+  // advertises its OAuth registration, resource and scope through discovery.
   await json('plugins/poise/mcp.json', {
     $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
-    mcpServers: { poise: { type: 'streamable-http', url: `${origin.origin}/mcp`,
-      extensions: { 'com.openai': { auth: { type: 'oauth', client: { mode: 'dcr' }, baseScopes: ['poise:read'] } } } } },
+    mcpServers: { poise: { type: 'streamable-http', url: `${origin.origin}/mcp` } },
   })
   await cp(new URL('../plugins/poise/skills', import.meta.url), resolve(root, 'plugins/poise/skills'), { recursive: true, errorOnExist: true, force: false })
   await json('.agents/plugins/marketplace.json', { name: `poise-${origin.hostname.replaceAll('.', '-')}`,

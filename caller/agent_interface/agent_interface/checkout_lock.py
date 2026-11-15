@@ -25,7 +25,7 @@ from threading import Event, Thread, current_thread, main_thread
 from time import monotonic, sleep, time
 from uuid import uuid4
 
-from . import native_namespace, resource_ownership
+from . import native_namespace, resource_ownership, review_receipt, review_watch
 from .provider_progress import ProviderStream
 from .review_watch import RateLimitAbort
 
@@ -489,7 +489,8 @@ def _interrupted(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, timeout: float, input: str = "", provider: str | None = None) -> subprocess.CompletedProcess:
+def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, timeout: float, input: str = "", provider: str | None = None,
+              head_watch: review_watch.ReviewWatch | None = None) -> subprocess.CompletedProcess:
     """Run the native writer under the lease. A gate leads a fresh process
     group and starts the agent only after it is registered in the lease and
     told GO over a pipe only we hold; it reports `STARTED` on a second pipe,
@@ -527,6 +528,7 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                 pass
             lease.start_heartbeat()
             deadline = monotonic() + timeout
+            next_head_check = monotonic() + review_watch.POLL_SECONDS
             while process.poll() is None:
                 events.read(stdout)
                 if limited:
@@ -539,6 +541,15 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                 if remaining <= 0:
                     _stop_group(process)
                     raise subprocess.TimeoutExpired(args, timeout)
+                if head_watch is not None and monotonic() >= next_head_check:
+                    changed = head_watch.changed_head(min(review_watch.HEAD_TIMEOUT_SECONDS, remaining))
+                    next_head_check = monotonic() + review_watch.POLL_SECONDS
+                    # Completion keeps its normal validation; only a fresh
+                    # observation and a winning durable fence can interrupt.
+                    if process.poll() is None and changed and changed != head_watch.head \
+                            and review_receipt.supersede_repair(head_watch.head, changed):
+                        raise review_watch.ReviewSuperseded(changed)
+                    continue
                 try:
                     process.wait(timeout=min(POLL_SECONDS, remaining))
                 except subprocess.TimeoutExpired:

@@ -1080,6 +1080,27 @@ class TestProcessesAndErrors(TestCase):
                 (own / "environ").write_bytes(b"TMPDIR=/elsewhere\0")
                 self.assertEqual(issue_review._cwd_pids(root, require_complete=True), [])
 
+    def test_process_inventory_cannot_release_an_unreadable_older_live_process(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work) / "owned"
+            root.mkdir()
+            older = Path(work) / "424241"
+            older.mkdir()
+            (older / "stat").write_text("424241 (older) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 1 0 0")
+            proc = Mock()
+            proc.is_dir.return_value = True
+            proc.iterdir.side_effect = lambda: iter([older])
+            readlink = os.readlink
+
+            def read_owned_link(path):
+                if path == older / "cwd":
+                    raise PermissionError("cannot inspect the original process")
+                return readlink(path)
+
+            with patch.object(issue_review, "Path", side_effect=lambda value: proc if value == "/proc" else Path(value)), \
+                    patch.object(os, "readlink", side_effect=read_owned_link):
+                self.assertIsNone(issue_review._cwd_pids(root, require_complete=True))
+
     def test_non_proc_inventory_checks_open_files_and_environment_then_proves_an_idle_run(self):
         root = Path("/owned/run")
         proc = Mock()

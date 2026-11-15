@@ -267,7 +267,7 @@ client sent.
   | `jti` | random, unique per assertion |
   | `sid` | browser only: opaque hash reference to the authenticated workspace session |
   | `gport` | browser only: gateway listening port for private Google delegation |
-  | `mcp` | MCP only: `{ resource, ownerId, handle, grantId }`, bound to the exact apex `/mcp` resource and immutable workspace owner ID |
+  | `mcp` | MCP only: `{ resource, ownerId, handle, grantId, chatMetadata?, chatList?, chatTranscript?, repository? }`, bound to the exact apex `/mcp` resource and immutable workspace owner ID |
 
 - The gateway generates its key pair on first start and keeps it in its data
   volume. Workspaces receive the public key as `POISE_GATEWAY_PUBLIC_KEY`, the
@@ -288,6 +288,36 @@ client sent.
     projections and retained ledger pages. Continuations bind the owner grant,
     resource, repository, label and limit. The gateway rechecks result scope;
     source freshness and missing receipts remain independent evidence.
+    The description and `poise://workspace/inventory` resource share a signed
+    workspace read for the running release and canonical navigation and capability
+    inventory. The gateway projects the fields, intersects tools with the live
+    grant and generates links within the authorized workspace.
+    The owner can opt in to Chat metadata during consent. The gateway signs
+    `chatMetadata: true` only for that grant. The workspace requires it for
+    `poise_get` and reads an exact Chat or live timer in its own Chat instance.
+    The gateway checks the returned kind and ID and builds its own workspace link.
+    An optional repository restriction comes from the owner’s consent. It
+    persists across refresh and is checked before reading workspace data.
+    Chat listings and transcript changes use separate signed permissions and
+    bounded indexed reads. Cursors bind the grant and selector. Transcript
+    projection follows the stored context reset boundary and reports when a
+    previous checkpoint has expired.
+    An exact work request can opt into Caller’s live pull evidence. It keeps
+    the live head and merge decision separate from the workspace’s recorded
+    observation and original review receipts.
+    Separate signed grants cover Chat artifacts, workspace operations and
+    workspace content. A restricted repository grant cannot read workspace-wide
+    snapshots. Logging and Link reads stay in the gateway. Instance Logging
+    requires explicit administrator consent and a live administrator check
+    before the read and response.
+    An independent Manager consent adds the client identity to the signed
+    claim. Its typed actions use `POST /api/mcp/manager`, the native Manager
+    authorization and budget, and the existing durable command receipts with
+    delegated grant attribution.
+    Separate owner delegation uses `POST /api/mcp/owner`. A chain action
+    stores attribution in the journal entry. Adding the configured intake label
+    verifies the live issue and owner account and persists an attributed
+    reservation before GitHub can observe the write.
     The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
     PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
@@ -1716,6 +1746,15 @@ An in-flight managed issue review whose final live seed read observes closure
 settles superseded without a PR head or publication plan. The reader accepts this
 unattempted receipt while retaining its original resource-release requirement;
 [Issue review](Issue-review.md) defines the publication race and reconciliation.
+Native repairs reuse Caller's bounded live-head read within the original gated
+provider run. Verified head drift fences the original Call against publication
+before cooperative interruption; a winning publication transaction retains normal
+ownership and settlement. The existing superseded receipt carries the old and
+new heads, and positive original resource release precedes replacement admission.
+Bounded chain observations show the changed head waiting on its original Call in
+existing work status. No new receipt fields, journal events or cancellation
+command are added; [Behavior chain](Behavior-chain.md#authority-and-recovery)
+defines the normal gates and unchanged-head behavior.
 Managed native admissions recheck the bounded receipt reader at their final
 launch, action and publication boundaries. Its independent diagnostics retain
 the first typed SQLite cause and affected workspace; confirmed integrity failure
@@ -1849,6 +1888,12 @@ Caller ID. Caller verifies that identity against the prior receipt and its
 private deadline artifact before restoring edits. The no-publication shape
 and retry requirements are defined in
 [Behavior chain](Behavior-chain.md#authority-and-recovery).
+
+At repair publication, Caller can return `repair_queue_blocked` with its
+original plan and exact queue membership or verified ref rejection. The Call
+has no published head or reply receipt. After positive resource release, the
+workspace journal settles it as deferred and applies the existing GitHub queue
+removal and merge rules. A lost or contradictory response remains uncertain.
 
 Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository

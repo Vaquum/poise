@@ -4,6 +4,7 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
 from github_interface.behaviors import merge_candidates, merge_if_ready, mergeable, pr_readiness, update_branch_if_behind
+from github_interface.cli import _parser
 from review_response_fixture import published_review, response
 
 HEAD = "a" * 40
@@ -117,6 +118,12 @@ class TestQueueReadiness(TestCase):
         self.assertIsNone(mergeable.readiness_behind(deepcopy(READY)))
         self.assertIn("mergeQueue", merge_candidates.FIELDS)
         self.assertIn("reviewDecision", merge_candidates.FIELDS)
+
+    def test_person_readiness_accepts_explicit_repository_without_changing_checkout_default(self):
+        parser = _parser("--pr-readiness")
+        head = ["--username", "review-bot", "--expected-head", HEAD, "--token-user", "review-bot"]
+        self.assertEqual(parser.parse_args([*head, "--repository", "acme/app"]).repository, "acme/app")
+        self.assertIsNone(parser.parse_args(head).repository)
 
     def test_person_readiness_retains_current_head_approval_checks_and_threads(self):
         approval = {"reviewer_approved_current_head": True, "changes_requested": False}

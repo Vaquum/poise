@@ -23,8 +23,13 @@ function reply(res: ServerResponse, status: number, value: unknown): void {
 // Observe poll it from every open tab. Identical reads within a few seconds
 // share that work; a change made through this API clears it at once.
 const LIST_REUSE_MS = 10_000
-let listReuse = new Map<string, { at: number, chains: unknown[], next: string | null }>()
+const listReuse = new Map<string, { at: number, chains: unknown[], next: string | null }>()
 let attentionReuse: { at: number, chatInstance: string | null, value: unknown } | null = null
+
+export function invalidateBehaviorChainReads(): void {
+  listReuse.clear()
+  attentionReuse = null
+}
 
 export async function handleBehaviorChains(req: IncomingMessage, res: ServerResponse, url: string, chatInstance: string | null = null): Promise<void> {
   let clearAfter = false
@@ -131,6 +136,6 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
   } catch (error) {
     return reply(res, httpStatus(error, 409), { error: error instanceof Error ? error.message : String(error) })
   } finally {
-    if (clearAfter) { listReuse = new Map(); attentionReuse = null }
+    if (clearAfter) invalidateBehaviorChainReads()
   }
 }

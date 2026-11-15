@@ -14,6 +14,7 @@ import { implementationReportAdmission, recoverReportedRepair, repairReportImple
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, nativeReviewContinuationSupported, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
+import { reviewClearanceConfigured, runReviewClearance } from './review-clearance'
 import { reviewContinuationArgs, reviewContinuationCode, reviewContinuationNoWrite, yieldedFinalization, yieldedReview, type ReviewCheckpoint } from './review-continuation'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
 import { prepareModelClis } from './provider-clis'
@@ -2106,7 +2107,8 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
       quarantineEvidence(snapshot, claim, call).hasLiveEvidence)
     return false
   }
-  if (call.outcome === 'published' || call.outcome === 'no_changes' || call.outcome === 'target_closed' || call.outcome === 'native_action') {
+  if (call.outcome === 'published' || call.outcome === 'no_changes' || call.outcome === 'target_closed'
+    || call.outcome === 'native_action' || call.outcome === 'repair_queue_blocked') {
     throw new Error('native chain outcomes cannot settle a legacy review claim')
   }
   // A recovered completion settles the launch record itself, not just the
@@ -8855,6 +8857,22 @@ export async function runEnabledBehaviorsOnce(
   if (behaviorOrganization.getStore() === undefined) restoreReviewCheckSlots()
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
+    if (reviewClearanceConfigured() && readyOrganizations().some(org => org.login.toLowerCase() === 'autonomio')) {
+      const release = trackReleaseBackground('behavior')
+      try {
+        await runReviewClearance(getSettings(), async chain => {
+          const panel = await reviewPanel(getReviewers('review-new-prs'), 'pr_review',
+            seededRandom(`${chain.repository}#${chain.issue}:pr_review:panel`))
+          if (panel.reviewers.length !== getReviewers('review-new-prs')) throw new Error('Review clearance panel is incomplete')
+          return panel.reviewers
+        })
+        behaviorChainHealth.delete('@review-clearance')
+      } catch (error) {
+        const message = behaviorErrorMessage(error)
+        behaviorChainHealth.set('@review-clearance', { lastSweepAt: Date.now(), error: message })
+        console.error(`[behaviors] review clearance failed: ${message}`)
+      } finally { release() }
+    }
     if (behaviorAdmissionDraining()) {
       await Promise.allSettled(readyOrganizations().map((org) =>
         behaviorOrganization.run(org, reconcileClosedTargetIncidents)))

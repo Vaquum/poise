@@ -6,7 +6,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from .interface import close_old_pr_if_ready, issue_work
+from .interface import close_old_pr_if_ready, issue_work, review_clearance
 from .behaviors.merge_if_ready import MergeAdmissionError
 from .behaviors.issue_work import failure_diagnostic as issue_work_failure_diagnostic
 
@@ -18,6 +18,7 @@ behaviors:
   --pr-review PR [--p p2] [--since-head SHA] [--manifest-only] --expected-head SHA --token-user USER
   --approve-pr PR --expected-head SHA --token-user USER
   --head-sha PR --token-user USER [--repository OWNER/REPO]
+  --review-clearance --mode snapshot|begin|complete [--results-json JSON]
   --list-failing-ci PR [--repository OWNER/REPO]
   --read-failing-ci-log LOG_ID
   --checkout-pr-head PR
@@ -50,7 +51,7 @@ behaviors:
   --pull-action-state PR --token-user USER [--repository OWNER/REPO]
   --update-branch-if-behind PR --expected-head SHA --author USER --token-user USER
   --current-pr [--token-user USER]
-  --pr-readiness PR --username USER --expected-head SHA [--token-user USER]
+  --pr-readiness PR --username USER --expected-head SHA [--token-user USER] [--repository OWNER/REPO]
   --local-checkout-path ORG REPO
   --prune-mirrors ROOT --cap-bytes N --now-ms N [--fresh-ms N] [--dry-run]
   --view-repos ORG
@@ -80,7 +81,7 @@ def main() -> None:
     if argv in (["-h"], ["--help"]):
         print(TOP_HELP)
         return
-    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--issue-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--merge-pr", "--pull-action-state", "--update-branch-if-behind", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--close-old-pr-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context", "--prune-mirrors", "--chain-seed"}:
+    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--issue-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--merge-pr", "--pull-action-state", "--update-branch-if-behind", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--close-old-pr-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context", "--prune-mirrors", "--chain-seed", "--review-clearance"}:
         print("error: first argument must be a behavior switch\n", file=sys.stderr)
         print(TOP_HELP, file=sys.stderr)
         raise SystemExit(2)
@@ -90,11 +91,11 @@ def main() -> None:
     batch = argv[0] in {"--requested-changes-addressed", "--review-activity-since"} and "--requests-json" in argv
     if batch and len(argv) > 1 and not argv[1].startswith("-"):
         raise SystemExit("error: --requests-json cannot be combined with a pull request argument")
-    if not batch and argv[0] not in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates"} and len(argv) < 2:
+    if not batch and argv[0] not in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates", "--review-clearance"} and len(argv) < 2:
         _parser(argv[0]).print_help()
         return
 
-    if batch or argv[0] in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates"}:
+    if batch or argv[0] in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates", "--review-clearance"}:
         args = _parser(argv[0]).parse_args(argv[1:])
         payload: dict[str, Any] = vars(args)
     else:
@@ -170,6 +171,7 @@ def main() -> None:
         "--checkout-review": checkout_review,
         "--review-context": review_context,
         "--chain-seed": chain_seed,
+        "--review-clearance": review_clearance,
     }[argv[0]]
     try:
         result = asyncio.run(behavior(payload))
@@ -199,6 +201,11 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
 
 
 def _arguments(behavior: str) -> argparse.ArgumentParser:
+    if behavior == "--review-clearance":
+        parser = argparse.ArgumentParser(prog="github-interface --review-clearance")
+        parser.add_argument("--mode", required=True, choices=("snapshot", "begin", "complete"))
+        parser.add_argument("--results-json")
+        return parser
     if behavior == "--issue-work":
         parser = argparse.ArgumentParser(prog="github-interface --issue-work ISSUE")
         parser.add_argument("--mode", required=True, choices=("prepare", "validate", "publish", "inspect", "complete", "retire"))
@@ -365,6 +372,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(prog="github-interface --pr-readiness PR")
         parser.add_argument("--username", required=True)
         _add_expected_head(parser)
+        _add_repository(parser)
         return parser
 
     if behavior == "--resolve-nonblocking-conversations-if-ready":

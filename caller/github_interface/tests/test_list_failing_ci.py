@@ -36,6 +36,12 @@ class FakeClient:
 
 
 class TestListFailingCiCli(TestCase):
+    def test_review_clearance_is_not_a_build_repair_trigger(self):
+        for state, conclusion in (("in_progress", None), ("completed", "failure")):
+            check = {**CHECKS[0], "name": list_failing_ci.REVIEW_CLEARANCE, "status": state, "conclusion": conclusion}
+            self.assertFalse(list_failing_ci._check_failing(check))
+            self.assertTrue(list_failing_ci._check_failing({**check, "name": "Verify (Node 22)"}))
+
     def test_server_argv_returns_the_bound_prs_typed_ci_state(self) -> None:
         self.assertIn("--repository", cli._parser("--list-failing-ci").format_help())
         stdout, stderr = StringIO(), StringIO()

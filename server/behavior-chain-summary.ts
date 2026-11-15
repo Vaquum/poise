@@ -1,7 +1,7 @@
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
 import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
-import { APPROVAL_CONVERSATION_WAIT, approvalConversationRefusal, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, lastChainQueueInvocation, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
+import { APPROVAL_CONVERSATION_WAIT, approvalConversationRefusal, CHAIN_OBSERVATION_MAX_AGE_MS, chainQueueSettlement, chainReviewResponse, closedChainTarget, decideBehaviorChain, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
 import { nativeBehavior } from './behavior-chain-runtime'
 import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
@@ -486,8 +486,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       const resourceContradicted = chain.invocations.find(invocation => !!invocation.evidence
         && resourceReleaseContradicted(invocation.evidence as Record<string, unknown>))
       const last = chain.invocations.at(-1)
-      const lastQueue = pull ? lastChainQueueInvocation(chain) : undefined
-      const queueRemoval = pull?.queueRemoval ?? null
+      const queue = pull && chainQueueSettlement(chain, pull)
+      const queueRemoval = queue?.removal ?? null
       // Mirroring decideBehaviorChain: a dismissed chain approval on the
       // current head holds for an explicit decision before any review or repair.
       const dismissedApproval = pull
@@ -496,20 +496,15 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         : undefined
       // Mirroring decideBehaviorChain: a previously queued head without current
       // removal evidence waits for that evidence instead of review or repair.
-      const queueAwaitingRemoval = !!pull && lastQueue?.evidence?.head_sha === pull.head
-        && (!queueRemoval || typeof queueRemoval.at !== 'number' || queueRemoval.at < lastQueue.admittedAt)
-      const queueMergedNeedsWait = !!pull && lastQueue?.evidence?.head_sha === pull.head
-        && !!queueRemoval && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
-        && queueRemoval.reason === 'merged'
+      const queueAwaitingRemoval = !!queue && !queueRemoval
+      const queueMergedNeedsWait = queueRemoval?.reason === 'merged'
       // Mirroring decideBehaviorChain: a removal for any other reason than a
       // merge or an integration rejection needs an explicit queue decision.
-      const queueRemovalNeedsDecision = !!pull && lastQueue?.evidence?.head_sha === pull.head
-        && !!queueRemoval && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
+      const queueRemovalNeedsDecision = !!queueRemoval
         && queueRemoval.reason !== 'merged' && queueRemoval.reason !== 'failed_checks' && queueRemoval.reason !== 'merge_conflict'
       let queueRejectionNeedsRepair = false
       const queueRecovery = observation && recoveredQueueRepair(chain, observation)
-      if (pull && lastQueue?.evidence?.head_sha === pull.head && queueRemoval
-        && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
+      if (pull && queueRemoval
         && (queueRemoval.reason === 'failed_checks' || queueRemoval.reason === 'merge_conflict')) {
         const diagnosis = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr'
           && invocation.evidence?.status === 'completed' && invocation.request.context?.head === pull.head
@@ -557,8 +552,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       // verification on the queue-verification basis before re-enqueueing.
       let queueVerificationBasis = queueRecovery && pull
         ? chainBasis(['queue-recovery', pull.head, pull.queueRemoval?.id, queueRecovery.id, pull.reviewContext]) : null
-      if (pull && observation && lastQueue?.evidence?.head_sha === pull.head && queueRemoval
-        && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
+      if (pull && observation && queueRemoval
         && (queueRemoval.reason === 'failed_checks' || queueRemoval.reason === 'merge_conflict') && !queueRejectionNeedsRepair) {
         const diagnosis = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr'
           && invocation.evidence?.status === 'completed' && invocation.request.context?.head === pull.head

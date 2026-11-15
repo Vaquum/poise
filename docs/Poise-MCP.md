@@ -6,11 +6,13 @@ set `POISE_MCP_ENABLED=1` in the gateway environment (`deploy/.env` with the
 deployment bundle); unset it to remove the transport, discovery and grant pages.
 No default or deployed configuration is changed by this capability.
 
-`poise_describe`, with no arguments, returns
-`{ workspace, owner, capabilities: { tools: ["poise_describe", "poise_work"] } }`
-for the authorized workspace. `poise_work` reads its issue work trail. Neither
-tool grants Manager controls or reads chats, documents, credentials or raw
-process state.
+`poise_describe`, with no arguments, returns the authorized workspace, effective
+tools, grant expiry, running release and a machine-readable inventory. Each entry
+names its data kind, source, permission, retention, current MCP availability and
+Poise link. The catalog follows Poise's existing places, Observe parts, Settings
+sections and capability names. The MCP resource `poise://workspace/inventory`
+returns the same projection and runbooks. `poise_work` reads the workspace's
+issue work trail. The owner can also grant Chat metadata during consent.
 
 ## Read work
 
@@ -23,6 +25,12 @@ Call `poise_work` with one of these selectors:
 ```json
 {"repository":"autonomio/poise","label":"poise","limit":5}
 ```
+
+Label pages also accept a UTC issue creation window. Pass `since` (inclusive)
+and `until` (exclusive) as `YYYY-MM-DDTHH:MM:SSZ`. Keep the window the same
+on continuation. Each row reports the known intake eligibility and selected
+label. The mirror does not retain label application times, so that history
+is reported separately as unavailable.
 
 The repository must belong to a ready followed account in the owner's workspace.
 Label pages include all matching issues, including closed issues and third-party
@@ -47,8 +55,10 @@ The result carries `work.items`, observation time and per-source coverage:
 - `coverage.issues` reports mirror freshness. Stale rows remain readable;
   failed issue reads return no rows with their reason, never confirmed absence.
 - Each item's chain and GitHub observation coverage are independent. Stage,
-  issue age in milliseconds, latest invocation admission time, step and blocker
-  come from retained records. `not_recorded` means no chain or retained ledger
+  issue age in milliseconds, latest invocation admission time, step, blocker
+  and next actor and action come from retained records. The next action is an
+  observation of the current chain and can still require runtime admission.
+  `not_recorded` means no chain or retained ledger
   work within fresh coverage, not proof about execution before collection or
   retention. Missing work with incomplete coverage remains `unknown`.
 - The latest five invocation receipts retain original Call IDs, recorded action,
@@ -66,6 +76,152 @@ checks, observed queue and recorded merge SHA under their existing browser acces
 rules. Returned source text is data, not instructions. Coverage and receipt
 records grant no execution or publication authority.
 
+Set `live: true` on an exact issue read to corroborate a recorded pull request
+with the configured account through Caller. The live result reports the head
+or merge SHA and current queue, review, conversation and check gates where
+applicable. A head change across reads reports partial coverage. Live GitHub
+evidence never alters Poise's original receipt or review-completion status.
+
+## Read Chat metadata
+
+On the Poise consent page, allow Chat metadata to enable `poise_get` and
+`poise_list`. The grant page shows the allowed tools. `poise_describe`
+reports the tools available with that grant.
+
+Call `poise_get` with `kind: "chat"` and a Chat record ID from its Poise link.
+The result includes the stored session state, role, repository, last sequence
+and live timer IDs. Call it with `kind: "timer"` and one of those IDs for its
+schedule and state, pending delivery and recorded failure and skip counts.
+The gateway builds the link to the owning Chat. Times use UTC.
+
+The exact lookup covers the connected workspace's stored Chats and active,
+held or tripped timers. An empty record means there is no matching record in
+that scope. This grant covers metadata. Transcript, attachment and timer
+message content and Manager actions require separate capabilities.
+
+`poise_list` accepts `kind: "chat"`, optional repository, UTC `since`
+(inclusive) and `until` (exclusive) update times, and a limit from one to ten.
+The page includes current and archived Chats. Pass `nextCursor` back with the
+same selector and grant. The keyset orders by update time and ID. Updates can
+move records between pages.
+
+With the separate transcript grant, `poise_changes` accepts `kind: "chat"`,
+a Chat ID, and `afterSequence` or a continuation cursor. It returns retained
+prompts, assistant text and turn metadata. Oversize text and events with only
+metadata report partial coverage. A reset reports expired coverage for an
+older checkpoint and returns the retained boundary. `watermark` is the last
+sequence consumed. Pass `nextCursor` to continue or check for new events.
+
+For exact Chat metadata, `poise_get` includes current worker and creator
+identities, work bindings, inbox delivery with the admitted turn ID,
+supervision, Switchboard item states and pending owner requests. Each collection
+returns up to ten records and reports truncation. Cross-repository relationships
+are visible only with the applicable repository access. Plan
+updates appear in the retained Chat event stream.
+
+With separate artifact consent, call `poise_get` with `kind: "chat-attachment"`
+or `kind: "chat-diff"`, the artifact `id`, and the owning `chatId`. Attachment
+metadata includes original size and upload time. Text up to 16 KiB is served
+only when its saved content hash still matches. A diff uses the retained event
+and returns up to 6,144 characters on each side for a previewable checkout file.
+Missing or limited content carries an explicit coverage result.
+
+## Read workspace operations
+
+With workspace-wide operational data consent, use `poise_get` with
+`kind: "workspace"` and a snapshot name from the workspace inventory. The
+available snapshots cover effective settings and model slots, followed accounts
+and recorded sign-in, behavior policy and capacity, release and dependency
+health, storage and GitHub quota, the analytics health cohort, notices and
+handling history, Current cards, repositories visible to the configured
+account, Switchboard check state and Manager Rhythm, and extension, memory
+and snippet metadata. `analytics-history` reports seven complete UTC days
+from the app’s issue, pull request and Behavior activity cohorts. Missing
+organization reads mark the window partial. `behavior-estimates` uses
+completed Calls with the same behavior and model, and returns the original
+running Call ID and estimate basis. Review-request notices carry their
+recorded pull request target.
+
+The same consent allows `poise_list` with `kind: "call"` to page the retained
+Caller archive newest first, or `poise_get` with the full Call ID. Use
+`kind: "invocation"` for a retained chain invocation. The archive total
+counts retained rows, including evidence the reader may need to quarantine. Receipts include the
+known actor, action, outcome, head, settlement and available response link.
+Quarantined Call evidence is reported as partial. Caller prompts, diagnostics
+payloads, extension arguments and memory text stay in their owning surfaces.
+Snapshot timestamps report when the read was assembled. Underlying observations
+keep their own times, and bounded summaries report omitted records.
+
+## Read Logging and linked devices
+
+Use `poise_list` with `kind: "logging"` for bounded retained workspace events.
+The optional `repository`, `since` and `until` select a repository and UTC
+window. Counts refer to retained events. Each page includes retention bounds,
+source coverage and a continuation. Open a specific event with
+`poise_get`, `kind: "logging"` and the exact event ID.
+
+Read new observations with `poise_changes`, the same selector and the
+previous `watermark` as `afterWatermark`. Finish all continuation pages of a
+batch before advancing to its new watermark. The cursor and watermark are
+bound to the grant. An instance administrator can separately consent to
+`kind: "instance-logging"`, with access rechecked before every read.
+
+Use `poise_get` with `kind: "gateway"` for `logging-health`,
+`instance-logging-health` or `link-devices`. Device status carries pairing and
+connection metadata. It carries no device credentials.
+
+## Read workspace content
+
+With separate workspace content consent, use `poise_list` with
+`kind: "document"` to page the Editor library and `poise_get` with the document
+slug to read the current version, bounded text, publication versions and
+cached review status. Documents are ordered by slug. Continue with the same
+page size under the same grant.
+
+Use `poise_get` with `kind: "snippet"` and a switch name, or with
+`kind: "memory"` and `id: "current"` for the saved revision. Text is limited
+to an 8,000-character preview and reports truncation. Cached review coverage
+retains its original observation time.
+
+## Delegate Manager controls
+
+The owner can separately delegate Manager actions in Connected agents consent.
+The active workspace Manager's limits and Chat policies apply. A client can
+queue a message, steer a running turn, stop a Chat or schedule supervision of
+one Chat. Supervision persists across turns and requires a workspace-wide grant.
+
+Call `poise_action_preview` with `operation` and `sessionId`. Send and steer
+also take `text`. Supervision takes `text` and `intervalMinutes`. The result
+shows the target and sequence, current turn, acting Manager, delegated client,
+effect and any required human decision. Use the opaque `preview` with
+`poise_action_apply` after checking that the effect matches the requested task.
+
+An unused preview lasts five minutes. Apply checks the current Manager, Chat
+basis and grant again. Reusing the same preview returns the durable original
+outcome or explicitly reports uncertainty. The command receipt identifies the
+grant, client and target. Messages report queue admission, and stops report
+whether execution settled. A send or steering action cannot approve a native
+permission request or supply the person's answer.
+
+## Delegate chain holds and resumes
+
+The owner can separately delegate the existing chain Hold and Resume controls.
+Call `poise_chain_preview` with `operation`, `repository` and `issue`. The
+preview names the exact chain, current journal sequence, client and effect.
+Pass its opaque `preview` to `poise_chain_apply`. The apply checks the current
+sequence and write scope before appending the event.
+
+The journal retains the delegate, grant, request ID and applied event
+sequence. Repeating a valid applied preview recovers this exact receipt.
+Normal admission, capacity, GitHub and review gates still decide whether
+a resumed chain can start work.
+
+A label preview verifies the live open GitHub issue, its identity and
+revision, the configured intake label and the workspace owner's GitHub account.
+Apply rechecks that basis before adding the label. Poise records attribution
+before sending the write. A missing GitHub acknowledgement returns uncertainty
+and a repeated preview cannot send the write again.
+
 ## Private plugin
 
 Render a private package for an installation's HTTPS apex into a new directory:
@@ -77,10 +233,10 @@ node scripts/package-poise-plugin.mjs https://poise.example.com /tmp/poise-priva
 The output contains `plugins/poise/plugin.json`, `mcp.json`, the `poise-manager`
 skill and `.agents/plugins/marketplace.json`. It uses the supported portable
 [OpenAI plugin format](https://developers.openai.com/plugins/build/plugins),
-with a Streamable HTTP server at that installation's `/mcp`, OAuth DCR and
-`poise:read`; discovery supplies the existing endpoints. The package contains
-no credentials. The renderer refuses an existing destination and does not
-install a plugin, change settings or enable the endpoint.
+with a Streamable HTTP server at that installation's `/mcp`. OAuth discovery
+supplies the resource, registration endpoint and `poise:read` scope. The
+package contains no credentials. The renderer refuses an existing destination
+and does not install a plugin, change settings or enable the endpoint.
 
 Open the generated directory in Codex desktop, select its private marketplace
 in the Plugins Directory and install Poise. Sign in and explicitly consent
@@ -108,6 +264,9 @@ registration and authorization code with S256 PKCE. Discovery starts from the
   Poise GitHub sign-in, and explicit owner consent protected by the browser
   session's CSRF token and exact apex Origin. It never accepts a requested
   workspace or owner from the client. Denial returns `access_denied`.
+- The owner can enter an `owner/repository` restriction at consent. The grant
+  page shows the repository. The scope survives refresh and applies at both
+  gateway and workspace dispatch. A repository outside the scope is refused.
 - A single-use code expires after 60 seconds. Access tokens expire after ten
   minutes; rotating refresh tokens end with their 30-day owner grant.
   Token exchange binds the client, redirect URI, PKCE verifier and resource.
@@ -125,6 +284,11 @@ endpoint, and an MCP assertion cannot call their APIs, static pages or sockets.
 New workspace containers receive `POISE_WORKSPACE_OWNER_ID` from the gateway.
 Older containers without it retain normal behavior but refuse MCP assertions;
 they need a normal container replacement before connecting.
+
+The Deployment CI journey opens the installed gateway's MCP endpoint with a
+real SDK client and follows records across two isolated workspaces. The
+deployment uses fixture GitHub identities, a generated plugin package and
+native datastore and journal records.
 
 `tests/mcp.test.ts` exercises a real SDK client through disposable gateway and
 workspace HTTP fixtures with the production assertion guard and read handler.

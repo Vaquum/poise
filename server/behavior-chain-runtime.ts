@@ -5,7 +5,7 @@ import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-r
 import type { DetachedProcessExit } from './process'
 import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS,
   chainReviewResponse, ciRefreshRequest, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold,
-  heldCiRepair, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+  heldCiRepair, implementationTestDependency, queueCiBlocker, repairQueueBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -676,8 +676,8 @@ export class BehaviorChainRuntime {
               }
               if (chain.mergeSha && owned && !released) continue
               if (owned && call && (call.status === 'running' || !nativeResourcesReleased(call))) {
-                // Running PR reviews still need bounded queue visibility, and a
-                // running first implementation needs bounded seed-closure
+                // Running PR reviews and repairs need bounded head/queue visibility,
+                // and a first implementation needs bounded seed-closure
                 // visibility. Neither observation can settle or replace its
                 // native invocation.
                 const prior = chain.observation as ChainObservation | null
@@ -685,6 +685,8 @@ export class BehaviorChainRuntime {
                   && Date.now() - (prior as ChainObservation).checkedAt < CHAIN_OBSERVATION_MAX_AGE_MS
                 if (owned.behavior === 'review-pr') {
                   if (call.status !== 'running' || prior?.pull?.state !== 'open' || prior.pull.merged || fresh) continue
+                } else if (owned.behavior === 'repair-pr') {
+                  if (call.status !== 'running' || fresh) continue
                 } else if (owned.behavior === 'implement-issue') {
                   if (!retireEligible(call) || prior?.publication.pull_number !== null || fresh
                     || !this.operations.retireClosedImplementation) continue
@@ -735,7 +737,17 @@ export class BehaviorChainRuntime {
                     new Error(`behavior retirement failed for ${chain.id}: ${behaviorErrorMessage(error)}`, { cause: error }))
                 }
               }
-              if (owned && call?.status === 'running') continue
+              if (owned && call?.status === 'running') {
+                if (owned.behavior === 'repair-pr' && observation.pull?.head !== call.expected_head
+                  && observation.pull?.number === Number(call.pr_id) && /^[0-9a-f]{40}$/.test(observation.pull.head)
+                  && observation.publication.head_sha === observation.pull.head
+                  && observation.publication.pull_number === observation.pull.number
+                  && observation.checkedAt <= Date.now() && Date.now() - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS) {
+                  const reason = `original repair Call ${call.id} is still running for ${call.expected_head}`
+                  if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                }
+                continue
+              }
               if (this.operations.recoverReport) {
                 const reason = await this.operations.recoverReport(chain, observation)
                 chain = this.current(chain)
@@ -1115,7 +1127,9 @@ export class BehaviorChainRuntime {
       const cause = failure ? `; ${failure.cause}${failure.path ? ` at ${failure.path}` : ''}`
         : !call.resource_ownership ? '; durable resource ownership is unavailable'
           : root ? `; ${root.state} directory at ${root.path} lacks a reclamation receipt` : ''
-      const reason = `native invocation ended without proof that its worker resources were released${cause}`
+      const replacement = invocation.behavior === 'repair-pr' && call.status === 'superseded' && call.head_sha !== call.expected_head
+        ? `PR head ${call.head_sha} is waiting on original repair Call ${call.id} for ${call.expected_head}; ` : ''
+      const reason = `${replacement}native invocation ended without proof that its worker resources were released${cause}`
       return invocation.state === 'uncertain' && invocation.outcome === reason ? chain
         : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id, reason })
     }
@@ -1188,6 +1202,27 @@ export class BehaviorChainRuntime {
       this.operations.received(invocation, call)
       return this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
         outcome: 'prerequisite_wait', evidence: { ...receipt(call), status: 'deferred', action: 'not_started', outcome: 'prerequisite_wait' } })
+    }
+    if (call.outcome === 'repair_queue_blocked') {
+      const evidence = { ...invocation.evidence, ...receipt(call), callId: call.id }
+      const prior = invocation.evidence?.artifact as Record<string, unknown> | undefined
+      const reason = 'repair queue blocker conflicts with the original publication admission or receipt'
+      if (call.model !== invocation.model || String(call.pr_id) !== invocation.request.argv[invocation.request.argv.indexOf('--pull-number') + 1]
+        || call.expected_head !== invocation.request.context?.head || invocation.evidence?.queueBlockerConflict === true
+        || prior?.replies_started === true || prior?.result != null
+        || (prior?.publication_head != null && prior.publication_head !== call.artifact?.publication_head)
+        || !repairQueueBlocker(chain, { ...invocation, callId: call.id, evidence })) {
+        const conflicted = { ...evidence, queueBlockerConflict: true }
+        if (!sameReceipt(invocation.evidence, conflicted)) chain = this.append(chain, {
+          type: 'invocation.reconciled', invocationId: invocation.id, evidence: conflicted })
+        return invocation.state === 'uncertain' && invocation.outcome === reason ? chain
+          : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id, reason })
+      }
+      this.operations.received(invocation, call)
+      chain = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
+        outcome: 'repair_queue_blocked', evidence: { ...evidence, nativeCallStatus: call.status, status: 'deferred' } })
+      this.operations.wake()
+      return chain
     }
     if (prReview && invocation.request.argv.includes('--review-slot')) {
       const checkpoint = yieldedReview(call) ?? yieldedFinalization(call)

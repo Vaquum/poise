@@ -1,4 +1,4 @@
-import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
+import { CHAIN_OBSERVATION_MAX_AGE_MS, chainQueueSettlement, chainReviewResponse, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, type BehaviorChain, type BehaviorChainJournal, type ChainInvocation } from './behavior-chain-store'
 import { attributedNativeAction, matchingNativeActionReceipt, type NativeActionReceipt } from './behavior-chain-action'
 import { chainWaitsForResourceRelease, currentChainWaiting } from './behavior-chain-summary'
@@ -63,12 +63,11 @@ export function projectChainPrStatus(chain: BehaviorChain, journal: BehaviorChai
     && now - responseAt <= CHAIN_OBSERVATION_MAX_AGE_MS
   const entry = fresh && pull?.queueEntry ? pull.queueEntry : newerQueue ? String(queueProof!.result.queue_entry_id) : null
   const disposition = fresh && !newerQueue && entry && pull?.queueEntryDetails?.id === entry ? pull.queueEntryDetails : null
-  const participation = lastChainQueueInvocation(chain)
-  const ejected = fresh && !entry && !!pull?.queueRemoval && participation?.evidence?.head_sha === pull.head
-    && pull.queueRemoval.at >= participation.admittedAt && pull.queueRemoval.reason !== 'merged'
+  const removal = pull && chainQueueSettlement(chain, pull)?.removal
+  const ejected = fresh && !entry && !!removal && removal.reason !== 'merged'
   const queue: PrStatusRow['queue'] = { state: entry ? 'queued' : ejected ? 'ejected' : fresh ? 'not_queued' : 'unknown',
     entryId: entry, since: entry ? new Date(newerQueue ? responseAt : observation!.checkedAt).toISOString()
-      : ejected ? new Date(pull!.queueRemoval!.at).toISOString() : null,
+      : ejected ? new Date(removal.at).toISOString() : null,
     ...(disposition ? { disposition: disposition.state, integrationBase: disposition.base, integrationHead: disposition.head } : {}) }
   const queueAttributed = !!entry && !!enqueueOwner
   if (entry) {

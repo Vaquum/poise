@@ -1613,10 +1613,12 @@ A degraded dependency never changes a status code. Alert on
 process existing. Ledger queue stalls, worker failures and capture loss
 also alert through Poise Link and the page's notices.
 
-A responsive health endpoint does not prove that PR automation is making
-progress. During a service-mode drain, `/api/health` can still report
-`scheduler.status: ok` and `selfUpdate.draining: false`. Read the workspace's
-actual drain state from its loopback service endpoint:
+`scheduler.releaseAdmission` reports whether a drain (`drain`) or pending
+in-place switch (`switch_pending`) pauses scheduled sweeps. `scheduler.organizationSweeps`
+records each followed organization's last sweep attempt in epoch milliseconds
+and any error. A skipped timer tick can advance the heartbeat without
+advancing sweep evidence. Read the detailed workspace drain and release state
+from its loopback service endpoint:
 
 ```bash
 docker exec poise-ws-<handle> curl -fsS http://127.0.0.1:5555/api/service/health
@@ -1625,7 +1627,7 @@ docker exec poise-ws-<handle> curl -fsS http://127.0.0.1:5555/api/service/health
 `draining: true` pauses new PR reviews and approvals while running work
 settles. The gateway reports a recreate drain in `workspace.drain.waiting`,
 including its blockers and `remainingSeconds`; an in-place release switch
-uses `workspace.update.waiting`. `switching` alone does not pause behaviors.
+uses `workspace.update.waiting`.
 Missing gateway events do not disprove a drain: when renewals stop, the drain
 lasts until its lapse timeout ([Upgrades](#upgrades)).
 

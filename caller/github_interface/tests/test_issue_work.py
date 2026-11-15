@@ -7,6 +7,7 @@ import httpx
 
 from github_interface.behaviors import pr_review
 from github_interface.behaviors.issue_work import confirmed_pull, publication_body, publication_metadata, review_replies, run
+from github_interface.atoms.process_diagnostic import GitProcessError
 from github_interface.client import GitHubClient
 
 CALL = "a" * 32
@@ -280,6 +281,85 @@ class MergedRepair(IsolatedAsyncioTestCase):
                 client.patch.assert_not_awaited()
 
 
+class RepairQueuePublication(IsolatedAsyncioTestCase):
+    head = "b" * 40
+    candidate = "c" * 40
+    branch = "poise/issue-7"
+    ref = f"refs/heads/{branch}"
+    payload = {"repository": "example/repo", "token_user": "author", "issue": 7, "mode": "publish", "path": "/tmp/repo",
+               "branch": branch, "pull_number": 3, "expected_head": head, "starting_head": head, "invocation_id": CALL,
+               "message": "fix: repair the problem", "replies_json": '[{"commentId":17,"body":"Verified repair."}]'}
+
+    def arrange(self, queue_entry=None, remote_after=head):
+        pull = {"number": 3, "state": "open", "user": {"login": "author"}, "body": "<!-- poise-chain example/repo#7 -->",
+                "head": {"ref": self.branch, "sha": self.head, "repo": {"full_name": "example/repo"}}}
+        client = AsyncMock(token="private-token")
+        client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"}, pull, {"state": "open"}, pull,
+                                  {"ref": self.ref, "object": {"type": "commit", "sha": remote_after}}]
+        client.paginate.side_effect = [[], []]
+        client.graphql.side_effect = [{"repository": {
+            "ref": {"target": {"oid": self.head}}, "defaultBranchRef": {"target": {"oid": "d" * 40}},
+            "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}},
+            {"repository": {"pullRequest": {"id": "pull-3", "state": "OPEN", "headRefOid": self.head,
+                                             "mergeQueueEntry": queue_entry}}}]
+        return client
+
+    async def test_an_existing_queue_entry_prevents_both_branch_push_and_reply_publication(self):
+        for dirty in ("", " M file"):
+            with self.subTest(dirty=dirty):
+                client = self.arrange({"id": "queue-123"})
+                with patch('github_interface.behaviors.issue_work._run', side_effect=[
+                    self.branch, "https://github.com/example/repo.git", self.head, dirty]) as git, \
+                        patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
+                    result = await run(client, self.payload)
+                self.assertEqual((result["outcome"], result["queue_blocker"]["kind"], result["queue_blocker"]["entry_id"]),
+                                 ("repair_queue_blocked", "already_queued", "queue-123"))
+                self.assertEqual(git.call_count, 4)
+                checkpoint.assert_not_called()
+                client.post.assert_not_awaited()
+
+    async def test_exact_github_rejection_proves_no_write_only_with_unchanged_pr_and_ref(self):
+        wire = (f"remote: error: GH006: Protected branch update failed for {self.ref}.        \n"
+                "remote: - A pull request for this branch has been added to a merge queue. Branches that        \n"
+                "remote:   are queued for merging cannot be updated. To modify this branch, dequeue the        \n"
+                "remote:   associated pull request.        \n"
+                "To https://github.com/example/repo.git\n"
+                f" ! [remote rejected]   HEAD -> {self.branch} (protected branch hook declined)\n"
+                "error: failed to push some refs to 'https://github.com/example/repo.git'")
+        for stderr, remote, truncated, proves_no_write in (
+            (wire, self.head, False, True),
+            (wire, self.candidate, False, False),
+            (wire, self.head, True, False),
+            (wire.replace(self.ref, "refs/heads/other"), self.head, False, False),
+            (wire.replace("hook declined", "some other refusal"), self.head, False, False),
+            (wire + "\n * [new tag] v1 -> v1", self.head, False, False),
+            ("connection lost after dispatch", self.head, False, False),
+        ):
+            with self.subTest(stderr=stderr[:90], remote=remote, truncated=truncated):
+                client = self.arrange(remote_after=remote)
+                error = GitProcessError({"operation": "push", "outcome": "exit", "exit_code": 1,
+                                         "signal": None, "errno": None, "stderr": stderr, "stderr_truncated": truncated})
+                with patch('github_interface.behaviors.issue_work._run', side_effect=[
+                    self.branch, "https://github.com/example/repo.git", self.head, " M file", "", "", self.candidate, error]) as git, \
+                        patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
+                    if proves_no_write:
+                        result = await run(client, self.payload)
+                        blocker = result["queue_blocker"]
+                        self.assertEqual((result["outcome"], blocker["kind"], blocker["rejection_code"], blocker["ref"],
+                                          blocker["head"], blocker["attempted_head"], blocker["call_id"]),
+                                         ("repair_queue_blocked", "push_rejected", "GH006", self.ref,
+                                          self.head, self.candidate, CALL))
+                    else:
+                        with self.assertRaises(GitProcessError) as caught:
+                            await run(client, self.payload)
+                        self.assertIs(caught.exception, error)
+                self.assertEqual(git.call_args.args[0][-5:],
+                                 ["push", "--no-follow-tags", "--recurse-submodules=no", "origin", f"HEAD:{self.ref}"])
+                self.assertEqual(git.call_count, 8)
+                checkpoint.assert_called_once_with(self.candidate)
+                client.post.assert_not_awaited()
+
+
 class ReviewReplyReceipts(IsolatedAsyncioTestCase):
     async def test_successive_repairs_reuse_prior_receipts_and_inspect_the_full_plan_after_a_lost_response(self):
         with patch('github_interface.client.get_token', return_value="test-token"):
@@ -526,6 +606,7 @@ class FirstPublicationPrerequisites(IsolatedAsyncioTestCase):
 
     async def test_existing_pr_validate_and_publish_ignore_unused_foreign_closure_and_preserve_metadata(self):
         self.graph["repository"]["ref"] = {"target": {"oid": self.base, "message": f"fix: original\n\nPoise-Invocation: {CALL}"}}
+        self.graph["repository"]["pullRequest"] = {"id": "pull-3", "state": "OPEN", "headRefOid": self.base, "mergeQueueEntry": None}
         title, body = "fix: implement seed", "Original description.\n\nCloses #7\n\n<!-- poise-chain example/repo#7 -->"
         pull = {"number": 3, "state": "open", "title": title, "body": body,
                 "html_url": "https://github.com/example/repo/pull/3", "user": {"login": "author"},
@@ -562,7 +643,8 @@ class FirstPublicationPrerequisites(IsolatedAsyncioTestCase):
                     if dirty:
                         self.assertIn(["git", "-C", "/tmp/repo", "commit", "-m", f"fix: implement seed\n\nPoise-Invocation: {CALL}"],
                                       [call.args[0] for call in git.call_args_list])
-                        self.assertEqual(git.call_args.args[0][-3:], ["push", "origin", "HEAD:refs/heads/poise/issue-7"])
+                        self.assertEqual(git.call_args.args[0][-5:], [
+                            "push", "--no-follow-tags", "--recurse-submodules=no", "origin", "HEAD:refs/heads/poise/issue-7"])
 
     async def test_first_pr_validate_publish_and_completion_reject_foreign_closure_before_writes(self):
         self.graph["repository"]["ref"] = {"target": {"oid": self.base, "message": f"fix: implement\n\nPoise-Invocation: {CALL}"}}

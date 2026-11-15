@@ -11,10 +11,12 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS chat_control_children (
     child TEXT PRIMARY KEY, manager TEXT NOT NULL, instance TEXT NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS chat_control_parent ON chat_control_children(instance, manager, child);
   CREATE TABLE IF NOT EXISTS chat_work_bindings (
     instance TEXT NOT NULL, target TEXT NOT NULL, session TEXT NOT NULL,
     created_at INTEGER NOT NULL, PRIMARY KEY(instance, target)
   );
+  CREATE INDEX IF NOT EXISTS chat_work_bindings_session ON chat_work_bindings(instance, session, target);
   CREATE TABLE IF NOT EXISTS chat_work_binding_releases (
     instance TEXT NOT NULL, target TEXT NOT NULL, session TEXT NOT NULL,
     released_at INTEGER NOT NULL, PRIMARY KEY(instance, target, session)
@@ -116,6 +118,13 @@ export function workTarget(value: string): WorkTarget {
 export interface Binding { target: string, session: string, created_at: number }
 export function bindings(instance: string): Binding[] {
   return db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? ORDER BY target').all(instance) as Binding[]
+}
+
+export function chatBindings(instance: string, session: string, repository: string | null, limit: number): Binding[] {
+  const prefix = repository ? 'https://github.com/' + repository.toLowerCase() + '/' : null
+  return cachedStatement(db, 'SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND session = ?'
+    + ' AND (? IS NULL OR lower(substr(target, 1, length(?))) = ?) ORDER BY target LIMIT ?')
+    .all(instance, session, prefix, prefix, prefix, limit) as Binding[]
 }
 
 export function openWorkBindings(instance: string): Array<{ target: string, session: string, role: string | null }> {
@@ -234,6 +243,12 @@ export function children(instance: string): Array<{ child: string, manager: stri
   return db.prepare('SELECT child, manager FROM chat_control_children WHERE instance = ?').all(instance) as Array<{ child: string, manager: string }>
 }
 
+export function chatChildren(instance: string, manager: string, repository: string | null, limit: number): string[] {
+  return (cachedStatement(db, 'SELECT child FROM chat_control_children c JOIN chat_sessions s ON s.id = c.child AND s.instance = c.instance'
+    + ' WHERE c.instance = ? AND c.manager = ? AND (? IS NULL OR s.repo = ? COLLATE NOCASE) ORDER BY child LIMIT ?')
+    .all(instance, manager, repository, repository, limit) as Array<{ child: string }>).map(row => row.child)
+}
+
 export interface InternalMessage {
   seq: number, recipient: string, sender: string, event_key: string, body: string, created_at: number,
   state: 'pending' | 'admitted' | 'recipient_deleted', turn_id: string | null, sender_title: string | null, sender_role: 'manager' | 'worker' | null,
@@ -245,9 +260,9 @@ export function message(instance: string, recipient: string, sender: string, bod
   return db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at, sender_title, sender_role)
     VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now(), from?.title ?? null, from?.role ?? null).changes > 0
 }
-export function inbox(instance: string, recipient: string, after = 0): InternalMessage[] {
-  return db.prepare(`SELECT ${INBOX_COLUMNS} FROM chat_control_inbox
-    WHERE instance = ? AND recipient = ? AND seq > ? ORDER BY seq LIMIT 100`).all(instance, recipient, after) as InternalMessage[]
+export function inbox(instance: string, recipient: string, after = 0, limit = 100): InternalMessage[] {
+  return cachedStatement(db, `SELECT ${INBOX_COLUMNS} FROM chat_control_inbox
+    WHERE instance = ? AND recipient = ? AND seq > ? ORDER BY seq LIMIT ?`).all(instance, recipient, after, limit) as InternalMessage[]
 }
 export function settleOrphanedMessages(instance: string): void {
   db.prepare(`UPDATE chat_control_inbox SET state = 'recipient_deleted'
@@ -301,9 +316,9 @@ export function internalTurn(turnId: string): boolean {
   return !!db.prepare('SELECT 1 FROM chat_control_inbox WHERE turn_id = ?').get(turnId)
 }
 export interface Watch { id: string, owner: string, targets: string, instruction: string, interval_ms: number, next_at: number, enabled: number }
-export function watches(instance: string, owner?: string): Watch[] {
-  return cachedStatement(db, 'SELECT id, owner, targets, instruction, interval_ms, next_at, enabled FROM chat_control_watches WHERE instance = ? AND (? IS NULL OR owner = ?)')
-    .all(instance, owner ?? null, owner ?? null) as Watch[]
+export function watches(instance: string, owner?: string, limit = -1): Watch[] {
+  return cachedStatement(db, 'SELECT id, owner, targets, instruction, interval_ms, next_at, enabled FROM chat_control_watches WHERE instance = ? AND (? IS NULL OR owner = ?) LIMIT ?')
+    .all(instance, owner ?? null, owner ?? null, limit) as Watch[]
 }
 export function addWatch(instance: string, owner: string, targets: string[], minutes: number, instruction: string): string {
   if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) throw new HttpError(400, 'intervalMinutes must be an integer from 1 to 1440')

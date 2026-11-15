@@ -1,11 +1,16 @@
 import { createHash } from 'node:crypto'
+import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { McpGrants } from '../src/mcp-grants.js'
-import { MCP_TOOLS } from '../src/mcp-contract.js'
+import { MCP_TOOLS, MCP_WORK_TOOL_NAMES } from '../src/mcp-contract.js'
+import { workspaceInventory } from '../src/mcp-inventory.js'
 import { loadConfig } from '../src/config.js'
+import { normalize } from '../src/diagnostics/contract.js'
+import { DiagnosticStore } from '../src/diagnostics/store.js'
 import { APEX, startHarness, type Harness } from './harness.js'
 
+const workTools = MCP_TOOLS.filter(tool => MCP_WORK_TOOL_NAMES.some(name => name === tool.name))
 let h: Harness
 beforeEach(async () => { h = await startHarness({ env: { POISE_MCP_ENABLED: '1' } }) })
 afterEach(async () => { await h.close() })
@@ -24,7 +29,7 @@ async function register(callback = redirectUri) {
   expect(reply.status).toBe(201)
   return String(reply.json().client_id)
 }
-async function authorize(login = 'Alice', overrides: Record<string, string> = {}) {
+async function authorize(login = 'Alice', overrides: Record<string, string> = {}, consent: Record<string, string> = {}) {
   const client = await register()
   const params = new URLSearchParams({ client_id: client, redirect_uri: redirectUri, code_challenge: challenge,
     code_challenge_method: 'S256', resource, scope: 'poise:read', response_type: 'code', state: 'client-state', ...overrides })
@@ -37,23 +42,76 @@ async function authorize(login = 'Alice', overrides: Record<string, string> = {}
   expect(page.status).toBe(200)
   expect(page.body).toContain('Allow read access')
   const csrf = h.store.findSession(apexCookie.slice('poise_gw='.length))!.csrf
-  const reply = await form('/mcp/authorize', { request: params.toString(), csrf, decision: 'approve' }, apexCookie)
+  const reply = await form('/mcp/authorize', { request: params.toString(), csrf, decision: 'approve', ...consent }, apexCookie)
   expect(reply.status).toBe(303)
   const target = new URL(String(reply.headers.location))
   expect(target.searchParams.get('state')).toBe('client-state')
   return { client, code: target.searchParams.get('code')!, apexCookie, csrf, params }
 }
-async function connect(login = 'Alice') {
-  const authorization = await authorize(login)
+async function connect(login = 'Alice', consent: Record<string, string> = {}) {
+  const authorization = await authorize(login, {}, consent)
   const token = await form('/mcp/token', { grant_type: 'authorization_code', client_id: authorization.client,
     code: authorization.code, redirect_uri: redirectUri, resource, code_verifier: verifier })
   expect(token.status).toBe(200)
   return { ...authorization, access: String(token.json().access_token), refresh: String(token.json().refresh_token) }
 }
+
+it('binds Logging checkpoints to one grant and requires separate live admin consent for instance records', async () => {
+  const own = normalize({ id: 'mcp-alice', source: 'caller', level: 'warning', operation: 'checked', workspace: 'alice', message: 'Alice event' })!
+  const foreign = normalize({ id: 'mcp-bob', source: 'caller', level: 'error', operation: 'checked', workspace: 'bob', message: 'Bob event' })!
+  const host = normalize({ id: 'mcp-host', source: 'kernel', level: 'critical', operation: 'memory', visibility: 'operator', message: 'Host event' })!
+  const database = new DiagnosticStore(join(h.config.dataDir, 'logging.db'))
+  try { database.append([own, foreign, host]) } finally { database.close() }
+  h.workspace.reachable = false
+  const alice = await connect('Alice', { workspaceData: '1', operatorLogs: '1' })
+  const second = await connect('Alice', { workspaceData: '1' })
+  const admin = await connect('root', { operatorLogs: '1' })
+  const tool = (access: string, name: string, args: Record<string, unknown>) => rpc(access, 'tools/call', { name, arguments: args })
+  function decoded(response: Awaited<ReturnType<typeof tool>>) {
+    const result = response.json().result as { content: Array<{ text: string }> }
+    return JSON.parse(result.content[0].text) as { page: { watermark: string }; lookup: unknown }
+  }
+  const page = await tool(alice.access, 'poise_list', { kind: 'logging', limit: 1 })
+  expect(page.status).toBe(200)
+  const logging = decoded(page).page
+  expect(logging).toMatchObject({ items: [{ id: own.id }], watermark: expect.any(String), source: 'Gateway Logging' })
+  for (const eventId of [foreign.id, host.id]) {
+    const lookup = await tool(alice.access, 'poise_get', { kind: 'logging', id: eventId })
+    expect(decoded(lookup).lookup).toMatchObject({ record: null })
+  }
+  const updated = normalize({ id: 'mcp-alice-next', source: 'caller', level: 'warning', operation: 'checked', workspace: 'alice', message: 'Next event' })!
+  const writer = new DiagnosticStore(join(h.config.dataDir, 'logging.db'))
+  try { writer.append([updated]) } finally { writer.close() }
+  const args = { kind: 'logging', limit: 1, afterWatermark: logging.watermark }
+  const changed = await tool(alice.access, 'poise_changes', args)
+  expect(decoded(changed).page).toMatchObject({ items: [{ id: updated.id }] })
+  expect((await tool(second.access, 'poise_changes', args)).status).toBe(400)
+  expect((await tool(alice.access, 'poise_list', { kind: 'instance-logging' })).status).toBe(403)
+  const operator = await tool(admin.access, 'poise_list', { kind: 'instance-logging' })
+  expect(decoded(operator).page).toMatchObject({ items: [{ id: host.id }] })
+  h.store.syncEnvAllowList([...h.config.allowedUsers, 'root'])
+  h.config.admins.splice(0)
+  expect((await tool(admin.access, 'poise_list', { kind: 'instance-logging' })).status).toBe(403)
+  expect(h.workspace.requests).toHaveLength(0)
+})
 function rpc(access: string, method = 'tools/list', params?: unknown) {
   return h.request({ host: APEX, path: '/mcp', method: 'POST', headers: { authorization: `Bearer ${access}`, 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
 }
+
+it('projects inventory fields and verifies links on the workspace origin', () => {
+  const origin = 'https://alice.poise.test'
+  const surface = { id: 'board', kind: 'issue-work', href: '/?view=board', source: 'GitHub mirror', retention: 'Current rows',
+    permission: 'Read grant', tool: 'poise_work', reason: 'Bounded issue reads', rawPath: '/private/workspace' }
+  const inventory = { observedAt: new Date().toISOString(), release: { repo: 'autonomio/poise', commit: null, since: null }, surfaces: [surface] }
+  const scoped = workspaceInventory(inventory, origin, ['poise_describe'])
+  expect(scoped).toMatchObject({ surfaces: [{ id: 'board', href: `${origin}/?view=board`, status: 'unavailable', tool: null }] })
+  expect(JSON.stringify(scoped)).not.toContain('/private/workspace')
+  expect(() => workspaceInventory({ ...inventory, surfaces: [{ ...surface, href: '//bob.poise.test/' }] }, origin, ['poise_work']))
+    .toThrow('invalid_workspace_inventory_surface')
+  expect(() => workspaceInventory({ ...inventory, surfaces: [surface, surface] }, origin, ['poise_work']))
+    .toThrow('duplicate_workspace_inventory_surface')
+})
 
 it('is absent by default and validates enablement explicitly', async () => {
   expect(() => loadConfig({ POISE_MCP_ENABLED: 'yes' })).toThrow('POISE_MCP_ENABLED')
@@ -74,7 +132,7 @@ it('completes discovery, existing GitHub sign-in, explicit owner consent, PKCE a
   const issuer = await h.request({ host: APEX, path: '/.well-known/oauth-authorization-server' })
   expect(issuer.json()).toMatchObject({ code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'] })
   const grant = await connect()
-  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: MCP_TOOLS } })
+  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: workTools } })
   expect((await rpc(grant.access, 'initialize', { protocolVersion: '2025-11-25' })).json()).toMatchObject({ result: { protocolVersion: '2025-11-25', capabilities: { tools: {} } } })
   expect((await form('/mcp/token', { grant_type: 'authorization_code', client_id: grant.client, code: grant.code, redirect_uri: redirectUri, resource, code_verifier: verifier })).status).toBe(400)
   const listed = await h.request({ host: APEX, path: '/mcp/grants', headers: { cookie: grant.apexCookie } })
@@ -158,7 +216,7 @@ it('isolates two owners, persists hash-only grants and revokes access and refres
 
 it('withholds poise_work from grants consented before it existed', async () => {
   const grant = await connect()
-  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: MCP_TOOLS } })
+  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: workTools } })
   // Simulate a pre-poise_work grant that records no permitted tools.
   const legacy = new Database(`${h.config.dataDir}/mcp.db`)
   legacy.prepare("UPDATE mcp_grants SET state = json_remove(state, '$.tools')").run()

@@ -1693,8 +1693,10 @@ def persist_action_plan(call_id: str, plan: dict) -> str:
         raise ValueError("native publication plan exceeds its durable byte bound")
     with db() as conn:
         conn.execute("begin immediate")
-        row = conn.execute("select action_plan, status, json_extract(artifact,'$.retirement.cause') as retirement "
+        row = conn.execute("select action_plan, status, json_extract(artifact,'$.retirement.cause') as retirement,outcome,head_sha "
                            "from calls where id=?", (call_id,)).fetchone()
+        if row is not None and row["outcome"] == "superseded":
+            raise ReviewSuperseded(row["head_sha"])
         if row is not None and row["retirement"] == "target_closed":
             raise ClosedImplementationRetired("work publication fenced by verified target closure")
         if row is None or row["status"] != "running" or (row["action_plan"] is not None and row["action_plan"] != encoded):
@@ -1949,7 +1951,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                         if pull is not None and repair_basis else {}
                     result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head,
                                              note, merge_base, expected_issue_revision, **repair_args)
-                except ClosedImplementationRetired:
+                except (ClosedImplementationRetired, ReviewSuperseded):
                     raise
                 except Exception as error:
                     if getattr(error, "diagnostic", None) is None:
@@ -1965,7 +1967,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                     failure = retain_native_failure(id_, error, diagnostic=failure)
                     raise
             outcome = result.get("outcome")
-            if outcome not in {"published", "no_changes", "superseded", "target_closed", "prerequisite_wait"}:
+            if outcome not in {"published", "no_changes", "superseded", "target_closed", "prerequisite_wait", "repair_queue_blocked"}:
                 raise RuntimeError("atomic behavior returned no publication outcome")
             if outcome == "target_closed":
                 if pull is not None or behavior != "implement_issue":
@@ -1973,6 +1975,28 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                 record({**artifact, "retirement": {"cause": "target_closed", "detected_at": time()}})
                 finish(id_, "superseded", response=json.dumps(result), outcome="target_closed",
                        head_sha=None, action="not_started", error_code="target_closed")
+            elif outcome == "repair_queue_blocked":
+                blocker = artifact.get("queue_blocker")
+                if pull is None or artifact.get("phase") != outcome or not isinstance(blocker, dict) \
+                        or blocker != result.get("queue_blocker") or blocker.get("call_id") != id_ \
+                        or (blocker.get("repository"), blocker.get("pull_number"), blocker.get("ref"), blocker.get("head")) \
+                        != (repo, pull, f"refs/heads/{branch}", expected_head) \
+                        or artifact.get("result") is not None or result.get("head_sha") != expected_head \
+                        or result.get("reply_receipts") is not None:
+                    raise RuntimeError("repair queue blocker lacks the original no-write publication evidence")
+                if blocker.get("kind") == "already_queued":
+                    valid = (isinstance(blocker.get("entry_id"), str) and bool(blocker["entry_id"])
+                             and artifact.get("publication_head") is None
+                             and artifact.get("replies_started") is None)
+                else:
+                    attempted = blocker.get("attempted_head")
+                    valid = (blocker.get("kind") == "push_rejected" and blocker.get("rejection_code") == "GH006"
+                             and isinstance(attempted, str) and re.fullmatch(r"[0-9a-f]{40}", attempted)
+                             and attempted != expected_head and attempted == artifact.get("publication_head")
+                             and artifact.get("replies_started") is False)
+                if not valid:
+                    raise RuntimeError("repair queue blocker contradicts the original push or reply checkpoint")
+                finish(id_, "completed", response=json.dumps(result), outcome=outcome, head_sha=None, action="not_started")
             elif outcome == "prerequisite_wait":
                 if pull is not None or artifact.get("phase") != "prerequisite_wait" \
                         or artifact.get("publication_head") is not None or artifact.get("replies_started") is not None \
@@ -1991,9 +2015,14 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                 resource_ownership.failure(DB, id_, "resources_unknown", run_dir)
             record({**artifact, "phase": "resources_unknown"})
         with db() as conn:
-            row = conn.execute("select error_code,artifact,action_plan from calls where id=?", (id_,)).fetchone()
+            row = conn.execute("select error_code,artifact,action_plan,outcome,head_sha from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
         stored = json.loads(row["artifact"] or "{}") if row and row["artifact"] else {}
+        if isinstance(error, ReviewSuperseded) and source == "poise:behavior-chain" and pull is not None \
+                and row is not None and row["outcome"] == "superseded" and row["head_sha"] == error.head_sha and not row["error_code"]:
+            finish(id_, "superseded", outcome="superseded", head_sha=error.head_sha, action=None)
+            print(json.dumps({"id": id_, "behavior": behavior, "outcome": "superseded", "head_sha": error.head_sha}))
+            return
         retired = (
             source == "poise:behavior-chain" and pull is None and behavior == "implement_issue"
             and row is not None and row["action_plan"] is None and failure is None

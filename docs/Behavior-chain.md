@@ -8,6 +8,10 @@ head or context requires the existing fresh-review cycle. Approval metadata and
 another process using the same account cannot supply that invocation's response.
 Merge and queue admission revalidate the retained response against the current
 PR and its published review while preserving the normal CI and thread gates.
+For `autonomio/poise`, the dedicated App's
+[Poise review clearance](Review-clearance.md) check also exposes the complete
+native review obligation at GitHub's PR-head and merge-group boundary. Its
+activation and audit are separate administrator rollout steps.
 A confirmed external merge is recorded separately: without qualifying pre-merge
 review evidence its review obligation remains open through journal recovery.
 A closed seed without a bound PR also discovers exactly one merged GitHub closing
@@ -512,6 +516,15 @@ through the existing control after resolving the blocker.
 4. Existing native primitives handle grey CI, approved nonblocking conversation resolution, strict readiness, merge and merge-queue admission. Conversation resolution also covers outdated threads, because GitHub's merge rule counts them, but only when readiness is blocked solely by `merge_state_not_clean` or `required_reviews_not_approved`, the blockers an open conversation can explain. A PR that readiness reports green goes to merge with its outdated threads left alone. Their repository policy leaves a merely behind branch to native queue integration; an actual conflict still requires repair. Completion requires the actual GitHub merge SHA. Queue admission, a finished turn, approval or CLOSED alone cannot complete a chain.
 5. A removed queue entry requires its actual GitHub removal event. Failed integration checks or conflicts lead to fresh repair; manual or unknown removal holds for a decision. A `merged` removal alongside an earlier open-PR read waits for confirmed merge evidence; that event alone neither completes nor holds the chain. An unchanged-head repair requires a new independent approval before another native queue attempt. Only that attempt's actual integration result can establish acceptance. Deliberate dismissal of a current-head managed approval is also held.
 
+Caller checks the exact PR head for a GitHub queue entry before repair can push
+or post replies. An existing entry defers publication. If GitHub queues the PR
+during the push, Caller records a deferral only after GitHub explicitly rejects
+the single attempted ref for that queue reason and fresh PR and ref reads still
+show the original head. Poise settles the deferral after the original resources
+are released and waits for fresh GitHub queue removal or confirmed merge evidence.
+The original plan and rejection remain in the receipt. A lost response or
+contradictory evidence keeps the original publication uncertain.
+
 Live queue observations retain the entry ID, GitHub disposition and nullable
 integration base/head commits together through `pull_action_state --queue-evidence`.
 Exhausting its three head-matching reads fails rather than attaching another
@@ -653,6 +666,17 @@ produces the same `target_closed` outcome. The invocation settles as deferred
 after verified no-write closure and original resource release, preserving
 history without an Error or a failed attempt. Other Calls and uncertain
 publication or cleanup retain their original ownership and reconciliation.
+
+A native repair also observes the live PR head within its original gated
+provider lifecycle. Only a verified different head and a Caller fence that wins
+the publication transaction can stop that provider early. The original Call
+records supersession with both revisions and retains its resources until positive
+settlement. The chain then considers the current head through its normal gates,
+without a chain supersession or a person's Stop/Resume hold. Publication that
+wins the race retains ownership and normal reconciliation. Bounded chain
+observations show the changed head waiting on the original Call, with the old
+and new revisions in the existing work status. Unavailable or unchanged head
+evidence never cancels a healthy repair or extends its deadline.
 
 The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,

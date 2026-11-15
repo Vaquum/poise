@@ -31,6 +31,8 @@ db.exec(`
     open_call_id TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_chat_sessions_instance ON chat_sessions(instance, updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_chat_sessions_mcp_page ON chat_sessions(instance, updated_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_chat_sessions_mcp_repo_page ON chat_sessions(instance, repo COLLATE NOCASE, updated_at DESC, id DESC);
   CREATE UNIQUE INDEX IF NOT EXISTS chat_sessions_subject ON chat_sessions(
     instance, json_extract(record, '$.subject.surface'), json_extract(record, '$.subject.key')
   ) WHERE json_extract(record, '$.subject.key') IS NOT NULL;
@@ -48,6 +50,8 @@ db.exec(`
   -- planner needs no table statistics to use it.
   CREATE INDEX IF NOT EXISTS idx_chat_events_turn_finished ON chat_events(session_id, json_extract(event, '$.turnId'))
     WHERE json_extract(event, '$.type') = 'turn.finished';
+  CREATE INDEX IF NOT EXISTS idx_chat_events_diff ON chat_events(session_id, json_extract(event, '$.diffId'))
+    WHERE json_extract(event, '$.type') = 'diff';
 
   CREATE TABLE IF NOT EXISTS chat_pending (
     request_id TEXT PRIMARY KEY,
@@ -229,6 +233,37 @@ export function listSessions(instance: string): SessionRecord[] {
   const rows = cachedStatement(db, 'SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
     .all(instance) as Array<{ record: string, last_seq: number, status: string, role: string | null }>
   return rows.map(parseRecord)
+}
+
+export interface ChatPageSelector {
+  repository: string | null
+  since: string | null
+  until: string | null
+  before: { updatedAt: string; id: string } | null
+  limit: number
+}
+
+/** Only the list fields cross the MCP projection. The repository and cursor
+ *  predicates run before the bounded read, including for archived sessions. */
+export function pageChatSessions(instance: string, selector: ChatPageSelector) {
+  const filters = ['instance = ?']
+  const args: Array<string | number> = [instance]
+  if (selector.repository) {
+    filters.push('repo = ? COLLATE NOCASE')
+    args.push(selector.repository)
+  }
+  if (selector.since) { filters.push('updated_at >= ?'); args.push(selector.since) }
+  if (selector.until) { filters.push('updated_at < ?'); args.push(selector.until) }
+  if (selector.before) {
+    filters.push('(updated_at, id) < (?, ?)')
+    args.push(selector.before.updatedAt, selector.before.id)
+  }
+  const rows = cachedStatement(db, `SELECT id, title, repo, role, status, updated_at AS updatedAt, last_seq AS lastSequence
+    FROM chat_sessions WHERE ${filters.join(' AND ')} ORDER BY updated_at DESC, id DESC LIMIT ?`)
+    .all(...args, selector.limit) as Array<{ id: string; title: string; repo: string; role: string | null;
+      status: SessionStatus; updatedAt: string; lastSequence: number }>
+  return rows.map(({ repo, role, ...row }) => ({ ...row, repository: repo || null,
+    role: role === 'manager' || role === 'worker' ? role : 'chat' }))
 }
 
 /** The subject's session id, in any state, or null. Keys compare exactly. */

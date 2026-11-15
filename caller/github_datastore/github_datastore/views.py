@@ -58,6 +58,7 @@ def issue(
     created_at_datetime: str | None = None,
     limit: int | None = None,
     label: str | None = None,
+    created_before_datetime: str | None = None,
     after_repo: str | None = None,
     after_number: int | None = None,
 ) -> str:
@@ -74,6 +75,7 @@ def issue(
             "created_since_datetime": _created_since(created_since_datetime, created_at_datetime),
             "limit": limit,
             "label": label,
+            "created_before_datetime": created_before_datetime,
             "after_repo": after_repo,
             "after_number": after_number,
         },
@@ -701,6 +703,10 @@ def _where(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
     if created_since is not None:
         clauses.append("created_at >= ?")
         params.append(_normalize_datetime(created_since))
+    created_before = filters.get("created_before_datetime")
+    if created_before is not None:
+        clauses.append("created_at < ?")
+        params.append(_normalize_datetime(created_before))
     return clauses, params
 
 
