@@ -127,6 +127,9 @@ registration and authorization code with S256 PKCE. Discovery starts from the
   Poise GitHub sign-in, and explicit owner consent protected by the browser
   session's CSRF token and exact apex Origin. It never accepts a requested
   workspace or owner from the client. Denial returns `access_denied`.
+- The owner can enter an `owner/repository` restriction at consent. The grant
+  page shows the repository. The scope survives refresh and applies at both
+  gateway and workspace dispatch. A repository outside the scope is refused.
 - A single-use code expires after 60 seconds. Access tokens expire after ten
   minutes; rotating refresh tokens end with their 30-day owner grant.
   Token exchange binds the client, redirect URI, PKCE verifier and resource.

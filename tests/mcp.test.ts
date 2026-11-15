@@ -106,7 +106,7 @@ const fetcher: typeof fetch = async (input, init) => {
 }
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
-async function connect(login: string, serverEndpoint = endpoint, chatMetadata = false) {
+async function connect(login: string, serverEndpoint = endpoint, options: { chatMetadata?: boolean; repository?: string } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -137,7 +137,7 @@ async function connect(login: string, serverEndpoint = endpoint, chatMetadata = 
   const approved = await fetcher(new URL('/mcp/authorize', endpoint), { method: 'POST', headers: {
     cookie: signedIn.apexCookie, origin: new URL(endpoint).origin, 'content-type': 'application/x-www-form-urlencoded',
   }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
-    ...(chatMetadata ? { chatMetadata: '1' } : {}) }) })
+    ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
   expect(callback.searchParams.get('state')).toBe('fixture-state')
@@ -220,8 +220,10 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
   const timer = createTimer('alice-chat', { sessionId: id, label: 'Fixture timer', message: 'Private timer instruction', delayMinutes: 5 },
     { kind: 'person' }, Date.now())
   const workGrant = await connect('Alice')
-  const alice = await connect('Alice', endpoint, true)
-  const bob = await connect('bob', endpoint, true)
+  const alice = await connect('Alice', endpoint, { chatMetadata: true })
+  const bob = await connect('bob', endpoint, { chatMetadata: true })
+  const matching = await connect('Alice', endpoint, { chatMetadata: true, repository: 'acme/repo' })
+  const outside = await connect('Alice', endpoint, { chatMetadata: true, repository: 'acme/other' })
   const args = { kind: 'chat', id }
   const request = { name: 'poise_get', arguments: args }
   async function lookup(client: Client, kind: 'chat' | 'timer', id: string) {
@@ -252,10 +254,16 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     expect(JSON.stringify(timerLookup)).not.toContain('Private timer instruction')
     expect(await lookup(bob.client, 'chat', id)).toMatchObject({ record: null, link: null })
     expect(await lookup(bob.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
+    expect(await lookup(matching.client, 'chat', id)).toMatchObject({ record: { id } })
+    expect(await lookup(matching.client, 'timer', timer.id)).toMatchObject({ record: { repository: 'Acme/Repo' } })
+    expect(await lookup(outside.client, 'chat', id)).toMatchObject({ record: null, link: null })
+    expect(await lookup(outside.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
   } finally {
     await workGrant.client.close()
     await alice.client.close()
     await bob.client.close()
+    await matching.client.close()
+    await outside.client.close()
     db.prepare('DELETE FROM chat_control_timers WHERE id = ?').run(timer.id)
     deleteSession(id)
   }
@@ -336,6 +344,34 @@ it('reports the running workspace inventory through describe and the matching MC
     expect(JSON.parse(content.text)).toMatchObject({ workspace: 'alice',
       inventory: { surfaces: result.inventory.surfaces }, access: { resource: endpoint } })
     await expect(client.readResource({ uri: 'poise://workspace/bob' })).rejects.toThrow('resource not found')
+  } finally { await client.close() }
+})
+
+it('keeps a consented repository restriction at the gateway and signed workspace boundary after refresh', async () => {
+  const { client, provider } = await connect('Alice', endpoint, { repository: 'Acme/Repo' })
+  const argumentsOutside = { repository: 'Acme/Other', issue: 1 }
+  const request = { name: 'poise_work', arguments: argumentsOutside }
+  try {
+    const original = (await provider.tokens())!
+    const grant = gateway.context.mcp.grants.find(original.access_token, 'access')!
+    expect(grant.repository).toBe('Acme/Repo')
+    const work = await client.callTool(request)
+    expect(work).toMatchObject({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
+    expect(workspaceReads).toBe(0)
+    expect(await describe(client)).toMatchObject({ access: { repository: 'Acme/Repo' } })
+    const renewed = await fetcher(new URL('/mcp/token', endpoint), { method: 'POST', headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+    }, body: new URLSearchParams({ grant_type: 'refresh_token', client_id: grant.clientId,
+      refresh_token: original.refresh_token!, resource: endpoint }) })
+    expect(renewed.status).toBe(200)
+    const { access_token: access } = await renewed.json() as { access_token: string }
+    expect(gateway.context.mcp.grants.find(access, 'access')).toMatchObject({ repository: 'Acme/Repo', grantId: grant.grantId })
+    const mcp = { resource: endpoint, ownerId: 1001, handle: 'alice', grantId: grant.grantId, repository: 'Acme/Repo' }
+    const identity = signAssertion(h.keys.privateKey, { handle: 'alice', login: 'Alice', scope: 'mcp', mcp }, Date.now())
+    const reply = await send(workspacePort, { host: 'alice.poise.test', path: '/api/mcp/read', method: 'POST',
+      headers: { 'x-poise-identity': identity, 'content-type': 'application/json' }, body: JSON.stringify(request) })
+    expect(reply.status).toBe(403)
+    expect(reply.body).toContain('repository is outside this grant')
   } finally { await client.close() }
 })
 
@@ -454,7 +490,7 @@ conn.close()
   const bundle = join(root, 'bundle')
   await packagePoisePlugin('https://poise.test', bundle)
   const manifest = JSON.parse(await readFile(join(bundle, 'plugins/poise/mcp.json'), 'utf8'))
-  const connection = await connect('Alice', manifest.mcpServers.poise.url)
+  const connection = await connect('Alice', manifest.mcpServers.poise.url, { repository: 'Acme/Repo' })
   const other = await connect('bob', manifest.mcpServers.poise.url)
   const run = vi.spyOn(processes, 'runFile')
   const reads = vi.spyOn(BehaviorChainJournal.prototype, 'read')

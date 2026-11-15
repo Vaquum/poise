@@ -3,7 +3,7 @@
 // verified with node:crypto alone.
 
 import { verify, type KeyObject } from 'node:crypto'
-import { MCP_READ_PATH, type McpGrantScope } from '../../gateway/src/mcp-contract'
+import { MCP_READ_PATH, isMcpRepository, type McpGrantScope } from '../../gateway/src/mcp-contract'
 
 export const IDENTITY_HEADER = 'x-poise-identity'
 export const ASSERTION_ISSUER = 'poise-gateway'
@@ -83,7 +83,8 @@ export function verifyIdentityAssertion(token: string, expected: AssertionExpect
     const value = claims.mcp as Partial<McpGrantScope> | undefined
     if (!value || !expected.resource || value.resource !== expected.resource || value.handle !== expected.handle
       || !Number.isSafeInteger(value.ownerId) || Number(value.ownerId) < 1 || value.ownerId !== expected.ownerId || typeof value.grantId !== 'string'
-      || !/^[a-f0-9-]{36}$/.test(value.grantId) || (value.chatMetadata !== undefined && value.chatMetadata !== true)) {
+      || (value.chatMetadata !== undefined && value.chatMetadata !== true)
+      || !/^[a-f0-9-]{36}$/.test(value.grantId) || (value.repository !== undefined && !isMcpRepository(value.repository))) {
       return refuse('the MCP assertion has an invalid grant or resource audience')
     }
     mcp = value as McpGrantScope

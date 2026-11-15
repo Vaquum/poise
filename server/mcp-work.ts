@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
-import type { McpGrantScope, McpWorkArguments } from '../gateway/src/mcp-contract'
+import { mcpRepositoryAllowed, type McpGrantScope, type McpWorkArguments } from '../gateway/src/mcp-contract'
 import { readBehaviorLedger } from './behavior-ledger'
 import type { LedgerHealth, LedgerReadReply, LedgerRecord } from './behavior-ledger-contract'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, type ChainObservation } from './behavior-chain-decision'
@@ -172,6 +172,7 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
 }
 
 export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig, grant: McpGrantScope) {
+  if (!mcpRepositoryAllowed(grant, args.repository)) throw new HttpError(403, 'repository is outside this grant')
   requireConfiguredRepository(args.repository)
   const org = organizationForRepository(args.repository)
   if (!org || org.status !== 'ready') throw new HttpError(403, 'repository is outside the ready workspace accounts')
