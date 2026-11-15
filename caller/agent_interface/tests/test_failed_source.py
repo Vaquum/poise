@@ -101,7 +101,7 @@ def linked_reader(monkeypatch, original, issue=99):
     with sqlite3.connect(os.environ["POISE_DB"]) as conn:
         conn.execute("create table meta(key text primary key, value text)")
         conn.execute("insert into meta values (?,?)", ("behavior_chain_repair_report:" + key, json.dumps({
-            "source": source, "pull": None, "issueNumber": 99,
+            "key": key, "source": source, "pull": None, "issueNumber": 99,
             "attempts": [{"call": original["id"], "invocation": original["correlation_id"]}]})))
     return reader
 
@@ -238,6 +238,75 @@ def test_inspection_refuses_unavailable_or_unauthorized_evidence(retained, monke
         with sqlite3.connect(database) as conn:
             conn.execute("create table calls(id text primary key)")
     assert failed_source.inspect(database, call, candidate, run)["status"] == "unavailable"
+
+
+def diagnosed_reader(original, capture, scoped):
+    source, target, hold = "example/repo#7", "example/repo#99", 5
+    attempt = original["correlation_id"]
+    parts = ["atomic_work_blocked", source, *([attempt, hold] if scoped else [])]
+
+    def compact(value):
+        return json.dumps(value, separators=(",", ":"))
+
+    key = hashlib.sha256(compact(parts).encode()).hexdigest()
+    revision, source_revision = "a" * 64, "b" * 64
+    inputs = {"source": source, "report": 99, "reportKey": key, "holdSequence": hold, "actor": original["actor"],
+              "reviewer": "reviewer", "sourceRevision": source_revision, "invocation": attempt, "call": original["id"],
+              "revision": revision, "review": "report-review", "reviewCall": "c" * 32, "commentId": 700,
+              "base": capture["base"], "prepared": capture["base"], "capture": capture, "assertion": None}
+    diagnosis = hashlib.sha256(compact(inputs).encode()).hexdigest()
+    report = {"key": key, "source": source, "pull": None, "holdSequence": hold, "issueNumber": 99,
+              "attempts": [{"call": original["id"], "invocation": attempt}]}
+    common = {"author": original["actor"], "reviewer": "reviewer", "mergeSha": None}
+
+    def observed(revision):
+        return {"pull": None, "existingPulls": [], "issue": {"open": True, "eligible": True, "revision": revision, "commentIds": [700]},
+                "publication": {"pull_number": None, "head_sha": None, "head_invocation": None, "state": None, "merged": False, "merge_sha": None}}
+
+    source_state = {**common, "resumedAfterSequence": 0, "held": original["error"], "observation": observed(source_revision),
+                    "invocations": [{"id": attempt, "callId": original["id"], "state": "settled", "evidence": {"error": original["error"]}}]}
+    target_state = {**common, "held": None, "observation": observed(revision),
+                    "invocations": [{"id": inputs["review"], "callId": inputs["reviewCall"], "behavior": "review-issue",
+                                     "state": "settled", "actor": "reviewer", "evidence": {"status": "completed", "action": "commented",
+                                     "issue_revision": revision, "receipts": [{"comment_id": 700, "issue": target, "author": "reviewer"}]}}]}
+    with sqlite3.connect(os.environ["POISE_DB"]) as conn:
+        conn.execute("create table meta(key text primary key, value text)")
+        conn.execute("create table behavior_chain_current(chain_id text primary key, state text)")
+        conn.execute("create table behavior_chain_events(sequence integer primary key, chain_id text, payload text)")
+        conn.executemany("insert into meta values (?,?)", [
+            ("me", original["actor"]), ("agentAccount", "reviewer"), ("behavior_chain_repair_report:" + key, compact(report)),
+            ("behavior_chain_implementation_triage:" + diagnosis, compact({
+                "inputs": inputs, "deadline": int(failed_source.time() * 1000) + 100_000, "outcome": None}))])
+        conn.executemany("insert into behavior_chain_current values (?,?)", [(source, compact(source_state)), (target, compact(target_state))])
+        conn.execute("insert into behavior_chain_events values (?,?,?)", (hold, source, '{"type":"chain.held"}'))
+    return diagnosis
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_diagnosis_reads_only_its_exact_current_hold_and_report_review(retained, monkeypatch, scoped):
+    call, _, archive, spec, candidate = retained
+    capture = failed_source.capture(api.DB, archive, spec, candidate, RUN, 1)
+    assert capture["status"] == "available"
+    with api.db() as conn:
+        conn.execute("update calls set status='failed', error_code='atomic_work_blocked',action='not_started',outcome='preflight_failed',"
+                     "error='original blocker',resources_settled_at=? where id=?", (failed_source.time(), call))
+    original, = api.logs_selected({"latest": [], "ids": [call]})
+    monkeypatch.delenv("AGENT_INTERFACE_FAILED_SOURCE_CALL")
+    diagnosis = diagnosed_reader(original, capture, scoped)
+    assert failed_source.inspect(api.DB, call, candidate, RUN)["status"] == "unavailable"
+    assert failed_source.inspect(api.DB, call, candidate, RUN, "0" * 64)["status"] == "unavailable"
+    evidence = failed_source.inspect(api.DB, call, candidate, RUN, diagnosis)
+    assert evidence["status"] == "available"
+    assert set(evidence) == set(capture) | {"path"}
+    with sqlite3.connect(os.environ["POISE_DB"]) as conn:
+        conn.execute("update behavior_chain_current set state=json_set(state, '$.observation.issue.revision', 'replacement') "
+                     "where chain_id='example/repo#99'")
+    assert failed_source.inspect(api.DB, call, candidate, RUN, diagnosis)["status"] == "unavailable"
+    with sqlite3.connect(os.environ["POISE_DB"]) as conn:
+        conn.execute("update behavior_chain_current set state=json_set(state, '$.observation.issue.revision', ?) "
+                     "where chain_id='example/repo#99'", ("a" * 64,))
+        conn.execute("insert into behavior_chain_events values (6,'example/repo#7','{\"type\":\"chain.held\"}')")
+    assert failed_source.inspect(api.DB, call, candidate, RUN, diagnosis)["status"] == "unavailable"
 
 
 def test_inspection_returns_unavailable_without_blocking_on_fifo_evidence(retained, monkeypatch):

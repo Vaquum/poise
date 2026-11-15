@@ -23,7 +23,7 @@ export interface ChainRuntimeOperations {
   /** Also reports terminal uncertain publications and merges without a chain hold. */
   reportHold?(chain: BehaviorChain): Promise<string | null>
   implementationAdmission?(chain: BehaviorChain, observation: ChainObservation): Promise<{
-    reason: string | null, source?: { id: string, sequence: number }
+    reason: string | null, source?: { id: string, sequence: number }, note?: string
   }>
   recoverReport?(chain: BehaviorChain, observation: ChainObservation): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
@@ -209,8 +209,13 @@ function recoveredImplementation(chain: BehaviorChain, observation: ChainObserva
     || observation.checkedAt < Date.parse(String(evidence.resources_settled_at))
     || !Number.isFinite(observation.checkedAt) || observation.checkedAt > now || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS
     || recovery?.invocationId !== original.id || recovery.verified !== true || recovery.recovered !== true
-    || !recovery.recovery || !/^[a-f0-9]{40}$/.test(recovery.recovery.merge) || !/^[a-f0-9]{40}$/.test(recovery.recovery.base)
-    || observation.prerequisites?.base !== recovery.recovery.base
+    || !recovery.recovery || !/^[a-f0-9]{40}$/.test(recovery.recovery.base)
+    || observation.prerequisites?.base !== recovery.recovery.base) return null
+  if (chain.testRecovery?.triage) {
+    return recovery.recheck === chain.testRecovery.recheck && recovery.recovery.triage === chain.testRecovery.triage
+      && recovery.recovery.base === chain.testRecovery.base ? chain.testRecovery : null
+  }
+  if (!recovery.recovery.merge || !/^[a-f0-9]{40}$/.test(recovery.recovery.merge)
     || chain.testRecovery && chain.testRecovery.merge !== recovery.recovery.merge) return null
   return { hold, merge: recovery.recovery.merge, base: recovery.recovery.base }
 }
@@ -387,11 +392,11 @@ export class BehaviorChainRuntime {
     return budgetShortfall(resources.budget, reserved, resources.reservation)
   }
 
-  private allowed(chain: BehaviorChain, invocation: ChainInvocation): boolean {
+  private allowed(chain: BehaviorChain, invocation: ChainInvocation, source = invocation.request.implementationSource): boolean {
     const current = this.current(chain)
     const accounts = this.operations.accounts()
     return current.invocations.some(candidate => candidate.id === invocation.id && candidate.state !== 'settled')
-      && (!invocation.request.implementationSource || this.journal.read(invocation.request.implementationSource.id)?.sequence === invocation.request.implementationSource.sequence)
+      && (!source || this.journal.read(source.id)?.sequence === source.sequence)
       && !closedChainTarget(current, current.observation as ChainObservation | null, invocation.behavior)
       && !current.held && this.operations.enabled() && accounts.author.toLowerCase() === current.author.toLowerCase() && accounts.reviewer.toLowerCase() === current.reviewer.toLowerCase()
       && this.operations.permitted(current, { kind: 'invoke', behavior: invocation.behavior, actor: invocation.actor,
@@ -850,6 +855,13 @@ export class BehaviorChainRuntime {
                   continue
                 }
                 if (gate?.source) request = { ...request, implementationSource: gate.source }
+                if (gate?.note) {
+                  const argv = [...request.argv]
+                  const note = argv.indexOf('--note')
+                  if (note < 0) argv.push('--note', gate.note)
+                  else argv[note + 1] = [argv[note + 1], gate.note].filter(Boolean).join('\n\n')
+                  request = { ...request, argv }
+                }
                 if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
                 const admitted = this.journal.admitInvocation(chain, randomUUID(), { id, behavior: decision.behavior, basis: decision.basis,
                   actor: decision.actor, model: request.command === 'agent-interface' ? request.argv[request.argv.indexOf('--model') + 1] : null, slot: decision.reviewer?.slot ?? null,
@@ -1137,11 +1149,11 @@ export class BehaviorChainRuntime {
     return this.append(chain, { type: 'chain.resumed', recovery: typeof recovery === 'object' ? recovery : { origin: 'unknown' } })
   }
 
-  private async start(chain: BehaviorChain, invocation: ChainInvocation): Promise<void> {
+  private async start(chain: BehaviorChain, invocation: ChainInvocation, source = invocation.request.implementationSource): Promise<void> {
     chain = this.append(chain, { type: 'invocation.started', invocationId: invocation.id })
     if (invocation.request.command === 'agent-interface') {
       try {
-        const started = await this.operations.launch(this.nativeInvocation(chain, invocation), (result) => this.exited(chain, invocation, result), () => this.allowed(chain, invocation))
+        const started = await this.operations.launch(this.nativeInvocation(chain, invocation), (result) => this.exited(chain, invocation, result), () => this.allowed(chain, invocation, source))
         if (!started) this.append(this.current(chain), { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
           evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
       } catch (error) {
@@ -1357,6 +1369,7 @@ export class BehaviorChainRuntime {
         reason: 'native process exited without a durable Call receipt; its exit evidence must be reconciled before another effect' })
       return
     }
+    let source = invocation.request.implementationSource
     if (invocation.state === 'admitted' && invocation.behavior === 'implement-issue' && this.operations.implementationAdmission) {
       const gate = await this.operations.implementationAdmission(chain, observation)
       if (gate.reason) {
@@ -1371,13 +1384,14 @@ export class BehaviorChainRuntime {
       }
       // An admission that predates source binding cannot carry its launch
       // precondition; retire it so a fresh admission binds the current source.
-      if (gate.source && !invocation.request.implementationSource) {
+      if (gate.source && gate.source.id !== source?.id) {
         this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
           evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
         this.operations.wake()
         return
       }
+      if (chain.testRecovery?.triage) source = gate.source
     }
-    if (invocation.state === 'admitted') await this.start(chain, invocation)
+    if (invocation.state === 'admitted') await this.start(chain, invocation, source)
   }
 }

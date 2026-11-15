@@ -52,7 +52,9 @@ export interface BehaviorChain {
   held: string | null
   ciHold?: { invocationId: string, callId: string, head: string, queue?: QueueCiBlocker }
   testHold?: { invocationId: string, callId: string, sequence: number }
-  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string, recheck?: string }
+  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, base: string, admission?: string } & (
+    { merge: string, recheck?: string, triage?: never } | { merge?: never, recheck: string, triage: string }
+  )
   repairRecovery?: { report: number, key: string, holdSequence: number, head: string, basis: string, slot: string,
     diagnosis: string, note: string, admission?: string }
   waiting: string | null
@@ -114,6 +116,7 @@ function resourceArtifact(prior: unknown, value: unknown): Record<string, unknow
 // cannot turn each capacity/observation read into a full journal scan.
 const LIVE_MODEL_SQL = 'resource_pending = 1'
 export const FIXTURE_RECHECK_WAIT = 'Implementation fixture recheck: waiting for its saved outcome'
+export const IMPLEMENTATION_TRIAGE_WAIT = 'Implementation hold report diagnosis pending:'
 /** Automatic holds for review-issue's authentication failures, which the
  *  runtime retires once Claude is signed in again: few chains, read every pass. */
 const AUTHENTICATION_HOLD_SQL = "merged = 0 AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%'"
@@ -143,6 +146,7 @@ const RECHECK_AT_SQL = `CASE
         OR json_extract(state, '$.waiting') LIKE 'Stage: implement-issue.% Next action: inspect the implementation Call, address the blocker, then explicitly Resume. Implementation hold reporting pending:%'
         OR json_extract(state, '$.waiting') LIKE 'Implementation hold report pending:%'
         OR json_extract(state, '$.waiting') = '${FIXTURE_RECHECK_WAIT}'
+        OR json_extract(state, '$.waiting') LIKE '${IMPLEMENTATION_TRIAGE_WAIT}%'
         OR json_extract(state, '$.waiting') LIKE 'Implementation hold report creation is unconfirmed;%'))
     THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,
@@ -198,11 +202,11 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (event.testRecovery) {
       const recovery = event.testRecovery
       const proof = next.observation?.testDependency as { invocationId?: string, verified?: boolean, recovered?: boolean, recheck?: string,
-        recovery?: { merge: string, base: string } } | undefined
+        recovery?: { merge?: string, triage?: string, base: string } } | undefined
       const original = next.invocations.at(-1)
       const rechecked = !next.testHold && recovery.recheck && /^[a-f0-9]{64}$/.test(recovery.recheck)
         && proof?.recheck === recovery.recheck && proof.verified === true && proof.recovered === true
-        && proof.recovery?.merge === recovery.merge && proof.recovery.base === recovery.base
+        && proof.recovery?.merge === recovery.merge && proof.recovery?.triage === recovery.triage && proof.recovery?.base === recovery.base
         && proof.invocationId === recovery.hold.invocationId && original?.id === recovery.hold.invocationId
         && original.behavior === 'implement-issue' && original.callId === recovery.hold.callId && original.state === 'settled'
         && original.evidence?.status === 'failed' && original.evidence.action === 'not_started' && resourceReleaseProven(original.evidence, true)
@@ -210,7 +214,9 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
         && recovery.hold.sequence <= current.sequence
       if (!next.held || next.testRecovery || recovery.admission
         || (!rechecked && chainBasis(recovery.hold) !== chainBasis(next.testHold ?? null))
-        || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
+        || (recovery.triage === undefined ? !SHA.test(recovery.merge)
+          : !rechecked || recovery.merge !== undefined || !/^[a-f0-9]{64}$/.test(recovery.triage))
+        || !SHA.test(recovery.base)) throw new Error('test recovery requires its original automatic hold')
       next.testRecovery = event.testRecovery
     } else if (!event.ciRecovery && !event.repairRecovery && !event.approvalRecovery) delete next.testRecovery
     next.held = null
