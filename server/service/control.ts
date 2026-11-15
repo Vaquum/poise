@@ -19,7 +19,7 @@ import type { ChatRuntime } from '../chat/runtime'
 import { findEvent, getOpenTurn, listOpenTurns } from '../chat/storage'
 import { db } from '../db'
 import { HttpError, readJson, type RequestAuthority } from '../http'
-import { markReleaseSwitch, pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
+import { markReleaseSwitch, markReplacementPending, pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
 import { eventLoopDelayStats, type EventLoopDelayStats } from '../event-loop-delay'
 import { DEFAULT_CHAT_SETTINGS } from '../settings'
 import { runningCallerCalls, type NativeCleanupHold } from './caller-calls'
@@ -35,6 +35,7 @@ export interface ServiceHealth {
   /** Native Calls awaiting durable resource release or cleanup retirement; null when unreadable. */
   unsettledNativeCalls: number | null
   nativeCleanupHold?: NativeCleanupHold
+  nativeWorkBlocker?: { callId: string, reason: string }
   backgroundWork: number
   /** True only when nothing a restart would cut is running. */
   idle: boolean
@@ -55,6 +56,8 @@ export interface ServiceHealth {
   pendingSince: string | null
   /** What the pending switch still waits for, one phrase per failing quiet-gate clause; null when none is pending or nothing blocks it. */
   switchWaitingOn: string | null
+  /** Replacement has no staged switch; its admission fence also survives a resumed attempt. */
+  replacement: { target: string, waitingOn: string | null } | null
 }
 
 /** What POST /api/service/switch answers. */
@@ -85,6 +88,11 @@ export const DRAINING_ERROR = 'Poise is installing an update; try again after it
 
 /** A drain lapses this long after the gateway's own drain timeout. */
 export const DRAIN_GRACE_SECONDS = 300
+
+/** Includes gateway rechecks and lost resume responses; renewals cannot extend this pause. */
+export const REPLACEMENT_PAUSE_MS = 180_000
+/** Covers serial replacement passes and the five-minute retry interval, but expires if the gateway disappears. */
+export const REPLACEMENT_ADMISSION_MS = 30 * 60_000
 
 /** How long one Chat turn may hold a refusing drain: past this the drain
  *  stops it through the person's Stop path, with a transcript notice naming
@@ -131,6 +139,8 @@ export interface ServiceControlOptions {
   switchTurnBoundMinutes?: () => number
   /** Clock the switch bound is counted on; tests hold it still. */
   now?: () => number
+  /** Observed datastore and journal progress after resuming a replacement attempt. */
+  replacementRecovery?: (since: number) => string | null
 }
 
 export class ServiceControl {
@@ -138,6 +148,10 @@ export class ServiceControl {
   private launches = 0
   private lapse: unknown = null
   private turnDeadline: unknown = null
+  private replacement: string | null = null
+  private replacementLapse: unknown = null
+  private replacementDrainUntil = 0
+  private replacementResumedAt: number | null = null
   // Drives the switch poll; health reports the persisted record, not this.
   private switchTo: string | null = null
   private switchPoll: unknown = null
@@ -210,6 +224,7 @@ export class ServiceControl {
       unsettledNativeCalls: calls.known ? calls.pendingResources : null,
       ...(cleanupHold && { nativeCleanupHold: { ...cleanupHold,
         reason: cleanupHold.reason === null ? null : redact(cleanupHold.reason, environmentSecrets()).slice(0, 2000) } }),
+      ...(calls.nativeWorkBlocker && { nativeWorkBlocker: calls.nativeWorkBlocker }),
       backgroundWork,
       // Never idle while Caller's records cannot be read: calls an earlier server started may still run.
       idle: calls.known && activeChatTurns + calls.count + backgroundWork === 0,
@@ -222,6 +237,7 @@ export class ServiceControl {
       installedRelease: desiredRelease !== null && this.releaseInstalled(desiredRelease) ? desiredRelease : null,
       pendingSince: pending?.since ?? null,
       switchWaitingOn: waitingOn.length > 0 ? waitingOn.join(', ') : null,
+      replacement: this.replacement === null ? null : { target: this.replacement, waitingOn: this.replacementRecoveryWait() },
     }
   }
 
@@ -525,24 +541,69 @@ export class ServiceControl {
     this.switchCancellation = cancellation
   }
 
-  /** Every call starts the lapse again: the gateway renews a drain by
-   *  calling drain again while it waits. The turn deadline is armed once per
-   *  drain: renewals must never move it. */
-  drain(): ServiceHealth {
+  /** Ordinary drains renew their lapse. Replacement renews only its admission
+   *  fence; rechecks cannot extend the current background pause. */
+  drain(replacement?: string): ServiceHealth {
+    let freshReplacement = false
+    if (replacement !== undefined) {
+      if (!replacement || replacement.length > 200) throw new HttpError(400, 'replacement must name the target release or image')
+      freshReplacement = this.replacement !== replacement
+      this.replacement = replacement
+      // Replacement lets Chat turns finish cooperatively; a fresh target disarms an ordinary drain's deadline.
+      if (freshReplacement && this.turnDeadline !== null) {
+        this.timer.clearTimeout(this.turnDeadline)
+        this.turnDeadline = null
+      }
+      markReplacementPending(true)
+      this.runtime.setSwitchPending(this.switchTo ?? replacement)
+      if (this.replacementLapse !== null) this.timer.clearTimeout(this.replacementLapse)
+      this.replacementLapse = this.timer.setTimeout(() => {
+        this.replacementLapse = null
+        this.log('[service] replacement admission lapsed without a gateway retry; new work is admitted again')
+        this.resume()
+      }, REPLACEMENT_ADMISSION_MS)
+      if (!this.drainOn && this.replacementRecoveryWait() !== null) return this.health()
+    }
     const first = !this.drainOn
+    if ((first || freshReplacement) && this.replacement !== null) {
+      this.replacementDrainUntil = this.now() + REPLACEMENT_PAUSE_MS
+      this.replacementResumedAt = null
+    }
     pauseReleaseBackground()
     // The release drain's gate; its id only names who asked.
     this.runtime.startDrain('service')
     this.drainOn = true
     this.renewLapse()
     const health = this.health()
-    if (first && health.nativeCleanupHold?.retainedCalls === undefined) this.armTurnDeadline()
+    if (first && this.replacement === null && health.nativeCleanupHold?.retainedCalls === undefined) this.armTurnDeadline()
     return health
   }
 
-  resume(): ServiceHealth {
-    this.lift()
+  resume(keepReplacement = false): ServiceHealth {
+    this.releaseAdmission(keepReplacement)
     return this.health()
+  }
+
+  /** Teardown half of resume(): releases replacement and drain admission
+   *  without the health read, for stops after stores have closed. */
+  private releaseAdmission(keepReplacement: boolean): void {
+    const releaseWait = !keepReplacement && this.replacement !== null && this.switchTo === null
+    if (!keepReplacement) {
+      this.replacement = null
+      this.replacementResumedAt = null
+      if (this.replacementLapse !== null) this.timer.clearTimeout(this.replacementLapse)
+      this.replacementLapse = null
+      markReplacementPending(false)
+      if (!releaseWait) this.runtime.setSwitchPending(this.switchTo)
+    }
+    this.lift()
+    if (releaseWait) void this.runtime.releaseSwitchWait()
+  }
+
+  private replacementRecoveryWait(): string | null {
+    if (this.replacementResumedAt === null) return null
+    return this.options.replacementRecovery ? this.options.replacementRecovery(this.replacementResumedAt)
+      : 'replacement recovery observation is unavailable'
   }
 
   /** The gate for a browser launch: null when the request is not one,
@@ -551,7 +612,7 @@ export class ServiceControl {
    *  drain can fall between them. */
   admitLaunch(method: string | undefined, path: string): (() => void) | 'draining' | null {
     if (method !== 'POST' || !LAUNCH_ROUTES.has(path)) return null
-    if (this.drainOn) return 'draining'
+    if (this.drainOn || this.replacement !== null) return 'draining'
     this.launches += 1
     let released = false
     return () => {
@@ -566,7 +627,7 @@ export class ServiceControl {
     this.endHold()
     if (this.switchPoll !== null) this.timer.clearTimeout(this.switchPoll)
     this.switchPoll = null
-    if (this.drainOn || this.switchTo !== null) this.lift()
+    if (this.drainOn || this.switchTo !== null || this.replacement !== null) this.releaseAdmission(false)
     if (this.switchTo !== null) markReleaseSwitch(false)
     this.switchTo = null
     this.switchPendingSince = null
@@ -578,6 +639,14 @@ export class ServiceControl {
 
   private renewLapse(): void {
     if (this.lapse !== null) this.timer.clearTimeout(this.lapse)
+    if (this.replacement !== null) {
+      this.lapse = this.timer.setTimeout(() => {
+        this.lapse = null
+        this.log('[service] replacement drain reached its admission-pause ceiling; background work resumes between attempts')
+        this.lift()
+      }, Math.max(0, this.replacementDrainUntil - this.now()))
+      return
+    }
     const seconds = this.options.drainTimeoutSeconds + DRAIN_GRACE_SECONDS
     this.lapse = this.timer.setTimeout(() => {
       this.lapse = null
@@ -597,6 +666,7 @@ export class ServiceControl {
   }
 
   private lift(): void {
+    if (this.drainOn && this.replacement !== null) this.replacementResumedAt = this.now()
     if (this.lapse !== null) this.timer.clearTimeout(this.lapse)
     this.lapse = null
     if (this.turnDeadline !== null) this.timer.clearTimeout(this.turnDeadline)
@@ -617,6 +687,31 @@ function json(res: ServerResponse, status: number, body: unknown): void {
  *  the gateway's admin scope. The owner's browser may only resume, to lift a
  *  drain the gateway left behind. */
 export function handleServiceApi(req: IncomingMessage, res: ServerResponse, path: string, authority: RequestAuthority, control: ServiceControl): void | Promise<void> {
+  if ((path === '/api/service/drain' || path === '/api/service/resume') && req.method === 'POST'
+      && Number(req.headers['content-length']) > 0) {
+    return (async () => {
+      let body: { replacement?: unknown } | null = null
+      try { body = await readJson<{ replacement?: unknown }>(req) } catch { body = null }
+      // An empty or unreadable body carries no replacement claim: existing
+      // ordinary callers keep the legacy contract below.
+      if (!body || Object.keys(body).length === 0) {
+        if (authority.kind === 'gateway' && authority.scope !== 'admin'
+            && !(authority.scope === 'browser' && path === '/api/service/resume')) {
+          throw new HttpError(403, 'service endpoints answer loopback and the gateway\'s admin scope; the owner\'s browser may only resume')
+        }
+        json(res, 200, path === '/api/service/drain' ? control.drain() : control.resume())
+        return
+      }
+      if (authority.kind === 'gateway' && authority.scope !== 'admin') throw new HttpError(403, 'only the gateway controls replacement admission')
+      if (path === '/api/service/drain') {
+        if (typeof body.replacement !== 'string') throw new HttpError(400, 'replacement must name the target release or image')
+        json(res, 200, control.drain(body.replacement))
+      } else {
+        if (body.replacement !== true) throw new HttpError(400, 'replacement resume must retain admission')
+        json(res, 200, control.resume(true))
+      }
+    })()
+  }
   if (path === '/api/service/config') {
     if (authority.kind === 'gateway' && authority.scope !== 'admin') throw new HttpError(403, 'only the gateway configures service reporting')
     if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return json(res, 405, { error: 'use POST for service configuration' }) }

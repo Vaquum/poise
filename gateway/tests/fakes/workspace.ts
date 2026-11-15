@@ -15,6 +15,8 @@ export interface StubHealth {
   runningCallerCalls: number
   unsettledNativeCalls?: number | null
   nativeCleanupHold?: { callId: string; reason: string | null; retainedCalls?: number }
+  nativeWorkBlocker?: { callId: string; reason: string }
+  replacement?: { target: string; waitingOn: string | null } | null
   backgroundWork: number
   draining: boolean
   /** The release its supervisor runs; null for a workspace started without one. */
@@ -38,6 +40,7 @@ export interface WorkspaceStub {
   drainApplies: boolean
   /** A non-200 resume refuses the request before releasing the drain. */
   resumeStatus: number
+  resumeApplies: boolean
   health: StubHealth
   /** Bytes of filler added to every health and drain answer, as a hostile workspace could. */
   healthPadding: number
@@ -73,6 +76,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
     healthStatus: 200,
     drainApplies: true,
     resumeStatus: 200,
+    resumeApplies: true,
     health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0, draining: false, release: null, switching: null },
     switches: [],
     failedReleases: [],
@@ -132,7 +136,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
         if (url === '/api/service/drain' && req.method === 'POST' && stub.drainApplies) stub.health.draining = true
         if (url === '/api/service/resume' && req.method === 'POST') {
           if (stub.resumeStatus !== 200) return json(res, stub.resumeStatus, { error: 'refused' })
-          stub.health.draining = false
+          if (stub.resumeApplies) stub.health.draining = false
         }
         const answer = (status: number, body: unknown): void => {
           if (stub.answerDelayMs > 0) setTimeout(() => json(res, status, body), stub.answerDelayMs)

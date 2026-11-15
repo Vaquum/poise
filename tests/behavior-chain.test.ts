@@ -7,6 +7,7 @@ import { behaviorChainAttention, behaviorChainSummary, CHAIN_ATTENTION_DELAY_MS,
 import { parseAgentLogList, type LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
+import { markReplacementPending, releaseReplacementPending } from '../server/release-background'
 import { reviewContinuationArgs } from '../server/review-continuation'
 
 const NOW = 1_800_000_000_000
@@ -16,7 +17,7 @@ const MERGE = '3'.repeat(40)
 const CONTEXT = '4'.repeat(64)
 const REVIEWER = { slot: 'primary', model: 'fixture-model', recovery: 'fixture-model' }
 const databases: Database.Database[] = []
-afterEach(() => { for (const db of databases.splice(0)) db.close() })
+afterEach(() => { markReplacementPending(false); for (const db of databases.splice(0)) db.close() })
 
 function setup(): { db: Database.Database, journal: BehaviorChainJournal, chain: BehaviorChain } {
   const db = new Database(':memory:'); databases.push(db)
@@ -1312,20 +1313,23 @@ describe('native admission and recovery', () => {
     expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
   })
 
-  it('recovers a review only with its retained substantive response and preserves its original completion time', async () => {
+  it.each(['review-pr', 'approve-pr'] as const)('settles %s during replacement only with its original substantive response and completion time', async behavior => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
     const now = Date.now(); const nativeId = 'c'.repeat(32)
     obs.checkedAt = now
-    const pending = invocation('original-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]))
+    const pending = invocation('original-review', behavior, chainBasis(['pr', HEAD, CONTEXT]))
     pending.admittedAt = now - 3000
-    pending.request.argv = ['--pr-review', '#21', '--expected-head', HEAD]
+    pending.request.argv = [behavior === 'review-pr' ? '--pr-review' : '--pr-approve', '#21', '--expected-head', HEAD]
     let current = record(journal, chain, { type: 'invocation.admitted', invocation: pending })
     current = record(journal, current, { type: 'invocation.uncertain', invocationId: pending.id, reason: 'submission response lost' })
     current = record(journal, current, { type: 'invocation.reconciled', invocationId: pending.id,
       evidence: { callId: nativeId, resources_settled_at: new Date(now).toISOString(), completedAt: now,
         resource_ownership: { version: 1, roots: [], errors: [] } } })
-    obs.pull!.reviewReceipts = [{ id: 91, head: HEAD, state: 'COMMENTED', invocation: nativeId, submittedAt: now - 1000 }]
-    const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => obs, launch: async () => { throw new Error('duplicate review dispatch') } }))
+    obs.pull!.reviewReceipts = [{ id: 91, head: HEAD, state: behavior === 'review-pr' ? 'COMMENTED' : 'APPROVED', invocation: nativeId, submittedAt: now - 1000 }]
+    markReplacementPending(true)
+    const launch = vi.fn(async () => true), perform = vi.fn(async () => ({}))
+    const runtime = new BehaviorChainRuntime(journal, operations({ enabled: () => !releaseReplacementPending(),
+      observe: async () => obs, launch, perform }))
     await runtime.run()
     current = journal.read(chain.id)!
     expect(current.invocations[0].state).toBe('uncertain')
@@ -1335,9 +1339,12 @@ describe('native admission and recovery', () => {
     await runtime.run()
     expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'settled', callId: nativeId,
       evidence: { artifact: { review_response: { completed_at: now - 2000 } } } })
+    await runtime.run()
+    expect(launch).not.toHaveBeenCalled()
+    expect(perform).not.toHaveBeenCalled()
   })
 
-  it('reconciles and advances admitted work while intake failure remains visible', async () => {
+  it.each(['intake failure', 'replacement'])('reconciles original receipts during %s without duplicate publication', async mode => {
     const { journal, chain } = setup(); const obs = observation()
     const pending = invocation('existing-review', 'review-issue', chainBasis(['issue', obs.issue.revision]))
     record(journal, chain, { type: 'invocation.admitted', invocation: pending })
@@ -1348,12 +1355,25 @@ describe('native admission and recovery', () => {
       issue_revision: obs.issue.revision, resources_settled_at: new Date(NOW).toISOString(),
       resource_ownership: { version: 1, roots: [], errors: [] },
       receipts: [{ issue: 'Example/Repo#7', comment_id: 17, author: 'reviewer', url: null }] }
-    const runtime = new BehaviorChainRuntime(journal, operations({ discover: async () => { throw new Error('intake is stale') },
+    markReplacementPending(mode === 'replacement')
+    const launch = vi.fn(async () => true), perform = vi.fn(async () => ({}))
+    const runtime = new BehaviorChainRuntime(journal, operations({ enabled: () => !releaseReplacementPending(), launch, perform,
+      discover: async () => { throw new Error('intake is stale') },
       readInvocations: async () => ({ entries: [call], quarantined: [] }) }))
+    if (mode === 'replacement') {
+      await runtime.run()
+      await runtime.run()
+      expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+      expect(launch).not.toHaveBeenCalled()
+      expect(perform).not.toHaveBeenCalled()
+      markReplacementPending(false)
+    }
     await expect(runtime.run()).rejects.toThrow('intake is stale')
     const current = journal.read(chain.id)!
     expect(current.invocations[0]).toMatchObject({ state: 'settled', callId: call.id, outcome: 'commented' })
     expect(current.invocations[1]).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+    expect(launch).toHaveBeenCalledTimes(1)
+    expect(perform).not.toHaveBeenCalled()
   })
 
   it.each(['review-pr', 'approve-pr'] as const)('starts a never-started relative %s target against the original chain without a checkout or a new admission', async (behavior) => {

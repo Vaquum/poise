@@ -120,14 +120,17 @@ it('retries busy deadline and recovery observations through the compiled CLI wit
   expect((await observe(rollout, 'alice', 1, 0, 0, health))[0].events).toBe(0)
   expect((await observe(rollout, 'alice', 1, 600, 600, { ...health, release: requested, version: requested }))[0].events).toBe(0)
   expect(read().total).toBe(0)
-  await observeAfterContention(rollout, 'alice', 2, 600, 604, health)
+  const replacementHealth = { ...health, nativeWorkBlocker: { callId: 'a'.repeat(32), reason: 'native Call is still running' },
+    replacement: { target: requested, waitingOn: null } }
+  await observeAfterContention(rollout, 'alice', 2, 600, 604, replacementHealth)
   await observe(rollout, 'alice', 2, 600, 604, health)
   const first = read().events[0]
   expect(first).toMatchObject({ severity: 'error', operation: 'workspace.deployment.pause', phase: 'deadline', release: requested,
     target: rollout, workspace: 'alice', timeoutMs: 600_000, occurrences: 1, eventTime: new Date(at + 2000).toISOString(),
     context: { rollout, requestedRevision: requested, servingRevision: serving, budget: 'deployment-verifier', budgetSeconds: 600,
       elapsedSeconds: 604, admissionState: 'drained', blocker: 'runningCallerCalls', nextRetry: null,
-      health: { desiredRelease: serving, pendingSince: null, runningCallerCalls: 2, unsettledNativeCalls: null } } })
+      health: { desiredRelease: serving, pendingSince: null, runningCallerCalls: 2, unsettledNativeCalls: null,
+        nativeWorkBlocker: replacementHealth.nativeWorkBlocker, replacement: replacementHealth.replacement } } })
   expect(JSON.stringify(first)).not.toContain('SECRET')
   await observe(rollout, 'alice', 3, 600, 900, { ...health, runningCallerCalls: 1 })
   await observe(rollout, 'alice', 1, 600, 605, health)
