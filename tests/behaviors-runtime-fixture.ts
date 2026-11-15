@@ -38,6 +38,9 @@ vi.mock('../server/process', async (importOriginal) => {
   mocks.realRunFile = actual.runFile
   return {
     setProcessFailureObserver: actual.setProcessFailureObserver,
+    MAX_PROCESS_ARG_BYTES: actual.MAX_PROCESS_ARG_BYTES,
+    processFailureEvidence: actual.processFailureEvidence,
+    isAbortError: actual.isAbortError,
     CLAUDE_SUBSCRIPTION_CLI: '/poise/claude-subscription',
     runFile: mocks.runFile,
     spawnDetached: mocks.spawnDetached,
@@ -369,7 +372,10 @@ function arrangeCli(
           body: 'An ordinary unmarked seed', state: 'open', labels: [{ name: 'poise' }] } }), stderr: '' }
     }
     if (command === 'agent-interface' && args[0] === '--logs') {
-      return { stdout: JSON.stringify(agentLogs), stderr: '' }
+      // As Caller answers it: the whole history leaves out progress events.
+      const rows = args.includes('--without-progress')
+        ? agentLogs.map(({ progress: _progress, ...row }) => row) : agentLogs
+      return { stdout: JSON.stringify(rows), stderr: '' }
     }
     throw new Error(`unexpected CLI call: ${command} ${args.join(' ')}`)
   })
@@ -407,7 +413,7 @@ function agentLog(overrides: Record<string, unknown> = {}): Record<string, unkno
     call.artifact = { review_response: { repository: call.repo, pull_number: Number(call.pr_id), head_sha: call.head_sha,
       context_sha: 'e'.repeat(64), reviewer: call.actor, model: call.model, invocation_id: call.id,
       completed_at: Date.parse(String(call.completed_at)),
-      assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+      coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
         reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } } }
   }
   return call
@@ -446,6 +452,7 @@ function recordCompletedInitialReview(
     outcome?: 'clean' | 'changes_requested'
     callId?: string
     response?: boolean
+    coverage?: string | null
   } = {},
 ): void {
   const pull = options.pull ?? pr
@@ -488,6 +495,7 @@ function recordCompletedInitialReview(
       completed_at: new Date(ended).toISOString(), head_sha: head, expected_head: head, review_id: 91,
       artifact: { review_response: { repository: pull.repo, pull_number: pull.number, head_sha: head, context_sha: 'e'.repeat(64),
         reviewer: 'review-bot', model: 'opus-4.7-max', invocation_id: callId, completed_at: ended - 1000,
+        coverage: options.coverage === undefined ? 'complete' : options.coverage,
         assessment: { verdict: 'The changed validation has no remaining blocking defects.',
           reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } } } }))
   }

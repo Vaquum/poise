@@ -16,10 +16,12 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import agent_interface
-from agent_interface import atoms, pr_review, pr_approve, review_budget, review_stages, structured_review, review_repository
+from agent_interface import atoms, pr_review, pr_approve, review_budget, review_stages, review_watch, structured_review, review_repository
 from agent_interface.model_catalog import CATALOG, ModelCatalogError
-from agent_interface.review_watch import ReviewWatch
+from agent_interface.review_watch import ReviewSuperseded, ReviewWatch
 
+COMPLETE_PACKET = json.dumps({"coverage": "complete", "files": [{"filename": "src/main.py"}],
+                             "diff": "diff --git a/src/main.py b/src/main.py\n--- a/src/main.py\n+++ b/src/main.py\n@@ -4 +4 @@\n-old\n+new\n"})
 FINDING = {"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "[p1] O'Brien's input crashes."}
 MUSE_SESSION_ERROR = "muse: local session messaging disabled: session logging is required"
 ASSESSMENT = {"verdict": "The changed validation paths have no remaining blocking defects.",
@@ -234,7 +236,7 @@ class TestStructuredVerdict(TestCase):
         with patch.object(structured_review.subprocess, "run", side_effect=process) as run, \
                 patch.object(ReviewWatch, "run", side_effect=run):
             try:
-                result = structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), behavior, "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                result = structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), behavior, "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
             except atoms.AgentPreflightError:
                 self.assertEqual(run.call_count, expected_attempts)
                 self.assertFalse(any(call.args[0][0] == "github-interface" for call in run.call_args_list))
@@ -327,12 +329,12 @@ class TestStructuredVerdict(TestCase):
                         review_budget.ReviewBudget(allowance):
                     if durations == [40, 5]:
                         structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                              "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                              "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
                         submit.assert_called_once()
                     else:
                         with self.assertRaises(review_budget.ReviewLimitError) as failure:
                             structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                                  "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                                  "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
                         self.assertEqual(failure.exception.code, "review_budget_exhausted")
                         submit.assert_not_called()
                 self.assertEqual(launches, expected)
@@ -352,7 +354,7 @@ class TestStructuredVerdict(TestCase):
                 patch.object(ReviewWatch, "run", side_effect=process):
             with self.assertRaises(ReviewSuperseded) as raised:
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertEqual(raised.exception.head_sha, "b" * 40)
 
     def test_unresolved_conversation_refusal_is_blocked_not_a_violation(self):
@@ -370,7 +372,7 @@ class TestStructuredVerdict(TestCase):
                 patch.object(ReviewWatch, "run", side_effect=process):
             with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertEqual(failure.exception.code, "approval_blocked_unresolved_conversations")
         self.assertIn("blocked", str(failure.exception))
         self.assertIn("1 unresolved review conversation(s) from other reviewers remain", str(failure.exception))
@@ -394,7 +396,7 @@ class TestStructuredVerdict(TestCase):
                 patch.object(ReviewWatch, "run", side_effect=process):
             with self.assertRaises(receipt_mod.SubmissionError) as failure:
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertIn("httpx.ReadTimeout", str(failure.exception))
 
     def test_clean_and_approval_are_distinct_terminal_actions(self):
@@ -431,7 +433,7 @@ class TestStructuredVerdict(TestCase):
     def test_timeout_is_proven_no_action_before_submission(self):
         with patch.object(ReviewWatch, "run", side_effect=subprocess.TimeoutExpired("codex", 60)) as run, \
                 self.assertRaises(agent_interface.review_budget.ReviewLimitError):
-            structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+            structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertEqual(run.call_count, 1)
 
 
@@ -462,11 +464,66 @@ def staged_packet(paths):
     return json.dumps({"action": "read", "repository": "o/r", "pull_number": 12, "head_sha": "a" * 40,
                        "diff": diff, "files": [{"filename": path, "status": "modified",
                                                 "old_mode": "100644", "new_mode": "100644"} for path in paths],
-                       "excluded_files": [], "review_scope": "Review the complete retained diff."},
+                       "coverage": "complete", "excluded_files": [], "review_scope": "Review the complete retained diff."},
                       separators=(",", ":"))
 
 
 class TestStagedReview(TestCase):
+    def test_finishing_every_retained_stage_cannot_clear_capacity_omissions(self):
+        node = json.loads(staged_packet([f"src/f{i:02d}.py" for i in range(9)]))
+        node.update(coverage="incomplete", omitted_files=[{"path": "src/z.py", "reason": "capacity"}])
+        with self.assertRaises(review_budget.ReviewLimitError) as failure:
+            self._run(json.dumps(node), [{"action": "reviewed_clean", "comments": [], "assessment": ASSESSMENT}] * 2)
+        self.assertEqual(failure.exception.code, "review_incomplete")
+
+    def test_completion_race_retains_closure_before_another_group_turn_or_submission(self):
+        real_popen = subprocess.Popen
+        head = "a" * 40
+        for state in ("CLOSED", "MERGED"):
+            for behavior in ("pr_review", "pr_approve"):
+                for boundary in ("group", "inspection", "submission"):
+                    with self.subTest(state=state, behavior=behavior, boundary=boundary):
+                        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9 if boundary == "group" else 1)])
+                        verdict = {"assessment": ASSESSMENT, "action": "reviewed_clean" if behavior == "pr_review" else "approve", "comments": []}
+                        repository = None
+                        if boundary == "inspection":
+                            verdict = {**verdict, "action": "inspect", "requests": [
+                                {"operation": "read", "path": "src/f00.py", "query": "", "start_line": 1}]}
+                            repository = SimpleNamespace(inspect=lambda *args, **kwargs: {"text": "pinned file"})
+                        children, completed = [], []
+
+                        def launch(*args, **kwargs):
+                            child = real_popen(*args, **kwargs)
+                            children.append(child)
+                            return child
+
+                        def lookup(args, **kwargs):
+                            self.assertEqual(args[1], "--head-sha", "closed review tried to publish")
+                            children[0].wait(timeout=2)
+                            return SimpleNamespace(returncode=0, stdout=json.dumps({"action": "head_sha", "repository": "o/r",
+                                                   "pull_number": 12, "head_sha": head, "state": state}))
+
+                        def ask(root, model, system, text, schema, watch, timeout):
+                            done = watch.run([sys.executable, "-c", f"import time; time.sleep(.1); print({json.dumps(verdict)!r})"],
+                                             input="", cwd=str(root), timeout=3, env=os.environ.copy())
+                            completed.append(done)
+                            return done.stdout
+
+                        with patch.multiple(review_watch, POLL_SECONDS=.03), \
+                                patch.object(subprocess, "Popen", side_effect=launch), \
+                                patch.object(subprocess, "run", side_effect=lookup) as read, \
+                                patch.dict(structured_review.ASK, {"codex": ask}), self.assertRaises(ReviewSuperseded) as stopped:
+                            structured_review.run("/tmp", "system", f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone",
+                                                  CATALOG.resolve("gpt-6-astra-ultra"), behavior,
+                                                  "https://github.com/o/r/pull/12", "bit-mis", head, 60,
+                                                  packet=packet, repository=repository)
+                        self.assertEqual(len(children), 1)
+                        self.assertEqual(len(completed), 1)
+                        self.assertEqual(completed[0].returncode, 0)
+                        self.assertEqual(json.loads(completed[0].stdout), verdict)
+                        self.assertEqual(stopped.exception.closed_target["state"], state)
+                        read.assert_called_once()
+
     def test_stages_carry_a_bounded_cumulative_assessment_without_joining_full_responses(self):
         packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
         first = {key: value + "a" * 3000 for key, value in ASSESSMENT.items()}
@@ -554,6 +611,35 @@ class TestStagedReview(TestCase):
                       text_packet=staged_packet(["src/other.py"]))
         self.assertEqual(failure.exception.code, "review_contract_violation")
 
+    def test_first_retention_failure_holds_completed_review(self):
+        packet = staged_packet(["src/only.py"])
+        finding = {"path": "src/only.py", "line": 1, "side": "RIGHT", "body": "[p1] Blocking defect."}
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [finding]}
+        calls = []
+
+        def process(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}), stderr="")
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process), \
+                patch.object(structured_review.review_receipt, "retain_verdict",
+                             side_effect=OSError("simulated storage failure")):
+            with self.assertRaises(review_budget.ReviewLimitError) as failure:
+                structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis",
+                                      "a" * 40, 60, packet=packet)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("could not retain its findings", str(failure.exception))
+        self.assertNotIn("retained on the original Call", str(failure.exception))
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
+        self.assertEqual([args for args, _ in calls if args[0] == "github-interface"], [])
+
     def test_stages_keep_repository_inspection_with_one_combined_submission(self):
         request = {"operation": "read", "path": "src/old.py", "query": "", "start_line": 1}
         calls = []
@@ -599,7 +685,7 @@ class TestGrokAnalysisCeiling(TestCase):
     """Replays through the real review loop, on a fake clock, the shapes of the
     Grok runs that used the whole budget on 2026-11-04 without posting."""
 
-    def _replay(self, model, turns, reply, behavior="pr_review", repository=None, packet="", timeout_s=1413,
+    def _replay(self, model, turns, reply, behavior="pr_review", repository=None, packet=COMPLETE_PACKET, timeout_s=1413,
                 budget_seconds=1413):
         clock = SimpleNamespace(now=1000.0)
         pending = iter(turns)
@@ -639,11 +725,9 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertEqual(run.elapsed, 800)
         self.assertEqual(run.error.code, "review_budget_exhausted")
         self.assertEqual(str(run.error), GROK_HANDOFF)
-        self.assertEqual(run.error.diagnostic, {
-            "version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-            "phase": "analysis", "outcome": "handoff", "stderr": "", "stderr_truncated": False,
-            "provider": "grok", "submission": "none",
-        })
+        self.assertEqual(run.error.diagnostic["phase"], "analysis")
+        self.assertEqual(run.error.diagnostic["outcome"], "handoff")
+        self.assertEqual(run.error.diagnostic["submission"], "none")
         run.submit.assert_not_called()
 
     def test_inspection_rounds_stop_at_the_ceiling(self):
@@ -701,13 +785,117 @@ class TestGrokAnalysisCeiling(TestCase):
                 self.assertEqual(run.error.diagnostic["submission"], "none")
 
     def test_a_shorter_file_group_deadline_is_not_a_provider_handoff(self):
-        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
-        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [1, NEVER_RETURNS], INSPECT,
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(27)])
+        self.assertEqual(review_stages.stage_count(packet), 4)
+        terminal = {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": [], "requests": []}
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [100, 500, NEVER_RETURNS], terminal,
                            repository=INSPECTED, packet=packet)
         self.assertLess(run.elapsed, 800)
+        self.assertEqual(run.error.code, "review_budget_exhausted")
         self.assertEqual(run.error.diagnostic["phase"], "file_group")
         self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
         self.assertNotIn("handing off", str(run.error))
+        run.submit.assert_not_called()
+
+    def _replay_before_inspection(self, seconds, validation_seconds, timeout_s=1413, budget_seconds=1413):
+        """Grok returns an inspection step, then validation consumes time before inspection starts."""
+        clock = SimpleNamespace(now=1000.0)
+        model = CATALOG.resolve("grok-4.6-xhigh")
+
+        def provider(args, *, timeout, **_kwargs):
+            if seconds >= timeout:
+                clock.now += timeout
+                raise subprocess.TimeoutExpired(args, timeout)
+            clock.now += seconds
+            return SimpleNamespace(returncode=0, stderr="",
+                                   stdout=json.dumps({**GROK_REPLY, "structuredOutput": INSPECT}))
+
+        original_validate = structured_review.validate_verdict
+
+        def validating(*args, **kwargs):
+            clock.now += validation_seconds
+            return original_validate(*args, **kwargs)
+
+        text = "policy\n\nPR packet:\n\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
+        error = None
+        with patch.object(structured_review, "monotonic", lambda: clock.now), \
+                patch.object(review_budget, "monotonic", lambda: clock.now), \
+                patch.object(ReviewWatch, "run", side_effect=provider), \
+                patch.object(structured_review, "validate_verdict", side_effect=validating), \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit, \
+                review_budget.ReviewBudget(budget_seconds):
+            try:
+                structured_review.run("/repo", "system", text, model, "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40,
+                                      timeout_s, repository=INSPECTED)
+            except review_budget.ReviewLimitError as failure:
+                error = failure
+        return SimpleNamespace(error=error, submit=submit)
+
+    def test_analysis_ceiling_expiring_before_inspection_is_a_handoff(self):
+        run = self._replay_before_inspection(799, 2)
+        self.assertEqual(str(run.error), GROK_HANDOFF)
+        self.assertEqual(run.error.diagnostic["phase"], "analysis")
+        self.assertEqual(run.error.diagnostic["outcome"], "handoff")
+        self.assertEqual(run.error.diagnostic["submission"], "none")
+        run.submit.assert_not_called()
+
+    def test_analysis_ceiling_expiring_during_inspection_keeps_local_inspection(self):
+        from agent_interface.process_diagnostic import command_failure
+        clock = SimpleNamespace(now=1000.0)
+        model = CATALOG.resolve("grok-4.6-xhigh")
+
+        def provider(args, *, timeout, **_kwargs):
+            clock.now += 795
+            return SimpleNamespace(returncode=0, stderr="",
+                                   stdout=json.dumps({**GROK_REPLY, "structuredOutput": INSPECT}))
+
+        original_validate = structured_review.validate_verdict
+
+        def validating(*args, **kwargs):
+            clock.now += 1
+            return original_validate(*args, **kwargs)
+
+        def inspecting(requests, *, timeout_s):
+            clock.now += 10
+            diagnostic = command_failure(subprocess.TimeoutExpired("github-interface", timeout_s),
+                                         "inspection", "/tmp/review", timeout_s)
+            raise atoms.AgentPreflightError(
+                f"Local review repository inspection timed out after {timeout_s:g} seconds",
+                "review_inspection_timeout", diagnostic)
+
+        repository = SimpleNamespace(inspect=inspecting)
+        text = "policy\n\nPR packet:\n\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
+        error = None
+        with patch.object(structured_review, "monotonic", lambda: clock.now), \
+                patch.object(review_budget, "monotonic", lambda: clock.now), \
+                patch.object(ReviewWatch, "run", side_effect=provider), \
+                patch.object(structured_review, "validate_verdict", side_effect=validating), \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit, \
+                review_budget.ReviewBudget(1413):
+            try:
+                structured_review.run("/repo", "system", text, model, "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40,
+                                      1413, repository=repository)
+            except review_budget.ReviewLimitError as failure:
+                error = failure
+        self.assertEqual(str(error), "Local review repository inspection timed out; incomplete analysis; needs attention")
+        self.assertEqual(error.code, "review_budget_exhausted")
+        self.assertEqual(error.diagnostic["operation"], "github-interface")
+        self.assertEqual(error.diagnostic["phase"], "provider_analysis")
+        self.assertEqual(error.diagnostic["outcome"], "timed_out")
+        self.assertEqual(error.diagnostic["submission"], "none")
+        submit.assert_not_called()
+
+    def test_shorter_overall_deadline_before_inspection_is_not_a_handoff(self):
+        run = self._replay_before_inspection(59, 2, timeout_s=60)
+        self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
+        self.assertEqual(run.error.diagnostic["phase"], "overall")
+        self.assertEqual(run.error.diagnostic["outcome"], "timed_out")
         run.submit.assert_not_called()
 
     def test_other_providers_keep_the_remaining_analysis_budget(self):
@@ -720,6 +908,7 @@ class TestGrokAnalysisCeiling(TestCase):
                 self.assertEqual(run.launches, expected)
                 self.assertEqual(run.elapsed, 1293)
                 self.assertEqual(run.error.code, "review_budget_exhausted")
+                self.assertEqual(run.error.diagnostic["phase"], "overall")
                 self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
 
 
@@ -857,7 +1046,7 @@ class TestSincePositions(TestCase):
                                          self._full(self.REMOVAL))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                      "a" * 40, "p2", since_head=None)
+                                      "a" * 40, "p2", since_head=None, reserve=120)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
@@ -944,7 +1133,7 @@ class TestSincePositions(TestCase):
         result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(full))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                      "a" * 40, "p2", since_head=None)
+                                      "a" * 40, "p2", since_head=None, reserve=120)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
@@ -1121,7 +1310,7 @@ class TestSincePositions(TestCase):
                 packet = self._packet(None, self.REMOVAL)
                 verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [
                     {"path": path, "line": line, "side": side, "body": "A confirmed blocking defect."}]}
-                with patch.object(structured_review, "_review_once", return_value=(json.dumps(verdict), verdict)), \
+                with patch.object(structured_review, "_review_once", return_value=(json.dumps(verdict), verdict, 0)), \
                         patch.object(structured_review.subprocess, "run", return_value=SimpleNamespace(
                             returncode=0, stdout='{"action":"requested_changes","review_id":91}', stderr="")) as submit, \
                         patch.object(structured_review, "fetch_packet") as fetch:
@@ -1155,7 +1344,7 @@ class TestSincePositions(TestCase):
                 result, _, fetch = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
                 self.assertIn('"review_id": 91', result)
                 fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
-                                              "a" * 40, priority, since_head=None)
+                                              "a" * 40, priority, since_head=None, reserve=120)
 
     def test_missing_priority_fails_closed_without_fetch_or_submit(self):
         verdict = {"assessment": ASSESSMENT, "action": "request_changes",
@@ -1197,7 +1386,7 @@ class TestSincePositions(TestCase):
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         full = self._full(self.REMOVAL)
 
-        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None):
+        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None, *, reserve=0):
             atoms._priority(p)
             return full
 
@@ -1233,7 +1422,7 @@ class TestOtherProviderVerdicts(TestCase):
         with patch.object(structured_review.subprocess, "run", side_effect=github), \
                 patch.object(ReviewWatch, "run", side_effect=provider):
             result = structured_review.run("/repo", "system", "packet", CATALOG.resolve(identity), behavior,
-                                           "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                           "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         return result, calls
 
     def test_grok_runs_one_tool_free_turn_from_a_prompt_file_and_submits(self):
@@ -1274,7 +1463,7 @@ class TestOtherProviderVerdicts(TestCase):
         with patch.object(structured_review.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")), \
                 patch.object(ReviewWatch, "run", side_effect=provider):
             structured_review.run("/repo", "system", "packet", CATALOG.resolve("grok-4.6-high"), "pr_review",
-                                  "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                  "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertTrue(seen["prompt"].startswith("system\n\npacket"))
         self.assertIn('"reviewed_clean"', seen["prompt"])
         self.assertIn("no code fence", seen["prompt"])
@@ -1458,7 +1647,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
                 patch.object(ReviewWatch, "run", side_effect=run):
             try:
                 return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60), run
+                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET), run
             finally:
                 if returncode:
                     # Even a valid verdict file cannot authorize submission.
@@ -1549,7 +1738,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
                     returncode=101, stdout="\n".join(json.dumps(e) for e in stream), stderr="")):
             with self.assertRaises(atoms.AgentPreflightError) as failure:
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertEqual(failure.exception.code, "review_provider_exit")
         self.assertEqual(failure.exception.diagnostic["provider"], "codex")
         self.assertEqual(failure.exception.diagnostic["exit_code"], 101)
@@ -1564,11 +1753,59 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
                     returncode=-9, stdout="", stderr="")):
             with self.assertRaises(atoms.AgentPreflightError) as failure:
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertEqual(failure.exception.code, "review_provider_exit")
         self.assertEqual(failure.exception.diagnostic["signal"], 9)
         self.assertIsNone(failure.exception.diagnostic["exit_code"])
         submit.assert_not_called()
+
+    def test_codex_credential_rejection_is_typed_as_authentication_failed(self):
+        reuse = ("Your refresh token could not be refreshed because it was already used. "
+                 "Authorization: Bearer fake-secret-123")
+        negatives = (
+            ("refresh token request failed: connection reset by peer", "connection reset by peer"),
+            ("HTTP 429 Too Many Requests", "HTTP 429 Too Many Requests"),
+            ("GitHub 401 Unauthorized", "GitHub 401 Unauthorized"),
+        )
+        cases = (
+            (101, reuse, "authentication_failed", "already used"),
+            (0, reuse, "authentication_failed", "already used"),
+            *[(101, message, "review_provider_exit", expected) for message, expected in negatives],
+            *[(0, message, "review_provider_error", expected) for message, expected in negatives],
+        )
+        for returncode, message, expected_code, expected_text in cases:
+            with self.subTest(returncode=returncode, message=message):
+                # The reuse text arrives solely in error.message, as the
+                # provider emits it; the turn path must not drop it.
+                stdout = json.dumps({"type": "turn.failed", "error": {"message": message}}) + "\n"
+                with patch.object(structured_review.subprocess, "run") as submit, \
+                        patch.object(ReviewWatch, "run", return_value=SimpleNamespace(
+                            returncode=returncode, stdout=stdout, stderr="")):
+                    with self.assertRaises(atoms.AgentPreflightError) as failure:
+                        structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                              "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60,
+                                              packet=COMPLETE_PACKET)
+                self.assertEqual(failure.exception.code, expected_code)
+                self.assertTrue(str(failure.exception).startswith("codex review failed: "))
+                self.assertIn(expected_text, str(failure.exception))
+                diagnostic = failure.exception.diagnostic
+                self.assertEqual(diagnostic["operation"], "provider.review")
+                self.assertEqual(diagnostic["provider"], "codex")
+                self.assertEqual(diagnostic["submission"], "none")
+                self.assertEqual(diagnostic["artifact"], "none")
+                self.assertEqual(diagnostic["exit_code"], 101 if returncode else None)
+                self.assertIn(expected_text, diagnostic["stderr"])
+                if expected_code == "authentication_failed":
+                    for field in (str(failure.exception), diagnostic["stderr"]):
+                        self.assertNotIn("fake-secret-123", field)
+                submit.assert_not_called()
+        # Other providers keep their existing codes for the same text.
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            structured_review.provider_failure(reuse, provider="grok")
+        self.assertEqual(failure.exception.code, "review_provider_exit")
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            structured_review.provider_error("grok", reuse)
+        self.assertEqual(failure.exception.code, "review_provider_error")
 
     def test_muse_server_error_is_typed_whether_exit_or_terminal(self):
         from agent_interface import review_receipt as receipt_mod
@@ -1579,7 +1816,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             with self.assertRaises(atoms.AgentPreflightError) as failure:
                 structured_review.run("/repo", "system", "packet",
                                       CATALOG.resolve("muse-spark-1.3-contributor-max"), "pr_review",
-                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertEqual(failure.exception.code, "review_provider_exit")
         submit.assert_not_called()
         # Exit zero with a failed terminal.
@@ -1590,7 +1827,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             with self.assertRaises(atoms.AgentPreflightError) as failure:
                 structured_review.run("/repo", "system", "packet",
                                       CATALOG.resolve("muse-spark-1.3-contributor-max"), "pr_review",
-                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
         self.assertEqual(failure.exception.code, "review_provider_error")
         self.assertEqual(failure.exception.diagnostic["provider"], "muse")
         submit.assert_not_called()
@@ -1612,7 +1849,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             with self.assertRaises(atoms.AgentPreflightError):
                 structured_review.run("/repo", "system", "packet",
                                       CATALOG.resolve("muse-spark-1.3-contributor-max"), "pr_review",
-                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
             submit.assert_not_called()
 
     def test_submission_rejection_noop_and_uncertainty_are_typed(self):
@@ -1628,7 +1865,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             with patch.object(structured_review.subprocess, "run", side_effect=process), \
                     patch.object(ReviewWatch, "run", side_effect=process):
                 return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
 
         with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
             run_with_github(SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 422: line not in diff"))
@@ -1655,7 +1892,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
                 patch.object(ReviewWatch, "run", side_effect=provider):
             with self.assertRaises(receipt_mod.SubmissionError):
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
 
     def test_repeat_only_noop_is_typed_for_recovery(self):
         verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}
@@ -1669,7 +1906,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             with patch.object(structured_review.subprocess, "run", side_effect=process), \
                     patch.object(ReviewWatch, "run", side_effect=process):
                 return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60, packet=COMPLETE_PACKET)
 
         skipped = [{"reason": "repeat", "comment": FINDING},
                    {"reason": "repeat", "comment": FINDING}]

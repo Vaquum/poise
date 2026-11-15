@@ -104,8 +104,8 @@ still release continuations together; that is not a throughput guarantee.
 ## 6. Recovery and escalation
 
 - Input-determined failures (same packet plus same model yields the same
-  result) recover only through changed input, a different model, or a
-  human; they surface as Needs you with that action named.
+  result) recover through changed input, a different model, or an explicit
+  intervention. Overview lists the failure under Faults with its known next step.
 - Dependency-determined failures (provider 429/5xx, budget or capacity,
   account balance/sign-in, lock contention, datastore staleness) hold on
   the dependency, recover through one probe per window, and release every
@@ -143,14 +143,14 @@ Current `status: 'ok'` does not meet this definition (G4).
 | Caller `approval_blocked_unresolved_conversations` | Waiting: the approval guard refused while other reviewers' conversations stay open — nothing approved, retried on backoff while the head is unchanged. Proven no-action failures never adopt another request's review; a superseding head keeps the original disposition. |
 | Caller `review_target_closed` | Native terminal closure: settles the obsolete panel without claiming publication or worker termination. |
 | Caller `target_closed` / `not_started` with the exact `admission_fenced` artifact | Original-correlation fence won before any native worker could start. Only validated native resource-release proof permits journal settlement; an existing Call, malformed row or failed fence command retains ownership. This is neither a review verdict nor a legacy review completion. |
-| Caller `not_started` / `preflight_failed`, `launch_preflight_failed` | No-action proof candidates under E3; missing, conflicting or quarantined evidence stays under Needs you. |
+| Caller `not_started` / `preflight_failed`, `launch_preflight_failed` | No-action proof candidates under E3. Missing, conflicting or quarantined evidence stays visible under Faults. |
 | Caller `stopped`, `stopping`, `interrupted`, `atomic_work_failed` | User stop holds like a bounded failure; process loss closes direct runs as `interrupted`, outside the success rate with unknown duration. |
-| Caller issue-review `authentication_failed` | Explicit native Codex credential rejection, classified before redaction; `not_started` / `preflight_failed` proves no posting. Accounts status alone cannot clear the runtime sign-in condition. Verified native recovery allows one early dependency probe; only auth-episode attempts with no publication and settled resources can retire their journal retry boundary. |
+| Caller issue-review and structured-review `authentication_failed` | Explicit native Codex credential rejection, classified before redaction; `not_started` / `preflight_failed` proves no posting. Accounts status alone cannot clear the runtime sign-in condition. Verified native recovery allows one early dependency probe; only auth-episode attempts with no publication and settled resources can retire their journal retry boundary. |
 | Server `overloaded`, `rate_limit`, `server_error` | Classifier-only codes Caller never writes; provider 429s arrive as `review_provider_exit` or untyped text (G2). |
 | Ledger `running`, `held`, `unknown`, `pending`, `failed`, `superseded`, `completed` plus `activity` | Observation only; native settlement overrides passive Caller observations. |
 | Dead letter `resolved`, `superseded`, `held` plus quarantine | Resolved and superseded rows retire; held rows stay open; quarantined rows are never resolved or superseded. |
 | Datastore freshness gate (120 s), `unavailable` versus stale | Admission pauses scheduling until an ordinary sync passes; bounded lock-admission deferrals stay distinct from ownership corruption and shared failure. |
-| Diagnostics: Poise faults, Needs you, Handled automatically | Severity groups presentation only; severity changes no launch, retry, ownership or publication rule. |
+| Overview diagnostics: Faults, Handled automatically | Presentation follows the diagnostic cause. Launch, retry, ownership and publication obey their existing gates. |
 | Repository access holds and reviewer trips | Access holds are per repository and actor with hourly recheck; reviewer trips are per reviewer with backoff and a single probe per window. |
 
 ## 9. Regression obligations

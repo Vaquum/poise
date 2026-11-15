@@ -1,6 +1,6 @@
 import { environmentSecrets } from '../gateway/src/diagnostics/redaction.mjs'
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, delimiter, join } from 'node:path'
@@ -28,9 +28,6 @@ export const AGENT_RIPGREP_CONFIG = fileURLToPath(new URL(
 ))
 // Bounds Go runtimes only; every other child ignores it.
 export const AGENT_GOMAXPROCS = '2'
-// An agent's shell tool waits for a suite on a test box too, starting one included. The default
-// outlasts the box's time limit (POISE_TEST_LIMIT_SECONDS), so the agent hears why from the box.
-const TEST_OFFLOAD_SHELL_TIMEOUTS = [['BASH_DEFAULT_TIMEOUT_MS', '600000'], ['BASH_MAX_TIMEOUT_MS', '3600000']] as const
 
 export function assertProcessArgSize(value: string, label = 'argument'): void {
   if (Buffer.byteLength(value, 'utf8') > MAX_PROCESS_ARG_BYTES) {
@@ -68,6 +65,9 @@ export interface RunFileOptions {
   /** Declare this call a probe: a matching exit rejects with `expected: true`
    *  and is not reported to the process-failure observer. */
   expected?: ExpectedFailure
+  /** Identity for a response read; argv and response bodies stay excluded. */
+  callId?: string
+  readerPurpose?: string
 }
 
 /** True when the runFile rejection was a declared expected probe outcome. */
@@ -397,10 +397,24 @@ function applyAgentToolDefaults(env: NodeJS.ProcessEnv, overrides: NodeJS.Proces
 // a test runner does anything but carry on. Off until the gateway installs them into the home volume.
 function applyTestOffload(env: NodeJS.ProcessEnv): void {
   const hooks = join(homedir(), '.poise', 'test-offload')
-  if (!existsSync(join(hooks, 'relay'))) return
+  // One read: the release installer may remove relay to disable offload at any moment.
+  let installed: string
+  try {
+    installed = readFileSync(join(hooks, 'relay'), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  // Older installed relays have only URL/key. Keep their nine-minute command budget.
+  const limit = installed.trimEnd().split('\n')[2] ?? '540'
+  if (!/^\d+$/.test(limit) || Number(limit) < 1 || Number(limit) > 3540) {
+    throw new Error('POISE_TEST_LIMIT_SECONDS must be a whole number from 1 to 3540')
+  }
   env.PYTHONPATH = [hooks, env.PYTHONPATH].filter(Boolean).join(delimiter)
   env.NODE_OPTIONS = [`--require "${join(hooks, 'hook.cjs')}"`, env.NODE_OPTIONS].filter(Boolean).join(' ')
-  for (const [key, value] of TEST_OFFLOAD_SHELL_TIMEOUTS) env[key] ??= value
+  // The relay gets time to report exhaustion and request cleanup before the shell stops it.
+  env.BASH_DEFAULT_TIMEOUT_MS ??= String((Number(limit) + 60) * 1000)
+  env.BASH_MAX_TIMEOUT_MS ??= '3600000'
 }
 
 function abortError(signal: AbortSignal, killSignal: NodeJS.Signals): Error {
@@ -429,6 +443,13 @@ export interface ProcessFailureEvidence {
   timeoutMs: number
   stderrAllowed: boolean
   secrets: string[]
+  callId?: string
+  readerPurpose?: string
+}
+const processFailures = new WeakMap<Error, ProcessFailureEvidence>()
+/** Original child evidence, including when its handler owns reporting. */
+export function processFailureEvidence(error: unknown): ProcessFailureEvidence | undefined {
+  return error instanceof Error ? processFailures.get(error) : undefined
 }
 let processFailureObserver: ((error: Error, evidence: ProcessFailureEvidence) => void) | null = null
 export function setProcessFailureObserver(observer: typeof processFailureObserver): void { processFailureObserver = observer }
@@ -464,13 +485,17 @@ export function runFile(
   return new Promise((resolve, reject) => {
     const startedAt = Date.now()
     const observe = (error: Error) => {
+      const evidence = { command, executable: resolveCommand(command),
+        operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review',
+          '--requested-changes-addressed', '--review-activity-since', '--head-sha', '--local-checkout-path', '--checkout-repo'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
+        cwd: options.cwd ?? null, elapsedMs: Date.now() - startedAt, timeoutMs: timeout,
+        callId: options.callId, readerPurpose: options.readerPurpose,
+        stderrAllowed: !(command === 'gh' && args[0] === 'auth' && args[1] === 'token'),
+        secrets: environmentSecrets(options.env ?? {}) }
+      processFailures.set(error, evidence)
       if (!processFailureObserver || options.reportFailure === false || options.signal?.aborted || args[0] === '--diagnostics') return
       try {
-        processFailureObserver(error, { command, executable: resolveCommand(command),
-          operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
-          cwd: options.cwd ?? null, elapsedMs: Date.now() - startedAt, timeoutMs: timeout,
-          stderrAllowed: !(command === 'gh' && args[0] === 'auth' && args[1] === 'token'),
-          secrets: environmentSecrets(options.env ?? {}) })
+        processFailureObserver(error, evidence)
       } catch (failure) {
         process.stderr.write(JSON.stringify({ level: 'error', event: 'logging.process_observer.failed', message: failure instanceof Error ? failure.message : 'observer failure' }) + '\n')
       }

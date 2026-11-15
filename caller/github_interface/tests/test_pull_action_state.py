@@ -4,6 +4,7 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
 from github_interface import cli, interface
+from github_interface.atoms.pulls import get_pr_readiness_state
 from github_interface.behaviors import pull_action_state
 
 HEAD = 'a' * 40
@@ -16,6 +17,8 @@ REVIEWS = [
      'submitted_at': '2026-09-02T00:00:00Z'},
 ]
 PAYLOAD = {'repository': 'acme/app', 'pr': '#7', 'token_user': 'octocat'}
+QUEUE_ENTRY = {'id': 'MQE_lQDOU59AVM8AAAABO91Wr84ABOPkzgP6O_8', 'state': 'UNMERGEABLE',
+               'baseCommit': {'oid': '7ad75ba8c4fa9ab4df456e13824a311715082e64'}, 'headCommit': None}
 
 
 class TestPullActionState(IsolatedAsyncioTestCase):
@@ -25,7 +28,7 @@ class TestPullActionState(IsolatedAsyncioTestCase):
         self.reviews = deepcopy(REVIEWS)
         self.patch_pull = patch.object(pull_action_state, 'get_pull', AsyncMock(side_effect=lambda *_: deepcopy(self.pull)))
         self.patch_reviews = patch.object(pull_action_state, 'list_reviews', AsyncMock(side_effect=lambda *_: deepcopy(self.reviews)))
-        self.readiness = AsyncMock(return_value={'mergeQueueEntry': None})
+        self.readiness = AsyncMock(return_value={'mergeQueueEntry': None, 'headRefOid': HEAD, 'state': 'OPEN'})
         self.patch_ready = patch.object(pull_action_state, 'get_pr_readiness_state', self.readiness)
         self.patch_pull.start()
         self.patch_reviews.start()
@@ -35,7 +38,7 @@ class TestPullActionState(IsolatedAsyncioTestCase):
         self.addCleanup(self.patch_ready.stop)
 
     async def test_reports_merge_state_head_queue_entry_and_only_my_reviews(self):
-        self.readiness.return_value = {'mergeQueueEntry': {'id': 'entry-1'}}
+        self.readiness.return_value['mergeQueueEntry'] = {'id': 'entry-1'}
         result = await pull_action_state.run(self.client, PAYLOAD)
         self.assertEqual(result, {
             'action': 'pull_action_state', 'repository': 'acme/app', 'pull_number': 7,
@@ -70,6 +73,44 @@ class TestPullActionState(IsolatedAsyncioTestCase):
         self.readiness.return_value = {'mergeQueueEntry': {'id': 7}}
         with self.assertRaisesRegex(RuntimeError, 'malformed merge queue entry'):
             await pull_action_state.run(self.client, PAYLOAD)
+
+    async def test_queue_evidence_preserves_unknown_pr_mergeability_and_nullable_integration(self):
+        head = 'ee7c6737a58dbdbbebbc59eb9222891e7af72f22'
+        self.pull.update(head={'sha': head}, mergeable=None, title='Queued candidate', body='',
+                         base={'sha': 'c' * 40})
+        self.readiness.side_effect = get_pr_readiness_state
+        ready = {'headRefOid': head, 'state': 'OPEN', 'mergeable': 'UNKNOWN', 'mergeQueueEntry': QUEUE_ENTRY}
+        self.client.graphql.side_effect = [
+            {'repository': {'pullRequest': ready}},
+            {'repository': {'pullRequest': {'headRefOid': head, 'timelineItems': {'nodes': []}}}},
+        ]
+        result = await pull_action_state.run(self.client, dict(PAYLOAD, queue_evidence=True))
+        self.assertEqual(result['queue_entry'], {'id': QUEUE_ENTRY['id'], 'state': 'UNMERGEABLE',
+                                               'base': QUEUE_ENTRY['baseCommit']['oid'], 'head': None})
+        self.assertEqual(result['queue_removals'], [])
+        self.assertIn('mergeQueueEntry { id state baseCommit { oid } headCommit { oid } }',
+                      self.client.graphql.await_args_list[0].args[0])
+
+    async def test_exhausted_head_mismatches_fail_before_reading_removals(self):
+        self.readiness.return_value.update(headRefOid='b' * 40, mergeQueueEntry=QUEUE_ENTRY)
+        with self.assertRaisesRegex(RuntimeError, 'all three readiness reads'):
+            await pull_action_state.run(self.client, dict(PAYLOAD, queue_evidence=True))
+        self.assertEqual(self.readiness.await_count, 3)
+        self.client.graphql.assert_not_awaited()
+
+    async def test_retry_replaces_the_entire_stale_queue_packet(self):
+        self.pull.update(title='Queued candidate', body='', base={'sha': 'c' * 40})
+        self.readiness.side_effect = [
+            {'headRefOid': 'b' * 40, 'state': 'OPEN', 'mergeQueueEntry': QUEUE_ENTRY},
+            {'headRefOid': HEAD, 'state': 'OPEN', 'mergeQueueEntry': {
+                'id': 'replacement', 'state': 'AWAITING_CHECKS', 'baseCommit': None, 'headCommit': {'oid': 'd' * 40}}},
+        ]
+        self.client.graphql.return_value = {'repository': {'pullRequest': {
+            'headRefOid': HEAD, 'timelineItems': {'nodes': []}}}}
+        result = await pull_action_state.run(self.client, dict(PAYLOAD, queue_evidence=True))
+        self.assertEqual(result['queue_entry_id'], 'replacement')
+        self.assertEqual(result['queue_entry'], {'id': 'replacement', 'state': 'AWAITING_CHECKS',
+                                               'base': None, 'head': 'd' * 40})
 
     async def test_identity_must_be_explicit(self):
         with self.assertRaisesRegex(ValueError, 'token-user is required'):

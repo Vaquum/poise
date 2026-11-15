@@ -67,7 +67,7 @@ export function nativeActionReceipt(chain: BehaviorChain, invocation: ChainInvoc
       const coverage = JSON.parse(argument(invocation, '--coverage-json')) as Record<string, unknown>
       const duplicate = coverage.duplicate as { number?: unknown, head?: unknown } | undefined
       if (result.state !== 'closed' || coverage.verified !== true || duplicate?.number !== result.pull_number || duplicate.head !== head
-        || chainBasis(coverage) !== chainBasis(result.coverage)) throw new Error('native retirement lacks its original full-suite coverage')
+        || chainBasis(coverage) !== chainBasis(result.coverage)) throw new Error('native retirement lacks its original verified coverage')
     }
   } else if (merging) {
     if (!['merged', 'enqueued', 'already_merged', 'in_queue', 'not_ready', 'superseded'].includes(String(result.outcome))

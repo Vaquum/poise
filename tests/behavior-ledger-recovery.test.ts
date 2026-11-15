@@ -175,6 +175,83 @@ describe('ledger recovery boundaries', () => {
     expect(retained.sort()).toEqual(burst.map((observation) => observation.nativeId).sort())
   })
 
+  it('keeps capture batching available between read turns', async () => {
+    // Queue order is one in-flight capture, a leading run of 24 captures,
+    // then 8 reads. Batching coalesces only the leading run, so an
+    // interleaved C,R,C,R arrival pattern would still yield singletons.
+    const startedAt = 1_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(startedAt)
+    try {
+      const directory = await mkdtemp(join(tmpdir(), 'ledger-batch-reads-'))
+      asyncRoots.push(directory)
+      await writeFile(join(directory, 'worker.mjs'),
+        `import { parentPort as port } from 'node:worker_threads';\nimport { appendFileSync, existsSync, watch } from 'node:fs';\n${fixtureHealth}\n` + `
+        port.postMessage({ ready: true, captureBatch: true, health, pending: [] });
+        let held = false;
+        port.on('message', request => {
+          if (request.operation === 'close') {
+            port.postMessage({ id: request.id, status: 200, body: { version: 1, health }, pending: [] });
+            port.close();
+            return;
+          }
+          if (request.operation === 'capture') {
+            const observations = request.observations ?? [request.observation];
+            appendFileSync(new URL('./batches', import.meta.url), observations.length + '\\n');
+            appendFileSync(new URL('./captures', import.meta.url), observations.map(o => o.nativeId ?? o.type).join(',') + '\\n');
+          }
+          const reply = () => {
+            const observations = request.operation === 'capture' ? (request.observations ?? [request.observation]) : [];
+            for (const observation of observations) {
+              if (observation?.type === 'loss') {
+                health.dropped += observation.count;
+                health.status = 'incomplete';
+              }
+            }
+            port.postMessage({ id: request.id, status: 200, body: { version: 1, health }, pending: [] });
+          };
+          if (request.operation === 'capture' && !held) {
+            held = true;
+            const release = new URL('./release', import.meta.url);
+            const check = () => {
+              if (!existsSync(release)) return;
+              watcher.close(); reply();
+            };
+            const watcher = watch(new URL('.', import.meta.url), check);
+            check();
+            return;
+          }
+          reply();
+        });`)
+      const observer = new BehaviorLedgerObserver({ workerPath: join(directory, 'worker.mjs'), captureLimit: 23 })
+      observers.push(observer)
+      await observer.start()
+      observer.capture(admission('batch-read-0', { number: 1001 }))
+      await vi.waitFor(async () => {
+        expect(await readFile(join(directory, 'batches'), 'utf8')).toContain('1')
+      }, { timeout: 5000, interval: 25 })
+      for (let index = 1; index <= 24; index++) {
+        observer.capture(admission(`batch-read-${index}`, { number: 1001 + index }))
+      }
+      const reads = Array.from({ length: 8 }, () => observer.read({ operation: 'health' }))
+      await writeFile(join(directory, 'release'), '')
+      expect((await reads[0]).status).toBe(200)
+      expect((await reads[1]).status).toBe(200)
+      now.mockReturnValue(startedAt + 11_000)
+      observer.capture(admission('batch-read-late', { number: 2000 }))
+      for (const reply of await Promise.all(reads.slice(2))) expect(reply.status).toBe(200)
+      await vi.waitFor(async () => {
+        expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ pending: 0, dropped: 0 })
+      }, { timeout: 5000, interval: 25 })
+      const batches = (await readFile(join(directory, 'batches'), 'utf8')).trim().split('\n')
+      expect(batches[1]).toBe('24')
+      const retained = (await readFile(join(directory, 'captures'), 'utf8')).trim().split('\n')
+        .flatMap((line) => line.split(','))
+      expect(retained).toContain('batch-read-late')
+      expect(retained.filter((nativeId) => nativeId.startsWith('batch-read-')).sort()).toEqual(
+        [...Array.from({ length: 25 }, (_, index) => `batch-read-${index}`), 'batch-read-late'].sort())
+    } finally { now.mockRestore() }
+  })
+
   it('keeps two restart gaps separate across a healthy capture with checkpoint endpoints', () => {
     const db = store()
     db.capture(admission())

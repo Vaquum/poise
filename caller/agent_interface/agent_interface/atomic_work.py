@@ -2,13 +2,14 @@
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from . import atoms, checkout_lock, issue_review, progress, review_budget, resource_ownership
+from . import atoms, checkout_lock, failed_source, issue_review, native_namespace, progress, review_budget, resource_ownership
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope, escaped_failure
 
@@ -160,6 +161,7 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
     if baseline.get("head_sha") != head or baseline.get("ref") != base \
             or not isinstance(failures, list) or not failures or len(failures) > 100:
         raise AtomicWorkFailed("CI dependency lacks exact-base failure evidence")
+    sgr = re.compile(r"\x1b\[[0-9;]*m")
     verified, used = [], set()
     for failure in failures:
         if not isinstance(failure, dict):
@@ -167,11 +169,12 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
         check = next((item for item in integration["failing"] if item.get("check_run_id") == failure.get("check")), None)
         prior = next((item for item in baseline["failing"] if item.get("check_run_id") == failure.get("baselineCheck")), None)
         excerpt = failure.get("evidence")
+        visible_excerpt = sgr.sub("", excerpt) if isinstance(excerpt, str) else ""
         if not check or not prior or check["check_run_id"] in used or check.get("head_sha") != value["integration"] \
                 or prior.get("head_sha") != base or check.get("name") != prior.get("name") \
                 or check.get("state") != "completed" or check.get("conclusion") != "failure" \
                 or prior.get("state") != "completed" or prior.get("conclusion") != "failure" \
-                or not isinstance(excerpt, str) or not 20 <= len(excerpt.strip()) <= 2000:
+                or not isinstance(excerpt, str) or len(excerpt.strip()) > 2000 or len(visible_excerpt.strip()) < 20:
             raise AtomicWorkFailed("CI dependency requires matching completed failures and a specific cause excerpt")
         run = next((item for item in integration["runs"] if item.get("id") == check.get("run_id")), None)
         base_run = next((item for item in baseline["runs"] if item.get("id") == prior.get("run_id")), None)
@@ -183,7 +186,7 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
             if not item.get("log_id"):
                 raise AtomicWorkFailed("CI dependency has no readable job log")
             log = issue_review.interface("--read-failing-ci-log", str(item["log_id"]), "--repository", repo, "--token-user", actor)
-            if log.get("repository", "").lower() != repo.lower() or excerpt not in log.get("log", ""):
+            if log.get("repository", "").lower() != repo.lower() or visible_excerpt not in sgr.sub("", log.get("log", "")):
                 raise AtomicWorkFailed("CI dependency cause is absent from its actual job logs")
         used.add(check["check_run_id"])
         verified.append({**failure, "name": check["name"], "run": run["id"], "workflow": run["workflow_id"],
@@ -196,7 +199,7 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
             "allShared": len(used) == len(integration["failing"])}
 
 
-def _ci_only_blocker(ci: object) -> object:
+def _ci_only_blocker(ci: object, queue: dict, head: str, actor: str) -> object:
     # Durable CI-only evidence is the packet identity plus the failed
     # check/job IDs that pin the original run attempt. Full check summaries
     # can exceed the 128 KiB receipt limit and would turn an explicit CI-only
@@ -211,13 +214,72 @@ def _ci_only_blocker(ci: object) -> object:
                 compact.append({key: entry[key] for key in
                                 ("type", "name", "state", "conclusion", "check_run_id", "log_id", "url")
                                 if key in entry})
-    return {
+    blocker = {
         "action": ci.get("action"),
         "repository": ci.get("repository"),
         "pull_number": ci.get("pull_number"),
         "head_sha": ci.get("head_sha"),
         "failing": compact,
     }
+    if failing != [] or ci.get("head_sha") != head:
+        return blocker
+    removals = queue.get("queue_removals", [])
+    removal = removals[-1] if removals else None
+    integration = (removal.get("beforeCommit") or {}).get("oid") if isinstance(removal, dict) else None
+    if queue.get("head_sha") != head or not removal or removal.get("reason") != "failed_checks" \
+            or not isinstance(removal.get("id"), str) or not removal["id"] \
+            or not isinstance(integration, str) or not re.fullmatch(r"[0-9a-f]{40}", integration):
+        return blocker
+    packet = issue_review.interface("--list-failing-ci", str(ci["pull_number"]), "--repository", ci["repository"],
+                                    "--token-user", actor, "--ref", integration)
+    parents = packet.get("parents", [])
+    if packet.get("repository") != ci["repository"] or packet.get("pull_number") != ci["pull_number"] \
+            or packet.get("head_sha") != head or packet.get("ref") != integration \
+            or len(parents) < 2 or head not in parents[1:] or not re.fullmatch(r"[0-9a-f]{40}", str(parents[0])):
+        raise AtomicWorkFailed("CI blocker integration does not contain the admitted candidate and base")
+    failures = []
+    verified: set[tuple[int, str]] = set()
+    pending = []
+    for check in packet.get("failing", []):
+        run = next((run for run in packet.get("runs", []) if run.get("id") == check.get("run_id")), None)
+        if check.get("state") != "completed":
+            pending.append((check, run))
+            continue
+        if check.get("type") != "check_run" or check.get("head_sha") != integration or check.get("state") != "completed" \
+                or check.get("conclusion") not in {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"} \
+                or not check.get("name") or not check.get("url") or not run or run.get("head_sha") != integration \
+                or run.get("event") != "merge_group" \
+                or any(type(value) is not int or value < 1 for value in
+                       (check.get("check_run_id"), check.get("log_id"), run.get("id"), run.get("workflow_id"), run.get("run_attempt"))):
+            return blocker  # Unknown obligations cannot authorize recovery.
+        attempt = run["run_attempt"]
+        rerun_finished = run.get("status") == "completed" and run.get("conclusion") == "success"
+        rerun_running = isinstance(run.get("status"), str) and run.get("status") != "completed" and attempt > 1
+        if rerun_finished or rerun_running:
+            # The run already moved past the retained failure, so its
+            # current attempt is not the failed one. Pinning it would
+            # reject that existing success and demand another rerun.
+            if attempt < 2:
+                return blocker  # A completed success on attempt 1 contradicts the retained failure.
+            attempt -= 1
+        failures.append({"name": check["name"], "check": check["check_run_id"], "job": check["log_id"],
+                         "run": run["id"], "workflow": run["workflow_id"], "attempt": attempt, "url": check["url"]})
+        verified.add((run["workflow_id"], check["name"]))
+    for check, run in pending:
+        if not isinstance(check, dict) or check.get("type") != "check_run" or check.get("head_sha") != integration \
+                or not isinstance(check.get("state"), str) or check.get("state") == "completed" \
+                or check.get("conclusion") is not None or not check.get("name") or not check.get("url") \
+                or not run or run.get("head_sha") != integration or run.get("event") != "merge_group" \
+                or any(type(value) is not int or value < 1 for value in
+                       (check.get("check_run_id"), check.get("log_id"), run.get("id"), run.get("workflow_id"), run.get("run_attempt"))):
+            return blocker  # Unknown or malformed pending obligations cannot authorize recovery.
+        if (run["workflow_id"], check["name"]) not in verified:
+            return blocker  # A pending distinct obligation leaves the original failure set unknown.
+        # A pending rerun of a verified failure keeps the original
+        # evidence; recovery waits for its later result.
+    if failures:
+        blocker["queue"] = {"removal": removal["id"], "integration": integration, "base": parents[0], "failures": failures}
+    return blocker
 
 
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
@@ -236,14 +298,34 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
     data = issue_review.packet(repo, number, actor)
     if data["issue"]["state"] != "open":
         raise AtomicWorkFailed("seed issue is no longer open")
-    if expected_issue_revision and issue_review.revision(data["issue"]) != expected_issue_revision:
+    seed_revision = issue_review.revision(data["issue"])
+    if expected_issue_revision and seed_revision != expected_issue_revision:
         raise AtomicWorkFailed("seed issue changed before implementation/repair")
     progress.stage("preparing_checkout", "Preparing the implementation/repair checkout")
     prepared = issue_review.interface("--issue-work", *common, "--mode", "prepare", "--path", str(checkout),
                                       *(["--merge-base"] if merge_base else []), seconds=1800)
     if prepared.get("outcome") != "prepared":
         return prepared
-    record({"phase": "prepared", "prepared": prepared})
+    test_capture = {"call": call_id, "nonce": secrets.token_hex(32), "repository": repo, "base": prepared["checkout_head"]}
+    record({"phase": "prepared", "prepared": prepared, "test_capture": test_capture, "seed_revision": seed_revision})
+    restored = None
+    if pull is None:
+        try:
+            bound = resource_ownership.binding()
+        except Exception:
+            bound = None
+        if bound is not None and bound[1] == call_id:
+            try:
+                result = failed_source.restore_deadline(bound[0], call_id, checkout, prepared["checkout_head"], seed_revision)
+            except Exception as error:
+                raise AtomicWorkFailed(f"deadline restore verification failed; no publication attempted: {error}") from error
+            if result.get("status") == "restored":
+                restored = result
+                record({"phase": "prepared", "prepared": prepared, "seed_revision": seed_revision,
+                        "deadline_restored": {"predecessor": result["predecessor"], "base": result["base"],
+                                              "seed": result["seed"], "count": len(result["paths"])}})
+    test_evidence = work / "test-evidence"
+    test_evidence.mkdir(mode=0o700)
     evidence = {}
     required_reply_ids: set[int] = set()
     if pull is not None:
@@ -281,6 +363,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "and other blockers remain blockers; do not relabel them as relay no-results. "
         "Before cleanup, put the worker-reported first actionable assertion/failure excerpt, suite/test identifier, "
         "captured candidate digest and producing run ID in the existing blocked string, ahead of any later relay timeout explanation. "
+        "For the Caller pytest gate, copy its bounded 'completed Caller pytest failure:' summary first in blocked. "
         "Use the relay's captured candidate digest, which includes uncommitted edits; checkout_head is only the starting HEAD. "
         "Retain the run ID of the attempt that produced the failure. If only a failed-test marker was observed, "
         "say assertion details are unavailable; say when candidate or run identity is unavailable too. "
@@ -293,6 +376,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         f"Write JSON to {output}: {{\"commitMessage\":\"Conventional Commit subject\",\"title\":\"Conventional Commit PR title\","
         "\"body\":\"Concrete change, reason and actual checks, without a Closes footer\","
         "\"replies\":[{\"commentId\":123,\"body\":\"Your concrete answer to this actual review finding, including what changed or evidence for disagreement\"}],\"blocked\":null}}. "
+        "For repairs, retain the required title/body fields; they describe this repair but are not published. Existing PR metadata is preserved. "
         f"For a repair, include one substantive answer for each of these required unresolved root comment IDs: {json.dumps(sorted(required_reply_ids))}. "
         "This exact set includes outdated unresolved roots and roots that already have replies. Check each finding and its answer against the repaired code and current reviewer input. "
         "When an existing native reply still applies and that finding's reviewer input is unchanged, carry its entire body verbatim in replies, including its original <!-- poise-reply CALL_ID ROOT_ID --> marker. "
@@ -300,13 +384,31 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "For a new finding, changed reviewer input or a materially changed answer, write a fresh substantive answer without a native marker. Missing or uncertain prior reply proof cannot count as verified coverage. "
         "Do not reply to replies, invent comment ids, or use generic acknowledgements. For initial implementation replies must be empty. "
         "If unable to finish, set blocked to the concrete reason; do not claim the work complete. "
-        'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
-        "Use a string for every other blocker, including missing evidence, a product decision or uncertain publication. "
+        "For a pre-PR block caused solely by an observed failing main CI test run, you may also supply "
+        "testDependency: {base: prepared.checkout_head, run: original producing CI run ID, baselineRun: a distinct CI run ID "
+        "on that exact base, remediation: existing repository GitHub issue URL}. Caller independently reads the complete "
+        "assertion artifacts and requires every original failure/cause on the exact base. Keep blocked as the concrete string. "
+        "Relay assertion proof is currently held for #1619: candidate-controlled reports cannot authorize recovery. "
+        "Do not use source 'relay'; worker text and historical relay output cannot substitute. "
+        "Do not use the CI dependency for candidate-specific failures or other blockers. "
+        'If a repair is blocked solely by failed CI on the supplied PR head or a verified merge-group-only failure, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
+        "Use this ci_only receipt even when PR-head checks are green and optional baseline proof is unavailable. "
+        "Use a string for every other blocker, including missing original failure evidence, a product decision or uncertain publication. "
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
         f"Behavior note: {note}\nPreparation receipt:\n{json.dumps(prepared)}\nActual issue and comments:\n{json.dumps(data)}\nActual PR evidence:\n{json.dumps(evidence)}"
     )
+    if restored is not None:
+        instruction += (f"\nRestored {len(restored['paths'])} unvalidated file(s) from previous deadline attempt "
+                        f"{restored['predecessor']} on the same base and seed: {json.dumps(sorted(restored['paths']))}. "
+                        "These edits are unvalidated; validate from scratch and publish only from this attempt.\n")
     progress.stage("preparing_provider", "Preparing the atomic provider command")
     args, stdin, env = issue_review.command(model, instruction, checkout, work, seconds, UNATTENDED)
+    env = dict(os.environ if env is None else env)
+    env.update(POISE_TEST_BINDING=json.dumps(test_capture), POISE_TEST_EVIDENCE_DIR=str(test_evidence))
+    if os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") == call_id and pull is None:
+        # Unlike the receipt binding, this grants only private source inspection;
+        # worker tests must still not register resources against their parent.
+        env["AGENT_INTERFACE_FAILED_SOURCE_CALL"] = call_id
     lease = checkout_lock.Lease(str(checkout), call_id, f"atomic behavior {repo}#{number} ({call_id[:8]})", owner_kind="caller:repair-pr" if pull else "caller:implement-issue")
     with checkout_lock.interruptible():
         progress.stage("acquiring_checkout", "Acquiring the atomic checkout lease")
@@ -318,6 +420,39 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             try:
                 done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
             except subprocess.TimeoutExpired as error:
+                if pull is None:
+                    try:
+                        bound = resource_ownership.binding()
+                    except Exception:
+                        bound = None
+                    if bound is not None and bound[1] == call_id:
+                        base = prepared.get("checkout_head")
+                        proven = not lease.retained
+                        if proven:
+                            try:
+                                issue_review.stop_leftovers(work)
+                                proven = issue_review._cwd_pids(work, require_complete=True) == []
+                            except Exception:
+                                proven = False
+                        if proven:
+                            try:
+                                scope = native_namespace.active()
+                                if scope is not None:
+                                    scope.require_idle()
+                            except Exception:
+                                proven = False
+                        if proven:
+                            try:
+                                failed_source.capture_deadline(bound[0], call_id, checkout, base, seed_revision)
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                record({"phase": "executing", "prepared": prepared,
+                                        "deadline_source": {"status": "unavailable", "base": base,
+                                                            "seed": seed_revision, "reason": failed_source.DEADLINE_REASON}})
+                            except Exception:
+                                pass
                 raise review_budget.ReviewLimitError(
                     "Atomic behavior provider exhausted its execution budget; no publication attempted",
                     "atomic_work_execution_budget_exhausted",
@@ -338,7 +473,36 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             progress.stage("validating_provider_result", "Checking the atomic provider result")
             terminal = issue_review._terminal_failure(model.provider, done.stdout)
             if done.returncode or terminal:
-                raise RuntimeError(terminal or issue_review.provider_error(done.stdout, done.stderr) or f"provider exited {done.returncode}")
+                raw = terminal or issue_review.provider_error(done.stdout, done.stderr) or f"provider exited {done.returncode}"
+                # Classify the provider's own cause before credential redaction can
+                # hide natural-language words such as "token was".
+                if model.provider == "codex" and atoms.credential_rejected(raw):
+                    error = atoms.bounded_cause(raw)
+                    raise issue_review.ProviderFailure(
+                        error, "authentication_failed",
+                        diagnostic_envelope(operation="provider.atomic_work", phase="provider_execution",
+                                            outcome="signal" if done.returncode < 0 else "exit",
+                                            stderr=error, provider=model.provider,
+                                            exit_code=done.returncode if done.returncode > 0 else None,
+                                            signal=-done.returncode if done.returncode < 0 else None,
+                                            submission="none"))
+                from . import _retained_account_signal, _retained_rate_limit_signal
+                # Raw provider causes can include tool output. Keep only the
+                # existing fixed account/rate markers and observed process facts.
+                trip = _retained_account_signal(raw) or _retained_rate_limit_signal(raw)
+                disposition = f"signal {-done.returncode}" if done.returncode < 0 else f"exit {done.returncode}"
+                message = (f"Atomic behavior provider {'reported a failed terminal with' if terminal else 'failed with'} {disposition}; "
+                           "provider cause unavailable; no publication attempted")
+                if trip:
+                    message = f"{trip}: {message}"
+                raise issue_review.ProviderFailure(
+                    message, "atomic_work_failed",
+                    diagnostic_envelope(operation="provider.atomic_work", phase="provider_execution",
+                                        outcome="signal" if done.returncode < 0 else "exit",
+                                        executable=model.provider, message=message,
+                                        exit_code=done.returncode if done.returncode >= 0 else None,
+                                        signal=-done.returncode if done.returncode < 0 else None,
+                                        submission="none"))
             progress.stage("reading_publication", "Reading bounded publication metadata")
             if not output.is_file() or output.stat().st_size > 64 * 1024:
                 raise AtomicWorkFailed("atomic behavior returned no bounded publication metadata")
@@ -348,9 +512,49 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                 raise AtomicWorkFailed("atomic behavior blocked: invalid output")
             if publication.get("blocked") is not None:
                 blocked = publication["blocked"]
+                if pull is None and publication.get("testDependency") is not None and isinstance(blocked, str) and blocked.strip():
+                    dependency = publication["testDependency"]
+                    if not isinstance(dependency, dict) or dependency.get("base") != prepared.get("checkout_head") \
+                            or dependency.get("remediation") == f"https://github.com/{repo}/issues/{number}":
+                        raise AtomicWorkBlocked(f"{blocked}; test dependency does not identify the original checkout base and external remediation")
+                    try:
+                        if dependency.get("source") == "relay":
+                            receipts = {}
+                            for key, name in (("run", "original"), ("baselineRun", "baseline")):
+                                ident = dependency.get(key)
+                                if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{32}", ident):
+                                    raise ValueError("relay dependency requires original completed runner IDs")
+                                path = test_evidence / f"{ident}.json"
+                                if path.stat().st_size > 48 * 1024:
+                                    raise ValueError("relay assertion receipt is oversized")
+                                receipts[name] = json.loads(path.read_text())
+                            dependency = {**dependency, "capture": test_capture, "relay": receipts}
+                        verified = issue_review.interface("--chain-seed", f"#{number}", "--repository", repo, "--branch", branch,
+                                                          "--token-user", actor, "--test-dependency-json", json.dumps(dependency))
+                    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+                        raise AtomicWorkBlocked(f"{blocked}; authoritative test evidence is unavailable: {error}") from error
+                    proof = verified.get("test_dependency")
+                    if isinstance(proof, dict) and proof.get("verified") is True and proof.get("base") == prepared["checkout_head"]:
+                        # The original Call retains this independently read proof
+                        # even when report publication is disabled.
+                        record({"phase": "executing", "prepared": prepared, "test_dependency": proof})
                 if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
                         and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
-                    record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})
+                    try:
+                        blocker = _ci_only_blocker(evidence["ci"], evidence["queue"], expected_head or "", actor)
+                        record({"phase": "executing", "prepared": prepared, "ci_blocker": blocker})
+                        if publication.get("ciDependency") is not None and isinstance(blocker, dict) and blocker.get("queue"):
+                            dependency = _verify_ci_dependency(publication["ciDependency"], repo, pull, expected_head or "", actor, evidence["queue"])
+                            if dependency["remediation"] in {f"https://github.com/{repo}/issues/{number}", f"https://github.com/{repo}/pull/{pull}"}:
+                                raise AtomicWorkFailed("CI dependency cannot use its own repair as the external remediation")
+                            if dependency.get("allShared") is True:
+                                blocker["ci_dependency"] = {**dependency, "failures": [
+                                    {key: value for key, value in failure.items() if key != "evidence"} for failure in dependency["failures"]]}
+                            # A partial proof cannot grant baseline recovery; the
+                            # retained queue failures still allow integration recovery.
+                    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+                        raise AtomicWorkBlocked(f"{blocked['reason']}; authoritative queue CI evidence is unavailable: {error}") from error
+                    record({"phase": "executing", "prepared": prepared, "ci_blocker": blocker})
                     blocked = blocked["reason"]
                 raise AtomicWorkBlocked(blocked)
             dependency = None
@@ -419,6 +623,15 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             record(receipt)
             progress.stage("publishing", "Publishing the verified checkout through github-interface")
             published = issue_review.interface(*publication_args, "--mode", "publish", seconds=120)
+            if published.get("outcome") == "prerequisite_wait":
+                if pull is not None:
+                    raise AtomicWorkFailed("prerequisite wait is only available for first publication")
+                wait = published.get("prerequisite_wait")
+                if not isinstance(wait, dict) or wait.get("base") != str(prepared.get("checkout_head") or "").lower() \
+                        or not isinstance(wait.get("reason"), str) or not wait["reason"].strip():
+                    raise AtomicWorkFailed("prerequisite wait lacks its original candidate base and reason")
+                record({"phase": "prerequisite_wait", "prepared": prepared, "prerequisite_wait": wait})
+                return published
             record({**receipt, "phase": "published", "result": published})
             return published
         finally:

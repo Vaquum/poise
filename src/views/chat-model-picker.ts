@@ -85,7 +85,7 @@ export function attachModelPicker(container: HTMLElement, handlers: PickerHandle
           ${agent.models.map(model => `<button type="button" role="option" tabindex="-1"
             class="chat-model-option" data-identity="${escapeHtml(model.identity)}"
             aria-selected="${model.identity === state.identity}" aria-disabled="${!agent.available}"
-            title="${escapeHtml(agent.available ? model.identity : agent.reason || 'Unavailable')}">
+            data-help="${escapeHtml(agent.available ? model.identity : agent.reason || 'Unavailable')}">
             <span>${escapeHtml(consoleModelLabel(model.identity, model.effort))}</span>
             <span class="chat-model-check" aria-hidden="true">${model.identity === state.identity ? '✓' : ''}</span>
           </button>`).join('')}

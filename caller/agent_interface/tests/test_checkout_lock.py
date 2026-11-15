@@ -509,6 +509,28 @@ class TestRunGated(LockCase):
         self.assertTrue(self.writer_stopped())
         self.assertEqual(self.rows(), [])
 
+    def test_timeout_with_unverified_group_keeps_the_original_lease_and_timeout_context(self):
+        lease = self.lease().acquire(1)
+        original, = self.rows()
+        args = [sys.executable, "-c", WRITER]
+        # Only the holder's final group observation is uncertain; the real
+        # writer still reaches its deadline and follows normal group cleanup.
+        with patch.object(checkout_lock, "pgid_alive", return_value=True), \
+                patch.object(lease, "release", wraps=lease.release) as release, \
+                self.assertRaisesRegex(WorkerOrphaned, "worker group .* is still alive; lease retained") as failure:
+            checkout_lock.run_gated(lease, args, cwd=self.checkout, env=None, timeout=1)
+        row, = self.rows()
+        self.assertEqual((row["id"], row["token"], row["owner_id"]),
+                         (original["id"], original["token"], original["owner_id"]))
+        self.assertEqual(row["worker_pgid"], self.meta()[1])
+        self.assertEqual(str(failure.exception), lease.retained)
+        self.assertIsInstance(failure.exception.__context__, subprocess.TimeoutExpired)
+        self.assertEqual((failure.exception.__context__.cmd, failure.exception.__context__.timeout), (args, 1))
+        self.assertFalse(lease.held)
+        release.assert_not_called()
+        self.assertFalse(pgid_alive(self.meta()[1]))
+        self.assertTrue(self.writer_stopped())
+
     def test_losing_the_lease_mid_run_stops_the_agent_and_never_touches_the_new_row(self):
         lease = self.lease().acquire(1)
         with patch.object(checkout_lock, "HEARTBEAT_MS", 200):

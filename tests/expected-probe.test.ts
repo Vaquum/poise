@@ -107,7 +107,7 @@ describe('expected probe misses', () => {
     vi.stubEnv('CALLER_BIN_ROOT', bin)
     await expect(resolveReviewCheckout('octocat', 'hello', 1, 'reviewer', 'a'.repeat(40)))
       .rejects.toThrow('Command failed')
-    const seen = events().filter((event) => event.operation === 'github-interface')
+    const seen = events().filter((event) => event.operation === 'github-interface.checkout-repo')
     expect(seen).toHaveLength(1)
     expect(seen[0].stderr).toContain('reviewer cannot read repository')
     expect(JSON.stringify(events())).not.toContain('checkout not found')

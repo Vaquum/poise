@@ -60,7 +60,7 @@ import { WAKE_OPTIONS, wakeStatusText, type ManagerWakeView, type WakeMinutes } 
 import { deriveSessionTitle } from '../../../chat-title'
 import { applyWorklogOrder, compareWorklog } from '../../../chat-worklog'
 import { term } from '../../registry'
-import { chatState } from '../overview/states'
+import { chatState, type Placed } from '../overview/states'
 import { shortElapsed } from '../../../chat-turn-time'
 import { createDeployCard, type DeployCard, type LocalPendingChange } from '../../../views/chat-deploy-card'
 import { recognisePoiseRequest } from '../../../poise-request-intent'
@@ -280,8 +280,7 @@ function stallSummary(stall: StallState): string {
 }
 
 /** A chat's state in the registry's words, as Overview and Board say them (#556's vocabulary). */
-function stateWords(s: SessionRecord): string {
-  const placed = chatState(s)
+function stateWords(placed: Placed): string {
   return `${term(`state.${placed.state}`)}${placed.note ? ` · ${placed.note}` : ''}`
 }
 
@@ -354,8 +353,8 @@ function renderShell(): void {
   viewEl.innerHTML = `
     <header class="view-header">
       <div class="filter-cluster chat-view-controls">
-        <button type="button" class="chat-icon-btn chat-sidebar-toggle" title="Toggle sessions" aria-label="Toggle sessions" aria-controls="chat-sessions-pane" aria-expanded="true" aria-pressed="true">${ICON_SIDEBAR}</button>
-        <button type="button" class="chat-icon-btn chat-new-btn" title="New session" aria-label="New session">${ICON_PLUS}</button>
+        <button type="button" class="chat-icon-btn chat-sidebar-toggle" data-help="Toggle sessions" aria-label="Toggle sessions" aria-controls="chat-sessions-pane" aria-expanded="true" aria-pressed="true">${ICON_SIDEBAR}</button>
+        <button type="button" class="chat-icon-btn chat-new-btn" data-help="New session" aria-label="New session">${ICON_PLUS}</button>
         <button type="button" class="chat-icon-btn chat-switchboard-toggle" aria-label="Switchboard" aria-controls="chat-switchboard-pane" aria-expanded="false" aria-pressed="false" data-tooltip="Switchboard">${ICON_SWITCHBOARD}<span class="chat-switchboard-badge" aria-hidden="true" hidden></span></button>
         <span class="chat-conn" role="status" hidden></span>
       </div>
@@ -364,7 +363,7 @@ function renderShell(): void {
       <div class="chat-layout">
         <aside id="chat-sessions-pane" class="chat-sidebar" aria-label="Sessions">
           <div class="chat-session-list" role="list"></div>
-          <div class="chat-sidebar-resize" role="separator" aria-label="Resize sessions pane" aria-orientation="vertical" aria-controls="chat-sessions-pane" tabindex="0" title="Drag to resize; double-click to reset"></div>
+          <div class="chat-sidebar-resize" role="separator" aria-label="Resize sessions pane" aria-orientation="vertical" aria-controls="chat-sessions-pane" tabindex="0" data-help="Drag to resize; double-click to reset"></div>
         </aside>
         <section class="chat-main">
           <div class="chat-session-header" hidden></div>
@@ -757,10 +756,10 @@ function creatorHtml(s: SessionRecord): string {
   const creator = sessions.get(createdBy.sessionId)?.record
   if (creator) {
     const text = creator.role === 'manager' ? 'from Manager' : `from chat "${shortActorTitle(creator.title)}"`
-    return `<div class="chat-session-creator" title="${escapeHtml(actorTitleAttr({ title: creator.title, sessionId: creator.id }))}">${escapeHtml(text)}</div>`
+    return `<div class="chat-session-creator" data-help="${escapeHtml(actorTitleAttr({ title: creator.title, sessionId: creator.id }))}">${escapeHtml(text)}</div>`
   }
   const text = createdBy.role === 'manager' ? 'from a deleted Manager' : `from a deleted chat "${shortActorTitle(createdBy.title)}"`
-  return `<div class="chat-session-creator" title="${escapeHtml(actorTitleAttr(createdBy))}">${escapeHtml(text)}</div>`
+  return `<div class="chat-session-creator" data-help="${escapeHtml(actorTitleAttr(createdBy))}">${escapeHtml(text)}</div>`
 }
 
 function sidebarHtml(): string {
@@ -776,11 +775,11 @@ function sidebarHtml(): string {
     const bulkArmed = armed && armedDelete!.bulk && armedDelete!.bulk.length > 1 ? armedDelete!.bulk : null
     const confirm = armed ? (bulkArmed ? deleteBulkConfirmCopy(bulkArmed.length) : deleteConfirmCopy(s, records)) : null
     const placed = chatState(s)
-    const said = stateWords(s)
+    const said = stateWords(placed)
     const pinned = pins.has(id) && s.role !== 'manager'
     const selected = selectedIds.has(id)
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}${pinned ? ' pinned' : ''}${selected ? ' selected' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0" draggable="${s.role !== 'manager'}">`
-      + `<div class="chat-session-title" title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</div>`
+      + `<div class="chat-session-title" data-help="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</div>`
       + (s.subject ? `<div class="chat-session-subject">From Board · ${escapeHtml(s.subject.label)}</div>` : '')
       + creatorHtml(s)
       + `<div class="chat-session-meta">`
@@ -788,11 +787,11 @@ function sidebarHtml(): string {
       + (s.role === 'worker' ? `<span class="chat-pill chat-pill-worker">Worker</span>` : '')
       + `<span class="chat-pill">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)} · ${escapeHtml(s.model)}</span>`
       + `<span class="sc" data-state="${placed.state}" aria-hidden="true"></span>`
-      + `<span class="chat-session-state" title="${escapeHtml(said)}">${escapeHtml(said)}</span>`
+      + `<span class="chat-session-state" data-help="${escapeHtml(said)}">${escapeHtml(said)}</span>`
       + `<span class="chat-session-date">${escapeHtml(dateLabel(s.createdAt))}</span>`
       + `</div>`
-      + (pinned ? `<button type="button" class="chat-session-pin" title="Unpin — return to automatic order" aria-label="Unpin chat">${ICON_PIN}</button>` : '')
-      + `<button type="button" class="chat-session-delete${armed ? ' armed' : ''}" data-id="${escapeHtml(id)}" title="${escapeHtml(confirm ? confirm.title : 'Delete session')}" aria-label="${escapeHtml(confirm ? confirm.label : 'Delete session')}">${armed ? 'Sure?' : '×'}</button>`
+      + (pinned ? `<button type="button" class="chat-session-pin" data-help="Unpin — return to automatic order" aria-label="Unpin chat">${ICON_PIN}</button>` : '')
+      + `<button type="button" class="chat-session-delete${armed ? ' armed' : ''}" data-id="${escapeHtml(id)}" data-help="${escapeHtml(confirm ? confirm.title : 'Delete session')}" aria-label="${escapeHtml(confirm ? confirm.label : 'Delete session')}">${armed ? 'Sure?' : '×'}</button>`
       + `</div>`
   }).join('')
 }
@@ -2574,12 +2573,14 @@ function headerHtml(): string {
   const e = entry()
   if (!e) return `<div class="chat-h-row chat-h-fresh"><span class="chat-controls-spacer"></span>${reasoningButton()}${autoMergeButton(freshAutoMerge, !!quickSessionPromise || firstPromptPending)}${safeModeButton(freshSafeMode, !!quickSessionPromise || firstPromptPending)}${memoriesButton()}</div>`
   const s = e.record
+  const status = chatState(s)
+  const statusHtml = `<span class="chat-h-status" data-state="${status.state}">${escapeHtml(stateWords(status))}</span>`
   // Poise runs the Switchboard's chat: it can be followed and its own questions
   // answered, but its model, settings and messages are not the person's to change.
   if (!listed(s.id)) {
     return `<div class="chat-h-row"><span class="chat-pill chat-h-agent">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)}</span><span class="chat-h-model">${escapeHtml(s.model)}</span>`
-      + `<span class="chat-h-status" data-status="${s.status}">${escapeHtml(stateWords(s))}</span> ${sinceHtml(e, s)}<span class="chat-controls-spacer"></span>`
-      + `${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" title="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}</div>`
+      + `${statusHtml} ${sinceHtml(e, s)}<span class="chat-controls-spacer"></span>`
+      + `${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" data-help="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}</div>`
       + '<div class="st-help st-help-info chat-observer-note">Poise runs this chat for the Switchboard pane. It takes no messages; answer here only what it asks you.</div>'
   }
   const agent = agentFor(s.agent)
@@ -2602,16 +2603,16 @@ function headerHtml(): string {
         <select class="chat-h-select chat-model-select" aria-label="Model"${between ? '' : ' disabled'}>${models.map((m) => `<option value="${escapeHtml(m)}"${m === s.model ? ' selected' : ''}>${escapeHtml(m)}</option>`).join('')}</select>
         ${efforts.length ? `<select class="chat-h-select chat-effort-select" aria-label="Effort"${between ? '' : ' disabled'}>${(efforts.includes(s.effort) ? efforts : [s.effort, ...efforts]).map((x) => `<option value="${escapeHtml(x)}"${x === s.effort ? ' selected' : ''}>${escapeHtml(x)}</option>`).join('')}</select>` : `<span class="chat-h-effort">${escapeHtml(s.effort)}</span>`}
       </span>
-      <span class="chat-h-repo" title="${escapeHtml(s.checkout || '')}">${s.workspaceKind === 'poise-local' ? '<span>Poise · local</span>' : s.workspaceKind === 'poise-change' ? `<span>Poise · change</span> · <code>${escapeHtml(s.branch?.name || '')}</code>` : `<code>${escapeHtml(s.repo || 'local')}</code> · <code>${escapeHtml(s.branch?.name || '')}</code>`}${ws.text ? ` <span class="chat-h-ws ${ws.cls}">${escapeHtml(ws.text)}</span>` : ''}</span>
+      <span class="chat-h-repo" data-help="${escapeHtml(s.checkout || '')}">${s.workspaceKind === 'poise-local' ? '<span>Poise · local</span>' : s.workspaceKind === 'poise-change' ? `<span>Poise · change</span> · <code>${escapeHtml(s.branch?.name || '')}</code>` : `<code>${escapeHtml(s.repo || 'local')}</code> · <code>${escapeHtml(s.branch?.name || '')}</code>`}${ws.text ? ` <span class="chat-h-ws ${ws.cls}">${escapeHtml(ws.text)}</span>` : ''}</span>
       ${modeSel}
-      <span class="chat-h-status" data-status="${s.status}">${escapeHtml(stateWords(s))}</span>
+      ${statusHtml}
       ${sinceHtml(e, s)}
       <span class="chat-controls-spacer"></span>
-      ${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" title="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}
-      ${!isManager && s.capabilities?.fork ? `<button type="button" class="chat-icon-btn chat-h-fork" title="Fork session" aria-label="Fork"${between ? '' : ' disabled'}>${ICON_FORK}</button>` : ''}
+      ${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" data-help="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}
+      ${!isManager && s.capabilities?.fork ? `<button type="button" class="chat-icon-btn chat-h-fork" data-help="Fork session" aria-label="Fork"${between ? '' : ' disabled'}>${ICON_FORK}</button>` : ''}
       <button type="button" class="chat-icon-btn chat-h-activity" aria-label="${showActivity ? 'Hide activity' : 'Show activity'}" data-tooltip="Activity" aria-pressed="${showActivity}" aria-controls="chat-transcript">${ICON_ACTIVITY}</button>
       ${toolsButton()}
-      ${!isManager && others.length ? `<span class="chat-h-handoff-wrap"><button type="button" class="chat-icon-btn chat-h-handoff" title="Hand off to another agent" aria-label="Hand off…" aria-haspopup="true" aria-expanded="${handoffOpen}">${ICON_HANDOFF}</button>${handoffOpen ? handoffMenu(others) : ''}</span>` : ''}
+      ${!isManager && others.length ? `<span class="chat-h-handoff-wrap"><button type="button" class="chat-icon-btn chat-h-handoff" data-help="Hand off to another agent" aria-label="Hand off…" aria-haspopup="true" aria-expanded="${handoffOpen}">${ICON_HANDOFF}</button>${handoffOpen ? handoffMenu(others) : ''}</span>` : ''}
       ${reasoningButton()}
       ${autoMergeButton(s.autoMerge === true, e.pending || autoMergeUpdates.has(s.id))}
       ${safeModeButton(s.safeMode === true, e.pending || safeModeUpdates.has(s.id) || s.status === 'closed', s.safeModePending === true)}

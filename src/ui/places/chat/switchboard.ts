@@ -10,6 +10,7 @@ import { patchContent } from '../../../dom-patch'
 import { escapeHtml } from '../../../markdown'
 import { cancelMotion, spring } from '../../../motion'
 import { CHAT_MIN_WIDTH } from '../../../views/chat-sidebar'
+import { openDecision } from '../overview/entries'
 
 // The Switchboard pane (docs/Switchboard.md): a structured view of what every
 // other chat is doing, with decisions answered by buttons. It is a renderer of
@@ -23,7 +24,7 @@ const SNAP_PX = 14
 const MIN_WIDTH = 300
 const QUIET_AFTER_MS = 45 * 60_000
 const LINE_ITEMS = 5
-/** An answer stays confirmed under Needs you this long. */
+/** How long to keep the answer confirmation visible. */
 const ANSWERED_SHOWN_MS = 10 * 60_000
 
 type LineState = SwitchboardKind | 'quiet'
@@ -67,8 +68,6 @@ export function parseSwitchboardState(value: unknown): SwitchboardState | null {
   return state as SwitchboardState
 }
 
-const openDecision = (item: SwitchboardItem) => item.kind === 'decision' && !item.answer && !item.resolved
-
 /** A chat's line shows its latest report; an open question outranks
  *  everything but a blocker. */
 export function lineState(items: SwitchboardItem[], now: number): LineState {
@@ -101,7 +100,7 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
   el.id = 'chat-switchboard-pane'
   el.className = 'chat-switchboard-pane'
   el.setAttribute('aria-label', 'Switchboard')
-  el.innerHTML = `<div class="sb-resize" role="separator" aria-orientation="vertical" aria-label="Resize Switchboard" aria-controls="chat-switchboard-pane" tabindex="0" title="Drag to resize · double-click for one third"></div><div class="sb-inner"></div>`
+  el.innerHTML = `<div class="sb-resize" role="separator" aria-orientation="vertical" aria-label="Resize Switchboard" aria-controls="chat-switchboard-pane" tabindex="0" data-help="Drag to resize · double-click for one third"></div><div class="sb-inner"></div>`
   const handle = el.querySelector<HTMLElement>('.sb-resize')!
   const inner = el.querySelector<HTMLElement>('.sb-inner')!
   const badge = toggle.querySelector<HTMLElement>('.chat-switchboard-badge')!
@@ -303,9 +302,9 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
     // A new explanation needs a running Switchboard; one already asked for can always be shown.
     const unavailable = item.explanation.state !== 'ready' && item.explanation.state !== 'pending' && state?.status !== 'live' && state?.status !== 'paused'
     return `<div class="sb-actions">
-      <button type="button" class="sb-action" data-act="explain" data-id="${item.id}" aria-expanded="${shown}" aria-controls="sb-expl-${where}-${item.id}"${unavailable ? ' disabled title="The Switchboard is not running"' : ''}>${ICON_EXPLAIN}${shown ? 'Hide explanation' : 'Explain'}</button>
-      ${where === 'card' ? `<button type="button" class="sb-action" data-act="open" data-src="${escapeHtml(item.source.sessionId)}"${item.source.exists ? '' : ' disabled title="This chat was deleted"'}>${ICON_OPEN}Open chat</button>` : ''}
-      <button type="button" class="sb-action" data-act="dismiss" data-dismiss-id="${item.id}" title="Hide this update. The chat is told nothing.">${ICON_CLOSE}Dismiss</button>
+      <button type="button" class="sb-action" data-act="explain" data-id="${item.id}" aria-expanded="${shown}" aria-controls="sb-expl-${where}-${item.id}"${unavailable ? ' disabled data-help="The Switchboard is not running"' : ''}>${ICON_EXPLAIN}${shown ? 'Hide explanation' : 'Explain'}</button>
+      ${where === 'card' ? `<button type="button" class="sb-action" data-act="open" data-src="${escapeHtml(item.source.sessionId)}"${item.source.exists ? '' : ' disabled data-help="This chat was deleted"'}>${ICON_OPEN}Open chat</button>` : ''}
+      <button type="button" class="sb-action" data-act="dismiss" data-dismiss-id="${item.id}" data-help="Hide this update. The chat is told nothing.">${ICON_CLOSE}Dismiss</button>
     </div>`
   }
   function explanation(item: SwitchboardItem, where: 'card' | 'line'): string {
@@ -334,7 +333,7 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
     const choices = item.options ?? []
     const other = answering.has(item.id) || !choices.length
     return `<article class="sb-decision" data-key="decision-${item.id}" aria-label="Decision from ${escapeHtml(item.source.title)}">
-      <div class="sb-src">${lamp('decision', true)}<span class="sb-src-title">${escapeHtml(item.source.title)}</span>${agentPill(item)}<time class="sb-time" datetime="${escapeHtml(item.createdAt)}" title="${escapeHtml(clock(item.createdAt))}">${age(item.createdAt, now)}</time></div>
+      <div class="sb-src">${lamp('decision', true)}<span class="sb-src-title">${escapeHtml(item.source.title)}</span>${agentPill(item)}<time class="sb-time" datetime="${escapeHtml(item.createdAt)}" data-help="${escapeHtml(clock(item.createdAt))}">${age(item.createdAt, now)}</time></div>
       <p class="sb-q">${escapeHtml(item.text)}</p>
       ${item.detail ? `<p class="sb-ctx">${escapeHtml(item.detail)}</p>` : ''}
       ${item.source.turnsSince ? `<p class="sb-stale">${escapeHtml(item.source.title)} has started ${item.source.turnsSince === 1 ? 'a turn' : `${item.source.turnsSince} turns`} since it asked; the question may be out of date.</p>` : ''}
@@ -353,7 +352,7 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
   }
   function update(item: SwitchboardItem): string {
     const kind: LineState = item.kind === 'decision' ? (openDecision(item) ? 'decision' : 'done') : item.kind
-    const label = item.kind === 'decision' ? (item.answer ? 'Answered' : item.resolved ? 'Settled' : 'Asked you') : STATE_LABEL[item.kind]
+    const label = item.kind === 'decision' ? (item.answer ? 'Answered' : item.resolved ? 'Settled' : openDecision(item) ? 'Asked you' : 'Closed') : STATE_LABEL[item.kind]
     const detail = item.answer ? `You answered “${item.answer.label}”.` : item.resolved ? `Settled in the chat: ${item.resolved.reason}` : item.detail
     return `<li class="sb-update" data-kind="${kind}" data-key="update-${item.id}">
       <div class="sb-update-meta"><span class="sb-state">${label}</span><time class="sb-time" datetime="${escapeHtml(item.createdAt)}">${escapeHtml(clock(item.createdAt))}</time></div>
@@ -373,12 +372,12 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
       <button type="button" class="sb-line-head" data-act="line" data-src="${escapeHtml(source)}" aria-expanded="${isOpen}" aria-controls="sb-line-${escapeHtml(source)}">
         ${lamp(kind, kind === 'progress' || kind === 'blocked')}
         <span class="sb-line-title"><b>${escapeHtml(head.source.title)}</b>${agentPill(head)}${asks ? '<span class="sb-asks">Asks you</span>' : ''}</span>
-        <span class="sb-line-side"><time class="sb-time" datetime="${escapeHtml(head.createdAt)}" title="${escapeHtml(clock(head.createdAt))}">${age(head.createdAt, now)}</time><span class="sb-chev">${ICON_CHEV}</span></span>
+        <span class="sb-line-side"><time class="sb-time" datetime="${escapeHtml(head.createdAt)}" data-help="${escapeHtml(clock(head.createdAt))}">${age(head.createdAt, now)}</time><span class="sb-chev">${ICON_CHEV}</span></span>
         <span class="sb-line-text"><span class="sb-state">${STATE_LABEL[kind]}</span><span>${escapeHtml(headline)}</span></span>
       </button>
       <div class="sb-line-body" id="sb-line-${escapeHtml(source)}"${isOpen ? '' : ' hidden'}>
         <ol class="sb-updates">${items.slice(0, LINE_ITEMS).map(update).join('')}</ol>
-        <div class="sb-line-foot"><button type="button" class="chat-h-btn" data-act="open" data-src="${escapeHtml(source)}"${head.source.exists ? '' : ' disabled title="This chat was deleted"'}>${ICON_OPEN}Open ${escapeHtml(head.source.title)}</button></div>
+        <div class="sb-line-foot"><button type="button" class="chat-h-btn" data-act="open" data-src="${escapeHtml(source)}"${head.source.exists ? '' : ' disabled data-help="This chat was deleted"'}>${ICON_OPEN}Open ${escapeHtml(head.source.title)}</button></div>
       </div>
     </div>`
   }
@@ -421,13 +420,13 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
       <div class="sb-summary" role="group" aria-label="Filter chats">${count('decision', counts.decision === 1 ? 'needs you' : 'need you')}${count('blocked', 'blocked')}${count('progress', 'in progress')}${count('done', 'done')}</div>
       ${notice ? `<p class="sb-notice" role="alert">${escapeHtml(notice)}</p>` : ''}
       <div class="sb-scroll" data-key="scroll">
-        ${front || recent.length ? `<section class="sb-section" aria-label="Needs you">
+        ${front ? `<section class="sb-section" aria-label="Needs you">
           <h3 class="sb-h is-needs">Needs you <span class="n">${decisions.length}</span></h3>
-          ${front ? decisionCard(front, now) : ''}
+          ${decisionCard(front, now)}
           ${decisions.filter(item => item !== front).map(item => `<button type="button" class="sb-next" data-act="deck" data-id="${item.id}" data-key="next-${item.id}">
             ${lamp('decision')}<span class="sb-next-text"><b>${escapeHtml(item.source.title)}</b><span>${escapeHtml(item.text)}</span></span><span class="sb-next-go">Answer ${ICON_OPEN}</span></button>`).join('')}
-          ${recent.map(answered).join('')}
         </section>` : ''}
+        ${recent.length ? `<section class="sb-section" aria-label="Recent answers">${recent.map(answered).join('')}</section>` : ''}
         <section class="sb-section" aria-label="All chats">
           <h3 class="sb-h">${filter ? `${filter === 'decision' ? 'Chats asking you' : `${STATE_LABEL[filter]} chats`}` : 'All chats'} <span class="n">${shown.length}</span></h3>
           ${shown.length ? shown.map(entry => line(entry.source, entry.items, now)).join('') : `<p class="sb-empty">${filter ? 'No chat is in this state.' : current.status === 'live' ? 'Nothing to report yet. Updates appear here as the Switchboard checks your chats.' : 'Nothing reported.'}</p>`}

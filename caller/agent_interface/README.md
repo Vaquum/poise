@@ -23,6 +23,57 @@ starts. A named guide that is missing or empty fails the call. With neither,
 it writes without a voice guide, says so on stderr, and prints
 `"voice_guide": null` with its result.
 
+# Reading a response
+
+`agent-interface --read-response CALL_ID` looks up the Call before its response
+path. Success prints the original response plus one trailing newline. Ordinary
+absence exits 3 with JSON `{id, disposition: "unavailable", reason}` on stdout:
+the Call is unknown, still running, or ended without a response. A recorded
+`response_persist` / `persist_failed`, a missing required native receipt, invalid
+row evidence, or a promised file that is missing or unreadable remains an error.
+A null response path alone does not establish ordinary absence.
+
+Poise's History reader displays typed absence as unavailable with its reason,
+without retaining a process Error. Required content and native-action readers
+still reject absence; it grants no publication or retry authority. Failed reads
+retain the exact Call ID and reader purpose. Native receipt digest verification
+continues to use the original response bytes before the CLI's trailing newline.
+
+# Inspecting failed unpublished source
+
+For a managed `implement_issue`, the test-offload runner hands Caller the original
+archive and command specification after a completed nonzero suite exit, before
+deleting that archive. Caller verifies their combined candidate digest and
+checkout binding, then retains only changes against the prepared base: tracked
+files (including deletions) and new source files present in that archive. Ignored
+dependencies, Git metadata and other untracked files are excluded. Symlinks retain
+their target text without following it. Unsupported or mismatched captures are
+unavailable; no cleanup-time diff substitutes for them.
+
+The first failed capture is bounded to 2 MiB including its JSON/base64 encoding,
+in a mode-0600 file under the owning workspace's `incident-recovery` directory.
+It uses existing 30-day incident-artifact expiry, also enforced on reads. The
+ordinary managed checkout and process cleanup still runs. Only a settled,
+failed implementation with no publication attempt keeps the evidence; a later
+successful implementation discards it. Exported `artifact.failed_source` contains
+only validated availability, candidate/run/base identities, size, digest and
+expiry, or a fixed unavailable reason. It never contains source bytes or paths.
+
+The existing linked remediation report exposes availability and the command
+`agent-interface --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID`. This returns
+the private file location, never its contents, only inside the owning workspace
+to a running implementation Call for that report's issue, repository and actor.
+The original no-publication receipt, positive resource release, exact capture
+identity, private file permissions and digest must still match. Missing, expired,
+oversized, tampered or unauthorized evidence returns unavailable and requires a
+fresh reproduction. Historical deleted artifacts are not recovered.
+
+The retained capture can explain an earlier failure; edits made after it still
+require fresh validation. Source contents stay out of GitHub, notifications and
+logs. Inspection grants no publication, retry or approval authority. The blocked
+Call and captured bytes are bound evidence; the worker's diagnosis remains
+worker-reported and does not establish a defect on main.
+
 # Stopping a run
 
 Every local call records its supervisor PID and available kernel start/epoch
@@ -136,6 +187,13 @@ validation step. Caller-authored validation reasons and JSON line/column details
 are retained in both the error and diagnostic message before cleanup; other
 exception text remains excluded. These failures keep `atomic_work_failed` and
 the existing result, resource-release and retry rules.
+Recognized atomic provider failures retain `provider.atomic_work` diagnostics
+with the safe `executable`, observed exit code (including zero for a failed
+terminal) or negative-result signal, and `submission: none`. Caller names a
+failed terminal explicitly and reports `provider cause unavailable` without
+retaining either raw stream. Existing fixed account/rate-limit markers remain.
+An observed exit 137 stays an exit; the lease gate does not distinguish a child
+signal from an explicit exit with that status.
 The outer detached Caller records an explicit unknown cause and observed exit
 status when its inner continuation leaves no cause. These SQLite records survive
 Poise restarts; they authorize neither publication nor resource release.
@@ -226,6 +284,13 @@ stale row whose holder is dead is recovered by the next writer only when the
 registered group is dead too. Each hold uses a fresh token; a released or lost
 lease never touches the row again.
 
+A provider deadline that retains the lease raises `WorkerOrphaned`, keeping the
+original timeout as exception context. Atomic work records `resources_unknown`
+in its artifact and resource ownership errors, leaving `resources_settled_at`
+unset. The checkout grants no capture, publication, retry or release authority
+while ownership is unverified. A deadline with proven release remains an
+ordinary timeout.
+
 # PR review models
 
 Provider supervision hands off after a minute of quota or reconnect diagnostics
@@ -239,12 +304,20 @@ Every attempt ends with one durable terminal state: a validated result with its
 authoritative `review_id` receipt, or a typed failure carrying provider, phase,
 bounded redacted cause and known (`none`, `rejected`, `noop`, `blocked`) or
 unknown submission state. Structured provider exits and signals are `review_provider_exit`,
-provider-reported error terminals are `review_provider_error`; both keep
+provider-reported error terminals are `review_provider_error`, except a Codex
+credential rejection, which is `authentication_failed`; all three keep
 `not_started` / `preflight_failed` with no receipt, so Poise can safely retry
 after proving no reviewer action. On a nonzero Codex exit, the cause prefers the
 last usable `error` / `turn.failed` message, then a recognizable stderr failure;
 startup warnings alone report cause unavailable with the observed exit or signal.
 Malformed event lines cannot replace that process failure with invalid output.
+Poise verifies a fresh Connect with `agent-interface --verify-codex-login MODEL
+--pwd DIR`: one non-publishing request using the review's private Codex home and
+tool-free ChatGPT options. The caller owns the temporary directory, 30-second
+deadline and 64 KiB output limit, and validates the completed `OK` response.
+An isolated credential refresh that cannot seed the next worker fails verification;
+this command never copies credentials back to the canonical sign-in. Cross-Call
+credential persistence remains #1822's responsibility.
 Uncorrected invalid, missing, duplicate or contradictory
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
 GitHub reviews are `review_contract_violation` and held. A repeat-only
@@ -274,6 +347,12 @@ connection error during submission names no status, so it is uncertain as well �
 never a refused submission. Claude's pinned
 inspection root is also carried in its explicit settings so shell tools retain
 repository access.
+
+Review and approval deadlines persist a failed no-action result only after
+validating the original pre-POST phase and quiet, complete live inventory.
+Failed recovery reads retain uncertainty through cleanup. The durable retry,
+resource-release and receipt rules are in
+[Behavior chain](../../docs/Behavior-chain.md#authority-and-recovery).
 
 When live GitHub state confirms the pull request closed or merged — at
 preparation, after provider execution, or during publication reconciliation —
@@ -370,15 +449,22 @@ completion or supersession.
 An explicit provider refusal, exhausted Grok balance, or local Muse account latch
 is recorded as `review_provider_blocked`; transient provider outages remain retryable.
 
-While a model is analyzing a PR, Caller checks its live head approximately
-every 30 seconds through `github-interface --head-sha`. Only a valid response
-for the original repository and PR can cancel the run. Failed, timed-out, or
-malformed checks leave it running. A per-run submission lock lets an in-flight
-GitHub command finish and prevents cancelled workers from starting another one.
-Cancellation stops the provider process group and records `superseded` with the
-observed head, preserving the launch provenance. Poise then reconsiders the PR
-through its existing scheduler. Normal completion still uses the existing
-terminal head checks and authoritative review outcomes.
+While a model is analyzing a PR, Caller checks its live head and state approximately
+every 30 seconds through `github-interface --head-sha`, using its existing single
+PR read. Only a valid response for the original repository and PR can cancel the
+run. Failed, timed-out, or malformed checks leave it running. A per-run submission
+lock lets an in-flight GitHub command finish and prevents cancelled workers from
+starting another one. Head-change cancellation records `superseded` with the
+observed head, preserving the launch provenance for reconsideration.
+Verified closure on the same head also stops the provider process group. Closure
+returned as a provider turn completes preserves that turn's result but prevents
+another inspection turn, file group or structured submission. With no attempted
+submission and the original native receipt still in `reviewing`, the round settles
+through `review_target_closed` without a retry. Idle uncertain or sealed gates and
+native submission intent use the existing publication reconciliation; an original
+posted review keeps its own receipt and outcome. Native resource release remains
+independently required before capacity settles. Normal completion still uses the
+existing terminal head checks and authoritative review outcomes.
 
 Before provider invocation, verified head or base drift at either PR packet guard
 also settles as `superseded`. The packet CLI returns the original repository and
@@ -438,10 +524,12 @@ the remaining review budget. Structured analysis also caps each inspection by
 the remaining analysis allowance and current file group's deadline, keeping the
 60-second submission and 60-second verification reserves even after a provider
 returns near the analysis cutoff.
-A timeout records `review_inspection_timeout` and
+A local 30-second timeout records `review_inspection_timeout` and
 retains the inspection phase, deadline and pinned target in the existing process
 diagnostic, without command arguments or inspection content in the error.
-Poise excludes this diagnostic from provider backoff, including older calls
+If a file-group, provider-analysis or overall deadline limits the inspection
+first, that limiting phase is retained with `review_budget_exhausted` instead.
+Poise excludes local inspection timeouts from provider backoff, including older calls
 labeled `review_budget_exhausted`. The existing behavior chain retries the same
 review basis and slot after resource release and native failure backoff, holding
 after three failed attempts; Caller adds no inspection retry loop.
@@ -471,7 +559,8 @@ GitHub must first confirm the same open head and no new or pending reviewer acti
 A verified completed action is adopted instead. Ambiguous activity, time exhaustion,
 or failed recovery leaves a typed failure for Poise to retain without automatically
 repeating unchanged input. Every recovery exit keeps the refused first attempt beside
-the re-verdict outcome, including a later supersede.
+the re-verdict outcome, including a later supersede. Failed recovery also retains
+the inner diagnostic, including a file-group deadline's timing and no-submission evidence.
 Logs include `review_policy` and `recovery_model`; capability discovery includes
 `policy: bounded-v1` so Poise can reject an incompatible runtime before launch.
 
@@ -512,9 +601,19 @@ issue then approve. It must submit nothing when filing fails.
 
 A governed review admits up to 3,000,000 UTF-8 prompt bytes. Diff generation
 is capped at 2,850,000 bytes and the serialized packet at 2,950,000 bytes,
-leaving room for context and policy. Existing bulk-data compaction rules still
+leaving room for context and policy. JSON remains required regardless of its
+name or size, including during compaction, unless an existing exclusion identifies
+it as installed dependency content. Other bulk-data and archive exclusions still
 apply. These byte limits do not guarantee that an input fits a provider's token
 window. Claude receives the whole packet in one call.
+
+The packet builder records `coverage` as `complete` or `incomplete`, separately
+from declared `excluded_files`. Capacity omissions in `omitted_files` leave
+coverage incomplete even when every retained file group finishes. Caller pins
+this disposition in the native response; model assessments cannot change it.
+Incomplete reviews can submit genuine change requests and retain their receipts,
+but cannot submit clean reviews or approvals, including capped approvals.
+Their outcome remains `incomplete`, and they cannot qualify for automated merge.
 
 A structured review whose packet exceeds one provider call's reliable size
 runs in file-group stages targeting at most 8 files or 200,000 diff bytes each.
@@ -525,20 +624,38 @@ groups and inspection rounds, retaining earlier analysis and inspected source.
 Structured reviews reserve 60 seconds for submission and another 60 seconds
 for the authoritative outcome lookup. Submission keeps that verification
 reserve even when it is slow. After the first common-context turn, staged
-inspection shares the remaining analysis allowance across the remaining file
-groups. Each group stops offering further inspection once half its allowance
-is spent and requests a terminal assessment on the evidence already held.
-Provider execution and inspection stay within the group's deadline; a timeout
-still fails without submitting an incomplete review. Every stage's findings
-combine into the single verdict the harness submits; a packet that fits in one
-group needs no staging.
+inspection uses an equal share of the remaining analysis allowance as a scheduling
+guide. A group can borrow slack after reserving the mean observed analysis time
+of completed groups for each remaining group, excluding the common-context turn
+and capping each later group's reserve at half the current equal share. An expensive
+early prefix therefore cannot reserve away the current group's borrowing room.
+After half the equal share, Caller asks the provider to omit optional inspection;
+required inspection and subsequent provider turns can still use the borrowed time.
+The inspection schema stays available even at the round limit, so a need for
+further evidence fails explicitly as incomplete analysis rather than forcing a verdict.
+Provider execution and inspection stay within the group's deadline and the shared
+analysis cutoff. Deadline failures retain the limiting phase (`file_group`,
+`provider_analysis`, `inspection` or `overall`), group/count, elapsed time and
+remaining analysis allowance in bounded diagnostics. Every stage's findings
+combine into one verdict; a packet that fits in one group needs no staging.
+Before finalization, the original Call retains the complete verdict in its
+response file, readable with `agent-interface --read-response CALL_ID` after
+temporary review cleanup, including on failure. Finding bodies stay outside
+the bounded log artifact. Each provider group remains limited to 100 findings;
+an aggregate exceeding the existing 100-inline-finding publication limit holds
+with all findings retained instead of truncating or submitting another review.
+Position remapping and capped follow-up filing also leave both 60-second
+reserves. Exhaustion after completed analysis holds the review rather than
+handing it to another model. Rejected writes remain distinct from possibly
+accepted writes; a lost issue or review POST response holds without replay or
+approval.
 A follow-up (`--pr-approve`) round reviews the diff since
-the reviewer's last submitted review instead of the whole PR again: new
+the reviewer's last proven complete review instead of the whole PR again: new
 findings on current lines stay on current-head lines, while a defect caused
 by a removal is commented on the removed line and validated against the full
-pull request diff before the single submission. An unfetchable last head, or
-a base that moved since the last review, widens the round to the full diff
-instead. Both full and follow-up reviews validate every inline location against
+pull request diff before the single submission. An unfetchable last head,
+a base that moved since the last review, or no proven complete baseline widens
+the round to the full diff instead. Both full and follow-up reviews validate every inline location against
 the retained PR diff before invoking the GitHub submission command. Any finding
 without a verified position fails the review before
 submission, including a capped round's follow-up issue and approval.

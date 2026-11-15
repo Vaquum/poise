@@ -19,10 +19,10 @@ fi
 # On a first start this comes before the entrypoint, which makes ~/.poise private only when it creates it.
 [ -d "$HOME/.poise" ] || mkdir -m 700 "$HOME/.poise"
 mkdir -p "$target"
-for file in sitecustomize.py hook.cjs run.mjs; do
+for file in redaction.mjs sitecustomize.py hook.cjs run.mjs; do
   cp "$source/$file" "$target/.$file.new"
   mv "$target/.$file.new" "$target/$file"
 done
 umask 077
-printf '%s\n%s\n' "$POISE_TEST_RELAY_URL" "$POISE_TEST_RELAY_KEY" > "$target/.relay.new"
+printf '%s\n%s\n%s\n' "$POISE_TEST_RELAY_URL" "$POISE_TEST_RELAY_KEY" "${POISE_TEST_LIMIT_SECONDS:-540}" > "$target/.relay.new"
 mv "$target/.relay.new" "$target/relay"

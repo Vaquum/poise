@@ -1,18 +1,37 @@
 import base64
 import fcntl
 import os
+import re
 import shutil
 import subprocess
+import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from threading import Thread
 from time import monotonic
 from urllib.parse import urlparse
 
-from .process_diagnostic import StderrCapture, failure
+from .process_diagnostic import GitProcessError, StderrCapture, failure
 
 # One bare mirror per repository, outside ~/dev, so a fresh checkout is a
 # local clone instead of a full download.
 MIRROR_ROOT = Path(os.getenv("GITHUB_INTERFACE_MIRROR_DIR") or Path.home() / ".cache" / "github-interface" / "mirrors")
+
+# `git reset` reports a missing object as `fatal: unable to read tree <sha>`;
+# newer Git parenthesizes the hash. Both name the same defect.
+_MISSING_TREE = re.compile(
+    r"(?m)^fatal: unable to read tree (?:\((?:[0-9a-f]{40}|[0-9a-f]{64})\)|(?:[0-9a-f]{40}|[0-9a-f]{64}))$"
+)
+
+
+def _is_missing_tree_reset(error: RuntimeError) -> bool:
+    return (
+        isinstance(error, GitProcessError)
+        and error.diagnostic["operation"] == "reset"
+        and error.diagnostic["outcome"] == "exit"
+        and error.diagnostic["exit_code"] == 128
+        and bool(_MISSING_TREE.search(error.diagnostic["stderr"]))
+    )
 
 
 def checkout_path(org: str, repo: str, root: Path | None = None) -> str:
@@ -86,19 +105,71 @@ def checkout_repo(
               "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], token, basic)
         _run(["git", "clone", "--quiet", "--no-checkout", "--branch", branch, str(mirror), str(path)], token)
 
-    with open(mirror.parent / f"{repo}.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    def discard(directory: Path, descriptor: int) -> bool:
+        # Move the pathname aside before verifying: a replacement arriving
+        # between a check and a pathname-based rmtree would otherwise be
+        # deleted. The sibling name is unique, so only the moved generation
+        # is ever removed.
+        sibling = directory.parent / f"{directory.name}.discard-{uuid.uuid4().hex}"
         try:
-            refresh()
-        except RuntimeError:
-            # A git killed mid-fetch can leave the mirror locked or partial.
-            # Nobody else uses it while we hold the lock: start it over once.
-            shutil.rmtree(mirror, ignore_errors=True)
-            shutil.rmtree(path, ignore_errors=True)
-            refresh()
-    # The snapshot owns its objects. Slow filters and working-tree writes must
-    # not hold up other checkouts or make their caller's deadline expire.
-    _run(["git", "-C", str(path), "reset", "--hard", "--quiet", "HEAD"], token)
+            os.rename(directory, sibling)
+        except FileNotFoundError:
+            return True
+        try:
+            owned = os.path.samestat(sibling.lstat(), os.fstat(descriptor))
+        except FileNotFoundError:
+            return True
+        if not owned:
+            try:
+                os.rename(sibling, directory)
+            except OSError:
+                pass
+            return False
+        shutil.rmtree(sibling)
+        # A replacement arriving while the owned generation was moved aside
+        # stays; retrying would otherwise fail on mkdir with a blunter error.
+        if os.path.lexists(directory):
+            return False
+        return True
+
+    with open(mirror.parent / f"{repo}.lock", "w") as lock:
+        # Refresh, snapshot and materialization share one recovery allowance.
+        for attempt in range(2):
+            with ExitStack() as owned:
+                materializing = False
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    try:
+                        # Reserve the destination before Git runs; an earlier
+                        # absence check cannot authorize deleting a later arrival.
+                        path.mkdir(parents=True)
+                        snapshot_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                        owned.callback(os.close, snapshot_fd)
+                        mirror.mkdir(exist_ok=True)
+                        mirror_fd = os.open(mirror, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                        owned.callback(os.close, mirror_fd)
+                        refresh()
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    # Independent objects let both materializations run outside
+                    # the flock, even when another checkout replaces the mirror.
+                    materializing = True
+                    _run(["git", "-C", str(path), "reset", "--hard", "--quiet", "HEAD"], token)
+                except RuntimeError as error:
+                    if materializing and not _is_missing_tree_reset(error):
+                        raise
+                    if not discard(path, snapshot_fd):
+                        raise RuntimeError(f"checkout destination changed during recovery: {path}") from error
+                    if attempt:
+                        raise
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    try:
+                        # A replacement generation belongs to its new owner.
+                        discard(mirror, mirror_fd)
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    continue
+                break
     _run(["git", "-C", str(path), "remote", "set-url", "origin", remote], token)
     return {"branch": branch, "head_sha": _run(["git", "-C", str(path), "rev-parse", "HEAD"], token)}
 

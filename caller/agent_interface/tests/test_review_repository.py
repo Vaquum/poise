@@ -415,6 +415,9 @@ class TestStructuredInspection(TestCase):
             sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR, "bot", HEAD, 60, repository=repo)
         submit.assert_not_called()
         self.assertEqual(failure.exception.code, "review_budget_exhausted")
+        self.assertIn("incomplete analysis", str(failure.exception))
+        self.assertEqual(failure.exception.diagnostic["phase"], "inspection_rounds")
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
 
     def test_invalid_inspection_contract_has_a_terminal_failure_code(self):
         repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
@@ -442,7 +445,7 @@ class TestStructuredInspection(TestCase):
             sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR, "bot", HEAD, 60, repository=repo)
         submit.assert_not_called()
 
-    def test_final_inspection_round_accepts_the_terminal_only_verdict(self):
+    def test_final_inspection_round_keeps_required_inspection_available(self):
         repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
         schemas = []
 
@@ -450,7 +453,7 @@ class TestStructuredInspection(TestCase):
             schemas.append(args[4])
             if len(schemas) == 1:
                 return json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST]})
-            return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]})
+            return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING], "requests": []})
 
         receipt = json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD})
         with patch.dict(sr.ASK, {"codex": ask}), patch.object(repo, "inspect", return_value={}), \
@@ -461,5 +464,6 @@ class TestStructuredInspection(TestCase):
                    "bot", HEAD, 60, repository=repo)
         self.assertEqual(len(schemas), 2)
         self.assertIn("requests", schemas[0].get("properties", {}))
-        self.assertNotIn("requests", schemas[1].get("properties", {}))
+        self.assertIn("requests", schemas[1].get("properties", {}))
+        self.assertIn("inspect", schemas[1]["properties"]["action"]["enum"])
         submit.assert_called_once()

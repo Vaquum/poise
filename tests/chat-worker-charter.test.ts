@@ -299,6 +299,23 @@ it('refuses to delete /worker or change its trigger on every path and lets the p
   expect((await getSnippets()).json.snippets).toContainEqual({ trigger: ';worker', replace: 'Person text' })
 }, 30_000)
 
+it('requires Conventional Commits PR titles on every turn for existing workers and ordinary chats', async () => {
+  const initial = await getSnippets()
+  expect((await putSnippets({ snippets: [{ trigger: ';worker', replace: 'Saved worker instructions' }], base_version: initial.json.version }, true)).status).toBe(200)
+  const worker = await createWorkerViaBrowser()
+  const ordinary = await runtime.create({ agent: 'grok', model: GROK_MODEL })
+  await restart()
+
+  for (const id of [worker.id, ordinary.id]) {
+    for (const request of ['First task', 'Next task']) {
+      await runPrompt(id, request)
+      expect(prompts.get(id)!.at(-1)!.text).toContain('Every pull request you create, in any repository, must have a Conventional Commits title')
+    }
+  }
+  expect(prompts.get(worker.id)!.at(-1)!.text).toContain('Saved worker instructions')
+  expect((await getSnippets()).json.snippets).toContainEqual({ trigger: ';worker', replace: 'Saved worker instructions' })
+}, 30_000)
+
 it('refuses /worker changes through the native control api operation', async () => {
   const worker = await createWorkerViaBrowser()
   const connection = await config(worker.id)

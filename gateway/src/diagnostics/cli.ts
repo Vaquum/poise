@@ -46,6 +46,17 @@ export async function runOperator(args: string[], write: (line: string) => void 
     await relayIngress(join(process.env.POISE_GATEWAY_DATA ?? '/data', 'logging.ingress.sock'), command, stdin, write)
     return
   }
+  if (command === 'deployment') {
+    if (options.length !== 6) throw new Error('deployment requires rollout, workspace, budget seconds, elapsed seconds, observation time and completion proof')
+    const [rollout, workspace, budget, elapsed, observedAt, complete] = options
+    async function* observation() {
+      yield JSON.stringify({ rollout, workspace, budgetSeconds: Number(budget), elapsedSeconds: Number(elapsed), observedAt, complete: complete === 'true' }) + '\n'
+      yield* stdin
+    }
+    if (!['true', 'false'].includes(complete)) throw new Error('Invalid deployment completion proof')
+    await relayIngress(join(process.env.POISE_GATEWAY_DATA ?? '/data', 'logging.ingress.sock'), command, observation(), write)
+    return
+  }
   const db = new DiagnosticStore(path, policy, Date.now, true)
   try {
     if (command === 'event') {
@@ -57,7 +68,7 @@ export async function runOperator(args: string[], write: (line: string) => void 
       const page = db.query(access, filter)
       if (command === 'query') write(JSON.stringify(page))
       else { write(JSON.stringify({ type: 'metadata', ...page, events: undefined })); for (const event of page.events) write(JSON.stringify({ type: 'event', event })) }
-    } else throw new Error('Use health, query, event, export, ingress or ingress-stream')
+    } else throw new Error('Use health, query, event, export, ingress, ingress-stream or deployment')
   } finally { db.close() }
 }
 

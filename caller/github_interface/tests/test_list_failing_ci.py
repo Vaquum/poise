@@ -214,7 +214,8 @@ class TestIntegrationCi(IsolatedAsyncioTestCase):
         client = AsyncMock()
         client.get.side_effect = [{"parents": [{"sha": base}, {"sha": HEAD}]},
                                   {"workflow_runs": [{"id": n, "head_sha": integration, "event": "merge_group"} for n in range(100)]},
-                                  {"workflow_runs": [{"id": 101, "head_sha": integration, "event": "merge_group"}]}]
+                                  {"workflow_runs": [{"id": 101, "head_sha": integration, "event": "merge_group",
+                                                      "status": "completed", "conclusion": "success", "run_attempt": 2}]}]
         with patch.object(list_failing_ci, "get_pull", AsyncMock(return_value={**PULL, "base": {"ref": "main", "sha": base}})), \
                 patch.object(list_failing_ci, "list_check_runs", AsyncMock(return_value=[check])) as checks, \
                 patch.object(list_failing_ci, "get_combined_status", AsyncMock(return_value={"statuses": []})):
@@ -222,6 +223,8 @@ class TestIntegrationCi(IsolatedAsyncioTestCase):
         self.assertEqual((result["head_sha"], result["ref"], result["base_sha"]), (HEAD, integration, base))
         self.assertEqual(result["parents"], [base, HEAD])
         self.assertEqual(len(result["runs"]), 101)
+        self.assertEqual({key: result["runs"][-1][key] for key in ("status", "conclusion", "run_attempt")},
+                         {"status": "completed", "conclusion": "success", "run_attempt": 2})
         self.assertEqual(result["failing"][0]["run_id"], 1)
         self.assertEqual(result["failing"][0]["log_id"], 22)
         self.assertEqual(checks.call_args.args[1:], ("acme", "app", integration))

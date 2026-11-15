@@ -1,10 +1,19 @@
 import { build } from 'esbuild'
 import { buildSourceSha } from './build-identity.mjs'
 
+// libuv's thread pool runs every asynchronous file-system call, and its
+// default four threads are too few for this server: after a restart a page
+// waited behind the startup's own reads, queued up to a second each. libuv
+// reads the size once, when the pool first starts, so it is set on the
+// bundle's first line, before any of its code runs, unless whoever started
+// the process set it.
+const THREADPOOL_BANNER = "process.env.UV_THREADPOOL_SIZE ??= '16';"
+
 await build({
   entryPoints: ['server/production.ts'], bundle: true, platform: 'node',
   format: 'esm', packages: 'external', outfile: 'dist/server.js',
   define: { __POISE_BUILD_SHA__: JSON.stringify(buildSourceSha()) },
+  banner: { js: THREADPOOL_BANNER },
   logLevel: 'info',
 })
 

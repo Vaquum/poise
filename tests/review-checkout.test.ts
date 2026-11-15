@@ -9,6 +9,10 @@ import {
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return { ...actual, rm: vi.fn(actual.rm) }
+})
 const owner = 'autonomio', repo = 'autonomio', actor = 'bit-mis', head = 'a'.repeat(40)
 const remote = `https://github.com/${owner}/${repo}.git`
 let root: string
@@ -58,12 +62,11 @@ describe('review checkout provisioning through Caller', () => {
     expect(mocks.runFile).toHaveBeenCalledWith('git', ['checkout', '--quiet', '--detach', head], expect.any(Object))
     expect(mocks.runFile.mock.calls.some(([command]) => command === 'gh')).toBe(false)
   })
-  it('gives git verification the same timeout as other review CLI calls, so load does not fail it', async () => {
-    await resolveCheckout()
-    const gitCalls = mocks.runFile.mock.calls.filter(([command]) => command === 'git')
-    expect(gitCalls.length).toBeGreaterThan(0)
-    for (const [, , options] of gitCalls) {
-      expect((options as { timeoutMs?: number }).timeoutMs).toBe(30_000)
+  it.each([undefined, false])('keeps checkout child timeouts and forwards diagnostic ownership (%s)', async (reportFailure) => {
+    await resolveReviewCheckout(owner, repo, 146, actor, head, undefined, reportFailure)
+    expect(mocks.runFile.mock.calls.some(([command]) => command === 'git')).toBe(true)
+    for (const [, , options] of mocks.runFile.mock.calls) {
+      expect(options).toMatchObject({ timeoutMs: 30_000, reportFailure: reportFailure ?? true })
     }
   })
   it.each(['head changed', 'denied access', 'dirty checkout'] as const)('does not publish or retain staging after %s', async (cause) => {
@@ -72,6 +75,11 @@ describe('review checkout provisioning through Caller', () => {
     dirty = cause === 'dirty checkout'
     await expect(resolveCheckout()).rejects.toThrow()
     expect(await readdir(join(root, 'review-checkouts', head, owner))).toEqual([`${repo}.lock`])
+  })
+  it('keeps the checkout failure when staging cleanup fails', async () => {
+    failedFetch = true
+    vi.mocked(rm).mockRejectedValueOnce(new Error('staging cleanup failed'))
+    await expect(resolveCheckout()).rejects.toThrow('reviewer cannot read repository')
   })
   it('does not overwrite a managed checkout that was subsequently changed', async () => {
     const path = await resolveCheckout()

@@ -129,9 +129,9 @@ export function createComposer(handlers: ComposerHandlers, options?: { idPrefix?
         <textarea class="chat-input" rows="1" placeholder="${DEFAULT_PLACEHOLDER}" spellcheck="true" aria-label="Message"></textarea>
       </div>
       <div class="chat-controls">
-        <button class="chat-attach" type="button" aria-label="Attach file" title="Attach file">${ICON_PLUS}</button>
+        <button class="chat-attach" type="button" aria-label="Attach file" data-help="Attach file">${ICON_PLUS}</button>
         <div class="chat-model-control" hidden>
-          <button type="button" class="chat-default-model" aria-haspopup="listbox" aria-expanded="false" aria-controls="${prefix}chat-console-models" title="Choose model and effort">
+          <button type="button" class="chat-default-model" aria-haspopup="listbox" aria-expanded="false" aria-controls="${prefix}chat-console-models" data-help="Choose model and effort">
             <span class="chat-model-label"></span>
             <svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="m3 4.5 3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
@@ -140,7 +140,7 @@ export function createComposer(handlers: ComposerHandlers, options?: { idPrefix?
         <span class="chat-steer-hint" hidden>steering</span>
         <span class="chat-controls-spacer"></span>
         <button class="chat-resume-btn" type="button" hidden>Resume</button>
-        <button class="chat-send" type="submit" aria-label="Send" title="Send (Enter)">${ICON_SEND}</button>
+        <button class="chat-send" type="submit" aria-label="Send" data-help="Send (Enter)">${ICON_SEND}</button>
       </div>
       <div class="chat-popover" role="listbox" hidden></div>
     </div>
@@ -193,7 +193,7 @@ export function createComposer(handlers: ComposerHandlers, options?: { idPrefix?
   }
   function renderSelectedModel(): void {
     commandChips.hidden = !selectedModel
-    commandChips.innerHTML = selectedModel ? `<span class="chat-command-model-chip"><span>${escapeHtml(consoleModelLabel(selectedModel))}</span><button type="button" class="chat-icon-btn" aria-label="Clear model">×</button></span>` : ''
+    commandChips.innerHTML = selectedModel ? `<span class="chat-command-model-chip"><span>${escapeHtml(consoleModelLabel(selectedModel))}</span><button type="button" class="chat-icon-btn" aria-label="Clear model" data-tooltip>×</button></span>` : ''
   }
   commandChips.addEventListener('click', event => {
     if (!(event.target as HTMLElement).closest('button')) return
@@ -265,7 +265,7 @@ export function createComposer(handlers: ComposerHandlers, options?: { idPrefix?
       return
     }
     chip.textContent = `/${mode}`
-    chip.title = `/${mode}`
+    chip.dataset.help = `/${mode}`
     chip.hidden = false
     wrap.classList.add('mode-locked')
     // The chip sits inside the textarea's box; its rendered width decides the
@@ -319,9 +319,9 @@ export function createComposer(handlers: ComposerHandlers, options?: { idPrefix?
     }
     chipsEl.hidden = false
     layout(chipsEl, () => patchContent(chipsEl, attachments.map((a) => `
-      <span class="chat-attachment-chip" data-key="${escapeHtml(a.id)}" title="${escapeHtml(a.path)} · ${a.size} bytes">
+      <span class="chat-attachment-chip" data-key="${escapeHtml(a.id)}" data-help="${escapeHtml(a.path)} · ${a.size} bytes">
         <span class="chat-attachment-name">${escapeHtml(a.name)}</span>
-        <button type="button" class="chat-attachment-remove" data-path="${escapeHtml(a.path)}" aria-label="Remove ${escapeHtml(a.name)}">×</button>
+        <button type="button" class="chat-attachment-remove" data-path="${escapeHtml(a.path)}" aria-label="Remove ${escapeHtml(a.name)}" data-tooltip>×</button>
       </span>`).join(''), retire))
   }
 
@@ -640,7 +640,7 @@ export function createComposer(handlers: ComposerHandlers, options?: { idPrefix?
     if (sendBtn.dataset.icon !== icon) { sendBtn.innerHTML = stopping ? ICON_STOP : ICON_SEND; sendBtn.dataset.icon = icon }
     const label = creating ? 'Save switch' : resetting ? 'Reset chat' : queuing ? 'Queue message' : stopping ? 'Stop' : state.running ? 'Steer' : 'Send'
     sendBtn.setAttribute('aria-label', label)
-    sendBtn.title = label
+    sendBtn.dataset.help = label
     sendBtn.classList.toggle('is-stop', stopping)
     resumeBtn.hidden = !state.resume
     if (state.disabled) { closePopover(); history.close(); models.close() }

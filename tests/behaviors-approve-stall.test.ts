@@ -81,6 +81,7 @@ describe('approve-prs under load', () => {
   it('rotates past three slow front claims before retrying the same full batch', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const startedAt = Date.now()
     const open = Array.from({ length: 10 }, (_, index) => ({
       ...pr, number: 17 + index, url: `https://github.com/${pr.repo}/pull/${17 + index}`,
     }))
@@ -129,6 +130,9 @@ describe('approve-prs under load', () => {
       await vi.advanceTimersByTimeAsync(25_000)
       gates.activity.release.resolve()
     }
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
     try {
       const first = runtime.runEnabledBehaviorsOnce()
       await spendReadBudget()
@@ -138,23 +142,34 @@ describe('approve-prs under load', () => {
       expect(attempts).toEqual([17, 18, 19])
       expect(mocks.spawnDetached).not.toHaveBeenCalled()
       expect(db.getMeta('behavior_approve_prs_cursor')).toBe(`${pr.repo}#19`)
+      logging.loggingRuntime()!.flush()
+      const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
+      expect(events.filter((event) => event.operation === 'application.behaviors')).toEqual([expect.objectContaining({
+        severity: 'warning', occurrences: 1, behavior: 'approve-prs', phase: 'launch',
+        message: 'The operation was aborted due to timeout',
+        context: expect.objectContaining({ deadline: startedAt + 55_000,
+          progress: expect.objectContaining({ eligiblePrs: 10, checksPending: 0,
+            changeChecksRead: 10, activityChecksRead: 10, launchesPending: 10, launched: 0,
+            launches: [], ownershipError: null, disposition: 'deferred', continuationAt: startedAt + 60_000 }) }),
+      })])
 
-      // The same peer claims remain held on the next sweep.
+      // The existing ticker reconsiders unfinished work with the same peer claims held.
       attempts = []
       firstThree = deferred<void>()
       gates = readGates()
-      const second = runtime.runEnabledBehaviorsOnce()
+      await vi.advanceTimersByTimeAsync(1_000)
       await spendReadBudget()
       await firstThree.promise
       expect(attempts.slice(0, 3)).toEqual([20, 21, 22])
       await lastFastLaunch.promise
       await vi.advanceTimersByTimeAsync(9_000)
-      await second
+      await vi.waitFor(() => expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual([]))
       expect(mocks.spawnDetached.mock.calls.map(([, args]) => Number(args[1].slice(1))).sort((a, b) => a - b))
         .toEqual([20, 21, 22, 23, 24, 25, 26])
     } finally {
       gates.changes.release.resolve()
       gates.activity.release.resolve()
+      await logging.stopLogging()
     }
   })
 
@@ -238,6 +253,8 @@ describe('approve-prs under load', () => {
     { count: 11, evidence: 'uncertain writes' },
     { count: 11, evidence: 'unreadable' },
     { count: 11, evidence: 'unscheduled' },
+    { count: 4, evidence: 'released' },
+    { count: 4, evidence: 'partially released' },
   ])('retains one deadline diagnostic with $evidence launch evidence and $count eligible PRs', async ({ count, evidence }) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
@@ -248,13 +265,15 @@ describe('approve-prs under load', () => {
     const { database: db, behaviors: runtime } = await startApproving(open)
     if (evidence === 'unscheduled') await runtime.stopBehaviorsRuntime()
     openLaunchBudget(runtime)
-    const peerClaims = [18, 19].map((number) => db.claimPrOperationOwned(`${pr.repo}#${number}`, 600_000)!)
+    const releasedAttempt = evidence === 'released' || evidence === 'partially released'
+    const peerNumbers = evidence === 'partially released' ? [19, 20] : [18, 19]
+    const peerClaims = peerNumbers.map((number) => db.claimPrOperationOwned(`${pr.repo}#${number}`, 600_000)!)
     const peersEntered = deferred<void>()
     const claimOperation = db.claimPrOperationOwned
     const peersAttempted = new Set<number>()
     vi.spyOn(db, 'claimPrOperationOwned').mockImplementation((target, leaseMs) => {
       const number = Number(target.slice(target.lastIndexOf('#') + 1))
-      if (number === 18 || number === 19) peersAttempted.add(number)
+      if (peerNumbers.includes(number)) peersAttempted.add(number)
       if (peersAttempted.size === 2) peersEntered.resolve()
       return claimOperation(target, leaseMs)
     })
@@ -298,14 +317,19 @@ describe('approve-prs under load', () => {
     })
     const callId = 'b'.repeat(32)
     mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[1] === '#18' && evidence === 'partially released') {
+        fixture.agentLogs.push(agentLog({ id: 'c'.repeat(32), pr_id: '18', behavior: 'pr_approve',
+          correlation_id: args[args.indexOf('--correlation-id') + 1], expected_head: HEAD_SHA }))
+      }
       if (args[1] !== '#17') return
       const call = agentLog({ id: callId, behavior: 'pr_approve',
         correlation_id: args[args.indexOf('--correlation-id') + 1], expected_head: HEAD_SHA,
         ...(evidence === 'uncertain writes' ? { status: 'failed', error: 'publication outcome uncertain', review_id: 91 } : {}) })
-      if (evidence !== 'missing') fixture.agentLogs.push(call)
+      if (evidence !== 'missing' && !releasedAttempt) fixture.agentLogs.push(call)
       if (evidence === 'conflicting') fixture.agentLogs.push({ ...call, id: 'c'.repeat(32) })
       launched.resolve()
       await released.promise
+      if (releasedAttempt) throw new DOMException('launch acknowledgement unavailable', 'AbortError')
     })
     const logging = await import('../server/logging')
     vi.spyOn(process.stderr, 'write').mockReturnValue(true)
@@ -325,8 +349,8 @@ describe('approve-prs under load', () => {
       prepared.resolve()
       await launched.promise
       await peersEntered.promise
-      const claim = db.listBehaviorLaunchClaims('approve-prs')[0]!
-      if (evidence !== 'missing') expect(claim.launchCorrelationId).toBe(fixture.agentLogs[0]!.correlation_id)
+      const claim = db.listBehaviorLaunchClaims('approve-prs').find((claim) => claim.launchPr === 17)!
+      if (evidence !== 'missing' && !releasedAttempt) expect(claim.launchCorrelationId).toBe(fixture.agentLogs[0]!.correlation_id)
       await vi.advanceTimersByTimeAsync(5_000)
       timedOut = true
       released.resolve()
@@ -338,23 +362,28 @@ describe('approve-prs under load', () => {
           .filter((event) => event.operation === 'application.behaviors')
       }
       const proven = evidence === 'owned'
+      const visibleLaunches = releasedAttempt
+        ? evidence === 'partially released'
+          ? [expect.objectContaining({ callId: 'c'.repeat(32), ownership: 'owned', status: 'running' })] : []
+        : [expect.objectContaining({ target: claim.target, claimId: claim.claimId,
+          correlationId: claim.launchCorrelationId, expectedHead: HEAD_SHA,
+          ownership: proven || evidence === 'unscheduled' ? 'owned' : 'unresolved',
+          ...(proven ? { callId, status: 'running' } : {}) })]
       expect(events()).toEqual([expect.objectContaining({
         severity: proven ? 'warning' : 'error', occurrences: 1, behavior: 'approve-prs', phase: 'launch', exitCode: null,
         message: 'The operation was aborted due to timeout',
         context: expect.objectContaining({ organization: 'Vaquum', deadline: startedAt + 58_000,
           exceptionName: 'TimeoutError', exceptionCode: 23,
           progress: expect.objectContaining({ eligiblePrs: count, checksPending: count === 11 ? 1 : 0,
-            changeChecksRead: Math.min(count, 10), activityChecksRead: 4, launchesPending: 3,
-            launched: 1, publication: 'unverified', cursor: `${pr.repo}#19`,
+            changeChecksRead: Math.min(count, 10), activityChecksRead: 4, launchesPending: evidence === 'released' ? 4 : 3,
+            launched: evidence === 'released' ? 0 : 1, publication: 'unverified', cursor: `${pr.repo}#${peerNumbers[1]}`,
             disposition: proven ? 'deferred' : 'unresolved',
             continuationAt: evidence === 'unscheduled' ? null : startedAt + 60_000,
             ownershipError: evidence === 'unreadable' ? 'launch evidence unreadable' : null,
-            launches: [expect.objectContaining({ target: claim.target, claimId: claim.claimId,
-              correlationId: claim.launchCorrelationId, expectedHead: HEAD_SHA,
-              ownership: proven || evidence === 'unscheduled' ? 'owned' : 'unresolved',
-              ...(proven ? { callId, status: 'running' } : {}) })] }) }),
+            launches: visibleLaunches }) }),
       })])
-      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(evidence === 'partially released' ? 2 : 1)
+      if (releasedAttempt) expect(db.listBehaviorLaunchClaims('approve-prs')).toHaveLength(evidence === 'released' ? 0 : 1)
       expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual([])
       expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
         behavior: 'approve-prs', error: 'The operation was aborted due to timeout',
@@ -413,13 +442,15 @@ describe('approve-prs under load', () => {
     }
   })
 
-  it('retains prepared approvals when the deadline expires during a later activity log read', async () => {
+  it.each(['readable', 'unreadable', 'unscheduled'])('retains prepared approvals with %s evidence when the deadline expires during a later activity log read', async (evidence) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const startedAt = Date.now()
     const open = [17, 18].map((number) => ({
       ...pr, number, url: `https://github.com/${pr.repo}/pull/${number}`,
     }))
     const { database: db, behaviors: runtime } = await startApproving(open)
+    if (evidence === 'unscheduled') await runtime.stopBehaviorsRuntime()
     recordCompletedInitialReview(db, { pull: open[1]!, callId: 'c'.repeat(32) })
     openLaunchBudget(runtime)
     const { resetAgentLogCache } = await import('../server/agent')
@@ -448,6 +479,9 @@ describe('approve-prs under load', () => {
         return result
       }
       if (command === 'agent-interface' && args[0] === '--logs' && activityDone) {
+        if (evidence === 'unreadable' && Date.now() >= startedAt + runtime.BEHAVIOR_OPERATION_TIMEOUT_MS) {
+          throw new Error('launch evidence unreadable')
+        }
         logGate.entered.resolve()
         await logGate.release.promise
       }
@@ -465,11 +499,13 @@ describe('approve-prs under load', () => {
       logging.loggingRuntime()!.flush()
       const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
       expect(events.filter((event) => event.operation === 'application.behaviors')).toEqual([expect.objectContaining({
-        severity: 'error', behavior: 'approve-prs', phase: 'review-activity',
+        severity: evidence === 'readable' ? 'warning' : 'error', occurrences: 1, behavior: 'approve-prs', phase: 'review-activity',
         message: 'The operation was aborted due to timeout',
         context: expect.objectContaining({
           progress: expect.objectContaining({ eligiblePrs: 2, launchesPending: 1, launched: 0,
-            publication: 'unverified', disposition: 'unresolved' }) }),
+            publication: 'unverified', launches: [], disposition: evidence === 'readable' ? 'deferred' : 'unresolved',
+            ownershipError: evidence === 'unreadable' ? 'launch evidence unreadable' : null,
+            continuationAt: evidence === 'unscheduled' ? null : startedAt + 60_000 }) }),
       })])
       expect(mocks.spawnDetached).not.toHaveBeenCalled()
     } finally {

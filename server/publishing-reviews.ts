@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ArticleReview, ArticleReviews, ReviewAnchor, ReviewMessage } from '../src/publishing-review'
 import { REVIEW_INTERVAL_MS } from '../src/publishing-review'
-import { db, getMeta, setMeta } from './db'
+import { db, getMeta, setMeta, writeObservation } from './db'
 import { listDocs, readDoc, readPublishLedger, type PublishRecord } from './editor'
 import { HttpError, readJson } from './http'
 import { isRepositoryPath, parsePost, PostFileError } from './publishing'
@@ -59,7 +59,10 @@ function cached(key: string): Cached {
 function save(key: string, value: Cached): Cached {
   const raw = JSON.stringify(value)
   if (Buffer.byteLength(raw) > MAX_CACHE_BYTES) throw new HttpError(422, 'The article review history exceeds the 2 MB cache limit.')
-  setMeta(key, raw)
+  // A copy of GitHub's answer, written by the sweep every minute: a commit
+  // lost to a power cut only reads GitHub again, so it never waits for the
+  // disk on the server's thread (up to 0.8 s on production).
+  writeObservation(() => setMeta(key, raw))
   return value
 }
 

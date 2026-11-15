@@ -69,7 +69,7 @@ export function mountQuota(ctx: PartContext, box: HTMLElement, find: RightFilter
           ${bucket.limit ? bar('qbar', (bucket.used / bucket.limit) * 100) : ''}
           <p class="qb-n">${n(bucket.used)} of ${n(bucket.limit)} used · ${n(bucket.remaining)} left · resets ${clockAt(bucket.resetAt)}, in ${Math.round(minutes)} min</p>
           <p class="qb-n">${bucket.perMinute === null ? '—' : `${n(Math.round(bucket.perMinute * 10) / 10)} a minute now`} · ${(bucket.remaining / Math.max(minutes, 1 / 60)).toFixed(1)} a minute would last</p>
-          <svg class="qhours" viewBox="0 0 96 20" preserveAspectRatio="none" role="img" aria-label="Use in each of the last 24 hours">${hours.map((sample, i) => sample ? `<rect class="q-hr" x="${i * 4 + 0.5}" y="${(20 - (sample.used / sample.limit) * 20).toFixed(1)}" width="3" height="${((sample.used / sample.limit) * 20).toFixed(1)}"><title>${esc(clockAt(sample.at))}: ${n(sample.used)} used · ${n(sample.remaining)} left</title></rect>` : '').join('')}</svg></div>`
+          <svg class="qhours" viewBox="0 0 96 20" preserveAspectRatio="none" role="img" aria-label="Use in each of the last 24 hours">${hours.map((sample, i) => sample ? `<rect class="q-hr" x="${i * 4 + 0.5}" y="${(20 - (sample.used / sample.limit) * 20).toFixed(1)}" width="3" height="${((sample.used / sample.limit) * 20).toFixed(1)}" data-help="${esc(clockAt(sample.at))}: ${n(sample.used)} used · ${n(sample.remaining)} left"/>` : '').join('')}</svg></div>`
       }).join('')}</div>`).join('')}</div>`
   }
 

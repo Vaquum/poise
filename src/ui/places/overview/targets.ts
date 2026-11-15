@@ -30,7 +30,8 @@ export function targetOpening(target: NoticeTarget, role?: (chat: string) => 'ma
   if ('view' in target) return { href: placeHref('settings', { settings: 'behaviors', back: 'overview' }), label: 'Open Settings, Behaviors' }
   if ('swarm' in target) return { href: placeHref('observe', { part: 'behaviors', call: target.swarm, back: 'overview' }), label: 'Open the run in Observe' }
   if ('settings' in target) {
-    return { href: placeHref('settings', { settings: target.settings, back: 'overview' }), label: target.settings === 'accounts' ? 'Open Settings, Accounts' : 'Open Settings, General' }
+    const label = { accounts: 'Accounts', general: 'General', extensions: 'Extensions' }[target.settings]
+    return { href: placeHref('settings', { settings: target.settings, back: 'overview' }), label: `Open Settings, ${label}` }
   }
   if ('chat' in target) return chatOpening(target.chat, role?.(target.chat))
   const item = itemOf(target.pullRequest)

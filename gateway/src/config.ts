@@ -273,7 +273,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
       plan: read('POISE_TEST_BOX_PLAN') ?? '1c-2g',
       baseService: baseService ?? null,
       jobPlan: read('POISE_TEST_PLAN') ?? 'plan-crn-005',
-      limitSeconds: wholeNumber('POISE_TEST_LIMIT_SECONDS', 540),
+      // Leave a minute for cleanup inside the workspace shell's one-hour ceiling.
+      limitSeconds: wholeNumber('POISE_TEST_LIMIT_SECONDS', 540, 3540),
       maxRuns: wholeNumber('POISE_TEST_MAX_RUNS', 30),
     }
     : null

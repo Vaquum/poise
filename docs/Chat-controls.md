@@ -27,5 +27,5 @@ hides the individual tool calls and command blocks; text messages, errors
 and outstanding questions or approvals stay visible. The choice is remembered
 in this browser across chats and reloads. No display toggle deletes history.
 
-Icon-only buttons show short labels after one second of hovering. Keyboard
+Icon-only buttons show labels after half a second of hovering. Keyboard
 focus works too; leaving, clicking, scrolling or Escape dismisses the tooltip.

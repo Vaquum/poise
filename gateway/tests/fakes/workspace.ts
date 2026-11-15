@@ -44,6 +44,7 @@ export interface WorkspaceStub {
   /** Milliseconds every service answer waits before it is sent; past the gateway timeout it models a slow workspace. */
   answerDelayMs: number
   requests: SeenRequest[]
+  onRequest?: (request: SeenRequest) => void
   serviceRequests: SeenRequest[]
   onServiceRequest?: (request: SeenRequest) => void
   /** The releases POST /api/service/switch was asked for. */
@@ -99,10 +100,6 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
       res.write('open\n')
       req.on('data', (chunk: Buffer) => res.write(`echo:${chunk.toString('utf8')}\n`))
       req.on('end', () => res.end('done\n'))
-      return
-    }
-    if (url === '/reset') {
-      req.socket.destroy()
       return
     }
     if (url === '/truncate') {
@@ -162,6 +159,11 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
         return json(res, 404, { error: 'not_found' })
       }
       stub.requests.push(seen)
+      stub.onRequest?.(seen)
+      if (url === '/reset') {
+        req.socket.destroy()
+        return
+      }
       if (url === '/created') {
         res.writeHead(201, {
           'content-type': 'text/plain',

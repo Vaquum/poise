@@ -239,16 +239,16 @@ export function createGithub(ctx: PartContext): ObservePart {
 
   // ---------- Painting: rows repaint in place ----------
   const avatar = (login: string | null, title = ''): string => (login
-    ? `<span class="av${/\[bot\]$|bot$/i.test(login) ? ' is-bot' : ''}" title="${esc(title || login)}" aria-hidden="true">${esc(login.slice(0, 2))}</span><span class="av-n">${esc(login)}</span>`
-    : '<span class="dim" title="No assignee">—</span>')
+    ? `<span class="av${/\[bot\]$|bot$/i.test(login) ? ' is-bot' : ''}" data-help="${esc(title || login)}" aria-hidden="true">${esc(login.slice(0, 2))}</span><span class="av-n">${esc(login)}</span>`
+    : '<span class="dim" data-help="No assignee">—</span>')
   function reviewHTML(row: HistoryRow): string {
     if (row.kind !== 'pr') return ''
     const s = historyState(row)
-    if (s.settled) return `<button type="button" class="btn-ghost" aria-disabled="true" title="This pull request is ${s.word.toLowerCase()}: nothing to review" data-ref="gh.review">Review</button>`
+    if (s.settled) return `<button type="button" class="btn-ghost" aria-disabled="true" data-help="This pull request is ${s.word.toLowerCase()}: nothing to review" data-ref="gh.review">Review</button>`
     const stage = reviewing.get(row.url)
     if (stage) return `<span class="life" data-life="${stage}">${lifeHTML(stage, stage === 'Executing' ? 'several models review it' : 'review posted', true)}</span>`
     const done = reviewed.has(row.url)
-    return `<button type="button" class="btn-ghost" data-act="ar-review" title="${done ? 'Reviewed; run it again' : 'Run a consensus review'}" data-ref="gh.review">${done ? 'Reviewed · again' : 'Review'}</button>`
+    return `<button type="button" class="btn-ghost" data-act="ar-review" data-help="${done ? 'Reviewed; run it again' : 'Run a consensus review'}" data-ref="gh.review">${done ? 'Reviewed · again' : 'Review'}</button>`
   }
   function rowHTML(row: HistoryRow): string {
     const [org, repo] = row.repo.split('/', 2)
@@ -261,10 +261,10 @@ export function createGithub(ctx: PartContext): ObservePart {
       <td class="c-author" data-ref="gh.author">${avatar(row.author || null)}</td>
       <td class="c-org">${org ? external(github(org), esc(org), 'sw-link') : ''}</td>
       <td class="c-repo">${repo ? external(github(org, repo), esc(repo), 'sw-link') : ''}</td>
-      <td class="c-owner" data-ref="gh.owner">${row.kind === 'action' ? `<span class="t-mono br" title="${esc(row.event ?? '')}">${esc(row.branch || '—')}</span>` : avatar(row.owner, row.owner ? `Assigned to ${row.owner}` : '')}</td>
+      <td class="c-owner" data-ref="gh.owner">${row.kind === 'action' ? `<span class="t-mono br" data-help="${esc(row.event ?? '')}">${esc(row.branch || '—')}</span>` : avatar(row.owner, row.owner ? `Assigned to ${row.owner}` : '')}</td>
       <td class="c-state" data-ref="gh.state">${s.state ? capsule(s.state) : '<span class="sc-open"></span>'}<span class="ow">${esc(s.word)}</span></td>
-      <td class="c-updated" data-ref="gh.updated" data-updated title="${esc(exactTime(updated))}">${esc(relFromMs(updated))}</td>
-      <td class="c-act">${reviewHTML(row)}${row.kind !== 'action' ? `<a class="ib" href="${esc(onBoard(`${row.repo}#${row.number}`))}" aria-label="See it on Board" title="See it on Board" data-ref="gh.board">${icon('card', 'sm')}</a>` : ''}${note ? `<span class="note is-warn" title="${esc(note)}">${esc(note)}</span>` : ''}</td>`
+      <td class="c-updated" data-ref="gh.updated" data-updated data-help="${esc(exactTime(updated))}">${esc(relFromMs(updated))}</td>
+      <td class="c-act">${reviewHTML(row)}${row.kind !== 'action' ? `<a class="ib" href="${esc(onBoard(`${row.repo}#${row.number}`))}" aria-label="See it on Board" data-help="See it on Board" data-ref="gh.board">${icon('card', 'sm')}</a>` : ''}${note ? `<span class="note is-warn" data-help="${esc(note)}">${esc(note)}</span>` : ''}</td>`
   }
   const markup = new WeakMap<HTMLElement, string>()
   function paint(): void {

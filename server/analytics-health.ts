@@ -299,9 +299,9 @@ function chainFacts(journal: BehaviorChainJournal, chain: BehaviorChain, now: nu
       && (!retry || (retry.admissionSequence > failure.sequence ? row.sequence < retry.admissionSequence
         : launch ? row.sequence < launch.sequence : !success || row.sequence < success.sequence)))
     const operator = resumed.filter(row => row.event.type === 'chain.resumed' && row.event.recovery?.origin === 'operator').at(-1)
-    // A runtime CI recovery carries its own ciRecovery evidence and is not
+    // A runtime CI or test recovery carries its own evidence and is not
     // an ambiguous operator resume.
-    const ambiguous = resumed.some(row => row.event.type === 'chain.resumed' && !row.event.ciRecovery
+    const ambiguous = resumed.some(row => row.event.type === 'chain.resumed' && !row.event.ciRecovery && !row.event.testRecovery
       && (!row.event.recovery || row.event.recovery.origin === 'unknown'))
     const action = operator ?? resumed.at(-1)
     const origin = operator ? 'operator' : ambiguous ? 'unknown' : 'automatic'

@@ -9,6 +9,7 @@ import { getSelectedOrganization, organizationPayload, organizationUrl } from '.
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
 import { term } from '../../registry'
+import type { GhRecord } from '../board/model'
 import {
   chatState, countStates, issueState, PHASES, phaseWords, pullState, STATES, taskPhase, taskState,
   type ChainLike, type HeldReason, type Phase, type State,
@@ -18,7 +19,6 @@ import { chatOpening } from './targets'
 import { json, reason, readLine, reportRead, unread, whileVisible, type Read, type PartContext } from './util'
 
 interface Work { group: 'people' | 'items' | 'tasks', id: string, title: string, state: State, note: string, href: string, phase?: Phase }
-interface GhRecord { kind: 'pr' | 'issue', repo: string, number: number, title: string, state: string }
 interface GreenRead { records?: { repo: string, number: number, status: 'green' | 'yellow' }[], held?: { repo: string, number: number, held: { reasons: HeldReason[], checks?: { failing?: string[] } } }[] }
 interface RunningLog { repo: string | null, pr_id: string | null, issue?: string | null, status: string }
 
@@ -94,7 +94,7 @@ export function mountMotion(ctx: PartContext, card: HTMLElement, find: RightFilt
     for (const record of items.data ?? []) {
       const id = key(record.repo, record.number)
       const placed = record.kind === 'pr'
-        ? pullState({ status: status.get(id) ?? (held.has(id) ? 'yellow' : undefined), reasons: held.get(id)?.reasons, failing: held.get(id)?.checks?.failing, running: busy.has(id) })
+        ? pullState({ reviewRequested: record.reviewRequested, status: status.get(id) ?? (held.has(id) ? 'yellow' : undefined), reasons: held.get(id)?.reasons, failing: held.get(id)?.checks?.failing, running: busy.has(id) })
         : issueState({ running: busy.has(id) })
       // A pull request whose status could not be read has no state word.
       if (!placed) continue

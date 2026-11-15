@@ -82,7 +82,7 @@ function inlineHtml(segments: InlineSegment[], options: MarkdownOptions): string
         // escaped, inert, and still readable as what the agent wrote.
         if (href) out += `<a href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(seg.text)}</a>`
         else if (options.localFileLinks && chatFileReference(seg.url)) {
-          out += `<a href="#chat-file=${encodeURIComponent(seg.url)}" data-chat-file="${escapeHtml(seg.url)}" title="Preview ${escapeHtml(seg.url)}">${escapeHtml(seg.text)}</a>`
+          out += `<a href="#chat-file=${encodeURIComponent(seg.url)}" data-chat-file="${escapeHtml(seg.url)}" data-help="Preview ${escapeHtml(seg.url)}">${escapeHtml(seg.text)}</a>`
         } else out += escapeHtml(inlineSource(seg))
         break
       }

@@ -8,6 +8,7 @@ import socket
 import sqlite3
 import stat
 import struct
+import tempfile
 from pathlib import Path
 
 _reference: dict | None = None
@@ -165,6 +166,24 @@ def response(path: Path, responses: Path) -> Path:
 
 def response_name(path: Path) -> str:
     return str(path.resolve() if _store() is None else path.absolute())
+
+
+def write_response_text(path: Path, responses: Path, text: str) -> None:
+    """Replace a response file atomically; a failure keeps the prior file."""
+    target = response(path, responses)
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def open_responses(path: Path) -> int:

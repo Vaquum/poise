@@ -28,7 +28,7 @@ from time import monotonic, sleep, time
 from typing import Callable
 
 from . import progress, review_budget, resource_ownership
-from .atoms import AgentPreflightError, bounded_cause, provider_blocked
+from .atoms import AgentPreflightError, bounded_cause, credential_rejected, provider_blocked
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope, diagnostic_from_stderr
 from .provider_progress import ProviderStream, claude_error
@@ -284,7 +284,7 @@ def command(model: Model, text: str, checkout: Path, work: Path, seconds: float,
     else:
         env = os.environ.copy()
     # Worker tests must not register their scratch against the parent Call.
-    for key in ("AGENT_INTERFACE_RECEIPT_DB", "AGENT_INTERFACE_RECEIPT_CALL"):
+    for key in ("AGENT_INTERFACE_RECEIPT_DB", "AGENT_INTERFACE_RECEIPT_CALL", "AGENT_INTERFACE_FAILED_SOURCE_CALL"):
         env.pop(key, None)
     scratch = work.resolve() / "tmp"
     scratch.mkdir(mode=0o700, exist_ok=True)
@@ -656,16 +656,6 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
                                                     outcome="invalid_output", provider=model.provider,
                                                     artifact=artifact_status(output), submission="none")
         raise
-
-
-def credential_rejected(message: str) -> bool:
-    if re.search(r"github|\bgh:", message, re.I):
-        return False
-    return bool(re.search(
-        r"not\s+(?:signed|logged)\s+in|missing\s+credentials|invalid_grant|refresh_token_(?:reused|expired|revoked)"
-        r"|\b401\s+unauthorized\b|authentication[_ ](?:failed|error)"
-        r"|(?:refresh\s+token|credentials?)[^.\n]{0,160}(?:already\s+used|reused|revoked|expired|invalid|rejected)"
-        r"|(?:invalid|expired|revoked)\s+(?:refresh\s+)?(?:token|credentials?)", message, re.I))
 
 
 def provider_error(stdout: str, stderr: str) -> str:

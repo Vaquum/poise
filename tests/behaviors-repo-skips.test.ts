@@ -11,7 +11,8 @@ import { completedReviewCall } from './review-response-fixture'
 // recorded, so a test can prove what was never asked.
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
 
-vi.mock('../server/process', () => ({
+vi.mock('../server/process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../server/process')>()),
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
   runningCallerLaunches: () => 0,

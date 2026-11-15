@@ -18,6 +18,8 @@
 // leaving the service down — `npm run build` cleans dist/ first, so the
 // previous bundle is moved aside and restored rather than trusted in place.
 
+// First: sizes libuv's thread pool before anything starts it.
+import './self-update/threadpool.mjs'
 import { spawn } from 'node:child_process'
 import { buildSourceSha } from './build-identity.mjs'
 import { createHash } from 'node:crypto'

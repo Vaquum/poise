@@ -79,7 +79,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
   let searchQuery = ''
   let pageIndex = 0
   let searchDebounce = 0
-  const expanded = new Map<string, { body: string | null, loading: boolean, error: string }>()
+  const expanded = new Map<string, { body: string | null, loading: boolean, error: string, unavailable: string, running: boolean }>()
   const expandedGroups = new Set<string>()
   let displayedGroups = new Map<string, RunGroup>()
   const reasoning = new Map<string, { chars: number, body: string, loading: boolean, error: string }>()
@@ -173,14 +173,13 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     { entry: group.entries[0], group },
     ...(expandedGroups.has(group.key) ? group.entries.slice(1).map((entry) => ({ entry, repeat: true })) : []),
   ])
-  const hasDetail = (e: LogEntry): boolean => !!e.response || !!e.error || !!e.progress
 
   function groupButton(group?: RunGroup): string {
     if (!group || group.entries.length < 2) return ''
     const open = expandedGroups.has(group.key)
     const n = group.entries.length
     const label = `${open ? 'Hide' : 'Show'} ${n - 1} identical earlier ${n === 2 ? 'run' : 'runs'}, ${n} in all`
-    return `<button type="button" class="grp-btn${open ? ' is-open' : ''}" data-act="sw-group" data-group-id="${esc(group.entries[0].id)}" aria-expanded="${open}" aria-label="${esc(label)}" title="${esc(label)}" data-ref="bh.group">${n}</button>`
+    return `<button type="button" class="grp-btn${open ? ' is-open' : ''}" data-act="sw-group" data-group-id="${esc(group.entries[0].id)}" aria-expanded="${open}" aria-label="${esc(label)}" data-help="${esc(label)}" data-ref="bh.group">${n}</button>`
   }
   function whereCells(e: LogEntry): string {
     const { owner, name } = repoParts(e)
@@ -194,8 +193,8 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     if (e.session_id) {
       const label = esc(targetText(e))
       return isChatTurn(e)
-        ? `<td class="c-org" colspan="2"><a class="sw-session" href="${esc(placeHref('chat', { chat: e.session_id, back: 'observe' }))}" title="Open this conversation in Chat" data-ref="bh.session">${icon('chat', 'sm')}${label}</a></td>`
-        : `<td class="c-org" colspan="2"><button type="button" class="sw-session" data-act="sw-session" data-session="${esc(e.session_id)}" title="Open this conversation — ${esc(e.session_id)}" data-ref="bh.session">${icon('chat', 'sm')}${label}</button></td>`
+        ? `<td class="c-org" colspan="2"><a class="sw-session" href="${esc(placeHref('chat', { chat: e.session_id, back: 'observe' }))}" data-help="Open this conversation in Chat" data-ref="bh.session">${icon('chat', 'sm')}${label}</a></td>`
+        : `<td class="c-org" colspan="2"><button type="button" class="sw-session" data-act="sw-session" data-session="${esc(e.session_id)}" data-help="Open this conversation — ${esc(e.session_id)}" data-ref="bh.session">${icon('chat', 'sm')}${label}</button></td>`
     }
     return '<td class="c-org"><span class="dim">—</span></td><td class="c-repo"><span class="dim">—</span></td>'
   }
@@ -205,31 +204,31 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     const word = s.state === 'running' || s.word === term(`state.${s.state}`) ? term(`state.${s.state}`) : `${term(`state.${s.state}`)} · ${s.word}`
     const est = estimateText(e, estimates.get(e.id))
     const row = rowNotes.get(e.id)
-    return `${capsule(s.state)}<span class="ow">${esc(word)}</span>${s.note ? `<span class="note${s.warn ? ' is-warn' : ''}" data-progress title="${esc(s.note)}">${esc(s.note)}</span>` : ''}${est ? `<span class="note${est.warn ? ' is-warn' : ''}" data-est data-ref="bh.est">${esc(est.text)}</span>` : ''}${row ? `<span class="note${row.warn ? ' is-warn' : ''}" data-row-note title="${esc(row.text)}">${esc(row.text)}</span>` : ''}`
+    return `${capsule(s.state)}<span class="ow">${esc(word)}</span>${s.note ? `<span class="note${s.warn ? ' is-warn' : ''}" data-progress data-help="${esc(s.note)}">${esc(s.note)}</span>` : ''}${est ? `<span class="note${est.warn ? ' is-warn' : ''}" data-est data-ref="bh.est">${esc(est.text)}</span>` : ''}${row ? `<span class="note${row.warn ? ' is-warn' : ''}" data-row-note data-help="${esc(row.text)}">${esc(row.text)}</span>` : ''}`
   }
   function stopHTML(e: LogEntry): string {
     if (!isRunning(e)) return '<span class="dim">—</span>'
     if (stopsInFlight.has(e.id) || stopping.has(e.id)) return '<span class="spin" aria-label="Stopping"></span>'
     const armed = armedStop?.id === e.id && armedStop.until > Date.now()
-    return `<button type="button" class="btn-ghost sw-stop${armed ? ' is-armed' : ''}" data-act="sw-stop" aria-label="${armed ? 'Confirm stopping this run' : 'Stop this run'}" title="${armed ? 'Sure? Press again to stop it' : 'Stop this run'}" data-ref="bh.stop">${armed ? 'Sure?' : icon('stop', 'sm')}</button>`
+    return `<button type="button" class="btn-ghost sw-stop${armed ? ' is-armed' : ''}" data-act="sw-stop" aria-label="${armed ? 'Confirm stopping this run' : 'Stop this run'}" data-help="${armed ? 'Sure? Press again to stop it' : 'Stop this run'}" data-ref="bh.stop">${armed ? 'Sure?' : icon('stop', 'sm')}</button>`
   }
   function replayHTML(e: LogEntry, repeat: boolean): string {
     if (!isReplayable(e) || repeat) return '<span class="dim">—</span>'
     if (replaysInFlight.has(e.id)) return '<span class="spin" aria-label="Replaying"></span>'
     const issue = e.behavior === 'issue_review'
-    return `<button type="button" class="ib" data-act="sw-replay" aria-label="${issue ? 'Review this revision again' : 'Replay this run'}" title="${issue ? 'Review this revision again' : 'Replay this run'}" data-ref="bh.replay">${icon('replay', 'sm')}</button>`
+    return `<button type="button" class="ib" data-act="sw-replay" aria-label="${issue ? 'Review this revision again' : 'Replay this run'}" data-help="${issue ? 'Review this revision again' : 'Replay this run'}" data-ref="bh.replay">${icon('replay', 'sm')}</button>`
   }
   function mainHTML(row: RunRow): string {
     const e = row.entry
     const open = expanded.has(e.id)
     const model = modelName(e)
-    const detail = hasDetail(e) ? `<button type="button" class="ib chev${open ? ' is-open' : ''}" data-act="sw-detail" aria-expanded="${open}" aria-label="${open ? 'Hide' : 'Show'} detail" title="${open ? 'Hide detail' : e.progress ? 'View activity' : e.response ? 'View response' : 'View error'}" data-ref="bh.detail">${icon('chev', 'sm')}</button>` : ''
+    const detail = `<button type="button" class="ib chev${open ? ' is-open' : ''}" data-act="sw-detail" aria-expanded="${open}" aria-label="${open ? 'Hide' : 'Show'} detail" data-help="${open ? 'Hide detail' : e.progress ? 'View activity' : e.error ? 'View error' : 'View response'}" data-ref="bh.detail">${icon('chev', 'sm')}</button>`
     return `<td class="c-group">${row.repeat ? '' : groupButton(row.group)}</td>
-      <td class="c-model" title="${esc(model)}" data-ref="bh.model">${model ? esc(model) : '<span class="dim">—</span>'}</td>
-      <td class="c-behavior" title="${esc(e.behavior ?? '')}" data-ref="bh.behavior">${esc(behaviorName(e))}</td>
+      <td class="c-model" data-help="${esc(model)}" data-ref="bh.model">${model ? esc(model) : '<span class="dim">—</span>'}</td>
+      <td class="c-behavior" data-help="${esc(e.behavior ?? '')}" data-ref="bh.behavior">${esc(behaviorName(e))}</td>
       ${whereCells(e)}
       <td class="c-status" data-ref="bh.status"><span class="sw-st">${statusHTML(e)}</span></td>
-      <td class="c-started" data-ref="bh.started" data-started title="${esc(exactTime(startedAtMs(e)))}">${esc(relFromMs(startedAtMs(e)))}</td>
+      <td class="c-started" data-ref="bh.started" data-started data-help="${esc(exactTime(startedAtMs(e)))}">${esc(relFromMs(startedAtMs(e)))}</td>
       <td class="c-elapsed" data-ref="bh.elapsed" data-elapsed>${esc(elapsedText(e))}</td>
       <td class="c-act">${replayHTML(e, !!row.repeat)}</td>
       <td class="c-act">${stopHTML(e)}</td>
@@ -260,7 +259,8 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     const target = owner && name && e.pr_id ? `${owner}/${name}#${e.pr_id}` : ''
     const response = state?.loading ? '<section><h4 class="t-micro">Response</h4><p class="note"><span class="spin"></span> Reading the response…</p></section>'
       : state?.error ? `<section><h4 class="t-micro">Response</h4><p class="note is-warn">${esc(state.error)}</p></section>`
-        : state?.body ? `<section><h4 class="t-micro">Response</h4><pre class="sw-pre">${esc(state.body)}</pre></section>` : ''
+        : state?.unavailable ? `<section><h4 class="t-micro">Response</h4><p class="note">Unavailable: ${esc(state.unavailable)}</p></section>`
+          : state?.body !== null && state?.body !== undefined ? `<section><h4 class="t-micro">Response</h4><pre class="sw-pre">${esc(state.body)}</pre></section>` : ''
     return `<td colspan="${COLUMNS}"><div class="sw-detail-in">
       ${activityHTML(e)}${response}
       ${e.error ? `<section><h4 class="t-micro">Error</h4><pre class="sw-pre is-error">${esc(e.error)}</pre></section>` : ''}
@@ -640,28 +640,37 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     for (const entry of entries) {
       const state = expanded.get(entry.id)
       if (state && openReasoning.has(entry.id)) void loadReasoning(entry.id)
-      if (state && !state.loading && state.body === null && !state.error && entry.response) void loadResponse(entry.id)
+      if (state && !state.loading && state.body === null && !state.error
+        && (entry.response || (state.unavailable !== '' && state.running && !isRunning(entry)))) void loadResponse(entry.id)
     }
   }
   async function loadResponse(id: string): Promise<void> {
-    const entry = entries.find((e) => e.id === id)
-    if (!entry?.response) { expanded.set(id, { body: null, loading: false, error: '' }); render(); return }
-    expanded.set(id, { body: null, loading: true, error: '' })
+    const startedRunning = entries.some((entry) => entry.id === id && isRunning(entry))
+    expanded.set(id, { body: null, loading: true, error: '', unavailable: '', running: false })
     render()
-    let next: { body: string | null, loading: boolean, error: string }
+    let next: { body: string | null, loading: boolean, error: string, unavailable: string, running: boolean }
     try {
       const response = await fetch(`/api/agent-response/${encodeURIComponent(id)}`, { cache: 'no-store', signal: ctx.signal })
       if (!response.ok) throw new Error(await failureOf(response))
-      const data = await response.json() as { body?: unknown }
-      next = { body: typeof data.body === 'string' ? data.body : '', loading: false, error: '' }
+      const data = await response.json() as { body?: unknown, disposition?: unknown, reason?: unknown }
+      if (data.disposition === 'unavailable' && typeof data.reason === 'string' && data.reason) {
+        next = { body: null, loading: false, error: '', unavailable: data.reason, running: startedRunning }
+      } else {
+        if (data.disposition !== undefined || typeof data.body !== 'string') throw new Error('the answer is incomplete')
+        next = { body: data.body, loading: false, error: '', unavailable: '', running: false }
+      }
     } catch (error) {
       if (aborted(error)) return
-      next = { body: null, loading: false, error: `The response could not be read: ${message(error)}` }
+      next = { body: null, loading: false, error: `The response could not be read: ${message(error)}`, unavailable: '', running: false }
     }
     // The row may have been folded while the response was out.
     if (!expanded.has(id)) return
     expanded.set(id, next)
     render()
+    if (next.unavailable !== '' && next.running) {
+      const current = entries.find((e) => e.id === id)
+      if (current && !isRunning(current)) void loadResponse(id)
+    }
   }
   async function loadReasoning(id: string): Promise<void> {
     const entry = entries.find((e) => e.id === id)
@@ -754,7 +763,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
       ctx.go(placeHref('chat', { chat: data.session.id, back: 'observe' }))
     } catch (error) {
       if (aborted(error)) return
-      button.setAttribute('title', `The conversation could not be found: ${message(error)}`)
+      button.setAttribute('data-help', `The conversation could not be found: ${message(error)}`)
       button.classList.add('is-warn')
     }
   }
@@ -874,7 +883,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
     if (group && group.entries[0].id !== match.id) expandedGroups.add(group.key)
     const index = groupRows(groups).findIndex((row) => row.entry.id === match.id)
     pageIndex = Math.max(0, Math.floor(index / PAGE_SIZE))
-    if (hasDetail(match) && !expanded.has(match.id)) void loadResponse(match.id)
+    if (!expanded.has(match.id)) void loadResponse(match.id)
     render()
     const row = body.querySelector<HTMLTableRowElement>(`tr[data-run="${CSS.escape(match.id)}"]`)
     if (row) {
@@ -937,7 +946,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
       if (isRunning(e) && !stopsInFlight.has(e.id) && !stopping.has(e.id)) {
         const progress = tr.querySelector<HTMLElement>('[data-progress]')
         const s = statusOf(e, now)
-        if (progress && progress.textContent !== s.note) { progress.textContent = s.note; progress.title = s.note; progress.classList.toggle('is-warn', s.warn) }
+        if (progress && progress.textContent !== s.note) { progress.textContent = s.note; progress.dataset.help = s.note; progress.classList.toggle('is-warn', s.warn) }
         const est = tr.querySelector<HTMLElement>('[data-est]')
         const x = estimateText(e, estimates.get(e.id), now)
         if (est && x && est.textContent !== x.text) { est.textContent = x.text; est.classList.toggle('is-warn', x.warn) }

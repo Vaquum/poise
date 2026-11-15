@@ -6,7 +6,7 @@ import { agentInterfaceCwd } from './models'
 import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import { chainCiDependency, chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { chainCiDependency, chainReviewResponse, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { datastoreViewOrCli } from './datastore-reader'
@@ -32,7 +32,7 @@ export async function readNativeInvocations(ids: string[], mode: 'strict' | 'res
 }
 export interface NativeChainHooks {
   roster(chainKey: string): Promise<Roster>
-  resolve(decision: Invoke, chainKey: string): Promise<ChainReviewer | null>
+  resolve(decision: Invoke, chainKey: string, chain: BehaviorChain, observation: ChainObservation): Promise<ChainReviewer | null>
   prepare(identities: string[]): Promise<NodeJS.ProcessEnv>
   borrow(): (() => void) | null
   available(): boolean
@@ -147,12 +147,16 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // The chain's draws seed by its seed issue, so every observation
       // refresh re-reads the same roster instead of admitting new slots.
       const chainKey = `${chain.repository}#${chain.issue}`
+      const testHold = chain.testHold ?? (!chain.testRecovery?.admission ? chain.testRecovery?.hold : undefined)
+      const originalTest = chain.invocations.find(invocation => invocation.id === testHold?.invocationId)
+      const testProof = originalTest && implementationTestDependency(originalTest)
       // One process reads the seed issue, its comments and the publication
       // inspection together, reusing their existing projections. The output
       // cap is the sum of the three previous per-read caps, so no facet
       // loses budget; any facet failure still fails the whole observation.
       const [seed, roster] = await Promise.all([
-        github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch, ...actor], 3 * 2 * 1024 * 1024),
+        github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch,
+          ...(testProof ? ['--test-dependency-json', JSON.stringify(testProof)] : []), ...actor], 3 * 2 * 1024 * 1024),
         hooks.roster(chainKey),
       ])
       if (seed.issue_number !== chain.issue || seed.branch !== chain.branch
@@ -174,6 +178,18 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           state: typeof publication.state === 'string' ? publication.state : null, merged: publication.merged === true,
           merge_sha: publication.merge_sha === null ? null : sha(publication.merge_sha, 'publication') }, pull: null }
       if (seed.full_suite) observation.fullSuite = object(seed.full_suite, 'full-suite recovery')
+      if (seed.remediation) observation.remediation = object(seed.remediation, 'redundant remediation')
+      if (testProof && originalTest) {
+        const proof = object(seed.test_dependency, 'implementation test dependency')
+        if (proof.verified === true && ['base', 'run', 'runAttempt', 'baselineRun', 'baselineAttempt', 'remediation', 'failures',
+          ...(testProof.source === 'relay' ? ['source', 'capture', 'candidate', 'baselineCapture', 'relay', 'totals'] : [])]
+          .some(key => chainBasis(proof[key]) !== chainBasis(testProof[key as keyof typeof testProof]))) throw new Error('original implementation test evidence changed')
+        const recovery = proof.recovered === true ? object(proof.recovery, 'implementation test recovery') : null
+        observation.testDependency = { invocationId: originalTest.id, verified: proof.verified === true, recovered: proof.recovered === true,
+          ...(typeof proof.reason === 'string' ? { reason: proof.reason } : {}),
+          ...(recovery ? { recovery: { merge: sha(recovery.merge, 'delivered test recovery'), base: sha(recovery.base, 'recovered implementation base'),
+            run: object(recovery.run, 'original-test validation run') } } : {}) }
+      }
       const pendingReview = chain.invocations.find((invocation) => invocation.state === 'uncertain' && invocation.behavior === 'review-issue')
       if (pendingReview && typeof pendingReview.evidence?.callId === 'string') {
         const artifact = object(pendingReview.evidence.artifact, 'issue review publication receipt')
@@ -211,10 +227,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       let number = observation.publication.pull_number
       if (number === null && observation.issue.open && !observation.publication.head_sha) {
         await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['implement-issue'])
-        const { stdout } = await runFile('github-datastore', organizationArgs(org,
-          ['view', 'issue-dependencies', '--repo', chain.repository, '--number', String(chain.issue), '--format', 'json']),
-        { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
-        const dependencies = object(JSON.parse(stdout), 'issue prerequisites')
+        const dependencies = object(publication.prerequisites ?? {}, 'live issue prerequisites')
         const base = typeof publication.base_sha === 'string' && /^[0-9a-f]{40}$/.test(publication.base_sha) ? publication.base_sha : null
         const prerequisites: NonNullable<ChainObservation['prerequisites']> = { wait: null, base, evidence: [dependencies] }
         observation.prerequisites = prerequisites
@@ -326,6 +339,16 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         || (state.queue_entry_id !== null && (typeof state.queue_entry_id !== 'string' || !state.queue_entry_id))
         || (state.state === 'open' && !Array.isArray(state.queue_removals))) throw new Error('native PR observations changed head or are incomplete')
       const checks = ci.failing.map((item) => object(item, 'CI check'))
+      let queueEntryDetails: NonNullable<ChainObservation['pull']>['queueEntryDetails'] = null
+      if (state.queue_entry_id !== null) {
+        const entry = object(state.queue_entry, 'native queue entry')
+        if (entry.id !== state.queue_entry_id || !['QUEUED', 'AWAITING_CHECKS', 'LOCKED', 'MERGEABLE', 'UNMERGEABLE'].includes(String(entry.state))) {
+          throw new Error('native queue entry disposition is incomplete or mismatched')
+        }
+        queueEntryDetails = { id: String(entry.id), state: String(entry.state),
+          base: entry.base === null ? null : sha(entry.base, 'queue integration base'),
+          head: entry.head === null ? null : sha(entry.head, 'queue integration head') }
+      }
       const pending = checks.some((check) => ['queued', 'pending', 'in_progress', 'requested', 'waiting'].includes(String(check.state)) || (check.state === 'completed' && check.conclusion == null))
       const failures = checks.filter((check) => ['failure', 'error'].includes(String(check.state)) || (check.state === 'completed' && ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(check.conclusion))))
       if (checks.some((check) => typeof check.name !== 'string' || !['completed', 'queued', 'pending', 'in_progress', 'requested', 'waiting', 'failure', 'error', 'success'].includes(String(check.state)))) throw new Error('native CI observation contains an unknown state')
@@ -347,6 +370,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       }
       observation.pull = { number, head, headSince, state: String(state.state), draft: readiness.draft, merged: false, mergeSha: null,
         queueEntry: typeof state.queue_entry_id === 'string' ? state.queue_entry_id : null,
+        queueEntryDetails,
         queueRemoval: removal ? { id: String(removal.id), reason: typeof removal.reason === 'string' ? removal.reason : null,
           at: Date.parse(String(removal.createdAt)), actor: removal.actor ? String(object(removal.actor, 'queue actor').login) : null } : null,
         changesRequested: latest?.state === 'CHANGES_REQUESTED' && latest.commit_id === head,
@@ -397,6 +421,47 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
             return !!latest && latest.state === 'completed' && latest.conclusion === 'success'
           }) }
       }
+      const blocked = [...chain.invocations].reverse().find(invocation => queueCiBlocker(invocation)
+        && invocation.request.context?.queueRemoval === observation.pull?.queueRemoval?.id)
+      const queue = blocked && queueCiBlocker(blocked)
+      if (blocked && queue) {
+        const blocker = (blocked.evidence!.artifact as { ci_blocker: Record<string, unknown> }).ci_blocker
+        if (blocker.repository !== chain.repository || blocker.pull_number !== number) throw new Error('CI blocker belongs to another repository or PR')
+        const baselineRecovered = dependency?.invocation.id === blocked.id && dependency.dependency.allShared === true
+          && observation.ciDependency?.recovered === true
+        let recovered = false
+        if (!baselineRecovered) {
+          const integration = await github(chain.repository, ['--list-failing-ci', String(number), '--ref', queue.integration, ...reviewer])
+          if (integration.repository !== chain.repository || integration.pull_number !== number || integration.head_sha !== head
+            || integration.ref !== queue.integration || integration.base_sha !== ci.base_sha || !Array.isArray(integration.parents)
+            || integration.parents[0] !== queue.base || !integration.parents.slice(1).includes(blocked.request.context?.head)
+            || !Array.isArray(integration.checks) || !Array.isArray(integration.runs)) {
+            throw new Error('CI hold recovery differs from the original queue integration or current candidate/base')
+          }
+          const checks = integration.checks.map(item => object(item, 'integration check'))
+          const runs = integration.runs.map(item => object(item, 'integration workflow'))
+          recovered = queue.failures.every(failure => {
+            const matchingRuns = runs.filter(run => run.workflow_id === failure.workflow && run.head_sha === queue.integration
+              && run.event === 'merge_group')
+            if (matchingRuns.some(run => ![run.id, run.run_attempt].every(id => Number.isSafeInteger(id) && Number(id) > 0))) return false
+            const run = matchingRuns.sort((a, b) => Number(b.id) - Number(a.id))[0]
+            if (!run || run.status !== 'completed' || run.conclusion !== 'success') return false
+            const matching = checks.filter(check => check.type === 'check_run' && check.name === failure.name
+              && check.head_sha === queue.integration && Number.isSafeInteger(check.check_run_id)
+              && check.run_id === run.id)
+            const latest = matching.sort((a, b) => Number(b.check_run_id) - Number(a.check_run_id))[0]
+            return !!latest && latest.state === 'completed' && latest.conclusion === 'success'
+              && Number(latest.check_run_id) > failure.check
+              && (Number(run.id) > failure.run || run.id === failure.run && Number.isSafeInteger(run.run_attempt)
+                && Number(run.run_attempt) > failure.attempt)
+          })
+        }
+        observation.ciRecovery = { invocationId: blocked.id, removal: queue.removal, integration: queue.integration,
+          recovered: recovered || baselineRecovered,
+          reason: recovered ? 'Later matching merge-group checks succeeded; current-head review and current-base merge gates still apply'
+            : baselineRecovered ? 'Verified shared-baseline checks recovered; current-head review and current-base merge gates still apply'
+              : `Awaiting later success for merge-group ${queue.integration}: ${queue.failures.map(failure => `${failure.name} (${failure.url})`).join(', ')}; PR-head green checks do not establish recovery` }
+      }
       return observation
     },
     async request(chain, observation, decision, id) {
@@ -405,9 +470,10 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const common = ['--source', 'poise:behavior-chain', '--correlation-id', id, '--actor', decision.actor]
       const dependency = pull && decision.behavior === 'repair-pr' ? chainCiDependency(chain, pull.queueRemoval?.id) : null
       const note = [await hooks.note(decision.behavior, chain, pull), decision.reason,
+        decision.behavior === 'repair-pr' && chain.repairRecovery && !chain.repairRecovery.admission ? chain.repairRecovery.note : '',
         dependency ? `Retained shared baseline CI dependency; keep candidate repairs scoped and do not duplicate its remediation: ${JSON.stringify(dependency.dependency)}` : ''].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
-        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`)
+        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`, chain, observation)
         if (!selected) return null
         const model = ['--model', selected.model, '--recovery-model', selected.recovery]
         if (decision.behavior === 'review-issue') return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: ['--issue-review', `${chain.repository}#${chain.issue}`,
@@ -439,7 +505,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const fixed = ['--expected-head', pull.head, '--token-user', decision.actor]
       if (decision.behavior === 'retire-pr') return { command: 'github-interface', cwd, nativeResources: 2,
         argv: ['--issue-work', String(chain.issue), '--mode', 'retire', '--branch', chain.branch, '--pull-number', String(pull.number),
-          '--coverage-json', JSON.stringify(observation.fullSuite), ...fixed] }
+          '--coverage-json', JSON.stringify(observation.fullSuite ?? observation.remediation), ...fixed] }
       if (decision.behavior === 'resolve-threads') return { command: 'github-interface', cwd, nativeResources: 2, argv: ['--resolve-nonblocking-conversations-if-ready', String(pull.number), '--username', chain.reviewer, ...fixed] }
       if (decision.behavior === 'rerun-grey-ci') {
         const run = pull.greyRuns[0]
@@ -539,7 +605,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         throw new Error('native action response differs from its immutable request')
       }
       const { stdout } = await runFile('agent-interface', ['--read-response', call.id],
-        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 256 * 1024 })
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 256 * 1024,
+          callId: call.id, readerPurpose: 'native-action-receipt' })
       // Caller prints the retained bytes plus one newline. Hash those bytes,
       // not a JavaScript reserialization (Python's 1.0 is JavaScript's 1).
       if (!stdout.endsWith('\n') || createHash('sha256').update(stdout.slice(0, -1)).digest('hex') !== call.artifact.response_sha) {

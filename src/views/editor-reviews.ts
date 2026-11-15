@@ -183,7 +183,7 @@ export class EditorReviews {
         const mark = document.createElement('div')
         mark.className = 'annotation-mark editor-review-mark'
         mark.dataset.review = review.id
-        mark.title = `Review · ${review.site} · @${review.messages[0]?.author}: ${review.messages[0]?.body}`
+        mark.dataset.help = `Review · ${review.site} · @${review.messages[0]?.author}: ${review.messages[0]?.body}`
         Object.assign(mark.style, { left: `${rect.left - page.left}px`, top: `${rect.top - page.top}px`, width: `${rect.width}px`, height: `${rect.height}px` })
         this.overlay.appendChild(mark)
       }

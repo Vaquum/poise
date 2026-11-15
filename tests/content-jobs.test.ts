@@ -790,6 +790,21 @@ describe('durable author-content finalization', () => {
     expect(jobs.getContentJobResponse(pending.call_id)?.status).toBe('completed')
   })
 
+  it('never publishes an empty article from an unavailable Caller response', async () => {
+    const pending = enqueue()
+    const agent = await import('../server/agent')
+    const read = vi.spyOn(agent, 'fetchAgentResponse').mockResolvedValue({ id: pending.call_id,
+      disposition: 'unavailable', reason: 'The Call ended without a response' })
+    try {
+      await jobs.runContentFinalizerOnce({ dependencies: {
+        inspectCall: vi.fn().mockResolvedValue({ status: 'completed', response_hash: 'promised' }),
+      } })
+      expect(read).toHaveBeenCalledWith(pending.call_id, 'content-finalization')
+      expect(jobs.getContentJob(pending.call_id)).toMatchObject({ status: 'pending', error: 'The Call ended without a response' })
+      await expect(readFile(join(root, 'editor', `${pending.slug}.md`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally { read.mockRestore() }
+  })
+
   it('migrates earlier content_jobs tables additively and idempotently', async () => {
     await jobs.stopContentFinalizer()
     database.closeDatabase()

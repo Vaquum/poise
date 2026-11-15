@@ -454,6 +454,13 @@ case "$path" in
 esac
 printf '%s\\n' "$path" >>"$GH_CALLS"
 case " $GH_FAIL " in *" $file "*) echo "boom" >&2; exit 1;; esac
+errors="$GH_FIXTURES/$file.errors.json"
+if [ -f "$errors" ]; then
+  error=$(jq -r '.[0] // empty' "$errors")
+  jq '.[1:]' "$errors" >"$errors.next"
+  mv "$errors.next" "$errors"
+  if [ -n "$error" ]; then echo "$error" >&2; exit 1; fi
+fi
 if [ "$file" = upstream.json ]; then
   if [ "$(jq -r .sha "$GH_FIXTURES/tip.json")" = "$(jq -r .sha "$GH_FIXTURES/upstream.json")" ]; then
     echo '{"merge_type":"none","message":"already synced"}'
@@ -564,6 +571,58 @@ cat "$GH_FIXTURES/$file"
         self.assertIn(f'repos/{self.REPO}/commits/main', calls)
         for workflow in ('ci.yml', 'caller.yml'):
             self.assertIn(f'repos/{self.REPO}/actions/workflows/{workflow}/runs?head_sha={self.TIP}&per_page=30', calls)
+
+    def test_recovers_workflow_server_errors_in_one_gate_invocation(self):
+        for workflow in ('ci', 'caller'):
+            with self.subTest(workflow=workflow):
+                self.green()
+                self.fixture(f'{workflow}-runs.json.errors.json', ['gh: Bad Gateway (HTTP 502)'])
+                result, outputs = self.gate()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(outputs, {'proceed': 'true', 'sha': self.TIP})
+        with open(self.calls) as file:
+            calls = file.read().splitlines()
+        self.assertEqual(calls.count(f'repos/{self.REPO}/commits/main'), 2)
+        for workflow in ('ci', 'caller'):
+            self.assertEqual(calls.count(
+                f'repos/{self.REPO}/actions/workflows/{workflow}.yml/runs?head_sha={self.TIP}&per_page=30'), 3)
+
+    def test_stops_workflow_server_errors_at_the_read_cap_with_the_cause(self):
+        for workflow in ('ci', 'caller'):
+            with self.subTest(workflow=workflow):
+                self.green()
+                self.fixture(f'{workflow}-runs.json.errors.json', [
+                    f'gh: Bad Gateway, read {attempt} (HTTP 502)' for attempt in range(1, 5)])
+                result, outputs = self.gate()
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(outputs, {})
+                cause = f'cannot read {workflow}.yml runs for {self.TIP}: gh: Bad Gateway, read 3 (HTTP 502)'
+                self.assertIn(cause, result.stderr)
+                self.assertIn(cause, self.summary_text())
+                with open(self.calls) as file:
+                    calls = file.read().splitlines()
+                self.assertEqual(calls[-3:], [
+                    f'repos/{self.REPO}/actions/workflows/{workflow}.yml/runs?head_sha={self.TIP}&per_page=30'] * 3)
+                os.unlink(os.path.join(self.fixtures, f'{workflow}-runs.json.errors.json'))
+
+    def test_recovered_workflow_evidence_still_controls_the_gate(self):
+        for workflow in ('ci', 'caller'):
+            for changes, trigger, code, outputs, says in [
+                ({'status': 'in_progress', 'conclusion': None}, 'workflow_run', 0,
+                 {'proceed': 'false', 'sha': self.TIP}, 'still in_progress'),
+                ({'status': 'in_progress', 'conclusion': None}, 'workflow_dispatch', 1, {}, 'dispatch again'),
+                ({'head_sha': 'a' * 40}, 'workflow_run', 1, {}, f'no {workflow}.yml run'),
+                ({'conclusion': 'failure'}, 'workflow_run', 1, {}, 'concluded failure'),
+            ]:
+                with self.subTest(workflow=workflow, changes=changes, trigger=trigger):
+                    self.green()
+                    self.fixture(f'{workflow}-runs.json', {'total_count': 1,
+                                 'workflow_runs': [self.workflow_run(101, **changes)]})
+                    self.fixture(f'{workflow}-runs.json.errors.json', ['gh: Bad Gateway (HTTP 502)'])
+                    result, actual_outputs = self.gate(trigger=trigger)
+                    self.assertEqual(result.returncode, code, result.stderr)
+                    self.assertEqual(actual_outputs, outputs)
+                    self.assertIn(says, result.stderr)
 
     def test_refuses_a_failed_workflow_naming_the_run_and_step(self):
         for trigger, hint in [('workflow_run', 'their success wakes the gate again'),

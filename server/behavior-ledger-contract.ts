@@ -9,9 +9,10 @@ export type LedgerActivity = 'running' | 'settled' | 'unknown'
 export type LedgerStateSource = 'native' | 'caller_observed'
 export type LedgerSlot = 'primary' | 'secondary' | 'tertiary'
 export type LedgerSource = `poise:${BehaviorKey}` | 'poise:manual-review' | 'poise:replay'
-export type LedgerOutcome = 'clean' | 'changes_requested' | 'approved' | 'commented' | 'preflight_failed'
+export type LedgerOutcome = 'clean' | 'changes_requested' | 'approved' | 'incomplete' | 'commented' | 'preflight_failed'
   | 'resolved' | 'waiting' | 'no_op' | 'merged' | 'already_merged' | 'updated' | 'not_ready' | 'superseded'
   | 'closed' | 'already_closed' | 'rerun_requested' | 'read_failed' | 'spawn_failed' | 'adopted' | 'enqueued' | 'review_target_closed'
+  | 'prerequisite_wait'
 export interface LedgerReference {
   kind: 'caller' | 'correlation' | 'review' | 'comment' | 'workflow' | 'intent' | 'logging' | 'queue'
   identity: string

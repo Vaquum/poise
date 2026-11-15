@@ -210,7 +210,7 @@ it.each(['review-pr', 'approve-pr'] as const)('retains a verified %s recovery, w
   const callId = fixture.successor.id.slice(0, 31) + 'f'
   const response = { repository: 'acme/repo', pull_number: observation.pull!.number, head_sha: observation.pull!.head,
     context_sha: observation.pull!.reviewContext, invocation_id: callId, reviewer: successor.actor,
-    model: successor.model, completed_at: at + 8000,
+    model: successor.model, completed_at: at + 8000, coverage: 'complete',
     assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   const action = behavior === 'approve-pr' ? 'approved' : 'reviewed_clean'
@@ -237,7 +237,7 @@ it.each(['review-pr', 'approve-pr'] as const)('keeps a verified %s recovery afte
   const callId = fixture.successor.id.slice(0, 31) + 'f'
   const response = { repository: 'acme/repo', pull_number: observation.pull!.number, head_sha: observation.pull!.head,
     context_sha: observation.pull!.reviewContext, invocation_id: callId, reviewer: successor.actor,
-    model: successor.model, completed_at: at + 8000,
+    model: successor.model, completed_at: at + 8000, coverage: 'complete',
     assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   const action = behavior === 'approve-pr' ? 'approved' : 'reviewed_clean'

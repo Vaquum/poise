@@ -4,7 +4,9 @@ import { parseAgentLogStdout } from '../server/agent-log-parse'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent } from '../server/behavior-chain-store'
 import { parseResourceOwnership } from '../server/behavior-resource-receipt'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { behaviorChainSummary } from '../server/behavior-chain-summary'
 import { BehaviorResourceRecovery } from '../server/behavior-chain-resource-recovery'
+import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import type { Organization } from '../server/organizations'
 import { completedReviewCall } from './review-response-fixture'
@@ -66,7 +68,282 @@ function bounded(memory = '10', reservation = '6'): void {
   vi.stubEnv('POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES', reservation)
 }
 
+function resourceQueue(dimension: 'memory' | 'disk', refusal: 'budget' | 'headroom', direct = false) {
+  vi.stubEnv(`POISE_BEHAVIOR_${dimension.toUpperCase()}_BUDGET_BYTES`, '10')
+  vi.stubEnv(`POISE_BEHAVIOR_${dimension.toUpperCase()}_RESERVATION_BYTES`, '6')
+  const { db, journal, chain } = setup()
+  const reservation = { memoryBytes: dimension === 'memory' ? 6 : 0, diskBytes: dimension === 'disk' ? 6 : 0 }
+  const observations = new Map<string, ChainObservation>()
+  const launches: string[] = []
+  let free = refusal === 'headroom' ? 1 : 100
+  const addObservation = (current: BehaviorChain, native: boolean) => {
+    const obs = observation(); obs.issueReviewers = []
+    if (native) {
+      obs.prReviewers = []
+      obs.publication = { pull_number: 21, head_sha: 'a'.repeat(40), head_invocation: 'implementation', state: 'open', merged: false, merge_sha: null }
+      obs.pull = { number: 21, head: 'a'.repeat(40), headSince: Date.now(), state: 'open', draft: false, merged: false,
+        mergeSha: null, mergedAt: null, queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 1,
+        approved: true, ready: false, reviewIds: [], reviewContext: 'context', reviewReceipts: [], reviewRevision: 'findings',
+        greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
+    }
+    observations.set(current.id, obs)
+    return current
+  }
+  addObservation(chain, direct)
+  const add = (number: number, native = false) => addObservation(seed(journal, number), native)
+  const finish = (id: string) => {
+    const current = journal.read(id)!, pending = current.invocations.at(-1)!
+    record(journal, current, { type: 'invocation.settled', invocationId: pending.id, callId: 'native', outcome: 'no_changes',
+      evidence: { ...pending.evidence, status: 'completed', action: 'no_changes', outcome: 'no_changes',
+        resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: new Date().toISOString() } })
+    const obs = observations.get(id)
+    if (obs?.pull) obs.pull.unresolved = 0
+  }
+  let busy: BehaviorChain | null = null
+  const occupy = () => {
+    busy = record(journal, seed(journal, 1), { type: 'invocation.admitted', invocation: {
+      ...invocation('busy', reservation), behavior: 'resolve-threads', model: null, slot: null,
+      request: { command: 'github-interface', argv: [], cwd: '/fixture', nativeResources: 2 } } })
+    busy = record(journal, busy, { type: 'chain.held', reason: 'original resource owner' })
+  }
+  if (refusal === 'budget') occupy()
+  const ops = operations({
+    observe: async current => ({ ...structuredClone(observations.get(current.id) ?? observation()), checkedAt: Date.now() }),
+    measureHeadroom: () => ({ freeMemoryBytes: dimension === 'memory' ? free : 100,
+      freeDiskBytes: dimension === 'disk' ? free : 100, diskPath: '/fixture' }),
+    request: async (current, _observation, decision) => decision.reviewer
+      ? { command: 'agent-interface', argv: ['--model', 'fixture-model', current.id], cwd: '/fixture' }
+      : { command: 'github-interface', argv: ['--resolve-nonblocking-conversations-if-ready', '21', '--expected-head', 'a'.repeat(40),
+        '--token-user', 'reviewer'], cwd: '/fixture', nativeResources: 2 },
+    launch: async pending => { launches.push(pending.request.argv[2]); return true },
+    perform: async (pending, current) => {
+      launches.push(current.id)
+      return { nativeCallId: chainBasis(pending.id).slice(0, 32), action: 'resolved_nonblocking_conversations_if_ready',
+        repository: current.repository, pull_number: 21, head_sha: 'a'.repeat(40), ready_except_conversations: true,
+        resolved_count: 1, unresolved_count: 0, conversations: [{ id: 'thread', isResolved: true }] }
+    },
+  })
+  const release = () => {
+    if (busy) { finish(busy.id); busy = null }
+    free = 100
+  }
+  return { db, journal, chain, observations, launches, reservation, ops, add, finish, occupy, release }
+}
+
+describe('durable resource admission order', () => {
+  it.each(['memory', 'disk'] as const)('gives an older %s waiter a released reservation across replacement and newer pages', async dimension => {
+    for (const refusal of ['budget', 'headroom'] as const) {
+      const queue = resourceQueue(dimension, refusal)
+      const { db, journal, chain, launches, ops } = queue
+      await new BehaviorChainRuntime(journal, ops).run()
+      expect(journal.read(chain.id)!.waiting).toContain(refusal === 'budget' ? 'budget is exhausted' : 'resource headroom')
+      expect(journal.liveModelInvocationCount()).toBe(0)
+      expect(journal.capacityWaiters().map(current => current.id)).toEqual([chain.id])
+      // Replace the runtime while the older obligation is still waiting.
+      journal.rebuild()
+      const runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), ops)
+      for (let turn = 0; turn < 3; turn++) {
+        for (let index = 0; index < 100; index++) queue.add(1000 + turn * 100 + index, index === 0)
+        expect(journal.reconcilable('', Date.now(), false).map(current => current.id)).not.toContain(chain.id)
+        if (turn === 0) queue.release()
+        else queue.finish(launches.at(-1)!)
+        await Promise.all([runtime.run(), runtime.run()])
+        expect(launches).toHaveLength(turn + 1)
+        expect(launches[0]).toBe(chain.id)
+        expect(journal.reservedResources()).toEqual({ ...queue.reservation, unaccounted: 0 })
+        await Promise.all([runtime.run(), runtime.run()])
+        expect(launches).toHaveLength(turn + 1)
+      }
+      expect(launches.filter(id => id === chain.id)).toHaveLength(1)
+    }
+  })
+
+  it.each(['memory', 'disk'] as const)('offers an older direct %s waiter even while model slots are unavailable', async dimension => {
+    const queue = resourceQueue(dimension, 'headroom', true)
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.journal.capacityWaiters().map(current => current.id)).toEqual([queue.chain.id])
+    for (let index = 0; index < 100; index++) queue.add(1000 + index)
+    queue.ops.available = () => false
+    queue.release()
+    const runtime = new BehaviorChainRuntime(queue.journal, queue.ops)
+    await Promise.all([runtime.run(), runtime.run()])
+    expect(queue.launches).toEqual([queue.chain.id])
+    expect(queue.journal.reservedResources()).toEqual({ ...queue.reservation, unaccounted: 0 })
+    expect(queue.journal.liveModelInvocationCount()).toBe(0)
+  })
+
+  it('runs newer direct work without observing older model waiters while model slots are unavailable', async () => {
+    const queue = resourceQueue('memory', 'headroom')
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.journal.capacityWaiters().map(current => current.id)).toEqual([queue.chain.id])
+    const direct = queue.add(1000, true)
+    for (let index = 1; index < 100; index++) queue.add(1000 + index)
+    expect(queue.journal.reconcilable('', Date.now(), false).map(current => current.id)).not.toContain(queue.chain.id)
+    queue.release()
+    queue.ops.available = () => false
+    const observed: string[] = []
+    const observe = queue.ops.observe
+    queue.ops.observe = async current => { observed.push(current.id); return observe(current) }
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.launches).toEqual([direct.id])
+    expect(observed).toContain(direct.id)
+    expect(observed).not.toContain(queue.chain.id)
+    expect(queue.journal.reservedResources()).toEqual({ ...queue.reservation, unaccounted: 0 })
+  })
+
+  it('yields queued model waiters without observation once capacity fills mid-sweep', async () => {
+    const queue = resourceQueue('memory', 'headroom')
+    const setupRuntime = new BehaviorChainRuntime(queue.journal, queue.ops)
+    await setupRuntime.run()
+    const second = queue.add(8)
+    await setupRuntime.run()
+    expect(queue.journal.capacityWaiters().map(current => current.id).sort()).toEqual([queue.chain.id, second.id].sort())
+    const direct = queue.add(1000, true)
+    for (let index = 1; index < 100; index++) queue.add(1000 + index)
+    const page = queue.journal.reconcilable('', Date.now(), false).map(current => current.id)
+    expect(page).not.toContain(queue.chain.id)
+    expect(page).not.toContain(second.id)
+    vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '20')
+    queue.ops.capacity = () => 1
+    queue.release()
+    const observed: string[] = []
+    const observe = queue.ops.observe
+    queue.ops.observe = async current => { observed.push(current.id); return observe(current) }
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.launches).toEqual([queue.chain.id, direct.id])
+    expect(observed).toContain(queue.chain.id)
+    expect(observed).toContain(direct.id)
+    expect(observed).not.toContain(second.id)
+    expect(queue.journal.reservedResources()).toEqual({ memoryBytes: 12, diskBytes: 0, unaccounted: 0 })
+  })
+
+  it.each(['basis', 'slot'] as const)('records a fresh resource wait after a %s change with identical shortage text', async change => {
+    const queue = resourceQueue('memory', 'headroom')
+    const runtime = new BehaviorChainRuntime(queue.journal, queue.ops)
+    await runtime.run()
+    const later = queue.add(6)
+    await runtime.run()
+    const before = queue.journal.read(queue.chain.id)!
+    const obs = queue.observations.get(queue.chain.id)!
+    if (change === 'basis') obs.issue.revision = 'changed issue'
+    else obs.implementer = { ...REVIEWER, slot: 'secondary' }
+    await runtime.run()
+    await runtime.run()
+    expect(queue.journal.read(queue.chain.id)!.waiting).toBe(before.waiting)
+    expect(queue.journal.history(queue.chain.id, before.sequence).filter(row => JSON.parse(row.payload).type === 'chain.waiting')).toHaveLength(1)
+    queue.release()
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.launches).toEqual([later.id])
+  })
+
+  it('retains age across model, memory and disk shortages and changing byte counts', async () => {
+    const queue = resourceQueue('memory', 'headroom')
+    const runtime = new BehaviorChainRuntime(queue.journal, queue.ops)
+    await runtime.run()
+    queue.add(6)
+    await runtime.run()
+    queue.ops.available = () => false
+    await runtime.run()
+    queue.ops.available = () => true
+    vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '5')
+    await runtime.run()
+    vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '10')
+    vi.stubEnv('POISE_BEHAVIOR_DISK_BUDGET_BYTES', '10')
+    vi.stubEnv('POISE_BEHAVIOR_DISK_RESERVATION_BYTES', '6')
+    for (const freeDiskBytes of [1, 2]) {
+      queue.ops.measureHeadroom = () => ({ freeMemoryBytes: 100, freeDiskBytes, diskPath: '/fixture' })
+      await runtime.run()
+    }
+    queue.ops.measureHeadroom = () => ({ freeMemoryBytes: 100, freeDiskBytes: 100, diskPath: '/fixture' })
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.launches).toEqual([queue.chain.id])
+  })
+
+  it('orders a verified transactional resource rejection before later arrivals', async () => {
+    const queue = resourceQueue('disk', 'headroom')
+    queue.release()
+    const request = queue.ops.request
+    queue.ops.request = async (...args) => { queue.occupy(); queue.ops.request = request; return request(...args) }
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.journal.read(queue.chain.id)!.waiting).toContain('budget is exhausted: disk')
+    for (let index = 0; index < 100; index++) queue.add(1000 + index, index === 0)
+    queue.release()
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.launches).toEqual([queue.chain.id])
+  })
+
+  it.each(['headroom', 'ineligible', 'permission', 'model capacity'] as const)('lets later direct work run when the oldest waiter fails %s', async cause => {
+    const queue = resourceQueue('disk', 'headroom')
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    const later = queue.add(6, true)
+    queue.release()
+    if (cause === 'headroom') {
+      let oldest = false
+      const observe = queue.ops.observe
+      queue.ops.observe = async current => { oldest = current.id === queue.chain.id; return observe(current) }
+      queue.ops.measureHeadroom = () => ({ freeMemoryBytes: 100, freeDiskBytes: oldest ? 1 : 100, diskPath: '/fixture' })
+    }
+    if (cause === 'ineligible') queue.observations.get(queue.chain.id)!.issue.eligible = false
+    if (cause === 'permission') queue.ops.permitted = current => current.id !== queue.chain.id
+    if (cause === 'model capacity') queue.ops.available = () => false
+    await new BehaviorChainRuntime(queue.journal, queue.ops).run()
+    expect(queue.launches).toEqual([later.id])
+    expect(queue.journal.reservedResources()).toEqual({ ...queue.reservation, unaccounted: 0 })
+  })
+})
+
 describe('durable behavior resource reservations', () => {
+  it('keeps a stale issue review’s ownership until release, then reviews the replacement revision', async () => {
+    const { journal, chain } = setup()
+    const admitted = invocation('stale-review', RESERVATION)
+    record(journal, chain, { type: 'invocation.admitted', invocation: admitted })
+    const call = { ...completedReviewCall(chain.repository, chain.issue, 'a'.repeat(40), chain.reviewer),
+      behavior: 'issue_review', source: 'poise:behavior-chain', correlation_id: admitted.id, model: admitted.model,
+      status: 'failed', error_code: 'issue_revision_changed', error: 'seed issue changed during review; no comments posted',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, expected_head: null, review_id: null,
+      artifact: { phase: 'reviewing', resource_root: '/owned/stale-review' }, receipts: null, issue_revision: 'a'.repeat(64),
+      resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: null as string | null }
+    const original = structuredClone(call), launch = vi.fn(async () => true)
+    const next = observation()
+    next.issue.revision = 'b'.repeat(64)
+    const runtime = new BehaviorChainRuntime(journal, operations({ launch, observe: async () => next,
+      readInvocations: async () => parseAgentLogStdout(JSON.stringify([call]), 'stale issue review') }))
+    expect(callerDiagnostic(call, 'local')).toBeNull()
+    expect(call).toEqual(original)
+    await runtime.run()
+    expect(journal.reservedResources()).toEqual({ ...RESERVATION, unaccounted: 0 })
+    expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+    expect(launch).not.toHaveBeenCalled()
+    call.resources_settled_at = new Date().toISOString()
+    await runtime.run()
+    const current = journal.read(chain.id)!
+    expect(current.invocations).toHaveLength(2)
+    expect(current.invocations[0]).toMatchObject({ state: 'settled', outcome: 'preflight_failed',
+      evidence: { issue_revision: original.issue_revision, resource_ownership: original.resource_ownership,
+        resources_settled_at: call.resources_settled_at, error_code: 'issue_revision_changed' } })
+    expect(current.invocations[1]).toMatchObject({ behavior: 'review-issue', basis: chainBasis(['issue', next.issue.revision]), state: 'started' })
+    expect(launch).toHaveBeenCalledOnce()
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    expect(journal.history(chain.id)).toEqual(history)
+    expect(journal.read(chain.id)).toEqual(current)
+  })
+
+  it('keeps a stale issue review with ownership cleanup failure visible in Logging', () => {
+    const { chain } = setup()
+    const call = { ...completedReviewCall(chain.repository, chain.issue, 'a'.repeat(40), chain.reviewer),
+      behavior: 'issue_review', source: 'poise:behavior-chain', correlation_id: 'stale-ownership', model: 'fixture-model',
+      status: 'failed', error_code: 'issue_revision_changed', error: 'seed issue changed during review; no comments posted',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, expected_head: null, review_id: null,
+      artifact: { phase: 'reviewing', resource_root: '/owned/stale-review' }, receipts: null, issue_revision: 'a'.repeat(64),
+      resource_ownership: { version: 1, roots: [], errors: [{ cause: 'deletion denied', path: null, at: 1 }] },
+      resources_settled_at: null as string | null }
+    expect(callerDiagnostic(call, 'local')).toMatchObject({ level: 'error', message: call.error })
+    const feed = { id: call.id, behavior: 'issue_review', status: 'failed', error_code: 'issue_revision_changed',
+      action: 'not_started', outcome: 'preflight_failed', error: call.error, ownership_error: 'ownership_failed' }
+    expect(callerDiagnostic(feed, 'local')).toMatchObject({ level: 'error', message: call.error })
+  })
+
   it.each(['merged', 'held', 'settled'])("recovers only physical resources for a %s chain without admission or external actions", async mode => {
     const { journal, chain } = setup()
     const admitted = { ...invocation('original', RESERVATION), request: { command: 'agent-interface' as const,
@@ -461,6 +738,58 @@ describe('resource-aware behavior admission', () => {
     await blind.run()
     expect(journal.read(chain.id)).toMatchObject({
       waiting: 'behavior resource measurement unavailable: disk read of /fixture failed: gone', invocations: [] })
+  })
+
+  it.each(['budget', 'headroom', 'probe'] as const)('records a fresh %s wait after Resume while the resource blocker still holds', async (mode) => {
+    bounded()
+    const { journal, chain } = setup()
+    if (mode === 'budget') {
+      let held = seed(journal, 8)
+      held = journal.admitInvocation(held, 'admit-held', invocation('held', RESERVATION), 2, BUDGET)!
+      held = record(journal, held, { type: 'invocation.uncertain', invocationId: 'held', reason: 'worker ended without proof of release' })
+      record(journal, held, { type: 'chain.held', reason: 'held for the test' })
+    }
+    const measureHeadroom = mode === 'headroom'
+      ? () => ({ freeMemoryBytes: 1, freeDiskBytes: 100, diskPath: '/fixture' })
+      : mode === 'probe'
+        ? () => { throw new Error('behavior resource measurement unavailable: disk read of /fixture failed: gone') }
+        : () => ({ freeMemoryBytes: 100, freeDiskBytes: 100, diskPath: '/fixture' })
+    const runtime = new BehaviorChainRuntime(journal, operations({ measureHeadroom,
+      request: async () => { throw new Error('must not prepare a provider while resources block') } }))
+    await runtime.run()
+    const reason = mode === 'budget'
+      ? 'shared native resource budget is exhausted: memory needs 12 of 10 bytes'
+      : mode === 'headroom'
+        ? 'insufficient behavior resource headroom: only 1 bytes of free memory for a 6 byte reservation'
+        : 'behavior resource measurement unavailable: disk read of /fixture failed: gone'
+    expect(journal.read(chain.id)).toMatchObject({ waiting: reason, invocations: [] })
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
+
+    let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
+    current = record(journal, current, { type: 'chain.resumed' })
+    const boundary = current.resumedAfterSequence
+    expect(current.waiting).toBe(reason)
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+    // A deferred sweep observes without reaching the wait site; renewal must survive it.
+    current = record(journal, current, { type: 'chain.observed', observation: { checkedAt: Date.now() } })
+    expect(behaviorChainSummary(current, journal).waiting).toBeNull()
+
+    await runtime.run()
+    const next = journal.read(chain.id)!
+    expect(next.waiting).toBe(reason)
+    expect(next.sequence).toBeGreaterThan(boundary)
+    const fresh = journal.history(chain.id, boundary).filter(row => {
+      const event = JSON.parse(row.payload) as ChainEvent
+      return event.type === 'chain.waiting' && event.reason === reason
+    })
+    expect(fresh).toHaveLength(1)
+    expect(behaviorChainSummary(next, journal).waiting).toBe(reason)
+
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(next)
+    expect(journal.history(chain.id)).toEqual(history)
+    expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting).toBe(reason)
   })
 
   it('records no reservation and runs no probe when budgets are unset', async () => {

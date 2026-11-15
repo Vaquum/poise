@@ -1,3 +1,4 @@
+import gzip
 import json
 import subprocess
 import tempfile
@@ -28,7 +29,10 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
             (source / 'old.py').rename(source / 'renamed.py')
             (source / 'new.py').write_text('print("é")\n')
             (source / 'new.py').chmod(0o755)
-            (source / 'data.json').write_text('x' * 4_000_000)
+            # A compressed capture is positively an archive payload; an
+            # arbitrary JSON filename and size cannot establish bulk data.
+            capture = json.dumps({'records': ['captured page'] * 300_000}).encode()
+            (source / 'capture.json.gz').write_bytes(gzip.compress(capture))
             (source / 'package.json').write_text('x' * 40_000)
             (source / 'fixtures').mkdir()
             (source / 'fixtures' / 'small.json').write_text('{"ok": true}\n')
@@ -62,7 +66,8 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
                 packet = await rd.review_diff(client, 'o', 'r', {'head': {'sha': head}, 'base': {'sha': new_base}})
 
             self.assertEqual(packet['merge_base_sha'], base)
-            self.assertEqual([f['path'] for f in packet['excluded_files']], ['data.json'])
+            self.assertEqual(packet['excluded_files'], [
+                {'path': 'capture.json.gz', 'reason': 'archive or document payload'}])
             self.assertIn('rename from old.py', packet['diff'])
             self.assertIn('rename to renamed.py', packet['diff'])
             self.assertIn('new file mode 100755', packet['diff'])
@@ -71,7 +76,7 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
                 self.assertIn(retained, packet['diff'])
             self.assertNotIn('base-only.py', packet['diff'])
             diff_call = next(args for args in calls if '--find-renames' in args)
-            self.assertNotIn(':(literal)data.json', diff_call)
+            self.assertNotIn(':(literal)capture.json.gz', diff_call)
             self.assertIn(':(literal)[literal].py', diff_call)
             client.get.assert_awaited_once_with(f'/repos/o/r/compare/{new_base}...{head}', params={'page': 2, 'per_page': 1})
 
@@ -143,7 +148,13 @@ class TestPacketPolicy(TestCase):
         self.assertIsNone(reason('tests/fixtures/example.json', 500))
         self.assertIsNone(reason('data.json', 500, compact=False))
         self.assertIsNone(reason('data.json', 80_000, compact=None))
-        self.assertIsNotNone(reason('data.json', 500))
+        self.assertIsNone(reason('data.json', 500))
+        for compact in (False, True):
+            for path in ('data.json', 'src/permissions.json', 'input-artefacts/RUN-abc.json',
+                         'tests/fixtures/large.json'):
+                self.assertIsNone(reason(path, 100_000, compact=compact), (path, compact))
+        self.assertEqual(reason('.venv/lib/python3.13/site-packages/vendor/data.json', 100_000),
+                         'installed Python dependency')
         self.assertIsNotNone(reason('data.csv', 100_000))
         self.assertIsNotNone(reason('captures/run/raw/markets.md', 100_000))
         self.assertIsNone(reason('captures/run/raw/check.py', 100_000))
@@ -181,10 +192,7 @@ class TestPacketBudget(IsolatedAsyncioTestCase):
         self.assertNotIn(':(literal)data.csv', diff_calls[-1])
         self.assertEqual(len(packet['diff']), 1000)
 
-    async def test_large_artifact_excluded_even_when_total_input_fits(self):
-        # A packet that fits locally can still carry an artifact diff entry
-        # GitHub rejects inline comments on (422 "diff is too large"). Bulk
-        # data is excluded upfront so the model never targets it.
+    async def test_large_json_artifact_name_is_not_positive_exclusion_evidence(self):
         base, head = 'a' * 40, 'b' * 40
         code, data = 'c' * 40, 'd' * 40
         raw = (f':000000 100644 {"0" * 40} {code} A\0code.py\0'
@@ -196,20 +204,20 @@ class TestPacketBudget(IsolatedAsyncioTestCase):
                 return raw
             if '--find-renames' in args:
                 diff_calls.append(args)
-                self.assertNotIn(':(literal)input-artefacts/RUN-abc.json', args)
-                return b'diff --git a/code.py b/code.py\n+pass\n'
+                return b'diff --git a/code.py b/code.py\n+pass\n' + (
+                    b'diff --git a/input-artefacts/RUN-abc.json b/input-artefacts/RUN-abc.json\n+{}\n')
             return b''
 
         client = AsyncMock()
         client.token = 'test-token'
         client.get.return_value = {'merge_base_commit': {'sha': base}}
-        # Total input (~100KB) fits well under the 1.35MB diff budget.
         with patch.object(rd, '_git', side_effect=git_result), \
                 patch.object(rd, '_blob_sizes', AsyncMock(return_value={code: 100, data: 100_000})):
             packet = await rd.review_diff(client, 'o', 'r', {'base': {'sha': base}, 'head': {'sha': head}})
-        self.assertEqual([f['path'] for f in packet['excluded_files']], ['input-artefacts/RUN-abc.json'])
-        self.assertEqual([f['filename'] for f in packet['files']], ['code.py'])
-        self.assertIn('code.py', packet['diff'])
+        self.assertEqual(packet['excluded_files'], [])
+        self.assertEqual([f['filename'] for f in packet['files']], ['code.py', 'input-artefacts/RUN-abc.json'])
+        self.assertIn('input-artefacts/RUN-abc.json', packet['diff'])
+        self.assertIn(':(literal)input-artefacts/RUN-abc.json', diff_calls[-1])
         self.assertNotIn('omitted_files', packet)
 
 
@@ -246,6 +254,7 @@ class TestBoundedCoverage(IsolatedAsyncioTestCase):
 
     async def test_oversized_diff_yields_bounded_packet_with_explicit_omitted_files(self):
         packet = await self._packet(['a.py', 'b.py', 'c.py', 'd.py', 'e.py', 'data.csv'], 1000, 2500)
+        self.assertEqual(packet['coverage'], 'incomplete')
         self.assertEqual(len(packet['diff']), 2000)
         self.assertEqual([entry['filename'] for entry in packet['files']],
                          ['a.py', 'b.py'])
@@ -280,6 +289,7 @@ class TestBoundedCoverage(IsolatedAsyncioTestCase):
 
     async def test_small_diff_carries_no_omitted_coverage_key(self):
         packet = await self._packet(['a.py', 'b.py'], 1000, rd.MAX_DIFF_BYTES)
+        self.assertEqual(packet['coverage'], 'complete')
         self.assertEqual(len(packet['diff']), 2000)
         self.assertNotIn('omitted_files', packet)
 

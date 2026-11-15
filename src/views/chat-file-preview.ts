@@ -5,7 +5,7 @@ export function createFilePreview(parent: HTMLElement, read: (session: string, r
   const dialog = document.createElement('dialog')
   dialog.className = 'chat-file-preview'
   dialog.setAttribute('aria-label', 'File preview')
-  dialog.innerHTML = `<header class="chat-file-header"><h2>File preview</h2><button type="button" class="chat-icon-btn" aria-label="Close file preview" title="Close">×</button></header>
+  dialog.innerHTML = `<header class="chat-file-header"><h2>File preview</h2><button type="button" class="chat-icon-btn" aria-label="Close file preview" data-help="Close">×</button></header>
     <div class="chat-file-path"></div><div class="chat-file-state" role="status"></div><pre class="chat-file-content" tabindex="0" aria-label="File contents"></pre>`
   parent.appendChild(dialog)
   const path = dialog.querySelector<HTMLElement>('.chat-file-path')!

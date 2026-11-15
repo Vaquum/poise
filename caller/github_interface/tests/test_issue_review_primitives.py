@@ -1,8 +1,13 @@
+import fcntl
+import io
+import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -12,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 from github_interface import cli
 from github_interface.atoms import local
 from github_interface.atoms.local import checkout_repo
+from github_interface.atoms.process_diagnostic import GitProcessError
 from github_interface.behaviors import issue_comments, sub_issues
 from github_interface.behaviors import reviewed_clean
 from review_response_fixture import ASSESSMENT
@@ -142,6 +148,11 @@ class TestCheckoutRepo(TestCase):
         git("add", "README.md", cwd=self.source)
         git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "one", cwd=self.source)
 
+    def remove_snapshot_tree(self, path: Path) -> str:
+        tree = git("rev-parse", "HEAD^{tree}", cwd=path)
+        (path / ".git" / "objects" / tree[:2] / tree[2:]).unlink()
+        return tree
+
     def test_clones_through_a_reused_mirror_with_full_history(self) -> None:
         first = checkout_repo("o", "r", "main", "secret", self.root / "a", root=self.root / "mirrors", remote=str(self.source))
         (self.source / "README.md").write_text("two\n")
@@ -163,6 +174,227 @@ class TestCheckoutRepo(TestCase):
         result = checkout_repo("o", "r", "main", "secret", self.root / "c", root=self.root / "mirrors", remote=str(self.source))
         self.assertEqual(result["head_sha"], git("rev-parse", "HEAD", cwd=self.source))
         self.assertEqual(git("rev-parse", "--is-bare-repository", cwd=mirror), "true")
+
+    def test_recovers_a_missing_snapshot_tree_once(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        path, mirror = self.root / "snapshot", self.root / "mirrors" / "o" / "r.git"
+        original_run, failures = local._run, []
+        snapshots = 0
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            nonlocal snapshots
+            try:
+                output = original_run(command, token, *secrets)
+            except GitProcessError as error:
+                failures.append(error.diagnostic)
+                raise
+            if "--no-checkout" in command:
+                snapshots += 1
+                if snapshots == 1:
+                    self.remove_snapshot_tree(path)
+                    (mirror / "old-generation").touch()
+            return output
+
+        with patch.object(local, "_run", side_effect=run) as calls:
+            result = checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+        self.assertEqual(result["head_sha"], git("rev-parse", "HEAD", cwd=self.source))
+        self.assertEqual((path / "README.md").read_text(), "one\n")
+        self.assertEqual(snapshots, 2)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["operation"], "reset")
+        self.assertIn("fatal: unable to read tree", failures[0]["stderr"])
+        self.assertEqual(sum("fetch" in call.args[0] for call in calls.call_args_list), 2)
+        self.assertFalse((mirror / "old-generation").exists())
+
+    def test_permanent_missing_tree_emits_one_actionable_cli_diagnostic(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        path, original_run = self.root / "snapshot", local._run
+        failures = []
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            try:
+                output = original_run(command, token, *secrets)
+            except GitProcessError as error:
+                failures.append(error.diagnostic)
+                raise
+            if "--no-checkout" in command:
+                self.remove_snapshot_tree(path)
+            return output
+
+        async def checkout(payload):
+            return checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+
+        stderr = io.StringIO()
+        with patch.object(local, "_run", side_effect=run) as calls, patch.object(cli, "checkout_repo", checkout), \
+                patch.object(sys, "argv", ["github-interface", "--checkout-repo", "o/r", "--path", str(path)]), \
+                redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+            cli.main()
+        self.assertEqual(error.exception.code, 1)
+        self.assertEqual(stderr.getvalue().count("caller_diagnostic: "), 1)
+        diagnostic = json.loads(stderr.getvalue().removeprefix("caller_diagnostic: "))
+        self.assertEqual((diagnostic["operation"], diagnostic["outcome"], diagnostic["exit_code"]), ("reset", "exit", 128))
+        self.assertEqual(len(failures), 2)
+        self.assertEqual(diagnostic, failures[-1])
+        self.assertIn("fatal: unable to read tree", diagnostic["stderr"])
+        self.assertNotIn("secret", stderr.getvalue())
+        self.assertEqual(sum("--no-checkout" in call.args[0] for call in calls.call_args_list), 2)
+        self.assertFalse(path.exists())
+
+    def test_refresh_and_materialization_share_one_recovery_allowance(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        path, mirror = self.root / "snapshot", self.root / "mirrors" / "o" / "r.git"
+        mirror.mkdir(parents=True)
+        (mirror / "HEAD").write_text("not a repository\n")
+        original_run = local._run
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            output = original_run(command, token, *secrets)
+            if "--no-checkout" in command:
+                self.remove_snapshot_tree(path)
+            return output
+
+        with patch.object(local, "_run", side_effect=run) as calls, self.assertRaises(GitProcessError) as error:
+            checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+        self.assertIn("unable to read tree", error.exception.diagnostic["stderr"])
+        self.assertEqual(sum("fetch" in call.args[0] for call in calls.call_args_list), 2)
+        self.assertEqual(sum("--hard" in call.args[0] for call in calls.call_args_list), 1)
+        self.assertFalse(path.exists())
+
+    def test_missing_tree_recovery_reuses_a_concurrent_mirror_replacement(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        first, second = self.root / "first", self.root / "second"
+        mirror = self.root / "mirrors" / "o" / "r.git"
+        lock_path = mirror.parent / "r.lock"
+        materializing, release = Event(), Event()
+        original_run, resets = local._run, 0
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            nonlocal resets
+            if str(first) in command and "--hard" in command:
+                resets += 1
+                # Both the original reset and recovery reset must be unlocked.
+                with open(lock_path) as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if resets == 1:
+                    materializing.set()
+                    if not release.wait(10):
+                        raise RuntimeError("fixture did not release missing-tree materialization")
+            output = original_run(command, token, *secrets)
+            if "--no-checkout" in command and str(first) in command and resets == 0:
+                self.remove_snapshot_tree(first)
+            return output
+
+        def clone(path: Path) -> dict[str, str]:
+            return checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+
+        with patch.object(local, "_run", side_effect=run), ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(clone, first)
+            try:
+                self.assertTrue(materializing.wait(5))
+                lock_identity = lock_path.stat()
+                with open(lock_path) as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    (mirror / "HEAD").write_text("not a repository\n")
+                clone(second)
+                (mirror / "replacement-generation").touch()
+                replacement = mirror.stat()
+            finally:
+                release.set()
+            pending.result(timeout=10)
+        self.assertEqual(resets, 2)
+        self.assertTrue((mirror / "replacement-generation").exists())
+        self.assertTrue(os.path.samestat(replacement, mirror.stat()))
+        self.assertTrue(os.path.samestat(lock_identity, lock_path.stat()))
+        for path in (first, second):
+            self.assertEqual((path / "README.md").read_text(), "one\n")
+            self.assertEqual(git("status", "--porcelain", cwd=path), "")
+
+    def test_recovery_preserves_a_replaced_snapshot_destination(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        path, original_run = self.root / "snapshot", local._run
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            try:
+                output = original_run(command, token, *secrets)
+            except GitProcessError:
+                path.rename(self.root / "original")
+                path.mkdir()
+                (path / "user-work").write_text("keep")
+                raise
+            if "--no-checkout" in command:
+                self.remove_snapshot_tree(path)
+            return output
+
+        with patch.object(local, "_run", side_effect=run) as calls, self.assertRaisesRegex(RuntimeError, "destination changed"):
+            checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+        self.assertEqual((path / "user-work").read_text(), "keep")
+        self.assertEqual(sum("fetch" in call.args[0] for call in calls.call_args_list), 1)
+
+    def test_missing_tree_diagnostic_matches_bare_and_parenthesized_hashes(self) -> None:
+        base = {"operation": "reset", "outcome": "exit", "exit_code": 128, "signal": None, "errno": None, "stderr": ""}
+        for stderr in (
+            f"fatal: unable to read tree {'a' * 40}",
+            f"fatal: unable to read tree ({'b' * 40})",
+            f"fatal: unable to read tree {'c' * 64}",
+            f"fatal: unable to read tree ({'d' * 64})",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertTrue(local._is_missing_tree_reset(GitProcessError({**base, "stderr": stderr})))
+        for stderr, operation, outcome, exit_code in (
+            ("fatal: unable to read tree xyz", "reset", "exit", 128),
+            (f"fatal: unable to read tree {'a' * 40} extra", "reset", "exit", 128),
+            (f"fatal: unable to read tree ({'a' * 40}", "reset", "exit", 128),
+            ("fatal: unable to read tree", "reset", "exit", 128),
+            (f"fatal: unable to read tree {'a' * 40}", "fetch", "exit", 128),
+            (f"fatal: unable to read tree {'a' * 40}", "reset", "signal", 128),
+            (f"fatal: unable to read tree {'a' * 40}", "reset", "exit", 1),
+        ):
+            with self.subTest(stderr=stderr, operation=operation, outcome=outcome, exit_code=exit_code):
+                error = GitProcessError({**base, "operation": operation, "outcome": outcome,
+                                         "exit_code": exit_code, "stderr": stderr})
+                self.assertFalse(local._is_missing_tree_reset(error))
+        self.assertFalse(local._is_missing_tree_reset(RuntimeError("working-tree filter failed")))
+
+    def test_recovery_preserves_a_snapshot_replaced_during_cleanup(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        path, original_run, original_rmtree = self.root / "snapshot", local._run, shutil.rmtree
+        replaced = False
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            output = original_run(command, token, *secrets)
+            if "--no-checkout" in command:
+                self.remove_snapshot_tree(path)
+            return output
+
+        def rmtree(target, *args, **kwargs):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                # A concurrent replacement arriving between ownership
+                # verification and deletion.
+                path.mkdir(parents=True, exist_ok=True)
+                (path / "user-work").write_text("keep")
+            return original_rmtree(target, *args, **kwargs)
+
+        with patch.object(local, "_run", side_effect=run) as calls, patch.object(shutil, "rmtree", side_effect=rmtree), \
+                self.assertRaisesRegex(RuntimeError, "destination changed"):
+            checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+        self.assertEqual((path / "user-work").read_text(), "keep")
+        self.assertEqual(sum("fetch" in call.args[0] for call in calls.call_args_list), 1)
+
+    def test_refuses_a_destination_created_while_waiting_for_the_lock(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        path, original_flock = self.root / "snapshot", fcntl.flock
+
+        def flock(descriptor, operation):
+            if operation == fcntl.LOCK_EX:
+                path.mkdir()
+                (path / "user-work").write_text("keep")
+            return original_flock(descriptor, operation)
+
+        with patch.object(local.fcntl, "flock", side_effect=flock), self.assertRaises(FileExistsError):
+            checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+        self.assertEqual((path / "user-work").read_text(), "keep")
 
     def test_slow_worktree_does_not_hold_another_checkout_behind_the_mirror(self) -> None:
         self.addCleanup(shutil.rmtree, self.root)

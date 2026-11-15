@@ -50,7 +50,9 @@ export async function readLegacyConversation(id: string): Promise<LegacyConversa
   for (let index = rows.length - 1; index >= 0; index--) {
     const row = rows[index]
     if (kept.length >= IMPORT_MAX_REPLIES) { omitted = index + 1; break }
-    const { body } = await fetchAgentResponse(row.id)
+    const response = await fetchAgentResponse(row.id, 'legacy-chat-import')
+    if ('disposition' in response) throw new Error(response.reason)
+    const { body } = response
     const size = Buffer.byteLength(row.prompt, 'utf8') + Buffer.byteLength(body, 'utf8')
     if (kept.length > 0 && bytes + size > IMPORT_MAX_BYTES) { omitted = index + 1; break }
     bytes += size

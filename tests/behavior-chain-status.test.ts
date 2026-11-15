@@ -106,6 +106,28 @@ it('does not let an earlier successful rollup hide a later same-head failing che
   expect(reply.rows[0]).toMatchObject({ ci: { state: 'FAILURE' }, blocker: { id: 'ci_failing' } })
 })
 
+it('omits a pre-Resume wait from PR status without hiding fresh waits or review and admission gates', async () => {
+  const { runtime, journal, chain, obs, status } = await setup()
+  const reason = 'Old blocker; explicitly Resume. Report https://github.com/example/repo/issues/99'
+  Object.assign(obs.pull!, { pending: false, checksState: 'SUCCESS' })
+  let current = record(journal, chain, { type: 'chain.observed', observation: obs })
+  current = record(journal, current, { type: 'chain.waiting', reason })
+  current = record(journal, current, { type: 'chain.held', reason: 'automatic hold' })
+  current = record(journal, current, { type: 'chain.resumed' })
+  const read = async () => (await status.readPrStatus(50)).rows[0]
+  const resumed = await read()
+  expect(resumed.blocker.id).toBe('awaiting_review')
+  expect(resumed.blocker.details).not.toContain(reason)
+  current = record(journal, current, { type: 'chain.observed', observation: { ...obs, checkedAt: Date.now() } })
+  expect((await read()).blocker).toEqual(resumed.blocker)
+  current = record(journal, current, { type: 'chain.waiting', reason })
+  expect((await read()).blocker).toMatchObject({ id: 'blocked', line: `v2 waiting: ${reason}` })
+  expect((await read()).blocker.details).toContain(reason)
+  runtime.setEnabled('review-new-prs', false)
+  expect((await read()).blocker.line).toContain('review-new-prs is disabled')
+  expect(journal.read(chain.id)).toEqual(current)
+})
+
 it.each(['stale', 'future'])('keeps %s observations unknown instead of reporting zero completed reviews or green CI', async (kind) => {
   const { status, obs } = await setup()
   const now = kind === 'stale' ? obs.checkedAt + 121_000 : obs.checkedAt - 1
@@ -163,7 +185,7 @@ it.each(['merged', 'closed-pr', 'closed-seed'] as const)('distinguishes immediat
   const before = journal.history(chain.id)
   expect(journal.reconcilable('', now, false).map(row => row.id)).toContain(chain.id)
   expect(journal.reconciliationAt(current)).toBeNull()
-  expect(behaviorChainSummary(current, { at: journal.reconciliationAt(current) }).reconciliation).toMatchObject({
+  expect(behaviorChainSummary(current, journal, { at: journal.reconciliationAt(current) }).reconciliation).toMatchObject({
     nextObservationAt: null, waitingForOriginalResponse: false, waitingForResourceRelease: true })
   const reply = await status.readPrStatus(50, now)
   expect(reply.health.status).toBe('ok')
@@ -184,7 +206,7 @@ it.each(['review-pr', 'approve-pr'] as const)('keeps open-PR %s observation elig
   current = record(journal, current, { type: 'chain.observed', observation: obs })
   const before = journal.history(chain.id)
   expect(journal.reconciliationAt(current)).toBe(0)
-  expect(behaviorChainSummary(current, { at: 0 }).reconciliation).toEqual({ nextObservationAt: 0, waitingForOriginalResponse: false })
+  expect(behaviorChainSummary(current, journal, { at: 0 }).reconciliation).toEqual({ nextObservationAt: 0, waitingForOriginalResponse: false })
   expect(journal.reconcilable('', Date.now(), false).map(row => row.id)).toContain(chain.id)
   expect(journal.liveModelInvocationCount()).toBe(1)
   expect(journal.history(chain.id)).toEqual(before)
@@ -282,7 +304,7 @@ it.each(['never-enqueued', 'old-head', 'earlier-removal'] as const)('does not le
   expect(row.blocker).toMatchObject({ id: 'ci_pending', line: 'v2 exact-head CI is running' })
 })
 
-it.each(['enqueued', 'in_queue'] as const)('distinguishes the original %s response from somebody else queueing the candidate', async (outcome) => {
+it.each(['enqueued', 'in_queue'] as const)('distinguishes the original %s response from somebody else queueing the candidate, including UNMERGEABLE', async (outcome) => {
   const { journal, chain, obs, status } = await setup()
   let current = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'queue-action', behavior: 'merge-pr',
     actor: chain.reviewer, model: null, slot: null, basis: 'queue', admittedAt: Date.now(),
@@ -298,11 +320,31 @@ it.each(['enqueued', 'in_queue'] as const)('distinguishes the original %s respon
   const row = (await status.readPrStatus(50)).rows[0]
   expect(row.queue).toMatchObject({ state: 'queued', attribution: outcome === 'enqueued' ? 'accepted-response' : 'observed' })
   expect(row.blocker.line).toContain(outcome === 'enqueued' ? 'enqueue accepted' : 'enqueue mutation is not attributed')
-  const summary = behaviorChainSummary(current)
+  const summary = behaviorChainSummary(current, journal)
   expect(summary.invocations[0].nativeAction).toMatchObject({
     attribution: outcome === 'enqueued' ? 'accepted-response' : 'observed-no-action', queueEntryId: 'real-entry',
   })
   expect(JSON.stringify(summary)).not.toContain('nativeActionReceipt')
+  obs.pull!.queueEntryDetails = { id: 'real-entry', state: 'UNMERGEABLE', base: MERGE, head: null }
+  current = record(journal, current, { type: 'chain.observed', observation: obs })
+  const blocked = (await status.readPrStatus(50)).rows[0]
+  expect(blocked).toMatchObject({ queue: { state: 'queued', entryId: 'real-entry',
+    attribution: outcome === 'enqueued' ? 'accepted-response' : 'observed', disposition: 'UNMERGEABLE', integrationBase: MERGE, integrationHead: null },
+  blocker: { id: 'blocked', line: 'v2 queue UNMERGEABLE; cause unknown; GitHub retains ownership' } })
+  expect(journal.read(chain.id)!.held).toBeNull()
+  for (const disposition of ['QUEUED', 'AWAITING_CHECKS', 'LOCKED', 'MERGEABLE']) {
+    obs.pull!.queueEntryDetails.state = disposition
+    current = record(journal, current, { type: 'chain.observed', observation: obs })
+    expect((await status.readPrStatus(50)).rows[0]).toMatchObject({ queue: { state: 'queued', disposition }, blocker: { id: 'in_queue' } })
+  }
+  obs.pull!.queueEntryDetails.state = 'UNMERGEABLE'
+  // A replaced entry cannot inherit the earlier entry's disposition.
+  obs.pull!.queueEntry = 'replacement'
+  current = record(journal, current, { type: 'chain.observed', observation: obs })
+  expect((await status.readPrStatus(50)).rows[0]).toMatchObject({ queue: { state: 'queued', entryId: 'replacement', attribution: 'observed' },
+    blocker: { id: 'in_queue' } })
+  record(journal, current, { type: 'chain.observed', observation: obs })
+  expect((await status.readPrStatus(50, Date.now() + 120_001)).rows[0]).toMatchObject({ queue: { state: 'unknown' }, blocker: { id: 'unknown' } })
 })
 
 it('preserves the original enqueue attribution after a later no-action observation of the same entry', async () => {
@@ -324,7 +366,7 @@ it('preserves the original enqueue attribution after a later no-action observati
   record(journal, current, { type: 'chain.observed', observation: obs })
   const row = (await status.readPrStatus(50)).rows[0]
   expect(row.queue).toMatchObject({ state: 'queued', entryId: 'original-entry', attribution: 'accepted-response', invocationId: 'queue-enqueued' })
-  expect(behaviorChainSummary(current).invocations[1].nativeAction?.attribution).toBe('observed-no-action')
+  expect(behaviorChainSummary(current, journal).invocations[1].nativeAction?.attribution).toBe('observed-no-action')
 })
 
 it('keeps a paused chain and a legacy PR under their respective status rules', async () => {
@@ -399,13 +441,51 @@ it('keeps durable model reservations visible after replacing the process-local s
   current = record(journal, current, { type: 'invocation.uncertain', invocationId: 'surviving-model', reason: 'native process ownership unresolved' })
   runtime.setBehaviorCheckSlots(new CheckSemaphore(() => 4))
   expect(runtime.getBehaviorCheckSlots().stats().running).toBe(0)
-  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'available', reservedModelInvocations: 1,
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'available', reservedModelInvocations: 1, retainedModelInvocations: 1,
     modelInvocationLimit: 3, enabled: true, mode: 'v2', intake: { seedMode: 'label', label: 'work-ready' },
     processLocal: { behaviorRunning: 0 }, resources: { unaccounted: 1 } })
   record(journal, current, { type: 'invocation.reconciled', invocationId: 'surviving-model',
     evidence: { resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
-  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 0 })
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 0, retainedModelInvocations: 0 })
   expect(journal.read(chain.id)!.invocations[0].state).toBe('uncertain')
+})
+
+it('counts retained cleanup across pages without counting released publication uncertainty or changing holds', async () => {
+  const { runtime, journal, chain, obs } = await setup()
+  const invocation = { id: 'live', behavior: 'repair-pr' as const, actor: chain.author, model: 'fixture', slot: 'primary',
+    basis: 'repair', admittedAt: Date.now(), request: { command: 'agent-interface' as const, cwd: '/fixture', argv: [], nativeResources: 2 as const } }
+  const live = record(journal, chain, { type: 'invocation.admitted', invocation })
+  record(journal, live, { type: 'invocation.started', invocationId: invocation.id })
+  for (let issue = 1000; issue < 1101; issue++) journal.append(chainIdentity(pr.repo, issue), `seed-${issue}`, 0, {
+    type: 'chain.admitted', repository: pr.repo, issue, branch: `poise/issue-${issue}`, author: chain.author, reviewer: chain.reviewer })
+  const release = { resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } }
+  for (const issue of [998, 999]) {
+    let target = journal.append(chainIdentity(pr.repo, issue), `seed-${issue}`, 0, { type: 'chain.admitted', repository: pr.repo,
+      issue, branch: `poise/issue-${issue}`, author: chain.author, reviewer: chain.reviewer })
+    target = record(journal, target, { type: 'chain.observed', observation: { ...obs, pull: null,
+      publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } } })
+    target = record(journal, target, { type: 'invocation.admitted', invocation: { ...invocation, id: `uncertain-${issue}` } })
+    target = record(journal, target, { type: 'invocation.uncertain', invocationId: `uncertain-${issue}`, reason: 'original publication receipt missing' })
+    if (issue === 998) target = record(journal, target, { type: 'invocation.resources_reconciled', invocationId: `uncertain-${issue}`, evidence: release })
+    record(journal, target, { type: 'chain.held', reason: 'original publication receipt missing' })
+  }
+  let retained = journal.read(chainIdentity(pr.repo, 999))!
+  expect(journal.page().map(entry => entry.id)).not.toContain(retained.id)
+  const before = journal.history(retained.id)
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 2, retainedModelInvocations: 1 })
+  expect(journal.liveModelInvocationCount()).toBe(2)
+  expect(journal.modelCapacityAvailable(2)).toBe(false)
+  expect(journal.history(retained.id)).toEqual(before)
+  retained = record(journal, retained, { type: 'invocation.reconciled', invocationId: 'uncertain-999',
+    evidence: { ...release, resource_ownership: { version: 1, roots: [], errors: [], process_pending: true } } })
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 2, retainedModelInvocations: 1 })
+  journal.rebuild()
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 2, retainedModelInvocations: 1 })
+  record(journal, retained, { type: 'invocation.resources_reconciled', invocationId: 'uncertain-999', evidence: release })
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ reservedModelInvocations: 1, retainedModelInvocations: 0 })
+  for (const issue of [998, 999]) expect(journal.read(chainIdentity(pr.repo, issue))).toMatchObject({
+    held: 'original publication receipt missing', invocations: [{ state: 'uncertain', outcome: 'original publication receipt missing' }] })
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
 })
 
 it('reports budget exhaustion from the same reservation snapshot that refuses another admission', async () => {
@@ -439,14 +519,14 @@ it('keeps a full durable ceiling distinct from an empty in-memory semaphore and 
     processLocal: { behaviorRunning: 0, allRunning: 0 } })
   expect(journal.modelCapacityAvailable(1)).toBe(false)
   vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', 'invalid')
-  try { expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'unavailable', reservedModelInvocations: null }) }
+  try { expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'unavailable', reservedModelInvocations: null, retainedModelInvocations: null }) }
   finally { vi.unstubAllEnvs() }
 })
 
 it('reports unavailable capacity as unknown instead of free', async () => {
   const { db, runtime, chain } = await setup()
   db.db.prepare("UPDATE behavior_chain_current SET state = json_set(state, '$.held', 'unrecorded change') WHERE chain_id = ?").run(chain.id)
-  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'unavailable', reservedModelInvocations: null, enabled: null })
+  expect(runtime.getBehaviorChainCapacity()).toMatchObject({ status: 'unavailable', reservedModelInvocations: null, retainedModelInvocations: null, enabled: null })
 })
 
 it('looks up a target beside 1,000 historical chains without loading their projections', async () => {

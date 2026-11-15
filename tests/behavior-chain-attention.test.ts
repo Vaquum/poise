@@ -17,6 +17,26 @@ function admit(journal: BehaviorChainJournal, issue: number, at: number) {
     issue, branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' }, at)
 }
 
+it('links a prerequisite from current delivery evidence and drops the link when the observation expires', () => {
+  const journal = new BehaviorChainJournal(db)
+  let chain = admit(journal, 7, now)
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const base = 'a'.repeat(40)
+  const wait = 'Waiting for prerequisite autonomio/poise#6: prerequisite is open'
+  const observation: ChainObservation = { checkedAt: now, issue: { open: true, eligible: true, revision: 'seed', commentIds: [] },
+    issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer, existingPulls: [],
+    publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null,
+    prerequisites: { wait, base, evidence: [
+      { repo: 'autonomio/poise', number: 7, found: true, complete: true, prerequisites: [{ repo: 'autonomio/poise', number: 6 }] },
+      { repository: 'autonomio/poise', issue_number: 6, base_sha: base, verified: false, state: 'open' },
+    ] } }
+  chain = append(journal, chain, { type: 'chain.observed', observation })
+  chain = append(journal, chain, { type: 'chain.waiting', reason: wait })
+  expect(behaviorChainAttention(journal, now)[0].nudge).toMatchObject({ kind: 'prerequisite', prerequisite: 'autonomio/poise#6' })
+  expect(behaviorChainAttention(journal, now + 120_001)).toEqual([])
+  expect(journal.read(chain.id)).toEqual(chain)
+})
+
 it('freezes the three reported holds alongside exact-head CI and review gates, oldest progress first', () => {
   const journal = new BehaviorChainJournal(db)
   const snapshot = delayedChainFixture(journal, now)
@@ -96,6 +116,35 @@ it('selects an oldest unpublished admission beyond page one and applies the exac
   expect(result.map(entry => entry.issue)).toEqual([999, 998])
   expect(result[0]).toMatchObject({ progressAt: now - 4 * CHAIN_ATTENTION_DELAY_MS, pullNumber: null,
     step: 'Issue admission', evidence: { state: 'unavailable' } })
+})
+
+it('carries each attention row’s hold, sequence and merge evidence past the first page', () => {
+  const journal = new BehaviorChainJournal(db)
+  for (let issue = 1000; issue < 1101; issue++) admit(journal, issue, now)
+  let held = admit(journal, 999, now)
+  held = append(journal, held, { type: 'chain.held', reason: 'New invocations held by the person' }, now)
+  let merged = admit(journal, 998, now)
+  merged = append(journal, merged, { type: 'chain.held', reason: 'qualifying original pre-merge review evidence is missing' }, now)
+  const mergeSha = 'c'.repeat(40)
+  merged = append(journal, merged, { type: 'chain.merged', mergeSha,
+    evidence: { repository: 'autonomio/poise', pull_number: 998, merged: true, merge_sha: mergeSha, review_complete: false } }, now)
+  let uncertain = admit(journal, 997, now)
+  uncertain = append(journal, uncertain, { type: 'invocation.admitted', invocation: { id: 'original', behavior: 'implement-issue',
+    actor: 'author', model: 'fixture', slot: 'primary', basis: 'original', admittedAt: now,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, now)
+  uncertain = append(journal, uncertain, { type: 'invocation.uncertain', invocationId: 'original', reason: 'original receipt unverified' }, now)
+  const first = journal.active().map(chain => chain.id)
+  expect(first).toHaveLength(100)
+  expect(first).not.toContain(held.id)
+  expect(first).not.toContain(merged.id)
+  expect(first).not.toContain(uncertain.id)
+  const entries = behaviorChainAttention(journal, now)
+  expect(entries.map(entry => entry.issue).sort((a, b) => a - b)).toEqual([997, 998, 999])
+  expect(entries.find(entry => entry.id === held.id)).toMatchObject({ held: 'New invocations held by the person',
+    sequence: held.sequence, mergeSha: null, progressAt: now })
+  expect(entries.find(entry => entry.id === merged.id)).toMatchObject({
+    held: 'qualifying original pre-merge review evidence is missing', sequence: merged.sequence, mergeSha })
+  expect(entries.find(entry => entry.id === uncertain.id)).toMatchObject({ held: null, sequence: uncertain.sequence, mergeSha: null })
 })
 
 it('advances the age when blocking outdated conversations resolve while live threads stay zero', () => {
@@ -283,6 +332,9 @@ it('distinguishes known retry eligibility from a hold and an unknown provider ba
   chain = append(journal, chain, { type: 'chain.waiting', reason: 'implement-issue is in native failure backoff' })
   chain = append(journal, chain, { type: 'chain.resumed' })
   expect(behaviorChainAttention(journal, now)[0].retryAt).toBeNull()
+  expect(behaviorChainAttention(journal, now)[0].step).toBe('Issue admission')
+  expect(behaviorChainAttention(journal, now)[0].blocker).not.toContain('native failure backoff')
+  expect(behaviorChainAttention(journal, now)[0].nextAction).toBe('Await a fresh, complete chain observation')
   append(journal, chain, { type: 'chain.held', reason: 'person intervention required' })
   expect(behaviorChainAttention(journal, now)[0].retryAt).toBeNull()
 })
@@ -1047,7 +1099,7 @@ it('directs a fully verified approved head to merge-pr', () => {
   const callId = chainBasis('review-988').slice(0, 32)
   const response = { repository: 'autonomio/poise', pull_number: 988, reviewer: 'reviewer', model: 'fixture',
     invocation_id: callId, head_sha: head, context_sha: 'b'.repeat(64), completed_at: admittedAt + 40_000,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
     issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
@@ -1226,7 +1278,7 @@ it('waits for the merge artifact instead of repeating merge-pr', () => {
   const callId = chainBasis('review-990').slice(0, 32)
   const response = { repository: 'autonomio/poise', pull_number: 990, reviewer: 'reviewer', model: 'fixture',
     invocation_id: callId, head_sha: head, context_sha: 'b'.repeat(64), completed_at: admittedAt + 40_000,
-    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+    coverage: 'complete', assessment: { verdict: 'The changed validation has no remaining blocking defects.',
       reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
   const mergeBasis = chainBasis(['merge', head, null])
   const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],

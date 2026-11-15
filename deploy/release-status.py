@@ -1,10 +1,10 @@
-"""Read-only release diagnosis for the Sync workflow's existing operator summary.
+"""Release diagnosis and opt-in drain reporting for Sync's operator summary.
 
 Only the private diagnostic episode is written on the deployment host. Release
 controls, rollout receipts and workspace proof files are never changed.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
@@ -83,6 +83,7 @@ def collect(repo):
         if run['status'] == 'completed':
             answer = read(f'repos/{repo}/actions/runs/{run["id"]}/jobs?per_page=100')
             if isinstance(answer, dict) and isinstance(answer.get('jobs'), list):
+                run['jobs'] = answer['jobs']
                 run['steps'] = [step for job in answer['jobs'] for step in job.get('steps', [])]
             else:
                 errors.append(f'Deploy {run["id"]}: steps unavailable')
@@ -103,6 +104,7 @@ def workspace_proof(deploy, candidate, remembered=frozenset()):
     workspace that vanishes mid-episode cannot clear it by absence.
     """
     notes, errors, expected, serving = [], [], set(remembered), []
+    drains, resumed = {}, set()
     store = deploy / '.env.workspace-proof.rollouts'
     pointer = target = image = rollout_state = None
     try:
@@ -158,6 +160,10 @@ def workspace_proof(deploy, candidate, remembered=frozenset()):
                     or not SHA.fullmatch(release) or health.get('version') != release:
                 raise ValueError('health does not verify the active release/build')
             serving.append(f'{handle}: {release}')
+            if health.get('draining') is True:
+                drains[handle] = health
+            elif health.get('draining') is False and not health.get('switching'):
+                resumed.add(handle)
             notes.append(f'{handle}: active {release}; desired {health.get("desiredRelease")}; '
                          f'switching {health.get("switching")}; pending since {health.get("pendingSince")}; '
                          f'waiting on {health.get("switchWaitingOn")}; drain {health.get("draining")}; '
@@ -180,6 +186,8 @@ def workspace_proof(deploy, candidate, remembered=frozenset()):
     return dict(current=bool(expected) and expected <= proven and target == candidate and not errors,
                 serving=serving, notes=notes, errors=errors, rollout=pointer, switching=switching and target == candidate, lag=lag,
                 rollout_state=rollout_state if pointer else None, rollout_target=target if pointer else None,
+                image=image if pointer else None, drains=drains, resumed=bool(expected) and expected <= resumed,
+                last_observation=receipt.splitlines()[-1] if pointer and len(receipt.splitlines()) > 6 else 'unavailable',
                 expected=sorted(expected))
 
 
@@ -250,6 +258,10 @@ def observe(evidence):
         if state is not None and (not isinstance(state, dict) or not re.fullmatch(r'[0-9a-f]{32}', state.get('id', ''))
                                   or not isinstance(state.get('since'), str) or not isinstance(state.get('notified'), bool)
                                   or not isinstance(state.get('handles', []), list)
+                                  or not isinstance(state.get('drain_active', False), bool)
+                                  or (state.get('report') is not None and
+                                      (not isinstance(state['report'], dict)
+                                       or not re.fullmatch(r'[\w.-]+/[\w.-]+', state['report'].get('repository', ''))))
                                   or any(not isinstance(handle, str) or not handle or ' ' in handle
                                          for handle in state.get('handles', []))):
             raise ValueError('invalid retained release-lag condition; refusing to reset it')
@@ -261,7 +273,15 @@ def observe(evidence):
                          expected=sorted(remembered))
         evidence['errors'].extend(proof['errors'])
         now = datetime.now(timezone.utc)
-        recovered = evidence['includes_upstream'] and proof['current'] and not evidence['errors']
+        # Admissions can resume before the candidate contains upstream. Rearm
+        # reporting at that verified boundary without resetting the lag clock.
+        if state and state.get('drain_active') and proof.get('resumed') and not proof['errors']:
+            state['id'] = uuid4().hex
+            state['drain_active'] = False
+            state['report_after'] = now.isoformat()
+            state.pop('report', None)
+        recovered = evidence['includes_upstream'] and proof['current'] and not evidence['errors'] \
+            and not proof.get('drains') and (not state or not state.get('drain_active') or proof.get('resumed'))
         reason, action, paused = stage(evidence, proof)
         if recovered:
             status = 'recovered' if state else 'current'
@@ -281,14 +301,34 @@ def observe(evidence):
         warning = bool(state) and not recovered and not paused and age >= GRACE_SECONDS and not state['notified']
         if warning:
             state['notified'] = True
+        if state and proof.get('drains'):
+            state['drain_active'] = True
+        reportable = bool(state) and not recovered and not evidence['errors'] \
+            and proof.get('rollout_state') == 'pending' and bool(proof.get('drains'))
+        update = evidence.get('report_update')
+        reserved = False
+        if update and state and update['id'] == state['id']:
+            existing = state.get('report')
+            if existing and existing['repository'] != update['repository']:
+                raise ValueError('report destination changed during an unresolved publication')
+            if update['action'] == 'reserve' and reportable and update['rollout'] == proof['rollout'] and not existing:
+                state['report'] = dict(repository=update['repository'])
+                reserved = True
+            elif update['action'] == 'published':
+                state['report'] = dict(repository=update['repository'], url=update['url'])
+            elif update['action'] == 'rejected' and existing and not existing.get('url'):
+                state.pop('report')
         summary = render(evidence, proof, state, status, reason, action)
-        # Store only diagnostic identity/age/inventory, never release authority
+        # Store diagnostic identity/age/inventory and issue intent, never release authority
         # or a new rollout format. A newer tip cannot replace an unresolved episode.
         with tempfile.NamedTemporaryFile(mode='w', dir=deploy, prefix='.env.release-lag.', delete=False) as file:
             json.dump(None if recovered else state, file)
             temporary = Path(file.name)
         temporary.replace(state_path)
-        return dict(summary=summary, warning=warning)
+        return dict(summary=summary, warning=warning, reserved=reserved,
+                    report=dict(id=state['id'], since=state['since'], proof=proof,
+                                after=state.get('report_after'), publication=state.get('report'),
+                                observed_at=now.isoformat(), action=action) if reportable else None)
 
 
 def render(evidence, proof, state, status, reason, action):
@@ -296,6 +336,8 @@ def render(evidence, proof, state, status, reason, action):
     lines = [f'### Production release: {status}', '', f'First waiting or failed stage: **{reason}**.', '', f'Next action: {action}', '']
     if state:
         lines += [f'Condition `{state["id"]}`; first observed {state["since"]}. Fixed grace: 30 minutes.', '']
+        if state.get('report'):
+            lines += [f'Drain report: {state["report"].get("url") or "publication outcome unconfirmed; reconcile the condition marker before another POST"}.', '']
     for label, repository, sha in (('Upstream tip', UPSTREAM, evidence['upstream']), ('Fork candidate', repo, evidence['candidate'])):
         lines.append(f'- {label}: [{sha}](https://github.com/{repository}/commit/{sha})' if sha else f'- {label}: unavailable')
     lines.append('- Serving now (fresh health): ' + ('; '.join(proof['serving']) or 'unavailable'))
@@ -311,30 +353,202 @@ def render(evidence, proof, state, status, reason, action):
     return '\n'.join(lines)
 
 
-def main():
-    evidence = collect(os.environ['REPO'])
+def remote(evidence, timeout=300):
     # Ship this observer, not the possibly stale production checkout's code.
     # Inputs and code use stdin; no credential or operator value becomes shell syntax.
     program = 'import json\nEVIDENCE = json.loads(' + repr(json.dumps(evidence)) + ')\n' + Path(__file__).read_text()
+    return json.loads(command(['ssh', 'poise-server', 'python3', '-', '--remote'], input=program, timeout=timeout))
+
+
+def exhausted_verifier(evidence, report, deadline):
+    """A failed workflow alone does not prove exhaustion of this rollout."""
+    proof = report['proof']
+    target = proof['rollout_target']
+    for run in evidence['workflows']['deploy.yml']['runs']:
+        if time.monotonic() >= deadline:
+            raise ValueError('drain report evidence exceeded two minutes; retry next observation')
+        if run['status'] != 'completed':
+            continue
+        jobs = run.get('jobs')
+        if jobs is None:
+            jobs = json.loads(command(['gh', 'api', f'repos/{evidence["repo"]}/actions/runs/{run["id"]}/jobs?per_page=100'],
+                                      timeout=min(30, max(1, deadline - time.monotonic()))))['jobs']
+        for job in jobs:
+            if time.monotonic() >= deadline:
+                raise ValueError('drain report evidence exceeded two minutes; retry next observation')
+            steps = job.get('steps', [])
+            applies = [step for step in steps if step.get('name') == f'Deploy {target}' and step.get('conclusion') == 'success']
+            verifiers = [step for step in steps if step.get('name') == f'Verify rollout {target}' and step.get('conclusion') == 'failure']
+            if not applies or not verifiers:
+                continue
+            apply, verify = applies[0], verifiers[0]
+            if not all(step.get(key) for step, key in ((apply, 'completed_at'), (verify, 'started_at'), (verify, 'completed_at'))):
+                continue
+            started = datetime.fromisoformat(verify['started_at'].replace('Z', '+00:00'))
+            ended = datetime.fromisoformat(verify['completed_at'].replace('Z', '+00:00'))
+            if datetime.fromisoformat(apply['completed_at'].replace('Z', '+00:00')) > started \
+                    or (ended - started).total_seconds() < 600:
+                continue
+            log = command(['gh', 'api', f'repos/{evidence["repo"]}/actions/jobs/{job["id"]}/logs'],
+                          timeout=min(30, max(1, deadline - time.monotonic())))
+            messages = []
+            for line in log.splitlines():
+                stamp, _, message = line.partition(' ')
+                if re.fullmatch(r'\d{4}-\d\d-\d\dT[\d:.]+Z', stamp):
+                    at = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                    # Actions step times have whole-second precision; log
+                    # lines in the completion second retain fractions.
+                    if started <= at < ended + timedelta(seconds=1):
+                        messages.append((at, message))
+            receipt = f'Rollout {proof["rollout"]}: pending (release {target}, image {proof["image"]}).'
+            timeout = f'poise: the deploy of {target} is still pending after 600s: these workspaces do not serve it yet:'
+            if any(message == receipt for _, message in messages):
+                for at, message in messages:
+                    if message == timeout and (at - started).total_seconds() >= 600 \
+                            and (not report['after'] or at > datetime.fromisoformat(report['after'])):
+                        return f'{run["html_url"]}/job/{job["id"]}', f'{at.isoformat()} {message}'
+    return None
+
+
+def publish_report(evidence, answer):
+    repository = os.environ.get('POISE_RELEASE_REPORT_REPOSITORY', '')
+    if not repository:
+        return 'Drain issue publication disabled (POISE_RELEASE_REPORT_REPOSITORY is unset).'
+    if not re.fullmatch(r'[\w.-]+/[\w.-]+', repository):
+        raise ValueError('invalid POISE_RELEASE_REPORT_REPOSITORY; expected owner/repo')
+    token = os.environ.get('POISE_RELEASE_REPORT_TOKEN', '')
+    if not token:
+        raise ValueError('POISE_RELEASE_REPORT_TOKEN is required for the explicitly configured issue destination')
+    report = answer.get('report')
+    if not report:
+        return 'No verified stalled replacement drain to report.'
+    publication = report['publication']
+    if publication and publication['repository'] != repository:
+        raise ValueError('report destination changed during an unresolved publication; reconcile the original destination')
+    if publication and publication.get('url'):
+        return f'Drain issue retained: {publication["url"]} (recovery does not close it).'
+    deadline = time.monotonic() + 120
+    verification = exhausted_verifier(evidence, report, deadline)
+    if not verification:
+        return 'No exact retained rollout with an exhausted 600-second verifier; no issue created.'
+    marker = f'<!-- poise-release-drain {evidence["repo"]} {report["id"]} -->'
+    env = dict(os.environ, GH_TOKEN=token)
+
+    def api(path):
+        if time.monotonic() >= deadline:
+            raise ValueError('drain issue lookup exceeded two minutes; retry next observation')
+        return json.loads(command(['gh', 'api', f'repos/{repository}/{path}'], env=env,
+                                  timeout=min(30, deadline - time.monotonic())))
+
+    update = dict(id=report['id'], repository=repository, rollout=report['proof']['rollout'])
+
+    def record(action, **fields):
+        if time.monotonic() >= deadline:
+            raise ValueError('drain publication exceeded two minutes; reconcile next observation')
+        return remote(dict(evidence, report_update=dict(update, action=action, **fields)),
+                      timeout=min(30, deadline - time.monotonic()))
+
+    # Read issues directly, including closed and unlabelled ones. Identity must
+    # not depend on a search index or the deployment host's clock.
+    for page in range(1, 31):
+        issues = api(f'issues?state=all&sort=created&direction=desc&per_page=100&page={page}')
+        if not isinstance(issues, list) or any(not isinstance(issue, dict) for issue in issues):
+            raise ValueError('issue lookup returned an invalid page; creation refused')
+        for issue in issues:
+            if 'pull_request' not in issue and marker in (issue.get('body') or ''):
+                url = issue['html_url']
+                record('published', url=url)
+                return f'Drain issue reconciled: {url} (including closed remediation).'
+        if len(issues) < 100:
+            break
+    else:
+        raise ValueError('issue lookup exceeded 30 pages; absence unverified, creation refused')
+    if publication:
+        raise ValueError('issue creation outcome unconfirmed; marker not yet found; retry reconciliation next observation, no second POST')
+    observation = os.environ.get('GITHUB_RUN_ID', '')
+    if not re.fullmatch(r'[1-9][0-9]*', observation):
+        raise ValueError('GITHUB_RUN_ID is required to link the fresh drain observation')
+    if deadline - time.monotonic() < 30:
+        raise ValueError('drain publication has insufficient time to create; retry next observation')
+    fresh = record('reserve')
+    if not fresh['reserved']:
+        return 'Drain or publication state changed during lookup; no issue created.'
+    report = fresh['report']
+    proof = report['proof']
+    lines = [marker, '', 'A replacement drain is still pausing production admissions after exact rollout verification exhausted its 600-second wait.', '',
+             f'- Requested release: `{proof["rollout_target"]}`; current fork candidate: `{evidence["candidate"]}`.',
+             f'- Retained rollout: `{proof["rollout"]}`; image `{proof["image"]}`.',
+             f'- Condition: `{report["id"]}`; release lag first observed {report["since"]}.',
+             f'- [Failed verification]({verification[0]}): `{verification[1]}`',
+             f'- [Fresh Sync observation](https://github.com/{evidence["repo"]}/actions/runs/{observation}) at {report["observed_at"]}.',
+             f'- Last retained rollout observation: `{proof["last_observation"]}`. Later progress: unavailable.',
+             f'- Next recorded action: {report["action"]}', '']
+    for handle, health in proof['drains'].items():
+        hold = health.get('nativeCleanupHold')
+        blocker = health.get('switchWaitingOn')
+        if not blocker and isinstance(hold, dict):
+            blocker = f'native cleanup Call {hold.get("callId") or "unavailable"}: {hold.get("reason") or "reason unavailable"}'
+        lines += [f'- Workspace `{handle}`: serving `{health["release"]}`; admissions paused (`draining=True`); '
+                  f'desired `{health.get("desiredRelease")}`; switching `{health.get("switching")}`; pending since `{health.get("pendingSince")}`.',
+                  f'  Known blocker: {blocker or "unavailable in health"}; running Caller {health.get("runningCallerCalls")}; '
+                  f'unsettled native Calls {health.get("unsettledNativeCalls")}; background work {health.get("backgroundWork")}; '
+                  f'active Chat turns {health.get("activeChatTurns")}.']
+    lines += ['', 'Inspect the retained blocker and allow the normal replacement/cleanup path to settle. Preserve rollout verification and native safety gates. Recovery does not close this remediation.']
+    if time.monotonic() >= deadline:
+        raise ValueError('drain publication exceeded two minutes before POST; reconcile reserved intent next observation')
     try:
-        answer = json.loads(subprocess.run(['ssh', 'poise-server', 'python3', '-', '--remote'], input=program,
-                                          check=True, capture_output=True, text=True, timeout=300).stdout)
+        result = subprocess.run(['gh', 'api', '--include', '--method', 'POST', f'repos/{repository}/issues', '--input', '-'],
+                                input=json.dumps(dict(title=f'Production replacement drain stalled in {evidence["repo"]}',
+                                                      body='\n'.join(lines), labels=['poise'])),
+                                env=env, capture_output=True, text=True, timeout=min(30, deadline - time.monotonic()))
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError('issue creation outcome unknown; intent retained; reconcile next observation') from error
+    statuses = re.findall(r'^HTTP/\S+ (\d{3})', result.stdout, re.MULTILINE)
+    status = int(statuses[-1]) if statuses else None
+    if result.returncode != 0 and status in (400, 401, 403, 404, 405, 410, 415, 422, 429):
+        record('rejected')
+        raise ValueError(f'issue creation rejected (HTTP {status}): {result.stderr.strip()[:1024]}; retry next observation')
+    if result.returncode != 0 or status != 201:
+        raise ValueError('issue creation outcome unknown; intent retained; reconcile next observation')
+    created = json.loads(re.split(r'\r?\n\r?\n', result.stdout, maxsplit=1)[-1])
+    url = created['html_url']
+    if not re.fullmatch(rf'https://github.com/{re.escape(repository)}/issues/[1-9][0-9]*', url):
+        raise ValueError('issue creation response unverified; intent retained; reconcile next observation')
+    record('published', url=url)
+    return f'Drain issue created: {url}.'
+
+
+def main():
+    evidence = collect(os.environ['REPO'])
+    try:
+        answer = remote(evidence)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         detail = error.stderr.strip()[:2048] if isinstance(error, subprocess.CalledProcessError) else str(error)
         evidence['errors'].append(f'deployment host observation unavailable ({detail}); retained condition cannot be cleared or reset')
         proof = dict(current=False, serving=[], notes=[], rollout=None)
         reason, action, _ = stage(evidence, proof)
         answer = dict(summary=render(evidence, proof, None, 'observation unavailable; condition and age retained on host', reason, action), warning=False)
+    failed = False
+    try:
+        publication = publish_report(evidence, answer)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+        failed = True
+        detail = error.stderr.strip()[:1024] if isinstance(error, subprocess.CalledProcessError) else str(error)
+        publication = f'Drain issue publication unavailable: {detail}. Retained intent and the next Sync observation govern retry.'
+        publication = publication.replace(os.environ.get('POISE_RELEASE_REPORT_TOKEN') or '\0', '[redacted]')
+        print('::error::' + publication.replace('\n', ' ')[:2048])
+    answer['summary'] += '\n' + publication + '\n'
     if answer['warning']:
         print('::warning::Production release overdue; inspect this run\'s release summary.')
     print(answer['summary'])
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as file:
             file.write(answer['summary'])
+    return 1 if failed else 0
 
 
 if __name__ == '__main__':
     if sys.argv[1:] == ['--remote']:
         print(json.dumps(observe(EVIDENCE)))
     else:
-        main()
+        sys.exit(main())

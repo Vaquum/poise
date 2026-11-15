@@ -1,3 +1,5 @@
+import { mkdir, readdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { mocks, fixture, loadModules, restartModules, arrangeCli, pr, HEAD_SHA, NEXT_HEAD_SHA, recordCompletedInitialReview, agentLog } from './behaviors-runtime-fixture'
 
@@ -107,6 +109,47 @@ describe('PR account routing', () => {
     const headReads = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--head-sha')
     expect(value(headReads[0][1], '--token-user')).toBe('review-bot')
     expect(headReads.slice(1).every(([, args]) => value(args, '--token-user') === actor)).toBe(true)
+  })
+
+  it.each(['manual', 'pr_review', 'pr_approve'] as const)('starts no %s worker after a permanent missing-tree checkout failure', async (mode) => {
+    await initial('poise-user')
+    const diagnostic = { version: 1, operation: 'reset', outcome: 'exit', exit_code: 128,
+      stderr: `fatal: unable to read tree ${'5'.repeat(40)}` }
+    const failure = Object.assign(new Error(diagnostic.stderr), {
+      code: 1, stderr: `caller_diagnostic: ${JSON.stringify(diagnostic)}\n`,
+    })
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+        throw Object.assign(new Error('checkout not found'), {
+          code: 1, stderr: `error: checkout not found under /dev: ${pr.repo}\n`,
+        })
+      }
+      if (command === 'github-interface' && args[0] === '--checkout-repo') {
+        const path = value(args, '--path')
+        await mkdir(path, { recursive: true })
+        await writeFile(join(path, 'partial'), 'invalid snapshot')
+        throw failure
+      }
+      if (command === 'github-interface' && args[0] === '--head-sha') {
+        const result = await original(command, args, options)
+        return { ...result, stdout: JSON.stringify({ ...JSON.parse(result.stdout), author: 'poise-user' }) }
+      }
+      return original(command, args, options)
+    })
+    const { triggerPrReview, replayAgentJob } = await import('../server/agent')
+    const attempt = mode === 'manual' ? triggerPrReview(pr.url)
+      : replayAgentJob({ behavior: mode, repo: pr.repo, pr_id: pr.number }, async () => ({
+        author: 'poise-user', actor: 'review-bot', accounts: { me: 'poise-user', agent: 'review-bot' },
+      }))
+    await expect(attempt).rejects.toBe(failure)
+    const [owner, repo] = pr.repo.toLowerCase().split('/')
+    expect(await readdir(join(fixture.tempRoot, 'review-checkouts', HEAD_SHA, owner))).toEqual([`${repo}.lock`])
+    const preparations = mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-interface' && args[0] === '--checkout-repo')
+    expect(preparations).toHaveLength(1)
+    expect(preparations[0][1]).toEqual(expect.arrayContaining(['--token-user', 'review-bot']))
+    expect(preparations[0][2]).toMatchObject({ timeoutMs: 30_000 })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
   it('abandons admission when accounts change after activity evidence', async () => {

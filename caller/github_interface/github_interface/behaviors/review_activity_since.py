@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any
 
 from github_interface.atoms.pulls import get_review_activity
-from github_interface.atoms.review_response import context_sha
+from github_interface.atoms.review_response import context_sha, parse_body, qualifying_response
 from github_interface.atoms.request_batch import read_requests, run_batch
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
@@ -118,6 +118,18 @@ async def read_request(
     )
     reviewer_latest = latest_reviews.get(username_lower)
     reviewer_latest_any = reviewer_reviews[-1] if reviewer_reviews else None
+    complete_head = None
+    context = {"base": {"sha": pull["baseRefOid"]}, "title": pull["title"], "body": pull["body"]}
+    for review in reversed(reviewer_reviews):
+        response = parse_body(review.get("body") or "")
+        if review.get("state") not in ACTIONABLE_REVIEW_STATES | {"COMMENTED"} or not response:
+            continue
+        commit = (review.get("commit") or {}).get("oid")
+        if qualifying_response(response, context, f"{owner}/{repo}", pull_number, commit, username) \
+                and review["body"].endswith(f"<!-- poise-invocation {response['invocation_id']} -->") \
+                and response["completed_at"] <= _time(review["submittedAt"], "review submittedAt").timestamp() * 1000 + 999:
+            complete_head = commit
+            break
 
     return {
         "action": "review_activity_since",
@@ -149,6 +161,7 @@ async def read_request(
             key=str.lower,
         ),
         "reviewer_latest_state": reviewer_latest.get("state") if reviewer_latest else None,
+        "reviewer_latest_complete_commit": complete_head,
         "reviewer_latest_commit": (
             (reviewer_latest.get("commit") or {}).get("oid") if reviewer_latest else None
         ),

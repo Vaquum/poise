@@ -449,6 +449,11 @@ const migrateSchema = db.transaction(() => {
     -- failed-launch read scanned them all once for every failed launch.
     CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_open_target
       ON behavior_dead_letters(behavior, target, correlation_id) WHERE retired_at IS NULL;
+    -- Superseded dead letters by what a closed pull request's historical
+    -- firing checks for. Retired rows are kept forever, and settling each
+    -- closed pull request read every one of them.
+    CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_superseded
+      ON behavior_dead_letters(behavior, target, correlation_id) WHERE retired_at IS NOT NULL AND resolution = 'superseded';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_one_unresolved
       ON alerts(dedupe_key) WHERE resolved_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_alerts_created

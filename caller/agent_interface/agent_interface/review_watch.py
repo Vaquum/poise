@@ -54,9 +54,12 @@ _GITHUB_STATUS = re.compile(rb"github\s+\d{3}")
 
 
 class ReviewSuperseded(RuntimeError):
-    def __init__(self, head_sha: str):
+    def __init__(self, head_sha: str, *, closed_target: dict | None = None, submission_attempted: bool = False):
         self.head_sha = atoms.expected_head(head_sha)
-        super().__init__(f"Review stopped early: PR head or base changed; observed head {self.head_sha}")
+        self.closed_target = closed_target
+        self.submission_attempted = submission_attempted
+        reason = f"target {closed_target['state']}" if closed_target else "PR head or base changed"
+        super().__init__(f"Review stopped early: {reason}; observed head {self.head_sha}")
 
 
 def _provider_diagnostic(line: bytes, *, stderr: bool) -> bytes:
@@ -192,6 +195,7 @@ class ReviewWatch:
         self.repo = atoms.repo_name(pr, pwd)
         self.actor = atoms.actor(actor)
         self.head = atoms.expected_head(head)
+        self.closed_target: dict | None = None
 
     def __enter__(self):
         self.directory = resource_ownership.temporary_directory(prefix="agent-interface-review-watch-")
@@ -224,15 +228,30 @@ class ReviewWatch:
                     or fact["pull_number"] != self.number):
                 return None
             head = fact.get("head_sha")
-            if not isinstance(head, str) or not atoms.SHA_RE.fullmatch(head):
+            if (not isinstance(head, str) or not atoms.SHA_RE.fullmatch(head)
+                    or fact.get("state") not in ("OPEN", "CLOSED", "MERGED")):
                 return None
+            if fact["state"] in {"CLOSED", "MERGED"}:
+                self.closed_target = fact
+                return head
             return head if head != self.head else None
         except (OSError, ValueError, subprocess.TimeoutExpired):
             # An unavailable/malformed check proves nothing. Keep the review;
             # the existing expected-head guard still protects its terminal call.
             return None
 
+    def check_closed(self) -> None:
+        if self.closed_target is not None:
+            review_receipt.record_file(self.receipt_path)
+            state = Path(self.gate_path).read_text()
+            raise ReviewSuperseded(
+                self.closed_target["head_sha"], closed_target=self.closed_target,
+                submission_attempted=("submitted" in state or "uncertain" in state
+                                      or submission_active(self.gate_path)),
+            )
+
     def run(self, args, *, input: str, cwd: str, timeout: float, env: dict, provider: str | None = None) -> subprocess.CompletedProcess:
+        self.check_closed()
         deadline = monotonic() + timeout
         next_head_check = monotonic() + POLL_SECONDS
         events = ProviderStream(provider)
@@ -276,6 +295,8 @@ class ReviewWatch:
                                 "Provider exited during a GitHub submission; needs reconciliation",
                                 "review_recovery_failed")
                         return subprocess.CompletedProcess(args, process.returncode, stdout.read(), stderr.read())
+                    if self.closed_target is not None and cancel_when_idle(self.gate_path, allow_submitted=True):
+                        self.check_closed()
                     # Completion wins over the abort: a run that just exited
                     # reports its own result, never a handoff.
                     limited.check(provider, process)
@@ -291,11 +312,12 @@ class ReviewWatch:
                         if monotonic() < next_head_check:
                             continue
                         changed = self.changed_head(min(HEAD_TIMEOUT_SECONDS, remaining))
-                        next_head_check = monotonic() + POLL_SECONDS
+                        next_head_check = deadline if self.closed_target is not None else monotonic() + POLL_SECONDS
                         # Completion wins a race with a slow head lookup.
                         if process.poll() is not None:
                             continue
-                        if changed and cancel_when_idle(self.gate_path):
+                        if changed and cancel_when_idle(self.gate_path, allow_submitted=self.closed_target is not None):
+                            self.check_closed()
                             raise ReviewSuperseded(changed)
             finally:
                 try:

@@ -623,6 +623,44 @@ describe('reading what Current shows', () => {
     expect((await readAnalytics(WEEK)).issues.opened).toBe(1)
   })
 
+  it('keeps the datastore records while no datastore changes, and reads again once an item does', async () => {
+    data()
+    const reader = await import('../server/analytics-reader')
+    const reads = vi.spyOn(reader, 'readAnalyticsInWorker')
+    try {
+      const first = await readAnalytics(WEEK)
+      expect(await readAnalytics(WEEK)).toEqual(first)
+      expect(reads).toHaveBeenCalledTimes(1)
+      seed(issue(99, '2026-10-07T00:00:00Z'), 'issue', true)
+      expect((await readAnalytics(WEEK)).issues.opened).toBe(first.issues.opened + 1)
+      expect(reads).toHaveBeenCalledTimes(2)
+    } finally { reads.mockRestore() }
+  })
+
+  it('keeps no records read while an account failed, so its recovery shows on the next read', async () => {
+    data()
+    const reader = await import('../server/analytics-reader')
+    const reads = vi.spyOn(reader, 'readAnalyticsInWorker')
+      .mockResolvedValueOnce({ issues: [], prs: [], errors: [{ org: 'alpha', error: 'database is locked' }] })
+    try {
+      expect((await readAnalytics(WEEK)).errors).toEqual([{ org: 'alpha', error: 'database is locked' }])
+      expect((await readAnalytics(WEEK)).errors).toEqual([])
+      expect(reads).toHaveBeenCalledTimes(2)
+    } finally { reads.mockRestore() }
+  })
+
+  it('reads a change the content mark cannot see once the mark stops vouching', async () => {
+    const id = seed(pr(1, '2026-10-06T00:00:00Z', '2026-10-08T00:00:00Z'), 'pr', true)
+    const before = (await readAnalytics(WEEK)).pullRequests.workReview
+    // A review alone changes the file but no item: the mark vouches for the kept records.
+    review(id, 'reviewer', 'CHANGES_REQUESTED', '2026-10-07T00:00:00Z')
+    expect((await readAnalytics(WEEK)).pullRequests.workReview).toEqual(before)
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 5 * 60_000 + 1)
+    try {
+      expect((await readAnalytics(WEEK)).pullRequests.workReview).not.toEqual(before)
+    } finally { clock.mockRestore() }
+  })
+
   it('reads the real datastores without preparing their queries on the server thread', async () => {
     data()
     const prepare = vi.spyOn(Database.prototype, 'prepare')

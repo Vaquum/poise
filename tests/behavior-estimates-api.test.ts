@@ -153,7 +153,7 @@ describe('behavior estimates API', () => {
     let release!: () => void
     const held = new Promise<void>((resolve) => { release = resolve })
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
-      if (command === 'agent-interface' && args.length === 1 && args[0] === '--logs') await held
+      if (command === 'agent-interface' && (args[0] === '--logs' && args[1] === '--without-progress')) await held
       return answer(command, args, options)
     })
     const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6_000)
@@ -163,7 +163,7 @@ describe('behavior estimates API', () => {
       expect(estimates?.status).toBe(200)
       const metrics = await within(fetch(`${base}/api/behavior-metrics`))
       expect(metrics?.status).toBe(200)
-      expect(mocks.runFile.mock.calls.filter(([, args]) => (args as string[]).length === 1 && (args as string[])[0] === '--logs')).toHaveLength(2)
+      expect(mocks.runFile.mock.calls.filter(([, args]) => ((args as string[])[0] === '--logs' && (args as string[])[1] === '--without-progress'))).toHaveLength(2)
     } finally {
       clock.mockRestore()
       release()
@@ -177,7 +177,7 @@ describe('behavior estimates API', () => {
     // Past the history's five seconds, every whole-history read fails.
     const answer = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
-      if (command === 'agent-interface' && args.length === 1 && args[0] === '--logs') throw new Error('log unavailable')
+      if (command === 'agent-interface' && (args[0] === '--logs' && args[1] === '--without-progress')) throw new Error('log unavailable')
       return answer(command, args, options)
     })
     const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6_000)

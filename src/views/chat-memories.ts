@@ -12,7 +12,7 @@ export function createMemoriesPane(view: HTMLElement, onChange: () => void) {
   el.className = 'chat-memories-pane'
   el.setAttribute('aria-label', 'Memories')
   el.innerHTML = `<div class="chat-memories-inner">
-    <div class="chat-memories-heading"><label for="chat-memories-text">Memories</label><button type="button" class="chat-icon-btn chat-memories-close" aria-label="Close memories" title="Close memories">×</button></div>
+    <div class="chat-memories-heading"><label for="chat-memories-text">Memories</label><button type="button" class="chat-icon-btn chat-memories-close" aria-label="Close memories" data-help="Close memories">×</button></div>
     <p class="chat-memories-help">Included last in every Chat message, across sessions and agents. Closing this pane keeps them active.</p>
     <textarea id="chat-memories-text" class="chat-memories-text" aria-label="Memories text" spellcheck="false" placeholder="What should every agent remember?"></textarea>
     <div class="chat-memories-footer"><span class="chat-memories-status" role="status"></span><button type="button" class="chat-h-btn chat-memories-retry" hidden>Retry save</button></div>

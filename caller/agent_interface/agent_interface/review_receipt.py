@@ -39,6 +39,13 @@ _QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-rema
                   "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
 
 
+def coverage_disposition(packet: dict) -> str:
+    # Only the packet builder can attest to the complete required source set.
+    # Finishing every stage of an omitted prefix cannot upgrade that proof.
+    return "complete" if packet.get("coverage") == "complete" \
+        and isinstance(packet.get("files"), list) and packet.get("omitted_files", []) == [] else "incomplete"
+
+
 def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
     """Pin controller-owned context before invoking the configured reviewer."""
     from hashlib import sha256
@@ -57,7 +64,8 @@ def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
         conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?),'$.review_scope',?,"
                      "'$.verification_candidates',json(?)) where id=? and status='running'",
                      (json.dumps({"repository": value["repository"], "pull_number": value["pull_number"],
-                                  "head_sha": value["head_sha"], "context_sha": context, "model": model}),
+                                  "head_sha": value["head_sha"], "context_sha": context, "model": model,
+                                  "coverage": coverage_disposition(value)}),
                       review_scope or None, json.dumps(fixes), call_id))
 
 
@@ -128,6 +136,26 @@ def retained_response() -> dict:
     if not response:
         raise RuntimeError("reviewer has not retained a substantive response")
     return response
+
+
+def retain_verdict(verdict: dict, head: str) -> None:
+    """Keep complete findings outside the bounded artifact before finalization."""
+    bound = _call.get()
+    if bound is None:
+        return
+    response = complete_response(verdict["assessment"], head)
+    database, call_id = bound
+    if response is None or response["invocation_id"] != call_id:
+        raise RuntimeError("review findings lack their original native invocation")
+    from . import RESPONSES
+    path = caller_store.response_name(RESPONSES / f"{call_id}.txt")
+    with caller_store.connect(database, timeout=30) as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select status,artifact from calls where id=?", (call_id,)).fetchone()
+        if not row or row[0] != "running" or json.loads(row[1])["phase"] != "reviewing":
+            raise RuntimeError("review findings no longer own an unsubmitted native invocation")
+        caller_store.write_response_text(Path(path), RESPONSES, json.dumps(verdict, ensure_ascii=False))
+        conn.execute("update calls set response_path=? where id=?", (path, call_id))
 
 
 @contextmanager
@@ -229,10 +257,34 @@ def work_publication(head: str, *, start_replies: bool = False) -> None:
                     # github-interface is an executed child, so it cannot
                     # inherit Caller's in-memory scope. Verify its original
                     # kernel boundary and that only this helper remains.
-                    scope = resource_ownership.original_scope(Path(database), call_id, ownership)
-                    if os.getpid() <= 2 or os.getppid() != 2 or os.readlink("/proc/self/ns/pid") != scope.binding["namespace"] \
-                            or set(scope.read()["pids"]) != {1, 2, os.getpid()}:
-                        raise RuntimeError("planned replies lack their original idle native helper")
+                    refusal = "planned replies lack their original idle native helper"
+                    try:
+                        scope = resource_ownership.original_scope(Path(database), call_id, ownership)
+                        helper = os.getpid()
+                        if helper <= 2:
+                            raise RuntimeError(f"{refusal}: helper_pid")
+                        if os.getppid() != 2:
+                            raise RuntimeError(f"{refusal}: helper_parent")
+                        if os.readlink("/proc/self/ns/pid") != scope.binding["namespace"]:
+                            raise RuntimeError(f"{refusal}: helper_namespace")
+                        expected = {1, 2, helper}
+                        deadline = time.monotonic() + native_namespace.SETTLE_SECONDS
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise RuntimeError(f"{refusal}: namespace_busy")
+                            members = set(scope.read(timeout_seconds=min(native_namespace.CONTROL_SECONDS, remaining))["pids"])
+                            if time.monotonic() > deadline:
+                                raise RuntimeError(f"{refusal}: namespace_read_timeout")
+                            if members == expected:
+                                break
+                            if not expected.issubset(members):
+                                raise RuntimeError(f"{refusal}: namespace_members")
+                            time.sleep(min(0.005, max(0, deadline - time.monotonic())))
+                    except TimeoutError as error:
+                        raise RuntimeError(f"{refusal}: namespace_read_timeout") from error
+                    except OSError as error:
+                        raise RuntimeError(f"{refusal}: namespace_read_io") from error
                 elif scope.key["callId"] != call_id:
                     raise RuntimeError("planned replies lack their original active native ownership")
                 else:

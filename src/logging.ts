@@ -26,6 +26,16 @@ export interface LoggingWorkImpact {
   nextAction: string | null
   journal: string
 }
+
+/** Retained source severity is immutable; only confirmed bounded handoffs
+ * have a work-dependent display severity. */
+export function loggingSeverity(event: LoggingEvent, work: LoggingWorkImpact | null | undefined): Severity {
+  return event.severity === 'error' && event.source === 'caller' && event.operation === 'provider.review.handoff'
+    && event.phase === 'analysis' && event.context.submission === 'none'
+    && event.context.errorCode === 'review_budget_exhausted' && !!work
+    && work.repository === event.repository && work.target === event.target && work.callerBehavior === event.behavior
+    && (work.impact === 'retrying' || work.impact === 'recovered') ? 'warning' : event.severity
+}
 export interface LoggingAccess { endpoint: string; isAdmin: boolean; owner: string }
 export interface LoggingHealth {
   version: 1

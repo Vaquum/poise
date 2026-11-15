@@ -44,7 +44,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                 break
             page += 1
         evidence.update({"checks": [_check(check) for check in checks],
-                         "runs": [{key: run.get(key) for key in ("id", "event", "head_sha", "head_branch", "workflow_id", "run_attempt")}
+                         "runs": [{key: run.get(key) for key in ("id", "event", "head_sha", "head_branch", "workflow_id", "run_attempt", "status", "conclusion")}
                                   for run in runs]})
 
     failing_checks = [_check(check) for check in checks if _check_failing(check)]

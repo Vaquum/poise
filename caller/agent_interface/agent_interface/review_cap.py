@@ -89,6 +89,8 @@ def file_followup_issue(
     actor_name: str,
     title: str,
     body: str,
+    *,
+    reserve: float = 0,
 ) -> dict:
     """File the capped round's follow-up issue; fail loudly, never half-publish.
 
@@ -98,7 +100,7 @@ def file_followup_issue(
     GitHub error) raises a submission error: Poise reconciles before anything
     retries, and the retry reuses the issue via its marker.
     """
-    limit = review_budget.timeout(600)
+    limit = review_budget.timeout(600, reserve=reserve)
     progress.stage("filing_followup", "Filing the capped round's follow-up issue", timeout=limit)
     args = [
         os.getenv("GITHUB_INTERFACE_CLI", "github-interface"),

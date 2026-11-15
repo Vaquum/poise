@@ -21,7 +21,7 @@ require('node:http').createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/api/service/drain') draining = true
   if (req.method === 'POST' && req.url === '/api/service/resume') draining = false
   res.setHeader('content-type', 'application/json')
-  res.end(JSON.stringify({ ok: true, mode: 'service', version: 'ci', activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, idle: true, draining }))
+  res.end(JSON.stringify({ ok: true, mode: 'service', version: 'ci', release: 'ci', activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, idle: true, draining }))
 }).listen(5555)`
 
 // The gateway's own container, standing in: it relays every call to poise-ws-ci by name, which resolves
@@ -72,11 +72,12 @@ function inspect(name: string): Inspected {
 }
 
 /** A stand-in runtime image: it answers every request with an idle service health. */
-function buildRuntimeStandIn(tag: string, variant: string): void {
+function buildRuntimeStandIn(tag: string, variant: string, base?: string): void {
   const dockerfile = [
     'FROM node:22-bookworm-slim',
     `RUN echo ${Buffer.from(HEALTH_SERVER).toString('base64')} | base64 -d > /health.js`,
     `LABEL poise.ci.variant=${variant}`,
+    ...(base ? [`LABEL poise.release=ci poise.base=${base}`] : []),
     'CMD ["node", "/health.js"]',
   ].join('\n')
   execFileSync('docker', ['build', '--quiet', '--tag', tag, '-'], { input: dockerfile })
@@ -109,7 +110,7 @@ async function ready(orchestrator: Orchestrator): Promise<boolean> {
   return false
 }
 
-// One workspace through three steps, each building on the one before.
+// One workspace through creation, replacement and cached rebuilds on the real image store.
 describe.skipIf(!enabled)('workspaces on a real Docker Engine', () => {
   const removeAll = () => {
     spawnSync('docker', ['rm', '--force', 'poise-ws-ci', 'poise-gateway-ci'])
@@ -262,5 +263,27 @@ describe.skipIf(!enabled)('workspaces on a real Docker Engine', () => {
     ])
     expect(logs[from]).toMatchObject({ event: 'workspace.upgrade.started', reason: 'changed drain timeout' })
     expect(logs.filter((entry) => entry.level !== 'info')).toEqual([])
+  }, 120_000)
+
+  it('keeps a healthy workspace through a cached rebuild of the same release and base', async () => {
+    docker('rm', '--force', 'poise-ws-ci')
+    // Move every tag on rebuild, as the installer's latest and same-SHA tags do.
+    buildRuntimeStandIn('poise-runtime:ci', 'cached-rebuild', 'ci-base')
+    const orchestrator = gatewayProcess()
+    await orchestrator.ensureStarted('ci', 'CI')
+    expect(await ready(orchestrator)).toBe(true)
+    const before = inspect('poise-ws-ci')
+    const from = logs.length
+    buildRuntimeStandIn('poise-runtime:ci', 'cached-rebuild', 'ci-base')
+    const engine = new DockerClient('/var/run/docker.sock')
+    const originalLabels = await engine.imageLabels(before.Image)
+    console.info('Cached rebuild identity', {
+      container: before.Id, originalImage: before.Image, rebuiltImage: await engine.imageId('poise-runtime:ci'),
+      containerBase: before.Config.Labels['poise.base'], originalImageBase: originalLabels?.['poise.base'] ?? null,
+    })
+    await orchestrator.upgradePass()
+    expect(inspect('poise-ws-ci').Id).toBe(before.Id)
+    expect(eventsSince(from)).toEqual([])
+    expect(await ready(orchestrator)).toBe(true)
   }, 120_000)
 })

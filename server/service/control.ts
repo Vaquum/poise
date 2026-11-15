@@ -68,6 +68,17 @@ export interface SwitchAnswer {
 const RELEASE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/
 const SWITCH_POLL_MS = 500
 
+/** How long after someone last used Poise in a browser a requested switch is
+ *  still held: the restart, and the minutes its caches take to warm, land in
+ *  a quiet moment instead of under the person's hands. */
+export const PERSON_QUIET_MS = 90_000
+/** The longest a switch is held for someone using Poise, from when it was
+ *  first asked for: well inside the deploy's ten-minute proof (deploy/lib.sh). */
+export const PERSON_HOLD_MAX_MS = 5 * 60_000
+const HOLD_POLL_MS = 5_000
+/** What a held switch waits on, in health. */
+export const PERSON_ACTIVE = 'someone using Poise'
+
 /** How every refusal of new work reads while a drain is on, as it already
  *  does for a release. */
 export const DRAINING_ERROR = 'Poise is installing an update; try again after it restarts'
@@ -138,6 +149,10 @@ export class ServiceControl {
   private waitLoggedEpoch: number | null = null
   private switchCancellation: Promise<void> | null = null
   private restarting = false
+  // A switch asked for while someone uses Poise is held, not queued (holdForPerson).
+  private personActiveAt: number | null = null
+  private held: { release: string, since: number } | null = null
+  private holdPoll: unknown = null
   private readonly timer: DrainTimer
   private readonly log: (line: string) => void
   private readonly releasesDir: string
@@ -156,6 +171,15 @@ export class ServiceControl {
     return this.drainOn
   }
 
+  /** Someone used Poise in a browser just now (POST /api/service/activity). */
+  notePersonActivity(): void {
+    this.personActiveAt = this.now()
+  }
+
+  private personActive(now: number): boolean {
+    return this.personActiveAt !== null && now - this.personActiveAt < PERSON_QUIET_MS
+  }
+
   /** `activeChatTurns` are the Chat turns recorded open: reserved before
    *  their first write, closed once their outcome is recorded.
    *  `backgroundWork` is everything else a restart would cut: the Chat
@@ -167,11 +191,14 @@ export class ServiceControl {
     const calls = runningCallerCalls()
     const cleanupHold = calls.cleanupHold
     const backgroundWork = this.runtime.busy() + releaseBackgroundBusy() + this.launches + calls.pendingResources
-    const pending = this.pendingSwitchRecord()
+    const record = this.pendingSwitchRecord()
+    // A held switch has no record yet: the supervisor must not restart onto it.
+    const held = record === null && this.held !== null ? { release: this.held.release, since: new Date(this.held.since).toISOString() } : null
+    const pending = record ?? held
     const release = this.release.name
     const switching = pending?.release ?? null
     const desiredRelease = switching ?? release
-    const waitingOn = switching === null ? [] : this.switchBlockers()
+    const waitingOn = switching === null ? [] : held !== null ? [PERSON_ACTIVE] : this.switchBlockers()
     return {
       ok: true,
       mode: 'service',
@@ -264,6 +291,57 @@ export class ServiceControl {
     }
     const problem = this.releaseInstallProblem(release)
     if (problem) throw new HttpError(409, problem)
+    // While someone is using Poise a switch is held, not queued: new Chat turns
+    // keep starting, and the restart waits for a quiet moment, at most
+    // PERSON_HOLD_MAX_MS from the first ask. A switch already queued goes on.
+    if (this.switchTo === null && this.holdForPerson(release)) return { release, switching: true }
+    return this.queueSwitch(release)
+  }
+
+  /** Holds a switch while someone uses Poise; false when it may be queued now. */
+  private holdForPerson(release: string): boolean {
+    const now = this.now()
+    const since = this.held?.since ?? now
+    if (!this.personActive(now) || now - since >= PERSON_HOLD_MAX_MS) {
+      this.endHold()
+      return false
+    }
+    if (this.held === null) {
+      this.log(`[service] holding release ${release} while someone uses Poise; it switches after ${PERSON_QUIET_MS / 1000} quiet seconds, or within ${PERSON_HOLD_MAX_MS / 60_000} minutes`)
+    }
+    this.held = { release, since }
+    if (this.holdPoll === null) this.pollHold()
+    return true
+  }
+
+  private pollHold(): void {
+    this.holdPoll = this.timer.setTimeout(() => {
+      this.holdPoll = null
+      const held = this.held
+      if (held === null) return
+      const now = this.now()
+      if (this.personActive(now) && now - held.since < PERSON_HOLD_MAX_MS) return this.pollHold()
+      this.held = null
+      const problem = this.releaseInstallProblem(held.release)
+      if (problem) return this.log(`[service] the held switch to release ${held.release} cannot start: ${problem}`)
+      // A timer has no caller to answer: a failed queue (a full disk, say) is
+      // logged, and the gateway's next ask tries again, as for any switch.
+      try {
+        this.queueSwitch(held.release)
+      } catch (error) {
+        this.log(`[service] the held switch to release ${held.release} could not be queued: ${error instanceof Error ? error.message : String(error)}; the gateway asks again`)
+      }
+    }, HOLD_POLL_MS)
+  }
+
+  private endHold(): void {
+    if (this.holdPoll !== null) this.timer.clearTimeout(this.holdPoll)
+    this.holdPoll = null
+    this.held = null
+  }
+
+  /** Queues the switch for the supervisor and restarts at the first quiet moment. */
+  private queueSwitch(release: string): SwitchAnswer {
     const next = join(this.releasesDir, 'next')
     // Re-asking the queued release — the gateway asks on every pass until the
     // switch lands — must not move the pending age: it counts from when the
@@ -294,6 +372,7 @@ export class ServiceControl {
 
   /** Asked for the release it runs: a switch asked for before, to a release since withdrawn, is called off. */
   private withdrawSwitch(): void {
+    this.endHold()
     // A restart already requested owns the shutdown: withdrawing now would
     // take the supervisor's `next` away and start waited turns mid-shutdown.
     if (this.restarting) return
@@ -482,6 +561,7 @@ export class ServiceControl {
 
   /** On runtime stop: a paused background must not outlive this server. */
   reset(): void {
+    this.endHold()
     if (this.switchPoll !== null) this.timer.clearTimeout(this.switchPoll)
     this.switchPoll = null
     if (this.drainOn || this.switchTo !== null) this.lift()
@@ -556,6 +636,18 @@ export function handleServiceApi(req: IncomingMessage, res: ServerResponse, path
     }
     if (Buffer.byteLength(JSON.stringify(page)) > 256 * 1024) throw new HttpError(503, 'diagnostic delivery exceeds 256 KiB')
     return json(res, 200, page)
+  }
+  if (path === '/api/service/activity') {
+    // The owner's browser says someone is using Poise: a requested switch
+    // waits for a quiet moment. Answers at once; it reads nothing.
+    if (req.method !== 'POST') {
+      res.setHeader('Allow', 'POST')
+      return json(res, 405, { error: `use POST for ${path}` })
+    }
+    control.notePersonActivity()
+    res.statusCode = 204
+    res.end()
+    return
   }
   if (path === '/api/service/switch') {
     if (authority.kind === 'gateway' && authority.scope !== 'admin') {

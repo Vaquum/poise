@@ -10,7 +10,7 @@ import { $, esc } from '../../dom'
 import { placeHref } from '../../address'
 import { term } from '../../registry'
 import {
-  KIND_WORDS, LEGACY_PULL, PHASES, REPOSITORY, age, attentionOrder, eventWords, failureWords, isActive,
+  KIND_WORDS, LEGACY_PULL, PHASES, REPOSITORY, age, attentionOrder, attentionRoot, eventWords, failureWords, isActive,
   phaseOf, readChain, readChainsPage, readJournalPage, reasonWords, stepEvent, taskState, timelineLines,
   type AttentionRow, type ChainInvocation, type ChainRow, type ChainsPage,
 } from './chains'
@@ -27,7 +27,7 @@ export function railHTML(chain: ChainRow): string {
   const { index, word } = phaseOf(chain)
   const { state } = taskState(chain)
   return `<span class="rail" data-ref="task.rail" role="img" aria-label="${esc(`Phase: ${word}`)}">${PHASES.map((phase, i) =>
-    `<i class="${i < index ? 'p' : i === index ? 'c' : ''}"${i === index ? ` data-state="${state}"` : ''} title="${esc(phase)}"></i>`).join('')}</span><span class="rail-w">${esc(word)}</span>`
+    `<i class="${i < index ? 'p' : i === index ? 'c' : ''}"${i === index ? ` data-state="${state}"` : ''} data-help="${esc(phase)}"></i>`).join('')}</span><span class="rail-w">${esc(word)}</span>`
 }
 
 const identity = (repository: string, issue: number, pull: number | null): string => `${repository}#${issue}${pull ? ` → #${pull}` : ''}`
@@ -181,7 +181,11 @@ export function createTasks(ctx: PartContext): ObservePart {
 
   // ---------- The list ----------
   function rows(): Array<{ chain: ChainRow | null, attention: AttentionRow | null }> {
-    if (which === 'attention') return attention.map((a) => ({ chain: byId(a.id) ?? null, attention: a }))
+    if (which === 'attention') {
+      const entries = new Map(attention.map((entry) => [entry.id, entry]))
+      return attention.filter((a) => search || open === a.id || attentionRoot(a.id, entries) === a.id)
+        .map((a) => ({ chain: byId(a.id) ?? null, attention: a }))
+    }
     return chains.map((chain) => ({ chain, attention: attentionFor(chain.id) ?? null }))
   }
   function matches(row: { chain: ChainRow | null, attention: AttentionRow | null }): boolean {
@@ -244,10 +248,13 @@ export function createTasks(ctx: PartContext): ObservePart {
       ? `Draining: v1 finishes its runs before v2 takes new work${cutover.blockers?.length ? ` (${cutover.blockers.join('; ')})` : ''}`
       : 'v2 owns new work'
     const runs = capacity?.status === 'available' && capacity.reservedModelInvocations !== null && capacity.modelInvocationLimit !== null
-      ? `${capacity.reservedModelInvocations} of ${capacity.modelInvocationLimit} model runs in use, shared with other heavy work${capacity.enabled === false ? ' · admissions paused' : ''}`
+      ? `${capacity.reservedModelInvocations} of ${capacity.modelInvocationLimit} model slots occupied across the workspace, shared with other heavy work${capacity.enabled === false ? ' · admissions paused' : ''}`
       : `model capacity unavailable${capacity?.error ? `: ${capacity.error}` : ''}`
+    const retained = capacity?.status === 'available' && capacity.retainedModelInvocations !== null
+      ? `${capacity.retainedModelInvocations} retained for unresolved cleanup, awaiting original resource evidence`
+      : 'retained cleanup count unknown'
     const errors = runtime.filter((r) => r.error).map((r) => `${r.organization}: ${r.error}`)
-    patchContent(box, `<span class="tk-st" role="status" data-ref="tk.status">${esc(owns)} · ${esc(runs)} · read ${esc(clockTime(readAt))}${loading ? ' <span class="spin"></span>' : ''}</span>${errors.length ? `<span class="tk-st is-warn" role="status">${esc(errors.join('; '))}</span>` : ''}${legacyHTML}`)
+    patchContent(box, `<span class="tk-st" role="status" data-ref="tk.status">${esc(owns)} · ${esc(runs)} · ${esc(retained)} · read ${esc(clockTime(readAt))}${loading ? ' <span class="spin"></span>' : ''}</span>${errors.length ? `<span class="tk-st is-warn" role="status">${esc(errors.join('; '))}</span>` : ''}${legacyHTML}`)
   }
 
   // ---------- The task: its state, evidence and controls ----------
@@ -259,10 +266,31 @@ export function createTasks(ctx: PartContext): ObservePart {
       rows.push(['Last verified advance', `${esc(age(now - a.progressAt))} ago · ${esc(clockTime(a.progressAt))} · it needs attention`])
       if (a.blocker && a.blocker !== chain.held) rows.push(['What holds it', esc(a.blocker)])
       if (a.evidence.gates.length) rows.push(['Evidence on its head', `${esc(a.evidence.gates.join(' · '))}${a.evidence.state !== 'fresh' ? ` <span class="note is-warn">${esc(a.evidence.state)} evidence${a.evidence.checkedAt ? `, read ${esc(clockTime(a.evidence.checkedAt))}` : ''}</span>` : ''}`])
-      if (a.nextAction) rows.push(['Next', `${esc(a.nextAction)}${a.retryAt ? ` · ${esc(clockTime(a.retryAt))}` : ''}`])
+      const entries = new Map(attention.map((entry) => [entry.id, entry]))
+      const root = attentionRoot(chain.id, entries)
+      const affected = attention.filter((entry) => entry.id !== chain.id && attentionRoot(entry.id, entries) === chain.id)
+      const taskLink = (id: string) => `<a class="lnk" href="${esc(partHref('tasks', { which: 'attention', chain: id }, back))}">${esc(id)}</a>`
+      if (root !== chain.id) rows.push(['Root blocker', taskLink(root)])
+      if (affected.length) rows.push(['Waiting on this', affected.map((entry) => taskLink(entry.id)).join(' · ')])
+      if (a.nudge) {
+        const nudge = a.nudge
+        const work = failure ? null : nudge.work
+        rows.push(['Ownership', work?.kind === 'chat'
+          ? `<a class="lnk" href="${esc(placeHref(work.manager ? 'manager' : 'chat', { chat: work.manager ? null : work.session, back: 'observe' }))}">${work.manager ? 'Open the Manager' : 'Open the bound Chat'}</a>`
+          : work?.kind === 'pull' ? external(work.url, 'Open the linked pull request') : 'Ownership unverified'])
+        rows.push(['Next', failure ? 'Current next step unverified.'
+          : `${esc(nudge.action)}${nudge.prerequisite ? ` ${taskLink(nudge.prerequisite)}` : ''}${a.retryAt ? ` · ${esc(clockTime(a.retryAt))}` : ''}`])
+      } else if (a.nextAction) rows.push(['Next', `${esc(a.nextAction)}${a.retryAt ? ` · ${esc(clockTime(a.retryAt))}` : ''}`])
     }
     const recheck = a?.reconciliation.nextObservationAt ?? chain.reconciliation?.nextObservationAt ?? null
-    if (recheck && recheck > now) rows.push(['Evidence recheck', `${esc(clockTime(recheck))}. A recheck never retries held work.`])
+    const warning = chain.mergedReviewWarning
+    if (warning) {
+      rows.push(['Native review clearance', `Unmet at merge on head ${esc(warning.head)}. Original review responses are complete; no qualifying favorable native response preceded the merge.`])
+      for (const review of warning.reviews) rows.push(['Retained native review', `${external(review.url, 'Changes requested', 'lnk')}: ${esc(review.verdict)}`])
+      const approval = warning.githubApproval
+      if (approval) rows.push(['Later GitHub approval', `${external(approval.url, `Review #${approval.id}`, 'lnk')} · head ${esc(approval.head)} · submitted ${esc(new Date(approval.submittedAt).toISOString())} · submitting client unknown`])
+    }
+    if (recheck && recheck > now) rows.push(['Evidence recheck', `${esc(clockTime(recheck))}. Poise checks for new evidence.`])
     if (chain.reconciliation?.waitingForOriginalResponse) rows.push(['Original response', 'Required: GitHub reads cannot settle this step.'])
     if (chain.reconciliation?.waitingForResourceRelease || a?.reconciliation.waitingForResourceRelease) rows.push(['Resources', 'Their release is unverified; reconciliation goes on and its memory and disk stay reserved.'])
     if (chain.supersession && REPOSITORY.test(chain.repository)) {
@@ -284,8 +312,8 @@ export function createTasks(ctx: PartContext): ObservePart {
     const held = !!chain.held
     const ref = held ? 'task.resume' : 'task.hold'
     const word = held ? 'Resume' : 'Hold new invocations'
-    if (failure) return `<button type="button" class="btn-ghost" aria-disabled="true" title="Tasks could not be read, so nothing can be held or resumed until they are." data-ref="${ref}">${word}</button>`
-    if (!meta?.cutover) return `<button type="button" class="btn-ghost" aria-disabled="true" title="Who owns new work has not been read yet; its controls wait for that read." data-ref="${ref}">${word}</button>`
+    if (failure) return `<button type="button" class="btn-ghost" aria-disabled="true" data-help="Tasks could not be read, so nothing can be held or resumed until they are." data-ref="${ref}">${word}</button>`
+    if (!meta?.cutover) return `<button type="button" class="btn-ghost" aria-disabled="true" data-help="Who owns new work has not been read yet; its controls wait for that read." data-ref="${ref}">${word}</button>`
     if (acting === chain.id) return `<button type="button" class="btn-ghost" aria-disabled="true" data-ref="${ref}"><span class="spin"></span>${held ? 'Resuming…' : 'Holding…'}</button>`
     return `<button type="button" class="btn-ghost${held ? ' is-primary' : ''}" data-act="${held ? 'tk-resume' : 'tk-hold'}" data-id="${esc(chain.id)}" data-ref="${ref}">${word}</button>`
   }
@@ -303,7 +331,7 @@ export function createTasks(ctx: PartContext): ObservePart {
     patchContent(head, `<div class="tk-d-h"><h3>${esc(identity(chain.repository, chain.issue, chain.pullNumber))}</h3><p class="t-gloss">${links} · driven by the behaviors</p></div>
       <div class="tk-d-rail">${railHTML(chain)}</div>
       <p class="tk-d-s"><span class="st" data-state="${state}" data-ref="state">${esc(term(`state.${state}`))}</span> ${esc(reason)}</p>
-      ${chain.held ? `<p class="tk-hold" data-ref="side.hold">${esc(reasonWords(chain.held))}. The chain waits for your decision; Resume ends the hold.</p>` : ''}
+      ${chain.held ? `<p class="tk-hold" data-ref="side.hold">${esc(reasonWords(chain.held))}</p>` : ''}
       ${evidenceHTML(chain)}
       <div class="tk-acts">${controlHTML(chain)}${/^[\w.-]+\/[\w.-]+$/.test(chain.repository) ? `<a class="lnk" href="${esc(onBoard(card))}" data-ref="tk.board">See it on Board</a>` : ''}</div>
       ${note && note.id === chain.id ? `<p class="tk-act-note${note.tone === 'failed' ? ' is-failed' : ''}" role="status">${esc(note.text)}</p>` : ''}`)
@@ -337,7 +365,7 @@ export function createTasks(ctx: PartContext): ObservePart {
       const failureText = failureWords(event)
       const isFrom = event.sequence === from
       const observed = event.type === 'chain.observed'
-      return `<li data-kind="${kind}"${isFrom ? ' class="is-from" data-ref="tk.from"' : observed ? ' data-ref="tk.observed"' : ''}><span class="t-mono" title="${esc(exactTime(event.at))}">${esc(clockTime(event.at))}</span><span><b>${KIND_WORDS[kind]}</b> ${esc(text)}${folded > 1 ? ` <span class="t-gloss">×${folded} since ${esc(clockTime(oldest ?? event.at))}</span>` : ''}${call ? ` · <a class="lnk" href="${esc(partHref('behaviors', { call }, back))}" data-ref="tk.run">run ${esc(call.slice(0, 8))}</a>` : ''}${failureText ? `<span class="t-gloss"> · ${esc(failureText)}</span>` : ''}</span></li>`
+      return `<li data-kind="${kind}"${isFrom ? ' class="is-from" data-ref="tk.from"' : observed ? ' data-ref="tk.observed"' : ''}><span class="t-mono" data-help="${esc(exactTime(event.at))}">${esc(clockTime(event.at))}</span><span><b>${KIND_WORDS[kind]}</b> ${esc(text)}${folded > 1 ? ` <span class="t-gloss">×${folded} since ${esc(clockTime(oldest ?? event.at))}</span>` : ''}${call ? ` · <a class="lnk" href="${esc(partHref('behaviors', { call }, back))}" data-ref="tk.run">run ${esc(call.slice(0, 8))}</a>` : ''}${failureText ? `<span class="t-gloss"> · ${esc(failureText)}</span>` : ''}</span></li>`
     }).join('')
     const status = windowReading ? '<span class="spin"></span> Reading the journal…' : windowError ? `<span class="note is-warn">${esc(windowError)}</span> <button type="button" class="lnk" data-act="tk-journal">Read it again</button>` : ''
     patchContent(box, `<p class="t-micro tk-tl-h">Timeline · newest first <span class="t-gloss">· ${journalReadAt ? `read ${esc(clockTime(journalReadAt))} · ` : ''}held still while you read it</span></p>

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -378,7 +379,9 @@ def test_resolution_progress_survives_caller_deadline_and_journal_reload(databas
     mutations = database / "mutations.json"
     monkeypatch.setenv("GITHUB_INTERFACE_AUTOMATED_REVIEWS", "[71]")
     script = f"""
-import asyncio, json, sys
+import asyncio, json, sys, time
+if {mode!r} == 'complete':
+    time.sleep(3)  # CLI startup can exceed the old two-second fixture deadline.
 from pathlib import Path
 from unittest.mock import patch
 import httpx
@@ -428,6 +431,31 @@ with patch.object(client, 'get_token', return_value='isolated-credential'), patc
     scopes = []
     with monkeypatch.context() as process_transport:
         children = process(process_transport, script)
+        if mode == "timeout":
+            start = native_action.subprocess.Popen
+
+            def start_after_acceptance(*args, **kwargs):
+                child = start(*args, **kwargs)
+                try:
+                    setup_deadline = time.monotonic() + 30
+                    while not mutations.exists() or mutations.read_text() != json.dumps(["A", "B"]):
+                        assert child.poll() is None, "resolution fixture exited before accepting B"
+                        assert time.monotonic() < setup_deadline, "resolution fixture did not accept B within 30 seconds"
+                        time.sleep(0.01)
+                except BaseException:
+                    try:
+                        child.kill()
+                        child.wait(timeout=30)
+                    finally:
+                        child.stdout.close()
+                        child.stderr.close()
+                    raise
+                return child
+
+            # Popen returns only after B is accepted, so the real deadline
+            # measures its lost response rather than CLI startup.
+            process_transport.setattr(native_action.subprocess, "Popen", start_after_acceptance)
+            process_transport.setattr(native_action, "TIMEOUT_SECONDS", 2)
 
         def enter(call, correlation):
             identity = json.loads(row(call)["process_identity"])
@@ -457,7 +485,6 @@ with patch.object(client, 'get_token', return_value='isolated-credential'), patc
         process_transport.setattr(api, "_enter_native_call", enter)
         process_transport.setattr(sys, "argv", ["agent-interface", "--native-action", "--source", "poise:behavior-chain"])
         process_transport.setattr(api, "_main", execute)
-        process_transport.setattr(native_action, "TIMEOUT_SECONDS", 2)
         if mode == "complete":
             api.main()
         else:

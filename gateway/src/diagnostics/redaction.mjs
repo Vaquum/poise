@@ -5,9 +5,24 @@ const TERMINAL_CSI = /\x1b\[[0-?]*[ -/]*[@-~]/g
 // Scan each field run once, then use the same classifier as structured facts.
 const CREDENTIAL_FIELD = /(?:^|(?<=["'\\{},\r\n:=]))([^"'\\:=\r\n{},]*[^ \t"'\\:=\r\n{},])\\*["']?[ \t]*[:=]/g
 
+// A `::` continuing a scope chain (pytest `::TestToken::`, C++) is not a header
+// separator; a `::` at a header boundary is a header whose value starts with `:`.
+// A Python file path opening the chain (`.../test_codex_credentials.py::`) is
+// also a scope: `/` plus a `.py` leaf, even after the `, ` that precedes it
+// once the persisted diagnostic collapses to one line. A bare `password.py::`
+// without `/` is a header, not a file.
+/** @param {string} value @param {RegExpMatchArray} match @returns {boolean} */
+function isScopeSeparator(value, match) {
+  if (!match[0].endsWith(':') || value[match.index + match[0].length] !== ':') return false
+  const field = match[1].trim()
+  if (field.includes('/') && field.endsWith('.py')) return true
+  if (/^[ \t]/.test(match[1])) return false
+  return value[match.index - 1] === ':' && value[match.index - 2] === ':'
+}
+
 /** @param {string} value @returns {boolean} */
 function hasCredentialHeader(value) {
-  for (const match of value.matchAll(CREDENTIAL_FIELD)) if (SECRET_KEY.test(match[1].trim())) return true
+  for (const match of value.matchAll(CREDENTIAL_FIELD)) if (!isScopeSeparator(value, match) && SECRET_KEY.test(match[1].trim())) return true
   return false
 }
 
@@ -15,7 +30,7 @@ function hasCredentialHeader(value) {
 function redactHeaders(value) {
   let output = '', offset = 0
   for (const match of value.matchAll(CREDENTIAL_FIELD)) {
-    if (match.index < offset || !SECRET_KEY.test(match[1].trim())) continue
+    if (match.index < offset || isScopeSeparator(value, match) || !SECRET_KEY.test(match[1].trim())) continue
     let end = value.indexOf('\n', match.index + match[0].length)
     while (end >= 0 && /[ \t]/.test(value[end + 1] ?? '')) end = value.indexOf('\n', end + 1)
     if (end < 0) end = value.length

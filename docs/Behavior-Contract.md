@@ -36,19 +36,17 @@ PR stop gate uses the same opposite-account rule from live PR author evidence.
 
 Behaviors' diagnostics are listed in the notification rail
 ([Notifications](Notifications.md)), grouped by target and cause.
-- **Poise faults** are red and mean the scheduler or Poise's launch/result
-  integration needs repair.
-- **Needs you** is amber for repository access, sign-in, provider limits and
-  uncertain outcomes, including unusable model verdicts and exhausted review
-  recovery.
+- **Faults** shows stopped or failed work, including repository access,
+  unusable model verdicts, uncertain outcomes and exhausted review recovery.
 - **Handled automatically** is grey and folded. It covers known capacity, head
   changes, upstream 429/5xx and transport interruptions that Poise rechecks.
 
+Confirmed account sign-in requests appear in **Only you** through Connected accounts.
+
 A failed behavior's notice and its diagnostic are one entry, in the group the
 diagnostic decides.
-Unknown causes stay yellow until their cause is established; a process exit or
-retry count alone never proves Poise is broken. Each row expands to its full
-diagnostic details, retaining its expansion through refresh.
+Unknown causes retain their diagnostic details. Each row expands to those
+details and retains its expansion through refresh.
 Chain observation summaries include the bounded, redacted stderr cause. Known
 upstream 5xx and transport observation failures are grey while the existing
 scheduler rechecks them; other runtime faults remain red.
@@ -73,7 +71,7 @@ A grey no-action PR incident requires one validated Caller row matching its
 call, correlation, actor, repository, PR, behavior and source, with
 `not_started` / `preflight_failed`, a pinned expected head, and no executed head
 or review/posting receipts. Missing, conflicting or quarantined evidence stays
-visible under Needs you. Classification never authorizes a retry.
+visible under Faults. Classification never authorizes a retry.
 Distinct attempts are read before visual grouping, so a newer automatic event
 cannot hide an older held reviewer. Persisted launch contract and quarantine
 evidence overrides Caller no-action text; a matching correlation must identify
@@ -138,7 +136,13 @@ their existing independent retry handling.
 
 `review-new-prs` accepts either one atomic `requested_changes` review or the
 authoritative `reviewed_clean` outcome. `approve-prs` accepts one head-pinned
-approval or one atomic change request. An unresolved finding whose location became
+approval or one atomic change request. Both legacy and durable-chain clearance
+require the controller's complete source coverage in the retained response.
+Capacity omissions cannot grant clean, approval, merge or later baseline
+authority; partial findings retain their review receipts with an incomplete
+outcome. [Caller coverage](../caller/agent_interface/README.md#staged-and-follow-up-reviews)
+defines the disposition and declared exclusions.
+An unresolved finding whose location became
 outdated can be reaffirmed without another inline comment when the reviewer
 confirms it still blocks the supplied head. The same review body retains each
 reaffirmed thread's root-comment permalink and finding text, including alongside
@@ -186,11 +190,16 @@ verdict can be submitted. Ordinary messages are unchanged. The bounds and
 failure rules are in [Caller PR review models](../caller/agent_interface/README.md#pr-review-models).
 A structured provider exit or error terminal keeps `not_started` /
 `preflight_failed` with a typed `review_provider_exit` / `review_provider_error`
-cause and no receipt; Poise retries it only after live GitHub evidence proves
+cause (a Codex credential rejection is typed `authentication_failed`) and no
+receipt; Poise retries it only after live GitHub evidence proves
 no reviewer action. Submission rejections, `no_review` no-ops, malformed or
 duplicate verdicts and duplicate GitHub reviews are contract violations and
 held. Uncertain submissions are reconciled from live receipts before any retry.
 A budget-exhausted run that proved it posted nothing can retry on backoff.
+Verified file-group deadlines (`review_budget_exhausted`, diagnostic phase
+`file_group`, outcome `timed_out`, submission `none`) count toward the target's
+retry stop without tripping the shared reviewer or clearing an existing provider
+trip. Older generic budget receipts still trigger shared backoff.
 After two distinct automatic timeouts for the same PR, head, behavior and model,
 the legacy runtime retains the failed launch and shows that automatic retries
 stopped, without another retry time. Provider recovery, restart, another slot
@@ -274,6 +283,13 @@ Load timeouts — an expired sweep deadline, a slow CLI, lock contention — ret
 on a short clock of a few minutes, not the hour-long backoff of hard failures.
 A failure carrying an explicit quota reset retries at the reset instead of that
 backoff: no sooner than a minute out, never later than an hour.
+PR review preparation and claimed-head revalidation retain the fixed GitHub
+primitive, phase, PR, reviewer slot, available expected head and original operation
+identity on failures. The handler records the existing per-slot `:check` retry
+before emitting one Error with the original child evidence and next retry time;
+separate attempts remain separate records. A timed-out probe launches no review.
+Its due retry reads the current head and launches each admitted reviewer slot
+once, while unrelated targets remain eligible.
 When the agent account cannot read a repository at all — GitHub 404 or
 NOT_FOUND for the repository — the first such failure records one held state
 for the repository instead of a per-target failure, and the pull-request
@@ -289,16 +305,22 @@ the reviews it managed to prepare, and an `approve-prs` sweep still fires the
 approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
-An approval cycle failure retains its organization, last known phase, live
+Review and approval cycle failures retain their organization, last known phase, live
 effective deadline and observed check/launch counts in diagnostic context before
 clock cleanup, including a tick that returns on abort. Pending checks include
-unread or failed reads; prepared approvals still awaiting dispatch are counted
-separately. A deadline record retains the cursor, original launch claim,
+unfinished review preparation and unread or failed approval reads; prepared work
+is counted separately. A review timeout keeps the sweep identity even when a
+target attached its identity to the same exception. A deadline record retains
+the cursor, original launch claim,
 correlation, expected head and observed Call, plus the next scheduled tick.
-Only a proven deferral with matching, unambiguous running Call evidence and an
-available scheduled continuation is captured as Warning at the approval cycle.
-Missing or conflicting ownership, uncertain writes and unavailable continuation
-remain Errors. Read counts do not prove completed evaluation, and a launch does
+Only a proven deferral with a successful final evidence read and an available
+scheduled continuation is captured as Warning at the sweep cycle: either
+prepared approvals remain before any launch attempt, or every attempted claim
+has matching, unambiguous running Call evidence. An approval deferral requires
+every attempted claim to stay visible: released attempts cannot be hidden by
+surviving owned launches. Missing or conflicting ownership, unreadable
+evidence, uncertain writes and unavailable continuation remain Errors.
+Read counts do not prove completed evaluation, and a launch does
 not prove publication: publication stays unverified until reconciliation proves
 its outcome. The next tick reconciles original launches before reconsidering
 unread and queued work under the existing eligibility, cursor and retry gates.
@@ -397,7 +419,16 @@ Caller revalidates the behind predicate on fresh head-pinned reads and sends the
 expected SHA to GitHub's update-branch endpoint. Anything else blocking, and a
 branch that caught up on its own, report `not_ready`. It reports `updated`,
 `not_ready`, or `superseded`; an update is not a merge and leaves Last triggered
-alone. A per-account cursor advances before each batch read and each merge attempt, so
+alone. A terminal branch-update failure identifies the initial REST read, GraphQL
+readiness read, final head read or possible PUT in the existing diagnostic.
+Only a confirmed CLI failure before the PUT proves no write: that attempt is
+`failed`/`settled` in the ledger. Its event, retry and direct run retain the same
+attempt identity and failed stage. A transient read failure is a Warning only
+after retry persistence succeeds and automatic retry remains eligible; cancellation,
+blocked work and bookkeeping failures retain Error. A possible PUT or a killed
+process without terminal proof stays Error/unknown, even after a later attempt
+updates the branch. Existing retry bounds and expected-head protections apply.
+A per-account cursor advances before each batch read and each merge attempt, so
 a scan cut short by its deadline resumes beyond the blocked batch or candidate.
 Ten blocked PRs in one account add 60 GraphQL queries per hour at the one-minute
 cadence. Each successful merge adds three REST reads, one GraphQL query and one
@@ -518,6 +549,17 @@ A closed legacy failure can recover when Caller subsequently supplies an exact
 and after restart. Other bounded, oversized-packet and invalid-result holds retain
 their existing rules; unrelated reviewers’ submitted receipts do not override
 an exact proof that this particular run never submitted.
+
+For legacy failed Calls with `action=null` and `outcome=null`, the existing
+publication probe retains its refusal on that exact held Call/correlation.
+Behaviors' held diagnostic and PR status `blocker.details` distinguish pending
+reviews, unclaimed reviews, incomplete identity inventory and unavailable reads,
+with the original/observed heads and at most three observed review IDs, states
+and commits where available. These observations never become the Call's receipt.
+The explanation survives ticks and restarts without another launch or changes to
+failure counts, backoff or the timeout-stop marker. Original Caller results and
+incident history remain intact; typed no-action and count-only zero-activity
+recovery retain their existing retry rules.
 
 ## Where the pull-request behaviors act
 

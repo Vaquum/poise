@@ -207,7 +207,7 @@ test('a refused assignment keeps its reason on the row, and the chain being off 
   await board(page, { records: RECORDS, assign: 'refused', chainEnabled: false })
   const issue = card(page, 'Opened today')
   await issue.getByRole('button', { name: 'Assign to Poise' }).focus()
-  await expect(issue.getByRole('button', { name: 'Assign to Poise' })).toHaveAttribute('title', /chain is off/)
+  await expect(issue.getByRole('button', { name: 'Assign to Poise' })).toHaveAttribute('data-help', /chain is off/)
   await issue.getByRole('button', { name: 'Assign to Poise' }).click()
   await issue.getByRole('button', { name: 'Sure?' }).click()
   await expect(issue.getByRole('alert')).toContainText('your account cannot triage acme/site')

@@ -309,7 +309,7 @@ function prChip(publication: PublicationView | undefined): string {
   if (!publication) return ''
   const pr = publication.pullRequest
   const label = pr.state === 'unknown' ? '' : ` ${pr.state}`
-  return `<a class="ep-pr ep-pr-${pr.state}" href="${escapeHtml(pr.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(publication.problem ?? publication.path)}">#${pr.number}${label}</a>`
+  return `<a class="ep-pr ep-pr-${pr.state}" href="${escapeHtml(pr.url)}" target="_blank" rel="noopener noreferrer" data-help="${escapeHtml(publication.problem ?? publication.path)}">#${pr.number}${label}</a>`
 }
 
 /** A typed control shows its own value, not its markup's: put the state back into each. */
@@ -363,7 +363,7 @@ function render(): void {
     return `
       <div class="ep-dest" data-key="${escapeHtml(c.key)}-fields">
         ${chosen.length > 1 || ownFields(c.section).length ? `<div class="ep-dest-name">${escapeHtml(c.site.site ?? c.site.repo)}${sectionsOf(c.site.repo) > 1 ? ` · ${escapeHtml(c.section.name)}` : ''}</div>` : ''}
-        <label class="ep-field"><span class="ep-label">Slug</span><input type="text" class="ep-input ep-mono" data-slug="${escapeHtml(c.key)}" aria-label="Slug" value="${escapeHtml(s.slugs.get(c.key) ?? '')}"${publication ? ' readonly title="Published under this slug"' : ''} autocomplete="off" spellcheck="false" /></label>
+        <label class="ep-field"><span class="ep-label">Slug</span><input type="text" class="ep-input ep-mono" data-slug="${escapeHtml(c.key)}" aria-label="Slug" value="${escapeHtml(s.slugs.get(c.key) ?? '')}"${publication ? ' readonly data-help="Published under this slug"' : ''} autocomplete="off" spellcheck="false" /></label>
         ${ownFields(c.section).map((f) => fieldHtml(c.key, f, own[f.name] ?? '', s.listText.get(fieldKey(c.key, f.name)))).join('')}
         ${resultHtml(s.results.get(c.key))}
       </div>`

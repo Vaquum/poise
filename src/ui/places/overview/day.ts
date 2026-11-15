@@ -109,7 +109,7 @@ export function mountDay(ctx: PartContext, main: HTMLElement, find: RightFilter,
   const arrow = (tile: AnalyticsTile) => tile.trend ? tile.trend.text.slice(0, 1) : ''
   function paceHTML(tile: AnalyticsTile): string {
     if (!tile.trend) return '<span class="pace is-neutral" data-ref="ov.pace">—</span>'
-    return `<span class="pace is-${tile.trend.direction}" data-ref="ov.pace" title="${esc(tile.trend.description)}"><b>${esc(arrow(tile))}</b>${esc(tile.trend.text.slice(2))}</span>`
+    return `<span class="pace is-${tile.trend.direction}" data-ref="ov.pace" data-help="${esc(tile.trend.description)}"><b>${esc(arrow(tile))}</b>${esc(tile.trend.text.slice(2))}</span>`
   }
   function sparkFor(label: string): string {
     const series = weekly()?.find((value) => value.label === label)
@@ -121,7 +121,7 @@ export function mountDay(ctx: PartContext, main: HTMLElement, find: RightFilter,
     const tone = tile.trend?.direction ?? 'neutral'
     return `<article class="otile${open === tile.label ? ' is-open' : ''}" data-tile="${esc(tile.label)}" draggable="true" tabindex="0" role="button" aria-expanded="${open === tile.label}" aria-label="${esc(tile.label)}: ${esc(tile.value)}. ${esc(tile.trend?.description ?? 'No comparison')}. Enter opens its year; Alt with an arrow key moves it." data-ref="ov.tile">
       <header class="otile-h"><span class="otile-l">${esc(tile.label)}</span><span class="grip" aria-hidden="true"></span></header>
-      <p class="otile-v" title="${esc(tile.note ?? '')}">${esc(tile.value)}</p>
+      <p class="otile-v" data-help="${esc(tile.note ?? '')}">${esc(tile.value)}</p>
       ${paceHTML(tile)}
       ${pair ? bullet(pair.current, pair.typical, tone) : ''}
       <p class="otile-t">${esc(tile.comparison ?? '')}</p>

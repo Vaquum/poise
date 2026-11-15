@@ -29,7 +29,7 @@ Observe and Settings. Elements explain themselves on hover, keyboard focus or
 `?`; Chat, the Manager place, the Editor and reused Settings components keep
 their existing tooltips. See [Interface](docs/Interface.md).
 
-- **Overview** — *Answer here* lists what needs you, with the answer on each entry: a failed behavior, a sign-in, a chat waiting for you, a Switchboard decision, a review thread, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. *In motion* shows the work in seven states; beside it, the day's numbers against their pace and year, Behaviors' runs and the GitHub API quota. The bell on every place opens it. See [Notifications](docs/Notifications.md) and [Analytics](docs/Analytics.md).
+- **Overview** — *Answer here* shows formal GitHub review requests, owner decisions and permissions, and accounts that need to reconnect. *In motion* shows the work in seven states alongside the day's metrics, Behaviors' runs and the GitHub API quota. The bell on every place opens Answer here. See [Notifications](docs/Notifications.md) and [Analytics](docs/Analytics.md).
 - **Board** — idea, concept and plan cards beside live issues and pull requests, a chained issue and its pull request as one task, and a List of the same work with its phase, owner and *Assign to Poise*.
 - **Chat** — native coding-agent sessions with streaming, tools, permissions and checkout-bound work; the Manager, its workers and the Switchboard in the Manager's place.
 - **Editor** — atomic Markdown storage, annotations, and agent-backed chat.

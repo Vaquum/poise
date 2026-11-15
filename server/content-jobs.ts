@@ -403,7 +403,9 @@ const defaultDependencies: ContentFinalizerDependencies = {
   listCalls: (identity) => fetchAgentLogs({ identity }),
   inspectCall: authorContentStatus,
   async readResponse(callId: string): Promise<string> {
-    return (await fetchAgentResponse(callId)).body
+    const response = await fetchAgentResponse(callId, 'content-finalization')
+    if ('disposition' in response) throw new Error(response.reason)
+    return response.body
   },
   observeProcessFailure(failure: unknown): void {
     claudeAuth.observeProcessFailure(failure)

@@ -53,9 +53,16 @@ tip=$(jq -r '.sha // empty' <<<"$tip_json" 2>/dev/null) || tip=""
 
 evidence=()
 for workflow in "${required[@]}"; do
-  if ! runs_json=$(gh api "repos/$REPO/actions/workflows/$workflow/runs?head_sha=$tip&per_page=30" 2>&1); then
-    fail "cannot read $workflow runs for $tip: $runs_json"
-  fi
+  # Retry only the read on GitHub server errors; judge the first successful answer.
+  for read_attempt in 1 2 3; do
+    if runs_json=$(gh api "repos/$REPO/actions/workflows/$workflow/runs?head_sha=$tip&per_page=30" 2>&1); then
+      break
+    fi
+    if [ "$read_attempt" = 3 ] || [[ ! "$runs_json" =~ HTTP\ 5[0-9][0-9] ]]; then
+      fail "cannot read $workflow runs for $tip: $runs_json"
+    fi
+    sleep 2
+  done
   if ! run_json=$(jq -c --arg repo "$REPO" \
     '[.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .head_repository.full_name == $repo)] | max_by([.created_at, .id]) // empty' \
     <<<"$runs_json" 2>/dev/null); then
