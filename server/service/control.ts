@@ -674,16 +674,28 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 export function handleServiceApi(req: IncomingMessage, res: ServerResponse, path: string, authority: RequestAuthority, control: ServiceControl): void | Promise<void> {
   if ((path === '/api/service/drain' || path === '/api/service/resume') && req.method === 'POST'
       && Number(req.headers['content-length']) > 0) {
-    if (authority.kind === 'gateway' && authority.scope !== 'admin') throw new HttpError(403, 'only the gateway controls replacement admission')
-    return readJson<{ replacement?: unknown }>(req).then(body => {
+    return (async () => {
+      let body: { replacement?: unknown } | null = null
+      try { body = await readJson<{ replacement?: unknown }>(req) } catch { body = null }
+      // An empty or unreadable body carries no replacement claim: existing
+      // ordinary callers keep the legacy contract below.
+      if (!body || Object.keys(body).length === 0) {
+        if (authority.kind === 'gateway' && authority.scope !== 'admin'
+            && !(authority.scope === 'browser' && path === '/api/service/resume')) {
+          throw new HttpError(403, 'service endpoints answer loopback and the gateway\'s admin scope; the owner\'s browser may only resume')
+        }
+        json(res, 200, path === '/api/service/drain' ? control.drain() : control.resume())
+        return
+      }
+      if (authority.kind === 'gateway' && authority.scope !== 'admin') throw new HttpError(403, 'only the gateway controls replacement admission')
       if (path === '/api/service/drain') {
-        if (typeof body?.replacement !== 'string') throw new HttpError(400, 'replacement must name the target release or image')
+        if (typeof body.replacement !== 'string') throw new HttpError(400, 'replacement must name the target release or image')
         json(res, 200, control.drain(body.replacement))
       } else {
-        if (body?.replacement !== true) throw new HttpError(400, 'replacement resume must retain admission')
+        if (body.replacement !== true) throw new HttpError(400, 'replacement resume must retain admission')
         json(res, 200, control.resume(true))
       }
-    })
+    })()
   }
   if (path === '/api/service/config') {
     if (authority.kind === 'gateway' && authority.scope !== 'admin') throw new HttpError(403, 'only the gateway configures service reporting')

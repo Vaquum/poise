@@ -454,6 +454,24 @@ describe('service endpoints', () => {
     expect(call('GET', '/api/service/resume', { kind: 'local' }, service)).toMatchObject({ status: 405, allow: 'POST' })
     expect(call('GET', '/api/service/unknown', { kind: 'local' }, service)).toMatchObject({ status: 404 })
   })
+
+  it('keeps ordinary drain/resume for empty bodies without a replacement claim', async () => {
+    const { service } = serviceOf()
+    const bodied = async (path: string, authority: RequestAuthority, body: string, contentType?: string) => {
+      const res = response()
+      const req = Object.assign(Readable.from(body ? [body] : []),
+        { method: 'POST', headers: { 'content-length': String(body.length), ...(contentType ? { 'content-type': contentType } : {}) } })
+      await control.handleServiceApi(req as unknown as IncomingMessage, res as unknown as ServerResponse, path, authority, service)
+      return { status: res.statusCode, body: res.body ? JSON.parse(res.body) : null }
+    }
+    // Existing callers POST '{}' with no JSON content-type.
+    expect(await bodied('/api/service/drain', { kind: 'local' }, '{}')).toMatchObject({ status: 200, body: { draining: true } })
+    expect(await bodied('/api/service/resume', { kind: 'local' }, '{}')).toMatchObject({ status: 200, body: { draining: false } })
+    expect(await bodied('/api/service/resume', { kind: 'gateway', scope: 'browser' }, '{}')).toMatchObject({ status: 200 })
+    // A non-empty body without a valid claim still fails.
+    await expect(bodied('/api/service/drain', { kind: 'local' }, '{"replacement":123}', 'application/json')).rejects
+      .toMatchObject({ statusCode: 400 })
+  })
 })
 
 describe('switching to another release', () => {
