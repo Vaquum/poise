@@ -80,6 +80,7 @@ export const OBSERVE: Registry = {
     now: (el) => textOf(el),
     values: [['Open, Merged, Closed', 'Issues and pull requests, as GitHub says.'], ['Failed', 'CI that failed or timed out.'], ['Done', 'CI that passed, or ended neutral.'], ['Running, Waiting', 'CI in progress, or queued.'], ['Blocked', 'CI that requires an action.'], ['Idle', 'CI that was cancelled, skipped or went stale.']],
   },
+  'gh.opened': { name: 'Opened', kind: 'Display', what: 'How long ago the pull request was originally opened, including after reopening or merging. A dash means it is not a pull request or its opening time is unavailable.', now: (el) => el.getAttribute('data-help') ?? textOf(el) },
   'gh.updated': { name: 'Updated', kind: 'Display', what: 'How long ago it last changed. Rows repaint in place at the refresh rate from General; nothing moves while you read.', now: (el) => el.getAttribute('data-help') ?? textOf(el) },
   'gh.review': { name: 'Consensus review', kind: 'Action', what: 'Asks several models to review an open pull request together, and posts the result on it.', shows: 'Accepted, Executing, then Review posted, on the row. Afterwards it offers to run again.', unavailable: 'A merged or closed pull request has nothing to review.' },
   'gh.more': { name: 'More history', kind: 'Display', what: 'Older history loads as you scroll, a page at a time, so the top is ready at once.', now: (el) => textOf(el) },
