@@ -31,7 +31,7 @@ import { behaviorChainJournal } from './behavior-chain-journal'
 import { BehaviorResourceRecovery } from './behavior-chain-resource-recovery'
 import { readNativeInvocations } from './behavior-chain-native'
 import { db } from './db'
-import { trackReleaseBackground } from './release-background'
+import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from './release-background'
 
 /** Closed sessions keep their workspace this long before it may be removed. */
 export const WORKSPACE_CLOSED_GRACE_MS = 24 * 60 * 60_000
@@ -999,7 +999,12 @@ let storageMeasurement: StorageMeasurement | null = null
 
 /** One pass unless one is already running, in which case the running report. */
 export function runStorageMaintenanceOnce(options: MaintenanceOptions = {}): Promise<MaintenanceReport> {
-  running ??= runStorageMaintenance(options).finally(() => { running = null })
+  if (running) return running
+  const release = trackReleaseBackground()
+  running = runStorageMaintenance(options).finally(() => {
+    running = null
+    release()
+  })
   return running
 }
 
@@ -1073,7 +1078,10 @@ export function firstMaintenanceDelay(now: number, last: Pick<MaintenanceReport,
 
 export function startStorageMaintenanceRuntime(): void {
   if (maintenanceTimer) return
-  const pass = () => { void runStorageMaintenanceOnce().catch((error: unknown) => console.error('[storage] maintenance failed:', error)) }
+  const pass = () => {
+    if (releaseBackgroundPaused() || releaseSwitchPending()) return
+    void runStorageMaintenanceOnce().catch((error: unknown) => console.error('[storage] maintenance failed:', error))
+  }
   maintenanceTimer = setTimeout(() => {
     pass()
     maintenanceTimer = setInterval(pass, MAINTENANCE_INTERVAL_MS)

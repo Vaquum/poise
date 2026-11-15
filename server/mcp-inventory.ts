@@ -7,7 +7,7 @@ interface Surface {
   source: string
   retention: string
   permission: string
-  tool?: 'poise_work' | 'poise_get'
+  tool?: 'poise_work' | 'poise_get' | 'poise_list' | 'poise_changes'
   reason: string
 }
 
@@ -86,6 +86,10 @@ export function mcpInventory() {
       ...PARTS.map(id => entry(`observe/${id}`, placeHref('observe', { part: id }), parts[id])),
       ...SECTIONS.map(id => entry(`settings/${id}`, placeHref('settings', { settings: id }), settings[id])),
       ...listCapabilities().map(id => entry(`capability/${id}`, capabilityLinks[id], capabilities[id])),
+      entry('chat/sessions', placeHref('chat'), { ...chat, retention: 'Current and archived sessions',
+        tool: 'poise_list', reason: 'Indexed pages by repository and update time' }),
+      entry('chat/transcript', placeHref('chat'), { kind: 'chat-event', source: 'Retained Chat journal', retention: 'Events since the last context reset',
+        permission: 'Chat transcript consent', tool: 'poise_changes', reason: 'Resumable transcript pages by stored sequence' }),
     ],
   }
 }
