@@ -644,14 +644,16 @@ export const mount: MountPlace = (ctx) => {
       toast(`The card was not saved: ${(error as Error).message}`, 'failed')
     }
   }
-  function startEdit(id: string): void { drafts.delete(`edit.${id}`); openWriter(`edit.${id}`) }
+  function startEdit(id: string): void { openWriter(`edit.${id}`) }
   async function saveEdit(id: string): Promise<void> {
-    const c = cardById(id), w = $(`[data-writer="edit.${id}"]`, lanesEl)
+    const key = `edit.${id}`
+    const c = cardById(id), w = $(`[data-writer="${key}"]`, lanesEl)
     if (!c || !w) return
     const text = ($('[data-w="edit-text"]', w).value as string).trim(), repo = ($('[data-w="edit-repo"]', w).value as string) || null
-    if (!text || (text === c.text && repo === c.repo)) { closeWriter(`edit.${id}`, writerFocus(`edit.${id}`)); return }
-    W.delete(`edit.${id}`)
-    drafts.delete(`edit.${id}`)
+    if (!text || (text === c.text && repo === c.repo)) { closeWriter(key, writerFocus(key)); return }
+    const query = repoPick?.query ?? repo ?? ''
+    W.delete(key)
+    drafts.delete(key)
     try {
       const saved = await updateCard(c.id, { text, repo })
       cards = cards.map((x) => (x.id === c.id ? { ...x, ...saved } : x))
@@ -659,9 +661,10 @@ export const mount: MountPlace = (ctx) => {
       render(false)
       $(`.card[data-id="${id}"]`, lanesEl)?.focus()
     } catch (error) {
-      W.set(`edit.${id}`, {})
-      drafts.set(`edit.${id}`, { 'edit-text': text, 'edit-repo': repo ?? '' })
-      openWriter(`edit.${id}`)
+      if (!W.has(key)) {
+        drafts.set(key, { 'edit-text': text, 'edit-repo': repo ?? '', 'repo-query': query })
+        if (!W.size) openWriter(key)
+      }
       toast(`The card was not saved: ${(error as Error).message}`, 'failed')
     }
   }

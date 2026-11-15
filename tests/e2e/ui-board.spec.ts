@@ -393,6 +393,59 @@ test('a failed card save leaves the newer repository writer active and keeps the
   await expect(idea.getByRole('combobox')).toHaveValue('api')
 })
 
+test('a failed card edit leaves the busy issue submission active and keeps the edit draft', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  const stored = { id: 7, text: 'Keep my edited card', repo: 'acme/site', lane: 'idea', position: 0, created_at: iso(0), updated_at: iso(0) }
+  let finishEdit: (() => void) | undefined
+  await page.route(/\/api\/current(?:\?|\/|$)/, async (route) => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { cards: [stored] } })
+    if (route.request().method() === 'PATCH') {
+      await new Promise<void>((resolve) => { finishEdit = resolve })
+      return route.fulfill({ status: 503, json: { error: 'Card save unavailable' } })
+    }
+    return route.fallback()
+  })
+  let finishIssue: (() => void) | undefined
+  await page.route('**/api/gh', async (route) => {
+    if (route.request().postDataJSON().operation !== 'open_issue') return route.fallback()
+    await new Promise<void>((resolve) => { finishIssue = resolve })
+    return route.fulfill({ status: 503, json: { error: 'GitHub unavailable' } })
+  })
+  await page.reload()
+  const edited = card(page, 'Keep my edited card')
+  await expect(edited).toBeVisible()
+
+  await edited.locator('.card-text').click()
+  await page.getByRole('textbox', { name: 'Card text' }).fill('Keep my edited draft')
+  await page.getByRole('combobox', { name: 'Linked repository' }).fill('api')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect.poll(() => !!finishEdit).toBe(true)
+
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.getByLabel('Issue title').fill('Keep this issue open')
+  await page.getByRole('button', { name: 'Open issue', exact: true }).click()
+  await expect.poll(() => !!finishIssue).toBe(true)
+  await expect(page.getByRole('combobox', { name: 'Repository', exact: true })).toBeDisabled()
+
+  finishEdit!()
+  await expect(page.getByText('The card was not saved: Card save unavailable')).toBeVisible()
+  await expect(page.getByRole('combobox')).toHaveCount(1)
+  await expect(page.getByLabel('Issue title')).toHaveValue('Keep this issue open')
+
+  finishIssue!()
+  await expect(page.locator('[data-writer="issue"]').getByRole('alert')).toHaveText('The issue was not opened: GitHub unavailable')
+  await expect(page.getByRole('combobox')).toHaveCount(1)
+  const repository = page.getByRole('combobox', { name: 'Repository', exact: true })
+  await repository.fill('api')
+  await expect(page.getByRole('option')).toHaveText(['acme/api'])
+  await expect(page.getByLabel('Issue title')).toHaveValue('Keep this issue open')
+
+  await page.locator('[data-writer="issue"]').getByRole('button', { name: 'Cancel' }).click()
+  await edited.locator('.card-text').click()
+  await expect(page.getByRole('textbox', { name: 'Card text' })).toHaveValue('Keep my edited draft')
+  await expect(page.getByRole('combobox', { name: 'Linked repository' })).toHaveValue('api')
+})
+
 test('choosing a live item opens it beside the board, and a card’s chat opens in the side pane', async ({ page }) => {
   await board(page, { records: RECORDS })
   await card(page, 'A pull request').locator('.card-meta').click()
