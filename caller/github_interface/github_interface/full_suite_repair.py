@@ -18,13 +18,14 @@ TITLE = "fix: the full test suite fails on main"
 BOT = "github-actions[bot]"
 
 
-async def test_results(client: GitHubClient, target: str, run: dict, *, causes: bool = False) -> dict:
+async def test_results(client: GitHubClient, target: str, run: dict, *, causes: bool = False, headlines: bool = False) -> dict:
     inventory = await client.get(f"/repos/{target}/actions/runs/{run['id']}/artifacts", params={"per_page": 100})
     artifacts = inventory["artifacts"]
     if len(artifacts) != inventory["total_count"]:
         raise ValueError("full-suite artifact inventory is incomplete")
     reports = [item for item in artifacts if re.fullmatch(r"unit-timings-[12]", item.get("name", ""))]
-    if sorted(item["name"] for item in reports) != ["unit-timings-1", "unit-timings-2"] or any(item.get("expired") for item in reports):
+    expected = sorted(run["unit_conclusions"]) if causes else ["unit-timings-1", "unit-timings-2"]
+    if sorted(item["name"] for item in reports) != expected or any(item.get("expired") for item in reports):
         raise ValueError("full-suite test artifacts are missing, expired or ambiguous")
     results = {}
     for artifact in reports:
@@ -50,6 +51,10 @@ async def test_results(client: GitHubClient, target: str, run: dict, *, causes: 
                             or status == "failed" and not any(message.strip() for message in messages):
                         raise ValueError("test artifact lacks a concrete assertion result/cause")
                     failed += status == "failed"
+                    # CI's formatted failure messages can append runtime IDs,
+                    # captured output and stack frames to the assertion text.
+                    if headlines:
+                        messages = sorted({re.sub(r"\x1b\[[0-9;]*m", "", message).partition("\n")[0].strip() for message in messages})
                     results.setdefault(key, []).append({"status": status, "cause": "\n".join(messages)})
                 else:
                     results.setdefault(key, []).append(status)

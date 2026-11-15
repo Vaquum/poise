@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
-import { parseFailedSource, type LogEntry } from './agent-log-parse'
+import { parseFailedSource, type FailedSourceEvidence, type LogEntry } from './agent-log-parse'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
-import { chainBasis, chainIdentity, FIXTURE_RECHECK_WAIT, type BehaviorChain, type BehaviorChainJournal, type ChainBehavior } from './behavior-chain-store'
+import { chainBasis, chainIdentity, FIXTURE_RECHECK_WAIT, IMPLEMENTATION_TRIAGE_WAIT, type BehaviorChain, type BehaviorChainJournal, type ChainBehavior } from './behavior-chain-store'
 import { ReviewScopeIndexingError } from './behavior-chain-runtime'
 import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
@@ -10,13 +10,14 @@ import { nativeResourcesPending, resourceReleaseProven } from './behavior-resour
 import { runDatastoreHealth, validatedHealth } from './datastore-health'
 import { getHeadSha, handleGhBody, listIssueCreationBodies, readIssueCreationBody, reconcileRepairReport } from './gh'
 import { HttpError } from './http'
+import { agentInterfaceCwd } from './models'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
 import type { ProcessDiagnostic } from './process-diagnostic'
 import { trackReleaseBackground } from './release-background'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { isServiceMode, readServiceConfig } from './service/config'
-import { recheckImplementationTest, type TestRecheckResult } from './behavior-chain-test-recheck'
+import { diagnoseReportedAssertion, recheckImplementationTest, reportedAssertion, type ReportedAssertion, type TestRecheckResult } from './behavior-chain-test-recheck'
 
 export const REMEDIATION_SCOPE = `Minimal, clinical interventions all the way. Get in, get out, do the thing that actually has to be done, never expand it beyond that. Keep asking "is this truly the cleanest and simplest and least intrusive way to get this done" and do it that way and only that way. Don't let others come expand it, let them come make it cleaner.`
 
@@ -28,6 +29,8 @@ const IMPLEMENTATION_PUBLICATION_CAUSE = 'implementation_publication_uncertain'
 const APPROVAL_CAUSE = 'approval_budget_exhausted'
 const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', APPROVAL_CAUSE, MERGE_CAUSE, CLOSED_CAUSE, IMPLEMENTATION_CAUSE, IMPLEMENTATION_BUDGET_CAUSE, IMPLEMENTATION_PUBLICATION_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
+const TRIAGE_PREFIX = 'behavior_chain_implementation_triage:'
+const TRIAGE_BUDGET_MS = 10 * 60_000
 const REPOSITORIES_KEY = 'service_repair_exhaustion_repositories'
 const implementationRechecks = new Map<string, Promise<void>>()
 
@@ -55,7 +58,34 @@ interface RepairReport {
   adopted?: boolean
   recheck?: { remedy: number, merge: string, base: string, state: 'running' | 'failed' | 'passed', reason?: string, result?: TestRecheckResult }
   disposition?: { kind: 'source-only' | 'distinct-fix' | 'existing-remedy', revision: string, review: string, commentId: number,
-    diagnosis: string, nextAction: string, remedy?: number }
+    diagnosis: string, nextAction: string, remedy?: number, triage?: string }
+}
+
+type Disposition = NonNullable<RepairReport['disposition']>
+type Capture = Extract<FailedSourceEvidence, { status: 'available' }>
+interface ImplementationTriage {
+  source: string
+  report: number
+  reportKey: string
+  holdSequence: number
+  actor: string
+  reviewer: string
+  sourceRevision: string
+  invocation: string
+  call: string
+  revision: string
+  review: string
+  reviewCall: string
+  commentId: number
+  base: string
+  prepared: string
+  capture: Capture | null
+  assertion: ReportedAssertion | null
+}
+interface TriageRecord {
+  inputs: ImplementationTriage
+  deadline: number
+  outcome: Awaited<ReturnType<typeof diagnoseReportedAssertion>> | null
 }
 
 const SCOPE_DIRECTIVE = 'Include this exact paragraph in the linked PR review.'
@@ -833,13 +863,25 @@ function dispositionReason(chain: BehaviorChain, report: RepairReport) {
     return `Repair hold report https://github.com/${chain.repository}/issues/${report.issueNumber}: ${disposition.kind} disposition for ${report.source} PR #${report.pull} head ${report.head}, reviewed revision ${disposition.revision}; original Call ${report.attempts[0].call}${disposition.kind === 'existing-remedy' ? `; remedy https://github.com/${chain.repository}/issues/${disposition.remedy}` : ''}. Diagnosis: ${disposition.diagnosis} Next action: ${disposition.nextAction} Source hold retained; checkout availability is unverified. Any source retry requires existing recovery or explicit Resume.`
   }
   const calls = report.attempts.map(attempt => attempt.call).join(', ')
-  return `Implementation hold report https://github.com/${chain.repository}/issues/${report.issueNumber}: ${disposition.kind} disposition for ${report.source}, reviewed revision ${disposition.revision}; original ${report.attempts.length > 1 ? `Calls ${calls}` : `Call ${report.attempts[0].call}`}. Diagnosis: ${disposition.diagnosis} Next action: ${disposition.nextAction} Source hold retained; checkout availability is unverified. Any source retry requires existing recovery or explicit Resume.`
+  const recovery = disposition.triage && disposition.kind === 'source-only'
+    ? 'The original chain can admit one fresh implementation while the report and source evidence stay current.'
+    : 'Source hold retained; checkout availability is unverified. Any source retry requires existing recovery or explicit Resume.'
+  return `Implementation hold report https://github.com/${chain.repository}/issues/${report.issueNumber}: ${disposition.kind} disposition for ${report.source}, reviewed revision ${disposition.revision}; original ${report.attempts.length > 1 ? `Calls ${calls}` : `Call ${report.attempts[0].call}`}. Diagnosis: ${disposition.diagnosis} Next action: ${disposition.nextAction} ${recovery}`
 }
 
 function reviewDispositionReason(chain: BehaviorChain, report: RepairReport) {
   const disposition = report.disposition!
   const calls = report.attempts.map(attempt => attempt.call).join(', ')
   return `PR review deadline report https://github.com/${chain.repository}/issues/${report.issueNumber}: ${disposition.kind} disposition for ${report.source} PR #${report.pull}, reviewed revision ${disposition.revision}; original Calls ${calls}. Diagnosis: ${disposition.diagnosis} Next action: ${disposition.nextAction} Source review obligation retained at head ${report.head}; no-submission and resource release preserved. Any source retry requires explicit retry; automatic retry stays stopped. No recovery is added.`
+}
+
+function saveImplementationDisposition(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain, source: BehaviorChain,
+  report: RepairReport, disposition: Disposition) {
+  report.disposition = disposition
+  db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(report), PREFIX + report.key)
+  const reason = dispositionReason(chain, report)
+  journal.append(source.id, `report-disposition:${chain.id}:${chain.sequence}`, source.sequence, { type: 'chain.waiting', reason })
+  journal.append(chain.id, `report-disposition:${chain.sequence}`, chain.sequence, { type: 'chain.waiting', reason })
 }
 
 /** Explicit owner triage, using the existing guarded chain control. Comment
@@ -902,12 +944,7 @@ export async function setImplementationReportDisposition(db: Database, journal: 
     }
     const source = boundImplementationSource(db, journal, chain, report)
     if (!source) throw new HttpError(409, 'Original blocked hold or Call changed before disposition')
-    report.disposition = disposition
-    db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(report), PREFIX + report.key)
-    journal.append(source.id, `report-disposition:${chain.id}:${sequence}`, source.sequence,
-      { type: 'chain.waiting', reason: dispositionReason(chain, report) })
-    journal.append(chain.id, `report-disposition:${sequence}`, sequence,
-      { type: 'chain.waiting', reason: dispositionReason(chain, report) })
+    saveImplementationDisposition(db, journal, chain, source, report, disposition)
   }).immediate()
 }
 
@@ -964,6 +1001,9 @@ async function findUnconfirmedPrePrReport(journal: BehaviorChainJournal, chain: 
 /** Runs at implementation admission even when new report publishing is off. */
 export async function implementationReportAdmission(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, observe: (source: BehaviorChain) => Promise<ChainObservation>) {
+  const recovery = chain.testRecovery
+  const recoveringSource = recovery?.triage && (!recovery.admission
+    || chain.invocations.some(item => item.id === recovery.admission && item.state === 'admitted'))
   const implWait = 'Implementation hold report awaits a current explicit source-only or verified distinct-fix disposition'
   const repairWait = 'Repair hold report awaits a current explicit existing-remedy or verified distinct-fix disposition'
   const approvalWait = 'Approval deadline report awaits a current explicit source-only or verified distinct-fix disposition'
@@ -1008,6 +1048,7 @@ export async function implementationReportAdmission(db: Database, journal: Behav
   if (report) {
     const approval = report.pull !== null && report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])
     const wait = report.pull === null ? implWait : approval ? approvalWait : repairWait
+    if (recoveringSource) return { reason: `${wait}: this issue is itself a generated report` }
     if (report.pull === null && report.key !== chainBasis([IMPLEMENTATION_CAUSE, report.source])
       && report.key !== chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])
       && report.adopted !== false) {
@@ -1079,7 +1120,11 @@ export async function implementationReportAdmission(db: Database, journal: Behav
         || chainBasis(qualifying.attempts.map(item => ({ invocation: item.id, call: item.callId, completedAt: item.evidence?.completedAt }))) !== chainBasis(report.attempts)) return { reason: `${wait}: source or reviewed report evidence changed` }
     }
     if (disposition.kind === 'source-only' || disposition.kind === 'existing-remedy') return { reason: dispositionReason(chain, report) }
-    return { reason: null, source: { id: source.id, sequence: source.sequence } }
+    if (disposition.triage && !currentTriage(db, source, fresh, chain, observation, report, disposition, 'distinct-fix')) {
+      return { reason: `${wait}: the independent reproduction no longer matches the current main, source or report review` }
+    }
+    return { reason: null, source: { id: source.id, sequence: source.sequence },
+      ...(disposition.triage ? { note: `${disposition.diagnosis} ${disposition.nextAction}` } : {}) }
   }
   const reviewWait = 'PR review deadline report awaits a current explicit source-only or verified distinct-fix disposition'
   let review = reviewReport(db, chain)
@@ -1100,8 +1145,9 @@ export async function implementationReportAdmission(db: Database, journal: Behav
         break
       }
     }
-    if (!review) return { reason: null }
+    if (!review) return recoveringSource ? diagnosedSourceAdmission(db, journal, chain, observation, observe) : { reason: null }
   }
+  if (recoveringSource) return { reason: `${reviewWait}: this issue is itself a generated report` }
   const reviewDisposition = review.disposition
   if (!reviewDisposition || !['source-only', 'distinct-fix'].includes(reviewDisposition.kind)
     || !dispositionReview(chain, observation, reviewDisposition)) return { reason: reviewWait }
@@ -1237,7 +1283,14 @@ export function repairReportImplementationFence(db: Database, chain: BehaviorCha
 export async function recoverReportedRepair(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, verify: (target: BehaviorChain, verifyConflict?: boolean) => Promise<ChainObservation>,
   allowed: () => boolean, signal?: AbortSignal): Promise<string | null> {
+  if (chain.testRecovery?.triage) {
+    if (chain.testRecovery.admission) return null
+    return recoverImplementationTriage(db, journal, chain, observation, verify, allowed, signal)
+  }
   const implementation = await recoverReportedImplementation(db, journal, chain, observation, allowed, signal)
+  if (implementation === null || implementation === FIXTURE_RECHECK_WAIT || chain.testRecovery?.recheck) return implementation ?? null
+  const triage = await recoverImplementationTriage(db, journal, chain, observation, verify, allowed, signal)
+  if (triage !== null) return triage
   if (implementation !== undefined) return implementation
   const fence = repairReportImplementationFence(db, chain, 'implement-issue')
   if (fence) {
@@ -1481,6 +1534,231 @@ function prePrReports(db: Database, chainId: string) {
     .all(PREFIX + '*', chainId) as Array<{ key: string, value: string }>
   return rows.map(row => ({ storageKey: row.key, value: row.value, report: JSON.parse(row.value) as RepairReport }))
     .filter(candidate => candidate.report.attempts.length === 1)
+}
+
+function noReportWork(chain: BehaviorChain, observation: ChainObservation) {
+  const publication = observation.publication
+  return !chain.held && !chain.mergeSha && !chain.supersession && observation.issue.open && observation.issue.eligible
+    && !observation.pull && !observation.existingPulls.length && !observation.workPublication
+    && publication.pull_number === null && publication.head_sha === null && publication.head_invocation === null
+    && publication.state === null && publication.merged === false && publication.merge_sha === null
+    && chain.invocations.every(item => item.state === 'settled'
+      && (!['implement-issue', 'publish-issue'].includes(item.behavior)
+        || item.outcome === 'launch_deferred' && !item.callId && item.evidence?.action === 'not_started')
+      && (!item.callId || resourceReleaseProven(item.evidence ?? {}, true)))
+}
+
+function originalTriageSource(db: Database, chain: BehaviorChain, observation: ChainObservation, report: RepairReport) {
+  const admission = chain.testRecovery?.triage ? chain.testRecovery.admission : undefined
+  const original = chain.invocations.filter(invocation => invocation.id !== admission).at(-1)
+  const source = chain.testRecovery?.triage && !chain.held
+    ? { ...chain, held: String(original?.evidence?.error ?? ''), invocations: chain.invocations.filter(item => item.id !== admission) }
+    : chain
+  const qualified = qualifyingImplementationHold(db, source, observation, Date.now())
+  const prepared = (original?.evidence?.artifact as { prepared?: Record<string, unknown> } | undefined)?.prepared
+  const base = observation.prerequisites?.base
+  const attempt = report.attempts[0]
+  if (!qualified || !original || !prepared || !base || !/^[a-f0-9]{40}$/.test(base) || !observation.issue.eligible
+    || chain.ciHold || chain.testHold || chain.repairRecovery || observation.workPublication || observation.prerequisites?.wait
+    || report.pull !== null || report.head !== null || report.adopted === true || report.attempts.length !== 1
+    || report.holdSequence !== qualified.hold.sequence || report.heldAt !== qualified.hold.at
+    || report.basis !== original.basis || report.slot !== original.slot || attempt?.invocation !== original.id
+    || attempt.call !== qualified.call || attempt.completedAt !== original.evidence?.completedAt
+    || original.basis !== chainBasis(['issue', observation.issue.revision]) || original.slot !== observation.implementer.slot
+    || original.request.argv[original.request.argv.indexOf('--expected-issue-revision') + 1] !== observation.issue.revision
+    || prepared.repository !== chain.repository || prepared.issue_number !== chain.issue || prepared.branch !== chain.branch
+    || prepared.actor !== chain.author || prepared.pull_number !== null || prepared.head_sha !== null
+    || typeof prepared.checkout_head !== 'string' || !/^[a-f0-9]{40}$/.test(prepared.checkout_head)
+    || source.invocations.some(item => item.callId && !resourceReleaseProven(item.evidence ?? {}, true))) return null
+  return { original, base, prepared: prepared.checkout_head, hold: qualified.hold, call: qualified.call }
+}
+
+function triageInputs(db: Database, source: BehaviorChain, observation: ChainObservation,
+  chain: BehaviorChain, reportObservation: ChainObservation, report: RepairReport): ImplementationTriage | null {
+  const original = originalTriageSource(db, source, observation, report)
+  const accounts = getSettings()
+  if (!original || report.issueNumber !== chain.issue || report.source !== source.id
+    || !Number.isFinite(reportObservation.checkedAt) || reportObservation.checkedAt > Date.now()
+    || Date.now() - reportObservation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS
+    || source.author !== chain.author || source.reviewer !== chain.reviewer
+    || accounts.me.toLowerCase() !== source.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== source.reviewer.toLowerCase()) return null
+  const revision = reportObservation.issue.revision
+  const review = [...chain.invocations].reverse().find(item => item.behavior === 'review-issue' && item.state === 'settled'
+    && item.basis === chainBasis(['issue', revision]) && item.actor.toLowerCase() === chain.reviewer.toLowerCase())
+  const receipts = review?.evidence?.receipts as Array<{ comment_id: number, issue?: string, author?: string }> | undefined
+  const commentId = Array.isArray(receipts) && receipts.find(receipt => receipt?.issue?.toLowerCase() === chain.id
+    && receipt.author?.toLowerCase() === chain.reviewer.toLowerCase() && reportObservation.issue.commentIds.includes(receipt.comment_id))
+  if (!review?.callId || !commentId || !resourceReleaseProven(review.evidence ?? {}, true)
+    || typeof review.evidence?.completedAt !== 'number' || !Number.isFinite(review.evidence.completedAt)
+    || reportObservation.checkedAt < review.evidence.completedAt
+    || reportObservation.checkedAt < Date.parse(String(review.evidence.resources_settled_at))
+    || !dispositionReview(chain, reportObservation, { kind: 'source-only', revision, review: review.id, commentId: commentId.comment_id,
+      diagnosis: '', nextAction: '' })) return null
+  const artifact = original.original.evidence?.artifact as { failed_source?: unknown }
+  const reported = String(original.original.evidence?.error ?? '')
+  const capture = parseFailedSource(artifact.failed_source)
+  const named = /\bCaptured candidate\b(.*)/i.exec(reported)?.[1]
+  const identity = named?.match(/^(?: digest)?:?\s+([a-f0-9]{64});\s+(?:original )?producing (?:relay )?run:?\s+([a-f0-9]{32})\b/i)
+  const retained = capture?.status === 'available' && capture.base === original.prepared && capture.expires_at * 1000 > Date.now()
+    && (named === undefined || capture.candidate === identity?.[1] && capture.run === identity[2]) ? capture : null
+  return { source: source.id, report: chain.issue, reportKey: report.key, holdSequence: original.hold.sequence,
+    actor: source.author, reviewer: source.reviewer, sourceRevision: observation.issue.revision,
+    invocation: original.original.id, call: original.call,
+    revision, review: review.id, reviewCall: review.callId, commentId: commentId.comment_id, base: original.base, prepared: original.prepared,
+    capture: retained, assertion: reportedAssertion(reported) }
+}
+
+function currentTriage(db: Database, source: BehaviorChain, observation: ChainObservation, chain: BehaviorChain,
+  reportObservation: ChainObservation, report: RepairReport, disposition: Disposition, kind: 'source-only' | 'distinct-fix') {
+  const inputs = triageInputs(db, source, observation, chain, reportObservation, report)
+  if (!inputs || !disposition.triage || chainBasis(inputs) !== disposition.triage || disposition.kind !== kind
+    || disposition.revision !== inputs.revision || disposition.review !== inputs.review || disposition.commentId !== inputs.commentId) return null
+  const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(TRIAGE_PREFIX + disposition.triage) as { value: string } | undefined
+  if (!row) return null
+  const saved = JSON.parse(row.value) as TriageRecord
+  return saved.outcome?.kind === kind && chainBasis(saved.inputs) === disposition.triage ? inputs : null
+}
+
+async function diagnosedSourceAdmission(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
+  observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>) {
+  const recovery = chain.testRecovery!
+  const wait = 'Source implementation awaits its current verified report diagnosis'
+  const saved = prePrReports(db, chain.id).find(candidate => candidate.report.key === recovery.recheck)
+  const report = saved?.report
+  const disposition = report?.disposition
+  if (!report?.issueNumber || !disposition || disposition.triage !== recovery.triage || observation.prerequisites?.wait
+    || !enabled(db, chain.repository) || !getBehaviorChainSettings().enabled) return { reason: wait }
+  const target = journal.read(chainIdentity(chain.repository, report.issueNumber))
+  if (!target || target.held || !target.observation) return { reason: wait }
+  const fresh = await verify(target)
+  if (!noReportWork(target, fresh) || !await verifiedReport(target, report, fresh.issue.revision)
+    || journal.read(target.id)?.sequence !== target.sequence || journal.read(chain.id)?.sequence !== chain.sequence
+    || chainBasis(implementationReport(db, target)) !== chainBasis(report)
+    || !currentTriage(db, chain, observation, target, fresh, report, disposition, 'source-only')) return { reason: wait }
+  return { reason: null, source: { id: target.id, sequence: target.sequence },
+    note: `${disposition.diagnosis} ${disposition.nextAction}` }
+}
+
+async function recoverImplementationTriage(db: Database, journal: BehaviorChainJournal, source: BehaviorChain, observation: ChainObservation,
+  verify: (chain: BehaviorChain) => Promise<ChainObservation>, allowed: () => boolean, signal?: AbortSignal): Promise<string | null> {
+  if (source.testHold || source.ciHold || source.testRecovery?.admission || source.mergeSha || source.supersession
+    || (!source.held && !source.testRecovery?.triage) || observation.pull || !enabled(db, source.repository) || !allowed() || signal?.aborted) return null
+  const exact = prePrReports(db, source.id).filter(({ report }) => report.issueNumber && originalTriageSource(db, source, observation, report))
+  if (exact.length !== 1 || implementationReport(db, source) || reviewReport(db, source)) return null
+  const report = exact[0].report
+  const pending = (reason: string) => `${IMPLEMENTATION_TRIAGE_WAIT} ${reason} (report #${report.issueNumber}, Call ${report.attempts[0].call})`
+  if (report.disposition && !report.disposition.triage) return null
+  const target = journal.read(chainIdentity(source.repository, report.issueNumber!))
+  if (!target || target.held || !target.observation) return pending('the report needs its settled current issue review')
+  // Use the ordinary admission binding for both original and scoped reports.
+  if (chainBasis(implementationReport(db, target)) !== chainBasis(report)) return null
+  if (report.recheck) return null
+  const fresh = await verify(target)
+  if (!noReportWork(target, fresh)) {
+    if (report.disposition?.kind === 'distinct-fix'
+      && target.invocations.some(item => item.behavior === 'implement-issue')) return dispositionReason(target, report)
+    return pending('the report has competing work, publication or unsettled resources')
+  }
+  const inputs = triageInputs(db, source, observation, target, fresh, report)
+  if (!inputs) return pending('the configured owner or settled current report review does not verify')
+  try {
+    if (!await verifiedReport(target, report, inputs.revision)) return pending('the authenticated report revision changed')
+  } catch {
+    return pending('the report marker, publisher or current revision could not be authenticated')
+  }
+  const current = () => allowed() && !signal?.aborted && enabled(db, source.repository)
+    && journal.read(source.id)?.sequence === source.sequence && journal.read(target.id)?.sequence === target.sequence
+    && chainBasis(implementationReport(db, target)) === chainBasis(report)
+    && getSettings().me.toLowerCase() === inputs.actor.toLowerCase() && getSettings().agentAccount.toLowerCase() === inputs.reviewer.toLowerCase()
+    && Date.now() - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
+    && Date.now() - fresh.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
+  if (!current()) return pending('source, report or ownership changed during verification')
+
+  const triage = chainBasis(inputs)
+  if (source.testRecovery?.triage && source.testRecovery.triage !== triage) return pending('the saved source retry diagnosis is stale')
+  const key = TRIAGE_PREFIX + triage
+  const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
+  if (!row) {
+    if (implementationRechecks.size) return pending('another bounded implementation recheck is running')
+    const record: TriageRecord = { inputs, deadline: Date.now() + TRIAGE_BUDGET_MS, outcome: null }
+    const intent = JSON.stringify(record)
+    if (!db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run(key, intent).changes) return pending('another observation owns this evidence')
+    const release = trackReleaseBackground('behavior')
+    const work = (async () => {
+      const budget = AbortSignal.timeout(TRIAGE_BUDGET_MS)
+      const probeSignal = signal ? AbortSignal.any([budget, signal]) : budget
+      let outcome: TriageRecord['outcome']
+      try {
+        let retained: Parameters<typeof diagnoseReportedAssertion>[5] = null
+        if (inputs.capture) {
+          const { stdout } = await runFile('agent-interface', ['--read-failed-source', inputs.call, inputs.capture.candidate, inputs.capture.run,
+            '--diagnosis', triage], { cwd: agentInterfaceCwd(), env: { POISE_DB: db.name }, signal: probeSignal,
+            timeoutMs: 30_000, maxOutputBytes: 16 * 1024, reportFailure: false })
+          const { path, ...receipt } = JSON.parse(stdout) as Record<string, unknown>
+          if (receipt.status === 'available' && typeof path === 'string' && chainBasis(parseFailedSource(receipt)) === chainBasis(inputs.capture)) {
+            retained = { path, capture: inputs.capture, call: inputs.call }
+          }
+        }
+        outcome = inputs.assertion ? await diagnoseReportedAssertion(source.repository, source.author, inputs.base, inputs.prepared,
+          inputs.assertion, retained, probeSignal) : { kind: 'inconclusive', reason: 'the original Call does not identify one supported test and concrete assertion' }
+      } catch {
+        outcome = { kind: 'inconclusive', reason: 'the exact source capture or bounded reproduction could not be read' }
+      }
+      if (db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?')
+        .run(JSON.stringify({ ...record, outcome }), key, intent).changes !== 1) throw new Error('saved diagnosis intent changed')
+    })().catch((error: unknown) => {
+      console.error(`[behavior-chain] implementation diagnosis for ${source.id} could not persist its outcome:`, error)
+    }).finally(() => {
+      release()
+      implementationRechecks.delete(key)
+    })
+    implementationRechecks.set(key, work)
+    return pending('waiting for the bounded reproduction')
+  }
+
+  const savedDiagnosis = JSON.parse(row.value) as TriageRecord
+  const { outcome } = savedDiagnosis
+  if (!outcome) return pending(implementationRechecks.has(key) ? 'waiting for the bounded reproduction' : 'the saved diagnosis was interrupted')
+  if (chainBasis(savedDiagnosis.inputs) !== triage) {
+    return pending('the saved outcome does not bind this evidence')
+  }
+  if (outcome.kind === 'inconclusive') return pending(outcome.reason)
+  if (!inputs.assertion) return pending('the completed diagnosis has no concrete assertion')
+  const { file, test, message } = inputs.assertion
+  const assertion = behaviorErrorMessage(message, 350)
+  const disposition: Disposition = { kind: outcome.kind, revision: inputs.revision, review: inputs.review, commentId: inputs.commentId, triage,
+    diagnosis: outcome.kind === 'distinct-fix'
+      ? `A clean main checkout at ${inputs.base} reproduced ${file} > ${test}: ${assertion}.`
+      : `The exact retained candidate reproduced ${file} > ${test}: ${assertion}. The same assertion passed on the clean prepared and current bases.`,
+    nextAction: outcome.kind === 'distinct-fix'
+      ? `Repair and validate the independently reproduced assertion on main. Retain the source trail at https://github.com/${source.repository}/issues/${source.issue} and Call ${inputs.call}.`
+      : `Investigate that assertion in the fresh source implementation. Provenance is in https://github.com/${source.repository}/issues/${target.issue} and Call ${inputs.call}.` }
+  const existing = report.disposition
+  if (existing?.triage === triage && chainBasis(existing) !== chainBasis(disposition)) return pending('the saved disposition disagrees with its diagnosis')
+  if (!existing || existing.triage !== triage) {
+    const recorded = db.transaction(() => {
+      if (!current() || !boundImplementationSource(db, journal, target, report)) return false
+      saveImplementationDisposition(db, journal, target, source, report, disposition)
+      return true
+    }).immediate()
+    if (!recorded) return pending('the original automatic hold or report changed before disposition')
+  }
+  if (disposition.kind === 'distinct-fix') return dispositionReason(target, report)
+  const active = journal.read(source.id)!
+  const recovery = { hold: { sequence: inputs.holdSequence, invocationId: inputs.invocation, callId: inputs.call },
+    base: inputs.base, recheck: report.key, triage }
+  const recovered: ChainObservation = { ...observation, testDependency: { invocationId: inputs.invocation,
+    verified: true, recovered: true, recheck: report.key, recovery: { base: inputs.base, triage, run: { report: report.issueNumber, review: inputs.review } } } }
+  const decision = decideBehaviorChain({ ...active, held: null, testRecovery: recovery }, recovered, Date.now())
+  if (decision.kind !== 'invoke' || decision.behavior !== 'implement-issue') {
+    return pending(`normal source admission: ${'reason' in decision ? decision.reason : 'source is complete'}`)
+  }
+  db.transaction(() => {
+    const observed = journal.append(active.id, randomUUID(), active.sequence, { type: 'chain.observed', observation: recovered })
+    if (!observed.testRecovery) journal.append(active.id, randomUUID(), observed.sequence,
+      { type: 'chain.resumed', testRecovery: recovery, recovery: { origin: 'automatic' } })
+  }).immediate()
+  return null
 }
 
 async function recoverReportedImplementation(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,

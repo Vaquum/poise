@@ -216,6 +216,8 @@ describe('the work in the seven states', () => {
     const repairing = chain({ invocations: [{ behavior: 'repair-pr', state: 'settled', outcome: 'x' }, { behavior: 'review-pr', state: 'settled', outcome: 'x' }, { behavior: 'repair-pr', state: 'started', outcome: null }] })
     expect(taskPhase(repairing)).toEqual({ phase: 'Repair', round: 2 })
     expect(taskState(repairing)).toEqual({ state: 'running', note: 'Repair · round 2' })
+    expect(taskPhase(chain({ held: 'CI failed', invocations: [{ behavior: 'refresh-pr-ci', state: 'settled', outcome: 'updated' }] })))
+      .toEqual({ phase: 'Repair', round: 1 })
     expect(taskState(chain({ held: 'Removed from the merge queue by hand' }))).toEqual({ state: 'blocked', note: 'Removed from the merge queue by hand' })
     expect(taskState(chain({ invocations: [{ behavior: 'review-pr', state: 'uncertain', outcome: 'a reply may have posted' }] })).state).toBe('blocked')
     expect(taskState(chain({ waiting: 'waiting for memory' }))).toEqual({ state: 'waiting', note: 'waiting for memory' })

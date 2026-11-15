@@ -1863,22 +1863,22 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
-Their own implementation additionally requires an explicit disposition through
-the existing guarded chain control, bound to the authenticated report, native
-issue review, reviewed revision and original source hold/Call. Source-only and
-missing or stale dispositions wait without starting report implementation;
-a verified distinct-fix disposition retains ordinary admission gates, including
-fresh source verification after preparation. Diagnosis and next action persist
-on the held source through the existing report metadata and journal waits.
-This adds no retry or checkout-retention authority; see
-[report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
+Their own implementation also requires a current disposition through the
+guarded chain contract, bound to the authenticated report, native issue review,
+reviewed revision and original source hold and Call. Poise can use a bounded
+reproduction to record that same disposition after the report review settles.
+Only a verified distinct-fix retains ordinary report admission. A verified
+automatic source-only diagnosis can authorize one fresh original implementation
+through the existing scheduler, with current review, no-publication and resource
+checks at admission. See [report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
 The existing linked remediation also exposes bounded private source evidence
 from failed validation, including interrupted runs with a recorded Vitest
 assertion diagnostic. Caller retains it through normal checkout cleanup under
 the workspace's incident-artifact lifecycle. Receipts and reports carry its
 availability and capture identity. The interrupted marker and source bytes stay
 in the owning workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
-defines binding, access, limits and expiry without granting recovery authority.
+defines the diagnosis and implementation bindings, access, limits and expiry
+for inspection without granting recovery authority.
 Terminal repair reports require the matching automatic hold, settled original Call,
 positive release and unchanged open PR head and repair basis, without possible
 publication effects. They preserve repair ownership and exclude CI-only recovery holds.

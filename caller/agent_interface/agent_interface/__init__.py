@@ -1799,6 +1799,8 @@ def run_native_action(argv: list[str], cwd: str, repository: str, actor: str, co
         diagnostic = getattr(error, "diagnostic", None)
         no_action = not started or (argv[0] == "--merge-if-ready" and isinstance(error, native_action.ActionFailure)
                                    and diagnostic.get("submission") in {"none", "rejected"})
+        no_action = no_action or (argv[0] == "--update-branch-if-behind" and isinstance(error, native_action.ActionFailure)
+                                  and diagnostic.get("operation") == "update_branch_if_behind" and diagnostic.get("submission") == "none")
         finish(id_, "failed", error=str(error)[:2000], error_code="native_action_failed",
                outcome="preflight_failed" if no_action else None, action="not_started" if no_action else None,
                diagnostic=diagnostic)
@@ -3147,7 +3149,7 @@ behaviors:
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--expected-issue-revision SHA256] [--note TEXT]
   --atomic-work OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID --branch BRANCH [--pull-number N --expected-head SHA] [--merge-base] [--expected-issue-revision SHA256] [--note TEXT]
   --read-action-plan CALL_ID
-  --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID
+  --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID [--diagnosis DIGEST]
   --complete-atomic-publication CALL_ID PLAN_SHA HEAD_SHA
   --author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]
   --debate TOPIC [--rounds N]
@@ -3356,8 +3358,8 @@ def _main():
         exit_code = None if sys.argv[6] == "interrupted" else int(sys.argv[6])
         failed_source.capture(DB, Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5], exit_code)
         return
-    if len(sys.argv) == 5 and sys.argv[1] == "--read-failed-source":
-        print(json.dumps(failed_source.inspect(DB, *sys.argv[2:])))
+    if sys.argv[1:2] == ["--read-failed-source"] and (len(sys.argv) == 5 or len(sys.argv) == 7 and sys.argv[5] == "--diagnosis"):
+        print(json.dumps(failed_source.inspect(DB, *sys.argv[2:5], diagnosis=sys.argv[6] if len(sys.argv) == 7 else None)))
         return
     if len(sys.argv) >= 5 and sys.argv[1] == "--complete-atomic-publication":
         import argparse
