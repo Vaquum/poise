@@ -388,6 +388,23 @@ describe('service drain', () => {
     expect(log).toHaveBeenCalledWith('[service] the drain lapsed: no drain call renewed it within 2100 s, so new work is admitted again')
   })
 
+  it('holds the replacement pause when the first replacement arrives during an ordinary drain', () => {
+    const timer = new FakeTimer()
+    let now = 1_800_000_000_000
+    const service = new control.ServiceControl(fakeRuntime() as unknown as ChatRuntime,
+      { drainTimeoutSeconds: 1800, timer, log: vi.fn(), now: () => now })
+    service.drain()
+    expect(service.draining).toBe(true)
+    const health = service.drain('new-image')
+    expect(health.draining).toBe(true)
+    // The replacement pause ceiling must arm, not an immediate release.
+    const delays = [...timer.timers.values()].map((entry) => entry.delayMs)
+    expect(delays).toContain(control.REPLACEMENT_PAUSE_MS)
+    expect(delays).not.toContain(0)
+    timer.fireDelay(control.REPLACEMENT_PAUSE_MS)
+    expect(service.draining).toBe(false)
+  })
+
   it('stops Chat turns that hold the drain past the turn deadline, once per drain', () => {
     const { runtime, timer, log, service } = serviceOf()
     service.drain()

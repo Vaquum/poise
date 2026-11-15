@@ -542,8 +542,10 @@ export class ServiceControl {
   /** Ordinary drains renew their lapse. Replacement renews only its admission
    *  fence; rechecks cannot extend the current background pause. */
   drain(replacement?: string): ServiceHealth {
+    let freshReplacement = false
     if (replacement !== undefined) {
       if (!replacement || replacement.length > 200) throw new HttpError(400, 'replacement must name the target release or image')
+      freshReplacement = this.replacement !== replacement
       this.replacement = replacement
       markReplacementPending(true)
       this.runtime.setSwitchPending(this.switchTo ?? replacement)
@@ -556,7 +558,7 @@ export class ServiceControl {
       if (!this.drainOn && this.replacementRecoveryWait() !== null) return this.health()
     }
     const first = !this.drainOn
-    if (first && this.replacement !== null) {
+    if ((first || freshReplacement) && this.replacement !== null) {
       this.replacementDrainUntil = this.now() + REPLACEMENT_PAUSE_MS
       this.replacementResumedAt = null
     }
