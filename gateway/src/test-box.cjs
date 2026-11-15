@@ -150,8 +150,8 @@ function ranOutOfMemory(before, after) {
 function gitBytes(cwd, ...args) {
   // Unpacking runs as the suite user, so this must too when root; otherwise run as self (tests, jobs).
   const identity = process.getuid?.() === 0 ? asUser : {}
-  const result = spawnSync('git', ['--no-replace-objects', '-c', 'core.fsmonitor=false', '-c', 'protocol.allow=never',
-    '-C', cwd, ...args], { env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_LAZY_FETCH: '1' },
+  const result = spawnSync('git', ['--no-replace-objects', '-c', 'core.fsmonitor=false', '-C', cwd, ...args], {
+    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '' },
     timeout: 5_000, maxBuffer: 16 * 1024 * 1024, ...identity })
   if (result.status !== 0) throw new Error('test capture git identity is unavailable')
   return result.stdout
