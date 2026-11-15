@@ -929,7 +929,11 @@ normal reporter. This failure-only stderr record is redacted in full before
 being limited to 8,192 characters (plus its final newline). Passing tests add no
 output. A later interruption still leaves the suite incomplete and any observed
 failure blocked under the evidence rules below.
-An explicit gateway-restart failure is the one exception: the active command
+An explicit gateway-restart failure or code-125 relay fail frame starting
+`sending the checkout to the box failed: ` permits bounded recovery. The latter
+confirms that the relay exhausted its three part-upload attempts and retired
+the run before any suite command started, including on a final checkout part.
+The active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated
 run handshake and retries the whole suite once. The authenticated
@@ -946,7 +950,10 @@ A shorter inherited `BASH_DEFAULT_TIMEOUT_MS` still caps the command budget.
 Cancellation retires the active upload and lease and prevents recovery from
 starting a new suite. Only the fresh suite's complete exit is returned; a genuine
 suite exit (including 125), a broken stream or another relay cause never retries.
-A second restart or an unrecovered relay retains the no-result contract above.
+Upload failures and gateway restarts share this single recovery allowance.
+A second interruption or an unrecovered relay retains the no-result contract above.
+Output followed by EOF without an exit event on Render's command stream remains
+incomplete and does not authorize recovery.
 Poise derives the agent shell default from the installed budget plus 60 seconds
 for reporting and cleanup (600000 ms at the default budget). The shell maximum
 stays 3600000 ms. The client allows up to one second for its cleanup DELETE;

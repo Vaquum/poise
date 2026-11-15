@@ -251,7 +251,8 @@ class Session:
         with caller_store.connect(self.database) as conn:
             conn.execute("begin immediate")
             original, saved = self.owned(conn)
-            saved.update(checkpoint=reference, generation=self.generation + 1, unit=self.state["unit"])
+            saved.update(checkpoint=reference, generation=self.generation + 1, unit=self.state["unit"],
+                         required_units=len(self.manifest["units"]) + 1)
             if advanced:
                 saved["last_progress_at"] = max(saved.get("last_progress_at", 0), int(time() * 1000))
                 saved["progress_call"] = self.call
@@ -276,7 +277,6 @@ class Session:
             conn.execute("begin immediate")
             original, saved = self.owned(conn)
             saved["manifest"] = reference
-            saved["required_units"] = len(self.manifest["units"]) + 1
             _write(conn, self.root, original)
         self.checkpoint(advanced=True)
 

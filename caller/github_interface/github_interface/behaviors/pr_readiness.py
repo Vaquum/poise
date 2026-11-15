@@ -34,6 +34,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         for thread in threads["nodes"]
         if not thread["isResolved"] and not thread["isOutdated"]
     ]
+    # The approval guard uses the root author and ignores outdated threads.
+    approval_blocked = any(
+        str(((thread["comments"]["nodes"] or [{}])[0].get("author") or {}).get("login") or "").lower()
+        != username.lower() for thread in unresolved_live
+    )
     blockers = _blockers(
         pull,
         approval,
@@ -56,6 +61,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "reviewer_approved_current_head": approval["reviewer_approved_current_head"],
         "changes_requested": approval["changes_requested"],
         "unresolved_live_conversation_count": len(unresolved_live),
+        "approval_blocked_by_conversations": approval_blocked if approval_blocked or not threads["pageInfo"]["hasNextPage"] else None,
         "unresolved_outdated_conversation_count": sum(
             not thread["isResolved"] and thread["isOutdated"] for thread in threads["nodes"]
         ),

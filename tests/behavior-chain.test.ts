@@ -166,6 +166,36 @@ describe('authoritative behavior journal', () => {
 })
 
 describe('completion-driven atomic behavior decisions', () => {
+  it.each(['review-pr', 'approve-pr'] as const)('reuses a %s checkpoint after a preflight failure with no progress receipt', behavior => {
+    const { journal, chain } = setup()
+    const obs = observation()
+    pull(obs)
+    let current = reviewed(journal, chain, obs)
+    if (behavior === 'approve-pr') {
+      current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+        { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    }
+    const initial = decideBehaviorChain(current, obs, NOW)
+    if (initial.kind !== 'invoke' || initial.behavior !== behavior) throw new Error('expected review admission')
+    const root = '1'.repeat(32)
+    const link = { root_call: root, basis: '2'.repeat(64), generation: 13 }
+    const checkpoint = { ...link, unit: 6, required_units: 23, attempts: 7, spent_ms: 60_000,
+      allowance_ms: 2_826_000, last_progress_at: NOW, progress_call: root }
+    const released = { completedAt: NOW, resources_settled_at: new Date(NOW).toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] }, action: 'not_started' }
+    current = record(journal, current, { type: 'invocation.admitted', invocation: invocation('first-slice', behavior, initial.basis) })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: 'first-slice', callId: root,
+      outcome: 'review_continuation_required', evidence: { ...released, status: 'deferred', outcome: 'incomplete',
+        artifact: { phase: 'reviewing', review_resume: link, review_checkpoint: checkpoint } } })
+    current = record(journal, current, { type: 'invocation.admitted', invocation: invocation('preflight', behavior, initial.basis) })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: 'preflight', callId: '3'.repeat(32),
+      outcome: 'preflight_failed', evidence: { ...released, status: 'failed', outcome: 'preflight_failed' } })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: `${behavior} is in native failure backoff` })
+    expect(decideBehaviorChain(current, { ...obs, checkedAt: NOW + 60_000 }, NOW + 60_000)).toMatchObject({
+      kind: 'invoke', behavior, checkpoint,
+    })
+  })
+
   it('retains receipted partial findings for repair without granting merge clearance', () => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
     let current = reviewed(journal, chain, obs)

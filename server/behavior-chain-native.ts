@@ -335,6 +335,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         github(chain.repository, ['--list-failing-ci', String(number),
           ...(baseUpdateFrom ? ['--base-update-from', baseUpdateFrom] : []), ...reviewer]), hooks.reviews(chain.repository, number),
       ])
+      const approvalBlocked = readiness.approval_blocked_by_conversations
+      if (approvalBlocked != null && (typeof approvalBlocked !== 'boolean' || readiness.repository !== chain.repository
+        || readiness.pull_number !== number || readiness.state !== String(state.state).toUpperCase()
+        || approvalBlocked && readiness.unresolved_live_conversation_count === 0)) {
+        throw new Error('native approval conversation evidence is invalid')
+      }
       if (readiness.head_sha !== head || ci.head_sha !== head || ci.pull_number !== number || !Array.isArray(ci.failing)
         || !Array.isArray(state.my_reviews) || typeof readiness.draft !== 'boolean' || typeof readiness.reviewer_approved_current_head !== 'boolean'
         || !Number.isSafeInteger(readiness.unresolved_live_conversation_count) || Number(readiness.unresolved_live_conversation_count) < 0
@@ -380,6 +386,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           at: Date.parse(String(removal.createdAt)), actor: removal.actor ? String(object(removal.actor, 'queue actor').login) : null } : null,
         changesRequested: latest?.state === 'CHANGES_REQUESTED' && latest.commit_id === head,
         unresolved: Number(readiness.unresolved_live_conversation_count), unresolvedOutdated: Number(readiness.unresolved_outdated_conversation_count),
+        ...(typeof approvalBlocked === 'boolean' ? { approvalBlocked } : {}),
         approved: readiness.reviewer_approved_current_head,
         ready: readiness.green === true, reviewIds: reviews.filter((review) => review.commit_id === head && review.state !== 'DISMISSED').map((review) => positive(review.id, 'review')),
         checksState: typeof readiness.checks_state === 'string' ? readiness.checks_state : null,

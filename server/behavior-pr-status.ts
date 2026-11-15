@@ -429,8 +429,10 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
   const reviewProgressByPr = new Map<string, NonNullable<PrStatusRow['reviewProgress']>>()
   for (const call of snapshot?.entries ?? []) {
     if (!call.repo || !call.pr_id || !call.expected_head || call.source !== 'poise:review-new-prs' && call.source !== 'poise:approve-prs') continue
+    const key = targetKey(call.repo, Number(call.pr_id))
+    if (reviewProgressByPr.has(key)) continue
     const progress = parseReviewCheckpoint(call.artifact)
-    if (progress) reviewProgressByPr.set(targetKey(call.repo, Number(call.pr_id)), { ...progress, callId: call.id, head: call.expected_head })
+    if (progress) reviewProgressByPr.set(key, { ...progress, callId: call.id, head: call.expected_head })
   }
   const skips = new Map(SKIPPABLE_BEHAVIORS.map((behavior) =>
     [behavior, new Set(getRepositorySkips(behavior).map((repo) => repo.toLowerCase()))] as const))

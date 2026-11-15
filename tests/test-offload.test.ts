@@ -2,7 +2,7 @@
 // Agents' test suites run on disposable test boxes: these run the real hooks, runner, relay and box
 // script, with only Render itself replaced. docs/Operating.md, "Agents' test suites".
 import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process'
-import { createHash, generateKeyPairSync } from 'node:crypto'
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
@@ -509,7 +509,9 @@ describe('a suite on a test box', () => {
   let listLagMs: number
   let runBoxes: boolean
   let runJobs: boolean
-  let refuseTreeUploads: boolean
+  let refuseTreeUploads: number
+  let treeUploads: { boxId: string; path: string; body: Buffer }[]
+  let omitCommandExit: boolean
   let warnings: Record<string, unknown>[]
   let events: Record<string, unknown>[]
   let runners: { child: ChildProcess; done: Promise<unknown> }[]
@@ -562,7 +564,7 @@ describe('a suite on a test box', () => {
     child.stdout?.on('data', (chunk) => { event('output', { data: chunk.toString(), stream: 'stdout' }) })
     child.stderr?.on('data', (chunk) => { event('output', { data: chunk.toString(), stream: 'stderr' }) })
     child.on('close', (code) => {
-      if (box.status === 'running') event('exit', { exit_code: code })
+      if (box.status === 'running' && !omitCommandExit) event('exit', { exit_code: code })
       res.end()
     })
   }
@@ -586,11 +588,17 @@ describe('a suite on a test box', () => {
         mkdirSync(dirname(file), { recursive: true })
         const chunks: Buffer[] = []
         for await (const chunk of req) chunks.push(chunk as Buffer)
-        if (refuseTreeUploads && url.searchParams.get('path')?.startsWith('/tmp/poise-tree/')) {
-          res.writeHead(503).end('upload refused')
-          return
+        const body = Buffer.concat(chunks)
+        const uploadedPath = url.searchParams.get('path') ?? ''
+        if (uploadedPath.startsWith('/tmp/poise-tree/')) {
+          treeUploads.push({ boxId: box!.id, path: uploadedPath, body })
+          if (refuseTreeUploads > 0) {
+            refuseTreeUploads -= 1
+            res.writeHead(502).end('upload refused')
+            return
+          }
         }
-        writeFileSync(file, Buffer.concat(chunks))
+        writeFileSync(file, body)
         res.writeHead(200).end()
         return
       }
@@ -715,7 +723,9 @@ describe('a suite on a test box', () => {
     runners = []
     runBoxes = true
     runJobs = true
-    refuseTreeUploads = false
+    refuseTreeUploads = 0
+    treeUploads = []
+    omitCommandExit = false
     render = startRender()
     relayServer = undefined as unknown as Server
   })
@@ -1818,6 +1828,84 @@ ${interruption === 'capture failed' ? 'process.exit(1)' : 'fs.copyFileSync(archi
     }
   })
 
+  it.each([[0, 0], [128 * 1024, 7], [0, 125]])('recovers exhausted checkout uploads with the original capture (extra bytes: %i, suite exit: %i)', async (bytes, status) => {
+    refuseTreeUploads = 3
+    await startAll({ maxRuns: 1 })
+    const repo = repository()
+    writeFileSync(join(repo, 'tracked.txt'), 'captured input')
+    if (bytes) writeFileSync(join(repo, 'large.bin'), randomBytes(bytes))
+    const run = suite(repo, [process.execPath, '-e', `console.log(require('fs').readFileSync(process.argv[1], 'utf8')); process.exit(${status})`, join(unpacked, repo, 'tracked.txt')])
+    await until(() => treeUploads.length > 0, 'the first captured part to reach Render')
+    writeFileSync(join(repo, 'tracked.txt'), 'edited after capture')
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(status)
+    expect(stdout).toBe('captured input\n')
+    const [failed, recovered] = suiteBoxes()
+    expect(suiteBoxes()).toHaveLength(2)
+    const refused = treeUploads.filter(({ boxId }) => boxId === failed.id)
+    expect(refused).toHaveLength(3)
+    expect(refused[1]).toEqual(refused[0])
+    expect(refused[2]).toEqual(refused[0])
+    if (bytes) expect(refused[0].body.length).toBe(64 * 1024)
+    else expect(refused[0].body.length).toBeLessThan(64 * 1024) // This part accompanies ?end=1.
+    const sent = treeUploads.filter(({ boxId }) => boxId === recovered.id)
+    expect(sent[0]).toEqual({ ...refused[0], boxId: recovered.id })
+    expect(failed.child).toBeNull()
+    expect(existsSync(join(failed.dir, 'tmp/poise-spec.json'))).toBe(false)
+    expect(relay.runs.size).toBe(0)
+    expect(terminated).toContain(failed.id)
+    const candidate = createHash('sha256').update(readFileSync(join(recovered.dir, 'tmp/poise-spec.json')))
+      .update(gunzipSync(Buffer.concat(sent.map(({ body }) => body)))).digest('hex')
+    const originalId = /, run ([a-f0-9]{32})/.exec(stderr)![1]
+    expect(stderr).toContain(`interrupted validation: candidate ${candidate}, suite `)
+    expect(stderr).toContain(`run ${originalId}: no test result: sending the checkout to the box failed: `)
+    expect(stderr).toContain(`relay recovered; rerunning candidate ${candidate} as run `)
+    expect(stderr).not.toContain('Skip local tests')
+    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: originalId,
+      error: expect.stringContaining('with HTTP 502: upload refused') }))
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([expect.objectContaining({ exit: status })])
+  })
+
+  it.each(['upload', 'restart'])('shares one recovery allowance when the first failure is %s and the next is the other cause', async (first) => {
+    refuseTreeUploads = first === 'upload' ? 3 : 0
+    await startAll()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    if (first === 'restart') refuseTreeUploads = 3
+    relay.stop()
+    await startAll2()
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(stdout).toBe('started\n')
+    expect(stderr.match(/interrupted validation:/g)).toHaveLength(2)
+    expect(stderr).toContain('no test result: sending the checkout to the box failed: ')
+    expect(stderr).toContain('no test result: the gateway restarted')
+    expect(stderr.match(/retrying this captured suite once/g)).toHaveLength(1)
+    expect(stderr).toContain('Skip local tests for this work')
+    expect(suiteBoxes()).toHaveLength(2)
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([])
+  })
+
+  it.each([true, false])('retains cancellation and the original deadline after upload failure (cancel: %s)', async (cancel) => {
+    refuseTreeUploads = 3
+    await startAll()
+    const started = Date.now()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'], { BASH_DEFAULT_TIMEOUT_MS: '2500' })
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    if (cancel) run.child.kill('SIGTERM')
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(cancel ? 143 : 124)
+    expect(stdout).toBe('started\n')
+    expect(stderr).toContain('interrupted validation')
+    if (cancel) expect(stderr).not.toContain('Skip local tests')
+    else expect(stderr).toContain('no test result: the test offload exhausted its total time budget')
+    expect(Date.now() - started).toBeLessThan(5000)
+    expect(suiteBoxes()).toHaveLength(2)
+    expect(suiteBoxes()[0].child).toBeNull()
+    await until(() => relay.runs.size === 0 && suiteBoxes().every(({ id }) => terminated.includes(id)), 'both upload attempts to retire')
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([])
+  })
+
   it.each([7, 124, 125])('returns a genuine suite exit %s without retrying, even if its output names a gateway restart', async (status) => {
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.error('the gateway restarted'); process.exit(${status})`]).done
@@ -1936,8 +2024,9 @@ setInterval(() => {}, 1000)`)
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
   })
 
-  it.each([0, 4_000])('keeps the full rerun within the remaining command budget (setup delayed %i ms)', async (setupDelay) => {
+  it.each([[0, 'restart'], [4_000, 'restart'], [0, 'upload']] as const)('keeps the full rerun within the remaining command budget (setup delayed %i ms, %s)', async (setupDelay, interruption) => {
     setupMs = setupDelay
+    refuseTreeUploads = interruption === 'upload' ? 3 : 0
     await startAll()
     const control = temp()
     const clock = join(control, 'clock.cjs')
@@ -1972,21 +2061,26 @@ setInterval(() => {}, 1000)`)
       BASH_DEFAULT_TIMEOUT_MS: '3500', NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require "${clock}"`].filter(Boolean).join(' '),
     })
     let output = ''
+    let errors = ''
     run.child.stdout?.on('data', (chunk) => { output += chunk })
+    run.child.stderr?.on('data', (chunk) => { errors += chunk })
     const advance = async (at: number) => {
       writeFileSync(time, String(at))
       await until(() => existsSync(observed) && readFileSync(observed, 'utf8') === String(at), 'the runner clock to advance', 5_000)
     }
-    await until(() => output === 'started\n', 'the first suite to start')
-    const original = [...relay.runs.keys()][0]
+    await until(() => interruption === 'upload' ? errors.includes('interrupted validation') : output === 'started\n', 'the first run to be interrupted or start')
+    const original = events.find(({ event }) => event === 'test_relay.run.created')!.id
     expect(original).toMatch(/^[a-f0-9]{32}$/)
     await advance(1_000)
-    relay.stop()
-    await startAll2()
+    if (interruption === 'restart') {
+      relay.stop()
+      await startAll2()
+    }
     await until(() => relay.runs.size === 1, 'the replacement run to be admitted')
     const replacement = [...relay.runs.keys()][0]
     expect(replacement).not.toBe(original)
-    await until(() => output === 'started\nstarted\n', 'the replacement suite to start')
+    const expectedOutput = interruption === 'upload' ? 'started\n' : 'started\nstarted\n'
+    await until(() => output === expectedOutput, 'the replacement suite to start')
     await advance(3_499)
     expect(run.child.exitCode).toBeNull()
     expect(relay.runs.has(replacement)).toBe(true)
@@ -1994,7 +2088,7 @@ setInterval(() => {}, 1000)`)
     await until(() => run.child.exitCode !== null, 'the original deadline to stop the replacement suite', 5_000)
     const { code, stdout, stderr } = await run.done
     expect(code).toBe(124)
-    expect(stdout).toBe('started\nstarted\n')
+    expect(stdout).toBe(expectedOutput)
     expect(stderr).toContain('no test result: the test offload exhausted its total time budget')
     expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
     await until(() => !relay.runs.has(replacement), 'the timed-out replacement run to be retired')
@@ -2335,34 +2429,52 @@ ${stderr}`
     expect(lines.map((line) => JSON.parse(line)).filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   }, 20_000)
 
-  it('fails loud when the box dies without a word', async () => {
+  it.each([false, true])('fails loud when the Render command stream ends without an exit event (otherwise successful: %s)', async (successful) => {
+    omitCommandExit = successful
     await startAll()
-    const { child, done } = suite(repository(), [process.execPath, '-e', 'console.log("up"); setInterval(() => {}, 1000)'])
-    child.stdout?.once('data', () => {
+    const { child, done } = suite(repository(), [process.execPath, '-e', successful ? 'console.log("up")' : 'console.log("up"); setInterval(() => {}, 1000)'])
+    if (!successful) child.stdout?.once('data', () => {
       const box = runBox()
       box.status = 'errored'
       box.child?.kill('SIGKILL')
     })
-    const { code, stderr } = await done
+    const { code, stdout, stderr } = await done
     expect(code).toBe(125)
+    expect(stdout).toBe('up\n')
     expect(stderr).toContain('no test result')
     expect(stderr).toContain('says nothing about your code')
+    expect(stderr).toContain('Skip local tests for this work')
+    expect(stderr).not.toContain('retrying this captured suite')
+    expect(suiteBoxes()).toHaveLength(1)
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([])
     const admission = /, run ([a-f0-9]{32})/.exec(stderr)
     expect(admission).not.toBeNull()
     expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![1],
       error: expect.stringContaining('the stream from the box ended before the command did') }))
   })
 
-  it('warns when the checkout upload fails', async () => {
-    refuseTreeUploads = true
+  it('stops after one recovery when checkout uploads persistently return 502', async () => {
+    refuseTreeUploads = Infinity
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done
     expect(code).toBe(125)
     expect(stderr).toContain('no test result: sending the checkout to the box failed:')
+    expect(stderr.match(/interrupted validation:/g)).toHaveLength(2)
+    expect(stderr.match(/retrying this captured suite once/g)).toHaveLength(1)
+    expect(stderr).toContain('Skip local tests for this work')
+    expect(treeUploads).toHaveLength(6)
+    expect(suiteBoxes()).toHaveLength(2)
+    for (const { id, child } of suiteBoxes()) {
+      expect(treeUploads.filter(({ boxId }) => boxId === id)).toHaveLength(3)
+      expect(child).toBeNull()
+      expect(terminated).toContain(id)
+    }
+    expect(relay.runs.size).toBe(0)
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([])
     const admission = /, run ([a-f0-9]{32})/.exec(stderr)
     expect(admission).not.toBeNull()
     expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![1],
-      error: expect.stringContaining('with HTTP 503: upload refused') }))
+      error: expect.stringContaining('with HTTP 502: upload refused') }))
   })
 
   it('keeps a healthy run whose box took long to get, however far Render\'s list lags', async () => {

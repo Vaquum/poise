@@ -78,6 +78,7 @@ export function createGithub(ctx: PartContext): ObservePart {
           <th class="c-repo"><span class="t-micro">Repo</span></th>
           <th class="c-owner"><span class="t-micro" data-ar-ownerh>Branch</span></th>
           <th class="c-state"><span class="t-micro">Status</span></th>
+          <th class="c-opened"><span class="t-micro">Opened</span></th>
           <th class="c-updated"><span class="t-micro">Updated</span></th>
           <th class="c-act"><span class="sr">Review and Board</span></th>
         </tr></thead>
@@ -254,6 +255,7 @@ export function createGithub(ctx: PartContext): ObservePart {
     const [org, repo] = row.repo.split('/', 2)
     const s = historyState(row)
     const kind = row.kind === 'pr' ? 'PR' : row.kind === 'issue' ? 'Issue' : 'CI'
+    const opened = row.kind === 'pr' ? Date.parse(row.createdAt) : NaN
     const updated = Date.parse(row.updatedAt)
     const note = reviewNotes.get(row.url)
     return `<td class="c-kind"><span class="kind is-${row.kind}" data-ref="gh.kind">${kind}</span></td>
@@ -263,6 +265,7 @@ export function createGithub(ctx: PartContext): ObservePart {
       <td class="c-repo">${repo ? external(github(org, repo), esc(repo), 'sw-link') : ''}</td>
       <td class="c-owner" data-ref="gh.owner">${row.kind === 'action' ? `<span class="t-mono br" data-help="${esc(row.event ?? '')}">${esc(row.branch || '—')}</span>` : avatar(row.owner, row.owner ? `Assigned to ${row.owner}` : '')}</td>
       <td class="c-state" data-ref="gh.state">${s.state ? capsule(s.state) : '<span class="sc-open"></span>'}<span class="ow">${esc(s.word)}</span></td>
+      <td class="c-opened" data-ref="gh.opened" data-opened data-help="${esc(exactTime(opened))}">${esc(relFromMs(opened))}</td>
       <td class="c-updated" data-ref="gh.updated" data-updated data-help="${esc(exactTime(updated))}">${esc(relFromMs(updated))}</td>
       <td class="c-act">${reviewHTML(row)}${row.kind !== 'action' ? `<a class="ib" href="${esc(onBoard(`${row.repo}#${row.number}`))}" aria-label="See it on Board" data-help="See it on Board" data-ref="gh.board">${icon('card', 'sm')}</a>` : ''}${note ? `<span class="note is-warn" data-help="${esc(note)}">${esc(note)}</span>` : ''}</td>`
   }
@@ -323,10 +326,16 @@ export function createGithub(ctx: PartContext): ObservePart {
     const byKey = new Map(items.map((row) => [rowKey(row), row]))
     for (const tr of tbody.querySelectorAll<HTMLElement>('tr[data-key]')) {
       const row = byKey.get(tr.dataset.key ?? '')
-      const cell = tr.querySelector<HTMLElement>('[data-updated]')
-      if (!row || !cell) continue
-      const text = relFromMs(Date.parse(row.updatedAt))
-      if (cell.textContent !== text) cell.textContent = text
+      if (!row) continue
+      for (const [selector, at] of [
+        ['[data-opened]', row.kind === 'pr' ? row.createdAt : ''],
+        ['[data-updated]', row.updatedAt],
+      ]) {
+        const cell = tr.querySelector<HTMLElement>(selector)
+        if (!cell) continue
+        const text = relFromMs(Date.parse(at))
+        if (cell.textContent !== text) cell.textContent = text
+      }
     }
   }
 

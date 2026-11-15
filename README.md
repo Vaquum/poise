@@ -233,6 +233,10 @@ An account whose intake or pull request references cannot be fully read shows
 none of this and reports the error.
 Observe → GitHub paints its page before the full-history total is available, showing
 an available-row count until that read finishes.
+Its **Opened** column, immediately before **Updated**, shows each pull request's
+original opening time, including reopened and merged PRs. Both ages refresh every
+30 seconds and show exact timestamps on hover. Issues, CI runs and unavailable
+opening times show a dash; ordering and time filters still use Updated.
 
 Behaviors uses one shared set of enabled flags, review settings, repository
 selections, skipped repositories, trusted authors, and memory across all ready

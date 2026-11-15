@@ -3371,7 +3371,7 @@ function nativeReviewEnvironment(): NodeJS.ProcessEnv {
 }
 
 function legacyReviewCheckpoint(snapshot: AgentLogSnapshot, history: LogEntry[], slot: string): ReviewCheckpoint | undefined {
-  const call = [...history].reverse().find(entry => (entry.artifact?.review_resume as { slot?: string } | undefined)?.slot === slot)
+  const call = history.find(entry => (entry.artifact?.review_resume as { slot?: string } | undefined)?.slot === slot)
   if (!call || !unambiguousAgentCall(snapshot, call) || !resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) return undefined
   return yieldedReview(call) ?? undefined
 }

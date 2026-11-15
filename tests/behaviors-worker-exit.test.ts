@@ -105,6 +105,31 @@ describe('managed legacy review continuation', () => {
       const resumed = mocks.spawnDetached.mock.calls[2][1] as string[]
       expect(resumed[1]).toBe('#17')
       expect(resumed[resumed.indexOf('--resume-review') + 1]).toBe(`${link.root_call}:13`)
+      for (const [index, unit] of [12, 18].entries()) {
+        const claim = database.listBehaviorLaunchClaims(behavior)[0]
+        const id = (index === 0 ? 'c' : 'd').repeat(32)
+        const latest = { ...link, generation: link.generation + (index + 1) * 13 }
+        const ended = new Date().toISOString()
+        fixture.agentLogs.push({ ...incomplete, id, correlation_id: claim.claimId,
+          started_at: claim.launchRequestedAt, started_at_precise: claim.launchRequestedAt, completed_at: ended, resources_settled_at: ended,
+          artifact: { phase: 'reviewing', review_resume: latest, review_checkpoint: { ...checkpoint, unit,
+            generation: latest.generation, progress_call: id } } })
+        await resetLogCache()
+        await behaviors.runEnabledBehaviorsOnce()
+        expect(mocks.spawnDetached).toHaveBeenCalledTimes(4 + index)
+        expect(mocks.spawnDetached.mock.lastCall![1]).toContain(`${link.root_call}:${latest.generation}`)
+      }
+      const final = database.listBehaviorLaunchClaims(behavior)[0]
+      const ended = new Date().toISOString()
+      fixture.agentLogs.push(agentLog({ id: 'e'.repeat(32), model, status: 'completed', behavior: final.launchBehavior,
+        source: final.launchSource, correlation_id: final.claimId, started_at: final.launchRequestedAt,
+        started_at_precise: final.launchRequestedAt, completed_at: ended, resources_settled_at: ended,
+        action: approves ? 'approved' : 'reviewed_clean', outcome: approves ? 'approved' : 'clean', head_sha: HEAD_SHA,
+        resource_ownership: { version: 1, roots: [], errors: [] } }))
+      await resetLogCache()
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(5)
+      expect(database.listBehaviorLaunchClaims(behavior)).toEqual([])
       expect(database.listBehaviorDeadLetters(20)).toEqual([])
     } finally { vi.unstubAllEnvs() }
   }, 45_000)

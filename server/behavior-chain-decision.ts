@@ -3,8 +3,11 @@ import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuat
 import { validReviewResponse, type ReviewResponse } from './review-response'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { matchingNativeActionReceipt } from './behavior-chain-action'
+import type { ProcessDiagnostic } from './process-diagnostic'
 
 export const CHAIN_OBSERVATION_MAX_AGE_MS = 120_000
+export const APPROVAL_CONVERSATION_REFUSAL = 'approval_blocked_unresolved_conversations'
+export const APPROVAL_CONVERSATION_WAIT = 'Awaiting GitHub review conversation closure: '
 // The readiness blockers an open conversation can explain. Any other also fails
 // the native resolver's gate, and that deferral is re-admitted without backoff.
 const CONVERSATION_BLOCKERS = new Set(['merge_state_not_clean', 'required_reviews_not_approved'])
@@ -40,6 +43,7 @@ export interface ChainObservation extends Record<string, unknown> {
     queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null },
     queueEntryDetails?: { id: string, state: string, base: string | null, head: string | null } | null,
     changesRequested: boolean, unresolved: number, unresolvedOutdated?: number, approved: boolean, ready: boolean,
+    approvalBlocked?: boolean,
     reviewIds: number[], reviewRevision: string,
     reviewContext?: string, mergedAt?: number | null,
     reviewReceipts: Array<{ id: number, head: string, state: string, invocation: string | null, response?: unknown, submittedAt?: number }>,
@@ -64,6 +68,63 @@ function settled(chain: BehaviorChain, behavior: ChainBehavior, basis: string, s
 
 function succeeded(invocation: ChainInvocation): boolean {
   return invocation.evidence?.status === 'completed'
+}
+
+/** Attribution comes from the pinned original Call, never the failure message. */
+export function approvalConversationRefusal(chain: BehaviorChain, invocation: ChainInvocation) {
+  const evidence = invocation.evidence
+  if (invocation.behavior !== 'approve-pr' || evidence?.error_code !== APPROVAL_CONVERSATION_REFUSAL) return null
+  const artifact = evidence?.artifact as Record<string, unknown> | null
+  const context = artifact?.review_context as Record<string, unknown> | null
+  const diagnostic = evidence?.diagnostic as ProcessDiagnostic | undefined
+  const argv = invocation.request.argv
+  const pin = argv.indexOf('--expected-head')
+  const head = argv[pin + 1]
+  const prefix = `https://github.com/${chain.repository}/pull/`
+  const number = argv[1]?.startsWith(prefix) ? Number(argv[1].slice(prefix.length)) : NaN
+  const completedAt = evidence?.completedAt, releasedAt = Date.parse(String(evidence?.resources_settled_at))
+  if (invocation.state !== 'settled' || invocation.actor !== chain.reviewer
+    || !invocation.callId || !/^[a-f0-9]{32}$/.test(invocation.callId) || invocation.request.command !== 'agent-interface'
+    || argv[0] !== '--pr-approve' || pin < 2 || pin !== argv.lastIndexOf('--expected-head') || !/^[a-f0-9]{40}$/.test(head)
+    || !Number.isSafeInteger(number) || number < 1 || argv[1] !== prefix + number
+    || evidence.status !== 'failed'
+    || evidence.action !== 'not_started' || evidence.outcome !== 'preflight_failed' || artifact?.phase !== 'reviewing'
+    || [evidence.review_id, evidence.head_sha, evidence.receipts, evidence.publicationReceipt, evidence.publicationResume,
+      artifact.action, artifact.review_id, artifact.head_sha, artifact.submitted_at, artifact.receipts].some(value => value != null)
+    || context != null && (context.repository !== chain.repository || context.pull_number !== number || context.head_sha !== head)
+    || diagnostic != null && (diagnostic.context?.submission !== 'blocked' || diagnostic.context.call_id !== invocation.callId
+      || diagnostic.context.correlation_id !== invocation.id || diagnostic.context.expected_head !== head
+      || diagnostic.context.repository !== chain.repository || diagnostic.context.pr !== String(number)
+      || diagnostic.context.reviewer !== invocation.actor || diagnostic.context.behavior !== 'pr_approve')
+    || typeof evidence.error !== 'string' || !evidence.error.trim()
+    || typeof completedAt !== 'number' || !Number.isFinite(completedAt) || completedAt < invocation.admittedAt
+    || !resourceReleaseProven(evidence, true)) return null
+  return { number, head, at: Math.max(completedAt, releasedAt), reason: evidence.error }
+}
+
+function exhaustedReason(invocation: ChainInvocation) {
+  return `${invocation.behavior} failed before publication three times: ${String(invocation.evidence?.error || 'native failure')}`
+}
+
+export function exhaustedApprovalConversationHold(chain: BehaviorChain, observation: ChainObservation, now: number): string | null {
+  if (!chain.held || chain.mergeSha || chain.supersession || chain.ciHold || chain.testHold
+    || chain.invocations.some(invocation => invocation.state !== 'settled')) return null
+  const last = chain.invocations.at(-1)
+  const pull = observation.pull
+  if (!last || last.behavior !== 'approve-pr' || chain.held !== exhaustedReason(last)
+    || !pull || pull.state !== 'open' || pull.merged || pull.draft || typeof pull.approvalBlocked !== 'boolean'
+    || observation.publication.pull_number !== pull.number || observation.publication.head_sha !== pull.head
+    || observation.existingPulls.length || !Number.isFinite(observation.checkedAt)
+    || observation.checkedAt > now || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return null
+  const attempts = settled(chain, last.behavior, last.basis, last.slot).filter(invocation =>
+    invocation.admissionSequence > chain.resumedAfterSequence && invocation.evidence?.status !== 'deferred')
+  const original = approvalConversationRefusal(chain, last)
+  if (!original || attempts.at(-1) !== last) return null
+  if (attempts.length !== 3 || attempts.some(invocation => {
+    const refusal = approvalConversationRefusal(chain, invocation)
+    return !refusal || refusal.number !== pull.number || refusal.head !== original.head || observation.checkedAt <= refusal.at
+  })) return null
+  return last.callId
 }
 
 /** This proof comes from Caller's bounded artifact verification, never prose. */
@@ -184,7 +245,7 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
   if (successful) return { kind: 'wait', reason: `${behavior} finished; waiting for its verified artifact or changed input` }
   const latestReview = (behavior === 'review-pr' || behavior === 'approve-pr') && reviewer
     ? recent.find(invocation => invocation.actor === actor && invocation.model === reviewer.model
-      && (invocation.evidence?.status !== 'deferred' || invocation.outcome === 'review_continuation_required')) : undefined
+      && (invocation.outcome === 'review_continuation_required' || invocation.evidence?.error_code === 'review_continuation_held')) : undefined
   if (latestReview?.evidence?.error_code === 'review_continuation_held' && resourceReleaseProven(latestReview.evidence, true)) {
     return { kind: 'wait', reason: `${latestReview.evidence.error}; inspect review Call ${latestReview.callId} before changing the review input` }
   }
@@ -204,11 +265,15 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
     if (!original || original.basis !== basis || original.slot !== reviewer?.slot || original.actor !== actor) return { kind: 'hold', reason: 'verified test recovery no longer matches the original implementation source' }
     return { kind: 'invoke', behavior, basis, actor, reviewer, reason }
   }
-  const attempts = history.filter((invocation) => invocation.evidence?.status !== 'deferred' && invocation.admissionSequence > chain.resumedAfterSequence)
+  const attempts = history.filter((invocation) => invocation.evidence?.status !== 'deferred'
+    && invocation.admissionSequence > chain.resumedAfterSequence && !approvalConversationRefusal(chain, invocation))
   if (attempts.length) {
     const last = attempts.at(-1)!
-    if (last.evidence?.action !== 'not_started' && last.evidence?.outcome !== 'superseded') return { kind: 'hold', reason: `${behavior} has an uncertain effect; reconcile its native receipt before retrying` }
-    if (attempts.length >= 3) return { kind: 'hold', reason: `${behavior} failed before publication three times: ${String(last.evidence?.error || 'native failure')}` }
+    if (last.evidence?.action !== 'not_started' && last.evidence?.outcome !== 'superseded'
+      || last.evidence?.status === 'failed' && last.evidence.error_code === APPROVAL_CONVERSATION_REFUSAL) {
+      return { kind: 'hold', reason: `${behavior} has an uncertain effect; reconcile its native receipt before retrying` }
+    }
+    if (attempts.length >= 3) return { kind: 'hold', reason: exhaustedReason(last) }
     const completedAt = Number(last.evidence?.completedAt)
     if (!Number.isFinite(completedAt) || now < completedAt + 60_000 * 2 ** (attempts.length - 1)) return { kind: 'wait', reason: `${behavior} is in native failure backoff` }
   }
@@ -218,6 +283,20 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
     return { kind: 'invoke', behavior, basis, actor, reviewer, reason, checkpoint }
   }
   return { kind: 'invoke', behavior, basis, actor, reviewer, reason }
+}
+
+function proposeApproval(chain: BehaviorChain, observation: ChainObservation, basis: string, reason: string, now: number): ChainDecision {
+  const decision = propose(chain, 'approve-pr', basis, chain.reviewer, observation.approver, reason, now)
+  if (decision.kind !== 'invoke') return decision
+  const pull = observation.pull!
+  for (let index = chain.invocations.length - 1; index >= 0; index--) {
+    const refusal = approvalConversationRefusal(chain, chain.invocations[index])
+    if (refusal?.number !== pull.number) continue
+    if (observation.checkedAt > refusal.at && pull.approvalBlocked === false
+      && observation.publication.pull_number === pull.number && observation.publication.head_sha === pull.head) break
+    return { kind: 'wait', reason: APPROVAL_CONVERSATION_WAIT + refusal.reason }
+  }
+  return decision
 }
 
 function reviewComplete(chain: BehaviorChain, behavior: 'review-issue' | 'review-pr', basis: string, reviewer: ChainReviewer,
@@ -408,8 +487,8 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     && invocation.request.argv.includes('--expected-issue-revision')
     && invocation.request.argv[invocation.request.argv.indexOf('--expected-issue-revision') + 1] === observation.issue.revision)
   if (pull.failing.length || pull.conflict || pull.behind || pull.changesRequested || (pull.unresolved && !pull.approved)) {
-    if ((answered || publishedRepair && !pull.changesRequested) && !pull.failing.length && !pull.conflict && !pull.behind) return propose(chain, 'approve-pr',
-      queueVerification ?? chainBasis(['verify-repair', pull.head, pull.reviewRevision]), chain.reviewer, observation.approver,
+    if ((answered || publishedRepair && !pull.changesRequested) && !pull.failing.length && !pull.conflict && !pull.behind) return proposeApproval(chain, observation,
+      queueVerification ?? chainBasis(['verify-repair', pull.head, pull.reviewRevision]),
       'verify the repair and its actual replies; unchanged code is not itself proof that the findings are addressed', now)
     return propose(chain, 'repair-pr', repairBasis, chain.author, observation.repairer, 'address actual reviews, failing CI and branch conflicts', now)
   }
@@ -423,12 +502,12 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       && invocation.evidence?.action === 'approved' && invocation.evidence.head_sha === pull.head
       && typeof invocation.evidence.review_id === 'number' && pull.reviewIds.includes(invocation.evidence.review_id)
       && chainReviewResponse(chain, invocation, observation, now))
-    if (!approval) return propose(chain, 'approve-pr', queueVerification, chain.reviewer, observation.approver,
+    if (!approval) return proposeApproval(chain, observation, queueVerification,
       'independently verify the queue-rejection diagnosis before a fresh native integration attempt', now)
   }
   if (!pull.approved) {
     const repair = [...chain.invocations].reverse().find((invocation) => invocation.behavior === 'repair-pr' && succeeded(invocation))
-    return propose(chain, 'approve-pr', chainBasis(['approve', pull.head, pull.reviewRevision, repair?.id ?? null]), chain.reviewer, observation.approver,
+    return proposeApproval(chain, observation, chainBasis(['approve', pull.head, pull.reviewRevision, repair?.id ?? null]),
       'review the current candidate and submit the native approval verdict', now)
   }
   // GitHub's merge rule also counts outdated conversations, which readiness does not

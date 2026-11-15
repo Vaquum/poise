@@ -104,7 +104,7 @@ td > .sw-detail-in { position: sticky; left: 0; max-width: 100cqw; }
 .ar-table .c-repo { width: calc(var(--sp-unit) * 34); }
 .ar-table .c-owner { width: calc(var(--sp-unit) * 42); }
 .ar-table .c-state { width: calc(var(--sp-unit) * 40); }
-.ar-table .c-updated { width: calc(var(--sp-unit) * 18); font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--c-text-soft); }
+.ar-table .c-opened, .ar-table .c-updated { width: calc(var(--sp-unit) * 18); font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--c-text-soft); }
 .ar-table .c-act { width: calc(var(--sp-unit) * 50); }
 .ar-table .c-act > * { vertical-align: middle; }
 .ar-table .c-act .btn-ghost { height: var(--size-chip); }
