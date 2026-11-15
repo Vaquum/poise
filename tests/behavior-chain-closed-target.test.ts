@@ -337,7 +337,7 @@ it('adopts an already-recorded native fence without repeating it or starting a w
   expect(forbidden).not.toHaveBeenCalled()
 })
 
-it('retires a running first implementation once seed closure is verified, settling deferred without an attempt', async () => {
+it.each(['closed directly', 'closed by an external merge'])('retires a running first implementation when its seed is %s', async closure => {
   const { db, journal, chain, calls, operations, forbidden, fenceClosedTarget } = setup('implement-issue', true)
   const open: ChainObservation = { checkedAt: NOW - 180_000, existingPulls: [], issue: { open: true, eligible: true, revision: 'seed', commentIds: [] },
     issueReviewers: [reviewer], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer,
@@ -350,9 +350,10 @@ it('retires a running first implementation once seed closure is verified, settli
     artifact: { phase: 'executing', resource_root: '/isolated' },
     resource_ownership: { version: 1, roots: [], errors: [] } } as unknown as LogEntry
   calls.push(call)
-  const retire = vi.fn(async () => true)
-  operations.retireClosedImplementation = retire as unknown as ChainRuntimeOperations['retireClosedImplementation']
-  operations.observe = vi.fn(async () => ({ ...open, checkedAt: Date.now(), issue: { ...open.issue, open: false } }))
+  const retire = vi.fn<NonNullable<ChainRuntimeOperations['retireClosedImplementation']>>(async () => true)
+  operations.retireClosedImplementation = retire
+  const pull = closure === 'closed directly' ? null : observed().pull
+  operations.observe = vi.fn(async () => ({ ...open, checkedAt: Date.now(), issue: { ...open.issue, open: false }, pull }))
   await new BehaviorChainRuntime(journal, operations).run()
   expect(operations.observe).toHaveBeenCalledTimes(1)
   expect(retire).toHaveBeenCalledTimes(1)
@@ -369,7 +370,10 @@ it('retires a running first implementation once seed closure is verified, settli
   const settled = journal.read(chain.id)!
   expect(settled.invocations[0]).toMatchObject({ state: 'settled', callId: call.id, outcome: 'target_closed',
     evidence: { status: 'deferred', action: 'not_started', outcome: 'target_closed' } })
-  expect(settled.held).toBe('seed issue closed without a confirmed merged pull request')
+  expect(settled.held).toBe(pull
+    ? 'confirmed merge retains an open review obligation: original pre-merge review basis is missing or contradictory'
+    : 'seed issue closed without a confirmed merged pull request')
+  expect(settled.mergeSha).toBe(pull ? MERGE : null)
   expect(journal.liveModelInvocationCount()).toBe(0)
   expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
   const before = journal.history(chain.id)
@@ -393,8 +397,8 @@ it('settles validation-detected closure without a retirement signal and keeps a 
     artifact: { phase: 'executing', resource_root: '/isolated', retirement: { cause: 'target_closed', detected_at: Date.now() } },
     resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } as unknown as LogEntry
   first.calls.push(call)
-  const retire = vi.fn(async () => true)
-  first.operations.retireClosedImplementation = retire as unknown as ChainRuntimeOperations['retireClosedImplementation']
+  const retire = vi.fn<NonNullable<ChainRuntimeOperations['retireClosedImplementation']>>(async () => true)
+  first.operations.retireClosedImplementation = retire
   await new BehaviorChainRuntime(first.journal, first.operations).run()
   expect(first.journal.read(first.chain.id)?.invocations[0]).toMatchObject({ state: 'settled', outcome: 'target_closed',
     evidence: { status: 'deferred' } })
@@ -405,7 +409,7 @@ it('settles validation-detected closure without a retirement signal and keeps a 
   const running = { ...call, id: 'd'.repeat(32), status: 'running', action: null, outcome: null, error_code: null, completed_at: null,
     resources_settled_at: null, response: null, artifact: { phase: 'executing', resource_root: '/isolated' } } as unknown as LogEntry
   second.calls.push(running)
-  second.operations.retireClosedImplementation = retire as unknown as ChainRuntimeOperations['retireClosedImplementation']
+  second.operations.retireClosedImplementation = retire
   second.operations.observe = vi.fn(async () => ({ ...open, checkedAt: Date.now() }))
   retire.mockClear()
   await new BehaviorChainRuntime(second.journal, second.operations).run()
@@ -427,8 +431,8 @@ it('preserves a publishing implementation and holds unreleased or failed-cleanup
     head_sha: null, expected_head: null, source: 'poise:behavior-chain', correlation_id: 'original', response: null, error: '',
     artifact: { phase: 'publishing', plan_sha: 'f'.repeat(64), publication_head: HEAD },
     resource_ownership: { version: 1, roots: [], errors: [] } } as unknown as LogEntry)
-  const retire = vi.fn(async () => true)
-  publishing.operations.retireClosedImplementation = retire as unknown as ChainRuntimeOperations['retireClosedImplementation']
+  const retire = vi.fn<NonNullable<ChainRuntimeOperations['retireClosedImplementation']>>(async () => true)
+  publishing.operations.retireClosedImplementation = retire
   publishing.operations.observe = vi.fn(async () => { throw new Error('publishing work must not be observed for retirement') })
   await new BehaviorChainRuntime(publishing.journal, publishing.operations).run()
   expect(publishing.operations.observe).not.toHaveBeenCalled()
@@ -469,8 +473,8 @@ it('lets unrelated work continue while one implementation retires', async () => 
   operations.observe = async (target) => target.id === chain.id
     ? { ...open, checkedAt: Date.now(), issue: { ...open.issue, open: false } }
     : { ...open, checkedAt: Date.now() }
-  const retire = vi.fn(async () => true)
-  operations.retireClosedImplementation = retire as unknown as ChainRuntimeOperations['retireClosedImplementation']
+  const retire = vi.fn<NonNullable<ChainRuntimeOperations['retireClosedImplementation']>>(async () => true)
+  operations.retireClosedImplementation = retire
   operations.request = vi.fn(async () => ({ command: 'agent-interface' as const, cwd: '/isolated', argv: ['--issue-review', 'zzz/repo#8', '--model', 'fixture'] }))
   operations.launch = vi.fn(async (_invocation, _exit, allowed) => allowed())
   await new BehaviorChainRuntime(journal, operations).run()

@@ -43,7 +43,7 @@ export interface ChainRuntimeOperations {
   resumePublication(invocation: ChainInvocation, head: string, correlation: string): Promise<Record<string, unknown>>
   /** True only when Caller won the original correlation without a worker. */
   fenceClosedTarget(chain: BehaviorChain, invocation: ChainInvocation): Promise<boolean>
-  /** True when a running first implementation was fenced and signalled; false when already beyond publication. */
+  /** True when the original implementation is fenced for cooperative retirement. */
   retireClosedImplementation?(chain: BehaviorChain, invocation: ChainInvocation, call: LogEntry): Promise<boolean>
   wake(): void
 }
@@ -580,7 +580,7 @@ export class BehaviorChainRuntime {
                 if (owned.behavior === 'review-pr') {
                   if (call.status !== 'running' || prior?.pull?.state !== 'open' || prior.pull.merged || fresh) continue
                 } else if (owned.behavior === 'implement-issue') {
-                  if (!retireEligible(call) || prior?.issue.open !== true || prior.pull !== null || fresh
+                  if (!retireEligible(call) || prior?.publication.pull_number !== null || fresh
                     || !this.operations.retireClosedImplementation) continue
                 } else continue
               }
@@ -620,7 +620,7 @@ export class BehaviorChainRuntime {
                   pull_number: observation.pull.number, merged: true, merge_sha: observation.pull.mergeSha, review_complete: false } })
               }
               if (owned?.behavior === 'implement-issue' && call?.status === 'running' && retireEligible(call)
-                && !observation.issue.open && observation.pull === null
+                && !observation.issue.open && observation.publication.pull_number === null
                 && observation.publication.head_sha === null && observation.publication.head_invocation === null
                 && this.operations.retireClosedImplementation) {
                 try {

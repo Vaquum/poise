@@ -1,13 +1,17 @@
 """Retire a running first implementation against its publication checkpoint."""
+import io
 import json
 import os
+import signal
+import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import TestCase
+from unittest import TestCase, skipUnless
 from unittest.mock import patch
 
 import agent_interface as api
-from agent_interface import review_receipt
+from agent_interface import resource_ownership, review_receipt
 
 CALL = "b" * 32
 HEAD = "c" * 40
@@ -18,19 +22,20 @@ class RetireClosedImplementation(TestCase):
         self.work = TemporaryDirectory()
         self.addCleanup(self.work.cleanup)
         root = Path(self.work.name)
-        for target in (patch.object(api, "DB", root / "calls.sqlite3"),
+        for target in (patch.object(api, "DATA_DIR", root),
+                       patch.object(api, "DB", root / "calls.sqlite3"),
                        patch.object(api, "RESPONSES", root / "responses")):
             target.start()
             self.addCleanup(target.stop)
         api.init_db()
 
-    def running(self, *, behavior="implement_issue", artifact=None, error_code=None, pid=None):
+    def running(self, *, behavior="implement_issue", artifact=None, error_code=None, pid=None, action_plan=None):
         call = api.track("original-model", "", "7", "example/repo", actor="author",
                          behavior=behavior, source="poise:behavior-chain",
                          correlation_id="original-implementation", expected_head=None)
         with api.db() as conn:
-            conn.execute("update calls set artifact=?, error_code=?, pid=? where id=?",
-                         (json.dumps(artifact or {"phase": "executing"}), error_code, pid, call))
+            conn.execute("update calls set artifact=?, error_code=?, pid=coalesce(?,pid), action_plan=? where id=?",
+                         (json.dumps(artifact or {"phase": "executing"}), error_code, pid, action_plan, call))
         return call
 
     def row(self, call):
@@ -45,7 +50,7 @@ class RetireClosedImplementation(TestCase):
         with patch.object(api.process_identity, "pinned") as pinned:
             result = api.retire_closed_implementation(call)
         self.assertEqual(result["outcome"], "retiring")
-        pinned.assert_not_called()
+        pinned.return_value.__enter__.return_value.signal.assert_called_once_with(signal.SIGTERM)
         after = self.row(call)
         self.assertEqual((after["status"], after["error_code"]), ("running", None))
         self.assertEqual(after["artifact"]["retirement"]["cause"], "target_closed")
@@ -90,6 +95,7 @@ class RetireClosedImplementation(TestCase):
             {"behavior": "repair_pr"},
             {"artifact": {"phase": "publishing", "plan_sha": "d" * 64, "publication_head": HEAD}},
             {"artifact": {"phase": "executing", "plan_sha": "d" * 64}},
+            {"action_plan": '{"kind":"atomic_work"}'},
             {"artifact": {"phase": "executing", "publication_head": HEAD}},
             {"artifact": {"phase": "executing", "publication": {"title": "t"}}},
             {"artifact": {"phase": "executing", "result": {"outcome": "published"}}},
@@ -106,10 +112,9 @@ class RetireClosedImplementation(TestCase):
                 self.assertEqual(api.retire_closed_implementation(call)["outcome"], "refused")
                 self.assertEqual(self.row(call), before)
 
+    @skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"), "requires Linux pidfds")
     def test_retire_signals_the_verified_supervisor_without_a_user_stop(self):
-        import signal as native_signal
         import subprocess
-        import sys
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
                                    start_new_session=True)
         self.addCleanup(process.wait)
@@ -120,7 +125,52 @@ class RetireClosedImplementation(TestCase):
                          (api.process_identity.capture(process.pid), call))
         result = api.retire_closed_implementation(call)
         self.assertEqual(result["outcome"], "retiring")
-        self.assertIsNotNone(process.wait(timeout=5))
+        self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
         after = self.row(call)
         self.assertEqual((after["status"], after["error_code"]), ("running", None))
         self.assertEqual(after["artifact"]["retirement"]["cause"], "target_closed")
+
+    def test_original_call_keeps_ownership_until_its_finalizer_releases_resources(self):
+        for trigger in ("signal", "publication_plan", "validation"):
+            with self.subTest(trigger=trigger):
+                pending = []
+
+                def work(_model, _repo, _number, _branch, _actor, root, call_id, record, *_):
+                    record({"phase": "executing"})
+                    self.assertTrue(root.is_dir())
+                    if trigger == "validation":
+                        return {"outcome": "target_closed"}
+
+                    def interrupt(signum):
+                        self.assertEqual(self.row(call_id)["artifact"]["retirement"]["cause"], "target_closed")
+                        if trigger == "signal":
+                            signal.raise_signal(signum)
+
+                    with patch.object(api.process_identity, "pinned") as pinned:
+                        pinned.return_value.__enter__.return_value.signal.side_effect = interrupt
+                        api.retire_closed_implementation(call_id)
+                    record({"phase": "preparing_publication", "publication": {"title": "fix: candidate"}})
+                    self.fail("a retired implementation advanced to publication")
+
+                def execute():
+                    with patch.object(api, "_native_cli", False):
+                        api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain", trigger,
+                                            "opus-5-max", "poise/issue-7")
+                    pending.extend(row for row in api.logs() if row["correlation_id"] == trigger)
+
+                with patch.object(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7",
+                                                "--source", "poise:behavior-chain"]), \
+                        patch.object(api, "_main", side_effect=execute), \
+                        patch.object(api.atomic_work, "run", side_effect=work), \
+                        patch.object(api.issue_review, "sweep"), \
+                        patch.object(api.issue_review, "_cwd_pids", return_value=[]), redirect_stdout(io.StringIO()):
+                    api.main()
+                before, = pending
+                after, = [row for row in api.logs() if row["correlation_id"] == trigger]
+                self.assertEqual((after["id"], after["status"], after["outcome"], after["action"]),
+                                 (before["id"], "superseded", "target_closed", "not_started"))
+                self.assertIsNone(self.row(after["id"])["action_plan"])
+                self.assertIsNone(before["resources_settled_at"])
+                self.assertIsNotNone(after["resources_settled_at"], after["resource_ownership"])
+                self.assertTrue(resource_ownership.released(after["resource_ownership"]))
+                self.assertFalse(Path(after["artifact"]["resource_root"]).exists())

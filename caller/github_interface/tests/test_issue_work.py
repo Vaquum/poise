@@ -228,16 +228,21 @@ class MergedRepair(IsolatedAsyncioTestCase):
                 "user": {"login": "author"}, "body": "<!-- poise-chain example/repo#7 -->",
                 "head": {"ref": "poise/issue-7", "sha": "b" * 40, "repo": {"full_name": "example/repo"}},
                 "base": {"ref": "main", "repo": {"full_name": "example/repo"}}}
-        for mode, number in (("publish", None), ("validate", 3)):
-            with self.subTest(mode=mode, number=number):
+        for mode, number, issue in (
+            ("publish", None, {"state": "closed"}),
+            ("validate", 3, {"state": "closed"}),
+            ("validate", None, {}),
+            ("validate", None, {"state": "closed", "pull_request": {}}),
+        ):
+            with self.subTest(mode=mode, number=number, issue=issue):
                 client = AsyncMock(token="private-token")
                 if number is None:
                     client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"},
-                                              {"state": "closed"}]
+                                              issue]
                 else:
                     client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"},
-                                              pull, {"state": "closed"}]
-                client.paginate.side_effect = [[pull] if number is None else [], []]
+                                              pull, issue]
+                client.paginate.side_effect = [[pull] if number is None and mode == "publish" else [], []]
                 client.graphql.return_value = {"repository": {
                     "ref": None, "defaultBranchRef": {"target": {"oid": "d" * 40}},
                     "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}

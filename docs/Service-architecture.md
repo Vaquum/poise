@@ -1674,8 +1674,12 @@ The existing in-flight review/approval poll also observes same-head closure.
 It waits for active submission and retains completed-turn results while preventing
 further analysis. Unattempted rounds use `review_target_closed`; attempted writes
 retain the original publication fence and receipt.
-Existing Calls and uncertain
-resources are never released by closure alone. Merged-chain Hold/Resume writes
+A bounded recheck can request cooperative retirement of the original first
+implementation. Caller serializes the retirement fence with publication
+planning, and Poise requires that Call's release proof before recording a
+deferred `target_closed` outcome. See [Behavior chain](Behavior-chain.md#authority-and-recovery).
+Existing Calls and uncertain resources are never released by closure alone.
+Merged-chain Hold/Resume writes
 return 409 and the GUI retains History and read-only reconciliation. No new
 endpoint, signal or journal event type is added; the Caller contract is in
 [agent_interface](../caller/agent_interface/README.md#fencing-a-closed-behavior).

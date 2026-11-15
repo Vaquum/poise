@@ -463,6 +463,10 @@ def fence_closed_behavior(model: str, actor: str, repository: str, number: int,
 RETIRE_BEFORE_PUBLICATION_PHASES = {"preparing", "prepared", "executing"}
 
 
+class ClosedImplementationRetired(RuntimeError):
+    """The original Call was fenced before it could retain a publication plan."""
+
+
 def retire_closed_implementation(call_id: str) -> dict:
     """Fence a running first implementation against publication, then signal it.
 
@@ -477,7 +481,7 @@ def retire_closed_implementation(call_id: str) -> dict:
         raise ValueError("retirement requires the original native call id")
     with db() as conn:
         conn.execute("begin immediate")
-        row = conn.execute("select status,behavior,source,error_code,artifact,pid,process_identity "
+        row = conn.execute("select status,behavior,source,error_code,artifact,pid,process_identity,action_plan,head_sha "
                            "from calls where id=?", (call_id,)).fetchone()
         if row is None:
             raise ValueError("unknown call id")
@@ -489,22 +493,21 @@ def retire_closed_implementation(call_id: str) -> dict:
         artifact = json.loads(row["artifact"] or "{}")
         if isinstance(artifact.get("retirement"), dict) and artifact["retirement"].get("cause") == "target_closed":
             return {"id": call_id, "outcome": "retiring", "reason": "already requested"}
-        if artifact.get("phase") not in RETIRE_BEFORE_PUBLICATION_PHASES \
+        if row["action_plan"] is not None or row["head_sha"] is not None \
+                or artifact.get("phase") not in RETIRE_BEFORE_PUBLICATION_PHASES \
                 or artifact.get("plan_sha") or artifact.get("publication_head") \
-                or artifact.get("publication") or artifact.get("result") or artifact.get("resource_error"):
+                or artifact.get("publication") or artifact.get("result") or artifact.get("resource_error") \
+                or artifact.get("replies_started") is not None:
             return {"id": call_id, "outcome": "refused", "reason": "already beyond the publication boundary"}
-        artifact["retirement"] = {"cause": "target_closed", "requested_at": time()}
-        if conn.execute("update calls set artifact=? where id=? and status='running'",
-                        (json.dumps(artifact), call_id)).rowcount != 1:
-            return {"id": call_id, "outcome": "refused", "reason": "no longer running"}
-        pid, identity = row["pid"], row["process_identity"]
-    if pid:
-        try:
-            with process_identity.pinned(identity, int(pid)) as process:
-                if process is not None:
-                    process.signal(signal.SIGTERM)
-        except Exception:
-            pass
+        if not row["pid"]:
+            raise RuntimeError("retirement requires the original supervisor PID")
+        with process_identity.pinned(row["process_identity"], int(row["pid"])) as process:
+            if process is None:
+                return {"id": call_id, "outcome": "refused", "reason": "original supervisor exited"}
+            artifact["retirement"] = {"cause": "target_closed", "requested_at": time()}
+            conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), call_id))
+            conn.commit()
+            process.signal(signal.SIGTERM)
     return {"id": call_id, "outcome": "retiring"}
 
 
@@ -1649,7 +1652,10 @@ def persist_action_plan(call_id: str, plan: dict) -> str:
         raise ValueError("native publication plan exceeds its durable byte bound")
     with db() as conn:
         conn.execute("begin immediate")
-        row = conn.execute("select action_plan, status from calls where id=?", (call_id,)).fetchone()
+        row = conn.execute("select action_plan, status, json_extract(artifact,'$.retirement.cause') as retirement "
+                           "from calls where id=?", (call_id,)).fetchone()
+        if row is not None and row["retirement"] == "target_closed":
+            raise ClosedImplementationRetired("work publication fenced by verified target closure")
         if row is None or row["status"] != "running" or (row["action_plan"] is not None and row["action_plan"] != encoded):
             raise ValueError("native publication plan conflicts with its original durable record")
         if conn.execute("update calls set action_plan=? where id=? and status='running'", (encoded, call_id)).rowcount != 1:
@@ -1895,6 +1901,8 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
             with review_receipt.managed_resources(run_dir):
                 try:
                     result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
+                except ClosedImplementationRetired:
+                    raise
                 except Exception as error:
                     if getattr(error, "diagnostic", None) is None:
                         failure = atomic_work.failure_diagnostic(error)
@@ -1935,18 +1943,19 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                 resource_ownership.failure(DB, id_, "resources_unknown", run_dir)
             record({**artifact, "phase": "resources_unknown"})
         with db() as conn:
-            row = conn.execute("select error_code, artifact from calls where id=?", (id_,)).fetchone()
+            row = conn.execute("select error_code,artifact,action_plan from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
         stored = json.loads(row["artifact"] or "{}") if row and row["artifact"] else {}
         retired = (
             source == "poise:behavior-chain" and pull is None and behavior == "implement_issue"
-            and failure is None and not isinstance(error, Exception)
-            and not isinstance(error, atomic_work.checkout_lock.WorkerOrphaned)
+            and row is not None and row["action_plan"] is None and failure is None
+            and (isinstance(error, ClosedImplementationRetired)
+                 or isinstance(error, SystemExit) and error.code == 128 + signal.SIGTERM)
             and not stopped and stored.get("phase") in RETIRE_BEFORE_PUBLICATION_PHASES
             and isinstance(stored.get("retirement"), dict) and stored["retirement"].get("cause") == "target_closed"
             and not stored.get("plan_sha") and not stored.get("publication_head")
             and not stored.get("publication") and not stored.get("result")
-            and not stored.get("resource_error") and stored.get("phase") != "resources_unknown"
+            and not stored.get("resource_error") and stored.get("replies_started") is None
         )
         if retired:
             finish(id_, "superseded", outcome="target_closed", head_sha=None,
