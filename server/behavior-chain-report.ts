@@ -1193,8 +1193,7 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
   const { call, text } = selected
   let delivery: Record<string, unknown> | undefined
   if (!codeSite) {
-    const prerequisite = new RegExp(`\\bprerequisite\\s+\`?https://github\\.com/${repository}/issues/([1-9]\\d*)\\b`, 'i')
-      .exec(diagnostic!.stderr)
+    const prerequisite = diagnostic?.stderr?.match(new RegExp(`\\bprerequisite\\s+\`?https://github\\.com/${repository}/issues/([1-9]\\d*)\\b`, 'i'))
     const prerequisites = freshReport.prerequisites
     if (prerequisite && prerequisites?.wait === null && prerequisites.base) {
       delivery = prerequisites.evidence.slice(1).find(item => item.issue_number === Number(prerequisite[1])
