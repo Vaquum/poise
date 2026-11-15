@@ -77,10 +77,10 @@ node scripts/package-poise-plugin.mjs https://poise.example.com /tmp/poise-priva
 The output contains `plugins/poise/plugin.json`, `mcp.json`, the `poise-manager`
 skill and `.agents/plugins/marketplace.json`. It uses the supported portable
 [OpenAI plugin format](https://developers.openai.com/plugins/build/plugins),
-with a Streamable HTTP server at that installation's `/mcp`, OAuth DCR and
-`poise:read`; discovery supplies the existing endpoints. The package contains
-no credentials. The renderer refuses an existing destination and does not
-install a plugin, change settings or enable the endpoint.
+with a Streamable HTTP server at that installation's `/mcp`. OAuth discovery
+supplies the resource, registration endpoint and `poise:read` scope. The
+package contains no credentials. The renderer refuses an existing destination
+and does not install a plugin, change settings or enable the endpoint.
 
 Open the generated directory in Codex desktop, select its private marketplace
 in the Plugins Directory and install Poise. Sign in and explicitly consent

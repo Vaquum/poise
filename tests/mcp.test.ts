@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { execFile, execFileSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -254,7 +254,7 @@ it('accepts the same immutable owner after a case-only GitHub login change', asy
 })
 
 it('traces bounded label pages and exact issues through a packaged SDK connection on a disposable service', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'poise-mcp-work-'))
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'poise-mcp-work-'))
   const path = join(root, 'datastore.sqlite')
   const caller = join(root, 'caller')
   await mkdir(caller)
@@ -382,9 +382,11 @@ conn.close()
     return (JSON.parse(content[0].text) as { work: Awaited<ReturnType<typeof readMcpWork>> }).work
   }
   try {
-    expect(manifest.mcpServers.poise.url).toBe(endpoint)
-    expect(manifest.mcpServers.poise.extensions['com.openai'].auth).toEqual({ type: 'oauth', client: { mode: 'dcr' }, baseScopes: ['poise:read'] })
-    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.0.0' })
+    expect(manifest).toEqual({
+      $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
+      mcpServers: { poise: { type: 'streamable-http', url: endpoint } },
+    })
+    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.0.1' })
     expect(JSON.parse(await readFile(join(bundle, '.agents/plugins/marketplace.json'), 'utf8')).plugins[0].source).toEqual({ source: 'local', path: './plugins/poise' })
     expect(await readFile(join(bundle, 'plugins/poise/skills/poise-manager/SKILL.md'), 'utf8')).toBe(await readFile('plugins/poise/skills/poise-manager/SKILL.md', 'utf8'))
     await expect(packagePoisePlugin('https://poise.test', bundle)).rejects.toThrow('EEXIST')
