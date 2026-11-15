@@ -743,7 +743,7 @@ export class BehaviorChainRuntime {
                   && observation.publication.head_sha === observation.pull.head
                   && observation.publication.pull_number === observation.pull.number
                   && observation.checkedAt <= Date.now() && Date.now() - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS) {
-                  const reason = `PR head ${observation.pull.head} is waiting on original repair Call ${call.id} for ${call.expected_head}`
+                  const reason = `original repair Call ${call.id} is still running for ${call.expected_head}`
                   if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
                 }
                 continue

@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { LogEntry } from '../server/agent-log-parse'
 import { nativeActionReceipt, nativeRequestSha } from '../server/behavior-chain-action'
-import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
+import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
 import { behaviorChainSummary } from '../server/behavior-chain-summary'
@@ -206,13 +206,22 @@ it.each(['executing', 'publishing'])('shows a changed head waiting on the origin
   current = journal.read(chain.id)!
   expect(current.invocations).toHaveLength(1)
   expect(current.invocations[0].state).toBe('started')
-  expect(behaviorChainSummary(current, journal).waiting).toBe(`PR head ${changed} is waiting on original repair Call ${call.id} for ${HEAD}`)
+  expect(behaviorChainSummary(current, journal).waiting).toBe(`original repair Call ${call.id} is still running for ${HEAD}`)
   expect(call).toEqual(before)
   expect(operations.launch).not.toHaveBeenCalled()
   expect(operations.perform).not.toHaveBeenCalled()
   await runtime.run()
   expect(operations.observe).toHaveBeenCalledTimes(1)
   expect(journal.liveModelInvocationCount()).toBe(1)
+  // A head that returns before the repair retires must not leave a stale replacement SHA behind.
+  obs.pull!.head = HEAD
+  obs.publication.head_sha = HEAD
+  vi.useFakeTimers()
+  vi.advanceTimersByTime(CHAIN_OBSERVATION_MAX_AGE_MS + 1000)
+  await runtime.run()
+  expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting)
+    .toBe(`original repair Call ${call.id} is still running for ${HEAD}`)
+  expect(operations.observe).toHaveBeenCalledTimes(2)
 })
 
 it.each([false, true])('retains a lost close response as uncertain across closed observations, sweeps and rebuild (remediation=%s)', async remediation => {
