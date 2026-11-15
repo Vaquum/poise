@@ -1682,7 +1682,11 @@ own the exclusive claim, evidence and cumulative allowance across independently
 bounded Calls; partial analysis grants no review authority. Complete source and
 cross-unit coverage reserve one
 head-pinned finalization, preserving the first publisher's Call ID on a lost
-acknowledgement. Poise does not automatically admit these continuations. See
+acknowledgement. A complete verdict resumes only its unfinished remapping or
+publication step after resource settlement, without further provider analysis.
+Review and capped follow-up attempts retain their original identity and require
+reconciliation of uncertain effects before any further write. Poise does not
+automatically admit these continuations. See
 [Caller's protocol](../caller/agent_interface/README.md#explicit-review-continuation)
 for bounds, invalidation, holds and isolated proof.
 

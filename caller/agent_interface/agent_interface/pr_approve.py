@@ -134,8 +134,6 @@ def run(
     review_cap: int | None = None,
     review_scope: str = "",
 ) -> str:
-    if capped and review_continuation.enabled():
-        raise atoms.AgentPreflightError("review continuation requires an uncapped review round")
     if capped and (review_round is None or review_cap is None):
         raise ValueError("a capped approval round needs its round and cap numbers")
     spec = atoms.CATALOG.review_model("pr_approve", model)
@@ -157,7 +155,7 @@ def run(
         # round: review the full diff once, and say so in the prompt.
         lost_since = since
         packet_text = atoms.packet(pwd, pr, actor, expected_head, p, since_head=None)
-    if capped and review_receipt.coverage_disposition(json.loads(packet_text)) != "complete":
+    if capped and not review_continuation.enabled() and review_receipt.coverage_disposition(json.loads(packet_text)) != "complete":
         capped = False
         if spec.provider == "claude":
             tools = allowed(pr, actor, expected_head)
