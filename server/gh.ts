@@ -136,7 +136,7 @@ export async function reconcileRepairReport(repository: string, marker: string, 
       applied = labels(await request(['api', `repos/${repository}/issues/${issue.number}/labels`, '--method', 'POST', '-f', 'labels[]=poise']))
     }
     return { number: Number(issue.number), url: String(issue.html_url), state: String(issue.state), labels: applied,
-      title: issue.title, body: issue.body, created_at: issue.created_at, updated_at: issue.updated_at, author: author.login }
+      title: issue.title, body: issue.body, created_at: issue.created_at, author: author.login }
   } catch (error) {
     const failure = error as { stderr?: unknown, message?: string }
     const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)
@@ -144,42 +144,53 @@ export async function reconcileRepairReport(repository: string, marker: string, 
   }
 }
 
-/** Issues updated since `since`, oldest first. The orphan probe orders rival
- * claimants by creation. A direct listing, never search: search absence
- * never proves an earlier POST had no effect. */
-export async function listOwnerIssuesSince(repository: string, creator: string, since: string) {
+/** GitHub's creation edit holds the original Markdown even after body edits. */
+export async function readIssueCreationBody(repository: string, number: number) {
   requireConfiguredRepository(repository)
   const me = getMeta('me')
   if (!me) throw new Error('Repair reporting requires the configured GitHub account')
   const token = await resolveMeToken(me)
   const env = { GH_HOST: 'github.com', GH_TOKEN: token, GITHUB_TOKEN: undefined,
     GH_ENTERPRISE_TOKEN: undefined, GITHUB_ENTERPRISE_TOKEN: undefined }
+  const [owner, repo] = repository.split('/')
+  const query = `query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      nameWithOwner
+      issue(number: $number) {
+        number author { login } body createdAt lastEditedAt includesCreatedEdit
+        userContentEdits(last: 1) { totalCount nodes { editedAt deletedAt diff } }
+      }
+    }
+  }`
   try {
-    const { stdout } = await runFile(GH, ['api',
-      `repos/${repository}/issues?creator=${creator}&since=${since}&state=all&sort=created&direction=asc&per_page=100`], {
+    const { stdout } = await runFile(GH, ['api', 'graphql', '-f', `query=${query}`,
+      '-f', `owner=${owner}`, '-f', `repo=${repo}`, '-F', `number=${number}`], {
       env, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024,
     })
-    const items: unknown = JSON.parse(stdout)
-    if (!Array.isArray(items)) throw new Error('Repair report owner listing is invalid')
-    if (items.length >= 100) throw new Error('Repair report owner listing is incomplete')
-    return items.filter(item => !!item && typeof item === 'object' && !Array.isArray(item) && !('pull_request' in item))
-      // A missing body cannot match orphan signals, so unrelated null-body
-      // issues are skipped rather than aborting the listing.
-      .filter(item => typeof (item as Record<string, unknown>).body === 'string')
-      .map(item => {
-        const row = item as Record<string, unknown>
-        const user = row.user as Record<string, unknown> | undefined
-        if (!Number.isSafeInteger(row.number) || Number(row.number) < 1 || typeof user?.login !== 'string'
-          || typeof row.created_at !== 'string' || typeof row.updated_at !== 'string' || typeof row.body !== 'string') {
-          throw new Error('Repair report owner listing is invalid')
-        }
-        return { number: Number(row.number), author: user.login as string, created_at: row.created_at as string,
-          updated_at: row.updated_at as string, body: row.body as string }
-      })
+    const result = JSON.parse(stdout) as { data?: { repository?: { nameWithOwner?: unknown, issue?: {
+      number?: unknown, author?: { login?: unknown }, body?: unknown, createdAt?: unknown, lastEditedAt?: unknown,
+      includesCreatedEdit?: unknown,
+      userContentEdits?: { totalCount?: unknown, nodes?: Array<{ editedAt?: unknown, deletedAt?: unknown, diff?: unknown }> },
+    } } } }
+    const repoEvidence = result?.data?.repository
+    const issue = repoEvidence?.issue
+    if (typeof repoEvidence?.nameWithOwner !== 'string' || repoEvidence.nameWithOwner.toLowerCase() !== repository.toLowerCase()
+      || issue?.number !== number || typeof issue.author?.login !== 'string' || !issue.author.login
+      || typeof issue.createdAt !== 'string' || !Number.isFinite(Date.parse(issue.createdAt))) {
+      throw new Error('Issue identity is unverified')
+    }
+    const edits = issue.userContentEdits
+    const creation = edits?.nodes?.[0]
+    let body: string | null = null
+    if (issue.lastEditedAt === null && issue.includesCreatedEdit === false && edits?.totalCount === 0
+      && Array.isArray(edits.nodes) && edits.nodes.length === 0 && typeof issue.body === 'string') body = issue.body
+    if (issue.includesCreatedEdit === true && Array.isArray(edits?.nodes) && edits.nodes.length === 1
+      && creation?.editedAt === issue.createdAt && creation.deletedAt === null && typeof creation.diff === 'string') body = creation.diff
+    return { author: issue.author.login, createdAt: issue.createdAt, body }
   } catch (error) {
     const failure = error as { stderr?: unknown, message?: string }
     const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)
-    throw new Error(`Repair report owner listing failed: ${message.split(token).join('***')}`)
+    throw new Error(`Issue creation evidence read failed: ${message.split(token).join('***')}`)
   }
 }
 

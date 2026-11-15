@@ -8,7 +8,7 @@ import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { runDatastoreHealth, validatedHealth } from './datastore-health'
-import { getHeadSha, handleGhBody, listOwnerIssuesSince, reconcileRepairReport } from './gh'
+import { getHeadSha, handleGhBody, readIssueCreationBody, reconcileRepairReport } from './gh'
 import { HttpError } from './http'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
@@ -173,6 +173,12 @@ function reserveReport(db: Database, report: RepairReport): boolean {
     return db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
       .run(PREFIX + report.key, JSON.stringify(report)).changes !== 0
   }).immediate()
+}
+
+function bindReportIssue(db: Database, key: string, number: number): boolean {
+  return db.prepare(`UPDATE meta SET value = json_set(value, '$.issueNumber', ?)
+    WHERE key = ? AND (json_extract(value, '$.issueNumber') IS NULL OR json_extract(value, '$.issueNumber') = ?)`)
+    .run(number, PREFIX + key, number).changes === 1
 }
 
 async function createReport(db: Database, repository: string, report: RepairReport, title: string, body: string) {
@@ -902,6 +908,10 @@ function predatesHold(createdAt: unknown, heldAt: number | null): boolean {
   return Number.isFinite(created) && created + 60_000 < heldAt
 }
 
+function hasCreationMarker(body: string | null, key: string): boolean {
+  return body?.split(/\r?\n/, 1)[0] === `<!-- poise-repair-exhaustion:${key} -->`
+}
+
 /** Runs at implementation admission even when new report publishing is off. */
 export async function implementationReportAdmission(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, observe: (source: BehaviorChain) => Promise<ChainObservation>) {
@@ -912,15 +922,15 @@ export async function implementationReportAdmission(db: Database, journal: Behav
     // A lost creation acknowledgement leaves the stored intent without its
     // issue number while GitHub already serves the report to intake. Match
     // such intents against this chain before allowing implementation.
-    for (const candidate of unconfirmedImplementationReports(db, chain.repository)) {
-      const candidateWait = candidate.pull === null ? implWait : repairWait
+    const unconfirmed = unconfirmedImplementationReports(db, chain.repository)
+    for (const candidate of unconfirmed.filter(candidate => candidate.pull !== null)) {
       let issue
       try {
         issue = await reconcileRepairReport(chain.repository, `<!-- poise-repair-exhaustion:${candidate.key} -->`, chain.issue)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         if (message.includes('marker not found')) continue
-        return { reason: `${candidateWait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
+        return { reason: `${repairWait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
       }
       if (issue?.number === chain.issue) {
         candidate.issueNumber = chain.issue
@@ -930,86 +940,27 @@ export async function implementationReportAdmission(db: Database, journal: Behav
       }
     }
     if (!report) {
-      // A stripped or mutated marker defeats exact reconciliation. If any
-      // unconfirmed pre-PR intent could have filed this issue, bind it and
-      // require its disposition instead of ordinary intake. Body signals are
-      // quotable and removable, so a body match alone cannot consume the
-      // intent: a quoting ordinary issue copies every published signal while
-      // a rewrite removes them, including the failing file and test case.
-      // The reporter files the genuine report right after its hold through
-      // the orphan's own source-owner account, so a match binds only when no
-      // earlier owner-authored post-hold issue matches the same orphan. A
-      // quoter created after the publication is excluded by creation order;
-      // an ordinary issue created before it can still quote through a later
-      // edit, so edit times break that tie: a rival created before the
-      // probed issue but edited after its creation may quote it and is
-      // ignored, while a probed issue created before a matching rival but
-      // edited after that rival's creation may quote the rival and is not
-      // bound. Unknown authorship or timestamps fail closed. Never bind an
-      // orphan to its own source.
-      const orphans = unconfirmedImplementationReports(db, chain.repository)
-        .filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
-        .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
-          || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+      // The report starts with its exact marker at publication. Current body
+      // matches and edit times cannot distinguish later quotes and rewrites.
+      const orphans = unconfirmed.filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
       if (orphans.length) {
         try {
-          const probe = await reconcileRepairReport(chain.repository, '<!-- poise-repair-exhaustion:probe -->', chain.issue, false, () => true)
-          if (probe && typeof probe.body === 'string') {
-            const body = probe.body
-            const author = typeof (probe as { author?: unknown }).author === 'string'
-              ? ((probe as { author: string }).author.toLowerCase()) : null
-            const created = typeof probe.created_at === 'string' ? Date.parse(probe.created_at) : NaN
-            const updated = typeof (probe as { updated_at?: unknown }).updated_at === 'string'
-              ? Date.parse((probe as { updated_at: string }).updated_at) : NaN
-            const bodyMatches = (candidate: RepairReport, text: string) =>
-              text.includes(candidate.source)
-              && (candidate.holdSequence === null || new RegExp(`\\b${candidate.holdSequence}\\b`).test(text))
-              && (text.includes(candidate.basis)
-                || (candidate.attempts.length > 0 && candidate.attempts.every(attempt =>
-                  text.includes(attempt.invocation) && text.includes(attempt.call))))
-            const matches = (candidate: RepairReport) => {
-              if (author !== null) {
-                const owner = journal.read(candidate.source)?.author
-                if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
-              }
-              return bodyMatches(candidate, body) && !predatesHold(probe.created_at, candidate.heldAt)
-            }
-            for (const candidate of orphans.filter(matches)) {
-              const owner = journal.read(candidate.source)?.author
-              const creator = typeof owner === 'string' ? owner : author
-              // A hold is durable for these intents; without one there is no
-              // creation order to check, so the body match binds directly.
-              if (typeof candidate.heldAt !== 'number' || creator === null) {
-                candidate.issueNumber = chain.issue
-                db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(candidate), PREFIX + candidate.key)
-                report = candidate
-                break
-              }
-              if (!Number.isFinite(created)) return { reason: `${implWait}: verification unavailable: probed issue creation time is unavailable` }
-              if (!Number.isFinite(updated)) return { reason: `${implWait}: verification unavailable: probed issue update time is unavailable` }
-              const rivals = await listOwnerIssuesSince(chain.repository, creator, new Date(candidate.heldAt - 60_000).toISOString())
-              const rivalCreated = (rival: { created_at: string }) => Date.parse(rival.created_at)
-              const rivalUpdated = (rival: { updated_at: string }) => Date.parse(rival.updated_at)
-              const rivalMatches = (rival: { number: number, author: string, created_at: string, body: string }) =>
-                rival.number !== chain.issue && rival.author.toLowerCase() === creator.toLowerCase()
-                && bodyMatches(candidate, rival.body) && !predatesHold(rival.created_at, candidate.heldAt)
-              const earlier = rivals.some(rival => rivalMatches(rival)
-                && !(rivalCreated(rival) < created && rivalUpdated(rival) > created)
-                && (rivalCreated(rival) < created
-                  || (rivalCreated(rival) === created && rival.number < chain.issue)))
-              const quotes = rivals.some(rival => rivalMatches(rival)
-                && created < rivalCreated(rival) && updated > rivalCreated(rival))
-              if (!earlier && !quotes) {
-                candidate.issueNumber = chain.issue
-                db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(candidate), PREFIX + candidate.key)
-                report = candidate
-                break
-              }
-            }
+          const issue = await readIssueCreationBody(chain.repository, chain.issue)
+          const author = issue.author.toLowerCase()
+          const possible = orphans.filter(candidate => {
+            const creator = journal.read(candidate.source)?.author.toLowerCase()
+            return (!creator || creator === author) && !predatesHold(issue.createdAt, candidate.heldAt)
+          })
+          if (possible.length && issue.body === null) return { reason: `${implWait}: verification unavailable: original issue body is unavailable` }
+          const candidate = possible.find(candidate => hasCreationMarker(issue.body, candidate.key))
+          if (candidate) {
+            if (!journal.read(candidate.source)) return { reason: `${implWait}: verification unavailable: original report author is unavailable` }
+            if (!bindReportIssue(db, candidate.key, chain.issue)) return { reason: `${implWait}: verification unavailable: report intent binding changed` }
+            report = implementationReport(db, chain)
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
-          if (!message.includes('marker not found')) return { reason: `${implWait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
+          return { reason: `${implWait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
         }
       }
     }
@@ -1855,7 +1806,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
           && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
           && !body.includes(implementation!.invocation.id) && !body.includes(implementation!.call)
-        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string, created_at: unknown, updated_at: unknown, author: string }> = []
+        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string, created_at: unknown, author: string }> = []
         for (const entry of blockedBy) {
           const number = Number((entry as { number: number }).number)
           try {
@@ -2077,10 +2028,19 @@ async function confirmReport(db: Database, journal: BehaviorChainJournal,
   label: string, allowed: () => boolean, closedPrefix = '', linkedReport?: (body: string, author: string) => boolean,
   publicationAction = ''): Promise<string> {
   const marker = `<!-- poise-repair-exhaustion:${report.key} -->`
-  const save = () => db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(report), PREFIX + report.key)
   let issue = await reconcileRepairReport(chain.repository, marker, report.issueNumber, false, linkedReport)
   if (!issue) return `${publicationAction}${label} report creation is unconfirmed; no matching issue is visible yet. Reconcile the same marker; do not create a replacement`
-  if (report.issueNumber === null) { report.issueNumber = issue.number; save() }
+  if (report.issueNumber === null) {
+    if (report.pull === null && implementationReportIdentity(report)) {
+      const creation = await readIssueCreationBody(chain.repository, issue.number)
+      if (creation.author.toLowerCase() !== chain.author.toLowerCase() || predatesHold(creation.createdAt, report.heldAt)
+        || !hasCreationMarker(creation.body, report.key)) {
+        return `${label} report creation is unconfirmed; original issue body or author does not verify the report intent`
+      }
+    }
+    if (!bindReportIssue(db, report.key, issue.number)) return `${label} report creation is unconfirmed; issue binding changed during verification`
+    report.issueNumber = issue.number
+  }
   const link = `${publicationAction}${closedPrefix}${issue.state === 'closed' ? 'Historical ' : ''}${label} report ${issue.url} (last verified ${new Date().toISOString()}; not live status)`
   if (issue.state === 'closed') return `${link} is closed; no replacement will be created`
   if (!issue.labels.some(label => label.toLowerCase() === 'poise') && enabled(db, chain.repository) && allowed()) {

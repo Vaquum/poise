@@ -62,7 +62,7 @@ const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
 const databases: Database.Database[] = []
 const roots: string[] = []
 interface Issue { number: number, title: string, body: string, state: string, html_url: string,
-  user: { login: string }, labels: { name: string }[], created_at: string, updated_at: string }
+  user: { login: string }, labels: { name: string }[], created_at: string, updated_at: string, originalBody?: string | null }
 let remote: Issue[]
 let seedBody: string
 let seedState: string
@@ -140,14 +140,26 @@ beforeEach(() => {
     if (argv[1] === 'repos/acme/repo/issues' && argv.some(arg => arg.startsWith('title='))) {
       const row = issue(Math.max(98, ...remote.map(row => row.number)) + 1, argv.find(arg => arg.startsWith('body='))!.slice(5))
       row.title = argv.find(arg => arg.startsWith('title='))!.slice(6)
+      row.created_at = row.updated_at = new Date().toISOString()
+      row.originalBody = row.body
       if (!dropLabels) row.labels = [{ name: 'poise' }]
       remote.push(row)
       if (loseCreation) throw new Error('Lost creation acknowledgement')
       return response(row)
     }
-    // Owner issue listing for orphan rival ordering. The caller filters by
-    // creator, creation time and body itself; the full remote is returned.
-    if (argv[1].startsWith('repos/acme/repo/issues?')) return response(remote)
+    if (argv[1] === 'graphql') {
+      const number = Number(argv.find(arg => arg.startsWith('number='))?.slice(7))
+      const row = remote.find(row => row.number === number) ?? (number === 7 || number === 8 ? issue(number, seedBody) : null)
+      if (!row) throw new Error(`Unexpected fixture GitHub issue ${number}`)
+      const edited = row.originalBody !== undefined && row.originalBody !== row.body
+      return response({ data: { repository: { nameWithOwner: 'acme/repo', issue: {
+        number, author: row.user, body: row.body ?? '', createdAt: row.created_at,
+        lastEditedAt: edited ? row.updated_at : null, includesCreatedEdit: edited,
+        userContentEdits: { totalCount: edited ? 2 : 0, nodes: edited
+          ? [{ editedAt: row.created_at, deletedAt: row.originalBody === null ? row.updated_at : null, diff: row.originalBody }]
+          : [] },
+      } } } })
+    }
     // Seed source issues live outside the datastore remote: #7 is the shared
     // seed, #8 the swapped-accounts second source.
     if (argv[1] === 'repos/acme/repo/issues/7' || argv[1] === 'repos/acme/repo/issues/8') {
@@ -3029,7 +3041,11 @@ it('keeps an ordinary post-hold issue ordinary without consuming its lost-ack in
   expect(posts()).toHaveLength(2)
 })
 
-it('keeps a post-hold quoting issue ordinary without consuming its lost-ack intent', async () => {
+it.each([
+  { when: 'before the quote', editedAt: NOW + 30_000, deletedHistory: false },
+  { when: 'after the quote', editedAt: NOW + 90_000, deletedHistory: false },
+  { when: 'with deleted creation history', editedAt: NOW + 90_000, deletedHistory: true },
+])('keeps a post-hold quoting issue ordinary when the report was edited $when', async ({ editedAt, deletedHistory }) => {
   const { db, journal } = setup()
   const { chain, call } = blockedImplementation(journal)
   call.error = ingressError('a'.repeat(64), 'b'.repeat(32)); call.diagnostic = prePrDiagnostic()
@@ -3065,6 +3081,8 @@ it('keeps a post-hold quoting issue ordinary without consuming its lost-ack inte
   quoting.labels = [{ name: 'poise' }]
   quoting.created_at = new Date(NOW + 60_000).toISOString()
   quoting.updated_at = quoting.created_at
+  lost.updated_at = new Date(editedAt).toISOString()
+  if (deletedHistory) lost.originalBody = null
   quoting.body += ` Quoting ${scoped.attempts[0].invocation} ${scoped.attempts[0].call}.`
     + ` Copied Source: ${chain.id}; hold event ${scoped.holdSequence}; basis ${scoped.basis};`
     + ` Quoting file ${MEMORY_FILE} test keeps memory warnings correlatable without logging command bodies.`
@@ -3096,6 +3114,12 @@ it('keeps a post-hold quoting issue ordinary without consuming its lost-ack inte
   const admission = await implementationReportAdmission(db, journal, target,
     await gated.overrides.observe(target), gated.overrides.observe)
   expect(admission.reason).toContain('awaits a current explicit')
+  if (deletedHistory) {
+    expect(admission.reason).toContain('original issue body is unavailable')
+    expect(implementationReportBinding(db, target)).toBeNull()
+    expect(JSON.parse(reports(db).find(row => JSON.parse(row.value).key === scoped.key)!.value).issueNumber).toBeNull()
+    return
+  }
   expect(() => implementationReportBinding(db, target)).not.toThrow()
   expect(implementationReportBinding(db, journal.read('acme/repo#100')!)).toMatchObject({ key: scoped.key, source: chain.id,
     holdSequence: scoped.holdSequence, invocation: next.call.correlation_id, call: next.call.id })
@@ -3132,6 +3156,7 @@ it('keeps a pre-publication quoting issue ordinary without consuming its lost-ac
   const ordinary = issue(98, 'Ordinary follow-up work without generated content.')
   ordinary.labels = [{ name: 'poise' }]
   ordinary.created_at = new Date(NOW + 10_000).toISOString()
+  ordinary.originalBody = ordinary.body
   remote.push(ordinary)
   const lost = remote.find(row => row.number === 100)!
   lost.created_at = new Date(NOW + 20_000).toISOString()
@@ -4243,6 +4268,21 @@ it.each(['stale datastore', 'lost acknowledgement'])('rechecks pending implement
       expect(posts()).toHaveLength(1)
       journal.rebuild()
     }
+    const marker = `<!-- poise-repair-exhaustion:${JSON.parse(intent[0].value).key} -->`
+    const report = remote[0], originalBody = report.body
+    report.body = originalBody.replace(marker, '')
+    const quoting = issue(100, 'Ordinary follow-up.')
+    quoting.created_at = new Date().toISOString()
+    quoting.updated_at = new Date(Date.now() + 1_000).toISOString()
+    quoting.originalBody = quoting.body
+    quoting.body = `${marker}\n\n${quoting.body}`
+    remote.push(quoting)
+    searchVisible = true
+    await recheck()
+    expect(reports(db)).toEqual(intent)
+    expect(journal.read(chain.id)?.waiting).toContain('original issue body or author does not verify')
+    remote.pop()
+    report.body = originalBody
   }
   searchVisible = true
   await recheck()
