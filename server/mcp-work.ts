@@ -9,6 +9,7 @@ import { db } from './db'
 import { runDatastoreHealth, staleDatastoreFailure, validatedHealth } from './datastore-health'
 import { requireConfiguredRepository, type DatastoreRecord } from './gh'
 import { HttpError } from './http'
+import { readLivePull } from './mcp-live-pull'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { datastoreViewOrCli } from './datastore-reader'
 import { runFile } from './process'
@@ -69,7 +70,7 @@ function ledgerCoverage(reply: LedgerReadReply): Coverage {
 }
 
 async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Coverage, now: number,
-  ledgerShortCircuit: { reply: LedgerReadReply | null }, label: string | undefined, intake: BehaviorChainSettings | null) {
+  ledgerShortCircuit: { reply: LedgerReadReply | null }, label: string | undefined, intake: BehaviorChainSettings | null, live?: true) {
   let chain: BehaviorChain | null = null
   let chainCoverage = coverage('fresh', new Date(now).toISOString())
   let summary: ReturnType<typeof behaviorChainSummary> | null = null
@@ -168,6 +169,11 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
       chainCoverage.observedAt, missingReceipt ? 'Original Call or receipt evidence is not recorded'
         : omittedInvocations ? 'Only the latest five invocations are included' : chainCoverage.reason) },
     receipts, omittedInvocations, ledger,
+    ...(live ? { liveGitHub: observation?.externalMerge
+      ? await readLivePull(issue.repo, observation.externalMerge.pull_number, null, observation.externalMerge.merge_sha)
+      : pullNumber ? await readLivePull(issue.repo, pullNumber, head, summary?.mergeSha ?? null)
+      : { source: 'Live GitHub through Caller', observedAt: new Date(now).toISOString(), coverage: 'unavailable', record: null,
+        reason: 'No exact PR binding is recorded for this issue' } } : {}),
     github: observation?.pull ? { observedAt: observationCoverage.observedAt, head, merged: observation.pull.merged,
       mergeSha: observation.pull.mergeSha, checks: { pending: observation.pull.pending, failing: observation.pull.failing.slice(0, 10) },
       queueEntry: observation.pull.queueEntry, approved: openPull?.approved ?? null, changesRequested: openPull?.changesRequested ?? null,
@@ -238,7 +244,7 @@ export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig
   let intake: BehaviorChainSettings | null = null
   try { intake = getBehaviorChainSettings() } catch { /* corrupt intake settings cannot establish eligibility */ }
   for (const issue of selected) {
-    items.push(await workItem(issue, service, source, now, ledgerShortCircuit, args.label, intake))
+    items.push(await workItem(issue, service, source, now, ledgerShortCircuit, args.label, intake, args.live))
   }
   const last = selected.at(-1)
   return { repository: args.repository, issue: args.issue ?? null, label: args.label ?? null, observedAt: new Date(now).toISOString(),

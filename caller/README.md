@@ -138,7 +138,8 @@ whose IDs are absent. An absent variable preserves standalone Caller behavior.
 The installed stop gate selects the main reader for agent-authored PRs and the
 agent reviewer otherwise; the accounts must be distinct and author evidence known.
 
-The head-pinned `--pr-readiness` read reports
+The head-pinned `--pr-readiness` read accepts `--repository OWNER/REPO` and
+otherwise uses the current checkout. It reports
 `approval_blocked_by_conversations` for its `--username`. It is true for an
 observed unresolved, non-outdated conversation from another reviewer, false
 after a complete read with no such conversation, and null for an incomplete

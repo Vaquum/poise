@@ -722,6 +722,24 @@ it('traces bounded label pages and exact issues through a packaged SDK connectio
   await mkdir(caller)
   // Run the repository's real read-only CLI; no provider or GitHub CLI can run.
   await writeFile(join(caller, 'github-datastore'), `#!/usr/bin/env python3\nimport sys\nsys.path.insert(0, ${JSON.stringify(resolve('caller/github_datastore'))})\nfrom github_datastore.cli import main\nmain()\n`, { mode: 0o755 })
+  await writeFile(join(caller, 'github-interface'), `#!/usr/bin/env python3
+import json, sys
+command, number, *args = sys.argv[1:]
+number = int(number)
+assert args[:4] == ['--repository', 'acme/repo', '--token-user', 'reviewer']
+identity = {'repository': 'acme/repo', 'pull_number': number, 'head_sha': 'a' * 40}
+if command == '--pr-readiness':
+    assert number == 23 and args[4:] == ['--username', 'reviewer', '--expected-head', 'a' * 40]
+    result = {**identity, 'state': 'OPEN', 'outcome': 'blocked', 'reviewer_approved_current_head': True,
+              'changes_requested': False, 'unresolved_live_conversation_count': 1, 'checks_state': 'PENDING',
+              'github_mergeable': 'MERGEABLE', 'blockers': ['unresolved_live_conversations']}
+else:
+    assert command == '--pull-action-state' and number in (14, 23) and args[4:] == ['--queue-evidence']
+    result = {**identity, 'state': 'closed' if number == 14 else 'open', 'merged': number == 14,
+              'merge_sha': 'b' * 40 if number == 14 else '0' * 40, 'merged_at': '2026-11-10T00:00:00Z' if number == 14 else None,
+              'queue_entry_id': None, 'queue_entry': None}
+print(json.dumps(result))
+`, { mode: 0o755 })
   execFileSync('python3', ['-c', `
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -829,6 +847,12 @@ conn.close()
     request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
   heldWithActive = append(heldWithActive, { type: 'invocation.started', invocationId: 'original-active' })
   append(heldWithActive, { type: 'chain.held', reason: 'Pause new admission while the original worker finishes' })
+  const openPull = admit(13)
+  append(openPull, { type: 'chain.observed', observation: { ...waitedObservation,
+    issue: { ...waitedObservation.issue, open: true },
+    publication: { ...waitedObservation.publication!, pull_number: 23, state: 'open', merged: false, merge_sha: null },
+    pull: { ...waitedObservation.pull!, number: 23, state: 'open', merged: false, mergeSha: null },
+  } })
   await ledger.startBehaviorLedger({ path: join(root, 'ledger.sqlite') })
   ledger.behaviorLedgerHeartbeat()
   const packagePoisePlugin = (apex: string, destination: string) => promisify(execFile)(process.execPath,
@@ -904,6 +928,16 @@ conn.close()
     expect(reads.mock.calls.map(call => call[0])).toEqual(['acme/repo#3', 'acme/repo#4'])
     expect(receipts.mock.calls).toHaveLength(4)
     expect(receipts.mock.calls.every(call => call[0].operation === 'list' && call[0].limit === 5 && call[0].repository === 'Acme/Repo')).toBe(true)
+    const live = await work({ repository: 'Acme/Repo', issue: 4, live: true })
+    expect(live.items[0]).toMatchObject({ reviewStatus: 'pending', liveGitHub: { coverage: 'complete',
+      record: { number: 14, head: 'a'.repeat(40), mergeSha: 'b'.repeat(40), recordedHeadMatches: true,
+        recordedMergeMatches: true, gates: null } } })
+    expect((await work({ repository: 'Acme/Repo', issue: 13, live: true })).items[0]).toMatchObject({
+      liveGitHub: { coverage: 'complete', record: { number: 23, state: 'open', mergeSha: null,
+        gates: { approved: true, unresolvedThreads: 1, checks: 'PENDING', conflicts: false } } },
+    })
+    expect((await connection.client.callTool({ name: 'poise_work',
+      arguments: { repository: 'Acme/Repo', label: 'poise', live: true } })).isError).toBe(true)
     let inFlight = 0, maxInFlight = 0
     receipts.mockImplementation((request) => {
       inFlight += 1

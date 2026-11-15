@@ -50,7 +50,7 @@ behaviors:
   --pull-action-state PR --token-user USER [--repository OWNER/REPO]
   --update-branch-if-behind PR --expected-head SHA --author USER --token-user USER
   --current-pr [--token-user USER]
-  --pr-readiness PR --username USER --expected-head SHA [--token-user USER]
+  --pr-readiness PR --username USER --expected-head SHA [--token-user USER] [--repository OWNER/REPO]
   --local-checkout-path ORG REPO
   --prune-mirrors ROOT --cap-bytes N --now-ms N [--fresh-ms N] [--dry-run]
   --view-repos ORG
@@ -365,6 +365,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(prog="github-interface --pr-readiness PR")
         parser.add_argument("--username", required=True)
         _add_expected_head(parser)
+        _add_repository(parser)
         return parser
 
     if behavior == "--resolve-nonblocking-conversations-if-ready":
