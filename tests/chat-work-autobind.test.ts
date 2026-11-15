@@ -2,10 +2,11 @@ import './fixtures/light-git-gate'
 import './fixtures/workspace-template'
 import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CATALOG } from './model-catalog-fixture'
@@ -460,6 +461,33 @@ describe('automatic PR binding through workspace branches', () => {
     await command(other.id, { operation: 'bind', target: 'https://github.com/acme/app/issues/9' })
   }
 
+  it('verifies existing .git markers and skips directory aliases and missing markers', async () => {
+    const parent = await manager()
+    const { checkout } = await workerWithCheckout(parent.id)
+    const repo = join(checkout, 'repo')
+    const nested = join(repo, 'nested')
+    const empty = join(checkout, 'generated', 'fixtures')
+    const linkedMarker = join(checkout, 'linked-marker')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await mkdir(nested)
+    await writeFile(join(nested, '.git'), 'gitdir: fixture\n')
+    await mkdir(empty, { recursive: true })
+    await mkdir(linkedMarker)
+    await symlink(repo, join(checkout, 'directory-alias'))
+    await symlink(join(repo, '.git'), join(linkedMarker, '.git'))
+    const lstat = vi.spyOn((await import('node:fs/promises')).default, 'lstat')
+    syncBuiltinESMExports()
+    try {
+      const scan = await runtime.nestedTaskRepos(checkout)
+      expect(scan).toMatchObject({ complete: true, dirs: [repo, nested] })
+      const markerLookups = lstat.mock.calls.map(([path]) => String(path)).filter(path => path.startsWith(checkout) && basename(path) === '.git')
+      expect(markerLookups.sort()).toEqual([join(repo, '.git'), join(nested, '.git'), join(linkedMarker, '.git')].sort())
+    } finally {
+      lstat.mockRestore()
+      syncBuiltinESMExports()
+    }
+  })
+
   it('binds the PR pushed from a created worker\'s nested clone and wakes it for the review', async () => {
     const parent = await manager()
     const { worker, checkout } = await workerWithCheckout(parent.id)
@@ -653,7 +681,7 @@ describe('automatic PR binding through workspace branches', () => {
       expect(reported()).toHaveLength(1)
       expect(reported()[0]).toMatchObject({ severity: 'warning', operation: 'chat.control.item_failed',
         context: { kind: 'discovery', key: 'workspace-branches', sessionId: broken.worker, scope: 'whole-sweep',
-          causes: [{ path: 'unreadable', cause: 'lstat_git:EACCES' }], unreadableTruncated: 0,
+          causes: [{ path: 'unreadable', cause: 'readdir:EACCES' }], unreadableTruncated: 0,
           lastSuccessfulDiscoveryAt: null, retryIntervalMs: 60_000 } })
       expect(reported()[0].message).toContain('whole sweep')
 
@@ -690,7 +718,7 @@ describe('automatic PR binding through workspace branches', () => {
         'chat.control.item_failed', 'chat.control.item_recovered', 'chat.control.item_failed',
       ])
       expect(reported()[2].context).toMatchObject({ sessionId: broken.worker,
-        causes: [{ path: 'unreadable', cause: 'lstat_git:EACCES' }], lastSuccessfulDiscoveryAt: successfulAt })
+        causes: [{ path: 'unreadable', cause: 'readdir:EACCES' }], lastSuccessfulDiscoveryAt: successfulAt })
       expect(store.bindings(runtime.instance).find(b => b.target === branchOnly)?.session).toBe(pushed.worker)
       expect(store.bindings(runtime.instance).find(b => b.target === explicit)?.session).toBe(parent.id)
       expect(JSON.stringify(reported())).not.toContain('Fix the issue')

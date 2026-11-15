@@ -4788,6 +4788,18 @@ export class ChatRuntime extends EventEmitter {
       }
       entries += listed.length
       if (stop(dir)) break
+      // A complete listing proves that a directory without a .git entry
+      // cannot be a checkout. Verify actual markers without following links.
+      if (dir !== checkout && listed.some(entry => entry.name === '.git')) {
+        try {
+          const gitInfo = await lstat(join(dir, '.git'))
+          if (gitInfo.isDirectory() || gitInfo.isFile()) found.push(dir)
+        } catch (error) {
+          const { code } = error as NodeJS.ErrnoException
+          if (code !== 'ENOENT' && code !== 'ENOTDIR') { noteGap(dir, `lstat_git:${code ?? 'unknown'}`); continue }
+        }
+        if (stop(dir)) break
+      }
       for (const entry of listed) {
         const name = entry.name
         if (name === '.git' || name === 'node_modules') continue
@@ -4795,16 +4807,7 @@ export class ChatRuntime extends EventEmitter {
         // The listing gives each entry's type as lstat would, a symbolic
         // link unfollowed, so only directories cost a probe: a workspace's
         // files are most of its entries.
-        if (!entry.isDirectory()) continue
-        const child = join(dir, name)
-        try {
-          const gitInfo = await lstat(join(child, '.git'))
-          if (gitInfo.isDirectory() || gitInfo.isFile()) found.push(child)
-        } catch (error) {
-          const { code } = error as NodeJS.ErrnoException
-          if (code !== 'ENOENT' && code !== 'ENOTDIR') { noteGap(child, `lstat_git:${code ?? 'unknown'}`); continue }
-        }
-        stack.push(child)
+        if (entry.isDirectory()) stack.push(join(dir, name))
       }
     }
     gaps.sort((a, b) => a.path.localeCompare(b.path))
