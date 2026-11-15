@@ -9,10 +9,11 @@ export interface LoggingRead {
   policy: LogPolicy
   now: number
   access: LogAccess
-  operation: 'list' | 'event' | 'health' | 'export' | 'evidence'
+  operation: 'list' | 'event' | 'health' | 'export' | 'evidence' | 'handoffs'
   filter: LogFilter
   selectors?: EvidenceSelector[]
   eventId?: string
+  classification?: { high: number; warnings: string[] }
 }
 export interface LoggingReply { status: number; contentType: string; body: string }
 export type WorkerReply = { id: number; reply: LoggingReply } | { id: number; error: { status: number; code: string; message: string } }

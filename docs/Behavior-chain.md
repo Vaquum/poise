@@ -610,8 +610,8 @@ with no Call becomes `uncertain`: a partial receipt-store recovery can lose the
 unique correlation that once protected it. It cannot be relaunched or given a
 synthetic no-effect fence, even while held or disabled. Unreadable receipt
 snapshots also journal this uncertainty before reconciliation resumes.
-An existing Call is never altered, and normal validated receipt reconciliation
-must prove release. [Receipt-store recovery](Operating.md#caller-receipt-store-recovery)
+The no-worker fence leaves an existing Call alone. Normal validated receipt
+reconciliation must prove release. [Receipt-store recovery](Operating.md#caller-receipt-store-recovery)
 defines preservation and activation requirements.
 The receipt reader accepts only the fence's exact no-provider, no-publication
 shape with its native resource-release timestamp. Other superseded outcomes
@@ -620,10 +620,14 @@ retain their original validation; malformed fence rows stay quarantined.
 Original artifact/receipt adoption continues while paused or held. Incomplete
 publication after closure is held once; complete original comments, reviews or
 replies can still settle through read-only observation. Native exit or
-quarantined uncertainty is retained. A running Call, or a terminal Call without
-resource-release proof, keeps its existing cleanup owner and reservation; no
-new stop or signal is sent. Closure first seen after that running worker ends
-is not a retroactive guarantee about its in-flight publication.
+quarantined uncertainty is retained. A running first implementation before
+publication planning gets a bounded recheck when the previous observation is
+stale. Verified seed closure fences the original Call before requesting
+cooperative termination. A seed found closed during read-only validation
+produces the same `target_closed` outcome. The invocation settles as deferred
+after verified no-write closure and original resource release, preserving
+history without an Error or a failed attempt. Other Calls and uncertain
+publication or cleanup retain their original ownership and reconciliation.
 
 The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
@@ -928,6 +932,16 @@ Native `approve-pr` deadlines use the same two timeout codes, reviewer account,
 `reviewRevision` and their durable automatic hold must match the approval
 exhaustion. They file a distinct `approval_budget_exhausted` report intent and
 marker; an earlier review report never covers a current approval hold.
+These approval reports use the guarded `report-disposition` control described
+below with `source-only` or `distinct-fix`. Completed issue review alone cannot
+start implementation, including after a lost creation acknowledgement or when
+new report publishing is disabled. Triage binds the original PR/head, automatic
+approval hold, approval basis/slot and complete settled attempt list. Missing,
+source-only or stale dispositions start no report implementation; a current
+distinct-fix must pass the ordinary admission gates, including source verification
+after preparation and the source sequence guard at admission and launch. A changed
+approval basis on the same head or a replacement hold invalidates that binding.
+No disposition retries source approval or relaxes its approval and merge gates.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads, PR review contexts or approval bases
@@ -952,6 +966,14 @@ implementation, a settled native issue-review receipt and its actual posted
 comment must supply that diagnosis. Creation, labeling, review completion or
 closure alone cannot admit recovery. The explanation remains worker-reported;
 the source repair verifies it.
+
+A settled report implementation refused before publication can also leave a
+receipted review of a source merge conflict. Recovery verifies the prerequisite
+named in the refusal on the current base and independently checks the exact
+source head against that base. A report removed from intake can supply this
+review while its own implementation stays fenced. The conflict base and
+prerequisite delivery are bound to the diagnosis and checked again after repair
+preparation. A resolved conflict, changed base or missing evidence keeps the wait.
 
 The original seed and branch remain unchanged. The existing `--note` carries the
 diagnosis, original Call, report reference and configured accounts' report guidance
@@ -1008,7 +1030,19 @@ disposition returns to the ordinary quiescent cadence; operator holds retain it.
 
 These pre-PR implementation-hold reports require explicit triage before their
 own implementation can prepare or start. A posted issue review alone cannot
-authorize implementation. Through the existing guarded `/api/behavior-chains`
+authorize implementation. This includes follow-up reports keyed by their original
+invocation and hold sequence, even after a lost creation acknowledgement or restart.
+After a lost acknowledgement, admission binds the earliest issue by the original
+source author whose GitHub creation body begins with the exact marker. A later
+issue can quote the marker without taking the binding. Missing or incomplete
+creation evidence for a possible report keeps its admission waiting.
+An independently authored markerless remedy verified against the source's blocked-by
+relationship and original failing file and test case retains ordinary intake.
+That path is only for intents the reporter linked as remedies: an issue the
+reporter created stays gated even if its marker is later removed.
+Intents stored before the adoption record verify independence by the
+remedy predating the source hold.
+Through the existing guarded `/api/behavior-chains`
 control, the workspace owner records `source-only` or `distinct-fix`, with a
 diagnosis and next action. Read `GET /api/behavior-chains?id=OWNER/REPO%23N` for
 the report chain's current sequence and `implementationReport` binding, then

@@ -218,6 +218,9 @@ def packet(
         args.extend(["--p", _priority(p)])
     if since_head:
         args.extend(["--since-head", since_head])
+    from . import review_continuation
+    if review_continuation.enabled():
+        args.append("--manifest-only")
     try:
         done = subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=limit)
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -281,6 +284,17 @@ def prompt(
     )
 
 
+def analysis_policy(system: str, text: str, packet: str) -> str:
+    """Material review input for the continuation basis, without the packet
+    body or the appended pinned-repository suffix. The suffix starts after
+    the packet; a note that repeats its heading must not truncate the basis."""
+    marker = "\n\nPinned review repository:"
+    at = text.find(packet) if packet else -1
+    cut = text.find(marker, at + len(packet) if at >= 0 else 0)
+    base = text[:cut] if cut >= 0 else text
+    return system + "\n" + (base.replace(packet, "<pinned packet>", 1) if packet else base)
+
+
 def run_agent(
     pwd: str,
     system: str,
@@ -302,7 +316,11 @@ def run_agent(
     review_scope: str = "",
 ) -> str:
     spec = CATALOG.review_model(behavior, model)
-    review_receipt.prepare_response(packet, spec.identity, review_scope)
+    from . import review_continuation
+    if review_continuation.enabled() and (spec.provider == "claude" or repository is None or capped):
+        raise AgentPreflightError("review continuation requires uncapped structured analysis with a pinned repository")
+    policy = analysis_policy(system, text, packet)
+    review_receipt.prepare_response(packet, spec.identity, review_scope, policy=policy)
     if spec.provider == "claude":
         prompt_bytes = len(text.encode("utf-8"))
         if prompt_bytes > MAX_GOVERNED_PROMPT_BYTES:

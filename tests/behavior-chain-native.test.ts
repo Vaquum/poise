@@ -516,12 +516,14 @@ it.each([
   { name: 'behind requiring a base update', blockers: ['merge_state_not_clean'], mergeable: true, mergeState: 'behind', expected: 'review-pr' },
   { name: 'conflicting', blockers: ['not_mergeable'], mergeable: false, mergeState: 'dirty', expected: 'repair-pr' },
 ])('selects $expected for an unreviewed $name PR using exact-head native evidence', async ({ blockers, mergeable, mergeState, expected }) => {
-  let ciHead = HEAD
+  let ciHead = HEAD, proof: string | undefined
+  const base = 'c'.repeat(40)
   mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
     const evidence: Record<string, unknown> = {
       '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
         issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
-        publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
+        publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null,
+          base_sha: base, ...(argv.includes('--verify-conflict') ? { conflict_base: proof } : {}) } },
       '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
       '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: false,
         unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0, green: false, blockers: [...blockers, 'reviewer_not_approved_current_head'] },
@@ -547,6 +549,11 @@ it.each([
     expect(request).toMatchObject({ command: 'agent-interface', context: { head: HEAD, reviewRevision: 'reviews' } })
     expect(request?.argv).toEqual(expect.arrayContaining(['--atomic-work', 'example/repo#7', '--actor', 'author',
       '--pull-number', '21', '--expected-head', HEAD, '--merge-base']))
+    expect(observation.conflictBase).toBeUndefined()
+    proof = base
+    expect((await operations.observe(chain, true)).conflictBase).toBe(base)
+    proof = HEAD
+    await expect(operations.observe(chain, true)).rejects.toThrow('Conflict proof differs from the observed PR, head or base')
     ciHead = 'c'.repeat(40)
     await expect(operations.observe(chain)).rejects.toThrow('native PR observations changed head or are incomplete')
   }

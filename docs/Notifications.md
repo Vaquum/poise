@@ -27,7 +27,7 @@ Show sets how much Answer here lists. Each level includes the one before it.
 - **+ Faults:** also what is stuck. Chain work that is held or has not moved
   for four hours, a behavior that gave up on a target, Poise's own failures
   (a review outcome to verify, an unusable result, a failed command), a stalled
-  ledger, and anything automatic still open after four hours: a notice from
+  ledger, and automatic work still blocked after four hours: a notice from
   when it was raised, chain work from its last verified advance, a retried
   Behaviors failure from when its run of failures began. The default, and what
   the bell counts.
@@ -43,6 +43,10 @@ When that status cannot be read, the last read stays, an organization whose
 datastore could not be read keeps its earlier rows, and a pull request with no
 status read says that behavior status is unavailable.
 The heading counts what the level shows, and each group heading counts its own.
+Reviewer timeout backoff stays under Everything, with elapsed backoff explicitly
+unverified. Its age alone establishes neither recovery nor blocked work; see
+[diagnostic severity](Behavior-Contract.md#diagnostic-severity). The bell uses the
+same classification on every place.
 
 A load paints the last read at once: the entries Answer here last showed, under
 the same GitHub user and organizations, quieter, with "Last read" and its time

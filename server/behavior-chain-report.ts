@@ -8,7 +8,7 @@ import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { runDatastoreHealth, validatedHealth } from './datastore-health'
-import { getHeadSha, handleGhBody, reconcileRepairReport } from './gh'
+import { getHeadSha, handleGhBody, listIssueCreationBodies, readIssueCreationBody, reconcileRepairReport } from './gh'
 import { HttpError } from './http'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
@@ -52,6 +52,7 @@ interface RepairReport {
   slot: string | null
   attempts: Array<{ invocation: string, call: string, completedAt: number }>
   issueNumber: number | null
+  adopted?: boolean
   recheck?: { remedy: number, merge: string, base: string, state: 'running' | 'failed' | 'passed', reason?: string, result?: TestRecheckResult }
   disposition?: { kind: 'source-only' | 'distinct-fix' | 'existing-remedy', revision: string, review: string, commentId: number,
     diagnosis: string, nextAction: string, remedy?: number }
@@ -178,6 +179,12 @@ function reserveReport(db: Database, report: RepairReport): boolean {
     return db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
       .run(PREFIX + report.key, JSON.stringify(report)).changes !== 0
   }).immediate()
+}
+
+function bindReportIssue(db: Database, key: string, number: number): boolean {
+  return db.prepare(`UPDATE meta SET value = json_set(value, '$.issueNumber', ?)
+    WHERE key = ? AND (json_extract(value, '$.issueNumber') IS NULL OR json_extract(value, '$.issueNumber') = ?)`)
+    .run(number, PREFIX + key, number).changes === 1
 }
 
 async function createReport(db: Database, repository: string, report: RepairReport, title: string, body: string) {
@@ -591,19 +598,54 @@ function qualifyingImplementationHold(db: Database, chain: BehaviorChain, observ
     ? { invocation, call: invocation.callId, hold } : null
 }
 
+function implementationReportIdentity(report: RepairReport, storageKey = PREFIX + report.key): boolean {
+  const keys = report.pull === null ? [chainBasis([IMPLEMENTATION_CAUSE, report.source]),
+    chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source]),
+    ...(report.attempts.length === 1 && Number.isSafeInteger(report.holdSequence) && Number(report.holdSequence) > 0
+      ? [chainBasis([IMPLEMENTATION_CAUSE, report.source, report.attempts[0].invocation, report.holdSequence])] : [])]
+    : [IMPLEMENTATION_CAUSE, APPROVAL_CAUSE].map(cause => chainBasis([cause, report.source, report.pull]))
+  if (keys.some(key => storageKey === PREFIX + key) && storageKey !== PREFIX + report.key) {
+    throw new Error('Blocked report conflicts with its durable source intent')
+  }
+  return storageKey === PREFIX + report.key && keys.includes(report.key)
+}
+
 function implementationReport(db: Database, chain: BehaviorChain): RepairReport | null {
   const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
     AND json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.issueNumber') = ?`)
     .all(PREFIX + '*', chain.repository.toLowerCase() + '#*', chain.issue) as Array<{ key: string, value: string }>
   const reports = rows.filter(row => {
     const report = JSON.parse(row.value) as RepairReport
-    const keys = report.pull === null
-      ? [chainBasis([IMPLEMENTATION_CAUSE, report.source]), chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])]
-      : [chainBasis([IMPLEMENTATION_CAUSE, report.source, report.pull])]
-    if (keys.some(key => row.key === PREFIX + key) && !keys.includes(report.key)) throw new Error('Blocked report conflicts with its durable source intent')
-    return row.key === PREFIX + report.key && keys.includes(report.key)
+    return implementationReportIdentity(report, row.key)
   }).map(row => JSON.parse(row.value) as RepairReport)
-  if (reports.length > 1) throw new Error('Blocked report has conflicting source intents')
+  if (reports.length > 1) {
+    const shared = reports.every(report => report.pull === null)
+    if (shared) {
+      // Only an explicit generated record or a source-only/budget intent
+      // keeps its report gated. Source-only/budget keys never adopt, so
+      // they are always generated. Intents persisted before the record
+      // cannot conflict with each other, but a pre-record generated report
+      // must still run its predatesHold gate instead of collapsing to
+      // ordinary intake when another source adopts its stripped issue. The
+      // earliest pre-record decides: it predates only when every pre-record
+      // does. All-explicit adoptions return their earliest so admission runs
+      // its orphan gate instead of collapsing when a lost-ack could own the
+      // issue.
+      const generated = reports.filter(report => report.adopted === false
+        || report.key === chainBasis([IMPLEMENTATION_CAUSE, report.source])
+        || report.key === chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source]))
+      if (generated.length === 1) return generated[0]
+      if (!generated.length) {
+        const legacy = reports.filter(report => report.adopted === undefined)
+          .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
+            || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+        if (legacy.length) return legacy[0]
+        return [...reports].sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
+          || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))[0]
+      }
+    }
+    throw new Error('Blocked report has conflicting source intents')
+  }
   return reports[0] ?? null
 }
 
@@ -658,59 +700,58 @@ function unconfirmedImplementationReports(db: Database, repository: string): Rep
     .all(PREFIX + '*', repository.toLowerCase() + '#*') as Array<{ key: string, value: string }>
   return rows.flatMap(row => {
     const report = JSON.parse(row.value) as RepairReport
-    const keys = report.pull === null
-      ? [chainBasis([IMPLEMENTATION_CAUSE, report.source]), chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])]
-      : [chainBasis([IMPLEMENTATION_CAUSE, report.source, report.pull])]
-    if (keys.some(key => row.key === PREFIX + key) && !keys.includes(report.key)) throw new Error('Blocked report conflicts with its durable source intent')
-    return row.key === PREFIX + report.key && keys.includes(report.key) ? [report] : []
+    return implementationReportIdentity(report, row.key) ? [report] : []
   })
 }
 
 function boundImplementationSource(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain, report: RepairReport) {
   const source = journal.read(report.source)
-  const hold = db.prepare(`SELECT sequence FROM behavior_chain_events WHERE chain_id = ?
+  const hold = db.prepare(`SELECT sequence, at FROM behavior_chain_events WHERE chain_id = ?
     AND json_extract(payload, '$.type') = 'chain.held' ORDER BY sequence DESC LIMIT 1`)
-    .get(report.source) as { sequence: number } | undefined
+    .get(report.source) as { sequence: number, at: number } | undefined
   const accounts = getSettings()
+  if (!source || !hold || hold.sequence !== report.holdSequence || source.resumedAfterSequence >= hold.sequence
+    || !source.held || source.mergeSha || source.supersession || source.invocations.some(item => item.state !== 'settled')
+    || source.author.toLowerCase() !== chain.author.toLowerCase() || source.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()
+    || accounts.me.toLowerCase() !== source.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== source.reviewer.toLowerCase()) return null
+  if (report.pull !== null && report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])) {
+    const observation = source.observation as ChainObservation | null
+    const qualifying = observation && qualifyingAttempts(db, source, observation, Date.now())
+    return hold.at === report.heldAt && qualifying?.cause === APPROVAL_CAUSE
+      && observation?.pull?.number === report.pull && observation.pull.head === report.head
+      && qualifying.decision.basis === report.basis && qualifying.decision.reviewer?.slot === report.slot
+      && chainBasis(qualifying.attempts.map(item => ({ invocation: item.id, call: item.callId, completedAt: item.evidence?.completedAt }))) === chainBasis(report.attempts)
+      ? source : null
+  }
   const repair = report.pull !== null
   const budget = !repair && report.key === chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])
   if (budget) {
-    const last = source?.invocations.at(-1)
-    if (!source || report.attempts.length !== 3 || report.head !== null
-      || !hold || hold.sequence !== report.holdSequence || source.resumedAfterSequence >= hold.sequence
-      || !source.held || source.mergeSha || source.supersession || !last
+    const last = source.invocations.at(-1)
+    if (report.attempts.length !== 3 || report.head !== null || !last
       || last.id !== report.attempts[2].invocation
       || source.held !== `implement-issue failed before publication three times: ${String(last.evidence?.error || 'native failure')}`
-      || source.invocations.some(item => item.state !== 'settled')
       || report.attempts.some(attempt => {
         const invocation = source.invocations.find(item => item.id === attempt.invocation)
         return !invocation || invocation.callId !== attempt.call
           || invocation.evidence?.completedAt !== attempt.completedAt
           || invocation.basis !== report.basis || invocation.slot !== report.slot
           || invocation.behavior !== 'implement-issue' || invocation.actor !== source.author
-      })
-      || source.author.toLowerCase() !== chain.author.toLowerCase() || source.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()
-      || accounts.me.toLowerCase() !== source.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== source.reviewer.toLowerCase()) return null
+      })) return null
     return source
   }
   const attempt = report.attempts[0]
-  const invocation = source?.invocations.at(-1)
-  const key = repair ? chainBasis([IMPLEMENTATION_CAUSE, report.source, report.pull])
-    : chainBasis([IMPLEMENTATION_CAUSE, report.source])
+  const invocation = source.invocations.at(-1)
   const argv = invocation?.request.argv ?? []
-  if (!source || report.key !== key || report.attempts.length !== 1
+  if (!implementationReportIdentity(report) || report.attempts.length !== 1
     || repair !== (report.head !== null)
     || repair && (!Number.isSafeInteger(report.pull) || Number(report.pull) < 1 || !/^[a-f0-9]{40}$/i.test(report.head ?? ''))
-    || !hold || hold.sequence !== report.holdSequence || source.resumedAfterSequence >= hold.sequence
-    || !source.held || source.mergeSha || source.supersession || !invocation || invocation.id !== attempt.invocation
+    || !invocation || invocation.id !== attempt.invocation
     || invocation.callId !== attempt.call || invocation.basis !== report.basis || invocation.slot !== report.slot
     || (repair ? invocation.behavior !== 'repair-pr' : invocation.behavior !== 'implement-issue')
     || repair && (invocation.request.context?.head !== report.head
       || argv[argv.indexOf('--pull-number') + 1] !== String(report.pull)
       || argv[argv.indexOf('--expected-head') + 1] !== report.head)
-    || invocation.evidence?.error !== source.held || source.invocations.some(item => item.state !== 'settled')
-    || source.author.toLowerCase() !== chain.author.toLowerCase() || source.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()
-    || accounts.me.toLowerCase() !== source.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== source.reviewer.toLowerCase()) return null
+    || invocation.evidence?.error !== source.held) return null
   return source
 }
 
@@ -785,6 +826,9 @@ async function verifiedReport(chain: BehaviorChain, report: RepairReport, revisi
 
 function dispositionReason(chain: BehaviorChain, report: RepairReport) {
   const disposition = report.disposition!
+  if (report.pull !== null && report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])) {
+    return `Approval deadline report https://github.com/${chain.repository}/issues/${report.issueNumber}: ${disposition.kind} disposition for ${report.source} PR #${report.pull} head ${report.head}, reviewed revision ${disposition.revision}; original Calls ${report.attempts.map(attempt => attempt.call).join(', ')}. Diagnosis: ${disposition.diagnosis} Next action: ${disposition.nextAction} Source approval hold retained; any source retry requires explicit Resume. Original approval and merge gates remain required.`
+  }
   if (report.pull !== null) {
     return `Repair hold report https://github.com/${chain.repository}/issues/${report.issueNumber}: ${disposition.kind} disposition for ${report.source} PR #${report.pull} head ${report.head}, reviewed revision ${disposition.revision}; original Call ${report.attempts[0].call}${disposition.kind === 'existing-remedy' ? `; remedy https://github.com/${chain.repository}/issues/${disposition.remedy}` : ''}. Diagnosis: ${disposition.diagnosis} Next action: ${disposition.nextAction} Source hold retained; checkout availability is unverified. Any source retry requires existing recovery or explicit Resume.`
   }
@@ -812,7 +856,7 @@ export async function setImplementationReportDisposition(db: Database, journal: 
   const remedy = value && typeof value === 'object' && 'remedy' in value ? (value as { remedy: unknown }).remedy : undefined
   const sourceIssue = Number(report.source.split('#')[1])
   if (!value || typeof value !== 'object' || !('kind' in value)
-    || (review || report.pull === null
+    || (review || report.pull === null || report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])
       ? value.kind !== 'source-only' && value.kind !== 'distinct-fix'
       : value.kind !== 'existing-remedy' && value.kind !== 'distinct-fix')
     || (value.kind === 'existing-remedy'
@@ -867,18 +911,70 @@ export async function setImplementationReportDisposition(db: Database, journal: 
   }).immediate()
 }
 
+// Scoped intents persisted before the adoption record lack durable creation
+// classification, and a body rewrite can forge markerless remedy evidence.
+// Exemption then requires immutable proof that the linked issue predates
+// its source hold. The reporter files generated reports after the hold;
+// the minute tolerates journal/GitHub clock skew and timestamp rounding.
+function predatesHold(createdAt: unknown, heldAt: number | null): boolean {
+  if (typeof createdAt !== 'string' || typeof heldAt !== 'number' || !Number.isFinite(heldAt)) return false
+  const created = Date.parse(createdAt)
+  return Number.isFinite(created) && created + 60_000 < heldAt
+}
+
+function hasCreationMarker(body: string | null, key: string): boolean {
+  return body?.split(/\r?\n/, 1)[0] === `<!-- poise-repair-exhaustion:${key} -->`
+}
+
+async function earlierReportCreation(repository: string, report: RepairReport, issue: Awaited<ReturnType<typeof readIssueCreationBody>>) {
+  const since = report.heldAt !== null && Number.isFinite(report.heldAt) ? new Date(report.heldAt - 60_000).toISOString() : undefined
+  const { issues, hasNextPage } = await listIssueCreationBodies(repository, issue.author, since)
+  const created = Date.parse(issue.createdAt)
+  const earlier = issues.filter(other => {
+    const at = Date.parse(other.createdAt)
+    return !predatesHold(other.createdAt, report.heldAt) && (at < created || at === created && other.number < issue.number)
+  })
+  // A public marker can be copied into another issue's creation body.
+  if (earlier.some(other => hasCreationMarker(other.body, report.key))) return true
+  if (!issues.some(other => other.number === issue.number && other.createdAt === issue.createdAt)
+    || hasNextPage && !issues.some(other => Date.parse(other.createdAt) > created)) {
+    throw new Error('Issue creation listing is incomplete before the report')
+  }
+  if (earlier.some(other => other.body === null)) throw new Error('Earlier issue creation body is unavailable')
+  return false
+}
+
+async function findUnconfirmedPrePrReport(journal: BehaviorChainJournal, chain: BehaviorChain, unconfirmed: RepairReport[]) {
+  const orphans = unconfirmed.filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
+  if (!orphans.length) return null
+  const issue = await readIssueCreationBody(chain.repository, chain.issue)
+  const author = issue.author.toLowerCase()
+  const possible = orphans.filter(candidate => {
+    const creator = journal.read(candidate.source)?.author.toLowerCase()
+    return (!creator || creator === author) && !predatesHold(issue.createdAt, candidate.heldAt)
+  })
+  if (!possible.length) return null
+  if (issue.body === null) throw new Error('original issue body is unavailable')
+  const candidate = possible.find(candidate => hasCreationMarker(issue.body, candidate.key))
+  if (!candidate) return null
+  if (!journal.read(candidate.source)) throw new Error('original report author is unavailable')
+  return await earlierReportCreation(chain.repository, candidate, issue) ? null : candidate
+}
+
 /** Runs at implementation admission even when new report publishing is off. */
 export async function implementationReportAdmission(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, observe: (source: BehaviorChain) => Promise<ChainObservation>) {
   const implWait = 'Implementation hold report awaits a current explicit source-only or verified distinct-fix disposition'
   const repairWait = 'Repair hold report awaits a current explicit existing-remedy or verified distinct-fix disposition'
+  const approvalWait = 'Approval deadline report awaits a current explicit source-only or verified distinct-fix disposition'
   let report = implementationReport(db, chain)
   if (!report) {
     // A lost creation acknowledgement leaves the stored intent without its
     // issue number while GitHub already serves the report to intake. Match
     // such intents against this chain before allowing implementation.
-    for (const candidate of unconfirmedImplementationReports(db, chain.repository)) {
-      const candidateWait = candidate.pull === null ? implWait : repairWait
+    const unconfirmed = unconfirmedImplementationReports(db, chain.repository)
+    for (const candidate of unconfirmed.filter(candidate => candidate.pull !== null)) {
+      const candidateWait = candidate.key === chainBasis([APPROVAL_CAUSE, candidate.source, candidate.pull]) ? approvalWait : repairWait
       let issue
       try {
         issue = await reconcileRepairReport(chain.repository, `<!-- poise-repair-exhaustion:${candidate.key} -->`, chain.issue)
@@ -894,11 +990,63 @@ export async function implementationReportAdmission(db: Database, journal: Behav
         break
       }
     }
+    if (!report) {
+      // The report starts with its exact marker at publication. Current body
+      // matches and edit times cannot distinguish later quotes and rewrites.
+      try {
+        const candidate = await findUnconfirmedPrePrReport(journal, chain, unconfirmed)
+        if (candidate) {
+          if (!bindReportIssue(db, candidate.key, chain.issue)) return { reason: `${implWait}: verification unavailable: report intent binding changed` }
+          report = implementationReport(db, chain)
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { reason: `${implWait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
+      }
+    }
   }
   if (report) {
-    const wait = report.pull === null ? implWait : repairWait
+    const approval = report.pull !== null && report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])
+    const wait = report.pull === null ? implWait : approval ? approvalWait : repairWait
+    if (report.pull === null && report.key !== chainBasis([IMPLEMENTATION_CAUSE, report.source])
+      && report.key !== chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])
+      && report.adopted !== false) {
+      // Adopted scoped intents can link an independently authored blocked-by
+      // remedy. Only positive markerless remedy evidence exempts it from
+      // report triage. A generated report stays gated even when its marker
+      // and original invocation and Call are rewritten away.
+      const source = boundImplementationSource(db, journal, chain, report)
+      const failure = source && prePrFileAndTest(source.invocations.at(-1)?.evidence?.error)
+      const attempt = report.attempts[0]
+      try {
+        const issue = await reconcileRepairReport(chain.repository, `<!-- poise-repair-exhaustion:${report.key} -->`, report.issueNumber,
+          false, failure && attempt ? (body, author) => [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
+            && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
+            && !body.includes(attempt.invocation) && !body.includes(attempt.call) : undefined)
+        if (!issue) return { reason: `${wait}: report or linked remedy identity is unverified` }
+        if (!REPORT_MARKER.test(issue.body)) {
+          if (!source) return { reason: `${wait}: original source hold or Call changed` }
+          // A later adoption can link the issue from an unconfirmed report.
+          const canExempt = report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt)
+          const orphan = canExempt && await findUnconfirmedPrePrReport(journal, chain, unconfirmedImplementationReports(db, chain.repository))
+          const fresh = await observe(source)
+          const deps = fresh.prerequisites?.evidence?.[0] as { repo?: unknown, number?: unknown,
+            found?: unknown, complete?: unknown, prerequisites?: Array<{ repo?: unknown, number?: unknown }> } | undefined
+          const verified = issue.state === 'open' && chainBasis([issue.title, issue.body]) === observation.issue.revision
+            && typeof deps?.repo === 'string' && deps.repo.toLowerCase() === source.repository.toLowerCase() && deps.number === source.issue
+            && deps.found === true && deps.complete === true && Array.isArray(deps.prerequisites)
+            && deps.prerequisites.some(entry => typeof entry?.repo === 'string'
+              && entry.repo.toLowerCase() === chain.repository.toLowerCase() && entry.number === chain.issue)
+            && journal.read(source.id)?.sequence === source.sequence
+          if (!verified) return { reason: `${wait}: linked remedy source evidence changed` }
+          if (canExempt && !orphan) return { reason: null }
+        }
+      } catch (error) {
+        return { reason: `${wait}: verification unavailable: ${behaviorErrorMessage(error instanceof Error ? error.message : String(error), 500)}` }
+      }
+    }
     const disposition = report.disposition
-    const allowed = report.pull === null ? ['source-only', 'distinct-fix'] : ['existing-remedy', 'distinct-fix']
+    const allowed = report.pull === null || approval ? ['source-only', 'distinct-fix'] : ['existing-remedy', 'distinct-fix']
     if (!disposition || !allowed.includes(disposition.kind)
       || (disposition.kind === 'existing-remedy' && (!Number.isSafeInteger(disposition.remedy) || Number(disposition.remedy) < 1))
       || !dispositionReview(chain, observation, disposition)) return { reason: wait }
@@ -923,14 +1071,12 @@ export async function implementationReportAdmission(db: Database, journal: Behav
           : !qualifyingImplementationHold(db, source, fresh, Date.now()))) return { reason: `${wait}: source or reviewed report evidence changed` }
     } else {
       const qualifying = qualifyingAttempts(db, source, fresh, Date.now())
-      const attempt = qualifying?.attempts[0]
-      if (!fresh.issue.eligible || qualifying?.cause !== IMPLEMENTATION_CAUSE
+      if (!fresh.issue.eligible || qualifying?.cause !== (approval ? APPROVAL_CAUSE : IMPLEMENTATION_CAUSE)
         || qualifying.decision.basis !== report.basis || qualifying.decision.reviewer?.slot !== report.slot
         || fresh.pull?.head !== report.head || fresh.pull?.number !== report.pull
         || journal.read(source.id)?.sequence !== source.sequence
         || chainBasis(implementationReport(db, chain)) !== chainBasis(report)
-        || attempt?.id !== report.attempts[0]?.invocation || attempt?.callId !== report.attempts[0]?.call
-        || attempt?.evidence?.completedAt !== report.attempts[0]?.completedAt) return { reason: `${wait}: source or reviewed report evidence changed` }
+        || chainBasis(qualifying.attempts.map(item => ({ invocation: item.id, call: item.callId, completedAt: item.evidence?.completedAt }))) !== chainBasis(report.attempts)) return { reason: `${wait}: source or reviewed report evidence changed` }
     }
     if (disposition.kind === 'source-only' || disposition.kind === 'existing-remedy') return { reason: dispositionReason(chain, report) }
     return { reason: null, source: { id: source.id, sequence: source.sequence } }
@@ -1089,7 +1235,7 @@ export function repairReportImplementationFence(db: Database, chain: BehaviorCha
  * Call proves provenance and no publication, not that its proposed fix is right;
  * the exact-head repair must validate it through the normal publication gates. */
 export async function recoverReportedRepair(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
-  observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
+  observation: ChainObservation, verify: (target: BehaviorChain, verifyConflict?: boolean) => Promise<ChainObservation>,
   allowed: () => boolean, signal?: AbortSignal): Promise<string | null> {
   const implementation = await recoverReportedImplementation(db, journal, chain, observation, allowed, signal)
   if (implementation !== undefined) return implementation
@@ -1130,7 +1276,7 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
     return pending(`report #${report.issueNumber} has no unambiguous diagnostic owner`)
   }
   const freshReport = await verify(reportChain)
-  if (!freshReport.issue.open || !freshReport.issue.eligible || freshReport.pull || freshReport.existingPulls.length
+  if (!freshReport.issue.open || freshReport.pull || freshReport.existingPulls.length
     || freshReport.publication.pull_number !== null || freshReport.publication.head_sha !== null
     || freshReport.publication.head_invocation !== null || freshReport.publication.state !== null
     || freshReport.publication.merged || freshReport.publication.merge_sha !== null
@@ -1160,37 +1306,62 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
     || !Array.isArray(result.comments) || result.comments.some(comment => !Number.isSafeInteger(comment.id) || comment.id < 1
       || typeof comment.author !== 'string' || typeof comment.body !== 'string')) throw new Error('Repair report diagnosis comments are incomplete')
   const comments = result.comments.filter(comment => [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(comment.author.toLowerCase()))
-  // Review alone is insufficient: the original comment must name this exact
-  // source PR/head and a concrete code site. The repair validates the diagnosis.
+  // The code-site route retains its full head and file:line requirements.
   const repository = chain.repository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const actionable = (text: unknown): text is string => typeof text === 'string' && text.includes(report.head!)
-    && (new RegExp(`https://github\\.com/${repository}/pull/${report.pull}(?!\\d)`).test(text) || new RegExp(`\\bPR #${report.pull}\\b`, 'i').test(text))
+  const namesPull = (text: string) => new RegExp(`https://github\\.com/${repository}/pull/${report.pull}(?!\\d)`).test(text)
+    || new RegExp(`\\bPR #${report.pull}\\b`, 'i').test(text)
+  const actionable = (text: unknown): text is string => typeof text === 'string' && text.includes(report.head!) && namesPull(text)
     && /\b[\w.-]+(?:\/[\w.-]+)*\.[\w]+:\d+\b/.test(text)
-  const reviewed = !implementations.length ? reportChain.invocations.flatMap(invocation => {
+  const reviewed = reportChain.invocations.flatMap(invocation => {
     const evidence = invocation.evidence
     const receipts = evidence?.receipts as Array<{ issue: string, comment_id: number, author: string }> | undefined
     if (invocation.behavior !== 'review-issue' || !invocation.callId || invocation.actor !== chain.reviewer
       || evidence?.status !== 'completed' || evidence.action !== 'commented' || evidence.issue_revision !== freshReport.issue.revision
       || !Array.isArray(receipts)) return []
     return comments.filter(comment => comment.author.toLowerCase() === chain.reviewer.toLowerCase()
-      && freshReport.issue.commentIds.includes(comment.id) && actionable(comment.body)
+      && freshReport.issue.commentIds.includes(comment.id)
       && comment.body.includes(`<!-- agent-interface issue-review call=${invocation.callId} -->`)
       && receipts.some(receipt => receipt && typeof receipt.issue === 'string' && receipt.issue.toLowerCase() === reportChain.id
         && receipt.comment_id === comment.id && typeof receipt.author === 'string' && receipt.author.toLowerCase() === chain.reviewer.toLowerCase()))
       .map(comment => ({ call: invocation.callId!, text: comment.body }))
+  })
+  const codeSite = freshReport.issue.eligible && (implementations.length
+    ? diagnosis && actionable(diagnostic?.stderr) && { call: diagnosis.call, text: diagnostic.stderr }
+    : reviewed.find(review => actionable(review.text)))
+  // A report removed from intake can still supply this settled diagnostic
+  // receipt. Only the original source chain receives an admission.
+  const conflictReviews = !codeSite && diagnosis ? reviewed.filter(({ text }) => {
+    const head = /\b(?:reproduced|confirmed|verified)\b[^\n.!?]*\b(?:content|merge|branch) conflicts? (?:at|on) `?([a-f0-9]{8,40})\b/i.exec(text)
+    return head && report.head!.startsWith(head[1].toLowerCase()) && namesPull(text)
   }) : []
-  const text = implementations.length ? diagnostic?.stderr : reviewed[0]?.text
-  const call = implementations.length ? diagnosis?.call : reviewed[0]?.call
-  if (!call || !actionable(text)) return pending(`report #${report.issueNumber} lacks an actionable diagnosis pinned to the source PR/head`)
+  const selected = codeSite || (conflictReviews.length === 1 ? conflictReviews[0] : null)
+  if (!selected) return pending(`report #${report.issueNumber} lacks an actionable diagnosis pinned to the source PR/head`)
+  const { call, text } = selected
+  let delivery: Record<string, unknown> | undefined
+  if (!codeSite) {
+    const prerequisite = diagnostic?.stderr?.match(new RegExp(`\\bprerequisite\\s+\`?https://github\\.com/${repository}/issues/([1-9]\\d*)\\b`, 'i'))
+    const prerequisites = freshReport.prerequisites
+    if (prerequisite && prerequisites?.wait === null && prerequisites.base) {
+      delivery = prerequisites.evidence.slice(1).find(item => item.issue_number === Number(prerequisite[1])
+        && item.base_sha === prerequisites.base && item.verified === true)
+    }
+    if (!delivery) return pending(`report #${report.issueNumber} prerequisite delivery is unverified`)
+  }
+  const fresh = await verify(chain, !codeSite)
+  const conflictBase = codeSite ? undefined : fresh.conflictBase
+  if (!codeSite && (!fresh.pull?.conflict || !conflictBase || conflictBase !== delivery?.base_sha)) {
+    return pending('the source conflict and report prerequisite do not verify on the same current base')
+  }
   const digest = chainBasis([report.key, reportChain.id, call, prepared ?? null,
-    diagnostic ?? null, text, freshReport.issue.revision, comments])
+    diagnostic ?? null, text, freshReport.issue.revision, comments,
+    ...(conflictBase ? [conflictBase, diagnosis!.call, delivery] : [])])
   if (chain.repairRecovery && chain.repairRecovery.diagnosis !== digest) return pending(`report #${report.issueNumber} diagnosis changed after recovery preparation`)
   const note = [`Repair-exhaustion diagnosis from ${issue.url}; original diagnostic Call ${call}.`,
     `Keep source ${chain.id}, branch ${chain.branch}, PR #${report.pull}, head ${report.head} and repair basis ${report.basis}.`,
+    ...(conflictBase ? [`The source head conflicts with the verified current base ${conflictBase}. Report implementation Call ${diagnosis!.call} settled before publication.`] : []),
     'Original repair Calls prove no publication; diagnostic work and resources are settled. Verify the worker-reported diagnosis on the source PR through normal validation, publication, review and CI.',
     text, ...comments.map(comment => `Report comment ${comment.id} (${comment.author}):\n${comment.body}`)].join('\n\n')
   if (Buffer.byteLength(note) > 32 * 1024) return pending('the complete diagnosis exceeds the bounded repair note')
-  const fresh = await verify(chain)
   const qualifying = qualifyingAttempts(db, { ...chain, held: hold!.reason, repairRecovery: undefined }, fresh, Date.now())
   const owners = db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE chain_id != ?
     AND lower(json_extract(state, '$.repository')) = ? AND
@@ -1198,7 +1369,7 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
     .all(chain.id, chain.repository.toLowerCase(), report.pull, report.pull)
   if (!qualifying || !['repair_incomplete_replies', 'repair_execution_budget_exhausted'].includes(qualifying.cause)
     || report.key !== chainBasis([qualifying.cause, chain.id, report.pull]) || qualifying.decision.basis !== report.basis
-    || qualifying.decision.reviewer?.slot !== report.slot || fresh.pull?.head !== report.head
+    || qualifying.decision.reviewer?.slot !== report.slot || fresh.pull?.head !== report.head || fresh.pull.number !== report.pull
     || fresh.pull.state !== 'open' || fresh.pull.merged || fresh.pull.queueEntry || fresh.existingPulls.length
     || fresh.publication.pull_number !== report.pull || fresh.publication.head_sha !== report.head
     || fresh.publication.state !== 'open' || fresh.publication.merged || fresh.publication.merge_sha !== null
@@ -1447,20 +1618,11 @@ async function recoverReportedImplementation(db: Database, journal: BehaviorChai
  * can reopen that intent for another POST. Intake remains the normal reader. */
 export async function reportRepairExhaustion(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   verify: () => Promise<ChainObservation>, allowed: () => boolean): Promise<string | null> {
-  for (const cause of [IMPLEMENTATION_CAUSE, IMPLEMENTATION_BUDGET_CAUSE]) {
-    const retained = db.prepare('SELECT value FROM meta WHERE key = ?')
-      .get(PREFIX + chainBasis([cause, chain.id])) as { value: string } | undefined
-    if (retained) {
-      const report = JSON.parse(retained.value) as RepairReport
-      const target = report.issueNumber && journal.read(chainIdentity(chain.repository, report.issueNumber))
-      if (report.disposition && target && boundImplementationSource(db, journal, target, report)) return dispositionReason(target, report)
-    }
-  }
-  const repairRows = db.prepare(`SELECT value FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') = ?`)
-    .all(PREFIX + '*', chain.id) as Array<{ value: string }>
+  const repairRows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') = ?`)
+    .all(PREFIX + '*', chain.id) as Array<{ key: string, value: string }>
   for (const row of repairRows) {
     const repair = JSON.parse(row.value) as RepairReport
-    if (repair.pull === null || repair.key !== chainBasis([IMPLEMENTATION_CAUSE, repair.source, repair.pull])) continue
+    if (!implementationReportIdentity(repair, row.key)) continue
     const target = repair.issueNumber && journal.read(chainIdentity(chain.repository, repair.issueNumber))
     if (repair.disposition && target && boundImplementationSource(db, journal, target, repair)) return dispositionReason(target, repair)
   }
@@ -1615,6 +1777,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         return failure ? (body: string, author: string) =>
           [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
           && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
+          && !body.includes(implementation.invocation.id) && !body.includes(implementation.call)
           : undefined
       })()
     : undefined
@@ -1698,7 +1861,8 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         const verifier = (body: string, author: string) =>
           [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
           && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
-        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string }> = []
+          && !body.includes(implementation!.invocation.id) && !body.includes(implementation!.call)
+        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string, created_at: unknown, author: string }> = []
         for (const entry of blockedBy) {
           const number = Number((entry as { number: number }).number)
           try {
@@ -1790,7 +1954,13 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         : cause === MERGE_CAUSE ? [{ invocation: verifiedMerge!.invocation.id, call: verifiedMerge!.call,
         completedAt: Number(verifiedMerge!.invocation.evidence!.completedAt) }]
         : verified!.attempts.map(invocation => ({ invocation: invocation.id, call: invocation.callId!, completedAt: Number(invocation.evidence!.completedAt) })),
-      issueNumber: existing?.number ?? null }
+      issueNumber: existing?.number ?? null,
+      // Scoped intents record reporter creation versus adoption, so a later
+      // body rewrite cannot turn a generated report into a linked remedy.
+      // Intents persisted before this record predate it and keep body evidence.
+      ...(existing && !REPORT_MARKER.test(existing.body) ? { adopted: true as const }
+        : cause === IMPLEMENTATION_CAUSE && implementationReport && key !== chainBasis([cause, chain.id])
+          ? { adopted: false as const } : {}) }
     // FULL durability precedes the external effect. A competing runtime or a
     // crash after this insert may reconcile, but may never create again.
     if (!enabled(db, chain.repository) || !allowed()) return null
@@ -1914,10 +2084,19 @@ async function confirmReport(db: Database, journal: BehaviorChainJournal,
   label: string, allowed: () => boolean, closedPrefix = '', linkedReport?: (body: string, author: string) => boolean,
   publicationAction = ''): Promise<string> {
   const marker = `<!-- poise-repair-exhaustion:${report.key} -->`
-  const save = () => db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(report), PREFIX + report.key)
   let issue = await reconcileRepairReport(chain.repository, marker, report.issueNumber, false, linkedReport)
   if (!issue) return `${publicationAction}${label} report creation is unconfirmed; no matching issue is visible yet. Reconcile the same marker; do not create a replacement`
-  if (report.issueNumber === null) { report.issueNumber = issue.number; save() }
+  if (report.issueNumber === null) {
+    if (report.pull === null && implementationReportIdentity(report)) {
+      const creation = await readIssueCreationBody(chain.repository, issue.number)
+      if (creation.author.toLowerCase() !== chain.author.toLowerCase() || predatesHold(creation.createdAt, report.heldAt)
+        || !hasCreationMarker(creation.body, report.key) || await earlierReportCreation(chain.repository, report, creation)) {
+        return `${label} report creation is unconfirmed; original issue body or author does not verify the report intent`
+      }
+    }
+    if (!bindReportIssue(db, report.key, issue.number)) return `${label} report creation is unconfirmed; issue binding changed during verification`
+    report.issueNumber = issue.number
+  }
   const link = `${publicationAction}${closedPrefix}${issue.state === 'closed' ? 'Historical ' : ''}${label} report ${issue.url} (last verified ${new Date().toISOString()}; not live status)`
   if (issue.state === 'closed') return `${link} is closed; no replacement will be created`
   if (!issue.labels.some(label => label.toLowerCase() === 'poise') && enabled(db, chain.repository) && allowed()) {

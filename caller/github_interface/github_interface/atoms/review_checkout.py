@@ -41,7 +41,8 @@ def bounded_tree(tree: dict) -> list[dict]:
 
 
 def checkout(owner: str, repo: str, head: str, merge_base: str, token: str,
-             path: Path, head_tree: dict, base_tree: dict, *, remote: str | None = None) -> dict:
+             path: Path, head_tree: dict, base_tree: dict, *, remote: str | None = None,
+             diff_files: list[str] | None = None) -> dict:
     if not path.is_absolute() or path.exists():
         raise ValueError("review checkout path must be absolute and unused")
     for sha in (head, merge_base):
@@ -95,6 +96,17 @@ def checkout(owner: str, repo: str, head: str, merge_base: str, token: str,
                    and item.get("mode") in ("100644", "100755")]
         manifest = {"repository": f"{owner}/{repo}", "head_sha": head, "merge_base_sha": merge_base,
                     "files": tracked, "instructions": instructions, "unavailable": unavailable}
+        if diff_files is not None:
+            available = {item["path"] for item in files + base_files}
+            if not isinstance(diff_files, list) or len(diff_files) > MAX_FILES \
+                    or any(not isinstance(name, str) or name not in available for name in diff_files) \
+                    or len(set(diff_files)) != len(diff_files):
+                raise ValueError("review diff requires distinct pinned repository paths")
+            diff = git("-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                       merge_base, head, "--", *(f":(literal){name}" for name in sorted(diff_files)),
+                       limit=MAX_CHECKOUT_BYTES, checkout=True) if diff_files else b""
+            (path / ".git" / "caller-review.diff").write_bytes(diff)
+            manifest["diff_files"] = sorted(diff_files)
         (path / ".git" / MANIFEST).write_text(json.dumps(manifest))
         return {"head_sha": head, "merge_base_sha": merge_base, "instructions": instructions,
                 "files": len(tracked)}
@@ -104,7 +116,7 @@ def checkout(owner: str, repo: str, head: str, merge_base: str, token: str,
 
 
 def inspect(root: Path, requests: list[dict]) -> dict:
-    """No Git, network, shell, writes, symlink following, or untracked files."""
+    """Read pinned source and the optional precomputed diff without execution."""
     root = root.resolve()
     manifest = json.loads((root / ".git" / MANIFEST).read_text())
     if not isinstance(requests, list) or not 1 <= len(requests) <= MAX_REQUESTS:
@@ -121,7 +133,7 @@ def inspect(root: Path, requests: list[dict]) -> dict:
         if not isinstance(request, dict) or set(request) != {"operation", "path", "query", "start_line"}:
             raise ValueError("invalid repository inspection request")
         operation, value, query, start = (request[key] for key in ("operation", "path", "query", "start_line"))
-        if (operation not in ("read", "search", "list") or not isinstance(value, str)
+        if (operation not in ("read", "search", "list", "diff") or not isinstance(value, str)
                 or not isinstance(query, str) or len(query) > 512 or type(start) is not int or start < 1):
             raise ValueError("invalid repository inspection operation")
         raw = PurePosixPath(value)
@@ -130,7 +142,15 @@ def inspect(root: Path, requests: list[dict]) -> dict:
         relative = str(raw)
         selected = sorted(path for path in files if relative in ("", ".") or path == relative or path.startswith(relative + "/"))
         result = {"request": request}
-        if operation == "list":
+        if operation == "diff":
+            if relative != "." or query or "diff_files" not in manifest:
+                raise ValueError("inspection diff requires the pinned diff manifest")
+            with (root / ".git" / "caller-review.diff").open(encoding="utf-8") as handle:
+                items = ({"line": number, "text": line.rstrip("\n")} for number, line in enumerate(handle, 1)
+                         if number >= start)
+                lines, truncated = _page(items, 10000, page_bytes)
+            result.update(lines=lines, truncated=truncated, next_line=start + len(lines) if truncated else None)
+        elif operation == "list":
             paths, truncated = _page(iter(selected[start - 1:]), 200, page_bytes)
             result.update(paths=paths, truncated=truncated,
                           next_line=start + len(paths) if truncated else None)

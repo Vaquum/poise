@@ -229,6 +229,12 @@ the workspace.
 - `GET /_poise/api/logging`, `/logging/events/ID`, `/logging/health` and
   `/logging/export` read retained central diagnostics through a bounded worker.
   They require the owner's browser session and exact Origin when one is sent.
+  Before severity filtering and pagination, typed review handoffs use bounded
+  reads of that owner's `/api/behavior-chains?handoffs=…`, with the existing
+  browser assertion and workspace Host. Each read accepts at most ten retained
+  handoff selectors and returns confirmed event IDs within 64 KiB. There is no
+  read of another workspace. Unavailable evidence retains source severity;
+  continuations reject a changed classification snapshot and require Refresh.
   Explicit `scope=instance` requires current admin access; another workspace's
   private application/Caller records remain excluded. No assertion scope or
   workspace fan-out is added. [Logging](Logging.md) defines filters, budgets,
@@ -1642,6 +1648,10 @@ This uses the existing owner workspace boundary and canonical journal, including
 completed chains. Ambiguous or missing matches remain unknown, as does a failed
 workspace read; central Logging queries and retained evidence remain independent.
 No gateway read, scope, ingestion or execution authority is added.
+Logging severity queries may separately supply retained typed handoff selectors
+to that same owner route, before filtering, counts or page/export selection.
+This read verifies native `--expected-head` admissions and retained legacy
+same-target/context receipts.
 Typed provider analysis handoffs use the existing v1 diagnostic envelope and
 positive no-submission evidence. The same work-impact read confirms only later
 same-PR/head/basis/slot successor admissions or attributed review verdicts for
@@ -1665,6 +1675,17 @@ through Caller completion and native resource settlement under those same
 [recovery rules](Behavior-chain.md#authority-and-recovery); a diagnostic or
 cleanup alone cannot release an unknown publication effect.
 
+Caller also exposes an explicitly requested structured review continuation via
+`--review-slot` and `--resume-review`. Its typed incomplete result names the
+original Call and checkpoint generation. The existing receipt and response store
+own the exclusive claim, evidence and cumulative allowance across independently
+bounded Calls; partial analysis grants no review authority. Complete source and
+cross-unit coverage reserve one
+head-pinned finalization, preserving the first publisher's Call ID on a lost
+acknowledgement. Poise does not automatically admit these continuations. See
+[Caller's protocol](../caller/agent_interface/README.md#explicit-review-continuation)
+for bounds, invalidation, holds and isolated proof.
+
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
 started originals without a Call remain uncertain without a retry or synthetic
@@ -1674,8 +1695,12 @@ The existing in-flight review/approval poll also observes same-head closure.
 It waits for active submission and retains completed-turn results while preventing
 further analysis. Unattempted rounds use `review_target_closed`; attempted writes
 retain the original publication fence and receipt.
-Existing Calls and uncertain
-resources are never released by closure alone. Merged-chain Hold/Resume writes
+A bounded recheck can request cooperative retirement of the original first
+implementation. Caller serializes the retirement fence with publication
+planning, and Poise requires that Call's release proof before recording a
+deferred `target_closed` outcome. See [Behavior chain](Behavior-chain.md#authority-and-recovery).
+Existing Calls and uncertain resources are never released by closure alone.
+Merged-chain Hold/Resume writes
 return 409 and the GUI retains History and read-only reconciliation. No new
 endpoint, signal or journal event type is added; the Caller contract is in
 [agent_interface](../caller/agent_interface/README.md#fencing-a-closed-behavior).
@@ -1850,10 +1875,11 @@ on the held source through the existing report metadata and journal waits.
 This adds no retry or checkout-retention authority; see
 [report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
 The existing linked remediation also exposes bounded private source evidence
-from the original failed validation capture, retained through normal checkout
-cleanup under the workspace's incident-artifact lifecycle. Only its availability
-and capture identity enter receipts and reports; source bytes stay in the owning
-workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
+from failed validation, including interrupted runs with a recorded Vitest
+assertion diagnostic. Caller retains it through normal checkout cleanup under
+the workspace's incident-artifact lifecycle. Receipts and reports carry its
+availability and capture identity. The interrupted marker and source bytes stay
+in the owning workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
 defines binding, access, limits and expiry without granting recovery authority.
 Terminal repair reports require the matching automatic hold, settled original Call,
 positive release and unchanged open PR head and repair basis, without possible
@@ -1866,6 +1892,9 @@ hold and unchanged source/diagnosis are rechecked. An already-admitted report's
 original implementation must settle without publication before this handoff.
 The original seed/branch, normal publication, review and CI gates remain in force;
 missing evidence, changed heads and later operator holds retain the wait.
+For a conflict diagnosis, the existing Caller seed read verifies the owned PR
+head against the current default-branch tip with a bounded local Git probe.
+Admission rechecks the conflict base and prerequisite delivery after preparation.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,

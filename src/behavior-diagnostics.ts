@@ -55,6 +55,8 @@ export function targetRef(target: string): string {
 
 /** An unclassified timeout: the sweep ran out of time under load, and retries on its own. */
 export const STALLED_MESSAGE = 'The sweep is stalled under load. Poise retries automatically.'
+export const REVIEWER_BACKOFF_MESSAGE = 'The reviewer timed out. Recorded backoff is active; recovery unverified.'
+export const REVIEWER_RETRY_DUE_MESSAGE = 'The reviewer timed out. Recorded backoff elapsed; recovery unverified.'
 
 function diagnosticMessage(code: string, cause: string): string {
   if (code === 'unknown' && isTimeoutCause(cause)) return STALLED_MESSAGE
@@ -72,7 +74,7 @@ function diagnosticMessage(code: string, cause: string): string {
   } as Record<string, string>)[code] ?? cause
 }
 
-export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): BehaviorDiagnosticGroup[] {
+export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics, now = Date.now()): BehaviorDiagnosticGroup[] {
   const groups = new Map<string, BehaviorDiagnosticGroup>()
   const add = (classification: DiagnosticClassification, scope: string, message: string, detail: string,
     about: Omit<DiagnosticEntry, 'detail'> = { behavior: null, target: null, at: null, next: null }, episode?: string) => {
@@ -119,9 +121,15 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
       || `${failure.org ?? ''} ${failure.behavior}`.trim()
     if (failure.callId) failureCauses.set(JSON.stringify([failure.behavior, failure.callId, cause]), classification)
     if (failure.recovered === true && !stronger) continue
-    const message = classification.code === 'github_access'
+    let message = classification.code === 'github_access'
       ? `GitHub target is unavailable to ${diagnostics.identity.actor || 'the reviewer'}; check repository access.`
       : diagnosticMessage(classification.code, cause)
+    if (classification.code === 'unknown' && failure.kind === 'operation'
+      && failure.target?.startsWith('reviewer:') && isTimeoutCause(cause)) {
+      const retryAt = Date.parse(failure.nextRetryAt)
+      message = !Number.isFinite(retryAt) ? 'The reviewer timed out. Retry timing and recovery are unverified.'
+        : now >= retryAt ? REVIEWER_RETRY_DUE_MESSAGE : REVIEWER_BACKOFF_MESSAGE
+    }
     const detail = `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s) — ${cause}`
     add(classification, scope, message, detail, { behavior: failure.behavior, target: failure.target ?? null, at: failure.lastFailureAt || null, next: failure.nextRetryAt || null, since: failure.failingSince ?? null, callId: failure.callId, correlationId: failure.correlationId, ...evidenceAttachment(failure) })
   }

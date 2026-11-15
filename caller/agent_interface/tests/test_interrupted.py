@@ -25,6 +25,7 @@ class InterruptedCallsCase(TestCase):
             patch.object(agent_interface, "DB", data / "calls.sqlite3"),
             patch.object(agent_interface, "RESPONSES", data / "responses"),
             patch.dict(os.environ, {"AGENT_INTERFACE_ACTOR": ""}),
+            patch.object(agent_interface.caller_store, "observes_workspace_supervisor", return_value=True),
         ):
             target.start()
             self.addCleanup(target.stop)
@@ -35,18 +36,18 @@ class InterruptedCallsCase(TestCase):
         init.start()
         self.addCleanup(init.stop)
 
-    def call(self, started_ago, pid="4242", status="running", runner=None, error_code=None):
+    def call(self, started_ago, pid="4242", status="running", runner=None, error_code=None, identity=None):
         id_ = agent_interface.track("opus-5-max", "review", repo="acme/app", pr_id="7", behavior="pr_review", runner=runner)
         with agent_interface.db() as conn:
             conn.execute(
-                "update calls set pid=?, status=?, started_at=?, error_code=? where id=?",
-                (pid, status, self.now - started_ago, error_code, id_),
+                "update calls set pid=?, status=?, started_at=?, error_code=?, process_identity=? where id=?",
+                (pid, status, self.now - started_ago, error_code, identity, id_),
             )
         return id_
 
     def row(self, id_):
         with agent_interface.db() as conn:
-            return conn.execute("select status, error, error_code, ended_at from calls where id=?", (id_,)).fetchone()
+            return conn.execute("select status, error, error_code, ended_at, diagnostic from calls where id=?", (id_,)).fetchone()
 
     def test_a_call_from_before_the_container_restarted_reads_as_interrupted(self):
         id_ = self.call(started_ago=2 * 3600)
@@ -75,6 +76,106 @@ class InterruptedCallsCase(TestCase):
             self.assertEqual(agent_interface.reap_interrupted(), 1)
         self.assertEqual(self.row(reused)["error_code"], "interrupted")
         self.assertEqual(self.row(live)["status"], "running")
+
+    def test_legacy_same_epoch_supervisor_loss_keeps_the_orphan_grace(self):
+        epoch = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+        identity = json.dumps({"version": 1, "pid": 4242, "start": "42", "epoch": epoch})
+        for start in (FileNotFoundError, "43"):
+            with self.subTest(start=start):
+                call = self.call(started_ago=600, identity=identity)
+                with patch.object(agent_interface.process_identity, "epoch", return_value=epoch), \
+                        patch.object(agent_interface.process_identity, "_start", side_effect=start if start is FileNotFoundError else None,
+                                     return_value=start), \
+                        patch.object(agent_interface, "init_started_at", return_value=self.now), \
+                        patch.object(agent_interface.caller_store, "observes_workspace_supervisor", return_value=False), \
+                        patch.object(agent_interface, "process_command", return_value=None):
+                    self.assertEqual(agent_interface.reap_interrupted(), 0)
+                    self.assertEqual(self.row(call)["status"], "running")
+                    with agent_interface.db() as conn:
+                        conn.execute("update calls set started_at=? where id=?",
+                                     (self.now - agent_interface.ORPHAN_AFTER_SECONDS - 60, call))
+                    self.assertEqual(agent_interface.reap_interrupted(), 1)
+                diagnostic = json.loads(self.row(call)["diagnostic"])
+                observed = "gone" if start is FileNotFoundError else "different"
+                self.assertEqual(diagnostic["message"], f"legacy_orphan; observer=same_epoch; identity={observed}")
+
+    def test_a_live_legacy_identity_overrides_age_and_a_newer_init_timestamp(self):
+        epoch = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+        identity = json.dumps({"version": 1, "pid": 4242, "start": "42", "epoch": epoch})
+        call = self.call(started_ago=agent_interface.ORPHAN_AFTER_SECONDS + 60, identity=identity)
+        with patch.object(agent_interface.process_identity, "epoch", return_value=epoch), \
+                patch.object(agent_interface.process_identity, "_start", return_value="42"), \
+                patch.object(agent_interface, "init_started_at", return_value=self.now), \
+                patch.object(agent_interface, "process_command") as command:
+            self.assertEqual(agent_interface.reap_interrupted(), 0)
+            command.assert_not_called()
+        self.assertEqual(self.row(call)["status"], "running")
+
+    def test_legacy_missing_or_unverified_identity_requires_an_authorized_observer(self):
+        identities = (None, '{"version":1,"pid":4242,"unverified":"private process details"}', "unreadable")
+        for identity in identities:
+            with self.subTest(identity=identity):
+                call = self.call(started_ago=2 * 3600, identity=identity)
+                with patch.object(agent_interface.caller_store, "observes_workspace_supervisor", return_value=False):
+                    self.assertEqual(agent_interface.reap_interrupted(), 0)
+                self.assertEqual(self.row(call)["status"], "running")
+                self.assertEqual(agent_interface.reap_interrupted(), 1)
+                diagnostic = json.loads(self.row(call)["diagnostic"])
+                observed = "unverified" if identity else "missing"
+                self.assertEqual(diagnostic["message"], f"legacy_before_init; observer=workspace; identity={observed}")
+                self.assertNotIn("private process details", self.row(call)["diagnostic"])
+                self.assertLess(len(self.row(call)["diagnostic"]), 500)
+
+    def test_an_authorized_parent_preserves_a_live_legacy_child(self):
+        parent = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+        child = {**parent, "init_start": "20", "namespace_ino": 3}
+        identity = json.dumps({"version": 1, "pid": 4242, "start": "42", "epoch": child})
+        call = self.call(started_ago=60, identity=identity)
+        with patch.object(agent_interface.process_identity, "epoch", return_value=parent), \
+                patch.object(agent_interface.process_identity, "_start") as start:
+            running = agent_interface.logs(status="running")
+            start.assert_not_called()
+        self.assertIn(call, {entry["id"] for entry in running})
+        self.assertEqual(self.row(call)["status"], "running")
+
+    def test_a_malformed_reapable_diagnostic_does_not_break_history_reads(self):
+        good = self.call(started_ago=60, status="completed")
+        for changed_only in (False, True):
+            with self.subTest(changed_only=changed_only):
+                bad = self.call(started_ago=2 * 3600)
+                malformed = '{"operation":'
+                with agent_interface.db() as conn:
+                    conn.execute("update calls set diagnostic=? where id=?", (malformed, bad))
+                entries = ([entry["row"] for entry in agent_interface.logs_changed(0, 20)["rows"]]
+                           if changed_only else agent_interface.logs())
+                by_id = {entry["id"]: entry for entry in entries}
+                self.assertEqual(by_id[good]["status"], "completed")
+                self.assertIn("history_read_error", by_id[bad])
+                self.assertEqual(self.row(bad)["diagnostic"], malformed)
+                self.assertEqual(self.row(bad)["error_code"], "interrupted")
+
+    def test_authorized_legacy_replacement_preserves_publication_and_resource_fences(self):
+        epoch = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+        identity = json.dumps({"version": 1, "pid": 4242, "start": "42", "epoch": epoch})
+        call = self.call(started_ago=60, identity=identity)
+        prior = agent_interface.diagnostic_envelope(operation="provider.review", phase="submitting", outcome="unknown")
+        with agent_interface.db() as conn:
+            conn.execute("update calls set artifact=?,action_plan=?,receipts=?,diagnostic=? where id=?",
+                         ('{"phase":"submitting_review"}', 'original publication plan', '[{"review_id":91}]', json.dumps(prior), call))
+        with patch.object(agent_interface.process_identity, "epoch", return_value={**epoch, "init_start": "20", "namespace_ino": 3}), \
+                patch.object(agent_interface.process_identity, "_start") as start, \
+                patch.object(agent_interface, "init_started_at", return_value=self.now - 3600):
+            self.assertEqual(agent_interface.reap_interrupted(), 1)
+            start.assert_not_called()
+        with agent_interface.db() as conn:
+            row = conn.execute("select * from calls where id=?", (call,)).fetchone()
+        self.assertEqual(row["error_code"], "interrupted")
+        self.assertEqual((row["artifact"], row["action_plan"], row["receipts"]),
+                         ('{"phase":"submitting_review"}', 'original publication plan', '[{"review_id":91}]'))
+        self.assertEqual((row["action"], row["outcome"], row["resources_settled_at"]), (None, None, None))
+        diagnostic = json.loads(row["diagnostic"])
+        self.assertEqual(diagnostic.pop("reaper")["message"], "workspace_replaced; observer=workspace; identity=unobservable")
+        self.assertEqual(diagnostic, prior)
 
     def test_a_call_being_stopped_reads_as_stopped(self):
         id_ = self.call(started_ago=2 * 3600, error_code="stopping")

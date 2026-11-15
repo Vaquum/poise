@@ -127,14 +127,14 @@ def _changes(archive: Path, checkout: Path, base: str) -> list[dict]:
     return sorted(changes, key=lambda change: change["path"])
 
 
-def capture(database: Path, archive: Path, spec: Path, candidate: str, run: str, exit_code: int) -> dict:
-    """Only the first completed failed validation is retained; later edits cannot replace it."""
+def capture(database: Path, archive: Path, spec: Path, candidate: str, run: str, exit_code: int | None) -> dict:
+    """Retain the first capture. A missing suite exit marks the private manifest as interrupted."""
     call_id = os.environ.get("AGENT_INTERFACE_FAILED_SOURCE_CALL", "")
     row = _call(database, call_id)
     artifact = json.loads(row["artifact"] or "{}")
     if row["status"] != "running" or not _unpublished(row, artifact) \
             or not re.fullmatch(r"[0-9a-f]{64}", candidate) or not re.fullmatch(r"[0-9a-f]{32}", run) \
-            or not 1 <= exit_code <= 255:
+            or (exit_code is not None and not 1 <= exit_code <= 255):
         raise ValueError("failed validation lacks its original unpublished Call")
     if "failed_source" in artifact:
         return artifact["failed_source"]
@@ -165,8 +165,11 @@ def capture(database: Path, archive: Path, spec: Path, candidate: str, run: str,
                     digest.update(chunk)
         if digest.hexdigest() != candidate:
             raise ValueError("candidate capture mismatch")
-        payload = json.dumps({"call": call_id, "candidate": candidate, "run": run, "base": base,
-                              "changes": _changes(archive, checkout, base)}, separators=(",", ":")).encode()
+        evidence = {"call": call_id, "candidate": candidate, "run": run, "base": base,
+                    "changes": _changes(archive, checkout, base)}
+        if exit_code is None:
+            evidence["validation"] = "interrupted"
+        payload = json.dumps(evidence, separators=(",", ":")).encode()
         if len(payload) > MAX_BYTES:
             raise ValueError("source evidence exceeds its byte limit")
         fd = _directory()

@@ -399,10 +399,16 @@ def _time_limit_message(provider: str, phase: str) -> str:
 def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
                  timeout_s: int, deadline: float, repository, behavior: str, verify_fixes: bool = False,
                  groups_remaining: int | None = None, initializing: bool = False,
-                 total_groups: int = 1, expected_group_seconds: float | None = None) -> tuple[str, dict, float]:
+                 total_groups: int = 1, expected_group_seconds: float | None = None,
+                 checkpoint=None) -> tuple[str, dict, float]:
     schema = verdict_schema(behavior, inspection=repository is not None, verify_fixes=verify_fixes)
+    if checkpoint is not None:
+        schema["required"].append("evidence")
+        schema["properties"]["evidence"] = {"type": "array", "items": {"type": "string"}, "maxItems": 4096}
+    # Codex, Antigravity and Muse read this file as their output schema; it
+    # must require the same evidence the continuation validates below.
     (root / "verdict.schema.json").write_text(json.dumps(schema))
-    context = ""
+    context = checkpoint.context() if checkpoint is not None else ""
     round_number = 0
     correction_attempted = False
     group_deadline = None
@@ -439,12 +445,14 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                                              "review_inspection_timeout" if phase == "inspection" else "review_budget_exhausted",
                                              diagnostic)
 
-    def wait_allowance(cap=None):
+    def wait_allowance(cap=None, *, include_checkpoint=True):
         try:
             overall = review_budget.timeout(timeout_s, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
         except review_budget.ReviewLimitError as error:
             raise timed_out("overall", 0) from error
         limits = [(overall, "overall")]
+        if include_checkpoint and checkpoint is not None:
+            limits.append((checkpoint.remaining(), "cumulative"))
         if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS or correction_attempted:
             # The shared analysis deadline only hands off when the provider
             # ceiling binds; a shorter grant is an overall timeout.
@@ -460,8 +468,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
         return timeout, phase
 
     while round_number <= MAX_INSPECTION_ROUNDS:
-        timeout, phase = wait_allowance()
         if groups_remaining is not None and repository is not None and not initializing and group_deadline is None:
+            # Divide the current Call window. The saved review's remaining
+            # balance caps the resulting grant without shortening it twice.
+            timeout, _ = wait_allowance(include_checkpoint=False)
             share = timeout / groups_remaining
             # Cap each later group's estimated reserve at half the equal share,
             # leaving borrowing room even after an expensive early prefix.
@@ -470,7 +480,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                 allowance = max(share, timeout - min(expected_group_seconds, share / 2) * (groups_remaining - 1))
             group_deadline = monotonic() + allowance
             inspection_cutoff = monotonic() + share / 2
-            timeout, phase = wait_allowance()
+        timeout, phase = wait_allowance()
         if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
             # Loop-driven growth, not #186's initial-packet overflow: keep
             # it out of the packet block so the head is not pinned.
@@ -489,6 +499,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                         "If further inspection is required for a complete assessment, request it; "
                         "never return a verdict on incomplete analysis." if finish_soon else "")
                      if repository is not None else "")
+        if checkpoint is not None:
+            remaining += ("\nRequired evidence IDs for a terminal verdict: " + json.dumps(checkpoint.evidence())
+                          + "\nRequired unfinished inspection requests: " + json.dumps(checkpoint.session.state["pending"])
+                          + "\nReturn evidence=[] on an inspection step. Account for every listed evidence ID at termination.")
         try:
             raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
         except subprocess.TimeoutExpired as error:
@@ -501,6 +515,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             if repository is None:
                 return raw, validate_verdict(raw, behavior), monotonic() - group_started
             step = _loads_no_duplicates(raw)
+            evidence = step.pop("evidence", None) if checkpoint is not None and isinstance(step, dict) else None
             if not isinstance(step, dict) or set(step) != {"action", "comments", "assessment", "requests"}:
                 raise InvalidVerdict("review step must contain action, comments, assessment and requests")
             requests = step["requests"]
@@ -509,7 +524,15 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             if step["action"] != "inspect":
                 if requests:
                     raise InvalidVerdict("terminal verdict must not request repository inspection")
-                return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments", "assessment")}), behavior), monotonic() - group_started
+                verdict = validate_verdict(json.dumps({key: step[key] for key in ("action", "comments", "assessment")}), behavior)
+                if checkpoint is not None:
+                    try:
+                        verdict = checkpoint.terminal(verdict, evidence)
+                    except ValueError as error:
+                        raise InvalidVerdict(str(error)) from error
+                return raw, verdict, monotonic() - group_started
+            if checkpoint is not None and evidence != []:
+                raise InvalidVerdict("inspection steps must leave terminal evidence empty")
             if round_number == MAX_INSPECTION_ROUNDS:
                 raise review_budget.ReviewLimitError(
                     "Repository inspection limit reached; incomplete analysis; needs attention",
@@ -555,6 +578,8 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             raise failure from error
         except subprocess.TimeoutExpired as error:
             raise timed_out(phase, inspection_timeout) from error
+        if checkpoint is not None:
+            checkpoint.inspected(step, result)
         context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
         round_number += 1
     raise AssertionError("review rounds did not return a verdict")
@@ -577,8 +602,9 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     if ask is None:
         raise AgentPreflightError(f"{model.provider} cannot return a structured review verdict")
     capped_note = ""
+    from . import review_continuation
     try:
-        total = review_stages.stage_count(packet) if packet else 1
+        total = review_stages.stage_count(packet) if packet and not review_continuation.enabled() else 1
         staged = total > 1
         candidates = set(json.loads(packet).get("verification_candidates", [])) if packet and not capped else set()
         verified: set[int] = set()
@@ -589,7 +615,11 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             prior: list[dict] = []
             assessment: dict | None = None
             expected_group_seconds = None
-            for index, stage_text in enumerate(_stage_texts(text, packet)):
+            if review_continuation.enabled():
+                verdict, packet = review_continuation.analyze(pwd, system, text, model, behavior, pr, actor_name,
+                    head, timeout_s, repository, packet, root, watch, ask)
+                staged = False
+            for index, stage_text in enumerate(() if review_continuation.enabled() else _stage_texts(text, packet)):
                 _admit(stage_text)
                 if staged:
                     progress.stage("reviewing", f"Reviewing file group {index + 1} of {total}")

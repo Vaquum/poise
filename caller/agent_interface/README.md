@@ -42,10 +42,14 @@ continues to use the original response bytes before the CLI's trailing newline.
 # Inspecting failed unpublished source
 
 For a managed `implement_issue`, the test-offload runner hands Caller the original
-archive and command specification after a completed nonzero suite exit, before
-deleting that archive. Caller verifies their combined candidate digest and
-checkout binding, then retains only changes against the prepared base: tracked
-files (including deletions) and new source files present in that archive. Ignored
+archive and command specification after a completed nonzero suite exit or an
+interrupted validation that reported a Vitest assertion. For interrupted
+validation it keeps the producing run's ID across relay recovery and gives
+Caller up to 15 seconds before deleting the archive. The private manifest
+marks that capture with `"validation": "interrupted"`, and the command still
+returns its no-result disposition. Caller verifies the combined candidate
+digest and checkout binding, then retains only changes against the prepared
+base: tracked files (including deletions) and new source files in that archive. Ignored
 dependencies, Git metadata and other untracked files are excluded. Symlinks retain
 their target text without following it. Unsupported or mismatched captures are
 unavailable; no cleanup-time diff substitutes for them.
@@ -92,12 +96,23 @@ used. Externally managed Chat turns retain Poise's existing Stop route.
 Interruption reconciliation checks the original supervisor's process identity.
 Only a reader that can observe the current workspace supervisor can reconcile
 a previous workspace epoch. A reader in a private PID namespace cannot do so.
+Identified legacy Calls remain running while their supervisor is alive or its
+epoch is unobservable to that reader. Same-epoch supervisor loss retains the
+six-hour orphan grace because providers can outlive it. An authorized workspace
+observer can recognize a replacement from a prior boot or an older PID
+namespace init on the same boot. Missing or unverified identities retain the
+historical init/age/command rule only for an authorized workspace observer.
+Reaper decisions retain a bounded reason, observer scope and identity result
+in `diagnostic` (under `reaper` when an earlier diagnostic is present), without
+raw process or environment data.
 Existing resource and publication receipts still govern recovery.
 
 New native registrations use process identity version 2. An older Caller
 still running through a workspace update cannot reap these registrations.
 The current Caller continues to read version 1 identities and settle their
-original Calls.
+original Calls. Legacy protection covers updated observers reading those older
+registrations; rollout must exclude unpatched legacy reapers. A prior executable
+that ignores legacy identity can still interrupt them.
 
 Native per-Call resource receipts live in `resource_ownership`, outside the
 replaceable publication artifact. Directory registration precedes allocation;
@@ -222,6 +237,15 @@ and publication fields, and a valid resource-release timestamp. Caller tests
 feed real `--logs --select` bytes into Poise's decoder and journal runtime for
 all five behaviors; malformed variants remain quarantined. These contract
 checks create no GitHub artifacts and are not workflow acceptance runs.
+
+`--retire-closed-implementation CALL_ID` handles a running first implementation
+after Poise verifies seed closure. It pins the original supervisor and records
+closure under the same database write lock as publication planning, then sends
+cooperative SIGTERM. A stored plan or publication receipt prevents retirement.
+Validation of a first implementation can also report a confirmed closed seed
+before planning. The original Call retains the typed `superseded` /
+`not_started` / `target_closed` receipt and its own resource ownership. Poise
+settles the invocation only after the original cleanup proves release.
 
 # Recording a Chat turn
 
@@ -666,6 +690,64 @@ from the current diff.
 Every run reports its budget usage
 (`used_seconds` of `total_seconds`) in its terminal progress snapshot and in
 the completion result, so a near-miss is visible before it fails.
+
+### Explicit review continuation
+
+Managed structured PR reviews and uncapped approvals accept `--review-slot SLOT`
+to opt into durable analysis. Resume with the same review arguments, a new
+`--correlation-id`, and
+`--resume-review ROOT_CALL_ID:GENERATION` from the returned `continuation` object.
+Automatic behavior admission does not select this protocol. Ordinary one-pass
+reviews retain their existing path; Claude and capped rounds do not use it.
+
+Caller binds progress to the repository, PR, exact head, base and merge base,
+complete material packet (including thread/repair-answer revisions and linked
+issues), supplied policy/note/scope, actor, behavior, slot and model. A changed
+basis refuses reuse. Verifications retain the original answered-thread revision.
+Starting again without the saved root cannot reset the same basis's allowance.
+An immediate SQLite transaction claims the generation before work. A previous
+claimant must have settled its native resources; stale generations cannot spend,
+checkpoint, finalize or publish.
+
+`github-interface --pr-review PR --manifest-only` returns bounded context and the
+required file inventory, separately from declared exclusions, with incomplete
+coverage and a deferred diff. `--checkout-review ... --diff-files-json JSON`
+precomputes that diff at the pinned revisions. Caller reads it through bounded
+`--review-context` requests with `operation="diff"`, `path="."`, `query=""` and
+`start_line`; each response remains at most 64 KiB. Continuation units preserve
+every required region, subdividing large source hunks with original coordinates
+at the existing 200,000-byte target. The manifest admits at most 256 source units.
+
+The original Call's `artifact.review_progress` retains the generation, current
+unit, claimant, cumulative spend and bounded evidence references in the existing
+response store. Validated inspection pages, unfinished cursors, provisional
+findings and verified repair revisions survive interruption before a group
+verdict. Providers must account for the supplied evidence IDs; missing evidence,
+unfinished required pages and incomplete source inventories grant no review
+authority. A required final integration unit receives every unit's assessment,
+findings and boundary evidence, and can inspect cross-file contracts before
+returning the single verdict.
+
+Each Call retains its existing 1,413-second ceiling and its prompt and
+inspection-round bounds. A review obligation has a separate cumulative ceiling
+of 2,826 seconds across Calls, including the two 60-second finalization reserves.
+Each resume draws on the same saved balance. Execution allowance is charged
+before launch; an interrupted execution keeps its reserved charge. The protocol
+admits at most 6,682 executions and 32,000,000 cumulative retained bytes, charged
+before allocation. Two attempts
+at the same immutable unit without new validated evidence reach a target hold;
+heartbeats, provider prose and identical inspection results do not reset it.
+`review_continuation_required` returns an actionable `continuation_required`
+result; `review_continuation_held` returns `held` with the precise limiting reason.
+Both are incomplete, with no review action. Genuine provider failures retain
+their existing error types.
+
+Only the claimant that finishes every source and integration unit can reserve
+finalization. The existing head-pinned submission also reserves the shared
+progress receipt atomically. A lost publication acknowledgement keeps that first
+publisher's Call ID and fence for reconciliation; another Call cannot publish.
+Large evidence stays behind digest/length-checked artifact references rather
+than enlarging Call responses.
 
 # Issue review
 
