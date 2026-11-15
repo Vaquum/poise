@@ -1462,7 +1462,7 @@ describe('turn stall detection and waking', () => {
       expect(scan.causes).toHaveLength(20)
       expect(scan.causes.map(gap => gap.path)).toEqual(scan.unreadable)
       for (const gap of scan.causes) {
-        expect(gap.cause).toBe('lstat_git:EACCES')
+        expect(gap.cause).toBe('readdir:EACCES')
         expect(Buffer.byteLength(gap.path)).toBeLessThanOrEqual(200)
       }
       store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
