@@ -3,7 +3,10 @@ import { placeHref, type Section } from '../src/ui/address'
 import { accountLogins } from './accounts/logins'
 import { HANDLING_RETENTION_MS, listHandling } from './alerts/handling'
 import { noticesState } from './alerts/notices'
+import { fetchAgentLogSnapshot, fetchRunningAgentLogSnapshot } from './agent'
+import { readAnalyticsHistory } from './analytics'
 import { readAnalyticsHealth } from './analytics-health'
+import { ESTIMATE_MIN_SAMPLES, ESTIMATE_WINDOW_MS, readBehaviorEstimates } from './behavior-estimates'
 import { BEHAVIOR_KEYS, getBehaviorChainRuntimeHealth, getBehaviorsRuntimeHealth, getEnabledMap, getIssueAuthors,
   getIssueRepositories, getPausedBy, getPausedUntil, getRepositorySkips, getSettingMap, isSkippableBehavior } from './behaviors'
 import { readWake } from './chat/manager-settings'
@@ -36,6 +39,8 @@ const sources = {
   storage: ['Workspace storage measurement', 'Latest cached measurement and maintenance run', settingsLink('general')],
   'github-quota': ['GitHub quota observations', 'Most recent successful observation per configured account', settingsLink('accounts')],
   'analytics-health': ['Behavior chain analytics', 'Observed 24-hour work cohort and retained coverage', overview],
+  'analytics-history': ['GitHub mirror and completed Behavior actions', 'Seven most recent complete UTC days', overview],
+  'behavior-estimates': ['Caller running and completed Behavior Calls', 'Matching model and behavior over the last thirty days', observeLink('behaviors')],
   notices: ['Open workspace notifications', 'Current unresolved notices', overview],
   handling: ['Workspace handling log', '30 days after handling', overview],
   extensions: ['Saved Poise extension registrations', 'Current registrations and latest status', settingsLink('extensions')],
@@ -150,10 +155,29 @@ async function view(id: McpWorkspaceView, chatInstance?: string): Promise<Snapsh
         lastError: report.lastError, coverage: bounded(report.coverage) },
         coverage: report.limits.length || report.rate.items.length > 5 || report.blocked.items.length > 5 ? 'partial' : undefined }
     }
+    case 'analytics-history': {
+      const day = 86_400_000
+      const end = Math.floor(Date.now() / day) * day
+      const bounds = Array.from({ length: 8 }, (_, index) => new Date(end - (7 - index) * day).toISOString())
+      const report = await readAnalyticsHistory(bounds)
+      return { value: { basis: 'The app’s GitHub issue and PR cohorts and recorded Behavior actions, by UTC day',
+        periods: report.periods, unavailableOrganizations: report.errors.map(({ org }) => org) },
+        coverage: report.errors.length ? 'partial' : undefined }
+    }
+    case 'behavior-estimates': {
+      const [running, history] = await Promise.all([fetchRunningAgentLogSnapshot(), fetchAgentLogSnapshot()])
+      const now = Date.now()
+      const estimates = bounded(readBehaviorEstimates(history.entries, running.entries, now))
+      const incomplete = running.quarantined.length + history.quarantined.length
+      return { value: { ...estimates, cohort: { basis: 'Completed Caller runs of the same behavior and model',
+        from: new Date(now - ESTIMATE_WINDOW_MS).toISOString(), minimumSamples: ESTIMATE_MIN_SAMPLES,
+        counts: 'Elapsed time from Call start to completion', quarantined: incomplete } },
+        coverage: incomplete || estimates.more ? 'partial' : undefined }
+    }
     case 'notices': {
       const { enabled, notices } = noticesState()
-      const current = bounded(notices.map(({ id, kind, title, body, since, due }) =>
-        ({ id, kind, title: safeTitle(title), body: body.slice(0, 600), since, due })))
+      const current = bounded(notices.map(({ id, kind, title, body, since, due, target }) =>
+        ({ id, kind, title: safeTitle(title), body: body.slice(0, 600), since, due, target })))
       return { value: { enabled, ...current }, coverage: current.more ? 'partial' : undefined }
     }
     case 'handling': {

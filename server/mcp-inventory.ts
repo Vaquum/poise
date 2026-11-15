@@ -68,11 +68,11 @@ const settings = {
 
 const capabilities = {
   'held-reasons': { ...work, reason: 'Recorded issue-chain blocker' },
-  'review-requests': browser('review-request', 'Owner review requests', 'Current pending requests', 'Review request reads are pending'),
+  'review-requests': { ...workspace('notices'), reason: 'Current review_requested notices include the exact pull request' },
   'approve-merge': browser('approval', 'GitHub approval and merge controls', 'Current head and recorded receipts', 'Interactive approval control'),
   'behavior-pause': browser('behavior-control', 'Behavior runtime policy', 'Current applied pause', 'Interactive behavior policy control'),
   'organization-unfollow': browser('organization', 'Followed GitHub accounts', 'Current configured accounts', 'Interactive account control'),
-  'behavior-estimates': browser('estimate', 'Caller evidence and behavior timing', 'Retained timing history', 'Estimate reads are pending'),
+  'behavior-estimates': workspace('behavior-estimates'),
   'chat-requests': { ...chat, kind: 'chat-request', source: 'Chat owner requests', retention: 'Current pending requests',
     reason: 'Exact Chat includes its pending owner requests' },
   'handled-log': workspace('handling'),

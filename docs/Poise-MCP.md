@@ -129,7 +129,12 @@ and recorded sign-in, behavior policy and capacity, release and dependency
 health, storage and GitHub quota, the analytics health cohort, notices and
 handling history, Current cards, repositories visible to the configured
 account, Switchboard check state and Manager Rhythm, and extension, memory
-and snippet metadata.
+and snippet metadata. `analytics-history` reports seven complete UTC days
+from the app’s issue, pull request and Behavior activity cohorts. Missing
+organization reads mark the window partial. `behavior-estimates` uses
+completed Calls with the same behavior and model, and returns the original
+running Call ID and estimate basis. Review-request notices carry their
+recorded pull request target.
 
 The same consent allows `poise_list` with `kind: "call"` to page the retained
 Caller archive newest first, or `poise_get` with the full Call ID. Use

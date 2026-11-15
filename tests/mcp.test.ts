@@ -26,6 +26,8 @@ import type { ChainObservation } from '../server/behavior-chain-decision'
 import { db, setMeta } from '../server/db'
 import * as ledger from '../server/behavior-ledger'
 import * as agent from '../server/agent'
+import * as analytics from '../server/analytics'
+import { raiseAlert, resolveAlert } from '../server/alerts/store'
 import * as processes from '../server/process'
 import type { readMcpWork } from '../server/mcp-work'
 import { PARTS, PLACES, SECTIONS } from '../src/ui/address'
@@ -615,6 +617,46 @@ it('keeps workspace settings consent separate and projects extension and memory 
     removeCard(card.id)
     db.prepare('DELETE FROM meta WHERE key = ?').run('chat_memories')
     await Promise.all([scope.client.close(), chat.client.close(), repository.client.close()])
+  }
+})
+
+it('reports the source cohort and partial daily Analytics and Behavior estimates through the running inventory', async () => {
+  const scope = await connect('Alice', endpoint, { workspaceData: true })
+  const runningCall = { id: 'f'.repeat(32), behavior: 'implement_issue', model: 'fixture', status: 'running',
+    started_at: new Date(Date.now() - 2000).toISOString() } as agent.LogEntry
+  const samples = Array.from({ length: 5 }, (_, index) => ({ ...runningCall, id: (index + 1).toString(16).repeat(32), status: 'completed',
+    started_at: new Date(Date.now() - 60_000).toISOString(), completed_at: new Date(Date.now() - 25_000).toISOString() }))
+  const running = vi.spyOn(agent, 'fetchRunningAgentLogSnapshot').mockResolvedValue({ entries: [runningCall], quarantined: [] })
+  const history = vi.spyOn(agent, 'fetchAgentLogSnapshot').mockResolvedValue({ entries: samples, quarantined: [] })
+  const daily = vi.spyOn(analytics, 'readAnalyticsHistory').mockResolvedValue({ periods: [], errors: [{ org: 'Fixture', error: 'private source error' }] })
+  const key = 'mcp-staged-review'
+  const target = { pullRequest: 'https://github.com/Acme/Repo/pull/14' }
+  raiseAlert({ kind: 'review_requested', dedupeKey: key, title: 'Review requested', body: 'Fixture request', path: '/?view=overview', target })
+  async function read(id: string) {
+    const response = await scope.client.callTool({ name: 'poise_get', arguments: { kind: 'workspace', id } })
+    expect(response.isError).not.toBe(true)
+    return JSON.parse((response.content as { text: string }[])[0].text).lookup
+  }
+  try {
+    const analyticsHistory = await read('analytics-history')
+    expect(analyticsHistory).toMatchObject({ coverage: 'partial', record: { value: { unavailableOrganizations: ['Fixture'] } } })
+    expect(JSON.stringify(analyticsHistory)).not.toContain('private source error')
+    const [bounds] = daily.mock.calls[0]
+    expect(bounds).toHaveLength(8)
+    expect(Date.parse(bounds[7]) - Date.parse(bounds[0])).toBe(7 * 86_400_000)
+    expect(bounds.every(bound => bound.endsWith('T00:00:00.000Z'))).toBe(true)
+    expect(await read('behavior-estimates')).toMatchObject({ coverage: 'complete', record: { value: {
+      items: [{ id: runningCall.id, estimate: { samples: 5, remainingMs: expect.any(Number) } }], cohort: { minimumSamples: 5 },
+    } } })
+    expect(await read('notices')).toMatchObject({ record: { value: {
+      items: expect.arrayContaining([expect.objectContaining({ kind: 'review_requested', target })]),
+    } } })
+  } finally {
+    running.mockRestore()
+    history.mockRestore()
+    daily.mockRestore()
+    resolveAlert(key)
+    await scope.client.close()
   }
 })
 
