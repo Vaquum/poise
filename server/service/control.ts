@@ -571,6 +571,13 @@ export class ServiceControl {
   }
 
   resume(keepReplacement = false): ServiceHealth {
+    this.releaseAdmission(keepReplacement)
+    return this.health()
+  }
+
+  /** Teardown half of resume(): releases replacement and drain admission
+   *  without the health read, for stops after stores have closed. */
+  private releaseAdmission(keepReplacement: boolean): void {
     const releaseWait = !keepReplacement && this.replacement !== null && this.switchTo === null
     if (!keepReplacement) {
       this.replacement = null
@@ -582,7 +589,6 @@ export class ServiceControl {
     }
     this.lift()
     if (releaseWait) void this.runtime.releaseSwitchWait()
-    return this.health()
   }
 
   private replacementRecoveryWait(): string | null {
@@ -612,7 +618,7 @@ export class ServiceControl {
     this.endHold()
     if (this.switchPoll !== null) this.timer.clearTimeout(this.switchPoll)
     this.switchPoll = null
-    if (this.drainOn || this.switchTo !== null || this.replacement !== null) this.resume()
+    if (this.drainOn || this.switchTo !== null || this.replacement !== null) this.releaseAdmission(false)
     if (this.switchTo !== null) markReleaseSwitch(false)
     this.switchTo = null
     this.switchPendingSince = null

@@ -11,7 +11,7 @@ import type { SessionRecord } from '../server/chat/protocol'
 import type { RequestAuthority } from '../server/http'
 import { createCpuCapture } from '../server/production-cpu-profile'
 import Database from 'better-sqlite3'
-import { CURRENT_IMAGE_ID, OLD_IMAGE_ID, startHarness } from '../gateway/tests/harness'
+import { CURRENT_IMAGE_ID, OLD_IMAGE_ID, startHarness, workspaceHost } from '../gateway/tests/harness'
 import { REPLACEMENT_DRAIN_MS } from '../gateway/src/orchestrator'
 
 let root = ''
@@ -125,7 +125,11 @@ describe('service health', () => {
       release: { name: 'old-release', base: 'old-base' },
     })
     try {
-      await h.openWorkspace('Alice')
+      h.workspace.reachable = false
+      h.docker.onStart = () => { h.workspace.reachable = true }
+      const { workspaceCookie } = await h.openWorkspace('Alice')
+      await h.request({ host: workspaceHost('alice'), path: '/', headers: { cookie: workspaceCookie } })
+      await h.orchestrator.startInProgress('alice')
       const original = h.docker.containers.get('poise-ws-alice')!
       original.imageId = OLD_IMAGE_ID
       h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'pending-release', 'poise.base': 'new-base' })
