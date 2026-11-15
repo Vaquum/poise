@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { McpGrants } from '../src/mcp-grants.js'
 import { MCP_TOOLS } from '../src/mcp-contract.js'
+import { workspaceInventory } from '../src/mcp-inventory.js'
 import { loadConfig } from '../src/config.js'
 import { APEX, startHarness, type Harness } from './harness.js'
 
@@ -55,6 +56,20 @@ function rpc(access: string, method = 'tools/list', params?: unknown) {
   return h.request({ host: APEX, path: '/mcp', method: 'POST', headers: { authorization: `Bearer ${access}`, 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
 }
+
+it('projects inventory fields and verifies links on the workspace origin', () => {
+  const origin = 'https://alice.poise.test'
+  const surface = { id: 'board', kind: 'issue-work', href: '/?view=board', source: 'GitHub mirror', retention: 'Current rows',
+    permission: 'Read grant', tool: 'poise_work', reason: 'Bounded issue reads', rawPath: '/private/workspace' }
+  const inventory = { observedAt: new Date().toISOString(), release: { repo: 'autonomio/poise', commit: null, since: null }, surfaces: [surface] }
+  const scoped = workspaceInventory(inventory, origin, ['poise_describe'])
+  expect(scoped).toMatchObject({ surfaces: [{ id: 'board', href: `${origin}/?view=board`, status: 'unavailable', tool: null }] })
+  expect(JSON.stringify(scoped)).not.toContain('/private/workspace')
+  expect(() => workspaceInventory({ ...inventory, surfaces: [{ ...surface, href: '//bob.poise.test/' }] }, origin, ['poise_work']))
+    .toThrow('invalid_workspace_inventory_surface')
+  expect(() => workspaceInventory({ ...inventory, surfaces: [surface, surface] }, origin, ['poise_work']))
+    .toThrow('duplicate_workspace_inventory_surface')
+})
 
 it('is absent by default and validates enablement explicitly', async () => {
   expect(() => loadConfig({ POISE_MCP_ENABLED: 'yes' })).toThrow('POISE_MCP_ENABLED')

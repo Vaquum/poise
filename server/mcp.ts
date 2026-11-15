@@ -3,6 +3,7 @@ import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_TOOLS, MCP_WORK_TOOL_NAMES, pars
 import { getSession, sessionInstance } from './chat/storage'
 import { timerById, timerSummaries } from './chat/control-store'
 import { HttpError, readJson, type RequestAuthority } from './http'
+import { mcpInventory } from './mcp-inventory'
 import { readMcpWork } from './mcp-work'
 import type { ServiceConfig } from './service/config'
 
@@ -37,6 +38,7 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
   }
   const tools = authority.mcp.chatMetadata && chatInstance ? MCP_TOOLS.map(tool => tool.name) : MCP_WORK_TOOL_NAMES
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },
+    ...(read.name === 'poise_describe' ? { inventory: mcpInventory() } : {}),
     ...(work ? { work } : {}), ...(lookup ? { lookup } : {}) })
   if (Buffer.byteLength(text) > MCP_RESPONSE_BYTES) throw new HttpError(503, 'work response exceeds its bound; request a smaller page')
   res.statusCode = 200

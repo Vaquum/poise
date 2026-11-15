@@ -288,6 +288,10 @@ client sent.
     projections and retained ledger pages. Continuations bind the owner grant,
     resource, repository, label and limit. The gateway rechecks result scope;
     source freshness and missing receipts remain independent evidence.
+    The description and `poise://workspace/inventory` resource share a signed
+    workspace read for the running release and canonical navigation and capability
+    inventory. The gateway projects the fields, intersects tools with the live
+    grant and generates links within the authorized workspace.
     The owner can opt in to Chat metadata during consent. The gateway signs
     `chatMetadata: true` only for that grant. The workspace requires it for
     `poise_get` and reads an exact Chat or live timer in its own Chat instance.

@@ -6,6 +6,7 @@ import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
 import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES, isMcpRecordId, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
+import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
 import { html, page } from './pages.js'
 import { hashSecret, newSecret, type User } from './store.js'
 
@@ -179,15 +180,22 @@ export class McpGateway {
     }
     const result = (body: unknown) => sendJson(res, 200, { jsonrpc: '2.0', id, result: body })
     if (rpc.method === 'initialize') return result({ protocolVersion: VERSIONS.includes(String((rpc.params as { protocolVersion?: unknown } | undefined)?.protocolVersion))
-      ? (rpc.params as { protocolVersion: string }).protocolVersion : VERSIONS[0], capabilities: { tools: {} },
+      ? (rpc.params as { protocolVersion: string }).protocolVersion : VERSIONS[0], capabilities: { tools: {}, resources: {} },
       serverInfo: { name: 'poise', version: '1.0.0' }, instructions: INSTRUCTIONS })
     if (rpc.method === 'ping') return result({})
     if (rpc.method === 'tools/list') return result({ tools: MCP_TOOLS.filter(tool => grant.tools.includes(tool.name)) })
-    if (rpc.method !== 'tools/call') return sendJson(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: 'unsupported method' } })
+    if (rpc.method === 'resources/list') return result({ resources: grant.tools.includes('poise_describe')
+      ? [{ uri: WORKSPACE_RESOURCE, name: 'Poise workspace inventory', mimeType: 'application/json' }] : [] })
+    if (rpc.method === 'resources/templates/list') return result({ resourceTemplates: [] })
+    const resource = rpc.method === 'resources/read'
+    if (resource && ((rpc.params as { uri?: unknown } | undefined)?.uri !== WORKSPACE_RESOURCE || !grant.tools.includes('poise_describe'))) {
+      return sendJson(res, 200, { jsonrpc: '2.0', id, error: { code: -32002, message: 'resource not found' } })
+    }
+    if (!resource && rpc.method !== 'tools/call') return sendJson(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: 'unsupported method' } })
     let read: McpRead
     try {
       const params = rpc.params as Record<string, unknown> | undefined
-      read = parseMcpRead(params && { name: params.name, arguments: params.arguments })
+      read = resource ? { name: 'poise_describe', arguments: {} } : parseMcpRead(params && { name: params.name, arguments: params.arguments })
     } catch (error) { return result({ isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : 'invalid tool request' }] }) }
     if (!grant.tools.includes(read.name)) {
       return result({ isError: true, content: [{ type: 'text', text: 'tool not authorized by this grant; reconnect to grant consent' }] })
@@ -203,6 +211,7 @@ export class McpGateway {
       // Revocation/access changes during an upstream read must also withhold its result.
       if (!this.grants.find(token!, 'access')) throw new HttpError(401, 'invalid_token')
       this.owner(grant)
+      if (resource) return result({ contents: [{ uri: WORKSPACE_RESOURCE, mimeType: 'application/json', text: JSON.stringify(body) }] })
       return result({ content: [{ type: 'text', text: JSON.stringify(body) }] })
     } finally { rate.active-- }
   }
@@ -245,7 +254,10 @@ export class McpGateway {
       throw new HttpError(502, 'invalid_workspace_capabilities')
     }
     const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: grant.tools.filter(tool => tools.includes(tool)) } }
-    if (read.name === 'poise_describe') return described
+    if (read.name === 'poise_describe') return { ...described,
+      access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString() },
+      inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools),
+      runbooks: RUNBOOKS, instructions: INSTRUCTIONS }
     if (read.name === 'poise_get') {
       const lookup = body.lookup as { observedAt?: unknown; record?: Record<string, unknown> | null } | undefined
       const record = lookup?.record
