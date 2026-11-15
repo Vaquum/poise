@@ -399,6 +399,18 @@ def supervise(args: list[str], *, input: str, cwd: Path, timeout: float, env: di
                     signal.signal(signal.SIGTERM, previous)
 
 
+def _self_start_ticks() -> int:
+    """Our start time in clock ticks; 0 when /proc is unavailable."""
+    try:
+        fields = Path("/proc/self/stat").read_text().rpartition(") ")[2].split()
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+_SELF_START_TICKS = _self_start_ticks()
+
+
 def _cwd_pids(root: Path, *, require_complete: bool = False) -> list[int] | None:
     """Processes whose working directory is inside `root`, this one excepted."""
     prefix, found = str(root.resolve()), []
@@ -429,10 +441,22 @@ def _cwd_pids(root: Path, *, require_complete: bool = False) -> list[int] | None
                     # An existing unreadable process cannot prove the run idle.
                     if require_complete and entry.exists():
                         try:
-                            state = (entry / "stat").read_text().rpartition(") ")[2].split()[0]
+                            fields = (entry / "stat").read_text().rpartition(") ")[2].split()
+                            state = fields[0]
                         except (OSError, IndexError):
                             return None
-                        if state != "Z":
+                        if state == "Z":
+                            continue
+                        if len(fields) < 20:
+                            return None
+                        # A process that started before we did cannot be our
+                        # leftover: everything we spawn starts after us. Only
+                        # an unreadable process from our own lifetime blocks.
+                        try:
+                            started = int(fields[19])
+                        except ValueError:
+                            return None
+                        if started >= _SELF_START_TICKS:
                             return None
     else:
         try:
