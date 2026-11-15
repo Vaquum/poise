@@ -5,7 +5,7 @@ import { signAssertion } from './assertion.js'
 import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
 import { MCP_CONTROL_PATH, MCP_MANAGER_TOOLS, MCP_OWNER_PATH, MCP_OWNER_TOOLS, MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES,
-  isMcpManagerTool, isMcpOwnerTool, isMcpRecordId, isMcpRepository, mcpRepositoryAllowed, parseMcpManagerRequest, parseMcpOwnerRequest,
+  isMcpManagerTool, isMcpOwnerTool, isMcpRecordId, isMcpRepository, mcpRepositoryAllowed, mcpToolNames, parseMcpManagerRequest, parseMcpOwnerRequest,
   parseMcpRead, type McpGrantScope, type McpRequest } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
 import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
@@ -95,7 +95,8 @@ export class McpGateway {
         <p>Client ${authorization.client}. Return to ${authorization.redirect}. Allowed tools: poise_describe (workspace identity) and poise_work (issue work trail, recorded receipts and links).</p>
         <form method="post" action="/mcp/authorize"><input type="hidden" name="csrf" value="${principal.session.csrf}">
         <input type="hidden" name="request" value="${url.searchParams.toString()}">
-        <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata</label>
+        <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata, including listings</label>
+        <label><input type="checkbox" name="chatTranscript" value="1"> Allow Chat transcript and retained turn events</label>
         <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
         <label><input type="checkbox" name="managerControls" value="1"> Delegate Manager send, steer, stop and workspace-wide supervision</label>
         <label><input type="checkbox" name="ownerControls" value="1"> Delegate Behavior chain hold and resume</label>
@@ -117,7 +118,8 @@ export class McpGateway {
         const code = newSecret()
         this.codes.set(hashSecret(code), { ...auth, expires: ctx.deps.now() + 60_000, redirects: this.grants.redirects(auth.client),
           scope: { resource: this.resource, handle: principal.user.handle, ownerId: principal.user.githubId,
-            ...(form.get('chatMetadata') === '1' ? { chatMetadata: true } : {}),
+            ...(form.get('chatMetadata') === '1' ? { chatMetadata: true, chatList: true } : {}),
+            ...(form.get('chatTranscript') === '1' ? { chatTranscript: true } : {}),
             ...(form.get('managerControls') === '1' ? { managerClientId: auth.client } : {}),
             ...(form.get('ownerControls') === '1' ? { ownerClientId: auth.client } : {}),
             ...(repository ? { repository } : {}) } })
@@ -217,6 +219,13 @@ export class McpGateway {
     if ((read.name === 'poise_work' || read.name === 'poise_chain_preview') && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
       return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     }
+    if (read.name === 'poise_list') {
+      const repository = read.arguments.repository ?? grant.repository ?? null
+      if (!mcpRepositoryAllowed(grant, repository)) {
+        return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
+      }
+      read = { ...read, arguments: { ...read.arguments, repository } }
+    }
     const minute = Math.floor(ctx.deps.now() / 60_000)
     for (const [key, value] of this.reads) if (value.minute !== minute && !value.active) this.reads.delete(key)
     const rate = this.reads.get(grant.grantId) ?? { minute, count: 0, active: 0 }
@@ -247,6 +256,8 @@ export class McpGateway {
     const target = ctx.deps.upstream(owner.handle), payload = JSON.stringify(read)
     const scope: McpGrantScope = { resource: grant.resource, ownerId: grant.ownerId, handle: grant.handle, grantId: grant.grantId,
       ...(grant.chatMetadata && grant.tools.includes('poise_get') ? { chatMetadata: true } : {}),
+      ...(grant.chatMetadata && grant.chatList && grant.tools.includes('poise_list') ? { chatList: true } : {}),
+      ...(grant.chatTranscript && grant.tools.includes('poise_changes') ? { chatTranscript: true } : {}),
       ...(grant.managerClientId === grant.clientId && grant.tools.includes('poise_action_apply') ? { managerClientId: grant.clientId } : {}),
       ...(grant.ownerClientId === grant.clientId && grant.tools.includes('poise_chain_apply') ? { ownerClientId: grant.clientId } : {}),
       ...(grant.repository === undefined ? {} : { repository: grant.repository }) }
@@ -323,17 +334,17 @@ export class McpGateway {
     }
     // GitHub logins are case-preserved but case-insensitive; the container keeps the case from its creation.
     const tools = body.capabilities && typeof body.capabilities === 'object' && 'tools' in body.capabilities ? body.capabilities.tools : null
-    const permitted = [...MCP_WORK_TOOL_NAMES, ...(scope.chatMetadata ? ['poise_get'] : []),
-      ...(scope.managerClientId ? MCP_MANAGER_TOOLS.map(tool => tool.name) : []),
-      ...(scope.ownerClientId ? MCP_OWNER_TOOLS.map(tool => tool.name) : [])]
+    const allowedTools = mcpToolNames(scope)
     if (typeof body.owner !== 'string' || body.owner.toLowerCase() !== owner.login.toLowerCase() || !Array.isArray(tools)
-      || !MCP_WORK_TOOL_NAMES.every(tool => tools.includes(tool)) || tools.some(tool => !permitted.includes(tool))) {
+      || MCP_WORK_TOOL_NAMES.some(tool => !tools.includes(tool)) || new Set(tools).size !== tools.length
+      || tools.some(tool => typeof tool !== 'string' || !allowedTools.includes(tool))) {
       throw new HttpError(502, 'invalid_workspace_capabilities')
     }
     const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: grant.tools.filter(tool => tools.includes(tool)) } }
     if (read.name === 'poise_describe') return { ...described,
       access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString(),
-        repository: grant.repository ?? null },
+        repository: grant.repository ?? null, managerControls: scope.managerClientId !== undefined && tools.includes('poise_action_apply'),
+        ownerControls: scope.ownerClientId !== undefined && tools.includes('poise_chain_apply') },
       inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools),
       runbooks: RUNBOOKS, instructions: INSTRUCTIONS }
     if (read.name === 'poise_get') {
@@ -349,6 +360,35 @@ export class McpGateway {
       const chatId = record?.kind === 'timer' ? String(record.chatId) : read.arguments.id
       return { ...described, lookup: { source: 'chat', coverage: 'complete', observedAt: lookup.observedAt, record,
         link: record === null ? null : `${ctx.workspaceOrigin(owner.handle)}/?view=chat&chat=${chatId}` } }
+    }
+    if (read.name === 'poise_list' || read.name === 'poise_changes') {
+      const page = body.page as Record<string, unknown> | undefined
+      if (!page || typeof page.observedAt !== 'string' || !Number.isFinite(Date.parse(page.observedAt))
+        || !Array.isArray(page.items) || page.items.length > read.arguments.limit
+        || (page.nextCursor !== null && (typeof page.nextCursor !== 'string' || page.nextCursor.length > 2048))) {
+        throw new HttpError(502, 'invalid_workspace_chat_page')
+      }
+      const chatLink = (id: string) => `${ctx.workspaceOrigin(owner.handle)}/?view=chat&chat=${id}`
+      if (read.name === 'poise_list') {
+        const { repository, since, until } = read.arguments
+        if (page.repository !== repository || page.since !== since || page.until !== until || page.items.some(item =>
+          !item || typeof item !== 'object' || !isMcpRecordId(item.id)
+          || typeof item.updatedAt !== 'string' || !Number.isFinite(Date.parse(item.updatedAt))
+          || since !== null && Date.parse(item.updatedAt) < Date.parse(since)
+          || until !== null && Date.parse(item.updatedAt) >= Date.parse(until)
+          || (repository !== null && (typeof item.repository !== 'string' || item.repository.toLowerCase() !== repository.toLowerCase())))) {
+          throw new HttpError(502, 'invalid_workspace_chat_list_scope')
+        }
+        return { ...described, page: { ...page, source: 'chat', coverage: 'complete',
+          items: page.items.map(item => ({ ...item, link: chatLink(item.id) })) } }
+      }
+      if (page.chatId !== read.arguments.id || typeof page.found !== 'boolean'
+        || (!page.found && page.items.length !== 0)
+        || (page.found && !mcpRepositoryAllowed(grant, typeof page.repository === 'string' ? page.repository : null))
+        || page.items.some(item => !item || typeof item !== 'object' || !Number.isSafeInteger(item.sequence) || item.sequence <= 0)) {
+        throw new HttpError(502, 'invalid_workspace_chat_change_scope')
+      }
+      return { ...described, page: { ...page, source: 'chat', link: page.found ? chatLink(read.arguments.id) : null } }
     }
     const work = body.work as Record<string, unknown> | undefined
     if (!work || work.repository !== read.arguments.repository || !Array.isArray(work.items) || work.items.length > (read.arguments.issue ? 1 : read.arguments.limit!)

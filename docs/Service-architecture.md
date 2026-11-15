@@ -267,7 +267,7 @@ client sent.
   | `jti` | random, unique per assertion |
   | `sid` | browser only: opaque hash reference to the authenticated workspace session |
   | `gport` | browser only: gateway listening port for private Google delegation |
-  | `mcp` | MCP only: `{ resource, ownerId, handle, grantId, chatMetadata?, repository? }`, bound to the exact apex `/mcp` resource and immutable workspace owner ID |
+  | `mcp` | MCP only: `{ resource, ownerId, handle, grantId, chatMetadata?, chatList?, chatTranscript?, repository? }`, bound to the exact apex `/mcp` resource and immutable workspace owner ID |
 
 - The gateway generates its key pair on first start and keeps it in its data
   volume. Workspaces receive the public key as `POISE_GATEWAY_PUBLIC_KEY`, the
@@ -296,8 +296,12 @@ client sent.
     `chatMetadata: true` only for that grant. The workspace requires it for
     `poise_get` and reads an exact Chat or live timer in its own Chat instance.
     The gateway checks the returned kind and ID and builds its own workspace link.
-    An optional repository restriction comes from the owner's consent. It
+    An optional repository restriction comes from the owner’s consent. It
     persists across refresh and is checked before reading workspace data.
+    Chat listings and transcript changes use separate signed permissions and
+    bounded indexed reads. Cursors bind the grant and selector. Transcript
+    projection follows the stored context reset boundary and reports when a
+    previous checkpoint has expired.
     An independent Manager consent adds the client identity to the signed
     claim. Its typed actions use `POST /api/mcp/manager`, the native Manager
     authorization and budget, and the existing durable command receipts with

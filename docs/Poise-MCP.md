@@ -70,8 +70,8 @@ records grant no execution or publication authority.
 
 ## Read Chat metadata
 
-On the Poise consent page, select **Allow Chat session and live timer metadata**
-to enable `poise_get`. The grant page shows the allowed tools. `poise_describe`
+On the Poise consent page, allow Chat metadata to enable `poise_get` and
+`poise_list`. The grant page shows the allowed tools. `poise_describe`
 reports the tools available with that grant.
 
 Call `poise_get` with `kind: "chat"` and a Chat record ID from its Poise link.
@@ -84,6 +84,19 @@ The exact lookup covers the connected workspace's stored Chats and active,
 held or tripped timers. An empty record means there is no matching record in
 that scope. This grant covers metadata. Transcript, attachment and timer
 message content and Manager actions require separate capabilities.
+
+`poise_list` accepts `kind: "chat"`, optional repository, UTC `since`
+(inclusive) and `until` (exclusive) update times, and a limit from one to ten.
+The page includes current and archived Chats. Pass `nextCursor` back with the
+same selector and grant. The keyset orders by update time and ID. Updates can
+move records between pages.
+
+With the separate transcript grant, `poise_changes` accepts `kind: "chat"`,
+a Chat ID, and `afterSequence` or a continuation cursor. It returns retained
+prompts, assistant text and turn metadata. Oversize text and events with only
+metadata report partial coverage. A reset reports expired coverage for an
+older checkpoint and returns the retained boundary. `watermark` is the last
+sequence consumed. Pass `nextCursor` to continue or check for new events.
 
 ## Delegate Manager controls
 
@@ -180,6 +193,11 @@ endpoint, and an MCP assertion cannot call their APIs, static pages or sockets.
 New workspace containers receive `POISE_WORKSPACE_OWNER_ID` from the gateway.
 Older containers without it retain normal behavior but refuse MCP assertions;
 they need a normal container replacement before connecting.
+
+The Deployment CI journey opens the installed gateway's MCP endpoint with a
+real SDK client and follows records across two isolated workspaces. The
+deployment uses fixture GitHub identities, a generated plugin package and
+native datastore and journal records.
 
 `tests/mcp.test.ts` exercises a real SDK client through disposable gateway and
 workspace HTTP fixtures with the production assertion guard and read handler.

@@ -4,6 +4,7 @@ export const MCP_OWNER_PATH = '/api/mcp/owner'
 export const MCP_SCOPE = 'poise:read'
 export const MCP_RESPONSE_BYTES = 128 * 1024
 const MCP_RECORD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
+const pageProperties = { limit: { type: 'integer', minimum: 1, maximum: 10 }, cursor: { type: 'string', maxLength: 2048 } } as const
 export const MCP_TOOLS = [
   { name: 'poise_describe', description: 'Describe the authorized Poise workspace identity and available tools.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -18,6 +19,18 @@ export const MCP_TOOLS = [
   { name: 'poise_get', description: 'Read a Chat session or a live Chat timer by its Poise record ID. Requires the owner’s Chat metadata grant.',
     inputSchema: { type: 'object', required: ['kind', 'id'], properties: {
       kind: { enum: ['chat', 'timer'] }, id: { type: 'string', pattern: MCP_RECORD_ID.source },
+    }, additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: false } },
+  { name: 'poise_list', description: 'List a bounded page of current or archived Chat session records by repository and UTC update window.',
+    inputSchema: { type: 'object', required: ['kind'], properties: {
+      kind: { const: 'chat' }, repository: { type: 'string', maxLength: 140 },
+      since: { type: 'string', format: 'date-time' }, until: { type: 'string', format: 'date-time' }, ...pageProperties,
+    }, additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: false } },
+  { name: 'poise_changes', description: 'Read a bounded page of retained Chat transcript events by sequence. Use the continuation to resume.',
+    inputSchema: { type: 'object', required: ['kind', 'id'], properties: {
+      kind: { const: 'chat' }, id: { type: 'string', pattern: MCP_RECORD_ID.source },
+      afterSequence: { type: 'integer', minimum: 0 }, ...pageProperties,
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
 ] as const
@@ -46,14 +59,26 @@ export const MCP_OWNER_TOOLS = [
       additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } },
 ] as const
 export interface McpGrantScope {
-  resource: string; ownerId: number; handle: string; grantId: string; chatMetadata?: true; repository?: string
-  managerClientId?: string; ownerClientId?: string
+  resource: string
+  ownerId: number
+  handle: string
+  grantId: string
+  chatMetadata?: true
+  chatList?: true
+  chatTranscript?: true
+  managerClientId?: string
+  ownerClientId?: string
+  repository?: string
 }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
 export interface McpGetArguments { kind: 'chat' | 'timer'; id: string }
+export interface McpChatListArguments { kind: 'chat'; repository: string | null; since: string | null; until: string | null; limit: number; cursor?: string }
+export interface McpChatChangesArguments { kind: 'chat'; id: string; limit: number; afterSequence?: number; cursor?: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
   | { name: 'poise_work'; arguments: McpWorkArguments }
   | { name: 'poise_get'; arguments: McpGetArguments }
+  | { name: 'poise_list'; arguments: McpChatListArguments }
+  | { name: 'poise_changes'; arguments: McpChatChangesArguments }
 export type McpManagerAction = { operation: 'send' | 'steer'; sessionId: string; text: string }
   | { operation: 'stop'; sessionId: string }
   | { operation: 'supervise'; sessionId: string; text: string; intervalMinutes: number }
@@ -120,6 +145,26 @@ export const isMcpRepository = (value: unknown): value is string => typeof value
 export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
   scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
+export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'managerClientId' | 'ownerClientId'>): string[] {
+  const tools: string[] = [...MCP_WORK_TOOL_NAMES]
+  if (scope.chatMetadata === true) tools.push('poise_get')
+  if (scope.chatMetadata === true && scope.chatList === true) tools.push('poise_list')
+  if (scope.chatTranscript === true) tools.push('poise_changes')
+  if (scope.managerClientId) tools.push(...MCP_MANAGER_TOOLS.map(tool => tool.name))
+  if (scope.ownerClientId) tools.push(...MCP_OWNER_TOOLS.map(tool => tool.name))
+  return tools
+}
+
+function pageTime(value: unknown): string | null {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value) || !Number.isFinite(Date.parse(value))) {
+    throw new Error('use UTC date-time bounds')
+  }
+  const normalized = new Date(value).toISOString()
+  if (normalized.slice(0, 19) !== value.slice(0, 19)) throw new Error('use a valid UTC date-time')
+  return normalized
+}
+
 export function parseMcpRead(value: unknown): McpRead {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid tool request')
   const row = value as Record<string, unknown>
@@ -131,6 +176,30 @@ export function parseMcpRead(value: unknown): McpRead {
     const { kind, id } = args as Record<string, unknown>
     if (Object.keys(args).length !== 2 || (kind !== 'chat' && kind !== 'timer') || !isMcpRecordId(id)) throw new Error('provide a Chat or timer record ID')
     return { name: row.name, arguments: { kind, id } }
+  }
+  if (row.name === 'poise_list' || row.name === 'poise_changes') {
+    const page = args as Record<string, unknown>
+    const limit = page.limit ?? 5
+    const cursor = page.cursor
+    if (page.kind !== 'chat' || !Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 10
+      || (cursor !== undefined && (typeof cursor !== 'string' || !cursor || cursor.length > 2048))) throw new Error('invalid Chat page selector')
+    const bounds = { kind: 'chat' as const, limit: Number(limit), ...(typeof cursor === 'string' ? { cursor } : {}) }
+    if (row.name === 'poise_list') {
+      const repository = page.repository ?? null
+      if (Object.keys(page).some(key => !['kind', 'repository', 'since', 'until', 'limit', 'cursor'].includes(key))
+        || (repository !== null && !isMcpRepository(repository))) throw new Error('invalid Chat list selector')
+      const since = pageTime(page.since), until = pageTime(page.until)
+      if (since && until && since >= until) throw new Error('Chat list requires since before until')
+      return { name: row.name, arguments: { ...bounds, repository, since, until } }
+    }
+    const afterSequence = page.afterSequence
+    if (Object.keys(page).some(key => !['kind', 'id', 'afterSequence', 'limit', 'cursor'].includes(key))
+      || !isMcpRecordId(page.id)
+      || (afterSequence !== undefined && (!Number.isSafeInteger(afterSequence) || Number(afterSequence) < 0 || cursor !== undefined))) {
+      throw new Error('invalid Chat change selector')
+    }
+    return { name: row.name, arguments: { ...bounds, id: page.id,
+      ...(afterSequence === undefined ? {} : { afterSequence: Number(afterSequence) }) } }
   }
   if (row.name !== 'poise_work') throw new Error('unsupported tool or arguments')
   const work = args as Record<string, unknown>

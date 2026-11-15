@@ -1,10 +1,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { MCP_MANAGER_TOOLS, MCP_OWNER_TOOLS, MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_TOOLS, MCP_WORK_TOOL_NAMES, mcpRepositoryAllowed, parseMcpRead, type McpGetArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
+import { MCP_READ_PATH, MCP_RESPONSE_BYTES, mcpRepositoryAllowed, mcpToolNames, parseMcpRead, type McpGetArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
 import { getSession, sessionInstance } from './chat/storage'
 import { timerById, timerSummaries } from './chat/control-store'
 import { HttpError, readJson, type RequestAuthority } from './http'
 import { mcpInventory } from './mcp-inventory'
 import { readMcpWork } from './mcp-work'
+import { readMcpChatChanges, readMcpChatList } from './mcp-chat-pages'
 import type { ServiceConfig } from './service/config'
 
 function readChatRecord(instance: string, grant: McpGrantScope, { kind, id }: McpGetArguments) {
@@ -34,17 +35,24 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
   const read = parseMcpRead(await readJson<unknown>(req, 16 * 1024))
   const work = read.name === 'poise_work' ? await readMcpWork(read.arguments, service, authority.mcp) : undefined
   let lookup
+  let page
   if (read.name === 'poise_get') {
     if (!authority.mcp.chatMetadata) throw new HttpError(403, 'Chat metadata consent is required')
     if (!chatInstance) throw new HttpError(503, 'Chat metadata is unavailable until the workspace starts')
     lookup = { observedAt: new Date().toISOString(), record: readChatRecord(chatInstance, authority.mcp, read.arguments) }
   }
-  const tools = [...(authority.mcp.chatMetadata && chatInstance ? MCP_TOOLS.map(tool => tool.name) : MCP_WORK_TOOL_NAMES),
-    ...(authority.mcp.managerClientId && managerRunning ? MCP_MANAGER_TOOLS.map(tool => tool.name) : []),
-    ...(authority.mcp.ownerClientId ? MCP_OWNER_TOOLS.map(tool => tool.name) : [])]
+  if (read.name === 'poise_list' || read.name === 'poise_changes') {
+    if (read.name === 'poise_list' ? !authority.mcp.chatList || !authority.mcp.chatMetadata : !authority.mcp.chatTranscript) {
+      throw new HttpError(403, 'the selected Chat data consent is required')
+    }
+    if (!chatInstance) throw new HttpError(503, 'Chat data is unavailable until the workspace starts')
+    page = read.name === 'poise_list' ? readMcpChatList(chatInstance, authority.mcp, read.arguments)
+      : readMcpChatChanges(chatInstance, authority.mcp, read.arguments)
+  }
+  const tools = mcpToolNames({ ...(chatInstance ? authority.mcp : {}), managerClientId: managerRunning ? authority.mcp.managerClientId : undefined, ownerClientId: authority.mcp.ownerClientId })
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },
     ...(read.name === 'poise_describe' ? { inventory: mcpInventory() } : {}),
-    ...(work ? { work } : {}), ...(lookup ? { lookup } : {}) })
+    ...(work ? { work } : {}), ...(lookup ? { lookup } : {}), ...(page ? { page } : {}) })
   if (Buffer.byteLength(text) > MCP_RESPONSE_BYTES) throw new HttpError(503, 'work response exceeds its bound; request a smaller page')
   res.statusCode = 200
   res.setHeader('Content-Type', 'application/json')

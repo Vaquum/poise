@@ -13,6 +13,10 @@ When `poise_describe` lists `poise_get`, read a known Chat ID with `kind: "chat"
 and follow its live timer IDs with `kind: "timer"`. Report pending delivery and
 recorded execution failures separately.
 
+Use `poise_list` to discover current and archived Chat IDs and `poise_changes`
+to follow granted transcript events by sequence. Continue with the returned
+cursor and report expired or partial coverage.
+
 Report each source's coverage before interpreting missing work. A fresh empty
 label page establishes absence only within that selector; stale, partial or
 unavailable coverage cannot. Receipt absence and mirror staleness are separate
