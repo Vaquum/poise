@@ -224,6 +224,61 @@ class MergedRepair(IsolatedAsyncioTestCase):
             self.assertNotIn(secret, str(caught.exception))
             self.assertNotIn(secret, json.dumps(diagnostic))
 
+    async def test_closed_seed_at_validation_returns_typed_no_write_for_first_implementation_only(self):
+        client = AsyncMock(token="private-token")
+        client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"},
+                                  {"state": "closed"}]
+        client.paginate.side_effect = [[], []]
+        client.graphql.return_value = {"repository": {
+            "ref": None, "defaultBranchRef": {"target": {"oid": "d" * 40}},
+            "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+        with patch('github_interface.behaviors.issue_work._run') as git, \
+                patch('github_interface.behaviors.issue_work.checkout_repo') as checkout, \
+                patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
+            result = await run(client, {"repository": "example/repo", "token_user": "author",
+                                        "issue": 7, "branch": "poise/issue-7", "mode": "validate"})
+        self.assertEqual(result["outcome"], "target_closed")
+        self.assertIsNone(result["pull_number"])
+        git.assert_not_called()
+        checkout.assert_not_called()
+        checkpoint.assert_not_called()
+        client.post.assert_not_awaited()
+        client.patch.assert_not_awaited()
+        pull = {"number": 3, "state": "open", "merged": False, "merged_at": None,
+                "user": {"login": "author"}, "body": "<!-- poise-chain example/repo#7 -->",
+                "head": {"ref": "poise/issue-7", "sha": "b" * 40, "repo": {"full_name": "example/repo"}},
+                "base": {"ref": "main", "repo": {"full_name": "example/repo"}}}
+        for mode, number, issue in (
+            ("publish", None, {"state": "closed"}),
+            ("validate", 3, {"state": "closed"}),
+            ("validate", None, {}),
+            ("validate", None, {"state": "closed", "pull_request": {}}),
+        ):
+            with self.subTest(mode=mode, number=number, issue=issue):
+                client = AsyncMock(token="private-token")
+                if number is None:
+                    client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"},
+                                              issue]
+                else:
+                    client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"},
+                                              pull, issue]
+                client.paginate.side_effect = [[pull] if number is None and mode == "publish" else [], []]
+                client.graphql.return_value = {"repository": {
+                    "ref": None, "defaultBranchRef": {"target": {"oid": "d" * 40}},
+                    "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+                payload = {"repository": "example/repo", "token_user": "author", "issue": 7,
+                           "branch": "poise/issue-7", "mode": mode}
+                if number is not None:
+                    payload["pull_number"] = number
+                with patch('github_interface.behaviors.issue_work._run') as git, \
+                        patch('github_interface.behaviors.issue_work.work_publication') as checkpoint, \
+                        self.assertRaisesRegex(ValueError, "no longer an open issue"):
+                    await run(client, payload)
+                git.assert_not_called()
+                checkpoint.assert_not_called()
+                client.post.assert_not_awaited()
+                client.patch.assert_not_awaited()
+
 
 class ReviewReplyReceipts(IsolatedAsyncioTestCase):
     async def test_successive_repairs_reuse_prior_receipts_and_inspect_the_full_plan_after_a_lost_response(self):
