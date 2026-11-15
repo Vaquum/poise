@@ -12,6 +12,8 @@ interface Surface {
   tool?: 'poise_work' | 'poise_get' | 'poise_list' | 'poise_changes'
   requiresWorkspace?: true
   requiresChat?: true
+  requiresChatTranscript?: true
+  requiresChatArtifacts?: true
   requiresOperator?: true
   requiresContent?: true
   reason: string
@@ -103,7 +105,10 @@ export function mcpInventory() {
       entry('chat/sessions', placeHref('chat'), { ...chat, retention: 'Current and archived sessions',
         tool: 'poise_list', reason: 'Indexed pages by repository and update time' }),
       entry('chat/transcript', placeHref('chat'), { kind: 'chat-event', source: 'Retained Chat journal', retention: 'Events since the last context reset',
-        permission: 'Chat transcript consent', tool: 'poise_changes', reason: 'Resumable transcript pages by stored sequence' }),
+        permission: 'Chat transcript consent', tool: 'poise_changes', requiresChatTranscript: true, reason: 'Resumable transcript pages by stored sequence' }),
+      entry('chat/artifacts', placeHref('chat'), { kind: 'chat-artifact', source: 'Recorded Chat attachments and diffs',
+        retention: 'Retained upload records and journal events', permission: 'Separate Chat artifact consent',
+        tool: 'poise_get', requiresChatArtifacts: true, reason: 'Exact artifact ID under the owning Chat' }),
       ...MCP_WORKSPACE_VIEWS.map(id => ({ id: 'workspace/' + id, ...workspaceViewSurface(id) })),
       entry('workspace/caller', placeHref('observe', { part: 'tasks' }), { ...workspace('behaviors'), kind: 'call',
         source: 'Caller retained Call log and Behavior chain journal', retention: 'Retained Call and invocation records',

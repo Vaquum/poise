@@ -24,10 +24,11 @@ export const MCP_TOOLS = [
       cursor: { type: 'string', maxLength: 2048 },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
-  { name: 'poise_get', description: 'Read an exact Chat or timer record, or a named workspace snapshot. Requires consent for the selected data.',
+  { name: 'poise_get', description: 'Read an exact retained record or named workspace snapshot. Requires consent for the selected data.',
     inputSchema: { type: 'object', required: ['kind', 'id'], properties: {
-      kind: { enum: ['chat', 'timer', 'workspace', 'call', 'invocation', 'document', 'snippet', 'memory', 'gateway', ...LOG_KINDS] },
+      kind: { enum: ['chat', 'timer', 'chat-attachment', 'chat-diff', 'workspace', 'call', 'invocation', 'document', 'snippet', 'memory', 'gateway', ...LOG_KINDS] },
       id: { type: 'string', maxLength: 120 },
+      chatId: { type: 'string', pattern: MCP_RECORD_ID.source, description: 'Required for a Chat attachment or diff' },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_list', description: 'List a bounded page of current or archived Chat session records by repository and UTC update window.',
@@ -55,14 +56,16 @@ export interface McpGrantScope {
   chatMetadata?: true
   chatList?: true
   chatTranscript?: true
+  chatArtifacts?: true
   workspaceData?: true
   operatorLogs?: true
   contentData?: true
   repository?: string
 }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
-export interface McpChatGetArguments { kind: 'chat' | 'timer'; id: string }
-export type McpGetArguments = McpChatGetArguments | { kind: 'workspace'; id: McpWorkspaceView }
+export interface McpChatMetadataArguments { kind: 'chat' | 'timer'; id: string }
+export interface McpChatArtifactArguments { kind: 'chat-attachment' | 'chat-diff'; id: string; chatId: string }
+export type McpGetArguments = McpChatMetadataArguments | McpChatArtifactArguments | { kind: 'workspace'; id: McpWorkspaceView }
   | { kind: 'call'; id: string } | { kind: 'invocation'; id: string }
   | { kind: 'gateway'; id: McpGatewayView } | { kind: McpLoggingKind; id: string }
   | { kind: 'document'; id: string } | { kind: 'snippet'; id: string } | { kind: 'memory'; id: 'current' }
@@ -85,10 +88,10 @@ export const isMcpRepository = (value: unknown): value is string => typeof value
 export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
   scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
-export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'workspaceData' | 'operatorLogs' | 'contentData' | 'repository'>): string[] {
+export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'chatArtifacts' | 'workspaceData' | 'operatorLogs' | 'contentData' | 'repository'>): string[] {
   const tools: string[] = [...MCP_WORK_TOOL_NAMES]
   const gatewayRead = mcpWorkspaceAllowed(scope) || (scope.operatorLogs === true && scope.repository === undefined)
-  if (scope.chatMetadata === true || gatewayRead || mcpContentAllowed(scope)) tools.push('poise_get')
+  if (scope.chatMetadata === true || scope.chatArtifacts === true || gatewayRead || mcpContentAllowed(scope)) tools.push('poise_get')
   if (scope.chatMetadata === true && scope.chatList === true || gatewayRead || mcpContentAllowed(scope)) tools.push('poise_list')
   if (scope.chatTranscript === true || gatewayRead) tools.push('poise_changes')
   return tools
@@ -123,7 +126,10 @@ export function parseMcpRead(value: unknown): McpRead {
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('invalid tool arguments')
   if (row.name === 'poise_describe' && !Object.keys(args).length) return { name: row.name, arguments: {} }
   if (row.name === 'poise_get') {
-    const { kind, id } = args as Record<string, unknown>
+    const { kind, id, chatId } = args as Record<string, unknown>
+    if ((kind === 'chat-attachment' || kind === 'chat-diff') && Object.keys(args).length === 3 && isMcpRecordId(id) && isMcpRecordId(chatId)) {
+      return { name: row.name, arguments: { kind, id, chatId } }
+    }
     if (Object.keys(args).length === 2) {
       if ((kind === 'chat' || kind === 'timer') && isMcpRecordId(id)) return { name: row.name, arguments: { kind, id } }
       if (kind === 'workspace' && (MCP_WORKSPACE_VIEWS as readonly unknown[]).includes(id)) {
@@ -142,7 +148,7 @@ export function parseMcpRead(value: unknown): McpRead {
       }
       if (kind === 'memory' && id === 'current') return { name: row.name, arguments: { kind, id } }
     }
-    throw new Error('provide a supported workspace snapshot name or exact Chat or timer ID')
+    throw new Error('provide a supported snapshot name or exact record ID, plus the owning Chat ID for an artifact')
   }
   if (row.name === 'poise_list' || row.name === 'poise_changes') {
     const page = args as Record<string, unknown>

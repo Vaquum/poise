@@ -32,9 +32,10 @@ import { listCapabilities } from '../server/capabilities'
 import { MCP_WORKSPACE_VIEWS } from '../gateway/src/mcp-contract'
 import { createServer as createExtension, deleteServer as deleteExtension } from '../server/extensions/store'
 import { deleteDoc, writeDoc } from '../server/editor'
-import { createTimer } from '../server/chat/control-store'
+import { addChild, createTimer } from '../server/chat/control-store'
+import { attachmentPath, sha256Of } from '../server/chat/attachments'
 import { emptyCapabilities } from '../server/chat/runtime'
-import { appendEvent, deleteSession, getSession, insertSession, resetConversation } from '../server/chat/storage'
+import { appendEvent, deleteSession, getSession, insertAttachment, insertSession, resetConversation } from '../server/chat/storage'
 
 const endpoint = 'https://poise.test/mcp'
 let h: Harness
@@ -111,7 +112,7 @@ const fetcher: typeof fetch = async (input, init) => {
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
 async function connect(login: string, serverEndpoint = endpoint,
-  options: { chatMetadata?: boolean; chatTranscript?: boolean; workspaceData?: boolean; contentData?: boolean; repository?: string } = {}) {
+  options: { chatMetadata?: boolean; chatTranscript?: boolean; chatArtifacts?: boolean; workspaceData?: boolean; contentData?: boolean; repository?: string } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -145,6 +146,7 @@ async function connect(login: string, serverEndpoint = endpoint,
     ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.chatTranscript ? { chatTranscript: '1' } : {}),
     ...(options.workspaceData ? { workspaceData: '1' } : {}),
     ...(options.contentData ? { contentData: '1' } : {}),
+    ...(options.chatArtifacts ? { chatArtifacts: '1' } : {}),
     ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
@@ -225,6 +227,12 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
   insertSession({ id, title: 'Fixture Chat', agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
     repo: 'Acme/Repo', checkout: '/private/checkout', branch: { name: 'main', origin: 'existing', provisional: false },
     createdAt: now, updatedAt: now, status: 'idle', capabilities: emptyCapabilities(), lastSeq: 0, pendingRequests: [], instance: 'alice-chat' })
+  const child = randomUUID(), foreignRepository = randomUUID()
+  for (const worker of [child, foreignRepository]) {
+    insertSession({ ...getSession(id)!, id: worker, title: 'Worker', role: 'worker',
+      repo: worker === child ? 'Acme/Repo' : 'Acme/Other' })
+    addChild('alice-chat', id, worker)
+  }
   const timer = createTimer('alice-chat', { sessionId: id, label: 'Fixture timer', message: 'Private timer instruction', delayMinutes: 5 },
     { kind: 'person' }, Date.now())
   const workGrant = await connect('Alice')
@@ -262,7 +270,7 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     expect(JSON.stringify(timerLookup)).not.toContain('Private timer instruction')
     expect(await lookup(bob.client, 'chat', id)).toMatchObject({ record: null, link: null })
     expect(await lookup(bob.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
-    expect(await lookup(matching.client, 'chat', id)).toMatchObject({ record: { id } })
+    expect(await lookup(matching.client, 'chat', id)).toMatchObject({ record: { id, workerIds: [child] } })
     expect(await lookup(matching.client, 'timer', timer.id)).toMatchObject({ record: { repository: 'Acme/Repo' } })
     expect(await lookup(outside.client, 'chat', id)).toMatchObject({ record: null, link: null })
     expect(await lookup(outside.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
@@ -273,6 +281,8 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     await matching.client.close()
     await outside.client.close()
     db.prepare('DELETE FROM chat_control_timers WHERE id = ?').run(timer.id)
+    db.prepare('DELETE FROM chat_control_children WHERE manager = ?').run(id)
+    for (const worker of [child, foreignRepository]) deleteSession(worker)
     deleteSession(id)
   }
 })
@@ -329,6 +339,47 @@ it('pages Chat records and retained transcript events with independent consent a
   }
 })
 
+it('reads only recorded artifacts with separate content permission, checkout containment and the original attachment hash', async () => {
+  const checkout = await mkdtemp(join(await realpath(tmpdir()), 'poise-mcp-artifact-'))
+  const id = randomUUID(), attachment = randomUUID(), diff = randomUUID(), privateDiff = randomUUID()
+  const now = new Date().toISOString(), body = Buffer.from('fixture uploaded text')
+  const path = attachmentPath(id, attachment, 'source.txt')
+  await mkdir(join(checkout, '.poise-chat', 'attachments', id), { recursive: true })
+  await writeFile(join(checkout, path), body)
+  insertSession({ id, title: 'Artifacts', agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
+    repo: 'Acme/Repo', checkout, branch: { name: 'main', origin: 'existing', provisional: false },
+    createdAt: now, updatedAt: now, status: 'idle', capabilities: emptyCapabilities(), lastSeq: 0, pendingRequests: [], instance: 'alice-chat' })
+  insertAttachment({ id: attachment, sessionId: id, name: 'source.txt', path, size: body.length, sha256: sha256Of(body), createdAt: now })
+  const change = { type: 'diff' as const, turnId: randomUUID(), toolId: 'fixture', oldText: 'before', newText: 'after',
+    oldExists: true, newExists: true }
+  appendEvent(id, { ...change, diffId: diff, path: join(checkout, 'source.txt') })
+  appendEvent(id, { ...change, diffId: privateDiff, path: '/outside/source.txt' })
+  const metadata = await connect('Alice', endpoint, { chatMetadata: true, chatTranscript: true })
+  const transcript = await connect('Alice', endpoint, { chatArtifacts: true, repository: 'acme/repo' })
+  const foreign = await connect('bob', endpoint, { chatArtifacts: true })
+  const request = (kind: string, artifactId: string) => ({ name: 'poise_get', arguments: { kind, id: artifactId, chatId: id } })
+  async function lookup(client: Client, kind: string, artifactId: string) {
+    const result = await client.callTool(request(kind, artifactId))
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).lookup as unknown
+  }
+  try {
+    expect((await metadata.client.callTool(request('chat-attachment', attachment))).isError).toBe(true)
+    expect(await lookup(foreign.client, 'chat-diff', diff)).toMatchObject({ record: null, link: null })
+    const found = await lookup(transcript.client, 'chat-attachment', attachment)
+    expect(found).toMatchObject({ coverage: 'complete', record: { text: body.toString(), name: 'source.txt' } })
+    expect(JSON.stringify(found)).not.toContain('.poise-chat')
+    expect(await lookup(transcript.client, 'chat-diff', diff)).toMatchObject({ coverage: 'complete', record: { path: 'source.txt', oldText: 'before', newText: 'after' } })
+    expect(await lookup(transcript.client, 'chat-diff', privateDiff)).toMatchObject({ coverage: 'partial', record: null })
+    await writeFile(join(checkout, path), Buffer.alloc(body.length, 65))
+    expect(await lookup(transcript.client, 'chat-attachment', attachment)).toMatchObject({ coverage: 'partial', record: { text: null } })
+  } finally {
+    await Promise.all([metadata.client.close(), transcript.client.close(), foreign.client.close()])
+    deleteSession(id)
+    await rm(checkout, { recursive: true, force: true })
+  }
+})
+
 it('withholds an in-flight workspace response when its owner revokes the grant', async () => {
   const connection = await connect('Alice')
   try {
@@ -382,7 +433,7 @@ it('reports the running workspace inventory through describe and the matching MC
   try {
     const result = await describe(client) as { inventory: { surfaces: Array<{ id: string; href: string }> } }
     const expected = [...PLACES, ...PARTS.map(id => `observe/${id}`), ...SECTIONS.map(id => `settings/${id}`),
-      ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript',
+      ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript', 'chat/artifacts',
       ...MCP_WORKSPACE_VIEWS.map(id => 'workspace/' + id), 'workspace/caller', 'settings/link-devices']
     expect(result.inventory.surfaces.map(surface => surface.id)).toEqual(expected)
     expect(result.inventory.surfaces.every(surface => new URL(surface.href).origin === 'https://alice.poise.test')).toBe(true)

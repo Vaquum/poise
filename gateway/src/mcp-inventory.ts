@@ -15,7 +15,7 @@ const timestamp = (value: unknown): value is string => typeof value === 'string'
 /** The workspace owns the inventory. Publish only metadata and links back to
  *  the authorized workspace, after intersecting its tools with the owner grant. */
 export function workspaceInventory(value: unknown, origin: string, tools: readonly string[],
-  scope: Pick<McpGrantScope, 'chatMetadata' | 'workspaceData' | 'operatorLogs' | 'contentData' | 'repository'> = {}) {
+  scope: Pick<McpGrantScope, 'chatMetadata' | 'chatTranscript' | 'chatArtifacts' | 'workspaceData' | 'operatorLogs' | 'contentData' | 'repository'> = {}) {
   if (value === undefined) return { coverage: 'unavailable', reason: 'The running workspace has no inventory projection' }
   if (!object(value) || !timestamp(value.observedAt) || !Array.isArray(value.surfaces) || value.surfaces.length > 128
     || !object(value.release) || typeof value.release.repo !== 'string' || !repoName.test(value.release.repo)
@@ -30,6 +30,8 @@ export function workspaceInventory(value: unknown, origin: string, tools: readon
     const available = typeof entry.tool === 'string' && tools.includes(entry.tool)
       && (entry.requiresWorkspace !== true || mcpWorkspaceAllowed(scope))
       && (entry.requiresChat !== true || scope.chatMetadata === true)
+      && (entry.requiresChatTranscript !== true || scope.chatTranscript === true)
+      && (entry.requiresChatArtifacts !== true || scope.chatArtifacts === true)
       && (entry.requiresOperator !== true || scope.operatorLogs === true)
       && (entry.requiresContent !== true || mcpContentAllowed(scope))
     return { id: entry.id, kind: entry.kind, source: entry.source, permission: entry.permission, retention: entry.retention,
