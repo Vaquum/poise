@@ -933,14 +933,13 @@ export async function implementationReportAdmission(db: Database, journal: Behav
       // A stripped or mutated marker defeats exact reconciliation. If any
       // unconfirmed pre-PR intent could have filed this issue, bind the
       // earliest and require its disposition instead of ordinary intake.
-      // Generated reports carry their source, hold sequence and unguessable
-      // basis in the body and are authored by the orphan's own source owner
-      // at creation; the invocation and Call IDs are published and therefore
-      // quotable, so they cannot anchor the match. The source/hold anchor
-      // alone is both copyable and fragile, so binding requires the basis
-      // alongside tolerant source and hold signals. An ordinary post-hold
-      // issue lacks the basis and must not consume the intent. Unknown
-      // authorship fails closed. Never bind an orphan to its own source.
+      // Every body signal is quotable and removable singly: the published
+      // source/hold/basis line alone must not consume the intent, while a
+      // basis removal must still gate. Binding therefore requires the
+      // original failing file/test plus the basis or the original
+      // invocation/Call IDs, alongside tolerant source and hold signals and
+      // the orphan's own source-owner authorship. Unknown authorship fails
+      // closed. Never bind an orphan to its own source.
       const orphans = unconfirmedImplementationReports(db, chain.repository)
         .filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
         .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
@@ -957,10 +956,19 @@ export async function implementationReportAdmission(db: Database, journal: Behav
                 const owner = journal.read(candidate.source)?.author
                 if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
               }
-              if (!body.includes(candidate.source) || !body.includes(candidate.basis)) return false
+              if (!body.includes(candidate.source)) return false
               if (candidate.holdSequence !== null
                 && !new RegExp(`\\b${candidate.holdSequence}\\b`).test(body)) return false
-              return !predatesHold(probe.created_at, candidate.heldAt)
+              if (predatesHold(probe.created_at, candidate.heldAt)) return false
+              const reason = candidate.holdSequence === null ? null : (db.prepare(`SELECT json_extract(payload, '$.reason') AS reason
+                FROM behavior_chain_events WHERE chain_id = ? AND sequence = ? AND json_extract(payload, '$.type') = 'chain.held'`)
+                .get(candidate.source, candidate.holdSequence) as { reason: unknown } | undefined)?.reason ?? null
+              const failure = typeof reason === 'string' ? prePrFileAndTest(reason) : null
+              if (!failure) return body.includes(candidate.basis)
+              if (!body.includes(failure.file) || !body.includes(failure.test)) return false
+              return body.includes(candidate.basis)
+                || (candidate.attempts.length > 0 && candidate.attempts.every(attempt =>
+                  body.includes(attempt.invocation) && body.includes(attempt.call)))
             })
             if (match) {
               match.issueNumber = chain.issue
