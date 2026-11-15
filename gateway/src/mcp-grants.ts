@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync } from 'node:fs'
 import Database from 'better-sqlite3'
 import { hashSecret, newSecret } from './store.js'
-import { MCP_TOOLS, MCP_WORK_TOOL_NAMES } from './mcp-contract.js'
+import { mcpToolNames } from './mcp-contract.js'
 import type { McpGrantScope } from './mcp-contract.js'
 
 const ACCESS_MS = 10 * 60_000
@@ -11,9 +11,9 @@ export interface McpGrant extends McpGrantScope { clientId: string; createdAt: n
 interface StoredGrant extends McpGrant { accessHash: string; accessExpires: number; refreshHash: string }
 // Grants issued before poise_work existed carry no tools; they consented to workspace identity only.
 const LEGACY_TOOLS = ['poise_describe']
-function grantedTools(value: unknown, chatMetadata?: true): string[] {
+function grantedTools(value: unknown, scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript'>): string[] {
   return Array.isArray(value) && value.length > 0 && value.every(tool => typeof tool === 'string')
-    ? value.filter(tool => tool !== 'poise_get' || chatMetadata === true) : [...LEGACY_TOOLS]
+    ? mcpToolNames(scope).filter(tool => value.includes(tool)) : [...LEGACY_TOOLS]
 }
 
 /** Only token hashes persist. The separate store adds no authority to browser or Link sessions. */
@@ -49,15 +49,17 @@ export class McpGrants {
   }
   list(ownerId: number): McpGrant[] {
     return (this.db.prepare('SELECT state FROM mcp_grants WHERE owner = ? ORDER BY id LIMIT 100').all(ownerId) as { state: string }[])
-      .map(row => JSON.parse(row.state) as StoredGrant).map(({ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools, chatMetadata, repository }) =>
-        ({ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools: grantedTools(tools, chatMetadata),
-          ...(repository === undefined ? {} : { repository }) }))
+      .map(row => JSON.parse(row.state) as StoredGrant).map(grant => {
+        const { resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools, repository } = grant
+        return { resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools: grantedTools(tools, grant),
+          ...(repository === undefined ? {} : { repository }) }
+      })
   }
   create(scope: Omit<McpGrantScope, 'grantId'>, clientId: string, redirects: string[]) {
     this.db.prepare("DELETE FROM mcp_grants WHERE json_extract(state, '$.expiresAt') <= ?").run(this.now())
     if (this.list(scope.ownerId).length >= 100) throw new Error('read grant capacity reached; wait for a retained grant to expire')
     const grant: StoredGrant = { ...scope, clientId, grantId: randomUUID(), createdAt: this.now(), expiresAt: this.now() + GRANT_MS,
-      revokedAt: null, tools: scope.chatMetadata ? MCP_TOOLS.map(tool => tool.name) : [...MCP_WORK_TOOL_NAMES],
+      revokedAt: null, tools: mcpToolNames(scope),
       accessHash: '', refreshHash: '', accessExpires: 0 }
     const tokens = this.rotate(grant)
     // A live grant retains its registration; otherwise redirects() would reject consented clients after 30 days from registration.
@@ -80,7 +82,7 @@ export class McpGrants {
     const grant = row ? JSON.parse(row.state) as StoredGrant : null
     if (!grant || grant.revokedAt !== null || grant.expiresAt <= this.now()
       || (kind === 'access' && grant.accessExpires <= this.now())) return null
-    grant.tools = grantedTools((grant as { tools?: unknown }).tools, grant.chatMetadata)
+    grant.tools = grantedTools((grant as { tools?: unknown }).tools, grant)
     return grant
   }
   refresh(grant: StoredGrant) { return this.rotate(grant) }

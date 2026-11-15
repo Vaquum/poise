@@ -4,7 +4,8 @@ import { pagePrincipal, postPrincipal } from './auth.js'
 import { signAssertion } from './assertion.js'
 import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
-import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES, isMcpRecordId, isMcpRepository, mcpRepositoryAllowed, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
+import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES, isMcpRecordId, isMcpRepository,
+  mcpRepositoryAllowed, mcpToolNames, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
 import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
 import { html, page } from './pages.js'
@@ -93,7 +94,8 @@ export class McpGateway {
         <p>Client ${authorization.client}. Return to ${authorization.redirect}. Allowed tools: poise_describe (workspace identity) and poise_work (issue work trail, recorded receipts and links).</p>
         <form method="post" action="/mcp/authorize"><input type="hidden" name="csrf" value="${principal.session.csrf}">
         <input type="hidden" name="request" value="${url.searchParams.toString()}">
-        <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata</label>
+        <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata, including listings</label>
+        <label><input type="checkbox" name="chatTranscript" value="1"> Allow Chat transcript and retained turn events</label>
         <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
         <button name="decision" value="approve">Allow read access</button><button name="decision" value="deny">Deny</button></form></div>`), authorizeHeaders)
     }
@@ -113,7 +115,8 @@ export class McpGateway {
         const code = newSecret()
         this.codes.set(hashSecret(code), { ...auth, expires: ctx.deps.now() + 60_000, redirects: this.grants.redirects(auth.client),
           scope: { resource: this.resource, handle: principal.user.handle, ownerId: principal.user.githubId,
-            ...(form.get('chatMetadata') === '1' ? { chatMetadata: true } : {}),
+            ...(form.get('chatMetadata') === '1' ? { chatMetadata: true, chatList: true } : {}),
+            ...(form.get('chatTranscript') === '1' ? { chatTranscript: true } : {}),
             ...(repository ? { repository } : {}) } })
         target.searchParams.set('code', code)
       }
@@ -208,6 +211,13 @@ export class McpGateway {
     if (read.name === 'poise_work' && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
       return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     }
+    if (read.name === 'poise_list') {
+      const repository = read.arguments.repository ?? grant.repository ?? null
+      if (!mcpRepositoryAllowed(grant, repository)) {
+        return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
+      }
+      read = { ...read, arguments: { ...read.arguments, repository } }
+    }
     const minute = Math.floor(ctx.deps.now() / 60_000)
     for (const [key, value] of this.reads) if (value.minute !== minute && !value.active) this.reads.delete(key)
     const rate = this.reads.get(grant.grantId) ?? { minute, count: 0, active: 0 }
@@ -231,6 +241,8 @@ export class McpGateway {
     const target = ctx.deps.upstream(owner.handle), payload = JSON.stringify(read)
     const scope: McpGrantScope = { resource: grant.resource, ownerId: grant.ownerId, handle: grant.handle, grantId: grant.grantId,
       ...(grant.chatMetadata && grant.tools.includes('poise_get') ? { chatMetadata: true } : {}),
+      ...(grant.chatMetadata && grant.chatList && grant.tools.includes('poise_list') ? { chatList: true } : {}),
+      ...(grant.chatTranscript && grant.tools.includes('poise_changes') ? { chatTranscript: true } : {}),
       ...(grant.repository === undefined ? {} : { repository: grant.repository }) }
     const identity = signAssertion(ctx.deps.keys.privateKey, { handle: owner.handle, login: owner.login, scope: 'mcp', mcp: scope }, ctx.deps.now())
     let text: string
@@ -257,9 +269,10 @@ export class McpGateway {
     if (body.workspace !== owner.handle) throw new HttpError(502, 'wrong_workspace_response')
     // GitHub logins are case-preserved but case-insensitive; the container keeps the case from its creation.
     const tools = body.capabilities && typeof body.capabilities === 'object' && 'tools' in body.capabilities ? body.capabilities.tools : null
+    const allowedTools = mcpToolNames(scope)
     if (typeof body.owner !== 'string' || body.owner.toLowerCase() !== owner.login.toLowerCase() || !Array.isArray(tools)
-      || (JSON.stringify(tools) !== JSON.stringify(MCP_WORK_TOOL_NAMES)
-        && (!scope.chatMetadata || JSON.stringify(tools) !== JSON.stringify(MCP_TOOLS.map(tool => tool.name))))) {
+      || MCP_WORK_TOOL_NAMES.some(tool => !tools.includes(tool)) || new Set(tools).size !== tools.length
+      || tools.some(tool => typeof tool !== 'string' || !allowedTools.includes(tool))) {
       throw new HttpError(502, 'invalid_workspace_capabilities')
     }
     const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: grant.tools.filter(tool => tools.includes(tool)) } }
@@ -281,6 +294,35 @@ export class McpGateway {
       const chatId = record?.kind === 'timer' ? String(record.chatId) : read.arguments.id
       return { ...described, lookup: { source: 'chat', coverage: 'complete', observedAt: lookup.observedAt, record,
         link: record === null ? null : `${ctx.workspaceOrigin(owner.handle)}/?view=chat&chat=${chatId}` } }
+    }
+    if (read.name === 'poise_list' || read.name === 'poise_changes') {
+      const page = body.page as Record<string, unknown> | undefined
+      if (!page || typeof page.observedAt !== 'string' || !Number.isFinite(Date.parse(page.observedAt))
+        || !Array.isArray(page.items) || page.items.length > read.arguments.limit
+        || (page.nextCursor !== null && (typeof page.nextCursor !== 'string' || page.nextCursor.length > 2048))) {
+        throw new HttpError(502, 'invalid_workspace_chat_page')
+      }
+      const chatLink = (id: string) => `${ctx.workspaceOrigin(owner.handle)}/?view=chat&chat=${id}`
+      if (read.name === 'poise_list') {
+        const { repository, since, until } = read.arguments
+        if (page.repository !== repository || page.since !== since || page.until !== until || page.items.some(item =>
+          !item || typeof item !== 'object' || !isMcpRecordId(item.id)
+          || typeof item.updatedAt !== 'string' || !Number.isFinite(Date.parse(item.updatedAt))
+          || since !== null && Date.parse(item.updatedAt) < Date.parse(since)
+          || until !== null && Date.parse(item.updatedAt) >= Date.parse(until)
+          || (repository !== null && (typeof item.repository !== 'string' || item.repository.toLowerCase() !== repository.toLowerCase())))) {
+          throw new HttpError(502, 'invalid_workspace_chat_list_scope')
+        }
+        return { ...described, page: { ...page, source: 'chat', coverage: 'complete',
+          items: page.items.map(item => ({ ...item, link: chatLink(item.id) })) } }
+      }
+      if (page.chatId !== read.arguments.id || typeof page.found !== 'boolean'
+        || (!page.found && page.items.length !== 0)
+        || (page.found && !mcpRepositoryAllowed(grant, typeof page.repository === 'string' ? page.repository : null))
+        || page.items.some(item => !item || typeof item !== 'object' || !Number.isSafeInteger(item.sequence) || item.sequence <= 0)) {
+        throw new HttpError(502, 'invalid_workspace_chat_change_scope')
+      }
+      return { ...described, page: { ...page, source: 'chat', link: page.found ? chatLink(read.arguments.id) : null } }
     }
     const work = body.work as Record<string, unknown> | undefined
     if (!work || work.repository !== read.arguments.repository || !Array.isArray(work.items) || work.items.length > (read.arguments.issue ? 1 : read.arguments.limit!)

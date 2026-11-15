@@ -30,7 +30,7 @@ import { PARTS, PLACES, SECTIONS } from '../src/ui/address'
 import { listCapabilities } from '../server/capabilities'
 import { createTimer } from '../server/chat/control-store'
 import { emptyCapabilities } from '../server/chat/runtime'
-import { deleteSession, insertSession } from '../server/chat/storage'
+import { appendEvent, deleteSession, getSession, insertSession, resetConversation } from '../server/chat/storage'
 
 const endpoint = 'https://poise.test/mcp'
 let h: Harness
@@ -106,7 +106,8 @@ const fetcher: typeof fetch = async (input, init) => {
 }
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
-async function connect(login: string, serverEndpoint = endpoint, options: { chatMetadata?: boolean; repository?: string } = {}) {
+async function connect(login: string, serverEndpoint = endpoint,
+  options: { chatMetadata?: boolean; chatTranscript?: boolean; repository?: string } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -137,7 +138,8 @@ async function connect(login: string, serverEndpoint = endpoint, options: { chat
   const approved = await fetcher(new URL('/mcp/authorize', endpoint), { method: 'POST', headers: {
     cookie: signedIn.apexCookie, origin: new URL(endpoint).origin, 'content-type': 'application/x-www-form-urlencoded',
   }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
-    ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
+    ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.chatTranscript ? { chatTranscript: '1' } : {}),
+    ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
   expect(callback.searchParams.get('state')).toBe('fixture-state')
@@ -239,7 +241,7 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     const workspaceReply = await send(workspacePort, { host: 'alice.poise.test', path: '/api/mcp/read', method: 'POST',
       headers: { 'x-poise-identity': bare, 'content-type': 'application/json' }, body: JSON.stringify(request) })
     expect(workspaceReply.status).toBe(403)
-    const tools = ['poise_describe', 'poise_work', 'poise_get']
+    const tools = ['poise_describe', 'poise_work', 'poise_get', 'poise_list']
     expect((await alice.client.listTools()).tools.map(tool => tool.name)).toEqual(tools)
     expect(await describe(alice.client)).toMatchObject({ capabilities: { tools },
       inventory: { surfaces: expect.arrayContaining([expect.objectContaining({ id: 'chat', status: 'available', tool: 'poise_get' })]) } })
@@ -266,6 +268,58 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     await outside.client.close()
     db.prepare('DELETE FROM chat_control_timers WHERE id = ?').run(timer.id)
     deleteSession(id)
+  }
+})
+
+it('pages Chat records and retained transcript events with independent consent and reset coverage', async () => {
+  const now = new Date().toISOString()
+  const ids = [randomUUID(), randomUUID()].sort().reverse()
+  const foreign = randomUUID()
+  const anotherRepo = randomUUID()
+  for (const id of [...ids, foreign, anotherRepo]) insertSession({ id, title: id, agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
+    repo: id === anotherRepo ? 'Acme/Other' : 'Acme/Repo', checkout: '/private/checkout', branch: { name: 'main', origin: 'existing', provisional: false },
+    createdAt: now, updatedAt: now, status: 'closed', capabilities: emptyCapabilities(), lastSeq: 0, pendingRequests: [],
+    instance: id === foreign ? 'bob-chat' : 'alice-chat' })
+  const turnId = randomUUID()
+  appendEvent(ids[0], { type: 'turn.started', turnId, prompt: { text: 'Fixture prompt', memories: 'private runtime appendix', attachments: [], mentions: [] } })
+  appendEvent(ids[0], { type: 'text.delta', turnId, messageId: randomUUID(), delta: 'Fixture answer' })
+  appendEvent(ids[0], { type: 'turn.finished', turnId, stopReason: 'end_turn' })
+  const metadata = await connect('Alice', endpoint, { chatMetadata: true })
+  const full = await connect('Alice', endpoint, { chatMetadata: true, chatTranscript: true })
+  const other = await connect('bob', endpoint, { chatMetadata: true, chatTranscript: true })
+  const scoped = await connect('Alice', endpoint, { chatMetadata: true, chatTranscript: true, repository: 'Acme/Repo' })
+  const changes = { kind: 'chat', id: ids[0], limit: 1 }
+  async function page(client: Client, name: 'poise_list' | 'poise_changes', args: Record<string, unknown>) {
+    const result = await client.callTool({ name, arguments: args })
+    expect(result.isError).not.toBe(true)
+    const content = result.content as { type: string; text: string }[]
+    return JSON.parse(content[0].text).page as { items: Array<Record<string, unknown>>; nextCursor: string | null; coverage: string }
+  }
+  try {
+    expect((await metadata.client.callTool({ name: 'poise_changes', arguments: changes })).isError).toBe(true)
+    expect((await scoped.client.callTool({ name: 'poise_list', arguments: { kind: 'chat', repository: 'Acme/Other' } })).isError).toBe(true)
+    expect((await page(scoped.client, 'poise_list', { kind: 'chat' })).items.map(item => item.id)).toEqual(ids)
+    expect(await page(scoped.client, 'poise_changes', { ...changes, id: anotherRepo })).toMatchObject({ found: false, items: [] })
+    const selector = { kind: 'chat', repository: 'acme/repo', since: now, limit: 1 }
+    const first = await page(full.client, 'poise_list', selector)
+    expect(first.items).toMatchObject([{ id: ids[0], status: 'closed', link: `https://alice.poise.test/?view=chat&chat=${ids[0]}` }])
+    expect(first.nextCursor).toBeTruthy()
+    expect((await page(full.client, 'poise_list', { ...selector, cursor: first.nextCursor })).items).toMatchObject([{ id: ids[1] }])
+    await expect(metadata.client.callTool({ name: 'poise_list', arguments: { ...selector, cursor: first.nextCursor } })).rejects.toThrow()
+    expect(await page(other.client, 'poise_changes', changes)).toMatchObject({ found: false, items: [], nextCursor: null })
+    const transcript = await page(full.client, 'poise_changes', changes)
+    expect(transcript.items).toMatchObject([{ sequence: 1, type: 'turn.started', detail: { text: 'Fixture prompt' } }])
+    expect(JSON.stringify(transcript)).not.toContain('private runtime appendix')
+    const continued = await page(full.client, 'poise_changes', { ...changes, cursor: transcript.nextCursor })
+    expect(continued.items).toMatchObject([{ sequence: 2, type: 'text.delta', detail: { text: 'Fixture answer' } }])
+    const { envelope } = resetConversation(getSession(ids[0])!)
+    const afterReset = await page(full.client, 'poise_changes', { ...changes, cursor: transcript.nextCursor })
+    expect(afterReset).toMatchObject({ coverage: 'expired', retainedFrom: envelope.seq,
+      items: [{ sequence: envelope.seq, type: 'session.reset' }] })
+    expect(JSON.stringify(afterReset)).not.toContain('Fixture prompt')
+  } finally {
+    await Promise.all([metadata.client.close(), full.client.close(), other.client.close(), scoped.client.close()])
+    for (const id of [...ids, foreign, anotherRepo]) deleteSession(id)
   }
 })
 
@@ -322,7 +376,7 @@ it('reports the running workspace inventory through describe and the matching MC
   try {
     const result = await describe(client) as { inventory: { surfaces: Array<{ id: string; href: string }> } }
     const expected = [...PLACES, ...PARTS.map(id => `observe/${id}`), ...SECTIONS.map(id => `settings/${id}`),
-      ...listCapabilities().map(id => `capability/${id}`)]
+      ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript']
     expect(result.inventory.surfaces.map(surface => surface.id)).toEqual(expected)
     expect(result.inventory.surfaces.every(surface => new URL(surface.href).origin === 'https://alice.poise.test')).toBe(true)
     expect(result).toMatchObject({ access: { resource: endpoint, scope: 'poise:read' }, instructions: expect.any(String),
@@ -508,7 +562,7 @@ conn.close()
       $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
       mcpServers: { poise: { type: 'streamable-http', url: endpoint } },
     })
-    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.1.0' })
+    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.2.0' })
     expect(JSON.parse(await readFile(join(bundle, '.agents/plugins/marketplace.json'), 'utf8')).plugins[0].source).toEqual({ source: 'local', path: './plugins/poise' })
     expect(await readFile(join(bundle, 'plugins/poise/skills/poise-manager/SKILL.md'), 'utf8')).toBe(await readFile('plugins/poise/skills/poise-manager/SKILL.md', 'utf8'))
     await expect(packagePoisePlugin('https://poise.test', bundle)).rejects.toThrow('EEXIST')
