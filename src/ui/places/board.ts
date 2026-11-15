@@ -260,12 +260,51 @@ export const mount: MountPlace = (ctx) => {
   const W = new Map<string, unknown>()   // open writers: add.<lane>, issue, edit.<id>
   const drafts = new Map<string, Record<string, string>>()
   const issueW = (): IssueWriter | null => (W.get('issue') as IssueWriter | undefined) ?? null
-  const repoOptions = (sel: string | null, none = true) => `${none ? `<option value=""${sel ? '' : ' selected'}>No repository</option>` : ''}${(sel && !repos.includes(sel) ? [sel, ...repos] : repos).map((r) => `<option${r === sel ? ' selected' : ''}>${esc(r)}</option>`).join('')}`
+  let repoPick: { key: string, value: string, query: string, open: boolean, active: number } | null = null
+  const repoChoices = (): string[] => {
+    if (!repoPick) return []
+    const { key, value, query } = repoPick
+    const available = value && !repos.includes(value) ? [value, ...repos] : repos
+    const matching = available.filter((r) => r.toLowerCase().includes(query.toLowerCase()))
+    return key !== 'issue' && !query ? ['', ...matching] : matching
+  }
+  function repoHTML(key: string, selected: string | null, disabled = false): string {
+    const field = `${key.split('.')[0]}-repo`
+    if (repoPick?.key !== key) {
+      const draft = drafts.get(key)
+      const value = draft?.[field] ?? selected ?? ''
+      repoPick = { key, value, query: draft?.['repo-query'] ?? value, open: false, active: -1 }
+    }
+    const p = repoPick
+    if (disabled) p.open = false
+    const choices = repoChoices()
+    const label = key === 'issue' ? 'Repository' : key.startsWith('edit.') ? 'Linked repository' : 'Link a repository'
+    return `<div class="board-repo"><input type="hidden" data-w="${field}" data-repo-value value="${esc(p.value)}"><input type="search" data-w="repo-query" data-repo-query role="combobox" aria-label="${label}" aria-autocomplete="list" aria-expanded="${p.open}" aria-controls="board-repo-list"${p.open && choices[p.active] !== undefined ? ` aria-activedescendant="board-repo-${p.active}"` : ''} autocomplete="off" placeholder="${key === 'issue' ? 'Search repositories…' : 'No repository'}" value="${esc(p.query)}" data-ref="composer.repo"${disabled ? ' disabled' : ''}><div class="board-repo-list" id="board-repo-list" role="listbox" aria-label="Repositories"${p.open ? '' : ' hidden'}>${choices.length ? choices.map((r, i) => `<button type="button" role="option" tabindex="-1" id="board-repo-${i}" data-repo-option="${esc(r)}" aria-selected="${r === p.value}" data-active="${i === p.active}">${esc(r || 'No repository')}</button>`).join('') : '<p class="t-gloss" role="status">No repositories match.</p>'}</div></div>`
+  }
+  function dismissRepos(): void {
+    if (!repoPick) return
+    repoPick.open = false
+    $('[data-repo-query]', lanesEl)?.setAttribute('aria-expanded', 'false')
+    $('[data-repo-query]', lanesEl)?.removeAttribute('aria-activedescendant')
+    const list = $('#board-repo-list', lanesEl)
+    if (list) list.hidden = true
+  }
+  function selectRepo(value: string): void {
+    if (!repoPick || !repoChoices().includes(value)) return
+    const changed = value !== repoPick.value
+    Object.assign(repoPick, { value, query: value, open: false, active: -1 })
+    const w = issueW()
+    if (w && changed) Object.assign(w, { repo: value, cleared: w.labels.length, labels: [], lq: '' })
+    render(false)
+    if (w && changed && w.labelsOpen) void loadLabels(value)
+    $('[data-repo-query]', lanesEl)?.focus()
+    $('[data-repo-query]', lanesEl)?.select()
+  }
   const actsMine = `<div class="card-acts"><button class="ib" data-act="copy" aria-label="Copy" data-ref="card.copy">${icon('copy', 'sm')}</button><button class="ib" data-act="chat" aria-label="Chat about this" data-ref="card.chat">${icon('chat', 'sm')}</button><button class="ib" data-act="to-issue" aria-label="Open as issue…" data-ref="card.to-issue">${icon('issue', 'sm')}</button><button class="ib" data-act="del" aria-label="Delete card" data-ref="card.delete">${icon('cross', 'sm')}</button></div>`
 
   function mineHTML(c: Card): string {
     if (W.has(`edit.${c.id}`)) {
-      return `<article class="card is-editing" data-id="${c.id}" data-kind="mine" data-ref="card.edit"><div class="writer" data-writer="edit.${c.id}"><textarea data-w="edit-text" aria-label="Card text" rows="3">${esc(c.text)}</textarea><div class="row"><select data-w="edit-repo" aria-label="Linked repository" data-ref="composer.repo">${repoOptions(c.repo)}</select><span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="edit.${c.id}">Cancel</button><button class="btn btn-primary" data-act="w-save" data-id="${c.id}">Save</button></div></div></article>`
+      return `<article class="card is-editing" data-id="${c.id}" data-kind="mine" data-ref="card.edit"><div class="writer" data-writer="edit.${c.id}"><textarea data-w="edit-text" aria-label="Card text" rows="3">${esc(c.text)}</textarea><div class="row">${repoHTML(`edit.${c.id}`, c.repo)}<span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="edit.${c.id}">Cancel</button><button class="btn btn-primary" data-act="w-save" data-id="${c.id}">Save</button></div></div></article>`
     }
     return `<article class="card" data-id="${c.id}" data-kind="mine" tabindex="0" draggable="true" data-ref="card.manual" aria-label="Card: ${esc(c.text.slice(0, 60))}"><div class="card-text">${esc(c.text)}</div><div class="card-meta">${c.repo ? `<span class="repo">${esc(c.repo)}</span>` : ''}<time>${ago(minutesSince(c.updated_at))}</time></div>${lifeEl(String(c.id))}${actsMine}</article>`
   }
@@ -318,10 +357,10 @@ export const mount: MountPlace = (ctx) => {
       const n = w.labels.length
       const pop = w.labelsOpen ? labelsHTML(w) : ''
       const blocked = !!w.conflict || w.busy
-      return `<div class="writer" data-writer="issue">${w.edit ? `<span class="t-micro" data-ref="composer.editing">Edit ${esc(w.repo)}#${w.edit.number}</span>` : ''}<input data-w="issue-title" placeholder="Issue title" aria-label="Issue title" data-ref="composer.title" value="${esc(w.title)}"${w.busy ? ' readonly' : ''}><textarea data-w="issue-body" rows="3" placeholder="What should happen, in plain words (optional)" aria-label="Issue body" data-ref="composer.body"${w.busy ? ' readonly' : ''}>${esc(w.body)}</textarea><div class="row"><select data-w="issue-repo" aria-label="Repository" data-ref="composer.repo"${w.edit || w.busy ? ' disabled' : ''}>${repoOptions(w.repo, false)}</select>${w.edit ? '' : `<button class="ib${n ? ' is-on' : ''}" data-act="labels" aria-label="Labels${n ? `, ${n} chosen` : ''}" aria-expanded="${w.labelsOpen}"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.labels">${icon('tag', 'sm')}${n ? `<span class="n">${n}</span>` : ''}</button>`}<span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="issue"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-open-issue"${blocked ? ' aria-disabled="true"' : ''} data-ref="${w.edit ? 'composer.save-issue' : 'composer.open'}">${w.edit ? 'Save issue' : 'Open issue'}</button></div>${pop}${w.busy ? `<div class="life" data-ref="life" data-life="Executing" role="status">${lifeHTML('Executing', w.edit ? 'saving on GitHub' : 'opening on GitHub', true)}</div>` : ''}${w.conflict ? `<p class="w-err" role="alert">${esc(w.conflict)} <button class="lnk" data-act="w-theirs">Load the latest</button></p>` : ''}${w.err ? `<p class="w-err" role="alert">${esc(w.err)}</p>` : ''}${w.cleared ? `<p class="t-gloss">Cleared ${w.cleared} label${w.cleared > 1 ? 's' : ''} chosen for the previous repository.</p>` : ''}</div>`
+      return `<div class="writer" data-writer="issue">${w.edit ? `<span class="t-micro" data-ref="composer.editing">Edit ${esc(w.repo)}#${w.edit.number}</span>` : ''}<input data-w="issue-title" placeholder="Issue title" aria-label="Issue title" data-ref="composer.title" value="${esc(w.title)}"${w.busy ? ' readonly' : ''}><textarea data-w="issue-body" rows="3" placeholder="What should happen, in plain words (optional)" aria-label="Issue body" data-ref="composer.body"${w.busy ? ' readonly' : ''}>${esc(w.body)}</textarea><div class="row">${repoHTML('issue', w.repo, !!w.edit || w.busy)}${w.edit ? '' : `<button class="ib${n ? ' is-on' : ''}" data-act="labels" aria-label="Labels${n ? `, ${n} chosen` : ''}" aria-expanded="${w.labelsOpen}"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.labels">${icon('tag', 'sm')}${n ? `<span class="n">${n}</span>` : ''}</button>`}<span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="issue"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-open-issue"${blocked ? ' aria-disabled="true"' : ''} data-ref="${w.edit ? 'composer.save-issue' : 'composer.open'}">${w.edit ? 'Save issue' : 'Open issue'}</button></div>${pop}${w.busy ? `<div class="life" data-ref="life" data-life="Executing" role="status">${lifeHTML('Executing', w.edit ? 'saving on GitHub' : 'opening on GitHub', true)}</div>` : ''}${w.conflict ? `<p class="w-err" role="alert">${esc(w.conflict)} <button class="lnk" data-act="w-theirs">Load the latest</button></p>` : ''}${w.err ? `<p class="w-err" role="alert">${esc(w.err)}</p>` : ''}${w.cleared ? `<p class="t-gloss">Cleared ${w.cleared} label${w.cleared > 1 ? 's' : ''} chosen for the previous repository.</p>` : ''}</div>`
     }
     if (lane.kind === 'mine' && W.has(`add.${lane.key}`)) {
-      return `<div class="writer" data-writer="add.${lane.key}"><textarea data-w="add-text" rows="3" placeholder="Write a card…" aria-label="Card text" data-ref="composer.text"></textarea><div class="row"><select data-w="add-repo" aria-label="Link a repository" data-ref="composer.repo">${repoOptions(null)}</select><span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="add.${lane.key}" data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-add" data-lane="${lane.key}" data-ref="composer.add">Add</button></div></div>`
+      return `<div class="writer" data-writer="add.${lane.key}"><textarea data-w="add-text" rows="3" placeholder="Write a card…" aria-label="Card text" data-ref="composer.text"></textarea><div class="row">${repoHTML(`add.${lane.key}`, null)}<span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="add.${lane.key}" data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-add" data-lane="${lane.key}" data-ref="composer.add">Add</button></div></div>`
     }
     return ''
   }
@@ -397,7 +436,7 @@ export const mount: MountPlace = (ctx) => {
   function render(animate = true): void {
     const before = new Map($$('.card[data-id]', lanesEl).map((c: HTMLElement) => [c.dataset.id, c.getBoundingClientRect()]))
     const scrolls = Object.fromEntries($$('[data-body]', lanesEl).map((b: HTMLElement) => [b.dataset.body, b.scrollTop]))
-    const values = Object.fromEntries($$('[data-w]', lanesEl).map((f: HTMLInputElement) => [f.dataset.w, f.value]))
+    const values = Object.fromEntries($$('[data-w]:not([data-repo-value], [data-repo-query])', lanesEl).map((f: HTMLInputElement) => [f.dataset.w, f.value]))
     const a = document.activeElement as HTMLInputElement | null
     const focusW = a?.dataset?.w
     const focusId = !focusW ? a?.closest?.<HTMLElement>('.card')?.dataset.id : undefined
@@ -554,6 +593,7 @@ export const mount: MountPlace = (ctx) => {
     // An issue on its way to GitHub keeps its writer, so the answer lands where it was asked.
     if (issueW()?.busy) return
     stash()
+    repoPick = null
     W.clear()
     W.set(key, data)
     render(false)
@@ -561,7 +601,7 @@ export const mount: MountPlace = (ctx) => {
     if (!w) return
     const draft = drafts.get(key)
     if (draft) $$('[data-w]', w).forEach((f: HTMLInputElement) => { const v = draft[f.dataset.w ?? '']; if (v != null) f.value = v })
-    const f = $('[data-w]', w)
+    const f = $('[data-w]:not([type="hidden"])', w)
     f?.focus({ preventScroll: true })
     if (f?.setSelectionRange) f.setSelectionRange(f.value.length, f.value.length)
     w.scrollIntoView({ block: 'nearest' })
@@ -570,6 +610,7 @@ export const mount: MountPlace = (ctx) => {
     if (issueW()?.busy) return
     drafts.delete(key)
     W.delete(key)
+    repoPick = null
     render(false)
     focusTo?.()
   }
@@ -579,11 +620,13 @@ export const mount: MountPlace = (ctx) => {
   })
 
   async function addCard(lane: MineLane): Promise<void> {
-    const w = $(`[data-writer="add.${lane}"]`, lanesEl)
+    const key = `add.${lane}`
+    const w = $(`[data-writer="${key}"]`, lanesEl)
     const text = ($('[data-w="add-text"]', w).value as string).trim(), repo = ($('[data-w="add-repo"]', w).value as string) || null
-    if (!text) { closeWriter(`add.${lane}`, writerFocus(`add.${lane}`)); return }
-    W.delete(`add.${lane}`)
-    drafts.delete(`add.${lane}`)
+    if (!text) { closeWriter(key, writerFocus(key)); return }
+    const query = repoPick?.query ?? repo ?? ''
+    W.delete(key)
+    drafts.delete(key)
     try {
       const created = await createCard({ text, lane, repo })
       // + Add puts the card at the top of its lane, under the composer.
@@ -594,20 +637,23 @@ export const mount: MountPlace = (ctx) => {
       $(`.card[data-id="${placed.id}"]`, lanesEl)?.focus()
       if (!matches(text, repo) || !inOrg(repo)) toast('Card added. Your filter hides it; clear the filter to see it.')
     } catch (error) {
-      W.set(`add.${lane}`, {})
-      drafts.set(`add.${lane}`, { 'add-text': text, 'add-repo': repo ?? '' })
-      render(false)
+      if (!W.has(key)) {
+        drafts.set(key, { 'add-text': text, 'add-repo': repo ?? '', 'repo-query': query })
+        if (!W.size) openWriter(key)
+      }
       toast(`The card was not saved: ${(error as Error).message}`, 'failed')
     }
   }
-  function startEdit(id: string): void { drafts.delete(`edit.${id}`); openWriter(`edit.${id}`) }
+  function startEdit(id: string): void { openWriter(`edit.${id}`) }
   async function saveEdit(id: string): Promise<void> {
-    const c = cardById(id), w = $(`[data-writer="edit.${id}"]`, lanesEl)
+    const key = `edit.${id}`
+    const c = cardById(id), w = $(`[data-writer="${key}"]`, lanesEl)
     if (!c || !w) return
     const text = ($('[data-w="edit-text"]', w).value as string).trim(), repo = ($('[data-w="edit-repo"]', w).value as string) || null
-    if (!text || (text === c.text && repo === c.repo)) { closeWriter(`edit.${id}`, writerFocus(`edit.${id}`)); return }
-    W.delete(`edit.${id}`)
-    drafts.delete(`edit.${id}`)
+    if (!text || (text === c.text && repo === c.repo)) { closeWriter(key, writerFocus(key)); return }
+    const query = repoPick?.query ?? repo ?? ''
+    W.delete(key)
+    drafts.delete(key)
     try {
       const saved = await updateCard(c.id, { text, repo })
       cards = cards.map((x) => (x.id === c.id ? { ...x, ...saved } : x))
@@ -615,9 +661,10 @@ export const mount: MountPlace = (ctx) => {
       render(false)
       $(`.card[data-id="${id}"]`, lanesEl)?.focus()
     } catch (error) {
-      W.set(`edit.${id}`, {})
-      drafts.set(`edit.${id}`, { 'edit-text': text, 'edit-repo': repo ?? '' })
-      openWriter(`edit.${id}`)
+      if (!W.has(key)) {
+        drafts.set(key, { 'edit-text': text, 'edit-repo': repo ?? '', 'repo-query': query })
+        if (!W.size) openWriter(key)
+      }
       toast(`The card was not saved: ${(error as Error).message}`, 'failed')
     }
   }
@@ -947,9 +994,26 @@ export const mount: MountPlace = (ctx) => {
   }
 
   // ---------- Events ----------
+  on('mousedown', (e) => {
+    if ((e.target as Element).closest('[data-repo-option]')) e.preventDefault()
+  }, root)
+  on('focusin', (e) => {
+    const t = e.target as HTMLInputElement
+    if (t.matches('[data-repo-query]') && repoPick?.query === repoPick?.value) t.select()
+  }, root)
   on('click', (e) => {
     const t = e.target as Element
+    // Closing the inline list on pointer focusout can move the next button before its click.
+    if (!t.closest('.board-repo')) dismissRepos()
     if (!root.contains(t)) return
+    const option = t.closest<HTMLElement>('[data-repo-option]')
+    if (option) { selectRepo(option.dataset.repoOption ?? ''); return }
+    if (t.matches('[data-repo-query]') && repoPick && !(t as HTMLInputElement).disabled) {
+      repoPick.open = true
+      render(false)
+      if (repoPick.query === repoPick.value) $('[data-repo-query]', lanesEl)?.select()
+      return
+    }
     const seg = t.closest<HTMLElement>('[data-filter] button')
     if (seg) {
       const key = seg.closest<HTMLElement>('[data-filter]')?.dataset.filter as FilterKey
@@ -1023,6 +1087,11 @@ export const mount: MountPlace = (ctx) => {
   let searchTimer = 0
   on('input', (e) => {
     const t = e.target as HTMLInputElement
+    if (t.matches('[data-repo-query]') && repoPick) {
+      Object.assign(repoPick, { query: t.value, open: true, active: 0 })
+      render(false)
+      return
+    }
     if (t.matches('[data-search]')) { clearTimeout(searchTimer); searchTimer = window.setTimeout(() => { search = t.value.trim(); render() }, 90); return }
     if (t.matches('[data-labels-filter]')) {
       const w = issueW()
@@ -1048,18 +1117,30 @@ export const mount: MountPlace = (ctx) => {
       render(false)
       $(`[data-label][value="${CSS.escape(t.value)}"]`, lanesEl)?.focus()
     }
-    if (t.matches('[data-w="issue-repo"]')) {
-      stash()
-      Object.assign(w, { repo: t.value, cleared: w.labels.length, labels: [], lq: '' })
-      render(false)
-      if (w.labelsOpen) void loadLabels(w.repo)
-      $('[data-w="issue-repo"]', lanesEl)?.focus()
-    }
   }, root)
   on('keydown', (e) => {
     const t = e.target as HTMLElement
     if (!root.contains(t)) return
     const w = t.closest<HTMLElement>('[data-writer]')
+    if (w && repoPick?.open && e.key === 'Escape') { e.preventDefault(); dismissRepos(); return }
+    if (t.matches('[data-repo-query]') && repoPick && !(t as HTMLInputElement).disabled) {
+      if (e.key === 'Tab') dismissRepos()
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault()
+        const choices = repoChoices()
+        repoPick.active = repoPick.open ? Math.max(0, Math.min(choices.length - 1, repoPick.active + (e.key === 'ArrowDown' ? 1 : -1))) : e.key === 'ArrowDown' ? 0 : choices.length - 1
+        repoPick.open = true
+        render(false)
+        $(`#board-repo-${repoPick.active}`, lanesEl)?.scrollIntoView({ block: 'nearest' })
+        return
+      }
+      if (e.key === 'Enter' && !e.metaKey && !e.ctrlKey && repoPick.open) {
+        e.preventDefault()
+        const value = repoChoices()[repoPick.active]
+        if (value !== undefined) selectRepo(value)
+        return
+      }
+    }
     if (w && e.key === 'Escape' && t.closest('.labels-pop') && issueW()?.labelsOpen) { e.preventDefault(); stash(); issueW()!.labelsOpen = false; render(false); $('[data-act="labels"]', lanesEl)?.focus(); return }
     if (w) {
       const key = w.dataset.writer ?? ''
@@ -1133,7 +1214,7 @@ export const mount: MountPlace = (ctx) => {
     const out: string[] = []
     for (const key of W.keys()) {
       const box = $(`[data-writer="${CSS.escape(key)}"]`, lanesEl)
-      const typed = box ? $$('[data-w]', box).some((f: HTMLInputElement) => f.tagName !== 'SELECT' && f.value.trim()) : false
+      const typed = box ? $$('[data-w]:not([data-repo-value], [data-repo-query])', box).some((f: HTMLInputElement) => f.value.trim()) : false
       if (typed) out.push(key === 'issue' ? 'An issue being written on Board' : 'A card being written on Board')
     }
     if ([...LIFE.values()].some(([stage]) => stage === 'Accepted' || stage === 'Executing')) out.push('A Board action on its way')
