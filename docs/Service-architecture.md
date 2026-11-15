@@ -302,6 +302,11 @@ client sent.
     bounded indexed reads. Cursors bind the grant and selector. Transcript
     projection follows the stored context reset boundary and reports when a
     previous checkpoint has expired.
+    Separate signed grants cover Chat artifacts, workspace operations and
+    workspace content. A restricted repository grant cannot read workspace-wide
+    snapshots. Logging and Link reads stay in the gateway. Instance Logging
+    requires explicit administrator consent and a live administrator check
+    before the read and response.
     An independent Manager consent adds the client identity to the signed
     claim. Its typed actions use `POST /api/mcp/manager`, the native Manager
     authorization and budget, and the existing durable command receipts with

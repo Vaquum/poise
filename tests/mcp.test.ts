@@ -26,13 +26,21 @@ import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { db, getMeta, setMeta } from '../server/db'
 import * as ledger from '../server/behavior-ledger'
+import * as agent from '../server/agent'
+import * as analytics from '../server/analytics'
+import { raiseAlert, resolveAlert } from '../server/alerts/store'
 import * as processes from '../server/process'
 import type { readMcpWork } from '../server/mcp-work'
 import { PARTS, PLACES, SECTIONS } from '../src/ui/address'
 import { listCapabilities } from '../server/capabilities'
-import { createTimer, inbox, pauseDelivery, watches } from '../server/chat/control-store'
+import { MCP_WORKSPACE_VIEWS } from '../gateway/src/mcp-contract'
+import { createCard, removeCard } from '../server/current'
+import { createServer as createExtension, deleteServer as deleteExtension } from '../server/extensions/store'
+import { deleteDoc, writeDoc } from '../server/editor'
+import { addChild, addWatch, createTimer, inbox, message, pauseDelivery, watches } from '../server/chat/control-store'
+import { attachmentPath, sha256Of } from '../server/chat/attachments'
 import { ChatRuntime, emptyCapabilities } from '../server/chat/runtime'
-import { appendEvent, deleteSession, getSession, insertSession, resetConversation } from '../server/chat/storage'
+import { appendEvent, deleteSession, getSession, insertAttachment, insertSession, resetConversation } from '../server/chat/storage'
 import { ChatControl } from '../server/chat/control'
 
 const endpoint = 'https://poise.test/mcp'
@@ -114,7 +122,7 @@ const fetcher: typeof fetch = async (input, init) => {
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
 async function connect(login: string, serverEndpoint = endpoint,
-  options: { chatMetadata?: boolean; chatTranscript?: boolean; repository?: string; managerControls?: boolean; ownerControls?: boolean } = {}) {
+  options: { chatMetadata?: boolean; chatTranscript?: boolean; chatArtifacts?: boolean; workspaceData?: boolean; contentData?: boolean; repository?: string; managerControls?: boolean; ownerControls?: boolean } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -146,6 +154,9 @@ async function connect(login: string, serverEndpoint = endpoint,
     cookie: signedIn.apexCookie, origin: new URL(endpoint).origin, 'content-type': 'application/x-www-form-urlencoded',
   }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
     ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.chatTranscript ? { chatTranscript: '1' } : {}),
+    ...(options.workspaceData ? { workspaceData: '1' } : {}),
+    ...(options.contentData ? { contentData: '1' } : {}),
+    ...(options.chatArtifacts ? { chatArtifacts: '1' } : {}),
     ...(options.managerControls ? { managerControls: '1' } : {}),
     ...(options.ownerControls ? { ownerControls: '1' } : {}),
     ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
@@ -228,6 +239,12 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
   insertSession({ id, title: 'Fixture Chat', agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
     repo: 'Acme/Repo', checkout: '/private/checkout', branch: { name: 'main', origin: 'existing', provisional: false },
     createdAt: now, updatedAt: now, status: 'idle', capabilities: emptyCapabilities(), lastSeq: 0, pendingRequests: [], instance: 'alice-chat' })
+  const child = randomUUID(), foreignRepository = randomUUID()
+  for (const worker of [child, foreignRepository]) {
+    insertSession({ ...getSession(id)!, id: worker, title: 'Worker', role: 'worker',
+      repo: worker === child ? 'Acme/Repo' : 'Acme/Other' })
+    addChild('alice-chat', id, worker)
+  }
   const timer = createTimer('alice-chat', { sessionId: id, label: 'Fixture timer', message: 'Private timer instruction', delayMinutes: 5 },
     { kind: 'person' }, Date.now())
   const workGrant = await connect('Alice')
@@ -236,6 +253,8 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
   const matching = await connect('Alice', endpoint, { chatMetadata: true, repository: 'acme/repo' })
   const outside = await connect('Alice', endpoint, { chatMetadata: true, repository: 'acme/other' })
   const args = { kind: 'chat', id }
+  message('alice-chat', id, foreignRepository, 'Private inbox message')
+  const watch = addWatch('alice-chat', id, [child, foreignRepository], 10, 'Private watch instruction')
   const request = { name: 'poise_get', arguments: args }
   async function lookup(client: Client, kind: 'chat' | 'timer', id: string) {
     const result = await client.callTool({ name: 'poise_get', arguments: { kind, id } })
@@ -265,7 +284,12 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     expect(JSON.stringify(timerLookup)).not.toContain('Private timer instruction')
     expect(await lookup(bob.client, 'chat', id)).toMatchObject({ record: null, link: null })
     expect(await lookup(bob.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
-    expect(await lookup(matching.client, 'chat', id)).toMatchObject({ record: { id } })
+    const matchingChat = await lookup(matching.client, 'chat', id)
+    expect(matchingChat).toMatchObject({ record: { id, workerIds: [child], inbox: [{ delivery: 'pending', turnId: null, senderId: null }],
+      supervision: [{ id: watch, targetChatIds: [child] }] } })
+    expect(JSON.stringify(matchingChat)).not.toContain(foreignRepository)
+    expect(JSON.stringify(chat)).not.toContain('Private inbox message')
+    expect(JSON.stringify(chat)).not.toContain('Private watch instruction')
     expect(await lookup(matching.client, 'timer', timer.id)).toMatchObject({ record: { repository: 'Acme/Repo' } })
     expect(await lookup(outside.client, 'chat', id)).toMatchObject({ record: null, link: null })
     expect(await lookup(outside.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
@@ -276,6 +300,10 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     await matching.client.close()
     await outside.client.close()
     db.prepare('DELETE FROM chat_control_timers WHERE id = ?').run(timer.id)
+    db.prepare('DELETE FROM chat_control_children WHERE manager = ?').run(id)
+    db.prepare('DELETE FROM chat_control_inbox WHERE recipient = ?').run(id)
+    db.prepare('DELETE FROM chat_control_watches WHERE id = ?').run(watch)
+    for (const worker of [child, foreignRepository]) deleteSession(worker)
     deleteSession(id)
   }
 })
@@ -329,6 +357,47 @@ it('pages Chat records and retained transcript events with independent consent a
   } finally {
     await Promise.all([metadata.client.close(), full.client.close(), other.client.close(), scoped.client.close()])
     for (const id of [...ids, foreign, anotherRepo]) deleteSession(id)
+  }
+})
+
+it('reads only recorded artifacts with separate content permission, checkout containment and the original attachment hash', async () => {
+  const checkout = await mkdtemp(join(await realpath(tmpdir()), 'poise-mcp-artifact-'))
+  const id = randomUUID(), attachment = randomUUID(), diff = randomUUID(), privateDiff = randomUUID()
+  const now = new Date().toISOString(), body = Buffer.from('fixture uploaded text')
+  const path = attachmentPath(id, attachment, 'source.txt')
+  await mkdir(join(checkout, '.poise-chat', 'attachments', id), { recursive: true })
+  await writeFile(join(checkout, path), body)
+  insertSession({ id, title: 'Artifacts', agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
+    repo: 'Acme/Repo', checkout, branch: { name: 'main', origin: 'existing', provisional: false },
+    createdAt: now, updatedAt: now, status: 'idle', capabilities: emptyCapabilities(), lastSeq: 0, pendingRequests: [], instance: 'alice-chat' })
+  insertAttachment({ id: attachment, sessionId: id, name: 'source.txt', path, size: body.length, sha256: sha256Of(body), createdAt: now })
+  const change = { type: 'diff' as const, turnId: randomUUID(), toolId: 'fixture', oldText: 'before', newText: 'after',
+    oldExists: true, newExists: true }
+  appendEvent(id, { ...change, diffId: diff, path: join(checkout, 'source.txt') })
+  appendEvent(id, { ...change, diffId: privateDiff, path: '/outside/source.txt' })
+  const metadata = await connect('Alice', endpoint, { chatMetadata: true, chatTranscript: true })
+  const transcript = await connect('Alice', endpoint, { chatArtifacts: true, repository: 'acme/repo' })
+  const foreign = await connect('bob', endpoint, { chatArtifacts: true })
+  const request = (kind: string, artifactId: string) => ({ name: 'poise_get', arguments: { kind, id: artifactId, chatId: id } })
+  async function lookup(client: Client, kind: string, artifactId: string) {
+    const result = await client.callTool(request(kind, artifactId))
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).lookup as unknown
+  }
+  try {
+    expect((await metadata.client.callTool(request('chat-attachment', attachment))).isError).toBe(true)
+    expect(await lookup(foreign.client, 'chat-diff', diff)).toMatchObject({ record: null, link: null })
+    const found = await lookup(transcript.client, 'chat-attachment', attachment)
+    expect(found).toMatchObject({ coverage: 'complete', record: { text: body.toString(), name: 'source.txt' } })
+    expect(JSON.stringify(found)).not.toContain('.poise-chat')
+    expect(await lookup(transcript.client, 'chat-diff', diff)).toMatchObject({ coverage: 'complete', record: { path: 'source.txt', oldText: 'before', newText: 'after' } })
+    expect(await lookup(transcript.client, 'chat-diff', privateDiff)).toMatchObject({ coverage: 'partial', record: null })
+    await writeFile(join(checkout, path), Buffer.alloc(body.length, 65))
+    expect(await lookup(transcript.client, 'chat-attachment', attachment)).toMatchObject({ coverage: 'partial', record: { text: null } })
+  } finally {
+    await Promise.all([metadata.client.close(), transcript.client.close(), foreign.client.close()])
+    deleteSession(id)
+    await rm(checkout, { recursive: true, force: true })
   }
 })
 
@@ -557,7 +626,8 @@ it('reports the running workspace inventory through describe and the matching MC
   try {
     const result = await describe(client) as { inventory: { surfaces: Array<{ id: string; href: string }> } }
     const expected = [...PLACES, ...PARTS.map(id => `observe/${id}`), ...SECTIONS.map(id => `settings/${id}`),
-      ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript']
+      ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript', 'chat/artifacts',
+      ...MCP_WORKSPACE_VIEWS.map(id => 'workspace/' + id), 'workspace/caller', 'settings/link-devices']
     expect(result.inventory.surfaces.map(surface => surface.id)).toEqual(expected)
     expect(result.inventory.surfaces.every(surface => new URL(surface.href).origin === 'https://alice.poise.test')).toBe(true)
     expect(result).toMatchObject({ access: { resource: endpoint, scope: 'poise:read' }, instructions: expect.any(String),
@@ -580,6 +650,149 @@ it('reports the running workspace inventory through describe and the matching MC
       inventory: { surfaces: result.inventory.surfaces }, access: { resource: endpoint } })
     await expect(client.readResource({ uri: 'poise://workspace/bob' })).rejects.toThrow('resource not found')
   } finally { await client.close() }
+})
+
+it('keeps workspace settings consent separate and projects extension and memory metadata without stored content', async () => {
+  const scope = await connect('Alice', endpoint, { workspaceData: true })
+  const chat = await connect('Alice', endpoint, { chatMetadata: true })
+  const repository = await connect('Alice', endpoint, { chatMetadata: true, workspaceData: true, repository: 'Acme/Repo' })
+  const card = createCard('Current fixture source', 'idea', 'Acme/Repo')
+  const memory = 'fixture private memory text'
+  setMeta('chat_memories', JSON.stringify({ text: memory, revision: 12 }))
+  const extension = createExtension({ source: 'custom', name: 'fixture-extension', title: 'Fixture extension', transport: 'stdio',
+    command: 'fixture-private-command', args: ['fixture-private-arg'], auth: 'none',
+    env: [{ name: 'TOKEN', secret: true }] }, { 'env:TOKEN': 'fixture-private-token' }, { default: false, workspaces: {} })
+  const callId = 'e'.repeat(32)
+  const log = { id: callId, pr_id: '42', repo: 'Acme/Repo', actor: 'Alice', model: 'fixture', behavior: 'implement_issue',
+    session_id: null, started_at: new Date().toISOString(), time_elapsed: '0', status: 'completed', outcome: 'published',
+    head_sha: 'a'.repeat(40), expected_head: null, source: 'poise:behavior-chain', correlation_id: randomUUID(),
+    action: 'published', response: 'eeeeeeee', error: 'fixture-private-error', prompt: 'fixture-private-prompt' } satisfies agent.LogEntry
+  const calls = vi.spyOn(agent, 'fetchAgentLogById').mockResolvedValue({ entries: [log], quarantined: [] })
+  const pages = vi.spyOn(agent, 'fetchAgentLogPage')
+    .mockResolvedValueOnce({ entries: [log], quarantined: [], nextCursor: 'caller-watermark', total: 2 })
+    .mockResolvedValueOnce({ entries: [], quarantined: [], nextCursor: null, total: 2 })
+  async function view(id: string) {
+    const result = await scope.client.callTool({ name: 'poise_get', arguments: { kind: 'workspace', id } })
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).lookup as unknown
+  }
+  try {
+    for (const client of [chat.client, repository.client]) {
+      expect((await client.callTool({ name: 'poise_get', arguments: { kind: 'workspace', id: 'settings' } })).isError).toBe(true)
+    }
+    expect((await scope.client.callTool({ name: 'poise_get', arguments: { kind: 'chat', id: randomUUID() } })).isError).toBe(true)
+    expect(await view('memories')).toMatchObject({ coverage: 'complete', record: { kind: 'workspace', id: 'memories',
+      value: { revision: 12, bytes: Buffer.byteLength(memory) } } })
+    const extensions = await view('extensions')
+    expect(extensions).toMatchObject({ link: 'https://alice.poise.test/?view=settings&settings=extensions',
+      record: { value: { items: [{ name: 'fixture-extension', id: extension.id, enabledByDefault: false }] } } })
+    expect(JSON.stringify(extensions)).not.toContain('fixture-private')
+    expect(await view('settings')).toMatchObject({ coverage: 'complete', record: { value: { manager: { rhythm: expect.any(Number) } } } })
+    expect(await view('current')).toMatchObject({ coverage: 'complete', record: { value: { items: [{ id: card.id,
+      repository: 'Acme/Repo', text: 'Current fixture source' }] } } })
+    expect(await view('switchboard')).toMatchObject({ record: { value: { switchboard: null, manager: { rhythm: expect.any(Number) } } } })
+    const requestedCall = { name: 'poise_get', arguments: { kind: 'call', id: callId } }
+    expect((await repository.client.callTool(requestedCall)).isError).toBe(true)
+    const call = JSON.parse(((await scope.client.callTool(requestedCall)).content as { text: string }[])[0].text).lookup
+    expect(call).toMatchObject({ source: 'Caller retained Call log', coverage: 'complete',
+      link: 'https://alice.poise.test/api/agent-response/' + callId, record: { id: callId, repository: 'Acme/Repo',
+        invocationId: log.correlation_id, action: 'published' } })
+    expect(JSON.stringify(call)).not.toContain('fixture-private')
+    expect(calls).toHaveBeenCalledExactlyOnceWith(callId)
+    const request = { name: 'poise_list', arguments: { kind: 'call', limit: 1 } }
+    expect((await repository.client.callTool(request)).isError).toBe(true)
+    const page = JSON.parse(((await scope.client.callTool(request)).content as { text: string }[])[0].text).page
+    expect(page).toMatchObject({ coverage: 'complete', total: 2, items: [{ id: callId, link: call.link }], nextCursor: expect.any(String) })
+    expect(JSON.stringify(page)).not.toContain('fixture-private')
+    const continuation = { ...request, arguments: { ...request.arguments, cursor: page.nextCursor } }
+    await scope.client.callTool(continuation)
+    expect(pages.mock.calls).toEqual([[1, null], [1, 'caller-watermark']])
+    const inventory = await describe(scope.client)
+    expect(inventory).toMatchObject({ inventory: { surfaces: expect.arrayContaining([
+      expect.objectContaining({ id: 'settings', status: 'available' }),
+      expect.objectContaining({ id: 'chat', status: 'unavailable' }),
+    ]) } })
+    const mcp = { resource: endpoint, handle: 'alice', ownerId: 1001, grantId: randomUUID(), workspaceData: true as const, repository: 'Acme/Repo' }
+    const identity = signAssertion(h.keys.privateKey, { handle: 'alice', login: 'Alice', scope: 'mcp', mcp }, Date.now())
+    const direct = await send(workspacePort, { host: 'alice.poise.test', path: '/api/mcp/read', method: 'POST',
+      headers: { 'x-poise-identity': identity, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'poise_get', arguments: { kind: 'workspace', id: 'settings' } }) })
+    expect(direct.status).toBe(401)
+  } finally {
+    pages.mockRestore()
+    calls.mockRestore()
+    deleteExtension(extension.id)
+    removeCard(card.id)
+    db.prepare('DELETE FROM meta WHERE key = ?').run('chat_memories')
+    await Promise.all([scope.client.close(), chat.client.close(), repository.client.close()])
+  }
+})
+
+it('reports the source cohort and partial daily Analytics and Behavior estimates through the running inventory', async () => {
+  const scope = await connect('Alice', endpoint, { workspaceData: true })
+  const runningCall = { id: 'f'.repeat(32), behavior: 'implement_issue', model: 'fixture', status: 'running',
+    started_at: new Date(Date.now() - 2000).toISOString() } as agent.LogEntry
+  const samples = Array.from({ length: 5 }, (_, index) => ({ ...runningCall, id: (index + 1).toString(16).repeat(32), status: 'completed',
+    started_at: new Date(Date.now() - 60_000).toISOString(), completed_at: new Date(Date.now() - 25_000).toISOString() }))
+  const running = vi.spyOn(agent, 'fetchRunningAgentLogSnapshot').mockResolvedValue({ entries: [runningCall], quarantined: [] })
+  const history = vi.spyOn(agent, 'fetchAgentLogSnapshot').mockResolvedValue({ entries: samples, quarantined: [] })
+  const daily = vi.spyOn(analytics, 'readAnalyticsHistory').mockResolvedValue({ periods: [], errors: [{ org: 'Fixture', error: 'private source error' }] })
+  const key = 'mcp-staged-review'
+  const target = { pullRequest: 'https://github.com/Acme/Repo/pull/14' }
+  raiseAlert({ kind: 'review_requested', dedupeKey: key, title: 'Review requested', body: 'Fixture request', path: '/?view=overview', target })
+  async function read(id: string) {
+    const response = await scope.client.callTool({ name: 'poise_get', arguments: { kind: 'workspace', id } })
+    expect(response.isError).not.toBe(true)
+    return JSON.parse((response.content as { text: string }[])[0].text).lookup
+  }
+  try {
+    const analyticsHistory = await read('analytics-history')
+    expect(analyticsHistory).toMatchObject({ coverage: 'partial', record: { value: { unavailableOrganizations: ['Fixture'] } } })
+    expect(JSON.stringify(analyticsHistory)).not.toContain('private source error')
+    const [bounds] = daily.mock.calls[0]
+    expect(bounds).toHaveLength(8)
+    expect(Date.parse(bounds[7]) - Date.parse(bounds[0])).toBe(7 * 86_400_000)
+    expect(bounds.every(bound => bound.endsWith('T00:00:00.000Z'))).toBe(true)
+    expect(await read('behavior-estimates')).toMatchObject({ coverage: 'complete', record: { value: {
+      items: [{ id: runningCall.id, estimate: { samples: 5, remainingMs: expect.any(Number) } }], cohort: { minimumSamples: 5 },
+    } } })
+    expect(await read('notices')).toMatchObject({ record: { value: {
+      items: expect.arrayContaining([expect.objectContaining({ kind: 'review_requested', target })]),
+    } } })
+  } finally {
+    running.mockRestore()
+    history.mockRestore()
+    daily.mockRestore()
+    resolveAlert(key)
+    await scope.client.close()
+  }
+})
+
+it('uses independent workspace content consent for typed Editor pages and exact document versions', async () => {
+  const docs = await connect('Alice', endpoint, { contentData: true })
+  const operations = await connect('Alice', endpoint, { workspaceData: true })
+  const other = await connect('Alice', endpoint, { contentData: true })
+  const first = await writeDoc('fixture-one', '# First working note\nCurrent evidence')
+  await writeDoc('fixture-two', '# Second working note\nMore evidence')
+  const call = async (client: Client, name: string, args: Record<string, unknown>) => {
+    const result = await client.callTool({ name, arguments: args })
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text) as { page: { nextCursor: string }; lookup: unknown }
+  }
+  try {
+    const args = { kind: 'document', id: first.slug }
+    expect((await operations.client.callTool({ name: 'poise_get', arguments: args })).isError).toBe(true)
+    const detail = await call(docs.client, 'poise_get', args)
+    expect(detail.lookup).toMatchObject({ coverage: 'complete', link: 'https://alice.poise.test/?view=editor&doc=fixture-one',
+      record: { id: first.slug, value: { version: first.version, text: '# First working note\nCurrent evidence', publications: [] } } })
+    const page = await call(docs.client, 'poise_list', { kind: 'document', limit: 1 })
+    expect(page.page).toMatchObject({ items: [{ slug: 'fixture-one' }], nextCursor: expect.any(String) })
+    expect((await call(docs.client, 'poise_list', { kind: 'document', limit: 1, cursor: page.page.nextCursor })).page)
+      .toMatchObject({ items: [{ slug: 'fixture-two' }], nextCursor: null })
+    await expect(other.client.callTool({ name: 'poise_list', arguments: { kind: 'document', limit: 1, cursor: page.page.nextCursor } })).rejects.toThrow()
+  } finally {
+    await Promise.all([docs.client.close(), operations.client.close(), other.client.close(), deleteDoc('fixture-one'), deleteDoc('fixture-two')])
+  }
 })
 
 it('keeps a consented repository restriction at the gateway and signed workspace boundary after refresh', async () => {
@@ -749,7 +962,7 @@ conn.close()
       $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
       mcpServers: { poise: { type: 'streamable-http', url: endpoint } },
     })
-    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.2.0' })
+    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.3.0' })
     expect(JSON.parse(await readFile(join(bundle, '.agents/plugins/marketplace.json'), 'utf8')).plugins[0].source).toEqual({ source: 'local', path: './plugins/poise' })
     expect(await readFile(join(bundle, 'plugins/poise/skills/poise-manager/SKILL.md'), 'utf8')).toBe(await readFile('plugins/poise/skills/poise-manager/SKILL.md', 'utf8'))
     await expect(packagePoisePlugin('https://poise.test', bundle)).rejects.toThrow('EEXIST')

@@ -1,5 +1,7 @@
+import { MCP_WORKSPACE_VIEWS, type McpWorkspaceView } from '../gateway/src/mcp-contract'
 import { PARTS, PLACES, SECTIONS, placeHref, type Part, type Place, type Section } from '../src/ui/address'
 import { listCapabilities, type Capability } from './capabilities'
+import { workspaceViewSurface } from './mcp-workspace-views'
 import { runningRelease } from './running-release'
 
 interface Surface {
@@ -8,6 +10,13 @@ interface Surface {
   retention: string
   permission: string
   tool?: 'poise_work' | 'poise_get' | 'poise_list' | 'poise_changes'
+  requiresWorkspace?: true
+  requiresChat?: true
+  requiresChatList?: true
+  requiresChatTranscript?: true
+  requiresChatArtifacts?: true
+  requiresOperator?: true
+  requiresContent?: true
   reason: string
 }
 
@@ -15,51 +24,61 @@ const work: Surface = { kind: 'issue-work', source: 'GitHub mirror, chain journa
   retention: 'Current mirror rows and retained chain and ledger records', permission: 'Workspace work-trail grant',
   tool: 'poise_work', reason: 'Exact issues and bounded repository label pages' }
 const chat: Surface = { kind: 'chat', source: 'Chat sessions and timers', retention: 'Stored sessions and live timers',
-  permission: 'Chat metadata consent', tool: 'poise_get', reason: 'Exact Chat or live timer metadata' }
+  permission: 'Chat metadata consent', tool: 'poise_get', requiresChat: true, reason: 'Exact Chat or live timer metadata' }
+function workspace(id: McpWorkspaceView): Surface {
+  const { kind, source, retention, permission, tool, reason } = workspaceViewSurface(id)
+  return { kind, source, retention, permission, tool, reason, requiresWorkspace: true }
+}
 const browser = (kind: string, source: string, retention: string, reason: string): Surface =>
   ({ kind, source, retention, permission: 'Workspace browser session', reason })
 
 const places = {
-  overview: browser('overview', 'Notices, requests and work activity', 'Current and retained notices', 'Overview summary reads are pending'),
+  overview: workspace('notices'),
   board: work,
   chat,
   manager: { ...chat, reason: 'Exact Manager Chat metadata' },
-  editor: browser('document', 'Editor versions, reviews and publication bindings', 'Current document and retained versions', 'Document reads are pending'),
+  editor: { kind: 'document', source: 'Editor, publication ledger and cached reviews', retention: 'Current document and retained publication versions',
+    permission: 'Workspace content consent', tool: 'poise_list', requiresContent: true, reason: 'Resumable document list and exact document contents' },
   observe: work,
-  settings: browser('settings', 'Workspace settings and readiness', 'Current effective configuration', 'Settings reads are pending'),
+  settings: workspace('settings'),
 } satisfies Record<Place, Surface>
 
 const parts = {
   tasks: work,
-  behaviors: { ...work, reason: 'Issue-targeted chain receipts' },
+  behaviors: workspace('behaviors'),
   github: { ...work, reason: 'Issue mirror and recorded PR observations' },
-  logging: browser('logging', 'Gateway Logging and workspace diagnostic evidence', 'Source retention and coverage windows', 'Logging reads are pending'),
+  logging: { kind: 'logging', source: 'Gateway Logging', retention: 'Configured retention and recorded source gaps',
+    permission: 'Workspace settings and operational data consent', tool: 'poise_list', requiresWorkspace: true,
+    reason: 'Bounded workspace diagnostics with exact events and changes' },
 } satisfies Record<Part, Surface>
 
 const settings = {
-  general: browser('settings', 'Workspace configuration and release state', 'Current applied configuration', 'General settings reads are pending'),
-  accounts: browser('accounts', 'Connected account readiness and device state', 'Current account and live device state', 'Account reads are pending'),
-  models: browser('models', 'Model catalog and provider readiness', 'Latest model checks', 'Model reads are pending'),
-  extensions: browser('extensions', 'Workspace extension registrations', 'Current registrations', 'Extension metadata reads are pending'),
-  publishing: browser('publishing', 'Editor publication bindings', 'Current bindings and retained reviews', 'Publishing reads are pending'),
-  behaviors: browser('behavior-settings', 'Configured Behaviors and policy', 'Current applied settings', 'Behavior settings reads are pending'),
-  snippets: browser('snippets', 'Scoped workspace snippets', 'Current snippets', 'Snippet reads are pending'),
-  admin: { ...browser('infrastructure', 'Gateway operator diagnostics', 'Current health and retained diagnostic windows',
-    'Operator-only surface'), permission: 'Instance admin' },
+  general: workspace('settings'),
+  accounts: workspace('accounts'),
+  models: workspace('models'),
+  extensions: workspace('extensions'),
+  publishing: { kind: 'document', source: 'Editor publication bindings', retention: 'Current bindings and retained publication versions',
+    permission: 'Workspace content consent', tool: 'poise_get', requiresContent: true, reason: 'Exact document includes publication bindings' },
+  behaviors: workspace('behaviors'),
+  snippets: workspace('snippets'),
+  admin: { kind: 'instance-logging', source: 'Gateway operator diagnostics', retention: 'Current health and retained diagnostic windows',
+    permission: 'Instance admin', tool: 'poise_list', requiresOperator: true, reason: 'Separately consented instance Logging' },
   style: browser('style', 'Local browser preferences', 'Current browser preferences', 'Browser-local interface settings'),
   manager: { ...chat, kind: 'manager-timer', reason: 'Exact live Manager wake timer' },
 } satisfies Record<Section, Surface>
 
 const capabilities = {
   'held-reasons': { ...work, reason: 'Recorded issue-chain blocker' },
-  'review-requests': browser('review-request', 'Owner review requests', 'Current pending requests', 'Review request reads are pending'),
+  'review-requests': { ...workspace('notices'), reason: 'Current review_requested notices include the exact pull request' },
   'approve-merge': browser('approval', 'GitHub approval and merge controls', 'Current head and recorded receipts', 'Interactive approval control'),
   'behavior-pause': browser('behavior-control', 'Behavior runtime policy', 'Current applied pause', 'Interactive behavior policy control'),
   'organization-unfollow': browser('organization', 'Followed GitHub accounts', 'Current configured accounts', 'Interactive account control'),
-  'behavior-estimates': browser('estimate', 'Caller evidence and behavior timing', 'Retained timing history', 'Estimate reads are pending'),
-  'chat-requests': browser('chat-request', 'Chat owner requests', 'Current pending requests', 'Chat request reads are pending'),
-  'handled-log': browser('handling-event', 'Retained handling activity', 'Handling history retention', 'Handling history reads are pending'),
-  'publication-reviews': browser('publication-review', 'Editor review records', 'Retained publication reviews', 'Publication review reads are pending'),
+  'behavior-estimates': workspace('behavior-estimates'),
+  'chat-requests': { ...chat, kind: 'chat-request', source: 'Chat owner requests', retention: 'Current pending requests',
+    reason: 'Exact Chat includes its pending owner requests' },
+  'handled-log': workspace('handling'),
+  'publication-reviews': { kind: 'document', source: 'Cached publication reviews', retention: 'Retained publication reviews',
+    permission: 'Workspace content consent', tool: 'poise_get', requiresContent: true, reason: 'Exact document and retained review metadata' },
   'settings-conflict': browser('settings-conflict', 'Browser settings version check', 'Current settings version', 'Interactive settings conflict'),
 } satisfies Record<Capability, Surface>
 
@@ -87,9 +106,19 @@ export function mcpInventory() {
       ...SECTIONS.map(id => entry(`settings/${id}`, placeHref('settings', { settings: id }), settings[id])),
       ...listCapabilities().map(id => entry(`capability/${id}`, capabilityLinks[id], capabilities[id])),
       entry('chat/sessions', placeHref('chat'), { ...chat, retention: 'Current and archived sessions',
-        tool: 'poise_list', reason: 'Indexed pages by repository and update time' }),
+        tool: 'poise_list', requiresChatList: true, reason: 'Indexed pages by repository and update time' }),
       entry('chat/transcript', placeHref('chat'), { kind: 'chat-event', source: 'Retained Chat journal', retention: 'Events since the last context reset',
-        permission: 'Chat transcript consent', tool: 'poise_changes', reason: 'Resumable transcript pages by stored sequence' }),
+        permission: 'Chat transcript consent', tool: 'poise_changes', requiresChatTranscript: true, reason: 'Resumable transcript pages by stored sequence' }),
+      entry('chat/artifacts', placeHref('chat'), { kind: 'chat-artifact', source: 'Recorded Chat attachments and diffs',
+        retention: 'Retained upload records and journal events', permission: 'Separate Chat artifact consent',
+        tool: 'poise_get', requiresChatArtifacts: true, reason: 'Exact artifact ID under the owning Chat' }),
+      ...MCP_WORKSPACE_VIEWS.map(id => ({ id: 'workspace/' + id, ...workspaceViewSurface(id) })),
+      entry('workspace/caller', placeHref('observe', { part: 'tasks' }), { ...workspace('behaviors'), kind: 'call',
+        tool: 'poise_list', source: 'Caller retained Call log and Behavior chain journal', retention: 'Retained Call and invocation records',
+        reason: 'Paged Caller archive and exact Call or invocation reads with settlement and quarantine coverage' }),
+      entry('settings/link-devices', placeHref('settings', { settings: 'link' }), {
+        ...workspace('accounts'), kind: 'gateway', source: 'Gateway Poise Link device inventory',
+        retention: 'Current and retained pairings', reason: 'Exact link-devices snapshot' }),
     ],
   }
 }
