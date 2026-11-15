@@ -15,6 +15,7 @@ export interface HistoryRow {
   author: string
   state: string
   owner: string | null
+  createdAt: string
   updatedAt: string
   mergedAt: string | null
   branch: string | null
@@ -31,6 +32,7 @@ export function readRecord(value: unknown): HistoryRow | null {
     // Merged collapses to closed; merged_at tells them apart.
     state: r.state === 'merged' ? 'closed' : String(r.state ?? ''),
     owner: typeof r.owner_login === 'string' && r.owner_login ? r.owner_login : null,
+    createdAt: typeof r.created_at === 'string' ? r.created_at : '',
     updatedAt: typeof r.updated_at === 'string' ? r.updated_at : '', mergedAt: typeof r.merged_at === 'string' ? r.merged_at : null,
     branch: typeof r.branch === 'string' ? r.branch : null, event: typeof r.event === 'string' ? r.event : null,
   }

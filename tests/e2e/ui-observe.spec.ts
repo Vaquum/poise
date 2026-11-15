@@ -9,6 +9,7 @@ import type { ChainNudge } from '../../src/behavior-chain-nudge'
 // no chains, runs, history or diagnostics, so each test serves them here.
 
 const NOW = Date.now()
+const HISTORY_NOW = Date.parse('2026-11-13T12:00:00Z')
 const minutes = (n: number) => n * 60_000
 const iso = (at: number) => new Date(at).toISOString()
 const hex = (length: number, seed: string) => seed.repeat(length).slice(0, length)
@@ -141,9 +142,15 @@ async function serveHistory(page: Page): Promise<void> {
   await page.route((url) => url.pathname === '/api/gh', (route) => {
     const body = route.request().postDataJSON() as { operation: string, record_type?: string, count_only?: boolean }
     const record = (kind: string, number: number, title: string, state: string) => ({ kind, repo: 'acme/site', number, title, url: `https://github.com/acme/site/${kind === 'pr' ? 'pull' : kind === 'issue' ? 'issues' : 'actions/runs'}/${number}`,
-      author: 'me', state, owner_login: null, owner_avatar: null, updated_at: iso(NOW - minutes(number % 50)), merged_at: null, branch: kind === 'action' ? 'main' : undefined })
+      author: 'me', state, owner_login: null, owner_avatar: null, created_at: kind === 'action' ? undefined : iso(HISTORY_NOW - minutes(number % 50 + 5)),
+      updated_at: iso(HISTORY_NOW - minutes(number % 50)), merged_at: null, branch: kind === 'action' ? 'main' : undefined })
     const records = body.operation === 'actions' ? [record('action', 9121, 'CI · browser shard 3', 'failure')]
-      : body.record_type === 'pull_request' ? [record('pr', 496, 'Settings: say which slot a place runs', 'open')] : [record('issue', 495, 'Settings: say which slot a place runs', 'open')]
+      : body.record_type === 'pull_request' ? [
+        record('pr', 496, 'Settings: say which slot a place runs', 'open'),
+        { ...record('pr', 494, 'A merged PR', 'merged'), created_at: iso(HISTORY_NOW - minutes(90)), merged_at: iso(HISTORY_NOW - minutes(44)) },
+        { ...record('pr', 493, 'A PR without its opening time', 'open'), created_at: undefined },
+        { ...record('pr', 492, 'A PR with an invalid opening time', 'closed'), created_at: 'not a date' },
+      ] : [record('issue', 495, 'Settings: say which slot a place runs', 'open')]
     return route.fulfill({ json: body.count_only ? { count: records.length, errors: [] } : { records, count: records.length, errors: [] } })
   })
 }
@@ -586,12 +593,45 @@ test('a detail whose run ends while its response read is pending rereads without
 })
 
 test('a GitHub link opens its row, widening the filters for that visit only', async ({ page }) => {
-  await page.addInitScript(() => { localStorage.setItem('poise-observe-github', JSON.stringify({ types: ['action'], ci: 'failed', status: 'open', time: 'today' })) })
+  await page.clock.install({ time: HISTORY_NOW })
+  await page.clock.pauseAt(HISTORY_NOW + 1000)
+  await page.addInitScript(() => {
+    localStorage.setItem('poise-observe-github', JSON.stringify({ types: ['action'], ci: 'failed', status: 'open', time: 'today' }))
+    localStorage.setItem('poise-refresh-rate', '5m')
+  })
+  let historyReads = 0
+  page.on('request', (request) => { if (new URL(request.url()).pathname === '/api/gh') historyReads++ })
   await open(page, '/?view=observe&part=github&item=acme/site%23496')
   const github = page.locator('[data-panel="github"]')
-  await expect(github.locator('tr[data-key="acme/site#496"]')).toBeVisible()
-  await expect(github.locator('tr[data-key="acme/site#496"] [data-ref="gh.board"]')).toHaveAttribute('href', '?view=board&item=acme%2Fsite%23496&back=observe')
+  const pr = github.locator('tr[data-key="acme/site#496"]')
+  await expect(pr).toBeVisible()
+  await expect(pr.locator('[data-ref="gh.board"]')).toHaveAttribute('href', '?view=board&item=acme%2Fsite%23496&back=observe')
   expect(JSON.parse(await page.evaluate(() => localStorage.getItem('poise-observe-github') ?? '{}'))).toEqual({ types: ['action'], ci: 'failed', status: 'open', time: 'today' })
+  await expect(github.getByRole('columnheader')).toHaveText(['Kind', 'Title', 'Author', 'Org', 'Repo', 'Owner / Branch', 'Status', 'Opened', 'Updated', 'Review and Board'])
+  await expect(github.locator('[data-ar-count]')).toHaveText('6 of 6')
+  // Finish the link's focus repaint before testing the independent relative-time tick.
+  await page.clock.runFor(2000)
+  await expect(github.locator('tbody [data-opened]')).toHaveText(['—', '—', '—', '1h', '—', '51m'])
+  await expect(github.locator('tr[data-key="acme/site#494"] [data-ref="gh.state"]')).toHaveText('Merged')
+  const opened = pr.locator('[data-opened]')
+  const updated = pr.locator('[data-updated]')
+  const openedExact = 'Friday 13 November 2026 at 11:09:00 UTC'
+  const updatedExact = 'Friday 13 November 2026 at 11:14:00 UTC'
+  await expect(updated).toHaveText('46m')
+  await expect(opened).toHaveAttribute('data-help', openedExact)
+  await expect(updated).toHaveAttribute('data-help', updatedExact)
+  for (const [cell, exact] of [[opened, openedExact], [updated, updatedExact]] as const) {
+    await cell.hover()
+    await page.clock.runFor(600)
+    await expect(page.getByRole('tooltip')).toContainText(exact)
+  }
+  const reads = historyReads
+  await page.clock.fastForward(60_000)
+  await expect(github.locator('tbody [data-opened]')).toHaveText(['—', '—', '—', '1h', '—', '52m'])
+  await expect(updated).toHaveText('47m')
+  await expect(opened).toHaveAttribute('data-help', openedExact)
+  await expect(updated).toHaveAttribute('data-help', updatedExact)
+  expect(historyReads).toBe(reads)
 })
 
 for (const width of [375, 768, 1000]) {
