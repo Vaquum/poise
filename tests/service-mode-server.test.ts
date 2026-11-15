@@ -531,6 +531,7 @@ describe('Poise in service mode', () => {
       ['/api/chat-content', { topic: 'Release notes', session: 'chat-1' }],
       ['/api/debate', { topic: 'Ship it?' }],
       ['/api/models/refresh', {}],
+      ['/api/storage/maintenance', { dryRun: true }],
     ] as const) {
       expect(await send('POST', path, fromGateway(), body), path).toMatchObject({ status: 503, json: { error: 'Poise is installing an update; try again after it restarts', code: 'draining' } })
     }
@@ -642,6 +643,32 @@ describe('Poise in service mode', () => {
     expect((await send('POST', '/api/service/drain', fromGateway('browser'))).status).toBe(403)
     expect(await send('POST', '/api/service/resume', fromGateway('browser'))).toMatchObject({ status: 200, json: { draining: false } })
     expect((await send('POST', '/api/service/resume', fromGateway('link'))).status).toBe(403)
+  })
+
+  it('counts Settings maintenance before the request body is complete', async () => {
+    await vi.waitFor(async () => expect((await send('GET', '/api/service/health')).json.idle).toBe(true))
+    const browser = fromGateway()
+    const body = JSON.stringify({ dryRun: true })
+    const arrived = new Promise<void>(resolve => { server.once('request', () => resolve()) })
+    let request!: ReturnType<typeof httpRequest>
+    const response = new Promise<number | undefined>((resolve, reject) => {
+      request = httpRequest({ host: '127.0.0.1', port, method: 'POST', path: '/api/storage/maintenance', agent: false,
+        headers: { host: PUBLIC_HOST, origin: browser.origin!, 'x-test-peer': browser.peer!,
+          'x-poise-identity': browser.identity!, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+      }, res => { res.resume(); res.once('end', () => resolve(res.statusCode)) })
+      request.once('error', reject)
+      request.write(body.slice(0, 1))
+    })
+    try {
+      await arrived
+      expect(await send('POST', '/api/service/drain', fromGateway('admin'))).toMatchObject({ status: 200,
+        json: { draining: true, backgroundWork: 1, idle: false },
+      })
+    } finally {
+      request.end(body.slice(1))
+      try { expect(await response).toBe(200) }
+      finally { await send('POST', '/api/service/resume', fromGateway('admin')) }
+    }
   })
 
   it('answers and closes an upgrade that nothing serves', async () => {
@@ -913,12 +940,14 @@ describe('Poise in service mode', () => {
     const records = process.env.AGENT_INTERFACE_DATA_DIR!
     await mkdir(records, { recursive: true })
     const receipts = new Database(join(records, 'calls.sqlite3'))
-    receipts.exec('CREATE TABLE calls (id TEXT, status TEXT, pid INTEGER, runner TEXT, source TEXT, resources_settled_at REAL, resource_cleanup TEXT, artifact TEXT)')
+    receipts.exec(`CREATE TABLE calls (id TEXT, status TEXT, pid INTEGER, runner TEXT, source TEXT,
+      resources_settled_at REAL, resource_cleanup TEXT, artifact TEXT, correlation_id TEXT, resource_ownership TEXT)`)
     const originalArtifact = JSON.stringify({ outcome: 'completed', head_sha: 'b'.repeat(40) })
-    receipts.prepare('INSERT INTO calls VALUES (?, ?, NULL, NULL, ?, NULL, ?, ?)')
+    receipts.prepare('INSERT INTO calls VALUES (?, ?, NULL, NULL, ?, NULL, ?, ?, NULL, NULL)')
       .run('a'.repeat(32), 'completed', 'poise:behavior-chain', JSON.stringify({ token: 'original-claim' }), originalArtifact)
     const heldReceipt = { id: 'a'.repeat(32), status: 'completed', pid: null, runner: null, source: 'poise:behavior-chain',
-      resources_settled_at: null, resource_cleanup: JSON.stringify({ token: 'original-claim' }), artifact: originalArtifact }
+      resources_settled_at: null, resource_cleanup: JSON.stringify({ token: 'original-claim' }), artifact: originalArtifact,
+      correlation_id: null, resource_ownership: null }
     const resource = join(records, 'native-resources', 'a'.repeat(32))
     await mkdir(resource, { recursive: true })
     await writeFile(join(resource, 'owned'), 'original cleanup work')
@@ -926,7 +955,6 @@ describe('Poise in service mode', () => {
     const releaseCaller = join(root, 'release-surviving-caller')
     await writeFile(hold, '')
     vi.stubEnv('POISE_NATIVE_CONTROL', '{}')
-    maintenance.startStorageMaintenanceRuntime()
     await spawnDetached(join(bin, 'agent-interface'), ['--wait', releaseCaller])
     const exit = vi.fn((code: number) => ({ code, resourcePresent: existsSync(resource), receipt: receipts.prepare('SELECT * FROM calls').get(),
       databaseOpen: db.open, runningCallerCalls: runningCallerCalls().count }))
@@ -938,7 +966,11 @@ describe('Poise in service mode', () => {
     const service = new ServiceControl(getChatRuntime(), { releasesDir: releases, release: { name: 'old', base: 'same-base' },
       drainTimeoutSeconds: 1800, canRestart: () => true, restart: () => { shutdown(75); return true } })
     try {
-      await vi.waitFor(() => expect(existsSync(join(root, 'cleanup-started'))).toBe(true))
+      try {
+        expect(service.drain()).toMatchObject({ draining: true, unsettledNativeCalls: 1, idle: false })
+        maintenance.startStorageMaintenanceRuntime()
+        await vi.waitFor(() => expect(existsSync(join(root, 'cleanup-started'))).toBe(true))
+      } finally { service.resume() }
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
       service.switchRelease('new')
       // Longer than production's unchanged shutdown budget, with the actual
