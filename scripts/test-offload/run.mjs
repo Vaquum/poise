@@ -471,20 +471,14 @@ async function main(args) {
       let upload = null
       let uploadError = null
       const pytestFailure = callerPytest ? callerPytestFailure() : null
+      let evidence = null
       const read = frameReader((type, payload) => {
         if (type === FRAME.stdout || type === FRAME.stderr) pytestFailure?.write(type, payload)
         if (type === FRAME.stdout) process.stdout.write(payload)
         else if (type === FRAME.stderr) process.stderr.write(payload)
         else if (type === FRAME.exit) exitCode = Number(payload.toString())
         else if (type === FRAME.evidence && binding && process.env.POISE_TEST_EVIDENCE_DIR && payload.length <= 48 * 1024) {
-          // Only the gateway can authenticate this receipt. Caller checks it
-          // independently and retains it before reclaiming this directory.
-          try {
-            writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, `${id}.json`), payload, { flag: 'wx', mode: 0o600 })
-          } catch (error) {
-            // A failed receipt must not replace the suite's genuine exit with a no-result handoff.
-            say(`assertion recovery evidence could not be retained: ${error.message}`)
-          }
+          evidence = payload
         }
         else if (type === FRAME.fail) failure = { code: payload[0], message: payload.subarray(1).toString() }
         else if (type === FRAME.ready && !upload) {
@@ -510,6 +504,15 @@ async function main(args) {
         clearInterval(lease)
         controller.abort()
         await upload
+      }
+      // Receipt delivery can precede exit. An interrupted stream cannot
+      // leave a completed receipt for Caller.
+      if (!ending && !failure && exitCode === 1 && evidence) {
+        try {
+          writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, id + '.json'), evidence, { flag: 'wx', mode: 0o600 })
+        } catch (error) {
+          say('assertion recovery evidence could not be retained: ' + error.message)
+        }
       }
       current = null
       if (failure?.code === 143) { finish(143); return }

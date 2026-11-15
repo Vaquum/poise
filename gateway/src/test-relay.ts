@@ -1,10 +1,12 @@
 import { createHash, createPublicKey, sign, randomBytes, timingSafeEqual, verify, type KeyObject } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createRequire } from 'node:module'
 import type { Writable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { createGunzip } from 'node:zlib'
 import type { Logger } from './log.js'
+import { redact } from './diagnostics/redaction.mjs'
 import { TestDependencyCache } from './test-dependency-cache.js'
 
 /**
@@ -60,6 +62,7 @@ interface Run {
     capture?: { candidate: string; spec: string } }
   /** What a job presents. */
   token: string
+  collectorToken: string | null
   created: number
   lease: number
   /** A sandbox's ID, or a job's. */
@@ -123,9 +126,14 @@ const NO_RESULT = /\[poise\] no test result: (.*?)\. This says nothing/
 const TREE_PATH = '/tmp/poise-tree'
 const SPEC_PATH = '/tmp/poise-spec.json'
 const EVIDENCE_BYTES = 48 * 1024
-const EVIDENCE_DOMAIN = 'poise completed test assertions\n'
+const EVIDENCE_DOMAIN = 'poise completed test assertions v2\n'
+const { assertionTarget } = createRequire(import.meta.url)('./test-box.cjs') as {
+  assertionTarget: (argv: string[]) => string | null
+}
 const SCRIPT_PATH = '/tmp/poise-box.cjs'
 const SETUP_PATH = '/tmp/poise-setup.sh'
+const ASSERTION_PACKAGE_PATH = '/tmp/poise-assertion-package.json'
+const ASSERTION_LOCK_PATH = '/tmp/poise-assertion-lock.json'
 export const BOX_COMMAND = `node ${SCRIPT_PATH} ${SPEC_PATH} ${TREE_PATH}`
 export const SETUP_COMMAND = `sh ${SETUP_PATH}`
 
@@ -251,6 +259,8 @@ export class TestRelay {
   private timer: NodeJS.Timeout | null = null
   private lastRenderSweep = 0
   private base: Promise<{ group: string; snapshot: string }> | null = null
+  private readonly assertionPackage = readFileSync(new URL('../package.json', import.meta.url))
+  private readonly assertionLock = readFileSync(new URL('../package-lock.json', import.meta.url))
   private group: string | null = null
   private builder: string | null = null
 
@@ -392,7 +402,8 @@ export class TestRelay {
     const group = groups.find((item) => item.sandboxGroup.name === name)?.sandboxGroup.id
       ?? (await this.render<{ id: string }>('POST', '/sandbox-groups', { name, ownerId: this.deps.config.workspace, region: 'oregon' })).id
     this.group = group
-    const snapshot = `box-${createHash('sha256').update(this.setupScript).digest('hex').slice(0, 32)}`
+    const snapshotHash = createHash('sha256').update(this.setupScript).update(this.assertionPackage).update(this.assertionLock)
+    const snapshot = `box-${snapshotHash.digest('hex').slice(0, 32)}`
     const listed = await this.render<{ snapshot: { name: string; expiresAt?: string | null } }[]>('GET', `/sandbox-groups/${group}/snapshots?${this.owner}&status=available&limit=100`)
     const renewBy = this.deps.now() + SNAPSHOT_RENEW_MS
     const usable = listed.some((item) => item.snapshot.name === snapshot && (!item.snapshot.expiresAt || Date.parse(item.snapshot.expiresAt) > renewBy))
@@ -407,6 +418,8 @@ export class TestRelay {
     try {
       await this.boxRunning(box.id)
       await this.uploadTo(box.id, SETUP_PATH, new Blob([new Uint8Array(this.setupScript)]))
+      await this.uploadTo(box.id, ASSERTION_PACKAGE_PATH, new Blob([new Uint8Array(this.assertionPackage)]))
+      await this.uploadTo(box.id, ASSERTION_LOCK_PATH, new Blob([new Uint8Array(this.assertionLock)]))
       let tail = ''
       const code = await this.exec(box.id, SETUP_COMMAND, (_stream, data) => { tail = (tail + data).slice(-1_000) })
       if (code !== 0) throw new RelayError(502, `setting up the test box failed with exit code ${code}: ${tail}`)
@@ -560,9 +573,12 @@ export class TestRelay {
     }
     const now = this.deps.now()
     // A job costs less, and moves its suite to a sandbox once it reaches for Docker; a checkout known to do so goes there at once.
-    const job = this.deps.config.baseService !== null && spec.docker !== true && !this.dockerRepos.has(`${handle} ${spec.repo}`)
+    const collect = spec.capture && assertionTarget(spec.argv)
+    const job = !collect && this.deps.config.baseService !== null && spec.docker !== true && !this.dockerRepos.has(`${handle} ${spec.repo}`)
     const run: Run = {
-      id: randomBytes(16).toString('hex'), handle, spec, token: randomBytes(32).toString('hex'), created: now, lease: now, boxId: null, job, boxCreated: 0, ready: false, output: null, tree: null, received: 0, parts: 0, uploading: false, assertions: null,
+      id: randomBytes(16).toString('hex'), handle, spec, token: randomBytes(32).toString('hex'),
+      collectorToken: collect ? randomBytes(32).toString('hex') : null,
+      created: now, lease: now, boxId: null, job, boxCreated: 0, ready: false, output: null, tree: null, received: 0, parts: 0, uploading: false, assertions: null,
     }
     this.runs.set(run.id, run)
     return run
@@ -595,17 +611,16 @@ export class TestRelay {
     return run.job && timingSafeEqual(digest(bearer(req)), digest(run.token))
   }
 
-  private runnerSpec(run: Run): Run['spec'] {
-    // Held for #1619: no report credential leaves the gateway, so candidate code reading spec.json cannot POST fabricated assertions.
-    return { ...run.spec }
+  private runnerSpec(run: Run) {
+    return { ...run.spec, reportTo: run.collectorToken && !run.job ? {
+      url: this.deps.origin(run.handle) + TEST_RELAY_PATH + '/runs/' + run.id + '/assertions',
+      token: run.collectorToken,
+    } : undefined }
   }
 
-  /** Only an authenticated runner result followed by its genuine completed
-   * failure can produce this receipt. Stream text and canceled runs cannot.
-   * Held for #1619: POST assertions never stores, so run.assertions stays null and this never emits.
-   */
-  private retainAssertions(run: Run, code: number, noResult: unknown): void {
-    if (code !== 1 || noResult || !run.assertions) return
+  private retainAssertions(run: Run, code: number): void {
+    if (code !== 1 || !run.assertions || this.deps.now() - run.created >= this.deps.config.limitSeconds * 1000
+      || this.deps.now() - run.lease >= (this.deps.leaseMs ?? LEASE_MS)) return
     const payload = JSON.stringify({ ...run.assertions, handle: run.handle, run: run.id })
     const signature = sign(null, Buffer.from(EVIDENCE_DOMAIN + payload), this.deps.privateKey).toString('base64url')
     const receipt = Buffer.from(JSON.stringify({ payload, signature }))
@@ -637,9 +652,30 @@ export class TestRelay {
     if (req.method === 'POST' && part === 'assertions') {
       const run = this.runs.get(id ?? '')
       const digest = (value: string): Buffer => createHash('sha256').update(value).digest()
-      if (!run || !timingSafeEqual(digest(bearer(req)), digest(run.token))) throw new RelayError(410, 'this run is over')
-      // Held for #1619: the suite UID can present this token, so no inventory is accepted even when authenticated.
-      throw new RelayError(409, 'assertion result is not expected')
+      if (!run) throw new RelayError(410, 'this run is over')
+      const presented = digest(bearer(req))
+      if (timingSafeEqual(presented, digest(run.token))) throw new RelayError(409, 'assertion result is not expected')
+      if (!run.collectorToken || !timingSafeEqual(presented, digest(run.collectorToken))) throw new RelayError(410, 'this run is over')
+      const proof = JSON.parse((await readLimited(req, 40 * 1024)).toString()) as {
+        candidate: string; source: string; base: string; repository: string; binding: Run['spec']['binding']; clean: boolean; exit: number;
+        failures: { file: string; test: string; cause: string; causeDigest: string }[];
+      }
+      if (!this.runs.has(run.id)) throw new RelayError(410, 'this run is over')
+      const binding = run.spec.binding
+      const failure = proof.failures?.[0]
+      if (!binding || run.assertions || proof.exit !== 1 || proof.candidate !== run.spec.capture?.candidate
+        || proof.base !== binding.base || proof.repository !== binding.repository || JSON.stringify(proof.binding) !== JSON.stringify(binding)
+        || !/^[a-f0-9]{64}$/.test(proof.source) || typeof proof.clean !== 'boolean'
+        || !Array.isArray(proof.failures) || proof.failures.length !== 1 || !failure || failure.file !== assertionTarget(run.spec.argv)
+        || typeof failure.test !== 'string' || typeof failure.cause !== 'string' || !/^[a-f0-9]{64}$/.test(failure.causeDigest)) {
+        throw new RelayError(409, 'assertion result is not expected')
+      }
+      const { file, test, cause, causeDigest } = failure
+      run.assertions = { candidate: proof.candidate, source: proof.source, base: binding.base, repository: binding.repository, binding,
+        clean: proof.clean, exit: 1, command: run.spec.argv, failures: [{ file, test, cause: redact(cause), causeDigest }],
+        totals: [{ file, test, total: 1 }] }
+      res.writeHead(204).end()
+      return
     }
     const fromJob = (req.method === 'GET' && (part === 'spec' || part === 'tree')) || (req.method === 'POST' && (part === 'output' || part === 'docker'))
     if (fromJob) {
@@ -730,11 +766,6 @@ export class TestRelay {
       }
       run.received = seq
       const isEnd = url.searchParams.get('end') === '1'
-      if (isEnd && this.runs.has(run.id)) {
-        // The final body carries the exit frame; retain evidence first so the
-        // hook receives the receipt before it stops on exit (sandboxes already do).
-        this.retainAssertions(run, Number(url.searchParams.get('exit')), url.searchParams.get('why'))
-      }
       // A run that was ended has ended its response too, and writing to that would bring down the gateway.
       if (this.runs.has(run.id) && run.output && body.length) await write(run.output, body)
       if (isEnd && this.retire(run)) {
@@ -825,7 +856,7 @@ export class TestRelay {
       })
       if (!this.retire(run)) return
       const noResult = code === RUNNER_FAILED ? NO_RESULT.exec(tail)?.[1] : undefined
-      this.retainAssertions(run, code, noResult)
+      this.retainAssertions(run, code)
       if (noResult) this.runFailed(run, noResult)
       this.deps.log.info('test_relay.run.finished', {
         id: run.id, handle: run.handle, boxId, command: commandLabel(run.spec.argv), exit: code, seconds: Math.round((this.deps.now() - run.created) / 1000),

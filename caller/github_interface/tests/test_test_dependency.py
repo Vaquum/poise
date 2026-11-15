@@ -2,9 +2,13 @@
 import copy
 import io
 import json
+import tempfile
 import zipfile
+from pathlib import Path
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from github_interface import test_dependency
 
@@ -207,6 +211,29 @@ class TestDependency(IsolatedAsyncioTestCase):
             self.assertFalse((await self.inspect(proof))["recovered"])
             runs["original"]["candidate"] = "7" * 64
             self.assertFalse((await self.inspect(proof))["verified"])
+
+    async def test_verifies_both_receipts_using_the_installed_relay_configuration(self):
+        value, runs = self.relay_fixture()
+        original_client = httpx.AsyncClient
+
+        async def verify(request):
+            self.assertEqual(str(request.url), "https://relay.example/api/link/test-relay/evidence/verify")
+            self.assertEqual(request.headers["Authorization"], "Bearer workspace.key")
+            receipt = json.loads(request.content)
+            self.assertEqual(receipt, value["relay"][receipt["payload"]])
+            return httpx.Response(200, json=runs[receipt["payload"]])
+
+        with tempfile.TemporaryDirectory() as home, patch.object(test_dependency.Path, "home", return_value=Path(home)), \
+                patch.object(test_dependency.httpx, "AsyncClient", side_effect=lambda **options:
+                             original_client(**options, transport=httpx.MockTransport(verify))):
+            config = Path(home) / ".poise/test-offload/relay"
+            config.parent.mkdir(parents=True)
+            self.delivered = True
+            self.tests[3].append(copy.deepcopy(self.tests[3][0]))
+            for limit in ("", "540\n"):
+                config.write_text("https://relay.example/api/link/test-relay\nworkspace.key\n" + limit)
+                proof = await self.inspect(value)
+                self.assertTrue(proof["recovered"], proof)
 
     async def test_same_head_dirty_replay_mismatched_call_and_missing_relay_results_keep_hold(self):
         value, runs = self.relay_fixture()
