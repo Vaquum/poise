@@ -12,8 +12,9 @@ import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
 import { implementationReportAdmission, recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories, waitForImplementationRechecks } from './behavior-chain-report'
 import { resourceReleaseProven } from './behavior-resource-receipt'
-import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
+import { invalidateNativeCleanup, nativeCleanupSupport, nativeReviewContinuationSupported, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
+import { reviewContinuationArgs, reviewContinuationCode, reviewContinuationNoWrite, yieldedReview, type ReviewCheckpoint } from './review-continuation'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
@@ -949,6 +950,7 @@ function isLocalInspectionBudgetExhaustion(call: LogEntry): boolean {
 // nothing posted. Callers gate on postedNothing, so a run that submitted
 // still holds exactly as before.
 export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
+  if (reviewContinuationCode(call.error_code) || yieldedReview(call)) return null
   // Local inspection can time out after a successful provider request. Its
   // diagnostic takes precedence over provider-like text in older errors.
   if (call.diagnostic?.operation === 'github-interface' && call.diagnostic.phase === 'inspection'
@@ -1478,6 +1480,40 @@ export function getBehaviorCheckSlots(): CheckSemaphore {
   return behaviorCheckSlots
 }
 
+const LEGACY_PR_WAITER = 'behavior_pr_review_waiter:'
+const LEGACY_PR_WAITER_AGE_MS = 2 * 60_000
+
+function legacyPrWaiter(behavior: 'review-new-prs' | 'approve-prs', target: string): string {
+  return `${LEGACY_PR_WAITER}${scopedMetaKey(`${behavior}:${target}`)}`
+}
+
+function waitForLegacyReviewSlot(behavior: 'review-new-prs' | 'approve-prs', target: string): string {
+  const key = legacyPrWaiter(behavior, target)
+  cachedStatement(db, 'INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+    .run(key, String(Date.now() + LEGACY_PR_WAITER_AGE_MS))
+  return key
+}
+
+function tryLegacyReviewSlot(behavior: 'review-new-prs' | 'approve-prs', target: string): (() => void) | null {
+  if (!process.env.POISE_NATIVE_CONTROL) return behaviorCheckSlots.tryAcquire('behavior')
+  const booking: { release?: () => void } = {}
+  try {
+    return db.transaction(() => {
+      const key = waitForLegacyReviewSlot(behavior, target)
+      const range = prefixRange(LEGACY_PR_WAITER)
+      cachedStatement(db, 'DELETE FROM meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) < ?').run(...range, Date.now())
+      const { count } = cachedStatement(db, `SELECT count(*) AS count FROM meta WHERE key >= ? AND key < ?
+        AND rowid < (SELECT rowid FROM meta WHERE key = ?)`).get(...range, key) as { count: number }
+      if (count >= behaviorCheckSlots.availableSlots('behavior')) return null
+      const release = behaviorCheckSlots.tryAcquire('behavior')
+      if (!release) return null
+      booking.release = release
+      cachedStatement(db, 'DELETE FROM meta WHERE key = ?').run(key)
+      return release
+    })()
+  } catch (error) { booking.release?.(); throw error }
+}
+
 function trackClaim(
   behavior: ActiveClaim['behavior'],
   target: string,
@@ -1509,6 +1545,17 @@ function attachCheckSlotToClaim(claimId: string, release: () => void): void {
   }
   claim.releaseCheckSlot?.()
   claim.releaseCheckSlot = release
+}
+
+function restoreReviewCheckSlots(): void {
+  for (const behavior of ['review-new-prs', 'approve-prs'] as const) {
+    for (const claim of databaseListBehaviorLaunchClaims(behavior)) {
+      if (!claim.launchReviewSlot || activeClaims.has(claim.claimId)) continue
+      trackClaim(behavior, claim.target, claim.claimId)
+      markClaimLaunched(claim.claimId)
+      attachCheckSlotToClaim(claim.claimId, behaviorCheckSlots.claim('behavior'))
+    }
+  }
 }
 
 function releaseOwnedClaim(behavior: ActiveClaim['behavior'], target: string, claimId: string): boolean {
@@ -1585,6 +1632,7 @@ function markLaunchIntent(
   slot: ReviewerSlot = 'primary',
   plannedSlots: ReviewerSlot[] = ['primary'],
   replacesFailedCallId?: string,
+  reviewSlot?: string,
 ): boolean {
   const source = `poise:${behavior}` as const
   const startedAt = new Date().toISOString()
@@ -1601,6 +1649,7 @@ function markLaunchIntent(
     source,
     correlationId: claimId,
     replacesFailedCallId,
+    reviewSlot,
   })
   if (!admitted) {
     // Best-effort reason: the claim above already fences live replay
@@ -2259,6 +2308,10 @@ async function reconcileBehaviorLaunchClaims(
     }
 
     if (!call) {
+      if (claim.launchReviewSlot && candidates.length === 0) {
+        retainClaimSafely(claim, 'original managed review Call is missing; review capacity remains reserved')
+        continue
+      }
       if (claim.launchCallId) {
         const ageMs = Date.now() - requestedAtMs
         if (ageMs < BEHAVIOR_CLAIM_RENEWAL_MS) {
@@ -2316,6 +2369,30 @@ async function reconcileBehaviorLaunchClaims(
     }
 
     const status = call.status.toLowerCase()
+    if (claim.launchReviewSlot && status !== 'running' && !resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) {
+      retainClaimSafely(claim, 'review worker release is awaiting its original Caller resource receipt')
+      continue
+    }
+    if (claim.launchReviewSlot && yieldedReview(call) && unambiguousAgentCall(snapshot, call)) {
+      const link = call.artifact?.review_resume as { slot?: string } | undefined
+      if (link?.slot !== claim.launchReviewSlot) {
+        quarantineClaim(claim, 'invalid_result', 'review checkpoint belongs to a different launch slot', call.id, false)
+        continue
+      }
+      const released = db.transaction(() => {
+        if (!releaseSeenOwned(behavior, claim.target, claim.claimId)) return false
+        waitForLegacyReviewSlot(behavior, claim.target)
+        return true
+      })()
+      if (released) {
+        dropActiveClaim(claim.claimId)
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'pending', activity: 'settled', stateSource: 'native', outcome: 'waiting', completedAt: call.completed_at })
+        checkSlotRetryPending = true
+        onCheckSlotReleased()
+      }
+      continue
+    }
     if (status === 'invalid' || call.error_code === 'invalid_agent_result') {
       quarantineClaim(claim, 'invalid_result', call.error || 'agent result is invalid', call.id,
         quarantineEvidence(snapshot, claim, call).mayRun)
@@ -3106,6 +3183,10 @@ function settleClaimAfterExit(
   const claim = behavior === 'review-new-prs' || behavior === 'approve-prs'
     ? listBehaviorLaunchClaims(behavior).find((row) => row.target === target && row.claimId === claimId) : undefined
   return async ({ code, signal, error }) => {
+    if (claim?.launchReviewSlot) {
+      retainClaimSafely(claim, 'review worker exited; awaiting its original Caller resource receipt')
+      return
+    }
     if (!error && signal === null && code === 0) {
       dropActiveClaim(claimId)
       setBehaviorLaunchErrorOwned(
@@ -3265,7 +3346,34 @@ interface PreparedReviewTarget {
   expectedHead: string
   changes: ChangesAddressedResult | null
   source: string
+  reviewSlot?: string
+  checkpoint?: ReviewCheckpoint
   operatorRetryKey?: string
+}
+
+function continuationModel(catalog: Catalog | null, identity: string): boolean {
+  return !!catalog?.models.some(model => model.identity === identity && model.provider !== 'claude')
+}
+
+function legacyReviewSlot(catalog: Catalog, model: string, slot: string, target: string): string | undefined {
+  if (continuationModel(catalog, model) && nativeReviewContinuationSupported()) {
+    return legacyReviewSlotId(slot, target)
+  }
+}
+
+function legacyReviewSlotId(slot: string, target: string): string {
+  return `${slot}:${chainBasis(target)}`
+}
+
+function nativeReviewEnvironment(): NodeJS.ProcessEnv {
+  return { POISE_NATIVE_NODE: process.execPath,
+    POISE_NATIVE_PREPARE: resolve(agentInterfaceCwd(), '../../scripts/native-provider-prepare.mjs') }
+}
+
+function legacyReviewCheckpoint(snapshot: AgentLogSnapshot, history: LogEntry[], slot: string): ReviewCheckpoint | undefined {
+  const call = history.find(entry => (entry.artifact?.review_resume as { slot?: string } | undefined)?.slot === slot)
+  if (!call || !unambiguousAgentCall(snapshot, call) || !resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) return undefined
+  return yieldedReview(call) ?? undefined
 }
 
 // Slow idempotent preparation: eligibility probes, model resolution, sign-in
@@ -3311,8 +3419,9 @@ async function prepareReviewTarget(
       const { model, recovery, catalog } = resolved
       const claude = needsClaude(catalog, model)
       const actor = reviewer
+      const reviewSlot = legacyReviewSlot(catalog, model, slot, target)
       if (claude) await waitForBehavior(claudeAuth.requireReady())
-      const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], operationId)
+      const modelCliEnv = reviewSlot ? nativeReviewEnvironment() : await prepareBehaviorModelClis(catalog, [model, recovery], operationId)
       // mkdir the cwd hack dir — agent-interface needs it to exist for
       // --pwd resolution behavior identical to triggerPrReview in agent.ts.
       await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
@@ -3335,7 +3444,7 @@ async function prepareReviewTarget(
       prepared = {
         accounts, pr, num, key, slot, target, checkTarget, operationId,
         owner, repo, reviewer, actor, model, recovery, catalog,
-        modelCliEnv, expectedHead, changes, source: 'poise:review-new-prs',
+        modelCliEnv, expectedHead, changes, reviewSlot, source: 'poise:review-new-prs',
       }
       return prepared
     })
@@ -3383,6 +3492,7 @@ async function spawnReviewLaunch(prepared: PreparedReviewTarget, claimId: string
     '--p',
     setting,
     ...noteArgs('review-new-prs'),
+    ...(prepared.reviewSlot ? reviewContinuationArgs(prepared.reviewSlot, prepared.checkpoint) : []),
   ]
   await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: prepared.actor }, async () => {
     if (!renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
@@ -3799,10 +3909,18 @@ async function tickReviewNewPrs(): Promise<void> {
               releaseLeases(null); continue
             }
             bundle.operatorRetryKey = retry.operatorRetryKey ?? undefined
+            bundle.checkpoint = legacyReviewCheckpoint(stopSnapshot, retry.calls.filter(call => call.model === bundle.model), legacyReviewSlotId(slot, target))
+            if (bundle.checkpoint && !bundle.reviewSlot) {
+              recordBehaviorFailure('review-new-prs', 'operation', `Review Call ${bundle.checkpoint.root_call} awaits Caller continuation support`, checkTarget, { noBackoff: true })
+              releaseLeases(null); continue
+            }
             // A full shared budget stops here, before the probe and the
             // claim: the candidate retries on the next tick instead of
             // consuming a recovery probe for a launch that cannot run.
-            if (!behaviorCheckSlots.available('behavior')) { releaseLeases(null); continue }
+            if (!behaviorCheckSlots.available('behavior')) {
+              if (process.env.POISE_NATIVE_CONTROL) waitForLegacyReviewSlot('review-new-prs', target)
+              releaseLeases(null); continue
+            }
             // At most one probe per backoff window: a sibling that already
             // claimed it makes this target wait for the verdict.
             if (!claimReviewerTripProbe(bundle.model)) { releaseLeases(null); continue }
@@ -3837,6 +3955,8 @@ async function tickReviewNewPrs(): Promise<void> {
               // Fresh, not the bundle's advisory copy: the panel may have
               // changed while this target was prepared.
               [...admittedSlots],
+              undefined,
+              bundle.reviewSlot,
             )) { ownedClaimId = null; releaseLeases(claimId); continue }
             claimed.push({ prepared: bundle, claimId, setting })
             attemptedClaims.add(claimId)
@@ -3922,7 +4042,7 @@ async function tickReviewNewPrs(): Promise<void> {
       try {
         // Shed load before provisioning a checkout: a launch past the
         // shared budget defers without backoff and retries when a slot frees.
-        const checkSlot = behaviorCheckSlots.tryAcquire('behavior')
+        const checkSlot = tryLegacyReviewSlot('review-new-prs', target)
         if (!checkSlot) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
@@ -4228,7 +4348,7 @@ async function packetBlocked(
 // be relaunched on the same head by the next tick; a new head or a replay is
 // a fresh decision.
 function boundedReviewFailure(call: LogEntry): boolean {
-  return call.review_policy === REVIEW_POLICY
+  return call.error_code === 'review_continuation_held' || call.review_policy === REVIEW_POLICY
     && (['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'review_provider_blocked', 'stopped'].includes(call.error_code || '')
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
 }
@@ -4571,6 +4691,10 @@ async function releaseFailedBehaviorIfNoAction(
     || call.head_sha !== null) {
     return false
   }
+  if (call.artifact?.phase === 'submitting_review' || call.artifact?.phase === 'review_submitted') {
+    // A quiet or changed GitHub inventory cannot unreserve the original POST.
+    return false
+  }
   // A bounded attempt already used its recovery. Hold this input across
   // restarts; a different head or an explicit model change can be reconsidered.
   const configuredModel = launchBehavior === 'pr_approve'
@@ -4622,6 +4746,10 @@ async function releaseFailedBehaviorIfNoAction(
   if (boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call)
     && (configuredModel == null || call.model === configuredModel)
     && (observedHead = await currentHead()) === failed.launchExpectedHead) return false
+  if (call.error_code === 'review_continuation_held' && reviewContinuationNoWrite(call)
+    && resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) {
+    return releaseFailedBehaviorLaunch(behavior, target, failed.launchCallId, failed.launchExpectedHead)
+  }
   const blockedPacket = call.action === 'not_started'
     && call.outcome === 'preflight_failed'
     && call.error_code === 'review_packet_too_large'
@@ -4960,7 +5088,7 @@ async function fireApprove(
   }
   // Shed load before provisioning a checkout: a launch past the shared
   // budget defers without backoff and retries when a slot frees.
-  const checkSlot = behaviorCheckSlots.tryAcquire('behavior')
+  const checkSlot = tryLegacyReviewSlot('approve-prs', claimTarget)
   if (!checkSlot) {
     recordCheckSlotBusy('approve-prs', `${pr.repo}#${pr.number}`, `${pr.repo}#${pr.number}:check`)
     return false
@@ -4989,6 +5117,7 @@ async function fireApprove(
   const reviewCap = getReviewCap()
   const reviewRound = reviewCap === null ? null : reviewRoundNumber(pr.repo, pr.number)
   const reviewCapReached = reviewCap !== null && reviewRound !== null && reviewRound >= reviewCap
+  const reviewSlot = reviewCapReached ? undefined : legacyReviewSlot(catalog, model, slot, claimTarget)
   const args = [
     '--pr-approve',
     `#${num}`,
@@ -5017,6 +5146,13 @@ async function fireApprove(
   const stopSnapshot = await readBehaviorLogSnapshot()
   const retry = prReviewRetryState(stopSnapshot, 'approve-prs', pr.repo,
     pr.number, expectedHead, actor, model, claimTarget)
+  const checkpoint = legacyReviewCheckpoint(stopSnapshot, retry.calls.filter(call => call.model === model), legacyReviewSlotId(slot, claimTarget))
+  if (checkpoint && !reviewSlot) {
+    recordBehaviorFailure('approve-prs', 'operation', `Review Call ${checkpoint.root_call} awaits its original uncapped Caller path`,
+      `${pr.repo}#${pr.number}:check`, { noBackoff: true })
+    return false
+  }
+  if (reviewSlot) args.push(...reviewContinuationArgs(reviewSlot, checkpoint))
   if (!isRunnable('approve-prs') || behaviorAborted() || retry.stopped && !retry.operatorRetryKey) {
     if (retry.stopped && !retry.operatorRetryKey) {
       ensureBudgetStopHold('approve-prs', pr.repo, pr.number, expectedHead,
@@ -5044,6 +5180,7 @@ async function fireApprove(
     slot,
     [slot],
     replacesFailedCallId,
+    reviewSlot,
   )) return false
   if (!renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
     captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
@@ -5052,7 +5189,7 @@ async function fireApprove(
   }
   try { await spawnDetached(AGENT_INTERFACE, args, {
     cwd: agentInterfaceCwd(),
-    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv, ...reviewEnvironment },
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv, ...reviewEnvironment, ...(reviewSlot ? nativeReviewEnvironment() : {}) },
     onExit: settleClaimAfterExit('approve-prs', claimTarget, claimId),
   }) } catch (error) {
     captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
@@ -8500,13 +8637,13 @@ async function runBehaviorChains(): Promise<void> {
         if (identities.some((identity) => needsClaude(catalog, identity)) && status !== 'authenticated') {
           throw new ClaudeAuthReadinessError(status)
         }
-        return { ...claudeSubscriptionEnvironment(), POISE_NATIVE_NODE: process.execPath,
-          POISE_NATIVE_PREPARE: resolve(agentInterfaceCwd(), '../../scripts/native-provider-prepare.mjs') }
+        return { ...claudeSubscriptionEnvironment(), ...nativeReviewEnvironment() }
       },
       borrow() {
         return behaviorCheckSlots.tryAcquire('behavior')
       },
       available: () => { const available = behaviorCheckSlots.available('behavior'); if (!available) checkSlotRetryPending = true; return available },
+      availableSlots: () => behaviorCheckSlots.availableSlots('behavior'),
       capacity: () => behaviorCheckSlots.laneCapacity('behavior'),
       permitted(chain, decision) {
         if (!tickerStarted || behaviorAbortController?.signal.aborted || !getBehaviorChainSettings().enabled || releaseBackgroundPaused()) return false
@@ -8522,8 +8659,10 @@ async function runBehaviorChains(): Promise<void> {
         return key ? noteArgs(key)[1] ?? '' : ''
       },
       reviewScope: (chain, pull) => repairReportReviewScope(db, chain, pull.number),
+      reviewContinuation: model => continuationModel(loadedCatalog(), model) && nativeReviewContinuationSupported(),
       severity: (behavior) => getSetting(behavior === 'approve-pr' ? 'approve-prs' : 'review-new-prs'),
       authenticationRejected(call) {
+        if (reviewContinuationCode(call.error_code) || yieldedReview(call)) return
         observeProviderRejection(call)
         // The new signin trip needs provider evidence: local interface
         // diagnostics must not trip the reviewer. (reviewAccountFailure
@@ -8713,6 +8852,7 @@ export async function runEnabledBehaviorsOnce(
   }
   if (behaviorAborted()) return
   if (releaseBackgroundPaused() || releaseSwitchPending()) return
+  if (behaviorOrganization.getStore() === undefined) restoreReviewCheckSlots()
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
     if (behaviorAdmissionDraining()) {

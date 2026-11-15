@@ -198,9 +198,27 @@ def packet(
     since_head: str | None = None,
     *,
     reserve: float = 0,
+    manifest: bool | None = None,
+    fresh: bool = False,
 ) -> str:
-    cache = review_budget.packet_cache()
-    key = (pwd, pr, actor_name, head, p, since_head)
+    from . import review_continuation, review_stages
+    if manifest is None and review_continuation.select_automatically():
+        try:
+            ordinary = packet(pwd, pr, actor_name, head, p, since_head, reserve=reserve, manifest=False)
+        except AgentPreflightError as error:
+            if error.code != "review_packet_too_large":
+                raise
+        else:
+            value = json.loads(ordinary)
+            if review_receipt.coverage_disposition(value) == "complete" and isinstance(value.get("diff"), str) \
+                    and len(value["files"]) <= review_stages.STAGE_MAX_FILES \
+                    and len(value["diff"].encode()) <= review_stages.STAGE_MAX_DIFF_BYTES:
+                review_continuation.ordinary_review()
+                return ordinary
+        manifest, since_head = True, None
+    manifest = review_continuation.enabled() if manifest is None else manifest
+    cache = None if fresh else review_budget.packet_cache()
+    key = (pwd, pr, actor_name, head, p, since_head, manifest)
     if cache is not None and key in cache:
         return cache[key]
     limit = review_budget.timeout(600, reserve=reserve)
@@ -218,8 +236,7 @@ def packet(
         args.extend(["--p", _priority(p)])
     if since_head:
         args.extend(["--since-head", since_head])
-    from . import review_continuation
-    if review_continuation.enabled():
+    if manifest:
         args.append("--manifest-only")
     try:
         done = subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=limit)

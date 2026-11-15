@@ -1676,16 +1676,14 @@ through Caller completion and native resource settlement under those same
 [recovery rules](Behavior-chain.md#authority-and-recovery); a diagnostic or
 cleanup alone cannot release an unknown publication effect.
 
-Caller also exposes an explicitly requested structured review continuation via
-`--review-slot` and `--resume-review`. Its typed incomplete result names the
-original Call and checkpoint generation. The existing receipt and response store
-own the exclusive claim, evidence and cumulative allowance across independently
-bounded Calls; partial analysis grants no review authority. Complete source and
-cross-unit coverage reserve one
-head-pinned finalization, preserving the first publisher's Call ID on a lost
-acknowledgement. Poise does not automatically admit these continuations. See
-[Caller's protocol](../caller/agent_interface/README.md#explicit-review-continuation)
-for bounds, invalidation, holds and isolated proof.
+Poise schedules [resumable structured reviews](Behavior-Contract.md#resumable-structured-reviews)
+through the existing legacy and chain admission paths. Caller owns each exact
+review basis and reserves one finalization after full source and integration
+coverage. The original receipt proves worker release before re-admission and
+preserves the publisher's Call after a lost acknowledgement. Existing PR status
+and chain summary reads expose the compact checkpoint and cumulative spend.
+This uses the existing native cleanup capability, release barrier and review
+receipt interfaces.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;

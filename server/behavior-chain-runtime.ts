@@ -14,6 +14,7 @@ import { behaviorErrorMessage } from './behavior-diagnostics'
 import { classifyBehaviorDiagnostic } from '../src/behavior-failure-cause'
 import { CallerReceiptStoreError } from './service/caller-calls'
 import { diagnostic } from './logging'
+import { resumeReviewArgument, yieldedReview } from './review-continuation'
 
 export interface ChainSeed { repository: string, number: number }
 export interface ChainRuntimeOperations {
@@ -34,6 +35,7 @@ export interface ChainRuntimeOperations {
   authenticationRejected?(call: LogEntry): void
   authRecovered?(invocation: ChainInvocation): boolean | ChainRecoveryOrigin
   available(): boolean
+  availableSlots?(): number
   capacity(): number
   /** Override for the synchronous admission-boundary probe; production and
    *  local validation measure the actual host. Tests stub this. */
@@ -296,6 +298,8 @@ function capacityWait(reason: string): boolean {
     || reason.startsWith('shared native resource budget is exhausted: ') || reason.startsWith('insufficient behavior resource headroom: ')
 }
 
+const REVIEW_CAPACITY_WAIT = 'waiting for the shared native behavior capacity'
+
 function admissionDecision(chain: BehaviorChain, observation: ChainObservation, now: number): Extract<ChainDecision, { kind: 'invoke' }> | null {
   let decision: ChainDecision
   try {
@@ -400,13 +404,18 @@ export class BehaviorChainRuntime {
     const basis = observation && admissionDecisionBasis(chain, observation, observation.checkedAt)
     if (!basis) return null
     let first: number | null = null, matching = false, after = 0
+    let lastObservation: ChainObservation | null = null
     while (true) {
       const events = this.journal.history(chain.id, after)
       for (const row of events) {
         const event = JSON.parse(row.payload) as ChainEvent
         if (event.type === 'chain.observed') {
-          matching = admissionDecisionBasis(chain, event.observation as ChainObservation, row.at) === basis
+          lastObservation = event.observation as ChainObservation
+          matching = admissionDecisionBasis(chain, lastObservation, row.at) === basis
           if (!matching) first = null
+        } else if (event.type === 'invocation.settled' && event.outcome === 'review_continuation_required') {
+          matching = !!lastObservation && admissionDecisionBasis(chain, lastObservation, row.at) === basis
+          first = matching ? row.sequence : null
         } else if (event.type === 'chain.waiting' && capacityWait(event.reason) && matching) {
           first ??= row.sequence
         } else {
@@ -423,6 +432,30 @@ export class BehaviorChainRuntime {
     if (chain.waiting !== reason || this.capacityWaitSequence(chain) === null) {
       this.append(chain, { type: 'chain.waiting', reason })
     }
+  }
+
+  /** An organization's runtime cannot prepare another organization's review.
+   * Honor its durable turn and let the existing workspace wake offer it. */
+  private earlierReviewWaitsElsewhere(chain: BehaviorChain, decision: Extract<ChainDecision, { kind: 'invoke' }>,
+    resources: BehaviorResourceAdmission | null, headroom: BehaviorResourceHeadroom | undefined): boolean {
+    if (!decision.reviewer) return false
+    const turn = (chain.waiting && capacityWait(chain.waiting) ? this.capacityWaitSequence(chain) : null) ?? Infinity
+    const now = Date.now()
+    const earlierCount = this.journal.capacityWaiters().filter(waiter => {
+      const observation = waiter.observation as ChainObservation | null
+      if (this.operations.ownsRepository(waiter.repository) || !observation || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return false
+      const earlier = admissionDecision(waiter, observation, now)
+      if (!earlier?.reviewer || !decision.checkpoint && !earlier.checkpoint) return false
+      return (this.capacityWaitSequence(waiter) ?? Infinity) < turn
+    }).length
+    if (!earlierCount) return false
+    const free = Math.min(this.operations.availableSlots?.() ?? 1, this.operations.capacity() - this.journal.liveModelInvocationCount())
+    if (earlierCount >= free) return true
+    if (!resources) return false
+    const needed = { memoryBytes: resources.reservation.memoryBytes * (earlierCount + 1),
+      diskBytes: resources.reservation.diskBytes * (earlierCount + 1) }
+    return !!budgetShortfall(resources.budget, this.journal.reservedResources(), needed)
+      || !!headroom && !!headroomShortfall(headroom, needed)
   }
 
   /** Resume retains waiting in hashed reducer state; a still-blocking reason
@@ -793,6 +826,7 @@ export class BehaviorChainRuntime {
                 // count check, so blocked work holds no native agent session and
                 // consumes no provider probe. Unset budgets skip every probe.
                 const resources = readBehaviorResourceAdmission()
+                let headroom: BehaviorResourceHeadroom | undefined
                 if (resources) {
                   const exhausted = this.resourceWaitReason(resources)
                   if (exhausted) {
@@ -801,7 +835,8 @@ export class BehaviorChainRuntime {
                     continue
                   }
                   try {
-                    const cramped = headroomShortfall((this.operations.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)
+                    headroom = (this.operations.measureHeadroom ?? measureBehaviorHeadroom)()
+                    const cramped = headroomShortfall(headroom, resources.reservation)
                     if (cramped) {
                       this.waitForCapacity(chain, cramped)
                       continue
@@ -811,6 +846,10 @@ export class BehaviorChainRuntime {
                     if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
                     continue
                   }
+                }
+                if (this.earlierReviewWaitsElsewhere(chain, decision, resources, headroom)) {
+                  this.waitForCapacity(chain, REVIEW_CAPACITY_WAIT)
+                  continue
                 }
                 const accounts = this.operations.accounts()
                 if (accounts.author.toLowerCase() !== chain.author.toLowerCase() || accounts.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()) {
@@ -842,7 +881,9 @@ export class BehaviorChainRuntime {
                   continue
                 }
                 if (!request) {
-                  const reason = `${decision.behavior} is waiting for native provider backoff`
+                  const reason = decision.checkpoint
+                    ? `Review Call ${decision.checkpoint.root_call} needs its original reviewer ${decision.reviewer?.model} and a Caller with review continuation support`
+                    : `${decision.behavior} is waiting for native provider backoff`
                   if (this.renewsWait(chain, reason)) {
                     this.append(chain, { type: 'chain.waiting', reason })
                   }
@@ -923,6 +964,10 @@ export class BehaviorChainRuntime {
                   request = { ...request, argv }
                 }
                 if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
+                if (this.earlierReviewWaitsElsewhere(chain, decision, resources, headroom)) {
+                  this.waitForCapacity(chain, REVIEW_CAPACITY_WAIT)
+                  continue
+                }
                 const admitted = this.journal.admitInvocation(chain, randomUUID(), { id, behavior: decision.behavior, basis: decision.basis,
                   actor: decision.actor, model: request.command === 'agent-interface' ? request.argv[request.argv.indexOf('--model') + 1] : null, slot: decision.reviewer?.slot ?? null,
                   ...(resources ? { reservation: resources.reservation } : {}),
@@ -1143,6 +1188,24 @@ export class BehaviorChainRuntime {
       this.operations.received(invocation, call)
       return this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
         outcome: 'prerequisite_wait', evidence: { ...receipt(call), status: 'deferred', action: 'not_started', outcome: 'prerequisite_wait' } })
+    }
+    if (prReview && invocation.request.argv.includes('--review-slot')) {
+      const checkpoint = yieldedReview(call)
+      if (checkpoint) {
+        const resume = invocation.request.argv.indexOf('--resume-review')
+        const input = resume < 0 ? null : invocation.request.argv[resume + 1]
+        const link = call.artifact?.review_resume as { slot?: string } | undefined
+        const slot = invocation.request.argv[invocation.request.argv.indexOf('--review-slot') + 1]
+        if (call.model !== invocation.model || link?.slot !== slot || (input === null ? checkpoint.root_call !== call.id
+          : !input?.startsWith(`${checkpoint.root_call}:`) || Number(input.split(':')[1]) >= checkpoint.generation)) {
+          throw new Error(`native review checkpoint conflicts with admission ${invocation.id}: ${resumeReviewArgument(checkpoint)}`)
+        }
+        chain = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
+          outcome: 'review_continuation_required', evidence: { ...receipt(call), status: 'deferred' } })
+        chain = this.append(chain, { type: 'chain.waiting', reason: REVIEW_CAPACITY_WAIT })
+        this.operations.wake()
+        return chain
+      }
     }
     const possibleWrite = call.action !== 'not_started' || (invocation.behavior === 'review-issue' || prReview)
       && (call.receipts != null || call.review_id != null || call.head_sha != null)

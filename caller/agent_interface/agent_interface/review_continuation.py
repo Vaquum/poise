@@ -7,7 +7,7 @@ import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from hashlib import sha256
-from time import monotonic
+from time import monotonic, time
 from uuid import uuid4
 
 from . import caller_store, resource_ownership, review_budget, review_receipt, review_stages
@@ -17,7 +17,7 @@ MAX_STORAGE_BYTES = 32_000_000
 MAX_STALLED_ATTEMPTS = 2
 FINALIZATION_RESERVE_SECONDS = 120
 OBLIGATION_TIME_MS = 2 * review_budget.REVIEW_TIMEOUT_SECONDS * 1000
-_request: ContextVar[tuple[str, str | None] | None] = ContextVar("review_continuation_request", default=None)
+_request: ContextVar[tuple[str, str | None, int | None] | None] = ContextVar("review_continuation_request", default=None)
 
 
 class Continuation(review_budget.ReviewLimitError):
@@ -28,14 +28,16 @@ class Continuation(review_budget.ReviewLimitError):
 
 
 @contextmanager
-def request(slot: str | None, resume: str | None):
-    if resume and not slot:
-        raise ValueError("--resume-review requires --review-slot")
+def request(slot: str | None, resume: str | None, units_per_call: int | None = None):
+    if (resume or units_per_call is not None) and not slot:
+        raise ValueError("review continuation arguments require --review-slot")
     if slot is not None and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", slot):
         raise ValueError("review slot must be a bounded stable reviewer slot identity")
     if resume is not None and not re.fullmatch(r"[0-9a-f]{32}:[0-9]+", resume):
         raise ValueError("resume review must name ROOT_CALL_ID:GENERATION")
-    token = _request.set((slot, resume) if slot is not None else None)
+    if units_per_call is not None and not 1 <= units_per_call <= 32:
+        raise ValueError("review unit limit must be between 1 and 32")
+    token = _request.set((slot, resume, units_per_call) if slot is not None else None)
     try:
         yield
     finally:
@@ -44,6 +46,15 @@ def request(slot: str | None, resume: str | None):
 
 def enabled() -> bool:
     return _request.get() is not None
+
+
+def select_automatically() -> bool:
+    request = _request.get()
+    return request is not None and request[1] is None and request[2] is not None
+
+
+def ordinary_review() -> None:
+    _request.set(None)
 
 
 def digest(value) -> str:
@@ -99,7 +110,7 @@ class Session:
             raise RuntimeError("review continuation requires a bound native invocation and slot")
         self.database, self.call = bound
         self.responses = RESPONSES
-        slot, resume = requested
+        slot, resume, self.units_per_call = requested
         self.root = resume.split(":")[0] if resume else self.call
         self.saved = {}
         expected = int(resume.split(":")[1]) if resume else 0
@@ -108,8 +119,9 @@ class Session:
         with caller_store.connect(self.database) as conn:
             conn.execute("begin immediate")
             current = _artifact(conn, self.call)
-            row = conn.execute("select actor,behavior,status,source from calls where id=?", (self.call,)).fetchone()
-            if row[2:] != ("running", "poise:behavior-chain") or row[1] not in {"pr_review", "pr_approve"}:
+            row = conn.execute(f"select actor,behavior,status,{resource_ownership.MANAGED_CALLS},source from calls where id=?",
+                               (self.call,)).fetchone()
+            if row[2] != "running" or not row[3] or row[1] not in {"pr_review", "pr_approve"}:
                 raise RuntimeError("review continuation requires a running managed PR review")
             basis = digest({"analysis": current["review_context"]["analysis_sha"], "actor": row[0],
                             "behavior": row[1], "model": model, "slot": slot, "policy": review_budget.REVIEW_POLICY})
@@ -129,6 +141,9 @@ class Session:
             if resume:
                 if not saved:
                     self.stop("review continuation checkpoint is missing")
+                original_source = conn.execute("select source from calls where id=?", (self.root,)).fetchone()[0]
+                if original_source != row[4]:
+                    self.stop("review continuation belongs to a different launch source")
                 if saved["phase"] in {"finalizing", "publishing"}:
                     self.stop(f"review finalization belongs to Call {saved.get('publisher') or saved['owner']}; reconcile that Call")
                 if saved["basis"] != basis:
@@ -159,9 +174,10 @@ class Session:
             _write(conn, self.root, original)
             current = _artifact(conn, self.call)
             current["review_resume"] = {"root_call": self.root, "generation": self.generation, "basis": basis,
+                                       "slot": slot,
                                        "analysis_sha": current["review_context"]["analysis_sha"],
                                        "verification_sha": digest(current.get("verification_candidates", {}))}
-            _write(conn, self.call, current)
+            self.retain_progress(conn, saved, current)
         self.meter = monotonic()
         self.packet = packet
         if saved.get("checkpoint"):
@@ -222,17 +238,27 @@ class Session:
         caller_store.write_response_text(self.responses / f"{reference['id']}.txt", self.responses, raw)
         return reference
 
-    def checkpoint(self) -> None:
+    def retain_progress(self, conn, saved: dict, current: dict) -> None:
+        current["review_resume"]["generation"] = self.generation
+        if saved.get("last_progress_at") is not None:
+            current["review_checkpoint"] = {"root_call": self.root, **{key: saved[key] for key in (
+                "basis", "generation", "unit", "required_units", "attempts", "spent_ms", "allowance_ms", "last_progress_at", "progress_call",
+            )}}
+        _write(conn, self.call, current)
+
+    def checkpoint(self, *, advanced: bool = False) -> None:
         reference = self.put(self.state)
         with caller_store.connect(self.database) as conn:
             conn.execute("begin immediate")
             original, saved = self.owned(conn)
-            saved.update(checkpoint=reference, generation=self.generation + 1, unit=self.state["unit"])
+            saved.update(checkpoint=reference, generation=self.generation + 1, unit=self.state["unit"],
+                         required_units=len(self.manifest["units"]) + 1)
+            if advanced:
+                saved["last_progress_at"] = max(saved.get("last_progress_at", 0), int(time() * 1000))
+                saved["progress_call"] = self.call
             self.generation += 1
             _write(conn, self.root, original)
-            current = _artifact(conn, self.call)
-            current["review_resume"]["generation"] = self.generation
-            _write(conn, self.call, current)
+            self.retain_progress(conn, saved, _artifact(conn, self.call))
 
     def initialize(self, repository) -> None:
         if self.manifest is not None:
@@ -252,7 +278,7 @@ class Session:
             original, saved = self.owned(conn)
             saved["manifest"] = reference
             _write(conn, self.root, original)
-        self.checkpoint()
+        self.checkpoint(advanced=True)
 
     def funded(self, function, seconds: float):
         with caller_store.connect(self.database) as conn:
@@ -269,6 +295,7 @@ class Session:
             saved["spent_ms"] += reserved
             saved["attempts"] += 1
             _write(conn, self.root, original)
+            self.retain_progress(conn, saved, _artifact(conn, self.call))
         started = monotonic()
         try:
             result = function(grant)
@@ -284,6 +311,7 @@ class Session:
             original, saved = self.owned(conn)
             saved["spent_ms"] -= reserved - used
             _write(conn, self.root, original)
+            self.retain_progress(conn, saved, _artifact(conn, self.call))
         if elapsed > grant:
             raise review_budget.ReviewLimitError("review execution exceeded its cumulative allowance", "review_budget_exhausted")
         return result
@@ -301,6 +329,7 @@ class Session:
                 reason = "same immutable review unit made no validated advancement in two attempts; " + reason
             saved.update(phase="held" if held else "paused", owner=None, reason=reason)
             _write(conn, self.root, original)
+            self.retain_progress(conn, saved, _artifact(conn, self.call))
         self.stop(reason, resumable=not held)
 
     def verified(self, roots: list[int]) -> dict:
@@ -402,7 +431,7 @@ class Unit:
             state["verified"].update(verified)
             changed = True
         if changed:
-            self.session.checkpoint()
+            self.session.checkpoint(advanced=True)
 
     def terminal(self, verdict: dict, evidence) -> dict:
         if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence) \
@@ -423,12 +452,13 @@ class Unit:
 
 
 def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, repository, packet, root, watch, ask):
-    from . import structured_review
+    from . import atoms, structured_review
     from .atoms import AgentPreflightError, ReviewVerdictError
     session = Session(packet, model.identity)
     try:
         session.initialize(repository)
         units = session.manifest["units"]
+        first_unit = session.state["unit"]
         deadline = monotonic() + min(seconds, structured_review.PROVIDER_ANALYSIS_SECONDS.get(model.provider, seconds))
         while session.state["unit"] <= len(units):
             index = session.state["unit"]
@@ -473,7 +503,10 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
                 "verified_fixes": session.verified(review_receipt.verified_fix_ids(verdict["assessment"]))}))
             session.state["mean_seconds"] = (session.state.get("mean_seconds", 0) * index + _used) / (index + 1)
             session.state.update(unit=index + 1, inspection=[], pending=[], provisional=[], verified={}, stalled=0)
-            session.checkpoint()
+            session.checkpoint(advanced=True)
+            if session.units_per_call is not None and session.state["unit"] <= len(units) \
+                    and session.state["unit"] - first_unit >= session.units_per_call:
+                session.pause("completed the scheduled review units; continue the saved checkpoint")
         verdicts = [session.result(ref) for ref in session.state["results"]]
         verdict = verdicts[-1]
         findings, fixes = [], set()
@@ -486,6 +519,12 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
         verdict["action"] = "request_changes" if findings else "reviewed_clean" if behavior == "pr_review" else "approve"
         if fixes:
             verdict["assessment"]["verified_fixes"] = sorted(fixes)
+        if session.units_per_call is not None:
+            original_packet = json.loads(packet)
+            fresh_packet = json.loads(atoms.packet(pwd, pr, actor, head, original_packet.get("p"),
+                reserve=structured_review.VERIFICATION_RESERVE_SECONDS, manifest=True, fresh=True))
+            if analysis_basis(fresh_packet, "") != analysis_basis(original_packet, ""):
+                session.pause("material review basis changed before submission; inspect the current review inputs", terminal=True)
         with caller_store.connect(session.database) as conn:
             conn.execute("begin immediate")
             original, saved = session.owned(conn)
@@ -494,6 +533,7 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
                 session.stop("cumulative review time allowance exhausted before finalization")
             saved.update(phase="finalizing", complete=True)
             _write(conn, session.root, original)
+            session.retain_progress(conn, saved, _artifact(conn, session.call))
         return verdict, session.packet
     except Continuation as error:
         if error.result["outcome"] == "held":

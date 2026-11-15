@@ -22,6 +22,7 @@ import { projectChainPrStatus } from './behavior-chain-pr-status'
 import { getBehaviorChainSettings } from './settings'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { releaseBackgroundPaused } from './release-background'
+import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 import {
   BEHAVIOR_KEYS,
   chainBehaviorKey,
@@ -275,6 +276,7 @@ export interface PrStatusRow {
   /** Legacy counter only; null fields for v2, whose verified panel is in ownership.reviews. */
   rounds: { completed: number | null, cap: number | null, next: number | null }
   verdict: (PrStatusVerdict & { onCurrentHead: boolean | null }) | null
+  reviewProgress?: ReviewCheckpoint & { callId: string, head: string }
   ci: { state: string | null, head: string | null, asOf: string | null } | { state: 'unknown', reason: string }
   queue: { state: PrStatusQueueState, entryId: string | null, since: string | null,
     attribution?: 'accepted-response' | 'observed', invocationId?: string,
@@ -424,6 +426,14 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
   const greyHeads = listGreyCiPendingHeads()
   const snapshot = getCachedAgentLogSnapshot()
   const incidents = getBehaviorDiagnosticIncidents(snapshot)
+  const reviewProgressByPr = new Map<string, NonNullable<PrStatusRow['reviewProgress']>>()
+  for (const call of snapshot?.entries ?? []) {
+    if (!call.repo || !call.pr_id || !call.expected_head || call.source !== 'poise:review-new-prs' && call.source !== 'poise:approve-prs') continue
+    const key = targetKey(call.repo, Number(call.pr_id))
+    if (reviewProgressByPr.has(key)) continue
+    const progress = parseReviewCheckpoint(call.artifact)
+    if (progress) reviewProgressByPr.set(key, { ...progress, callId: call.id, head: call.expected_head })
+  }
   const skips = new Map(SKIPPABLE_BEHAVIORS.map((behavior) =>
     [behavior, new Set(getRepositorySkips(behavior).map((repo) => repo.toLowerCase()))] as const))
 
@@ -532,6 +542,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
     const onCurrentHead = !verdict ? null
       : !verdict.head || !currentHead ? null
       : verdict.head.toLowerCase() === currentHead
+    const reviewProgress = reviewProgressByPr.get(key)
 
     const admission = scoped(() => getMergeQueueAdmission(target))
     const admissionLive = admission && (!currentHead || admission.head.toLowerCase() === currentHead)
@@ -680,6 +691,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       createdAt: pr.created_at, ageMinutes,
       rounds: { completed, cap, next: reviewRoundNumber(pr.repo, pr.number) },
       verdict: verdict ? { ...verdict, onCurrentHead } : null,
+      ...(reviewProgress ? { reviewProgress } : {}),
       ci: cacheUsable
         ? { state: cached.rollupState, head: cached.head?.toLowerCase() ?? null, asOf: cached.at }
         : { state: 'unknown', reason: evidenceWhy ?? 'merge-candidate evidence' },

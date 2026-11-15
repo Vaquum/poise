@@ -332,6 +332,7 @@ const migrateSchema = db.transaction(() => {
   ensureColumn('behavior_seen', 'launch_correlation_id', 'launch_correlation_id TEXT')
   ensureColumn('behavior_seen', 'launch_action', 'launch_action TEXT')
   ensureColumn('behavior_seen', 'launch_covers', 'launch_covers TEXT')
+  ensureColumn('behavior_seen', 'launch_review_slot', 'launch_review_slot TEXT')
   ensureColumn('behavior_dead_letters', 'retired_at', 'retired_at TEXT')
   ensureColumn('behavior_dead_letters', 'resolution', 'resolution TEXT')
   ensureColumn('behavior_dead_letters', 'resolution_evidence', 'resolution_evidence TEXT')
@@ -617,6 +618,7 @@ export interface BehaviorLaunchClaim {
   launchActor: string
   launchSource: string
   launchCorrelationId: string
+  launchReviewSlot?: string | null
   // The sub-issues an issue review also comments on, as they stood at its
   // launch; empty for every other launch.
   launchCovers: string[]
@@ -723,6 +725,7 @@ export function markBehaviorLaunchIntentOwned(input: {
   source: string
   correlationId: string
   replacesFailedCallId?: string
+  reviewSlot?: string
   // Issue reviews only: the sub-issues this launch also comments on.
   covers?: readonly string[]
   leaseMs?: number
@@ -766,7 +769,7 @@ export function markBehaviorLaunchIntentOwned(input: {
         launch_quarantine_may_run = 1,
         launch_outcome = NULL, launch_completed_at = NULL, launch_head_sha = NULL,
         launch_expected_head = ?, launch_actor = ?, launch_source = ?,
-        launch_correlation_id = ?, launch_action = NULL, launch_covers = ?,
+        launch_correlation_id = ?, launch_action = NULL, launch_covers = ?, launch_review_slot = ?,
         lease_until = ?
     WHERE key = ? AND target = ? AND (
       (? IS NULL AND claim_id = ? AND claim_id <> '')
@@ -796,6 +799,7 @@ export function markBehaviorLaunchIntentOwned(input: {
     input.source,
     input.correlationId,
     covers.length > 0 ? JSON.stringify(covers) : null,
+    input.reviewSlot ?? null,
     Date.now() + leaseMs,
     input.key,
     input.target,
@@ -820,7 +824,7 @@ export function listBehaviorLaunchClaims(key: string): BehaviorLaunchClaim[] {
     SELECT key, target, seen_at, claim_id, lease_until, launch_behavior,
            launch_repo, launch_pr, launch_requested_at, launch_call_id, launch_error, launch_quarantine, launch_quarantine_may_run,
            launch_expected_head, launch_actor, launch_source, launch_correlation_id,
-           launch_covers
+           launch_covers, launch_review_slot
     FROM behavior_seen
     WHERE key = ? AND claim_id <> '' AND launch_requested_at IS NOT NULL
     ORDER BY launch_requested_at, target
@@ -843,6 +847,7 @@ export function listBehaviorLaunchClaims(key: string): BehaviorLaunchClaim[] {
     launch_source: string
     launch_correlation_id: string
     launch_covers: string | null
+    launch_review_slot: string | null
   }>
   return rows.map((row) => ({
     key: row.key,
@@ -862,6 +867,7 @@ export function listBehaviorLaunchClaims(key: string): BehaviorLaunchClaim[] {
     launchActor: row.launch_actor,
     launchSource: row.launch_source,
     launchCorrelationId: row.launch_correlation_id,
+    ...(row.launch_review_slot ? { launchReviewSlot: row.launch_review_slot } : {}),
     launchCovers: parseLaunchCovers(row.launch_covers),
   }))
 }

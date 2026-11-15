@@ -700,8 +700,11 @@ Managed structured PR reviews and uncapped approvals accept `--review-slot SLOT`
 to opt into durable analysis. Resume with the same review arguments, a new
 `--correlation-id`, and
 `--resume-review ROOT_CALL_ID:GENERATION` from the returned `continuation` object.
-Automatic behavior admission does not select this protocol. Ordinary one-pass
-reviews retain their existing path; Claude and capped rounds do not use it.
+Poise adds `--review-units-per-call 6` for automatic admission. This keeps a
+complete ordinary-sized packet on the single-pass path and yields a checkpoint
+after six completed units on a larger obligation. Claude and capped rounds
+retain their existing path. Managed legacy review Calls preserve their original
+source and use the same native release proof as chain Calls.
 
 Caller binds progress to the repository, PR, exact head, base and merge base,
 complete material packet (including thread/repair-answer revisions and linked
@@ -730,6 +733,12 @@ unfinished required pages and incomplete source inventories grant no review
 authority. A required final integration unit receives every unit's assessment,
 findings and boundary evidence, and can inspect cross-file contracts before
 returning the single verdict.
+
+The Call's `artifact.review_checkpoint` retains the original root and generation
+with completed and required units, attempts, cumulative time and the last
+verified progress timestamp. Later Calls update the root while preserving each
+earlier Call's snapshot. The current Call rechecks the material packet before
+automatic publication.
 
 Each Call retains its existing 1,413-second ceiling and its prompt and
 inspection-round bounds. A review obligation has a separate cumulative ceiling

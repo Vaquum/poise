@@ -12,7 +12,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import agent_interface as api
-from agent_interface import issue_review, review_budget, review_continuation as continuation, review_receipt, \
+from agent_interface import atoms, issue_review, review_budget, review_continuation as continuation, review_receipt, \
     review_stages, structured_review
 from agent_interface.model_catalog import CATALOG
 from review_submission_fixture import submission_args
@@ -85,12 +85,12 @@ class TestReviewContinuation(TestCase):
              "review_id": 91, "head_sha": HEAD}))
 
     @contextmanager
-    def call(self, node, resume=None, slot="sol", policy="policy"):
+    def call(self, node, resume=None, slot="sol", policy="policy", *, source="poise:behavior-chain", units_per_call=None):
         call_id = api.track(MODEL.identity, "", "12", "o/r", "reviewer", "pr_review",
-                            expected_head=HEAD, source="poise:behavior-chain")
+                            expected_head=HEAD, source=source, managed_review=units_per_call is not None)
         review_receipt.bind(api.DB, call_id)
         with review_budget.ReviewBudget(), review_receipt.invocation_environment(api.DB, call_id, True), \
-                continuation.request(slot, resume):
+                continuation.request(slot, resume, units_per_call):
             review_receipt.prepare_response(json.dumps(node), MODEL.identity, policy=policy)
             try:
                 yield call_id
@@ -115,6 +115,74 @@ class TestReviewContinuation(TestCase):
 
     def test_twenty_two_groups_resume_a_later_deadline_and_publish_one_verified_verdict(self):
         self.later_deadline(176, 22)
+
+    def test_six_unit_slices_of_a_22_group_review_keep_original_receipts(self):
+        node = packet(176)
+        seen = []
+
+        def ask(*args):
+            self.clock.now += 68
+            value = supplied(args[3])
+            if "required_cross_unit_evidence" in value:
+                self.assertEqual(len(value["required_cross_unit_evidence"]), 22)
+                seen.append("integration")
+            else:
+                seen.append(value["files"][0]["filename"])
+            return verdict(args[3])
+
+        for source in ("poise:behavior-chain", "poise:review-new-prs"):
+            with self.subTest(source=source), patch.object(atoms, "packet", return_value=json.dumps(node)):
+                root, resume = None, None
+                self.posts.clear()
+                seen.clear()
+                for completed in (6, 12, 18, 23):
+                    with self.call(node, resume, slot=source, source=source, units_per_call=6) as call_id:
+                        if completed < 23:
+                            with self.assertRaises(continuation.Continuation) as stopped:
+                                self.run_review(node, ask)
+                            self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
+                            self.assertEqual(self.posts, [])
+                        else:
+                            self.assertIn('"review_id": 91', self.run_review(node, ask))
+                        with sqlite3.connect(api.DB) as conn:
+                            call_source, raw = conn.execute("select source,artifact from calls where id=?", (call_id,)).fetchone()
+                        self.assertEqual(call_source, source)
+                        root = root or call_id
+                        evidence = json.loads(raw)["review_checkpoint"]
+                        self.assertEqual((evidence["root_call"], evidence["unit"], evidence["required_units"]), (root, completed, 23))
+                        self.assertGreaterEqual(evidence["spent_ms"], completed * 68_000)
+                        self.assertGreater(evidence["last_progress_at"], 0)
+                    resume = self.resume(root)
+                self.assertEqual(seen, [f"src/f{i:03d}.py" for i in range(0, 176, 8)] + ["integration"])
+                self.assertEqual(self.saved(root)["publisher"], call_id)
+                self.assertEqual(len(self.posts), 1)
+
+    def test_resumes_a_checkpoint_created_before_progress_metadata(self):
+        node = packet(9)
+        seen = []
+
+        def ask(*args):
+            value = supplied(args[3])
+            seen.append("integration" if "required_cross_unit_evidence" in value else value["files"][0]["filename"])
+            return verdict(args[3])
+
+        with self.call(node, units_per_call=1) as root:
+            with self.assertRaises(continuation.Continuation):
+                self.run_review(node, ask)
+        with sqlite3.connect(api.DB) as conn:
+            artifact = json.loads(conn.execute("select artifact from calls where id=?", (root,)).fetchone()[0])
+            del artifact["review_checkpoint"]
+            for key in ("required_units", "last_progress_at", "progress_call"):
+                del artifact["review_progress"][key]
+            conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), root))
+
+        with self.call(node, self.resume(root), units_per_call=6) as final, \
+                patch.object(atoms, "packet", return_value=json.dumps(node)):
+            self.assertIn('"review_id": 91', self.run_review(node, ask))
+        self.assertEqual(seen, ["src/f000.py", "src/f008.py", "integration"])
+        self.assertEqual(self.saved(root)["required_units"], 3)
+        self.assertEqual(self.saved(root)["publisher"], final)
+        self.assertEqual(len(self.posts), 1)
 
     def test_twenty_two_groups_can_spend_more_than_one_call_and_publish_once(self):
         node = packet(176)

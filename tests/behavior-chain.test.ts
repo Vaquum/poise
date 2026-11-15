@@ -7,6 +7,7 @@ import { behaviorChainAttention, behaviorChainSummary, CHAIN_ATTENTION_DELAY_MS,
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
+import { reviewContinuationArgs } from '../server/review-continuation'
 
 const NOW = 1_800_000_000_000
 const HEAD = '1'.repeat(40)
@@ -165,6 +166,36 @@ describe('authoritative behavior journal', () => {
 })
 
 describe('completion-driven atomic behavior decisions', () => {
+  it.each(['review-pr', 'approve-pr'] as const)('reuses a %s checkpoint after a preflight failure with no progress receipt', behavior => {
+    const { journal, chain } = setup()
+    const obs = observation()
+    pull(obs)
+    let current = reviewed(journal, chain, obs)
+    if (behavior === 'approve-pr') {
+      current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+        { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    }
+    const initial = decideBehaviorChain(current, obs, NOW)
+    if (initial.kind !== 'invoke' || initial.behavior !== behavior) throw new Error('expected review admission')
+    const root = '1'.repeat(32)
+    const link = { root_call: root, basis: '2'.repeat(64), generation: 13 }
+    const checkpoint = { ...link, unit: 6, required_units: 23, attempts: 7, spent_ms: 60_000,
+      allowance_ms: 2_826_000, last_progress_at: NOW, progress_call: root }
+    const released = { completedAt: NOW, resources_settled_at: new Date(NOW).toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] }, action: 'not_started' }
+    current = record(journal, current, { type: 'invocation.admitted', invocation: invocation('first-slice', behavior, initial.basis) })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: 'first-slice', callId: root,
+      outcome: 'review_continuation_required', evidence: { ...released, status: 'deferred', outcome: 'incomplete',
+        artifact: { phase: 'reviewing', review_resume: link, review_checkpoint: checkpoint } } })
+    current = record(journal, current, { type: 'invocation.admitted', invocation: invocation('preflight', behavior, initial.basis) })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: 'preflight', callId: '3'.repeat(32),
+      outcome: 'preflight_failed', evidence: { ...released, status: 'failed', outcome: 'preflight_failed' } })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: `${behavior} is in native failure backoff` })
+    expect(decideBehaviorChain(current, { ...obs, checkedAt: NOW + 60_000 }, NOW + 60_000)).toMatchObject({
+      kind: 'invoke', behavior, checkpoint,
+    })
+  })
+
   it('retains receipted partial findings for repair without granting merge clearance', () => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
     let current = reviewed(journal, chain, obs)
@@ -547,6 +578,141 @@ describe('native admission and recovery', () => {
       readActionResult: async () => { throw new Error('unexpected native response read') },
       fenceClosedTarget: async () => { throw new Error('unexpected closed-target fence') }, wake: () => {}, ...overrides }
   }
+
+  it.each(['one slot', 'bounded memory', 'spare slot'] as const)('preserves review admission order across runtimes with %s', async limit => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW)
+    if (limit === 'bounded memory') {
+      vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '100')
+      vi.stubEnv('POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES', '60')
+    }
+    try {
+      const { db, journal, chain: large } = setup()
+      const small = journal.append(chainIdentity('Other/Repo', 8), 'small', 0, { type: 'chain.admitted', repository: 'Other/Repo', issue: 8,
+        branch: 'poise/issue-8', author: large.author, reviewer: large.reviewer }, NOW)
+      const observations = new Map([large, small].map(chain => {
+        const obs = observation(); pull(obs); obs.issueReviewers = []; obs.pull!.reviewIds = []; obs.pull!.reviewReceipts = []; obs.pull!.pending = true
+        return [chain.repository, obs]
+      }))
+      const launches: ChainInvocation[] = []
+      const calls: LogEntry[] = []
+      let capacity = limit === 'bounded memory' ? 2 : 1
+      const shared = operations({
+        capacity: () => capacity,
+        availableSlots: () => capacity,
+        measureHeadroom: () => ({ freeMemoryBytes: 1000, freeDiskBytes: 1000, diskPath: '/fixture' }),
+        observe: async chain => structuredClone(observations.get(chain.repository)!),
+        readInvocations: async ids => ({ entries: calls.filter(call => ids.includes(call.correlation_id!)), quarantined: [] }),
+        request: async (chain, _obs, decision) => ({ command: 'agent-interface', cwd: '/fixture', argv: [
+          '--pr-review', `https://github.com/${chain.repository}/pull/21`, '--model', REVIEWER.model, '--expected-head', HEAD,
+          ...reviewContinuationArgs('primary', decision.checkpoint),
+        ] }),
+        launch: async invocation => { launches.push(invocation); return true },
+      })
+      const runtime = (owner: string) => new BehaviorChainRuntime(new BehaviorChainJournal(db), {
+        ...shared, ownsRepository: repository => repository.split('/')[0] === owner.split('/')[0],
+      })
+      let a = runtime(large.repository), b = runtime(small.repository)
+      const addCall = (number: number, chain: BehaviorChain, invocation: ChainInvocation): LogEntry => {
+        const call: LogEntry = { id: chainBasis(invocation.id).slice(0, 32), status: 'failed', model: REVIEWER.model, session_id: null, prompt: '',
+          started_at: new Date(NOW).toISOString(), completed_at: new Date(NOW).toISOString(), time_elapsed: '408s',
+          repo: chain.repository, pr_id: '21', behavior: 'pr_review', actor: chain.reviewer, source: 'poise:behavior-chain', correlation_id: invocation.id,
+          expected_head: HEAD, head_sha: null, action: 'not_started', outcome: 'incomplete', response: null,
+          error: 'completed the scheduled review units', error_code: 'review_continuation_required', resources_settled_at: null,
+          resource_ownership: { version: 1, roots: [], errors: [] } }
+        const root = number === 1 ? call.id : calls[0].id
+        const link = { root_call: root, generation: number * 12, basis: HEAD.padEnd(64, '0') }
+        call.artifact = { phase: 'reviewing', review_resume: { ...link, slot: 'primary' }, review_checkpoint: { ...link, unit: number * 6,
+          required_units: 23, attempts: number * 6 + 1, spent_ms: number * 408_000, allowance_ms: 2_826_000,
+          last_progress_at: NOW, progress_call: call.id } }
+        if (invocation.request.resourceLimits) call.resource_guard = { version: 1, limits: invocation.request.resourceLimits, state: 'measured',
+          memoryModel: 'rss', peakMemoryBytes: 30, peakDiskBytes: 0, samples: 1, partialSamples: 0, lastCompleteAt: NOW,
+          longestUnavailableSeconds: 0, failure: null }
+        calls.push(call)
+        return call
+      }
+      await Promise.all([a.run(), a.run()])
+      expect(launches).toHaveLength(1)
+      const first = addCall(1, large, launches[0])
+      await b.run()
+      expect(journal.read(small.id)!.waiting).toContain(limit === 'bounded memory' ? 'resource budget is exhausted' : 'capacity is occupied')
+      await a.run()
+      expect(journal.read(large.id)!.invocations[0].state).toBe('uncertain')
+      journal.rebuild()
+      a = runtime(large.repository); b = runtime(small.repository)
+      await Promise.all([a.run(), b.run()])
+      expect(launches).toHaveLength(1)
+
+      // Caller died after the checkpoint was committed, before it acknowledged it.
+      Object.assign(first, { error_code: 'interrupted', outcome: 'preflight_failed', resources_settled_at: first.completed_at })
+      await a.run()
+      expect(journal.read(large.id)!.invocations.at(-1)!.outcome).toBe('review_continuation_required')
+      expect(launches).toHaveLength(1)
+      await b.run()
+      expect(launches[1].request.argv[1]).toContain(small.repository)
+      const ordinary = addCall(1, small, launches[1])
+      Object.assign(ordinary, { error: '', error_code: null, status: 'completed', action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD,
+        resources_settled_at: ordinary.completed_at, review_id: 29, artifact: { phase: 'review_submitted', review_response: {
+          ...reviewResponse(ordinary.id), repository: small.repository,
+        } } })
+      const smallPull = observations.get(small.repository)!.pull!
+      smallPull.reviewIds = [29]
+      smallPull.reviewReceipts = [{ id: 29, head: HEAD, invocation: ordinary.id, state: 'COMMENTED', response: ordinary.artifact?.review_response, submittedAt: NOW }]
+      const arrivals = [9, 10, 11].map(number => {
+        const repository = `Other/Later-${number}`
+        const obs = observation(); pull(obs); obs.issueReviewers = []; obs.pull!.pending = true
+        observations.set(repository, obs)
+        journal.append(chainIdentity(repository, number), `seed:${number}`, 0, { type: 'chain.admitted', repository, issue: number,
+          branch: `poise/issue-${number}`, author: large.author, reviewer: large.reviewer }, NOW)
+        return obs.pull!
+      })
+      if (limit === 'spare slot') capacity = 2
+      await b.run()
+      if (limit === 'spare slot') {
+        await b.run()
+        expect(launches).toHaveLength(3)
+        expect(launches[2].request.argv[1]).toContain('Other/Later-')
+        await a.run()
+        expect(launches).toHaveLength(4)
+        expect(launches[3].request.argv).toContain(`${first.id}:12`)
+        return
+      }
+      expect(launches).toHaveLength(2)
+
+      for (const number of [2, 3, 4]) {
+        await Promise.all([a.run(), a.run()])
+        const invocation = launches.at(-1)!
+        expect(invocation.request.argv[invocation.request.argv.indexOf('--resume-review') + 1]).toBe(`${first.id}:${(number - 1) * 12}`)
+        expect(journal.read(large.id)!.held).toBeNull()
+        if (number === 2) {
+          for (const pull of arrivals) pull.draft = true
+          await b.run()
+        }
+        if (number < 4) {
+          const call = addCall(number, large, invocation)
+          call.resources_settled_at = call.completed_at
+          await a.run()
+        }
+      }
+      expect(launches).toHaveLength(5)
+      const largeReview = journal.read(large.id)!.invocations
+      expect(largeReview.filter(item => item.evidence?.status === 'deferred')).toHaveLength(3)
+      expect(largeReview.some(item => item.evidence?.review_id)).toBe(false)
+      const final = addCall(4, large, launches[4])
+      Object.assign(final, { error: 'submission acknowledgement lost', error_code: 'review_submission_failed', action: null, outcome: null,
+        resources_settled_at: final.completed_at, artifact: { phase: 'submitting_review', review_response: reviewResponse(final.id) } })
+      await a.run()
+      expect(journal.read(large.id)!.invocations.at(-1)!.state).toBe('uncertain')
+      expect(launches).toHaveLength(5)
+      const largePull = observations.get(large.repository)!.pull!
+      largePull.reviewIds = [31]
+      largePull.reviewReceipts = [{ id: 31, head: HEAD, invocation: final.id, state: 'COMMENTED', response: final.artifact?.review_response, submittedAt: NOW }]
+      await a.run()
+      expect(journal.read(large.id)!.invocations.filter(item => item.evidence?.review_id === 31)).toHaveLength(1)
+      await a.run()
+      expect(journal.read(large.id)!.waiting).toBe('exact-head CI is still running')
+      expect(launches).toHaveLength(5)
+    } finally { vi.unstubAllEnvs() }
+  })
 
   function admissionQueue() {
     vi.spyOn(Date, 'now').mockReturnValue(NOW)
