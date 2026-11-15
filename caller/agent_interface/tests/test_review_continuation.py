@@ -483,6 +483,11 @@ class TestReviewContinuation(TestCase):
                 self.assertEqual(json.loads(command[command.index("--comments") + 1]), [{**finding, "line": 5}])
                 self.assertTrue(body.endswith(f"<!-- poise-invocation {root} -->"))
                 self.assertEqual(self.saved(root)["publisher"], root)
+                link = self.artifact(resumed)["review_resume"]
+                with sqlite3.connect(api.DB) as conn:
+                    publisher_started = conn.execute("select started_at from calls where id=?", (root,)).fetchone()[0]
+                self.assertEqual(link["publication_call"], root)
+                self.assertEqual(link["publisher_started_at"], api.utc_stamp(publisher_started))
 
     def test_capped_followup_receipt_or_lost_ack_survives_a_deadline_before_approval(self):
         finding = {"path": "src/f000.py", "line": 2, "side": "RIGHT", "body": "[p1] Optional caller uses the wrong contract."}

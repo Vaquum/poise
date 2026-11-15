@@ -2705,7 +2705,8 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
     if after is None or earlier is None:
         return None
     seen = {item["id"] for item in earlier}
-    if receipt is not None and call_id and review_continuation.reconciled(call_id, receipt):
+    adopted = receipt is not None and bool(call_id) and review_continuation.reconciled(call_id, receipt)
+    if adopted:
         seen.discard(receipt["review_id"])
     new = [item for item in after if item["id"] not in seen]
     if receipt is not None:
@@ -2714,7 +2715,7 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
             if duplicate is not None:
                 raise duplicate
             repo, number = str(facts.get("repository") or ""), str(facts.get("pull_number") or "")
-            if receipt["review_id"] in review_receipt.sibling_ids(DB, call_id, repo, number):
+            if receipt["review_id"] in review_receipt.sibling_ids(DB, call_id, repo, number) and not adopted:
                 raise review_budget.ReviewLimitError(
                     f"review {receipt['review_id']} is claimed by another run; ownership conflicts, needs attention",
                     "review_contract_violation")

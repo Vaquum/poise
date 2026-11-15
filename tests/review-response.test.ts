@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest'
-import { validReviewResponse } from '../server/review-response'
+import { callReviewResponse, validReviewResponse } from '../server/review-response'
 import { parseAgentLogList } from '../server/agent-log-parse'
 import { completedReviewCall } from './review-response-fixture'
 
@@ -39,4 +39,28 @@ it('accepts only the configured recovery identity for the same invocation', () =
   expect(validReviewResponse(recovered, { ...target, recoveryModel: 'configured-recovery' }, NOW)).toBe(true)
   expect(validReviewResponse({ ...response, assessment: { ...response.assessment, verdict: ' Reviewed: no blocking findings. ' } }, target, NOW)).toBe(false)
   expect(validReviewResponse({ ...response, assessment: { ...response.assessment, limitations: '😀'.repeat(4000) } }, target, NOW)).toBe(true)
+})
+
+it('accepts a resumed finalization under its publisher identity and window', () => {
+  const resumed = { ...response, invocation_id: 'd'.repeat(32), completed_at: NOW - 5000 }
+  const link = { callId: 'd'.repeat(32), startedAt: NOW - 6000 }
+  expect(validReviewResponse(resumed, target, NOW)).toBe(false)
+  expect(validReviewResponse(resumed, { ...target, resumedFrom: link }, NOW)).toBe(true)
+  // The pair stays bound: neither window launders the other.
+  expect(validReviewResponse(resumed, { ...target, resumedFrom: { ...link, callId: 'e'.repeat(32) } }, NOW)).toBe(false)
+  expect(validReviewResponse(resumed, { ...target, resumedFrom: { ...link, startedAt: NOW - 4000 } }, NOW)).toBe(false)
+  expect(validReviewResponse({ ...resumed, completed_at: NOW + 1 }, { ...target, resumedFrom: link }, NOW)).toBe(false)
+})
+
+it('resolves a resumed call response through its publication link', () => {
+  const call = completedReviewCall('example/repo', 7, target.head, 'reviewer')
+  expect(callReviewResponse(call, Date.now())).not.toBeNull()
+  const started = Date.parse(call.started_at)
+  const retained = call.artifact?.review_response as Record<string, unknown>
+  const resumedCall = { ...call, started_at: new Date(started + 1500).toISOString(),
+    artifact: { review_response: { ...retained, invocation_id: 'd'.repeat(32), completed_at: started + 1000 },
+      review_resume: { publication_call: 'd'.repeat(32), publisher_started_at: call.started_at } } }
+  expect(callReviewResponse(resumedCall, Date.now())).not.toBeNull()
+  const unlink = { ...resumedCall, artifact: { review_response: resumedCall.artifact.review_response } }
+  expect(callReviewResponse(unlink, Date.now())).toBeNull()
 })

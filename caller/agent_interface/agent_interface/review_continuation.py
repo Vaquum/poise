@@ -247,11 +247,24 @@ class Session:
                     current["phase"] = "submitting_review"
                 elif self.finalization.get("followup"):
                     current["phase"] = "filing_followup"
+            if self.finalization:
+                from . import utc_stamp
+                publisher_row = conn.execute("select started_at from calls where id=?", (self.finalization["call"],)).fetchone()
+                try:
+                    publisher_started_at = utc_stamp(publisher_row[0]) if publisher_row else None
+                except (TypeError, ValueError, OSError, OverflowError):
+                    publisher_started_at = None
+                if publisher_started_at is None:
+                    self.stop("original finalization lacks its publication start")
+                publication = {"publication_call": self.finalization["call"],
+                               "publisher_started_at": publisher_started_at}
+            else:
+                publication = {}
             current["review_resume"] = {"root_call": self.root, "generation": self.generation, "basis": basis,
                                        "slot": slot,
                                        "analysis_sha": current["review_context"]["analysis_sha"],
                                        "verification_sha": digest(current.get("verification_candidates", {})),
-                                       **({"publication_call": self.finalization["call"]} if self.finalization else {})}
+                                       **publication}
             self.retain_progress(conn, saved, current)
         self.meter = monotonic()
         self.live_packet = packet
