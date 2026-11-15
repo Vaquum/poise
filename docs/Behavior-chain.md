@@ -332,6 +332,27 @@ existing resume event records `ciRecovery`. The normal decision path then
 rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
+
+For a still-red, mergeable PR on `main`, the CI-only hold can authorize one
+head-pinned branch update. Caller matches every failed job to the original
+pull-request workflow attempt and compares its complete assertion failures
+with an independent failed full run on main. The full-suite report locates
+both runs and a merged fixture repair. The current base must contain that
+repair and have a full run that passed every original failing case. A closed
+report, a green base alone or additional unexplained failures leave the hold
+in place. Caller rechecks the proof, pinned head and base, and absence of
+queue ownership and auto-merge before submitting the update.
+
+The update admission consumes the allowance for the original failed Call and
+head across restarts and later base advances. An invalidated refresh that never
+started releases its journal reservation. An accepted response retains its
+own Call and response. If the PUT response is lost, the original Call and
+released resources must reconcile against a clean two-parent merge of the
+admitted candidate and base. The recorded observation preserves the original
+failure and the uncertainty of the response. Releasing the hold requires a
+later successful pull-request CI run on that exact updated head. Review,
+approval and merge queue admission then use their existing gates.
+
 When a fresh conflict on the retained failed head prevents a clean base update,
 the same settled receipt and resource proof can instead release the hold for
 the existing `repair-pr --merge-base` path. The ordinary repair, ownership,

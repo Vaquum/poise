@@ -412,8 +412,10 @@ itself releases the admission.
 Operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
-Queue-enabled branches are excluded from automatic base updates: GitHub tests
-the queued integration against current main. With Merge Pull Requests enabled,
+The Merge Pull Requests behavior excludes queue-enabled branches from its
+behind-branch updates. GitHub tests the queued integration against current main.
+The [behavior chain](Behavior-chain.md#bounded-reconciliation) can refresh a held
+PR after verifying recovery from a shared CI failure. With Merge Pull Requests enabled,
 ready eligible PRs enter that queue automatically; no per-PR merge or confirmation
 click is needed. Chat Auto-merge instructions, the default Manager charter and
 work-monitor notices follow the repository's live merge policy instead of

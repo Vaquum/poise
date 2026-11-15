@@ -6,7 +6,7 @@ import { agentInterfaceCwd } from './models'
 import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import { chainCiDependency, chainReviewResponse, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { chainCiDependency, chainReviewResponse, ciRefreshRequest, heldCiRepair, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { datastoreViewOrCli } from './datastore-reader'
@@ -325,11 +325,16 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           reviewRevision: prior?.pull?.reviewRevision ?? '', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
         return observation
       }
-      const baseUpdateFrom = chain.held && chain.ciHold && chain.ciHold.head !== head ? chain.ciHold.head : null
+      const heldCi = heldCiRepair(chain)
+      const last = chain.invocations.at(-1)
+      const refresh = last?.behavior === 'refresh-pr-ci' && last.state !== 'admitted'
+        && (last.state !== 'settled' || heldCi?.refresh?.id === last.id) ? ciRefreshRequest(last) : null
+      const failedHead = refresh?.head ?? (chain.held ? chain.ciHold?.head : null)
+      const baseUpdateFrom = failedHead && failedHead !== head ? failedHead : null
       const [readiness, ci, reviewRevision] = await Promise.all([
         github(chain.repository, ['--pr-readiness', String(number), '--username', chain.reviewer, '--expected-head', head, ...reviewer]),
         github(chain.repository, ['--list-failing-ci', String(number),
-          ...(baseUpdateFrom ? ['--base-update-from', baseUpdateFrom] : []), ...reviewer]), hooks.reviews(chain.repository, number),
+          ...(baseUpdateFrom ? ['--base-update-from', baseUpdateFrom, ...(refresh ? ['--include-runs'] : [])] : []), ...reviewer]), hooks.reviews(chain.repository, number),
       ])
       const approvalBlocked = readiness.approval_blocked_by_conversations
       if (approvalBlocked != null && (typeof approvalBlocked !== 'boolean' || readiness.repository !== chain.repository
@@ -410,6 +415,37 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
             || ci.parents[0] !== baseUpdateFrom || ci.parents[1] !== update.base) throw new Error('CI base update proof differs from the retained failed head or parents')
           observation.ciBaseUpdate = { from: baseUpdateFrom, head,
             base: sha(update.base, 'CI base update parent'), tree: sha(update.tree, 'CI base update tree') }
+          if (refresh && observation.ciBaseUpdate.base === refresh.base && Array.isArray(ci.runs) && Array.isArray(ci.checks)) {
+            const run = ci.runs.map(item => object(item, 'candidate workflow'))
+              .filter(item => item.workflow_id === refresh.workflow && item.event === 'pull_request' && item.head_sha === head)
+              .sort((a, b) => Number(b.id) - Number(a.id))[0]
+            const gate = run && ci.checks.map(item => object(item, 'candidate check'))
+              .filter(item => item.head_sha === head && item.run_id === run.id && item.name === 'Verify (Node 22)')
+              .sort((a, b) => Number(b.check_run_id) - Number(a.check_run_id))[0]
+            if (run && Number.isSafeInteger(run.id) && Number(run.id) > refresh.failedRun && run.status === 'completed'
+              && run.conclusion === 'success' && gate?.state === 'completed' && gate.conclusion === 'success') observation.ciRefreshPassed = head
+          }
+        }
+      }
+      if (heldCi && !heldCi.hold.queue && !heldCi.refresh && heldCi.hold.head === head && observation.issue.open && state.state === 'open'
+        && state.queue_entry_id === null && !readiness.draft && ci.mergeable === true && !pending && failures.length
+        && observation.publication.head_sha === head && publication.base_sha === ci.base_sha && !observation.existingPulls.length) {
+        const blocker = object(heldCi.artifact.ci_blocker, 'original CI blocker')
+        if (blocker.repository === chain.repository && blocker.pull_number === number && blocker.head_sha === head
+          && Array.isArray(blocker.failing) && blocker.failing.length) {
+          const verified = await github(chain.repository, ['--list-failing-ci', String(number),
+            '--held-ci-json', JSON.stringify(blocker.failing), ...reviewer])
+          if (verified.repository === chain.repository && verified.pull_number === number && verified.head_sha === head
+            && verified.base_sha === ci.base_sha && verified.ci_refresh !== null) {
+            const proof = object(verified.ci_refresh, 'shared CI recovery')
+            if (proof.head !== head || proof.base !== ci.base_sha) throw new Error('CI refresh proof differs from the current candidate or base')
+            observation.ciRefresh = { head, base: sha(proof.base, 'recovered candidate base'),
+              remediation: sha(proof.remediation, 'delivered CI remediation'), report: positive(proof.report, 'full suite report'),
+              workflow: positive(proof.workflow, 'failed candidate CI workflow'), failedRun: positive(proof.failedRun, 'failed candidate CI run'),
+              baselineRun: positive(proof.baselineRun, 'independent failed main run'), passedRun: positive(proof.passedRun, 'passing main run'),
+              checks: Array.isArray(proof.checks) ? proof.checks.map(check => positive(check, 'original CI check')) : [] }
+            if (!observation.ciRefresh.checks.length) throw new Error('CI refresh proof has no original failed checks')
+          }
         }
       }
       const dependency = chainCiDependency(chain, observation.pull.queueRemoval?.id)
@@ -517,6 +553,11 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       }
       if (!pull) throw new Error('native PR action requires a verified pull request')
       const fixed = ['--expected-head', pull.head, '--token-user', decision.actor]
+      if (decision.behavior === 'refresh-pr-ci') {
+        if (!observation.ciRefresh) throw new Error('CI refresh lacks verified shared recovery')
+        return { command: 'github-interface', cwd, nativeResources: 2, argv: ['--update-branch-if-behind', String(pull.number),
+          '--author', chain.author, '--shared-ci-recovery-json', JSON.stringify(observation.ciRefresh), ...fixed] }
+      }
       if (decision.behavior === 'retire-pr') return { command: 'github-interface', cwd, nativeResources: 2,
         argv: ['--issue-work', String(chain.issue), '--mode', 'retire', '--branch', chain.branch, '--pull-number', String(pull.number),
           '--coverage-json', JSON.stringify(observation.fullSuite ?? observation.remediation), ...fixed] }

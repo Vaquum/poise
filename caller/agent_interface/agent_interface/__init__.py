@@ -1799,6 +1799,8 @@ def run_native_action(argv: list[str], cwd: str, repository: str, actor: str, co
         diagnostic = getattr(error, "diagnostic", None)
         no_action = not started or (argv[0] == "--merge-if-ready" and isinstance(error, native_action.ActionFailure)
                                    and diagnostic.get("submission") in {"none", "rejected"})
+        no_action = no_action or (argv[0] == "--update-branch-if-behind" and isinstance(error, native_action.ActionFailure)
+                                  and diagnostic.get("operation") == "update_branch_if_behind" and diagnostic.get("submission") == "none")
         finish(id_, "failed", error=str(error)[:2000], error_code="native_action_failed",
                outcome="preflight_failed" if no_action else None, action="not_started" if no_action else None,
                diagnostic=diagnostic)

@@ -3,7 +3,9 @@ import { DATASTORE_MAX_AGE_SECONDS, staleDatastoreFailure } from './datastore-he
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS,
+  chainReviewResponse, ciRefreshRequest, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold,
+  heldCiRepair, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -51,7 +53,8 @@ export interface ChainRuntimeOperations {
 export function nativeBehavior(behavior: ChainInvocation['behavior']): string | null {
   return ({ 'review-issue': 'issue_review', 'review-pr': 'pr_review', 'approve-pr': 'pr_approve',
     'implement-issue': 'implement_issue', 'repair-pr': 'repair_pr', 'merge-pr': 'native_action',
-    'resolve-threads': 'native_action', 'rerun-grey-ci': 'native_action', 'publish-issue': 'native_action', 'retire-pr': 'native_action' } as Partial<Record<ChainInvocation['behavior'], string>>)[behavior] ?? null
+    'resolve-threads': 'native_action', 'rerun-grey-ci': 'native_action', 'publish-issue': 'native_action', 'retire-pr': 'native_action',
+    'refresh-pr-ci': 'native_action' } as Partial<Record<ChainInvocation['behavior'], string>>)[behavior] ?? null
 }
 
 function receipt(call: LogEntry): Record<string, unknown> {
@@ -130,17 +133,17 @@ function ciOnlyHold(invocation: ChainInvocation, call: LogEntry): BehaviorChain[
 }
 
 function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, now: number, operations: ChainRuntimeOperations): boolean {
-  const hold = chain.ciHold, pull = observation.pull, original = chain.invocations.at(-1)
-  const evidence = original?.evidence, artifact = evidence?.artifact as Record<string, unknown> | undefined
-  if (!(!!chain.held && !!hold && !chain.mergeSha && original?.id === hold.invocationId && original.state === 'settled'
-    && original.callId === hold.callId && evidence?.status === 'failed' && evidence.error_code === 'atomic_work_blocked'
-    && evidence.action === 'not_started' && artifact?.phase === 'executing' && !artifact.plan_sha && !evidence.publicationResume
-    && evidence.receipts == null && evidence.review_id == null && evidence.head_sha == null
-    && resourceReleaseProven(evidence, true) && typeof evidence.completedAt === 'number'
-    && Number.isFinite(observation.checkedAt) && observation.checkedAt >= evidence.completedAt
-    && observation.checkedAt >= Date.parse(String(evidence.resources_settled_at))
+  const held = heldCiRepair(chain), pull = observation.pull
+  if (!(held && Number.isFinite(observation.checkedAt) && observation.checkedAt >= held.completedAt
+    && observation.checkedAt >= Date.parse(String(held.evidence.resources_settled_at))
     && observation.checkedAt <= now && now - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
     && !!pull && pull.state === 'open' && !pull.merged)) return false
+  const { hold, original, refresh } = held
+  if (refresh && refresh.evidence?.action !== 'not_started') {
+    return refresh.state === 'settled' && ['updated', 'update_observed'].includes(refresh.outcome ?? '')
+      && resourceReleaseProven(refresh.evidence ?? {}, true) && observation.ciRefreshPassed === pull.head
+      && observedCiRefresh(refresh, observation)
+  }
   if (pull.head === hold.head && pull.conflict) {
     // Release only for the ordinary scoped repair, including its retry bound.
     // The failed CI receipt remains evidence; admission does not resolve it.
@@ -161,6 +164,20 @@ function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, no
       && observation.ciRecovery.removal === hold.queue.removal && observation.ciRecovery.integration === hold.queue.integration
       && pull.queueRemoval?.id === hold.queue.removal && pull.queueRemoval.reason === 'failed_checks'
       && chainBasis(queueCiBlocker(original)) === chainBasis(hold.queue))
+}
+
+function observedCiRefresh(refresh: ChainInvocation, observation: ChainObservation): boolean {
+  const proof = ciRefreshRequest(refresh)
+  const pull = observation.pull, update = observation.ciBaseUpdate, publication = observation.publication
+  const completed = refresh.evidence?.completedAt
+  return typeof completed === 'number' && observation.checkedAt >= completed
+    && observation.checkedAt >= Date.parse(String(refresh.evidence?.resources_settled_at))
+    && observation.checkedAt <= Date.now() && Date.now() - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
+    && !!pull && pull.number === Number(refresh.request.argv[1]) && pull.state === 'open' && !pull.draft && !pull.merged
+    && pull.queueEntry === null && publication.pull_number === pull.number && publication.head_sha === pull.head
+    && publication.state === 'open' && !observation.existingPulls.length
+    && !!update && update.from === proof.head && update.base === proof.base && update.head === pull.head
+    && pull.checksState === 'SUCCESS' && !pull.pending && !pull.failing.length
 }
 
 function missingReceiptHoldCanResume(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
@@ -1337,6 +1354,38 @@ export class BehaviorChainRuntime {
       return
     }
     if (invocation.request.command === 'github-interface') {
+      if (invocation.behavior === 'refresh-pr-ci') {
+        const refreshCall = invocation.evidence?.nativeCallId
+        const artifact = invocation.evidence?.artifact as Record<string, unknown> | undefined
+        if (invocation.state === 'admitted') {
+          if (snapshot.entries.some(call => call.correlation_id === invocation.id) || snapshot.quarantined.length) return
+          const held = heldCiRepair(chain)
+          // The original request re-verifies its pinned base inside Caller.
+          // A crash before start can only resume that admission or settle it without a write.
+          const current = decideBehaviorChain({ ...chain, invocations: chain.invocations.slice(0, -1) },
+            { ...observation, ciRefresh: ciRefreshRequest(invocation) }, Date.now())
+          if (held?.refresh?.id !== invocation.id || current.kind !== 'invoke' || current.behavior !== invocation.behavior
+              || current.basis !== invocation.basis) {
+            this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
+              evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
+            this.operations.wake()
+            return
+          }
+          const accounts = this.operations.accounts()
+          if (accounts.author.toLowerCase() === chain.author.toLowerCase() && accounts.reviewer.toLowerCase() === chain.reviewer.toLowerCase()
+            && this.operations.enabled() && this.operations.permitted(chain, current)) await this.start(chain, invocation)
+        } else if (invocation.state === 'uncertain' && resourcesSettled && typeof refreshCall === 'string'
+          && invocation.evidence?.action === null && invocation.evidence?.status === 'failed'
+          && artifact?.phase === 'performing_native_action' && artifact.request_sha === nativeRequestSha(invocation.request)
+          && observedCiRefresh(invocation, observation)) {
+          // Keep the original possible-write Call and its error. The clean
+          // head proves the observed effect, without inventing a PUT response.
+          this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: refreshCall, outcome: 'update_observed',
+            evidence: { ...invocation.evidence, ciBaseUpdate: observation.ciBaseUpdate } })
+          this.operations.wake()
+        }
+        return
+      }
       if (this.recoverNativeAction(chain, invocation)) return
       let evidence: Record<string, unknown> | null = null
       if (invocation.behavior === 'rerun-grey-ci' && observation.greyRecovery?.invocationId === invocation.id
