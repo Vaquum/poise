@@ -129,13 +129,25 @@ class TestQueueReadiness(TestCase):
 
     def test_person_readiness_counts_unresolved_outdated_threads_separately(self):
         threads = [{"isResolved": False, "isOutdated": True}, {"isResolved": True, "isOutdated": True},
-                   {"isResolved": False, "isOutdated": False}]
+                   {"isResolved": False, "isOutdated": False, "comments": {"nodes": [{"author": {"login": "Review-Bot"}}]}}]
         packet = {**deepcopy(READY), "reviewThreads": {"nodes": threads, "pageInfo": {"hasNextPage": False}},
                   "reviews": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
         with patch.object(pr_readiness, "get_pr_readiness_state", AsyncMock(return_value=packet)):
             result = asyncio.run(pr_readiness.run(AsyncMock(), {**PAYLOAD, "username": "review-bot"}))
         self.assertEqual(result["unresolved_outdated_conversation_count"], 1)
         self.assertEqual(result["unresolved_live_conversation_count"], 1)
+        self.assertIs(result["approval_blocked_by_conversations"], False)
+
+        threads[-1]["comments"]["nodes"][0]["author"]["login"] = "other-reviewer"
+        with patch.object(pr_readiness, "get_pr_readiness_state", AsyncMock(return_value=packet)):
+            result = asyncio.run(pr_readiness.run(AsyncMock(), {**PAYLOAD, "username": "review-bot"}))
+        self.assertIs(result["approval_blocked_by_conversations"], True)
+
+        threads.pop()
+        packet["reviewThreads"]["pageInfo"]["hasNextPage"] = True
+        with patch.object(pr_readiness, "get_pr_readiness_state", AsyncMock(return_value=packet)):
+            result = asyncio.run(pr_readiness.run(AsyncMock(), {**PAYLOAD, "username": "review-bot"}))
+        self.assertIsNone(result["approval_blocked_by_conversations"])
 
     def test_queue_detection_fails_closed_on_malformed_evidence(self):
         for queue in ({}, {"id": None}, "enabled"):

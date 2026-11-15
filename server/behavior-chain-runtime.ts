@@ -3,7 +3,7 @@ import { DATASTORE_MAX_AGE_SECONDS, staleDatastoreFailure } from './datastore-he
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -669,6 +669,8 @@ export class BehaviorChainRuntime {
               if (chain.held && missingReceiptHoldCanResume(chain, observation, Date.now())) {
                 chain = this.append(chain, { type: 'chain.resumed' })
               }
+              const approvalRecovery = exhaustedApprovalConversationHold(chain, observation, Date.now())
+              if (approvalRecovery) chain = this.append(chain, { type: 'chain.resumed', approvalRecovery, recovery: { origin: 'automatic' } })
               const mergeEvidence = observation.pull?.merged ? {
                 before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
                 firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
@@ -1074,6 +1076,8 @@ export class BehaviorChainRuntime {
       && (call.receipts != null || call.review_id != null || call.head_sha != null)
       || prReview && (call.artifact?.phase === 'submitting_review' || call.artifact?.phase === 'review_submitted'
         || call.error_code === 'review_budget_exhausted' && call.artifact?.phase !== 'reviewing')
+      || invocation.behavior === 'approve-pr' && call.error_code === APPROVAL_CONVERSATION_REFUSAL && !approvalConversationRefusal(chain,
+        { ...invocation, state: 'settled', callId: call.id, evidence: receipt(call) })
     if (call.status === 'failed' && possibleWrite && ['implement-issue', 'repair-pr', 'review-issue', 'review-pr', 'approve-pr'].includes(invocation.behavior)) {
       if (invocation.state === 'uncertain' && invocation.evidence?.callId === call.id) {
         const evidence = { ...receipt(call), callId: call.id }
