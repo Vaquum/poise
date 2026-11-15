@@ -1,33 +1,18 @@
-import type { McpGrantScope } from '../gateway/src/mcp-contract'
+import { isMcpRecordId, type McpChatChangesArguments, type McpChatListArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
 import type { ChatEvent } from './chat/protocol'
-import { getSession, listEvents, pageChatSessions, sessionInstance } from './chat/storage'
+import { getSession, listEvents, pageChatSessions, sessionInstance, type ChatPageSelector } from './chat/storage'
 import { HttpError } from './http'
 import { mcpCursor } from './mcp-cursor'
 
-interface ChatList {
-  repository: string | null
-  since: string | null
-  until: string | null
-  limit: number
-  cursor?: string
-}
-
-interface ChatChanges {
-  id: string
-  limit: number
-  afterSequence?: number
-  cursor?: string
-}
-
-export function readMcpChatList(instance: string, grant: McpGrantScope, args: ChatList) {
+export function readMcpChatList(instance: string, grant: McpGrantScope, args: McpChatListArguments) {
   const { repository, since, until, limit } = args
   const cursor = mcpCursor(grant, ['chat-list-v1', repository?.toLowerCase(), since, until, limit])
-  let before = null
+  let before: ChatPageSelector['before'] = null
   if (args.cursor) {
     const value = cursor.decode(args.cursor)
     if (!value || typeof value !== 'object' || !('updatedAt' in value) || !('id' in value)
       || typeof value.updatedAt !== 'string' || !Number.isFinite(Date.parse(value.updatedAt))
-      || typeof value.id !== 'string') throw new HttpError(400, 'invalid Chat listing cursor')
+      || !isMcpRecordId(value.id)) throw new HttpError(400, 'invalid Chat listing cursor')
     before = { updatedAt: value.updatedAt, id: value.id }
   }
   const items = pageChatSessions(instance, { repository, since, until, before, limit: limit + 1 })
@@ -64,7 +49,7 @@ function eventDetail(event: ChatEvent) {
   }
 }
 
-export function readMcpChatChanges(instance: string, grant: McpGrantScope, args: ChatChanges, repository: string | null) {
+export function readMcpChatChanges(instance: string, grant: McpGrantScope, args: McpChatChangesArguments, repository: string | null) {
   const cursor = mcpCursor(grant, ['chat-changes-v1', args.id, args.limit])
   const requested = args.cursor ? cursor.decode(args.cursor) : args.afterSequence ?? 0
   if (typeof requested !== 'number' || !Number.isSafeInteger(requested) || requested < 0) {
@@ -85,8 +70,8 @@ export function readMcpChatChanges(instance: string, grant: McpGrantScope, args:
   const items = page.events.map(({ seq, at, event }) => ({ sequence: seq, at, type: event.type, detail: eventDetail(event) }))
   const retainedFrom = session.contextResetSeq ?? null
   const coverage = requested < floor ? 'expired'
-    : items.some(item => item.detail.truncated || item.detail.metadataOnly) ? 'partial' : 'complete'
+    : items.some(({ detail }) => ('truncated' in detail && detail.truncated) || detail.metadataOnly) ? 'partial' : 'complete'
   const watermark = items.at(-1)?.sequence ?? after
-  return { observedAt, chatId: args.id, found: true, coverage, retainedFrom, watermark, hasMore: page.truncated,
+  return { observedAt, chatId: args.id, repository: session.repo || null, found: true, coverage, retainedFrom, watermark, hasMore: page.truncated,
     items, nextCursor: cursor.encode(watermark) }
 }

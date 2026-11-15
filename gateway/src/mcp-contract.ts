@@ -34,7 +34,16 @@ export const MCP_TOOLS = [
 ] as const
 
 export const MCP_WORK_TOOL_NAMES = ['poise_describe', 'poise_work'] as const
-export interface McpGrantScope { resource: string; ownerId: number; handle: string; grantId: string; chatMetadata?: true; repository?: string }
+export interface McpGrantScope {
+  resource: string
+  ownerId: number
+  handle: string
+  grantId: string
+  chatMetadata?: true
+  chatList?: true
+  chatTranscript?: true
+  repository?: string
+}
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
 export interface McpGetArguments { kind: 'chat' | 'timer'; id: string }
 export interface McpChatListArguments { kind: 'chat'; repository: string | null; since: string | null; until: string | null; limit: number; cursor?: string }
@@ -53,12 +62,22 @@ export const isMcpRepository = (value: unknown): value is string => typeof value
 export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
   scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
+export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript'>): string[] {
+  const tools: string[] = [...MCP_WORK_TOOL_NAMES]
+  if (scope.chatMetadata === true) tools.push('poise_get')
+  if (scope.chatMetadata === true && scope.chatList === true) tools.push('poise_list')
+  if (scope.chatTranscript === true) tools.push('poise_changes')
+  return tools
+}
+
 function pageTime(value: unknown): string | null {
   if (value === undefined || value === null) return null
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value) || !Number.isFinite(Date.parse(value))) {
     throw new Error('use UTC date-time bounds')
   }
-  return new Date(value).toISOString()
+  const normalized = new Date(value).toISOString()
+  if (normalized.slice(0, 19) !== value.slice(0, 19)) throw new Error('use a valid UTC date-time')
+  return normalized
 }
 
 export function parseMcpRead(value: unknown): McpRead {
