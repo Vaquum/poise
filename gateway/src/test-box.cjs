@@ -14,9 +14,10 @@ const { createGunzip } = require('node:zlib')
 
 const [specPath, treePath, root = '/'] = process.argv.slice(2)
 // A real box unpacks at the root and has a system to start. Tests name a folder instead.
-const onBox = require.main === module && root === '/'
+const onBox = root === '/'
 const asJob = Boolean(process.env.POISE_TEST_JOB)
 const asUser = onBox ? { uid: 10001, gid: 10001 } : {}
+const captureUser = require.main === module ? asUser : {}
 const RUNNER_FAILED = 125
 // What only a runtime that ran out says, not a test that talks about memory.
 const OUT_OF_MEMORY = /FATAL ERROR: .*heap out of memory|Worker terminated due to reaching memory limit/
@@ -149,7 +150,7 @@ function ranOutOfMemory(before, after) {
 
 function gitBytes(cwd, ...args) {
   // Unpacking runs as the suite user, so this must too when root; otherwise run as self (tests, jobs).
-  const identity = process.getuid?.() === 0 ? asUser : {}
+  const identity = process.getuid?.() === 0 ? captureUser : {}
   const result = spawnSync('git', ['--no-replace-objects', '-c', 'core.fsmonitor=false', '-C', cwd, ...args], {
     env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '' },
     timeout: 5_000, maxBuffer: 16 * 1024 * 1024, ...identity })
@@ -230,7 +231,9 @@ function sourceCapture(cwd) {
     if (!stat) return [path, 'missing\t' + path]
     if (realpathSync(dirname(file)) !== dirname(file)) throw new Error('test capture contains a linked source directory')
     if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error('test capture contains an unsupported source entry')
-    if (stat.size > 32 * 1024 * 1024 || onBox && stat.uid !== asUser.uid) throw new Error('test capture contains an oversized or foreign source entry')
+    if (stat.size > 32 * 1024 * 1024 || captureUser.uid !== undefined && stat.uid !== captureUser.uid) {
+      throw new Error('test capture contains an oversized or foreign source entry')
+    }
     const data = stat.isSymbolicLink() ? Buffer.from(readlinkSync(file)) : readFileSync(file)
     const mode = stat.isSymbolicLink() ? '120000' : stat.mode & 0o111 ? '100755' : '100644'
     return [path, mode + ' blob ' + gitHash('blob', data) + '\t' + path]
