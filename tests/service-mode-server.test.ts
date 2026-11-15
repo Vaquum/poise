@@ -328,7 +328,7 @@ describe('Poise in service mode', () => {
     const health = await send('GET', '/api/service/health')
     expect(health.status).toBe(200)
     // Background passes (the /content finalizer every two seconds) can count for a moment.
-    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: expect.any(Number), idle: expect.any(Boolean), draining: false, release: null, switching: null, repairExhaustionRepositories: '', eventLoop: expect.any(Object), desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
+    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: expect.any(Number), idle: expect.any(Boolean), draining: false, release: null, switching: null, repairExhaustionRepositories: '', eventLoop: expect.any(Object), desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null, replacement: null })
     expect(health.json.idle).toBe(health.json.backgroundWork === 0)
     expect(await send('GET', '/api/service/health', fromGateway('admin'))).toMatchObject({ status: 200, json: { mode: 'service' } })
     expect((await send('GET', '/api/service/health', fromGateway('browser'))).status).toBe(403)
@@ -636,6 +636,29 @@ describe('Poise in service mode', () => {
     await rm(fail, { force: true })
     await vi.waitFor(async () => expect((await send('GET', '/api/service/health')).json).toMatchObject({ backgroundWork: 0, idle: true, draining: true }), { timeout: 5_000, interval: 50 })
     expect(await send('POST', '/api/service/resume', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: false } })
+  })
+
+  it('keeps replacement admission gateway-owned while restoring background work between attempts', async () => {
+    const background = await import('../server/release-background')
+    const replacement = 'b'.repeat(40)
+    try {
+      for (const authority of [fromGateway('browser'), fromGateway('link'),
+        fromGateway('admin', { aud: 'workspace:another' }), fromGateway('admin', { iat: 1, exp: 61 })]) {
+        expect((await send('POST', '/api/service/drain', authority, { replacement })).status).toBeGreaterThanOrEqual(400)
+      }
+      expect(await send('POST', '/api/service/drain', fromGateway('admin'), { replacement }))
+        .toMatchObject({ status: 200, json: { draining: true, switching: null, replacement: { target: replacement } } })
+      expect(await send('POST', '/api/service/resume', fromGateway('admin'), { replacement: true }))
+        .toMatchObject({ status: 200, json: { draining: false, replacement: { target: replacement } } })
+      expect(background.releaseBackgroundPaused()).toBe(false)
+      expect(background.releaseReplacementPending()).toBe(true)
+      expect((await send('POST', '/api/pr-review', fromGateway(), { url: 'https://github.com/acme/app/pull/1' })).status).toBe(503)
+      expect((await send('POST', '/api/settings', fromGateway(), { timezone: 'Europe/Helsinki' })).status).toBe(200)
+    } finally {
+      expect(await send('POST', '/api/service/resume', fromGateway('browser')))
+        .toMatchObject({ status: 200, json: { draining: false, replacement: null } })
+    }
+    expect(background.releaseReplacementPending()).toBe(false)
   })
 
   it('lets the owner lift a drain the gateway left behind', async () => {

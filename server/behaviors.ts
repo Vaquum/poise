@@ -15,13 +15,13 @@ import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, nativeReviewContinuationSupported, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
 import { reviewClearanceConfigured, runReviewClearance } from './review-clearance'
-import { reviewContinuationArgs, reviewContinuationCode, reviewContinuationNoWrite, yieldedReview, type ReviewCheckpoint } from './review-continuation'
+import { reviewContinuationArgs, reviewContinuationCode, reviewContinuationNoWrite, yieldedFinalization, yieldedReview, type ReviewCheckpoint } from './review-continuation'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
 import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun, reapAbandonedDirectBehaviorRuns } from './behavior-metrics'
 import { CLI_UPDATE_TIMEOUT_MS } from '../scripts/provider-cli-updates.mjs'
-import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from './release-background'
+import { releaseBackgroundPaused, releaseReplacementPending, releaseSwitchPending, trackReleaseBackground } from './release-background'
 import { CallerReceiptStoreError } from './service/caller-calls'
 // Server-side behavior runtime. Lives with the Poise HTTP server
 // so the toggle keeps working when the browser tab is closed,
@@ -440,7 +440,7 @@ export function isPaused(key: BehaviorKey): boolean {
 }
 
 export function isRunnable(key: BehaviorKey): boolean {
-  return !behaviorAdmissionDraining() && isEnabled(key) && !isPaused(key)
+  return !releaseReplacementPending() && !behaviorAdmissionDraining() && isEnabled(key) && !isPaused(key)
 }
 
 function setPersistedEnabled(key: BehaviorKey, enabled: boolean) {
@@ -2375,7 +2375,7 @@ async function reconcileBehaviorLaunchClaims(
       retainClaimSafely(claim, 'review worker release is awaiting its original Caller resource receipt')
       continue
     }
-    if (claim.launchReviewSlot && yieldedReview(call) && unambiguousAgentCall(snapshot, call)) {
+    if (claim.launchReviewSlot && (yieldedReview(call) ?? yieldedFinalization(call)) && unambiguousAgentCall(snapshot, call)) {
       const link = call.artifact?.review_resume as { slot?: string } | undefined
       if (link?.slot !== claim.launchReviewSlot) {
         quarantineClaim(claim, 'invalid_result', 'review checkpoint belongs to a different launch slot', call.id, false)
@@ -3375,7 +3375,7 @@ function nativeReviewEnvironment(): NodeJS.ProcessEnv {
 function legacyReviewCheckpoint(snapshot: AgentLogSnapshot, history: LogEntry[], slot: string): ReviewCheckpoint | undefined {
   const call = history.find(entry => (entry.artifact?.review_resume as { slot?: string } | undefined)?.slot === slot)
   if (!call || !unambiguousAgentCall(snapshot, call) || !resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) return undefined
-  return yieldedReview(call) ?? undefined
+  return yieldedReview(call) ?? yieldedFinalization(call) ?? undefined
 }
 
 // Slow idempotent preparation: eligibility probes, model resolution, sign-in

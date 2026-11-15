@@ -205,7 +205,7 @@ def events(stdout: str) -> list[dict]:
 
 def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
                           review_round: int, review_cap: int,
-                          comments: list, pwd: str) -> str:
+                          comments: list, pwd: str, *, checkpoint=None) -> str:
     try:
         node = json.loads(packet)
     except ValueError:
@@ -222,7 +222,9 @@ def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
             or base_sha is None:
         raise review_budget.ReviewLimitError(
             "a capped approval round needs a readable PR packet", "review_contract_violation")
-    existing = followup.find_capped_issue(packet, str(number), head)
+    existing = checkpoint.followup_issue() if checkpoint is not None else None
+    if existing is None:
+        existing = followup.find_capped_issue(packet, str(number), head)
     if existing is not None:
         return followup.issue_reference(existing)
     issue = followup.file_followup_issue(
@@ -232,6 +234,7 @@ def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
         followup.render_title(repo, str(number), review_round),
         followup.render_body(repo, str(number), head, base_sha, review_round, review_cap, comments),
         reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS,
+        **({"checkpoint": checkpoint} if checkpoint is not None else {}),
     )
     return followup.issue_reference(issue)
 
@@ -607,6 +610,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     if model.provider == "claude":
         ask = partial(ask, repository=repository)
     capped_note = ""
+    checkpoint = None
     from . import review_continuation
     try:
         total = review_stages.stage_count(packet) if packet and not review_continuation.enabled() else 1
@@ -621,8 +625,10 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             assessment: dict | None = None
             expected_group_seconds = None
             if review_continuation.enabled():
-                verdict, packet = review_continuation.analyze(pwd, system, text, model, behavior, pr, actor_name,
+                verdict, packet, checkpoint = review_continuation.analyze(pwd, system, text, model, behavior, pr, actor_name,
                     head, timeout_s, repository, packet, root, watch, ask)
+                if checkpoint.finalization and checkpoint.finalization["step"] == "submitting":
+                    return checkpoint.reconcile_review(pwd, pr, actor_name)
                 staged = False
             for index, stage_text in enumerate(() if review_continuation.enabled() else _stage_texts(text, packet)):
                 _admit(stage_text)
@@ -657,7 +663,11 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 verdict = {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}
             watch.check_closed()
             try:
-                review_receipt.retain_verdict(verdict, head)
+                if checkpoint is not None:
+                    if checkpoint.finalization is None:
+                        checkpoint.retain_finalization(verdict, head, "remap")
+                else:
+                    review_receipt.retain_verdict(verdict, head)
             except OSError as error:
                 cause = bounded_cause(str(error))
                 raise review_budget.ReviewLimitError(
@@ -666,15 +676,22 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
                                         stderr=cause, provider=model.provider, submission="none")) from error
             if len(verdict["comments"]) > 100:
-                raise review_budget.ReviewLimitError(
+                failure = review_budget.ReviewLimitError(
                     f"Completed review has {len(verdict['comments'])} findings; the single-review inline limit is 100; "
                     "complete findings retained on the original Call; no review submitted",
                     "review_contract_violation",
                     diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
                                         provider=model.provider, submission="none"))
+                if checkpoint is not None:
+                    checkpoint.finalization_failure(failure)
+                raise failure
             try:
-                _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
-                review_receipt.retain_verdict(verdict, head)
+                if checkpoint is None:
+                    _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
+                    review_receipt.retain_verdict(verdict, head)
+                elif checkpoint.finalization["step"] == "remap":
+                    checkpoint.remap(lambda: _validate_since_positions(pwd, pr, actor_name, head, packet, verdict))
+                    checkpoint.retain_finalization(verdict, head, "ready")
                 raw = json.dumps(verdict, ensure_ascii=False)
                 coverage = review_receipt.coverage_disposition(json.loads(packet)) if packet else "incomplete"
                 if coverage != "complete" and verdict["action"] != "request_changes":
@@ -690,11 +707,17 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                         raise review_budget.ReviewLimitError(
                             "a capped approval round needs its round and cap numbers", "review_contract_violation")
                     reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
-                                                      verdict["comments"], pwd)
+                                                      verdict["comments"], pwd, checkpoint=checkpoint)
                     verdict = {**verdict, "action": "approve", "comments": []}
                     capped_note = (f"\nReview cap reached (round {review_round} of {review_cap}); "
                                    f"findings filed as {reference}.")
-            except (review_budget.ReviewLimitError, AgentPreflightError, OSError) as error:
+            except (review_budget.ReviewLimitError, AgentPreflightError, OSError, ValueError) as error:
+                if isinstance(error, review_continuation.Continuation):
+                    raise
+                if checkpoint is not None:
+                    checkpoint.finalization_failure(error)
+                if isinstance(error, ValueError):
+                    raise
                 if isinstance(error, review_budget.ReviewLimitError) and error.code != "review_budget_exhausted":
                     raise
                 cause = bounded_cause(str(error))
@@ -735,12 +758,18 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             args.extend(["--assessment-json", json.dumps(verdict["assessment"], ensure_ascii=False)])
             limit = review_budget.timeout(600, reserve=VERIFICATION_RESERVE_SECONDS)
             progress.stage("submitting", "Submitting GitHub review", timeout=limit)
-            done = subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=limit)
+            def execute(grant):
+                if checkpoint is not None:
+                    checkpoint.begin_review(verdict["action"])
+                return subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=grant)
+            done = checkpoint.funded(execute, limit, reserve=VERIFICATION_RESERVE_SECONDS) if checkpoint is not None else execute(limit)
         except subprocess.TimeoutExpired as error:
             # The POST may have gone out before the timeout killed the child.
             raise review_receipt.SubmissionError(
                 "review submission timed out; publication uncertain, reconcile before retry") from error
         except (review_budget.ReviewLimitError, OSError) as error:
+            if checkpoint is not None:
+                checkpoint.finalization_failure(error)
             cause = bounded_cause(str(error))
             raise review_budget.ReviewLimitError(
                 f"Completed review could not start submission: {cause}; complete findings retained on the original Call; "

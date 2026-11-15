@@ -13,6 +13,7 @@ import type { NativeChainHooks } from '../server/behavior-chain-native'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { completedReviewCall } from './review-response-fixture'
 import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
+import { markReplacementPending, releaseReplacementPending } from '../server/release-background'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), health: vi.fn(), readDatastoreView: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn() }))
@@ -35,6 +36,7 @@ const { spawnDetached } = await import('../server/process')
 
 let directory = ''
 afterEach(() => {
+  markReplacementPending(false)
   vi.useRealTimers()
   vi.unstubAllEnvs()
   if (directory) rmSync(directory, { recursive: true, force: true })
@@ -46,6 +48,23 @@ const chain: BehaviorChain = { id: 'example/repo#7', repository: 'example/repo',
   author: 'author', reviewer: 'reviewer', sequence: 1, held: null, waiting: null, resumedAfterSequence: 0,
   mergeSha: null, observation: null, invocations: [] }
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+
+it('yields new native work throughout replacement recovery and rechecks after awaited preparation', async () => {
+  const operations = actionOperations({ prepare: async () => { markReplacementPending(true); return {} } })
+  const invocation = mergeInvocation()
+  const decision = { kind: 'invoke', behavior: 'merge-pr', actor: 'reviewer', basis: 'merge', reviewer: null, reason: 'ready' } as const
+  expect(operations.enabled()).toBe(true)
+  const spawned = vi.mocked(spawnDetached).mock.calls.length
+  await expect(operations.launch(invocation, () => {}, () => !releaseReplacementPending())).resolves.toBe(false)
+  expect(vi.mocked(spawnDetached).mock.calls).toHaveLength(spawned)
+  for (let admission = 0; admission < 3; admission++) {
+    expect(operations.enabled()).toBe(false)
+    expect(operations.permitted(chain, decision)).toBe(false)
+  }
+  markReplacementPending(false)
+  expect(operations.enabled()).toBe(true)
+  expect(operations.permitted(chain, decision)).toBe(true)
+})
 
 it('refuses managed admission and effects on unreadable receipts, including failure during preparation, and rechecks existing controls after recovery', async () => {
   directory = mkdtempSync(join(tmpdir(), 'poise-native-receipts-'))
@@ -402,7 +421,7 @@ it('waits on actual typed approval refusals across observation, restart and lega
   } finally { run.close() }
 }, 30_000)
 
-async function deadlineChain(behavior: 'review-pr' | 'approve-pr', mode = 'quiet') {
+async function deadlineChain(behavior: 'review-pr' | 'approve-pr', mode = 'quiet', continued = false) {
   const root = directory = mkdtempSync(join(tmpdir(), 'poise-review-deadline-'))
   vi.useFakeTimers({ toFake: ['Date'] })
   const path = join(directory, 'journal.sqlite')
@@ -433,7 +452,8 @@ async function deadlineChain(behavior: 'review-pr' | 'approve-pr', mode = 'quiet
     released = false
     return true
   })
-  const native = actionOperations({ resolve: async () => selected })
+  const native = actionOperations({ resolve: async () => selected,
+    ...(continued ? { reviewContinuation: () => true } : {}) })
   const operations: ChainRuntimeOperations = { ...native, discover: async () => [], permitted: () => true,
     observe: async () => ({ ...observed, checkedAt: Date.now() }), launch,
     readInvocations: async ids => parseAgentLogList(results.map(result => released ? result.released : result.pending)
@@ -509,6 +529,36 @@ it.each(['review-pr', 'approve-pr'] as const)('reconciles an original %s POST wi
     expect(run.results.flatMap(value => value.posts)).toHaveLength(1)
   } finally { run.close() }
 })
+
+it.each(['review-pr', 'approve-pr'] as const)('recovers a resumed %s POST with a lost acknowledgement under its original marker without another POST', async behavior => {
+  const run = await deadlineChain(behavior, 'lost_ack_resumed', true)
+  try {
+    await run.run()
+    expect(run.results).toHaveLength(1)
+    expect(run.results[0].released).toMatchObject({ status: 'failed', error_code: 'review_continuation_required' })
+    expect(run.results[0].posts).toHaveLength(0)
+    run.release()
+    await run.run()
+    expect(run.results).toHaveLength(2)
+    expect(run.current().invocations[0]).toMatchObject({ state: 'settled', outcome: 'review_continuation_required' })
+    expect(run.results[1].released).toMatchObject({ status: 'failed', error_code: 'review_submission_failed' })
+    expect(run.results[1].posts).toHaveLength(1)
+    expect(run.results[1].posts[0].body).toContain(`<!-- poise-invocation ${run.results[0].released.id} -->`)
+    run.release()
+    await run.run()
+    expect(run.current().invocations[1].state).toBe('uncertain')
+    run.observed.pull!.reviewReceipts = run.results[1].posts
+    run.observed.pull!.reviewIds = [91]
+    // Keep subsequent work disabled while testing read-only recovery.
+    run.operations.enabled = () => false
+    await run.run()
+    expect(run.current().invocations[1]).toMatchObject({ state: 'settled',
+      evidence: { status: 'completed', review_id: 91, reconciliation: 'native invocation marker verified on the actual GitHub review' } })
+    await run.run()
+    expect(run.launch).toHaveBeenCalledTimes(2)
+    expect(run.results.flatMap(value => value.posts)).toHaveLength(1)
+  } finally { run.close() }
+}, 30_000)
 
 it.each(['pending', 'missing_inventory', 'changed_inventory', 'contradictory_counters', 'failed_read', 'wrong_target',
   'missing_artifact', 'submitting'])('keeps %s deadline evidence fenced through Caller completion and native cleanup', async mode => {

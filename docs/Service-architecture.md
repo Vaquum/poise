@@ -844,6 +844,15 @@ assertion may only resume, and anything else is refused with 403):
     and durable settlement of its original process namespace, `retainedCalls`
     counts those failures. The gateway can carry that cleanup across replacement
     after a fresh drain confirms no other blocking work.
+  - Optional `nativeWorkBlocker` identifies a pending native Call separately
+    from terminal cleanup, with `callId` and its settlement `reason` from that
+    same bounded snapshot. Replacement waiting/timeout diagnostics retain it
+    alongside the requested release. The verifier's existing private diagnostic
+    delivery retains these fields with its original rollout receipt.
+  - `replacement` is `{ target, waitingOn }` while replacement admission is
+    held, otherwise `null`. The target is the gateway's existing image release
+    (or image ID without release labels); no supervisor switch is staged.
+    `waitingOn` names missing recovery observations between attempts.
   - `backgroundWork` counts everything else a restart would cut: the Chat
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),
@@ -864,18 +873,31 @@ assertion may only resume, and anything else is refused with 403):
   launches, then returns the same fields with the drain on. The gateway treats
   the drain as admitted only when the answer is `ok` and shows `draining`; an
   answer that does not (`workspace.drain.unconfirmed`) never recreates the
-  workspace, since without admission new work stays unblocked. A drain lapses
-  unless it is renewed: while the gateway polls health it re-POSTs
-  `/api/service/drain` at least every 5 minutes. One `POISE_DRAIN_TIMEOUT`
-  budget (default 5400, 90 minutes) covers the whole workspace operation: every
-  drain, recheck and re-drain. The gateway recreates the container after an
+  workspace. Replacement sends `{ replacement: TARGET }` and shares one
+  two-minute attempt budget across drains, rechecks and re-drains, or the
+  configured `POISE_DRAIN_TIMEOUT` when shorter. The workspace independently
+  restores background admission within three minutes of the first request;
+  renewals cannot extend that pause, including if resume responses are lost or
+  the gateway exits. The gateway recreates the container after an
   admitted drain reports `idle`, or when retained cleanup accounts for every
   unsettled Call and background operation and no Chat turn or Caller is running.
-  Past the budget, cutting confirmed busy work requires a fresh admitted drain
-  with `unsettledNativeCalls: 0` and no Caller or background work, including
-  launches before Call registration. Cleanup without settled process proof and
+  An expired budget still requires fresh admitted cooperative settlement,
+  including Chat turns, Caller and background work, launches before Call
+  registration, and native resources. It never authorizes cutting an unsettled
+  writer. Cleanup without settled process proof and
   unreadable or unconfirmed answers defer replacement. The gateway releases
-  the drain for the next pass (`workspace.upgrade.aborted`). When pending
+  the drain for the next five-minute pass (`workspace.upgrade.aborted`) and
+  observes `ok` with `draining: false`, probing health after a lost resume
+  response. An unconfirmed recovery prevents another attempt against the same
+  container. Between attempts, new native/legacy behavior launches and browser
+  launches yield, and Chat prompts use the existing update wait. Original work
+  continues; datastore sync, journal reconciliation and maintenance run normally.
+  Another drain requires successful syncs for every managed account and a
+  successful reconciliation sweep for every followed account after resume.
+  This prevents overlapping new Calls from starving replacement while completed
+  original receipts settle without repeating their publication. The admission
+  fence expires thirty minutes after its last replacement request if the gateway
+  stops retrying, covering serial passes; the owner's ordinary resume clears it too. When pending
   cleanup blocks replacement and no Caller is live, it releases the drain
   immediately. Existing maintenance retries cleanup independently. While
   waiting for live work, the gateway logs `workspace.drain.waiting` at each renew
@@ -896,21 +918,23 @@ assertion may only resume, and anything else is refused with 403):
   - One Chat turn holds an ordinary drain at most 30 minutes: past that the
     drain stops it through the person's Stop path, with a transcript notice
     naming the update, and the agent keeps its context for the next prompt.
-    A drain with retained native cleanup lets Chat turns finish.
+    Replacement attempts and drains with retained native cleanup let Chat turns finish.
     `idle` follows once the stopped turn settles and the other health counters
-    clear. Past the gateway's own timeout, confirmed busy work can be cut
-    only after native cleanup is positively clear. Older workspaces
+    clear. The replacement deadline cannot authorize a forced busy stop. Older workspaces
     without the native count still upgrade when cooperatively idle; they cannot
     authorize a forced busy replacement.
-  - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
-    5400) plus five minutes after the last drain call, so a gateway that
-    stopped renewing it cannot leave the workspace refusing work.
+  - An ordinary drain without a replacement target retains its
+    `POISE_DRAIN_TIMEOUT` seconds (default 5400) plus five-minute lapse after
+    the last drain call. Older workspace releases retain that lapse; the
+    three-minute backstop and selective admission require replacement-aware
+    workspace code.
   - One service call waits 5 seconds for an answer and retries a timeout twice
     with backoff; a refused connection is not retried.
 - `POST /api/service/resume` lifts a drain. The gateway calls it whenever it
   abandons an upgrade after attempting a drain without recreating the
-  workspace; the owner's browser may call it too, to lift a drain a gateway
-  left behind.
+  workspace, with `{ replacement: true }` to retain selective admission until
+  the retry. That body requires loopback or `admin` scope. The owner's browser
+  may send an ordinary resume to lift a drain and its replacement fence.
 
 ## Accounts, identities and the terminal
 
@@ -1710,10 +1734,15 @@ Poise schedules [resumable structured reviews](Behavior-Contract.md#resumable-st
 through the existing legacy and chain admission paths. Caller owns each exact
 review basis and reserves one finalization after full source and integration
 coverage. The original receipt proves worker release before re-admission and
-preserves the publisher's Call after a lost acknowledgement. Existing PR status
-and chain summary reads expose the compact checkpoint and cumulative spend.
-This uses the existing native cleanup capability, release barrier and review
-receipt interfaces.
+preserves the publisher's Call after a lost acknowledgement. A complete verdict
+resumes only its unfinished remapping or publication step after resource
+settlement, without further provider analysis. Review and capped follow-up
+attempts retain their original identity and require reconciliation of uncertain
+effects before any further write. Existing PR status and chain summary reads
+expose the compact checkpoint and cumulative spend. This uses the existing
+native cleanup capability, release barrier and review receipt interfaces. See
+[Caller's protocol](../caller/agent_interface/README.md#explicit-review-continuation)
+for bounds, invalidation, holds and isolated proof.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;

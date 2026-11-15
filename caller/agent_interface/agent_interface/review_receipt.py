@@ -118,6 +118,8 @@ def complete_response(assessment: dict, head: str) -> dict | None:
             if prior["assessment"] == assessment and prior.get("verified_fixes", {}) == verified \
                     and all(prior.get(key) == value for key, value in context.items()):
                 return prior
+            if artifact.get("review_resume"):
+                raise RuntimeError("retained review response differs from its original finalization")
             if artifact.get("phase") != "reviewing":
                 raise RuntimeError("native reviewer already submitted a different response")
         response = {**context, "reviewer": row[1], "invocation_id": call_id,
@@ -150,7 +152,7 @@ def retain_verdict(verdict: dict, head: str) -> None:
         return
     response = complete_response(verdict["assessment"], head)
     database, call_id = bound
-    if response is None or response["invocation_id"] != call_id:
+    if response is None:
         raise RuntimeError("review findings lack their original native invocation")
     from . import RESPONSES
     path = caller_store.response_name(RESPONSES / f"{call_id}.txt")
@@ -159,6 +161,10 @@ def retain_verdict(verdict: dict, head: str) -> None:
         row = conn.execute("select status,artifact from calls where id=?", (call_id,)).fetchone()
         if not row or row[0] != "running" or json.loads(row[1])["phase"] != "reviewing":
             raise RuntimeError("review findings no longer own an unsubmitted native invocation")
+        artifact = json.loads(row[1])
+        identity = artifact.get("review_resume", {}).get("publication_call", call_id)
+        if response["invocation_id"] != identity:
+            raise RuntimeError("review findings lack their original native invocation")
         caller_store.write_response_text(Path(path), RESPONSES, json.dumps(verdict, ensure_ascii=False))
         conn.execute("update calls set response_path=? where id=?", (path, call_id))
 
@@ -199,27 +205,31 @@ def begin_submission(body: str, head: str) -> str:
         from .review_continuation import authority
         row = conn.execute("select artifact from calls where id=?", (call_id,)).fetchone()
         if row:
-            authority(conn, call_id, json.loads(row[0] or "{}"), publishing=True)
+            artifact = json.loads(row[0] or "{}")
+            continued = authority(conn, call_id, artifact, publishing=True)
+            if artifact.get("phase") == "filing_followup" and not continued:
+                raise RuntimeError("follow-up review lacks its original finalization authority")
         changed = conn.execute("update calls set artifact=json_patch(artifact,?) where id=? and status='running' and behavior in ('pr_review','pr_approve') "
-                               "and coalesce(error_code,'') not in ('stopping','stopped') and json_extract(artifact,'$.phase')='reviewing' "
+                               "and coalesce(error_code,'') not in ('stopping','stopped') and json_extract(artifact,'$.phase') in ('reviewing','filing_followup') "
                                "and json_extract(artifact,'$.review_response.head_sha')=? "
                                "and json_extract(artifact,'$.review_response.completed_at') <= ?",
                                (json.dumps({"phase": "submitting_review", "expected_head": head}), call_id, head, int(time.time() * 1000))).rowcount
         if changed != 1:
             raise RuntimeError("managed review does not own an unsubmitted native action receipt")
-        scope = conn.execute("select json_extract(artifact,'$.review_scope') from calls where id=?", (call_id,)).fetchone()[0]
+        scope, identity = conn.execute("select json_extract(artifact,'$.review_scope'),"
+                                     "json_extract(artifact,'$.review_response.invocation_id') from calls where id=?", (call_id,)).fetchone()
     if scope:
         # Keep the retained assessment intact, including its response marker.
         # The visible policy is supplied by Poise, not by a model echo.
         visible, separator, response = body.partition('\n\n<!-- poise-review-response ')
         body = f"{visible.replace(scope, '').strip()}\n\n{scope}{separator}{response}"
-    return f"{body}\n\n<!-- poise-invocation {call_id} -->".strip()
+    return f"{body}\n\n<!-- poise-invocation {identity or call_id} -->".strip()
 
 
 def checkpoint_verified_resolution(response: dict, review_id: int | None, thread_id: str, *, resolved: bool = False) -> None:
     """Record each attempt and its response within the original review Call."""
     database, call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_DB"), os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
-    if not database or not call_id or response["invocation_id"] != call_id or type(review_id) is not int or review_id <= 0:
+    if not database or not call_id or type(review_id) is not int or review_id <= 0:
         raise RuntimeError("verified resolution lacks its original review")
     with caller_store.connect(database, timeout=30) as conn:
         conn.execute("begin immediate")
@@ -227,6 +237,7 @@ def checkpoint_verified_resolution(response: dict, review_id: int | None, thread
                            "and coalesce(error_code,'') not in ('stopping','stopped')", (call_id,)).fetchone()
         artifact = json.loads(row[0]) if row and row[0] else {}
         if artifact.get("phase") != "submitting_review" or artifact.get("review_response") != response \
+                or response["invocation_id"] != artifact.get("review_resume", {}).get("publication_call", call_id) \
                 or thread_id not in {fix["id"] for fix in response["verified_fixes"].values()}:
             raise RuntimeError("verified resolution differs from its original review")
         progress = artifact.get("verified_resolution", {"review_id": review_id, "threads": {}})

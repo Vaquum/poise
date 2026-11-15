@@ -2379,9 +2379,10 @@ def run_governed_behavior(
             print(json.dumps({"id": id_, "error": str(e), "error_code": "review_submission_failed"}))
             raise SystemExit(1)
         except review_continuation.Continuation as e:
-            finish(id_, "failed", error=str(e), error_code=e.code, action="not_started", outcome="incomplete")
+            action = None if e.result["publication_started"] else "not_started"
+            finish(id_, "failed", error=str(e), error_code=e.code, action=action, outcome="incomplete")
             print(json.dumps({"id": id_, "error": str(e), "error_code": e.code,
-                              "action": "not_started", "outcome": "incomplete", "continuation": e.result}))
+                              "action": action, "outcome": "incomplete", "continuation": e.result}))
             raise SystemExit(1)
         except review_budget.ReviewLimitError as e:
             diagnostic = {**e.diagnostic, "call_id": id_, "correlation_id": correlation_id,
@@ -2733,6 +2734,9 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
     if after is None or earlier is None:
         return None
     seen = {item["id"] for item in earlier}
+    adopted = receipt is not None and bool(call_id) and review_continuation.reconciled(call_id, receipt)
+    if adopted:
+        seen.discard(receipt["review_id"])
     new = [item for item in after if item["id"] not in seen]
     if receipt is not None:
         if call_id:
@@ -2740,7 +2744,7 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
             if duplicate is not None:
                 raise duplicate
             repo, number = str(facts.get("repository") or ""), str(facts.get("pull_number") or "")
-            if receipt["review_id"] in review_receipt.sibling_ids(DB, call_id, repo, number):
+            if receipt["review_id"] in review_receipt.sibling_ids(DB, call_id, repo, number) and not adopted:
                 raise review_budget.ReviewLimitError(
                     f"review {receipt['review_id']} is claimed by another run; ownership conflicts, needs attention",
                     "review_contract_violation")

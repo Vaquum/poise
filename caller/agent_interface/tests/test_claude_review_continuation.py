@@ -44,6 +44,7 @@ class TestGovernedClaudeContinuation(TestCase):
         self.posts, self.launches = [], []
         self.reply = lambda prompt: verdict(prompt)
         self.lost_ack = False
+        self.review_state, self.review_reads = None, 0
         self.repository = SimpleNamespace(root=self.root, prompt=lambda: "\n\nPinned review repository: fixture",
             diff_packet=lambda value, _limit, **_kwargs: json.dumps({**json.loads(value),
                 "diff": self.node["diff"], "diff_deferred": False, "coverage": "complete"}),
@@ -79,6 +80,11 @@ class TestGovernedClaudeContinuation(TestCase):
             return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(node))
         if flag == "--review-activity-since":
             return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({"reviewer_latest_complete_commit": HEAD}))
+        if flag == "--pull-action-state":
+            self.assertIn("--queue-evidence", command)
+            self.assertIsNotNone(self.review_state)
+            self.review_reads += 1
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(self.review_state))
         self.assertIn(flag, ("--request-changes", "--approve-pr", "--reviewed-clean"))
         body = review_receipt.begin_submission("Verified final verdict", HEAD)
         self.posts.append((submission_args(command), body))
@@ -247,12 +253,16 @@ class TestGovernedClaudeContinuation(TestCase):
         row, _result = self.execute(units=6)
         root = row["id"]
         self.assertEqual(row["error_code"], "review_submission_failed")
+        response = json.loads(row["artifact"])["review_response"]
+        self.review_state = {"repository": "o/r", "pull_number": 12, "head_sha": HEAD,
+                             "review_context": response["context_sha"], "my_reviews": []}
         launches = len(self.launches)
         row, result = self.execute(resume=self.resume(root), units=6)
         self.assertIn("reconcile that Call", result["error"])
         self.assertEqual(len(self.launches), launches)
         self.assertEqual(self.progress(root)["publisher"], root)
         self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.review_reads, 1)
 
     def test_small_approval_keeps_ordinary_claude_output_limit_recovery(self):
         self.node = packet(1)

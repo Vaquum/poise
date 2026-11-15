@@ -703,14 +703,68 @@ describe('image upgrades', () => {
     expect(h.docker.containers.get('poise-ws-alice')?.imageId).toBe(CURRENT_IMAGE_ID)
   })
 
-  it('recreates a busy workspace once POISE_DRAIN_TIMEOUT has passed', async () => {
+  it('resumes a busy workspace at the attempt deadline and replaces only after its original turn settles', async () => {
     await start({ env: { POISE_DRAIN_TIMEOUT: '1' } })
+    const original = h.docker.containers.get('poise-ws-alice')!.id
     h.workspace.health.activeChatTurns = 1
     const began = Date.now()
     await h.orchestrator.upgradePass()
     expect(Date.now() - began).toBeGreaterThanOrEqual(1000)
-    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+    expect(h.docker.containers.get('poise-ws-alice')!.id).toBe(original)
+    expect(h.workspace.health.draining).toBe(false)
     expect(h.logs.find((entry) => entry.event === 'workspace.drain.timeout')).toMatchObject({ handle: 'alice', timeoutSeconds: 1 })
+    h.workspace.health.activeChatTurns = 0
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('defers replacement past a slow install to the next pass instead of stopping near the pause ceiling', async () => {
+    await start({ replacementDrainMs: 50 })
+    h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'target-release', 'poise.base': 'new-base' })
+    const original = h.docker.containers.get('poise-ws-alice')!.id
+    // Idle workspace drains at once; a slow first install pushes the recheck past the attempt budget.
+    let slowed = false
+    h.docker.onTask = () => {
+      if (!slowed) { slowed = true; h.advance(1000) }
+    }
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')!.id).toBe(original)
+    expect(h.workspace.health.draining).toBe(false)
+    expect(dockerCalls(h).filter(call => call.endsWith('/stop'))).toHaveLength(0)
+    expect(h.logs.find(entry => entry.event === 'workspace.upgrade.aborted')).toMatchObject({ handle: 'alice' })
+    // The install is already done; the retry replaces promptly.
+    h.docker.onTask = undefined
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')!.id).not.toBe(original)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it.each(['lost', 'unapplied'] as const)('observes recovery after a %s resume before starting another replacement drain', async mode => {
+    await start({ replacementDrainMs: 30, serviceTimeoutMs: 10 })
+    const original = h.docker.containers.get('poise-ws-alice')!.id
+    Object.assign(h.workspace.health, { runningCallerCalls: 1, unsettledNativeCalls: 1, backgroundWork: 1 })
+    h.workspace.resumeApplies = mode !== 'unapplied'
+    h.workspace.onServiceRequest = request => {
+      h.workspace.answerDelayMs = request.url === '/api/service/resume' && mode === 'lost' ? 100 : 0
+    }
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')!.id).toBe(original)
+    expect(events(h.logs, 'workspace.drain.release.failed').length).toBeGreaterThan(0)
+    if (mode === 'unapplied') {
+      const drains = h.workspace.serviceRequests.filter(request => request.url === '/api/service/drain').length
+      await h.orchestrator.upgradePass()
+      expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/drain')).toHaveLength(drains)
+      expect(h.workspace.health.draining).toBe(true)
+    } else {
+      expect(h.workspace.health.draining).toBe(false)
+      expect(events(h.logs, 'workspace.drain.released')).toHaveLength(1)
+    }
+    h.workspace.onServiceRequest = undefined
+    h.workspace.answerDelayMs = 0
+    h.workspace.resumeApplies = true
+    Object.assign(h.workspace.health, { runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0 })
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')!.id).not.toBe(original)
   })
 
   it.each([

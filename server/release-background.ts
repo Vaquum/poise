@@ -4,6 +4,7 @@ let paused = false
 let operations = 0
 let behaviorOperations = 0
 let switchPending = false
+let replacementPending = false
 
 export function pauseReleaseBackground(): void { paused = true }
 export function resumeReleaseBackground(): void { paused = false }
@@ -15,6 +16,10 @@ export function behaviorBackgroundBusy(): number { return behaviorOperations }
  *  between safe units so it cannot keep it waiting. Set by the service controller. */
 export function markReleaseSwitch(pending: boolean): void { switchPending = pending }
 export function releaseSwitchPending(): boolean { return switchPending }
+
+/** Replacement retries let observation and settlement run, while new writers yield. */
+export function markReplacementPending(pending: boolean): void { replacementPending = pending }
+export function releaseReplacementPending(): boolean { return replacementPending }
 
 export function trackReleaseBackground(scope?: 'behavior'): () => void {
   operations += 1

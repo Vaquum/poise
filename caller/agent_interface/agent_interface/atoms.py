@@ -337,6 +337,8 @@ def run_agent(
     if review_continuation.enabled() and repository is None:
         raise AgentPreflightError("review continuation requires a pinned repository")
     policy = analysis_policy(system, text, packet)
+    if review_continuation.enabled():
+        policy += "\n" + json.dumps([capped, review_round, review_cap])
     review_receipt.prepare_response(packet, spec.identity, review_scope, policy=policy)
     if spec.provider == "claude" and not review_continuation.enabled():
         prompt_bytes = len(text.encode("utf-8"))

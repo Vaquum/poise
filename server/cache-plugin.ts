@@ -32,7 +32,7 @@ import { checkGithubQuota, readGithubQuota, startGithubQuotaRuntime, stopGithubQ
 import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
-import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
+import { getOrganizations, readyOrganizations, organizationsSyncedSince, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { startAgentCollaboratorRuntime, stopAgentCollaboratorRuntime } from './agent-collaborator'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob, RUNNING_SNAPSHOT_SERVED_MS } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
@@ -283,7 +283,17 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       if (preset === 'claude') void auth.check({ forceLive: true })
     })
     if (service) {
-      serviceControl = new ServiceControl(chatRuntime, { drainTimeoutSeconds: service.drainTimeoutSeconds, switchTurnBoundMinutes: () => getChatSettings().updateTurnBoundMinutes })
+      serviceControl = new ServiceControl(chatRuntime, {
+        drainTimeoutSeconds: service.drainTimeoutSeconds,
+        switchTurnBoundMinutes: () => getChatSettings().updateTurnBoundMinutes,
+        replacementRecovery: since => {
+          if (!organizationsSyncedSince(since)) return 'waiting for datastore refresh after replacement drain'
+          const health = getBehaviorChainRuntimeHealth()
+          return getOrganizations().some(org => !health.some(entry => entry.organization === org.login.toLowerCase()
+            && entry.error === null && entry.lastSweepAt > since))
+            ? 'waiting for behavior reconciliation after replacement drain' : null
+        },
+      })
       stopAccountsCheck = scheduleAccountsCheck(checkAccounts)
     } else {
       selfUpdate = new SelfUpdateService(chatRuntime, bridge)

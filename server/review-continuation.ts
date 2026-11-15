@@ -57,6 +57,21 @@ export function yieldedReview(call: LogEntry): ReviewCheckpoint | null {
   return checkpoint
 }
 
+/** A checkpoint whose analysis finished but whose finalization was interrupted
+ * by a transient failure. Unlike yieldedReview, the retained response is
+ * required: resuming reuses the analysis instead of repeating it. The Caller
+ * verdict already rules out uncertain writes (those hold instead), and calls
+ * without a retained response keep the analysis path, so the two shapes are
+ * disjoint. */
+export function yieldedFinalization(call: LogEntry): ReviewCheckpoint | null {
+  if (call.error_code !== 'review_continuation_required') return null
+  if (call.behavior !== 'pr_review' && call.behavior !== 'pr_approve') return null
+  if (call.status !== 'failed') return null
+  const response = call.artifact?.review_response
+  if (!response || typeof response !== 'object' || Array.isArray(response)) return null
+  return parseReviewCheckpoint(call.artifact)
+}
+
 export function resumeReviewArgument(checkpoint: ReviewCheckpoint): string {
   return `${checkpoint.root_call}:${checkpoint.generation}`
 }
