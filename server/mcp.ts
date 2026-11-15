@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_TOOLS, MCP_WORK_TOOL_NAMES, mcpRepositoryAllowed, parseMcpRead, type McpGetArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
+import { MCP_MANAGER_TOOLS, MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_TOOLS, MCP_WORK_TOOL_NAMES, mcpRepositoryAllowed, parseMcpRead, type McpGetArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
 import { getSession, sessionInstance } from './chat/storage'
 import { timerById, timerSummaries } from './chat/control-store'
 import { HttpError, readJson, type RequestAuthority } from './http'
@@ -28,7 +28,7 @@ function readChatRecord(instance: string, grant: McpGrantScope, { kind, id }: Mc
 
 /** This scope terminates here, before ordinary workspace API dispatch. */
 export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, service: ServiceConfig | null,
-  authority: RequestAuthority, chatInstance?: string): Promise<void> {
+  authority: RequestAuthority, chatInstance?: string, managerRunning = false): Promise<void> {
   if (!service || authority.kind !== 'gateway' || authority.scope !== 'mcp' || !authority.mcp) throw new HttpError(403, 'an MCP read assertion is required')
   if (req.method !== 'POST' || req.url !== MCP_READ_PATH) throw new HttpError(405, `MCP reads require POST ${MCP_READ_PATH}`)
   const read = parseMcpRead(await readJson<unknown>(req, 16 * 1024))
@@ -39,7 +39,8 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
     if (!chatInstance) throw new HttpError(503, 'Chat metadata is unavailable until the workspace starts')
     lookup = { observedAt: new Date().toISOString(), record: readChatRecord(chatInstance, authority.mcp, read.arguments) }
   }
-  const tools = authority.mcp.chatMetadata && chatInstance ? MCP_TOOLS.map(tool => tool.name) : MCP_WORK_TOOL_NAMES
+  const tools = [...(authority.mcp.chatMetadata && chatInstance ? MCP_TOOLS.map(tool => tool.name) : MCP_WORK_TOOL_NAMES),
+    ...(authority.mcp.managerClientId && managerRunning ? MCP_MANAGER_TOOLS.map(tool => tool.name) : [])]
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },
     ...(read.name === 'poise_describe' ? { inventory: mcpInventory() } : {}),
     ...(work ? { work } : {}), ...(lookup ? { lookup } : {}) })

@@ -17,6 +17,7 @@ import { createGateway, type Gateway } from '../gateway/src/gateway'
 import { send, startHarness, type Harness } from '../gateway/tests/harness'
 import { enforceApiRequest, httpStatus } from '../server/http'
 import { handleMcpRead } from '../server/mcp'
+import { handleMcpControl } from '../server/mcp-manager'
 import { readServiceConfig } from '../server/service/config'
 import { BehaviorChainJournal, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import { nativeActionReceipt, nativeActionSettlement } from '../server/behavior-chain-action'
@@ -28,9 +29,10 @@ import * as processes from '../server/process'
 import type { readMcpWork } from '../server/mcp-work'
 import { PARTS, PLACES, SECTIONS } from '../src/ui/address'
 import { listCapabilities } from '../server/capabilities'
-import { createTimer } from '../server/chat/control-store'
-import { emptyCapabilities } from '../server/chat/runtime'
-import { deleteSession, insertSession } from '../server/chat/storage'
+import { createTimer, inbox, pauseDelivery, watches } from '../server/chat/control-store'
+import { ChatRuntime, emptyCapabilities } from '../server/chat/runtime'
+import { appendEvent, deleteSession, insertSession } from '../server/chat/storage'
+import { ChatControl } from '../server/chat/control'
 
 const endpoint = 'https://poise.test/mcp'
 let h: Harness
@@ -41,6 +43,7 @@ let workspacePort: number
 let workspaceReads: number
 let beforeRead: (() => void) | undefined
 let workspaceHealthy: boolean
+let control: ChatControl | null
 
 beforeEach(async () => {
   vi.stubEnv('POISE_MODE', 'service')
@@ -48,6 +51,7 @@ beforeEach(async () => {
   workspaceReads = 0
   beforeRead = undefined
   workspaceHealthy = true
+  control = null
   workspace = http.createServer(async (req, res) => {
     // Both owners use the production guard and handler, with separate workspace identities.
     const bob = req.headers.host === 'bob.poise.test'
@@ -70,7 +74,8 @@ beforeEach(async () => {
       expect(req.headers['x-poise-identity']).toBeUndefined()
       workspaceReads++
       beforeRead?.()
-      await handleMcpRead(req, res, service, authority, bob ? 'bob-chat' : 'alice-chat')
+      if (req.url === '/api/mcp/manager') await handleMcpControl(req, res, authority, bob ? null : control)
+      else await handleMcpRead(req, res, service, authority, bob ? 'bob-chat' : 'alice-chat', !bob && control?.status().running)
     } catch (error) { res.statusCode = httpStatus(error, 400); res.end(JSON.stringify({ error: String(error) })) }
   })
   await new Promise<void>(resolve => workspace.listen(0, '127.0.0.1', resolve))
@@ -106,7 +111,8 @@ const fetcher: typeof fetch = async (input, init) => {
 }
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
-async function connect(login: string, serverEndpoint = endpoint, options: { chatMetadata?: boolean; repository?: string } = {}) {
+async function connect(login: string, serverEndpoint = endpoint,
+  options: { chatMetadata?: boolean; repository?: string; managerControls?: boolean } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -137,7 +143,8 @@ async function connect(login: string, serverEndpoint = endpoint, options: { chat
   const approved = await fetcher(new URL('/mcp/authorize', endpoint), { method: 'POST', headers: {
     cookie: signedIn.apexCookie, origin: new URL(endpoint).origin, 'content-type': 'application/x-www-form-urlencoded',
   }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
-    ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
+    ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.managerControls ? { managerControls: '1' } : {}),
+    ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
   expect(callback.searchParams.get('state')).toBe('fixture-state')
@@ -307,6 +314,73 @@ it('answers 503 while a starting workspace is not yet serving instead of 500', a
     expect(refused.status).toBe(503)
     expect(await refused.json()).toEqual({ error: 'workspace_read_unavailable' })
   } finally { await connection.client.close() }
+})
+
+it('requires delegated Manager authority and revalidates and receipts an exact action once', async () => {
+  const manager = randomUUID(), worker = randomUUID(), foreignWorker = randomUUID()
+  const now = new Date().toISOString()
+  const directory = await mkdtemp(join(await realpath(tmpdir()), 'poise-mcp-manager-'))
+  for (const [id, role, repo] of [[manager, 'manager', 'Acme/Repo'], [worker, 'worker', 'Acme/Repo'], [foreignWorker, 'worker', 'Acme/Other']] as const) {
+    insertSession({ id, title: role, role, agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
+      repo, checkout: '/fixture/checkout', branch: { name: 'main', origin: 'existing', provisional: false },
+      createdAt: now, updatedAt: now, status: 'idle', capabilities: emptyCapabilities(), lastSeq: 0, pendingRequests: [], instance: 'alice-chat' })
+    pauseDelivery('alice-chat', id)
+  }
+  const runtime = new ChatRuntime({ instance: 'alice-chat', instanceLabel: 'fixture', callerTurns: null })
+  control = new ChatControl(runtime, { connectionDir: directory })
+  control.start()
+  const ordinary = await connect('Alice', endpoint, { chatMetadata: true })
+  const delegated = await connect('Alice', endpoint, { managerControls: true, repository: 'Acme/Repo' })
+  const otherGrant = await connect('Alice', endpoint, { managerControls: true })
+  const preview = { name: 'poise_action_preview', arguments: { operation: 'send', sessionId: worker, text: '/model This is literal task text' } }
+  const apply = (value: string) => ({ name: 'poise_action_apply', arguments: { preview: value } })
+  async function managerTool(client: Client, request: typeof preview | ReturnType<typeof apply>) {
+    const result = await client.callTool(request)
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).action as { preview: string; requestId: string }
+  }
+  try {
+    expect((await ordinary.client.callTool(preview)).isError).toBe(true)
+    expect((await delegated.client.callTool({ ...preview, arguments: { operation: 'answer', sessionId: worker } })).isError).toBe(true)
+    const identity = signAssertion(h.keys.privateKey, { handle: 'alice', login: 'Alice', scope: 'mcp',
+      mcp: { resource: endpoint, ownerId: 1001, handle: 'alice', grantId: randomUUID(), chatMetadata: true } }, Date.now())
+    const direct = await send(workspacePort, { host: 'alice.poise.test', path: '/api/mcp/manager', method: 'POST',
+      headers: { 'x-poise-identity': identity, 'content-type': 'application/json' }, body: JSON.stringify(preview) })
+    expect(direct.status).toBe(403)
+    expect(await describe(delegated.client)).toMatchObject({ capabilities: { tools: ['poise_describe', 'poise_work', 'poise_action_preview', 'poise_action_apply'] } })
+    const outside = await managerTool(delegated.client, { ...preview, arguments: { ...preview.arguments, sessionId: foreignWorker } })
+    expect(outside).toMatchObject({ status: 'refused' })
+
+    const stale = await managerTool(delegated.client, preview)
+    expect(stale).toMatchObject({ status: 'preview', humanDecisionRequired: false, permission: 'delegated-manager',
+      basis: { managerId: manager, sessionId: worker, sequence: 0, repository: 'Acme/Repo' }, action: preview.arguments })
+    expect(inbox('alice-chat', worker)).toEqual([])
+    appendEvent(worker, { type: 'status.changed', status: 'idle' })
+    expect(await managerTool(delegated.client, apply(stale.preview))).toMatchObject({ status: 'refused', code: 'stale_preview' })
+    const approved = await managerTool(delegated.client, preview)
+    expect(await managerTool(otherGrant.client, apply(approved.preview))).toMatchObject({ status: 'refused' })
+    const [one, replay] = await Promise.all([managerTool(delegated.client, apply(approved.preview)), managerTool(delegated.client, apply(approved.preview))])
+    expect(one).toMatchObject({ status: 'applied', requestId: approved.requestId, result: { queued: true, sessionId: worker } })
+    expect(replay).toEqual(one)
+    expect(inbox('alice-chat', worker)).toMatchObject([{ body: preview.arguments.text, sender: manager, state: 'pending' }])
+    const grant = gateway.context.mcp.grants.find((await delegated.provider.tokens())!.access_token, 'access')!
+    const receipt = db.prepare('SELECT delegation FROM chat_command_receipts WHERE instance = ? AND request_id = ?')
+      .get('control:alice-chat:' + manager, approved.requestId) as { delegation: string }
+    const attributed = JSON.parse(receipt.delegation)
+    expect(attributed).toEqual({ managerId: manager, sessionId: worker, clientId: grant.clientId, grantId: grant.grantId, sequence: 1 })
+    expect(JSON.stringify(one)).not.toContain(grant.grantId)
+    const supervision = { name: 'poise_action_preview', arguments: { operation: 'supervise', sessionId: worker, text: 'Inspect progress', intervalMinutes: 60 } }
+    expect(await managerTool(delegated.client, supervision)).toMatchObject({ status: 'refused' })
+    const watch = await managerTool(otherGrant.client, supervision)
+    expect(await managerTool(otherGrant.client, apply(watch.preview))).toMatchObject({ status: 'applied', result: { watchId: expect.any(String) } })
+    expect(watches('alice-chat', manager)).toMatchObject([{ owner: manager, targets: JSON.stringify([worker]), interval_ms: 3_600_000 }])
+  } finally {
+    await Promise.all([ordinary.client.close(), delegated.client.close(), otherGrant.client.close()])
+    await control.stop()
+    db.prepare('DELETE FROM chat_control_watches WHERE instance = ? AND owner = ?').run('alice-chat', manager)
+    for (const id of [manager, worker, foreignWorker]) deleteSession(id)
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 it('accepts the same immutable owner after a case-only GitHub login change', async () => {

@@ -85,6 +85,26 @@ held or tripped timers. An empty record means there is no matching record in
 that scope. This grant covers metadata. Transcript, attachment and timer
 message content and Manager actions require separate capabilities.
 
+## Delegate Manager controls
+
+The owner can separately delegate Manager actions in Connected agents consent.
+The active workspace Manager's limits and Chat policies apply. A client can
+queue a message, steer a running turn, stop a Chat or schedule supervision of
+one Chat. Supervision persists across turns and requires a workspace-wide grant.
+
+Call `poise_action_preview` with `operation` and `sessionId`. Send and steer
+also take `text`. Supervision takes `text` and `intervalMinutes`. The result
+shows the target and sequence, current turn, acting Manager, delegated client,
+effect and any required human decision. Use the opaque `preview` with
+`poise_action_apply` after checking that the effect matches the requested task.
+
+An unused preview lasts five minutes. Apply checks the current Manager, Chat
+basis and grant again. Reusing the same preview returns the durable original
+outcome or explicitly reports uncertainty. The command receipt identifies the
+grant, client and target. Messages report queue admission, and stops report
+whether execution settled. A send or steering action cannot approve a native
+permission request or supply the person's answer.
+
 ## Private plugin
 
 Render a private package for an installation's HTTPS apex into a new directory:

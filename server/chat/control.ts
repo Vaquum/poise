@@ -1,9 +1,10 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { lstat, mkdir, rm } from 'node:fs/promises'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
+import { mcpRepositoryAllowed, type McpGrantScope, type McpManagerAction, type McpManagerRequest } from '../../gateway/src/mcp-contract'
 import { db, getMeta, setMeta } from '../db'
 import { behaviorChainOwner, behaviorChainOwnsRepository, type ChainPullIdentity } from '../behavior-chain-journal'
 import { HttpError, httpStatus, readJson } from '../http'
@@ -21,7 +22,7 @@ import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-re
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
 import { clearWakeFailure, readWake, readWakeFailure, recordWakeFailure, wakeArmed } from './manager-settings'
-import { findEvent, managerSession } from './storage'
+import { findEvent, getOpenTurn, managerSession } from './storage'
 import type { ManagerWakeView, WakeMinutes } from '../../src/chat-manager-settings-types'
 import { pushedBranches, writeFileAtomic } from './git'
 import { ChatError, type ChatRuntime } from './runtime'
@@ -38,6 +39,24 @@ const PATH = '/api/chat/control'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const CI_INTERVAL = 5 * 60_000
 const DISCOVERY_INTERVAL = 60_000
+const DELEGATED_PREVIEW_MS = 5 * 60_000
+
+interface ManagerBasis {
+  managerId: string
+  sessionId: string
+  repository: string | null
+  sequence: number
+  updatedAt: string
+  status: SessionRecord['status']
+  turnId: string | null
+}
+interface ManagerPreview {
+  requestId: string
+  expiresAt: number
+  action: McpManagerAction
+  basis: ManagerBasis
+}
+
 const OPERATIONS = {
   help: 'List control operations and Poise APIs.',
   list: 'List chats, manager relationships, work bindings and supervision.',
@@ -945,6 +964,95 @@ export class ChatControl {
     } catch (error) { reply(res, httpStatus(error, 400), { error: error instanceof Error ? error.message : String(error) }) }
   }
 
+  /** The gateway and workspace verify the separately consented grant before
+   *  reaching this entry point. Native Manager authorization and budget
+   *  still apply to the exact Chat and action. */
+  async delegated(grant: McpGrantScope, request: McpManagerRequest) {
+    const clientId = grant.managerClientId
+    if (!clientId) throw new HttpError(403, 'Manager controls require explicit delegation')
+    const now = this.options.now ?? Date.now
+    if (request.name === 'poise_action_preview') {
+      const action = request.arguments
+      const basis = this.delegatedBasis(grant, action)
+      const preview: ManagerPreview = { requestId: randomUUID(), expiresAt: now() + DELEGATED_PREVIEW_MS, action, basis }
+      const payload = Buffer.from(JSON.stringify(preview)).toString('base64url')
+      const effect = {
+        send: 'Queue this text for the next eligible idle turn',
+        steer: 'Send this literal text to the current active turn',
+        stop: 'Stop the current turn and pause automatic message and queue delivery',
+        supervise: 'Start persistent supervision of this Chat at the specified interval',
+      }[action.operation]
+      return { status: 'preview', ...preview, clientId, effect, permission: 'delegated-manager', humanDecisionRequired: false,
+        preview: payload + '.' + this.delegatedSignature(grant, payload).toString('base64url') }
+    }
+    const preview = this.decodeDelegatedPreview(grant, request.arguments.preview)
+    const { basis, action, requestId } = preview
+    const attribution = { grantId: grant.grantId, clientId, managerId: basis.managerId, sessionId: basis.sessionId, sequence: basis.sequence }
+    const scope = 'control:' + this.runtime.instance + ':' + basis.managerId
+    const receipt = { requestId, basis, clientId }
+    const budget = this.runtime.ownsSession(basis.managerId) && this.managerBudgetRefusal(basis.managerId, action.operation, scope, requestId)
+    if (budget) return { ...receipt, status: 'refused', code: 'manager_budget', error: budget.error }
+    const release = trackReleaseBackground()
+    try {
+      const ack = await executeCommandOnce(scope, requestId, { preview, attribution }, async () => {
+        const refuse = (error: string) => ({ kind: 'ack' as const, id: requestId, ok: false, code: 'stale_preview', error })
+        if (preview.expiresAt <= now()) return refuse('The Manager action preview expired')
+        let current: ManagerBasis
+        try { current = this.delegatedBasis(grant, action) }
+        catch (error) { return refuse(error instanceof Error ? error.message : 'The action basis is no longer available') }
+        if (JSON.stringify(current) !== JSON.stringify(basis)) return refuse('The Manager or target Chat changed after preview')
+        const manager = actorOf(this.session(basis.managerId))
+        const result = await this.execute(basis.managerId, action.operation, this.delegatedCommand(action, requestId),
+          { ...manager, title: ('Delegated client · ' + manager.title).slice(0, 200) })
+        return { kind: 'ack', id: requestId, ok: true, result }
+      }, { now, operation: action.operation, delegation: attribution })
+      if (ack.ok) return { ...receipt, status: 'applied', result: ack.result }
+      return { ...receipt, status: ack.code === 'command_in_doubt' ? 'uncertain' : 'refused', code: ack.code, error: ack.error }
+    } finally { release() }
+  }
+
+  private delegatedBasis(grant: McpGrantScope, action: McpManagerAction): ManagerBasis {
+    if (!this.ready || this.stopped || this.startError !== null) throw new HttpError(503, 'Manager controls are unavailable')
+    if ((this.runtime.draining || releaseBackgroundPaused()) && action.operation !== 'stop') throw new HttpError(503, 'Poise is draining')
+    const manager = managerSession(this.runtime.instance)
+    if (!manager || manager.status === 'closed') throw new HttpError(409, 'There is no active workspace Manager')
+    const target = this.session(action.sessionId)
+    const repository = target.repo || null
+    if (!mcpRepositoryAllowed(grant, repository)) throw new HttpError(404, 'unknown chat in this grant')
+    if (action.operation === 'supervise' && grant.repository !== undefined) {
+      throw new HttpError(403, 'Persistent supervision requires a workspace-wide Manager grant')
+    }
+    if (action.operation === 'supervise' && manager.id === target.id) throw new HttpError(400, 'The Manager cannot supervise itself')
+    this.authorize(manager.id, action.operation, this.delegatedCommand(action))
+    if (target.status === 'closed') throw new HttpError(409, 'the target chat is closed')
+    const turnId = getOpenTurn(target.id)?.turnId ?? null
+    if (action.operation === 'steer' && (!turnId || !target.capabilities.steer)) throw new HttpError(409, 'there is no steerable turn')
+    return { managerId: manager.id, sessionId: target.id, repository, sequence: target.lastSeq, updatedAt: target.updatedAt,
+      status: target.status, turnId }
+  }
+
+  private delegatedCommand(action: McpManagerAction, requestId?: string): Record<string, unknown> {
+    return action.operation === 'supervise'
+      ? { sessionIds: [action.sessionId], instruction: action.text, intervalMinutes: action.intervalMinutes }
+      : { ...action, requestId }
+  }
+
+  private delegatedSignature(grant: McpGrantScope, payload: string): Buffer {
+    const scope = JSON.stringify(['poise-mcp-manager-v1', grant.resource, grant.ownerId, grant.handle, grant.grantId,
+      grant.managerClientId, grant.repository ?? null])
+    return createHmac('sha256', this.secret).update(scope).update('.').update(payload).digest()
+  }
+
+  private decodeDelegatedPreview(grant: McpGrantScope, token: string): ManagerPreview {
+    if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(token)) throw new HttpError(400, 'Invalid Manager action preview')
+    const [payload, signature] = token.split('.')
+    const actual = Buffer.from(signature, 'base64url')
+    if (actual.length !== 32 || !timingSafeEqual(this.delegatedSignature(grant, payload), actual)) {
+      throw new HttpError(400, 'Invalid Manager action preview for this grant')
+    }
+    return JSON.parse(Buffer.from(payload, 'base64url').toString()) as ManagerPreview
+  }
+
   /** Before any receipt: a refusal is a 403, never a recorded outcome. The
    *  Switchboard observes and reports; only it reports. */
   private authorize(id: string, operation: string, command: Record<string, unknown>): void {
@@ -1012,7 +1120,7 @@ export class ChatControl {
     return { error: `${spent}; retry after ${retryAt}.`, limit, retryAfter: Math.max(1, Math.ceil((Date.parse(retryAt) - now) / 1000)) }
   }
 
-  private async execute(id: string, operation: string, command: Record<string, unknown>): Promise<unknown> {
+  private async execute(id: string, operation: string, command: Record<string, unknown>, delegatedActor?: ChatActor): Promise<unknown> {
     if (this.stopped) throw new HttpError(503, 'chat control is stopped')
     // Reporting starts no work, so a draining Poise still takes the Switchboard's reports.
     if ((this.runtime.draining || releaseBackgroundPaused()) && !['help', 'list', 'read', 'inbox', 'stop', 'answer', 'unbind', 'unsupervise', 'timers', 'cancelTimer'].includes(operation) && !operation.startsWith('switchboard.')) throw new HttpError(503, 'Poise is draining; new control work is paused')
@@ -1051,12 +1159,12 @@ export class ChatControl {
       const recipient = this.session(command.sessionId)
       if (recipient.status === 'closed') throw new HttpError(409, 'the target chat is closed')
       if (operation === 'steer') {
-        const actor = actorOf(this.session(id))
+        const actor = delegatedActor ?? actorOf(this.session(id))
         await this.runtime.steer(recipient.id, text(command.text, 'text'), undefined, actor)
         this.acted(id, recipient.id, 'steer')
         return { steered: true, sessionId: recipient.id }
       }
-      store.message(instance, recipient.id, id, text(command.text, 'text'), `send:${id}:${String(command.requestId)}`, actorOf(this.session(id)))
+      store.message(instance, recipient.id, id, text(command.text, 'text'), `send:${id}:${String(command.requestId)}`, delegatedActor ?? actorOf(this.session(id)))
       this.acted(id, recipient.id, 'send')
       return { queued: true, sessionId: recipient.id }
     }
@@ -1065,7 +1173,7 @@ export class ChatControl {
       if (record.status === 'closed') throw new HttpError(409, 'the target chat is closed')
       const idle = record.status === 'idle'
       store.pauseDelivery(instance, record.id)
-      const result = await this.runtime.cancel(record.id, actorOf(this.session(id)))
+      const result = await this.runtime.cancel(record.id, delegatedActor ?? actorOf(this.session(id)))
       this.acted(id, record.id, 'stop', undefined, idle ? false : undefined)
       return idle ? { ...result, stopped: false } : result
     }

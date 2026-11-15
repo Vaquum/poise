@@ -4,6 +4,7 @@ import { localLogging, stopLoggingApi } from './logging-api'
 import { startBehaviorLedger, stopBehaviorLedger } from './behavior-ledger'
 import { handleBehaviorLedger } from './behavior-ledger-http'
 import { handleMcpRead } from './mcp'
+import { handleMcpControl } from './mcp-manager'
 import { handleBehaviorPrStatus } from './behavior-pr-status'
 import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
@@ -404,7 +405,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         } catch (err) {
           return json(res, httpStatus(err, 403), { error: (err as Error).message })
         }
-        if (path === '/api/mcp/read') return handleMcpRead(req, res, service, authority, chatRuntime?.instance)
+        if (path === '/api/mcp/read') return handleMcpRead(req, res, service, authority, chatRuntime?.instance, chatControl?.status().running)
+        if (path === '/api/mcp/manager') return handleMcpControl(req, res, authority, chatControl)
         if (path === '/api/behavior-ledger/pr-status') {
           return handleBehaviorPrStatus(req, res, url)
         }
