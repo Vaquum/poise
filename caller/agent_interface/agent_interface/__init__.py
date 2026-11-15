@@ -3228,7 +3228,8 @@ def _main():
         print(json.dumps(read_action_plan(sys.argv[2]), ensure_ascii=False))
         return
     if len(sys.argv) == 7 and sys.argv[1] == "--capture-failed-source":
-        failed_source.capture(DB, Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6]))
+        exit_code = None if sys.argv[6] == "interrupted" else int(sys.argv[6])
+        failed_source.capture(DB, Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5], exit_code)
         return
     if len(sys.argv) == 5 and sys.argv[1] == "--read-failed-source":
         print(json.dumps(failed_source.inspect(DB, *sys.argv[2:])))

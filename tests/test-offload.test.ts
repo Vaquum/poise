@@ -1144,6 +1144,25 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect(result.stderr).not.toContain('total time budget')
   }, 30_000)
 
+  it.each([
+    { assertion: true, noResult: true, capture: 'interrupted' },
+    { assertion: false, noResult: true, capture: null },
+    { assertion: false, noResult: false, capture: '125' },
+  ])('distinguishes runner no-result 125 from a suite exit ($assertion, $noResult)', async ({ assertion, noResult, capture }) => {
+    await startAll()
+    const bin = temp()
+    const retained = join(bin, 'retained')
+    writeFileSync(join(bin, 'agent-interface'), '#!/bin/sh\nprintf "%s" "$6" > "$FIXTURE_RETENTION"\n', { mode: 0o700 })
+    const detail = (assertion ? '[poise] first test failure: fixture.test.js > expected value\nAssertionError: expected 1 to equal 2\n' : '')
+      + (noResult ? '[poise] no test result: the box stopped. This says nothing about your code.\n' : '')
+    const result = await suite(committed(), [process.execPath, '-e', `process.stderr.write(${JSON.stringify(detail)}); process.exitCode = 125`], {
+      PATH: `${bin}:${process.env.PATH}`, FIXTURE_RETENTION: retained, AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+    }).done
+    expect(result.code).toBe(125)
+    expect(result.stderr.match(/\[poise\] no test result:/g) ?? []).toHaveLength(noResult ? 1 : 0)
+    expect(existsSync(retained) ? readFileSync(retained, 'utf8') : null).toBe(capture)
+  })
+
   it('runs the command exactly as it was typed, with nothing of this workspace\'s hooks', async () => {
     await startAll()
     const repo = repository()
@@ -1322,8 +1341,12 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect(stderr).toContain('cannot start /no/such/command')
   })
 
-  it.each(['none', 'assertion', 'timeout', 'oversized'])('retains real Vitest evidence before interruption (failure: %s)', async (failure) => {
+  it.each([
+    ['none', 'relay'], ['assertion', 'relay'], ['timeout', 'relay'], ['oversized', 'relay'],
+    ['assertion', 'client'], ['assertion', 'capture failed'],
+  ])('retains real Vitest evidence before interruption (%s, %s)', async (failure, interruption) => {
     let now = Date.now()
+    const clientDeadline = interruption === 'client'
     await startAll({ limitSeconds: 2, now: () => now })
     const failed = failure !== 'none'
     const oversized = failure === 'oversized'
@@ -1345,7 +1368,20 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
         await new Promise(() => {})
       }, 60000)
     })`)
-    const running = suite(fixture.repo, fixture.argv)
+    const bin = temp()
+    const retained = join(bin, 'retained.json')
+    writeFileSync(join(bin, 'agent-interface'), `#!${process.execPath}
+const fs = require('node:fs')
+const [command, archive, spec, ...identity] = process.argv.slice(2)
+if (command !== '--capture-failed-source') process.exit(9)
+fs.writeFileSync(process.env.FIXTURE_RETENTION, JSON.stringify({ archive, identity, spec: fs.readFileSync(spec).toString() }))
+${interruption === 'capture failed' ? 'process.exit(1)' : 'fs.copyFileSync(archive, process.env.FIXTURE_RETENTION + ".tree")'}
+`, { mode: 0o700 })
+    const original = readFileSync(join(fixture.repo, 'tests/fixture.test.mjs'), 'utf8')
+    const running = suite(fixture.repo, fixture.argv, {
+      PATH: `${bin}:${process.env.PATH}`, FIXTURE_RETENTION: retained, AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+      ...(clientDeadline ? { BASH_DEFAULT_TIMEOUT_MS: '8000' } : {}),
+    })
     let output = '', evidence = ''
     running.child.stdout?.on('data', (chunk) => { output += chunk })
     running.child.stderr?.on('data', (chunk) => { evidence += chunk })
@@ -1380,13 +1416,16 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
       expect(admission).not.toBeNull()
       expect(evidence).toContain(`candidate ${admission![1]}, suite node vitest.mjs run, cwd ${fixture.repo}`)
       expect(relay.runs.has(admission![2])).toBe(true)
-      now += 3_000
+      writeFileSync(join(fixture.repo, 'tests/fixture.test.mjs'), '// later candidate B\n')
+      if (!clientDeadline) now += 3_000
       const { code, stderr } = await running.done
       expect(code).toBe(124)
-      expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
+      expect(stderr).toContain(clientDeadline
+        ? 'no test result: the test offload exhausted its total time budget'
+        : 'no test result: this suite is too big for its test box: it passed the 2 s time limit')
       expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
       expect(stderr).toContain('let CI run the tests')
-      expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![2] }))
+      if (!clientDeadline) expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![2] }))
       if (failed) {
         expect(stderr.match(/\[poise\] first test failure:/g)).toHaveLength(1)
         expect(stderr.indexOf(admission![0])).toBeLessThan(stderr.indexOf('[poise] first test failure:'))
@@ -1395,12 +1434,27 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
       const box = runBox()
       await until(() => terminated.includes(box.id), 'the box to be terminated')
       expect(events).not.toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', id: admission![2] }))
+      if (!failed || timeout) {
+        expect(existsSync(retained)).toBe(false)
+      } else {
+        const { archive, identity, spec } = JSON.parse(readFileSync(retained, 'utf8')) as { archive: string; identity: string[]; spec: string }
+        expect(identity).toEqual([admission![1], admission![2], 'interrupted'])
+        expect(existsSync(archive)).toBe(false)
+        if (interruption === 'capture failed') {
+          expect(stderr).toContain('failed source capture unavailable')
+        } else {
+          const bytes = readFileSync(retained + '.tree')
+          const tree = bytes[0] === 0x1f && bytes[1] === 0x8b ? gunzipSync(bytes) : bytes
+          expect(createHash('sha256').update(spec).update(tree).digest('hex')).toBe(admission![1])
+          expect(execFileSync('tar', ['-xOf', retained + '.tree', join(fixture.repo, 'tests/fixture.test.mjs').slice(1)], { encoding: 'utf8' })).toBe(original)
+        }
+      }
     } finally {
       // Render ends every process on the box; the local stand-in only ends its box script.
       const pid = /VITEST_HELD (\d+)/.exec(output)?.[1]
       if (pid) process.kill(Number(pid), 'SIGTERM')
     }
-  })
+  }, 15_000)
 
   it.each([false, true])('preserves completed Vitest output and exit status (test failure: %s)', async (failed) => {
     await startAll()
@@ -1829,12 +1883,28 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
   })
 
-  it('does not retry a second gateway restart', async () => {
+  it('does not retry a second gateway restart and retains the assertion-producing run', async () => {
     await startAll()
-    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    const bin = temp()
+    const retained = join(bin, 'retained')
+    writeFileSync(join(bin, 'agent-interface'), '#!/bin/sh\nprintf "%s %s" "$5" "$6" > "$FIXTURE_RETENTION"\n', { mode: 0o700 })
+    const script = `
+const fs = require('node:fs')
+if (!fs.existsSync(process.argv[1])) process.stderr.write('[poise] first test failure: fixture.test.js > expected value\\nAssertionError: expected 1 to equal 2\\n')
+console.log('started')
+setInterval(() => {}, 1000)`
+    const secondAttempt = join(bin, 'second-attempt')
+    const run = suite(repository(), [process.execPath, '-e', script, secondAttempt], {
+      PATH: `${bin}:${process.env.PATH}`, FIXTURE_RETENTION: retained, AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
+    })
+    let evidence = ''
     let starts = 0
+    run.child.stderr?.on('data', (chunk) => { evidence += chunk })
     run.child.stdout?.on('data', () => { starts += 1 })
     await until(() => starts === 1, 'the first suite to start')
+    await until(() => evidence.includes('AssertionError: expected 1 to equal 2\n'), 'assertion from the first attempt')
+    const [producingRun] = relay.runs.keys()
+    writeFileSync(secondAttempt, '')
     relay.stop()
     await startAll2()
     await until(() => starts === 2, 'the fresh suite to start')
@@ -1842,6 +1912,8 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     const { code, stderr } = await run.done
     expect(code).toBe(125)
     expect(stderr.match(/interrupted validation:/g)).toHaveLength(2)
+    expect(stderr.match(/\[poise\] first test failure:/g)).toHaveLength(1)
+    expect(readFileSync(retained, 'utf8')).toBe(`${producingRun} interrupted`)
     expect(stderr).toContain("don't retry")
     expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)

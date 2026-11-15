@@ -42,10 +42,14 @@ continues to use the original response bytes before the CLI's trailing newline.
 # Inspecting failed unpublished source
 
 For a managed `implement_issue`, the test-offload runner hands Caller the original
-archive and command specification after a completed nonzero suite exit, before
-deleting that archive. Caller verifies their combined candidate digest and
-checkout binding, then retains only changes against the prepared base: tracked
-files (including deletions) and new source files present in that archive. Ignored
+archive and command specification after a completed nonzero suite exit or an
+interrupted validation that reported a Vitest assertion. For interrupted
+validation it keeps the producing run's ID across relay recovery and gives
+Caller up to 15 seconds before deleting the archive. The private manifest
+marks that capture with `"validation": "interrupted"`, and the command still
+returns its no-result disposition. Caller verifies the combined candidate
+digest and checkout binding, then retains only changes against the prepared
+base: tracked files (including deletions) and new source files in that archive. Ignored
 dependencies, Git metadata and other untracked files are excluded. Symlinks retain
 their target text without following it. Unsupported or mismatched captures are
 unavailable; no cleanup-time diff substitutes for them.
