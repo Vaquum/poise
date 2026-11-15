@@ -9,6 +9,10 @@ with `repository` and either an exact `issue` number or `label`. Follow
 Keep stable issue, chain, invocation and Call identities in the explanation
 and use the returned links to open the owner's records.
 
+When `poise_describe` lists `poise_get`, read a known Chat ID with `kind: "chat"`
+and follow its live timer IDs with `kind: "timer"`. Report pending delivery and
+recorded execution failures separately.
+
 Report each source's coverage before interpreting missing work. A fresh empty
 label page establishes absence only within that selector; stale, partial or
 unavailable coverage cannot. Receipt absence and mirror staleness are separate
