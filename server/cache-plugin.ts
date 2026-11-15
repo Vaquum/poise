@@ -48,7 +48,7 @@ import { workspaceOf } from './extensions/types'
 import { listSessions } from './chat/storage'
 import { handleGoogleApi } from './google/api'
 import { validateGoogleEnvironment } from './google/accounts'
-import { getBehaviorDiagnosticIncidents } from './behaviors'
+import { getBehaviorChainRuntimeHealth, getBehaviorDiagnosticIncidents } from './behaviors'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, setReviewCap as setBehaviorReviewCap, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getReviewCap, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isValidReviewCap, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, getCloseOldPrsLastFired, getCloseOldPrsDays, setCloseOldPrsDays, isValidCloseOldPrsDays, setPaused as setBehaviorPaused, getPausedUntil as getBehaviorPausedUntil, getPausedBy as getBehaviorPausedBy, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceRuntime, stopStorageMaintenanceRuntime, storageStatus } from './storage-maintenance'
@@ -69,7 +69,7 @@ import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
 import { setCallerAccounts } from './process'
 import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, handleSelfUpdateTurnedOff, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
-import { releaseBackgroundPaused } from './release-background'
+import { releaseBackgroundPaused, releaseSwitchPending } from './release-background'
 import { applyServiceEnvironment, readServiceConfig, type ServiceConfig } from './service/config'
 import { DRAINING_ERROR, ServiceControl, handleServiceApi } from './service/control'
 import { countDebate } from './service/caller-calls'
@@ -489,13 +489,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (path === '/api/behavior-chains') return handleBehaviorChains(req, res, url, chatRuntime?.instance)
 
         if (url === '/api/health' && req.method === 'GET') {
-          const scheduler = getBehaviorsRuntimeHealth()
           const claudeAuthState = auth.snapshot()
           const [callerRelease, production] = await Promise.all([
             getCallerReleaseHealth(),
             service ? productionUpdaterOff() : getProductionUpdateHealth(),
           ])
           const organizations = getOrganizations()
+          const scheduler = getBehaviorsRuntimeHealth()
           const requiresClaude = () => {
             const enabled = getEnabledMap()
             return enabled['review-new-prs'] || enabled['approve-prs'] || enabled['review-new-issues']
@@ -516,9 +516,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           // `status`, or `scheduler.status`, which the release judge, the
           // browser watcher and the health monitor read as before.
           const split = dependencySnapshot()
+          const releasePauseReason = releaseBackgroundPaused() ? 'drain' : releaseSwitchPending() ? 'switch_pending' : null
+          const followed = new Set(organizations.map(({ login }) => login.toLowerCase()))
           return json(res, healthy ? 200 : 503, {
             status: healthy ? 'ok' : 'degraded',
-            scheduler,
+            scheduler: {
+              ...scheduler,
+              releaseAdmission: { paused: releasePauseReason !== null, reason: releasePauseReason },
+              organizationSweeps: getBehaviorChainRuntimeHealth().filter(({ organization }) => followed.has(organization)),
+            },
             organizations,
             claudeAuth: claudeAuthState,
             callerRelease,
