@@ -125,6 +125,46 @@ it('keeps deferred holds with stale closure hints or outstanding ownership', asy
   expect(journal.active().map(chain => chain.id)).toEqual([stale.id, linked.id, unsettled.id])
 })
 
+it.each([false, true])('records a late merge through a closure hint with retained review evidence: %s', async reviewed => {
+  const { journal } = setup()
+  vi.setSystemTime(NOW - 3 * 86_400_000)
+  let chain = seed(journal)
+  const before = observation()
+  Object.assign(before.publication, { merged: false, merge_sha: null })
+  Object.assign(before.pull!, { merged: false, mergeSha: null, mergedAt: null })
+  if (reviewed) {
+    const call = completedReviewCall(chain.repository, before.pull!.number, before.pull!.head, chain.reviewer)
+    chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-review', behavior: 'review-pr',
+      actor: chain.reviewer, model: call.model, slot: reviewer.slot, basis: chainBasis(['pr', before.pull!.head, before.pull!.reviewContext]),
+      admittedAt: Date.parse(call.started_at), request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+    chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'original-review', callId: call.id, outcome: 'clean',
+      evidence: { status: 'completed', action: 'reviewed_clean', review_id: call.review_id, head_sha: call.head_sha,
+        artifact: call.artifact, completedAt: Date.parse(call.completed_at!), resources_settled_at: call.completed_at,
+        resource_ownership: { version: 1, roots: [], errors: [] } } })
+    before.pull!.reviewIds.push(91)
+    before.pull!.reviewReceipts.push({ id: 91, head: before.pull!.head, state: 'COMMENTED', invocation: call.id,
+      response: call.artifact!.review_response, submittedAt: Date.now() })
+  }
+  vi.setSystemTime(NOW - 4 * 3_600_000)
+  before.checkedAt = Date.now()
+  chain = record(journal, chain, { type: 'chain.observed', observation: before })
+  chain = record(journal, chain, { type: 'chain.held', reason: 'operator hold' })
+  vi.setSystemTime(NOW)
+  expect(journal.reconciliationAt(chain)).toBeGreaterThan(NOW + 3_600_000)
+  const merged = observation()
+  merged.issue.open = false
+  merged.pull!.mergedAt = NOW - 2 * 3_600_000
+  merged.pull!.reviewIds = before.pull!.reviewIds
+  merged.pull!.reviewReceipts = before.pull!.reviewReceipts
+  const observe = vi.fn(async () => merged)
+  const reportHold = vi.fn(async () => null)
+  await new BehaviorChainRuntime(journal, operations({ observe, reportHold,
+    closedSeedHints: async () => [{ repository: chain.repository, number: chain.issue, updatedAt: merged.pull!.mergedAt! }] })).run()
+  expect(observe).toHaveBeenCalledTimes(1)
+  expect(reportHold).not.toHaveBeenCalled()
+  expect(journal.read(chain.id)).toMatchObject({ held: chain.held, invocations: chain.invocations, mergeSha: MERGE, reviewPending: !reviewed })
+})
+
 function captureDiagnostics() {
   const root = mkdtempSync(join(tmpdir(), 'poise-chain-conflict-')); roots.push(root)
   vi.stubEnv('POISE_DB', join(root, 'cache.db'))

@@ -9,7 +9,7 @@ import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocatio
 import { chainCiDependency, chainReviewResponse, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
-import { datastoreViewOrCli, readDatastoreView } from './datastore-reader'
+import { datastoreViewOrCli, organizationDatastorePath, readDatastoreView } from './datastore-reader'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
@@ -140,13 +140,13 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
     async closedSeedHints(after) {
-      if (!org.datastorePath) return []
-      const rows = await readDatastoreView(org.datastorePath, ['view', 'issue', '--status', 'closed',
+      const datastorePath = organizationDatastorePath(org)
+      const rows = await readDatastoreView(datastorePath, ['view', 'issue', '--status', 'closed',
         '--format', 'json', '--limit', '100', '--updated-since-datetime', new Date(Date.now() - 86_400_000).toISOString(),
         '--after-repo', after?.repository ?? '', '--after-number', String(after?.number ?? 0)])
       if (!rows?.length) return []
       const { stdout } = await runDatastoreHealth(org, { timeoutMs: 5_000 })
-      if (validatedHealth(stdout, org)?.status !== 'healthy') return []
+      if (validatedHealth(stdout, { ...org, datastorePath })?.status !== 'healthy') return []
       return rows.flatMap(row => {
         const updatedAt = typeof row.updated_at === 'string' ? Date.parse(row.updated_at) : NaN
         return typeof row.repo === 'string' && ownsRepository(row.repo) && row.status === 'closed' && Number.isFinite(updatedAt)

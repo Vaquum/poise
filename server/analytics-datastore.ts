@@ -1,11 +1,12 @@
-import { homedir } from 'node:os'
-import { join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
 import Database from 'better-sqlite3'
 import type { ReviewSummary } from '../src/analytics-work-review'
 import type { AnalyticsWindow } from './analytics'
 import type { DatastoreRecord, OrganizationReadError } from './gh'
 import type { Organization } from './organizations'
+import { organizationDatastorePath as analyticsDatastorePath } from './datastore-reader'
+
+export { analyticsDatastorePath }
 
 type AnalyticsDatastoreOrganization = Pick<Organization, 'login' | 'datastorePath' | 'error'>
 
@@ -48,11 +49,6 @@ export function prepareMergedDetails(db: Database.Database) {
 // Read the same datastore views and involvement scopes as Current without
 // starting Python for every scope. Project only fields used by the report:
 // unused view columns can parse large payloads and count entire discussions.
-/** The datastore an organization's report reads: its own, or the legacy default. */
-export function analyticsDatastorePath(org: Pick<AnalyticsDatastoreOrganization, 'datastorePath'>): string {
-  return org.datastorePath ?? join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'github-datastore', 'github_datastore.sqlite')
-}
-
 async function readOrganization(org: AnalyticsDatastoreOrganization, me: string, window: AnalyticsWindow, scopeByKind: AnalyticsDatastoreQuery['scopes']): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[] }> {
   const path = analyticsDatastorePath(org)
   const db = new Database(path, { readonly: true, fileMustExist: true, timeout: 1_000 })

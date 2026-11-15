@@ -115,8 +115,8 @@ print(hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, sep
   expect(mocks.runFile.mock.lastCall?.[2].expected).toBeUndefined()
 })
 
-function actionOperations(overrides: Partial<NativeChainHooks> = {}, datastorePath?: string) {
-  return nativeChainOperations({ login: 'example', datastorePath } as Organization, {
+function actionOperations(overrides: Partial<NativeChainHooks> = {}) {
+  return nativeChainOperations({ login: 'example' } as Organization, {
     roster: async () => ({ issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
     resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
     capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
@@ -124,8 +124,9 @@ function actionOperations(overrides: Partial<NativeChainHooks> = {}, datastorePa
   })
 }
 
-it.each([false, true])('returns only owned closure hints with healthy mirror evidence: %s', async healthy => {
-  const database = '/fixture/mirror.sqlite3'
+it.each([false, true])('returns default-database closure hints only with healthy mirror evidence: %s', async healthy => {
+  vi.stubEnv('XDG_DATA_HOME', '/fixture/data')
+  const database = '/fixture/data/github-datastore/github_datastore.sqlite'
   const updatedAt = new Date().toISOString()
   mocks.readDatastoreView.mockResolvedValueOnce([
     { repo: 'example/repo', number: 7, status: 'closed', updated_at: updatedAt },
@@ -134,7 +135,7 @@ it.each([false, true])('returns only owned closure hints with healthy mirror evi
   mocks.health.mockResolvedValueOnce({ stdout: JSON.stringify({ action: 'health', database, healthy,
     status: healthy ? 'healthy' : 'stale', max_age_seconds: 120, age_seconds: healthy ? 1 : 180, last_success_at: updatedAt }) })
   const after = { repository: 'example/repo', number: 6 }
-  expect(await actionOperations({}, database).closedSeedHints!(after))
+  expect(await actionOperations().closedSeedHints!(after))
     .toEqual(healthy ? [{ repository: 'example/repo', number: 7, updatedAt: Date.parse(updatedAt) }] : [])
   expect(mocks.readDatastoreView).toHaveBeenLastCalledWith(database, expect.arrayContaining([
     '--status', 'closed', '--limit', '100', '--after-repo', after.repository, '--after-number', '6',

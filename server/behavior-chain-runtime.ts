@@ -304,6 +304,21 @@ export class BehaviorChainRuntime {
     return current
   }
 
+  private recordMerge(chain: BehaviorChain, observation: ChainObservation, reviewComplete: boolean): BehaviorChain {
+    const pull = observation.pull
+    if (!pull?.merged || !pull.mergeSha) return chain
+    return this.append(chain, { type: 'chain.merged', mergeSha: pull.mergeSha, evidence: { repository: chain.repository,
+      pull_number: pull.number, merged: true, merge_sha: pull.mergeSha, review_complete: reviewComplete } })
+  }
+
+  private decision(chain: BehaviorChain, observation: ChainObservation): ChainDecision {
+    const mergeEvidence = observation.pull?.merged ? {
+      before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
+      firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
+    } : undefined
+    return decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
+  }
+
   private async recheckClosedSeed(began: number): Promise<void> {
     if (!this.operations.closedSeedHints) return
     const hints = await this.operations.closedSeedHints(this.closedSeedCursor)
@@ -313,12 +328,18 @@ export class BehaviorChainRuntime {
       if (now - began > 45_000) break
       this.closedSeedCursor = hint
       if (!this.operations.ownsRepository(hint.repository) || hint.updatedAt > now) continue
-      const chain = this.journal.deferredSeedClosure(chainIdentity(hint.repository, hint.number), hint.updatedAt, now)
+      let chain = this.journal.deferredSeedClosure(chainIdentity(hint.repository, hint.number), hint.updatedAt, now)
       if (!chain) continue
       // Use the usual observation, with no admission, reporting or recovery.
       // An authoritative reopen also consumes the hint.
       const observation = await this.operations.observe(chain)
-      try { this.append(chain, { type: 'chain.observed', observation }) }
+      try {
+        chain = this.append(chain, { type: 'chain.observed', observation })
+        if (observation.pull?.merged && observation.pull.mergeSha) {
+          chain = this.recordMerge(chain, observation, false)
+          if (this.decision(chain, observation).kind === 'complete') this.recordMerge(chain, observation, true)
+        }
+      }
       catch (error) { if (!(error instanceof BehaviorChainRevisionConflict)) throw error }
       break
     }
@@ -613,10 +634,7 @@ export class BehaviorChainRuntime {
                 }
               }
               chain = this.append(chain, { type: 'chain.observed', observation })
-              if (observation.pull?.merged && observation.pull.mergeSha && !chain.mergeSha) {
-                chain = this.append(chain, { type: 'chain.merged', mergeSha: observation.pull.mergeSha, evidence: { repository: chain.repository,
-                  pull_number: observation.pull.number, merged: true, merge_sha: observation.pull.mergeSha, review_complete: false } })
-              }
+              if (!chain.mergeSha) chain = this.recordMerge(chain, observation, false)
               if (owned && call?.status === 'running') continue
               if (this.operations.recoverReport) {
                 const reason = await this.operations.recoverReport(chain, observation)
@@ -654,11 +672,7 @@ export class BehaviorChainRuntime {
               if (chain.held && missingReceiptHoldCanResume(chain, observation, Date.now())) {
                 chain = this.append(chain, { type: 'chain.resumed' })
               }
-              const mergeEvidence = observation.pull?.merged ? {
-                before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
-                firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
-              } : undefined
-              const decision = decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
+              const decision = this.decision(chain, observation)
               if (decision.kind === 'invoke' && decision.behavior === 'implement-issue' && this.operations.implementationAdmission) {
                 const gate = await this.operations.implementationAdmission(chain, observation)
                 if (gate.reason) {
@@ -671,8 +685,7 @@ export class BehaviorChainRuntime {
                 chain = this.append(chain, { type: 'chain.resumed' })
               }
               if (decision.kind === 'complete') {
-                this.append(chain, { type: 'chain.merged', mergeSha: decision.mergeSha, evidence: { repository: chain.repository,
-                  pull_number: observation.pull!.number, merged: true, merge_sha: decision.mergeSha, review_complete: true } })
+                this.recordMerge(chain, observation, true)
               } else if (decision.kind === 'supersede') {
                 this.append(chain, { type: 'chain.superseded', evidence: decision.evidence })
               } else if (decision.kind === 'hold') {
