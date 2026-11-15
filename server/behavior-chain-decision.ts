@@ -2,6 +2,7 @@ import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocatio
 import { validReviewResponse, type ReviewResponse } from './review-response'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { matchingNativeActionReceipt } from './behavior-chain-action'
+import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 
 export const CHAIN_OBSERVATION_MAX_AGE_MS = 120_000
 // The readiness blockers an open conversation can explain. Any other also fails
@@ -51,7 +52,8 @@ export type ChainDecision =
   | { kind: 'hold', reason: string }
   | { kind: 'complete', mergeSha: string }
   | { kind: 'supersede', evidence: Record<string, unknown> }
-  | { kind: 'invoke', behavior: ChainBehavior, basis: string, actor: string, reviewer: ChainReviewer | null, reason: string }
+  | { kind: 'invoke', behavior: ChainBehavior, basis: string, actor: string, reviewer: ChainReviewer | null, reason: string,
+    checkpoint?: ReviewCheckpoint }
 export interface MergeReviewEvidence { before: ChainObservation | null, firstMerged: ChainObservation | null }
 
 function settled(chain: BehaviorChain, behavior: ChainBehavior, basis: string, slot: string | null): ChainInvocation[] {
@@ -176,8 +178,15 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
 function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, actor: string,
   reviewer: ChainReviewer | null, reason: string, now: number): ChainDecision {
   const history = settled(chain, behavior, basis, reviewer?.slot ?? null)
-  const successful = [...history].reverse().find(succeeded)
+  const recent = [...history].reverse()
+  const successful = recent.find(succeeded)
   if (successful) return { kind: 'wait', reason: `${behavior} finished; waiting for its verified artifact or changed input` }
+  const latestReview = (behavior === 'review-pr' || behavior === 'approve-pr') && reviewer
+    ? recent.find(invocation => invocation.actor === actor && invocation.model === reviewer.model
+      && (invocation.evidence?.status !== 'deferred' || invocation.outcome === 'review_continuation_required')) : undefined
+  if (latestReview?.evidence?.error_code === 'review_continuation_held' && resourceReleaseProven(latestReview.evidence, true)) {
+    return { kind: 'wait', reason: `${latestReview.evidence.error}; inspect review Call ${latestReview.callId} before changing the review input` }
+  }
   if (behavior === 'repair-pr' && chain.repairRecovery) {
     const recovery = chain.repairRecovery
     const admitted = chain.invocations.find(invocation => invocation.id === recovery.admission)
@@ -201,6 +210,11 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
     if (attempts.length >= 3) return { kind: 'hold', reason: `${behavior} failed before publication three times: ${String(last.evidence?.error || 'native failure')}` }
     const completedAt = Number(last.evidence?.completedAt)
     if (!Number.isFinite(completedAt) || now < completedAt + 60_000 * 2 ** (attempts.length - 1)) return { kind: 'wait', reason: `${behavior} is in native failure backoff` }
+  }
+  if (latestReview?.outcome === 'review_continuation_required' && resourceReleaseProven(latestReview.evidence ?? {}, true)) {
+    const checkpoint = parseReviewCheckpoint(latestReview.evidence?.artifact as Record<string, unknown> | null)
+    if (!checkpoint) throw new Error('settled review continuation lacks its saved checkpoint')
+    return { kind: 'invoke', behavior, basis, actor, reviewer, reason, checkpoint }
   }
   return { kind: 'invoke', behavior, basis, actor, reviewer, reason }
 }

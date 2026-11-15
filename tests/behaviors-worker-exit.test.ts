@@ -3,8 +3,9 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
 import type { DetachedProcessExit, DetachedSpawnOptions } from '../server/process'
+import { CheckSemaphore } from '../server/check-semaphore'
 import checkoutSuperseded from './fixtures/review-checkout-superseded.json'
-import { agentLog, fixture, HEAD_SHA, NEXT_HEAD_SHA, launchApprovalBeforeCrash, launchReviewBeforeCrash, mocks } from './behaviors-runtime-fixture'
+import { agentLog, arrangeCli, fixture, HEAD_SHA, NEXT_HEAD_SHA, launchApprovalBeforeCrash, launchReviewBeforeCrash, loadModules, mocks, pr, resetLogCache, restartModules } from './behaviors-runtime-fixture'
 
 async function reviewWorker(behavior: 'review-new-prs' | 'approve-prs' = 'review-new-prs') {
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
@@ -44,6 +45,70 @@ async function reviewWorker(behavior: 'review-new-prs' | 'approve-prs' = 'review
   }
   return { ...launched, claim, timeout, exit, logging, collector, checkpoint, events }
 }
+
+describe('managed legacy review continuation', () => {
+  it.each(['review-new-prs', 'approve-prs'] as const)('keeps %s capacity across exit and restart, then honors the ordinary waiter', async behavior => {
+    vi.stubEnv('POISE_NATIVE_CONTROL', 'fixture')
+    try {
+      const model = 'gpt-6-astra-ultra'
+      arrangeCli(behavior === 'approve-prs')
+      mocks.spawnDetached.mockResolvedValue(undefined)
+      let { database, behaviors } = await loadModules()
+      database.setMeta('me', 'poise-user')
+      database.setMeta('models', JSON.stringify({ slots: { primary: model }, places: { pr_review: { slot: 'primary' }, pr_approve: { slot: 'primary' } } }))
+      database.setMeta(`behavior_${behavior.replace(/-/g, '_')}_enabled`, '1')
+      database.setMeta('behavior_review_new_prs_keyver', '3')
+      database.recordSeen('review-new-prs', '__snapshot_v3__')
+      behaviors.setBehaviorCheckSlots(new CheckSemaphore(() => 1))
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+      const first = database.listBehaviorLaunchClaims(behavior)[0]
+      const link = { root_call: 'a'.repeat(32), generation: 13, basis: '7'.repeat(64), slot: first.launchReviewSlot }
+      expect(first.launchReviewSlot).toBeTruthy()
+      const checkpoint = { root_call: link.root_call, generation: link.generation, basis: link.basis, unit: 6, required_units: 23,
+        attempts: 7, spent_ms: 408_000, allowance_ms: 2_826_000, last_progress_at: Date.now() }
+      const incomplete = agentLog({ id: link.root_call, model, behavior: first.launchBehavior, source: first.launchSource,
+        correlation_id: first.claimId, status: 'failed', error: 'Saved the scheduled review units', error_code: 'review_continuation_required',
+        action: 'not_started', outcome: 'incomplete', completed_at: new Date().toISOString(),
+        artifact: { phase: 'reviewing', review_resume: link, review_checkpoint: checkpoint },
+        resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: null })
+      const exit = (mocks.spawnDetached.mock.calls[0][2] as DetachedSpawnOptions).onExit!
+      fixture.agentLogs = [incomplete]
+      await exit({ code: 1, signal: null })
+      expect(behaviors.getBehaviorCheckSlots().stats().behaviorRunning).toBe(1)
+      const ordinary = { ...pr, number: 18, url: pr.url.replace(/17$/, '18') }
+      fixture.listedPrs = [pr, ordinary]
+      await resetLogCache()
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+
+      ;({ database, behaviors } = await restartModules())
+      behaviors.setBehaviorCheckSlots(new CheckSemaphore(() => 1))
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(behaviors.getBehaviorCheckSlots().stats().behaviorRunning).toBe(1)
+      expect(database.listBehaviorLaunchClaims(behavior)[0].claimId).toBe(first.claimId)
+      incomplete.resources_settled_at = new Date().toISOString()
+      await resetLogCache()
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      expect(mocks.spawnDetached.mock.calls[1][1][1]).toBe('#18')
+      expect(database.listBehaviorDeadLetters(20)).toEqual([])
+      const second = database.listBehaviorLaunchClaims(behavior)[0]
+      const approves = behavior === 'approve-prs'
+      fixture.agentLogs = [incomplete, agentLog({ id: 'b'.repeat(32), pr_id: '18', model, status: 'completed',
+        behavior: second.launchBehavior, source: second.launchSource, correlation_id: second.claimId,
+        action: approves ? 'approved' : 'reviewed_clean', outcome: approves ? 'approved' : 'clean', head_sha: HEAD_SHA, review_id: 42,
+        resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: new Date().toISOString() })]
+      await resetLogCache()
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+      const resumed = mocks.spawnDetached.mock.calls[2][1] as string[]
+      expect(resumed[1]).toBe('#17')
+      expect(resumed[resumed.indexOf('--resume-review') + 1]).toBe(`${link.root_call}:13`)
+      expect(database.listBehaviorDeadLetters(20)).toEqual([])
+    } finally { vi.unstubAllEnvs() }
+  }, 45_000)
+})
 
 describe('review worker exit diagnostics', () => {
   it.each([HEAD_SHA, NEXT_HEAD_SHA])('suppresses a generic worker error only for its durable supersession (%s)', async (head) => {

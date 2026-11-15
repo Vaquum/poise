@@ -16,6 +16,7 @@ import { resourceReleaseProven } from './behavior-resource-receipt'
 import { isExpectedFailure, runFile, spawnDetached } from './process'
 import { runDatastoreHealth } from './datastore-health'
 import { requireCallerReceipts } from './service/caller-calls'
+import { reviewContinuationArgs } from './review-continuation'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
@@ -42,6 +43,7 @@ export interface NativeChainHooks {
   note(behavior: ChainBehavior, chain: BehaviorChain, pull: { number: number } | null): string | Promise<string>
   reviewScope?(chain: BehaviorChain, pull: { number: number }): string | Promise<string>
   severity(behavior: ChainBehavior): string
+  reviewContinuation?(model: string): boolean
   received(invocation: ChainInvocation, call: LogEntry): void
   authenticationRejected?(call: LogEntry): void
   authRecovered?: ChainRuntimeOperations['authRecovered']
@@ -488,9 +490,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         const scope = await hooks.reviewScope?.(chain, pull) ?? ''
         const reviewNote = scope
           ? `${note}\n\nApply this scope directive when reviewing the remediation. Caller includes it once in the formal GitHub review.\n\n${scope}` : note
+        const checkpoint = decision.checkpoint
+        if (checkpoint && (selected.model !== decision.reviewer?.model || !hooks.reviewContinuation?.(selected.model))) return null
+        const continuation = hooks.reviewContinuation?.(selected.model) ? reviewContinuationArgs(selected.slot, checkpoint) : []
         return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `https://github.com/${chain.repository}/pull/${pull.number}`,
           ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior),
-          ...(scope ? ['--review-scope', scope] : []), '--note', reviewNote] }
+          ...(scope ? ['--review-scope', scope] : []), '--note', reviewNote, ...continuation] }
       }
       if (decision.behavior === 'publish-issue') {
         const partial = [...chain.invocations].reverse().find((invocation) => invocation.callId === observation.publication.head_invocation)

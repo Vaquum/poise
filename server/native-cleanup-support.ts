@@ -13,6 +13,7 @@ let current: NativeCleanupSupport = { status: 'checking', error: null }
 let pending: Promise<NativeCleanupSupport> | null = null
 let retryAt = 0
 let guardSupported = false
+let continuationSupported = false
 
 function executionSupport(support: NativeCleanupSupport): NativeCleanupSupport {
   return support.status === 'supported' && readBehaviorResourceAdmission() && !guardSupported
@@ -33,6 +34,7 @@ export function nativeCleanupSupport(): NativeCleanupSupport {
     pending = null
     retryAt = 0
     guardSupported = false
+    continuationSupported = false
     current = identity ? { status: 'checking', error: null }
       : { status: 'unsupported', error: 'This setup cannot safely clean up v2 workers. v1 remains available.' }
   }
@@ -54,7 +56,10 @@ export function nativeCleanupSupport(): NativeCleanupSupport {
       }
       result = value.supported ? { status: 'supported', error: null }
         : { status: 'unavailable' in value ? 'unavailable' : 'unsupported', error: String('error' in value ? value.error : '') }
-      if (controller === identity) guardSupported = value.supported && 'resourceGuard' in value && value.resourceGuard === 1
+      if (controller === identity) {
+        guardSupported = value.supported && 'resourceGuard' in value && value.resourceGuard === 1
+        continuationSupported = value.supported && 'reviewContinuation' in value && value.reviewContinuation === 1
+      }
     } catch (error) {
       result = { status: 'unavailable', error: error instanceof Error ? error.message : String(error) }
     } finally { release() }
@@ -66,6 +71,10 @@ export function nativeCleanupSupport(): NativeCleanupSupport {
     return result
   })
   return current
+}
+
+export function nativeReviewContinuationSupported(): boolean {
+  return nativeCleanupSupport().status === 'supported' && continuationSupported
 }
 
 export async function requireNativeCleanup(): Promise<void> {
