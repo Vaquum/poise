@@ -510,6 +510,15 @@ independent approval gates govern readmission.
 
 The chain intentionally does not use the legacy approval-round escape that files remaining findings as a follow-up issue and approves. Unresolved blockers remain blockers.
 
+A typed approval refusal before publication, with the original Call and native
+resource release verified, waits on fresh GitHub conversation evidence without
+using an approval failure attempt. The existing readiness read checks for live
+threads from other reviewers. Incomplete evidence cannot confirm closure.
+New heads, review obligations and verified conflicts go through the ordinary
+decision path. The chain can also release an existing automatic hold from
+three verified refusals once fresh PR evidence is available. The original
+Calls and retry boundary are retained, and a person's Hold still applies.
+
 ## Authority and recovery
 
 `behavior_chain_events` is immutable. It owns admissions, phase progression, retry history and ownership. `behavior_chain_current` is a rebuildable index whose state is checked against the authoritative event hash. Admissions and projection updates commit together with SQLite FULL durability. Existing observational behavior ledgers do not authorize this executor.
