@@ -7,6 +7,7 @@ import { workspaceInventory } from '../src/mcp-inventory.js'
 import { loadConfig } from '../src/config.js'
 import { APEX, startHarness, type Harness } from './harness.js'
 
+const workTools = MCP_TOOLS.filter(tool => tool.name !== 'poise_get')
 let h: Harness
 beforeEach(async () => { h = await startHarness({ env: { POISE_MCP_ENABLED: '1' } }) })
 afterEach(async () => { await h.close() })
@@ -89,7 +90,7 @@ it('completes discovery, existing GitHub sign-in, explicit owner consent, PKCE a
   const issuer = await h.request({ host: APEX, path: '/.well-known/oauth-authorization-server' })
   expect(issuer.json()).toMatchObject({ code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'] })
   const grant = await connect()
-  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: MCP_TOOLS } })
+  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: workTools } })
   expect((await rpc(grant.access, 'initialize', { protocolVersion: '2025-11-25' })).json()).toMatchObject({ result: { protocolVersion: '2025-11-25', capabilities: { tools: {} } } })
   expect((await form('/mcp/token', { grant_type: 'authorization_code', client_id: grant.client, code: grant.code, redirect_uri: redirectUri, resource, code_verifier: verifier })).status).toBe(400)
   const listed = await h.request({ host: APEX, path: '/mcp/grants', headers: { cookie: grant.apexCookie } })
@@ -173,7 +174,7 @@ it('isolates two owners, persists hash-only grants and revokes access and refres
 
 it('withholds poise_work from grants consented before it existed', async () => {
   const grant = await connect()
-  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: MCP_TOOLS } })
+  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: workTools } })
   // Simulate a pre-poise_work grant that records no permitted tools.
   const legacy = new Database(`${h.config.dataDir}/mcp.db`)
   legacy.prepare("UPDATE mcp_grants SET state = json_remove(state, '$.tools')").run()

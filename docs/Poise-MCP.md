@@ -12,7 +12,7 @@ names its data kind, source, permission, retention, current MCP availability and
 Poise link. The catalog follows Poise's existing places, Observe parts, Settings
 sections and capability names. The MCP resource `poise://workspace/inventory`
 returns the same projection and runbooks. `poise_work` reads the workspace's
-issue work trail.
+issue work trail. The owner can also grant Chat metadata during consent.
 
 ## Read work
 
@@ -67,6 +67,23 @@ Links open the issue, chain journal, known Calls, PR, reviews, exact observed-he
 checks, observed queue and recorded merge SHA under their existing browser access
 rules. Returned source text is data, not instructions. Coverage and receipt
 records grant no execution or publication authority.
+
+## Read Chat metadata
+
+On the Poise consent page, select **Allow Chat session and live timer metadata**
+to enable `poise_get`. The grant page shows the allowed tools. `poise_describe`
+reports the tools available with that grant.
+
+Call `poise_get` with `kind: "chat"` and a Chat record ID from its Poise link.
+The result includes the stored session state, role, repository, last sequence
+and live timer IDs. Call it with `kind: "timer"` and one of those IDs for its
+schedule and state, pending delivery and recorded failure and skip counts.
+The gateway builds the link to the owning Chat. Times use UTC.
+
+The exact lookup covers the connected workspace's stored Chats and active,
+held or tripped timers. An empty record means there is no matching record in
+that scope. This grant covers metadata. Transcript, attachment and timer
+message content and Manager actions require separate capabilities.
 
 ## Private plugin
 
