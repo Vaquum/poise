@@ -104,6 +104,75 @@ def stage_count(packet: str) -> int:
     return 1 if planned is None else len(planned[1])
 
 
+def required_stages(packet: str, *, max_units: int) -> Iterator[str]:
+    """Bound continuation units, including individual large source hunks.
+
+    Only hunk headers are regenerated. Every original diff line is retained,
+    with its original old/new coordinates; the final integration pass sees
+    adjacent unit boundaries together.
+    """
+    node = json.loads(packet)
+    retained = [entry["filename"] for entry in node["files"]]
+    sections = []
+    covered = set()
+    for section in _sections(node["diff"]):
+        paths = _covers(section, retained)
+        covered.update(paths)
+        for part in _subdivide(section):
+            sections.append((part, paths))
+    if covered != set(retained):
+        raise StageError("required source manifest differs from its diff sections")
+    groups = _pack(sections)
+    if len(groups) > max_units:
+        raise StageError("required review unit count exceeds its bounded manifest")
+    for index, group in enumerate(groups):
+        paths = {path for _, paths in group for path in paths}
+        yield _render(node, len(groups), index, ["\n".join(lines) for lines, _ in group],
+                      [entry for entry in node["files"] if entry["filename"] in paths])
+
+
+def _subdivide(section: list[str]) -> list[list[str]]:
+    if len("\n".join(section).encode()) <= STAGE_MAX_DIFF_BYTES:
+        return [section]
+    first = next((index for index, line in enumerate(section) if line.startswith("@@ ")), None)
+    if first is None:
+        raise StageError("oversized source section cannot be subdivided without losing coverage")
+    header = section[:first]
+    allowance = STAGE_MAX_DIFF_BYTES - len("\n".join(header).encode()) - 128
+    if allowance < 1:
+        raise StageError("source section metadata exceeds the unit byte bound")
+    result, chunk = [], []
+    old = new = old_start = new_start = size = 0
+
+    def finish():
+        if chunk:
+            before = old_start if old > old_start else max(0, old_start - 1)
+            after = new_start if new > new_start else max(0, new_start - 1)
+            result.append([*header, f"@@ -{before},{old - old_start} +{after},{new - new_start} @@", *chunk])
+
+    for line in section[first:]:
+        if line.startswith("@@ "):
+            finish()
+            match = _HUNK.match(line)
+            if match is None:
+                raise StageError("unparseable required source hunk")
+            old, new = int(match[1]), int(match[2])
+            old_start, new_start, chunk, size = old, new, [], 0
+            continue
+        cost = len(line.encode()) + 1
+        if cost > allowance:
+            raise StageError("a source line exceeds the unit byte bound")
+        if chunk and size + cost > allowance:
+            finish()
+            old_start, new_start, chunk, size = old, new, [], 0
+        chunk.append(line)
+        size += cost
+        old += line.startswith((" ", "-"))
+        new += line.startswith((" ", "+"))
+    finish()
+    return result
+
+
 def _sections(diff: str) -> list[list[str]]:
     sections, current = [], []
     for line in diff.splitlines():

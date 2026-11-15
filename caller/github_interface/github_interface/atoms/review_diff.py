@@ -30,6 +30,8 @@ PACKET_LIMIT_CODE = "review_packet_too_large"
 SINCE_HEAD_UNKNOWN_CODE = "review_since_head_unknown"
 SINCE_DROPPED_NOTE = (" A follow-up diff was requested, but the base moved since the last review, "
                       "so this round is not limited to changes since the last review.")
+MANIFEST_SINCE_NOTE = (" A follow-up diff was requested, but deferred review pages the complete retained diff "
+                       "from the PR merge base, so this round is not limited to changes since the last review.")
 
 
 class ReviewPacketTooLarge(RuntimeError):
@@ -260,11 +262,17 @@ async def review_diff(
     client: GitHubClient, owner: str, repo: str, pull: dict[str, Any],
     context: dict[str, Any] | None = None,
     since: str | None = None,
+    *, manifest_only: bool = False,
 ) -> dict[str, Any]:
     head = pull["head"]["sha"]
     base = pull["base"]["sha"]
     new_base = None
     since_dropped = False
+    manifest_widened = False
+    if manifest_only and since is not None:
+        # A deferred diff pages through a checkout pinned to GitHub's actual
+        # merge base; a since-scoped manifest could not be checked out.
+        since, manifest_widened = None, True
     if since is not None:
         # A rebase or base update between the last review and now pulls
         # base-only changes into a since...head comparison, whose findings
@@ -334,6 +342,19 @@ async def review_diff(
                 else:
                     retained.append(file["filename"])
             retained_paths = set(retained)
+            if manifest_only:
+                packet = {
+                    "diff": "", "diff_deferred": True, "coverage": "incomplete",
+                    "files": [{"filename": f["filename"], "status": FILE_STATUS[f["status"]],
+                               "old_mode": f["old_mode"], "new_mode": f["new_mode"]}
+                              for f in files if f["filename"] in retained_paths],
+                    "excluded_files": excluded, "merge_base_sha": merge_base, "since_head_sha": since,
+                    "review_scope": "Required diff is deferred to bounded pinned checkout pages; no source reviewed yet."
+                    + (MANIFEST_SINCE_NOTE if manifest_widened else ""),
+                }
+                if len(json.dumps({**(context or {}), **packet}, indent=2).encode()) > MAX_PACKET_BYTES:
+                    raise ReviewPacketTooLarge(f"{PACKET_LIMIT_CODE}: review manifest exceeds its packet budget")
+                return packet
             # Literal pathspecs cannot interpret a filename as an option, glob
             # or exclusion. Git supplies complete hunks, renames and modes.
             try:

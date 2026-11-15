@@ -23,6 +23,7 @@ tests/google-accounts.test.ts
 tests/google-gateway.test.ts
 tests/link-api.test.ts
 tests/link-service-mode.test.ts
+tests/logging-severity.test.ts
 tests/manager-policy.test.ts
 tests/self-update-policy.test.mjs
 tests/self-update-tool-permissions.test.ts

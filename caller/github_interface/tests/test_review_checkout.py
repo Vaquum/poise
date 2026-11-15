@@ -28,6 +28,51 @@ def tree(root, sha):
 
 
 class TestPinnedCheckout(TestCase):
+    def test_deferred_diff_pages_cover_large_source_and_removed_files_within_response_bound(self):
+        from agent_interface.review_repository import Repository
+
+        with tempfile.TemporaryDirectory() as work:
+            source, target = Path(work) / "source", Path(work) / "review"
+            source.mkdir()
+            git(source, "init", "-q")
+            git(source, "config", "user.name", "Test")
+            git(source, "config", "user.email", "test@example.com")
+            (source / "gone.py").write_text("removed_contract()\n")
+            (source / "large.py").write_text("old_contract()\n")
+            git(source, "add", ".")
+            git(source, "commit", "-qm", "base")
+            base = git(source, "rev-parse", "HEAD")
+            (source / "gone.py").unlink()
+            (source / "large.py").write_text("".join(f"value_{index} = '{'x' * 100}'\n" for index in range(30000))
+                                             + "result = 1 / 0\n")
+            git(source, "add", ".")
+            git(source, "commit", "-qm", "head")
+            head = git(source, "rev-parse", "HEAD")
+            info = rc.checkout("o", "r", head, base, "fixture-token", target,
+                               tree(source, head), tree(source, base), remote=source.as_uri(),
+                               diff_files=["gone.py", "large.py"])
+            pages = []
+
+            def inspect(requests, **_kwargs):
+                response = rc.inspect(target, requests)
+                self.assertLessEqual(len(json.dumps(response, indent=2).encode()) + 1, rc.MAX_RESPONSE_BYTES)
+                pages.append(response)
+                return response
+
+            repository = Repository(target, info)
+            repository.inspect = inspect
+            packet = {"diff_deferred": True, "coverage": "incomplete", "head_sha": head,
+                      "files": [{"filename": "gone.py"}, {"filename": "large.py"}]}
+            hydrated = json.loads(repository.diff_packet(json.dumps(packet), 10_000_000))
+            expected = subprocess.check_output(["git", "diff", "--no-renames", base, head, "--"], cwd=source).decode()
+            self.assertEqual(hydrated["diff"], expected)
+            self.assertEqual(hydrated["coverage"], "complete")
+            self.assertGreater(len(pages), 1)
+            self.assertGreater(len(hydrated["diff"].encode()), 2_850_000)
+            self.assertIn("+result = 1 / 0", hydrated["diff"])
+            self.assertIn("-removed_contract()", hydrated["diff"])
+            self.assertEqual(git(target, "rev-parse", "HEAD"), head)
+
     def test_concurrent_partial_checkouts_never_hydrate_archives_and_keep_source(self):
         with tempfile.TemporaryDirectory() as work:
             source = Path(work) / "source"

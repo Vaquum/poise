@@ -46,13 +46,14 @@ def coverage_disposition(packet: dict) -> str:
         and isinstance(packet.get("files"), list) and packet.get("omitted_files", []) == [] else "incomplete"
 
 
-def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
+def prepare_response(packet: str, model: str, review_scope: str = "", *, policy: str = "") -> None:
     """Pin controller-owned context before invoking the configured reviewer."""
     from hashlib import sha256
     bound = _call.get()
     if bound is None:
         return
     value = json.loads(packet)
+    from .review_continuation import analysis_basis, enabled
     pull = value["pull"]
     context = sha256(json.dumps([pull["base"]["sha"], pull["title"], pull.get("body") or ""],
                                ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
@@ -65,6 +66,7 @@ def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
                      "'$.verification_candidates',json(?)) where id=? and status='running'",
                      (json.dumps({"repository": value["repository"], "pull_number": value["pull_number"],
                                   "head_sha": value["head_sha"], "context_sha": context, "model": model,
+                                  **({"analysis_sha": analysis_basis(value, policy + "\n" + review_scope)} if enabled() else {}),
                                   "coverage": coverage_disposition(value)}),
                       review_scope or None, json.dumps(fixes), call_id))
 
@@ -104,6 +106,9 @@ def complete_response(assessment: dict, head: str) -> dict | None:
         context = artifact.get("review_context")
         if not context or context["head_sha"] != head:
             raise RuntimeError("review response lacks its pinned review context")
+        from .review_continuation import authority
+        if authority(conn, call_id, artifact):
+            context = {**context, "coverage": "complete"}
         candidates = artifact.get("verification_candidates", {})
         if roots and (row[3] not in {"pr_review", "pr_approve"} or any(str(root) not in candidates for root in roots)):
             raise ValueError("verified fix must name an answered thread in the original review packet")
@@ -190,6 +195,11 @@ def begin_submission(body: str, head: str) -> str:
     if not database or not call_id or not re.fullmatch(r"[0-9a-f]{32}", call_id):
         raise RuntimeError("managed review submission lacks its native receipt binding")
     with caller_store.connect(database, timeout=30) as conn:
+        conn.execute("begin immediate")
+        from .review_continuation import authority
+        row = conn.execute("select artifact from calls where id=?", (call_id,)).fetchone()
+        if row:
+            authority(conn, call_id, json.loads(row[0] or "{}"), publishing=True)
         changed = conn.execute("update calls set artifact=json_patch(artifact,?) where id=? and status='running' and behavior in ('pr_review','pr_approve') "
                                "and coalesce(error_code,'') not in ('stopping','stopped') and json_extract(artifact,'$.phase')='reviewing' "
                                "and json_extract(artifact,'$.review_response.head_sha')=? "
