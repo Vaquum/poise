@@ -1148,13 +1148,13 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     { assertion: true, noResult: true, capture: 'interrupted' },
     { assertion: false, noResult: true, capture: null },
     { assertion: false, noResult: false, capture: '125' },
-  ])('distinguishes runner no-result 125 from a suite exit ($assertion, $noResult)', async ({ assertion, noResult, capture }) => {
+  ])('distinguishes runner no-result 125 from a suite exit after unterminated stderr ($assertion, $noResult)', async ({ assertion, noResult, capture }) => {
     await startAll()
     const bin = temp()
     const retained = join(bin, 'retained')
     writeFileSync(join(bin, 'agent-interface'), '#!/bin/sh\nprintf "%s" "$6" > "$FIXTURE_RETENTION"\n', { mode: 0o700 })
-    const detail = (assertion ? '[poise] first test failure: fixture.test.js > expected value\nAssertionError: expected 1 to equal 2\n' : '')
-      + (noResult ? '[poise] no test result: the box stopped. This says nothing about your code.\n' : '')
+    const detail = (assertion ? 'unterminated stderr[poise] first test failure: fixture.test.js > expected value\nAssertionError: expected 1 to equal 2\n' : '')
+      + (noResult ? 'unterminated stderr[poise] no test result: the box stopped. This says nothing about your code.\n' : '')
     const repo = committed()
     writeFileSync(join(repo, 'runner-fixture.cjs'), `process.stderr.write(${JSON.stringify(detail)}); process.exitCode = 125`)
     const result = await suite(repo, [process.execPath, 'runner-fixture.cjs'], {

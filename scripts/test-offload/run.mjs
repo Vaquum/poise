@@ -31,9 +31,9 @@ const zip = promisify(gzip)
 // The first bytes go at once: a proxy gives up on a download that stays silent for long.
 const FIRST_CHUNK_BYTES = 64 * 1024
 const FRAME = { heartbeat: 0, stdout: 1, stderr: 2, exit: 3, fail: 4, ready: 5, evidence: 6 }
-// The first-failure reporter bounds its record to 8 KiB of text.
-const FIRST_ASSERTION = /\n\[poise\] first test failure: [^\n]+ > [^\n]+\nAssertionError: \S[^\n]*\n/
-const RUNNER_NO_RESULT = /\n\[poise\] no test result: [^\n]+\. This says nothing/
+// The first-failure reporter bounds its record to 8 KiB. Either diagnostic may follow unterminated stderr.
+const FIRST_ASSERTION = /\[poise\] first test failure: [^\n]+ > [^\n]+\nAssertionError: \S[^\n]*\n/
+const RUNNER_NO_RESULT = /\[poise\] no test result: [^\n]+\. This says nothing/
 // What a suite cannot run without although git ignores it.
 const DEPENDENCIES = new Set(['node_modules', '.venv', 'venv'])
 // Nothing a suite needs: credentials by name, and what only the provider CLIs and Poise read.
@@ -492,7 +492,7 @@ async function main(args) {
       let failure = null
       let upload = null
       let uploadError = null
-      let diagnosticTail = '\n'
+      let diagnosticTail = ''
       let runnerNoResult = false
       const pytestFailure = callerPytest ? callerPytestFailure() : null
       const read = frameReader((type, payload) => {
