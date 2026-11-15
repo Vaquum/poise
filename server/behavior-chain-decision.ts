@@ -11,7 +11,7 @@ const CONVERSATION_BLOCKERS = new Set(['merge_state_not_clean', 'required_review
 export interface ChainReviewer { slot: string, model: string, recovery: string }
 export interface ChainObservation extends Record<string, unknown> {
   checkedAt: number
-  issue: { open: boolean, revision: string, eligible: boolean, commentIds: number[] }
+  issue: { open: boolean, revision: string, eligible: boolean, commentIds: number[], updatedAt?: number }
   issueReviewers: ChainReviewer[]
   prReviewers: ChainReviewer[]
   implementer: ChainReviewer

@@ -58,6 +58,73 @@ function operations(overrides: Partial<ChainRuntimeOperations> = {}): ChainRunti
     launch: forbidden, perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {}, ...overrides }
 }
 
+it.each(['closed', 'reopened'])('rechecks a fresh mirror closure once when GitHub says %s', async state => {
+  const { journal } = setup()
+  vi.setSystemTime(NOW - 6 * 3_600_000)
+  let held = seed(journal)
+  held = record(journal, held, { type: 'invocation.admitted', invocation: { id: 'implementation', behavior: 'implement-issue',
+    actor: held.author, model: 'fixture', slot: 'primary', basis: 'seed', admittedAt: Date.now(),
+    request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+  held = record(journal, held, { type: 'invocation.settled', invocationId: 'implementation', callId: 'a'.repeat(32),
+    outcome: 'preflight_failed', evidence: { action: 'not_started' } })
+  vi.setSystemTime(NOW - 2000)
+  const prior = observation(false)
+  prior.issue.eligible = false
+  held = record(journal, held, { type: 'chain.observed', observation: prior })
+  held = record(journal, held, { type: 'chain.held', reason: 'implementation failed before publication' })
+  vi.setSystemTime(NOW)
+  const unrelated = seed(journal, 'acme/repo', 8)
+  expect(journal.reconciliationAt(held)).toBeGreaterThan(NOW + 3_600_000)
+  const original = journal.history(held.id)
+  const reportHold = vi.fn(async () => null)
+  const observe = vi.fn(async (chain: BehaviorChain) => {
+    const fresh = observation(false)
+    if (chain.id === held.id) fresh.issue = { ...prior.issue, open: state === 'reopened', updatedAt: NOW }
+    return fresh
+  })
+  const hint = { repository: held.repository, number: held.issue, updatedAt: NOW - 1000 }
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe, reportHold,
+    closedSeedHints: async after => after ? [] : [hint] }))
+  await runtime.run()
+  expect(observe.mock.calls.map(([chain]) => chain.id)).toEqual([unrelated.id, held.id])
+  expect(journal.active().some(chain => chain.id === held.id)).toBe(state === 'reopened')
+  expect(journal.read(held.id)).toMatchObject({ held: held.held, invocations: held.invocations })
+  const history = journal.history(held.id)
+  expect(history.slice(0, -1)).toEqual(original)
+  expect(JSON.parse(history.at(-1)!.payload).type).toBe('chain.observed')
+  await runtime.run()
+  await runtime.run()
+  expect(observe.mock.calls.filter(([chain]) => chain.id === held.id)).toHaveLength(1)
+  expect(reportHold).not.toHaveBeenCalled()
+})
+
+it('keeps deferred holds with stale closure hints or outstanding ownership', async () => {
+  const { journal } = setup()
+  const prior = observation(false)
+  const held = (issue: number, obs: ChainObservation) => {
+    let chain = seed(journal, 'acme/repo', issue)
+    chain = record(journal, chain, { type: 'chain.observed', observation: obs })
+    return record(journal, chain, { type: 'chain.held', reason: 'confirmation needed' })
+  }
+  const stale = held(1, prior)
+  const linked = held(2, { ...prior, existingPulls: ['https://github.com/acme/repo/pull/17'] })
+  let unsettled = record(journal, seed(journal, 'acme/repo', 3), { type: 'chain.observed', observation: prior })
+  unsettled = record(journal, unsettled, { type: 'invocation.admitted', invocation: { id: 'publication', behavior: 'publish-issue',
+    actor: unsettled.author, model: null, slot: null, basis: 'seed', admittedAt: NOW,
+    request: { command: 'github-interface', cwd: '/fixture', argv: [] } } })
+  unsettled = record(journal, unsettled, { type: 'invocation.uncertain', invocationId: 'publication', reason: 'publication outcome is missing' })
+  unsettled = record(journal, unsettled, { type: 'chain.held', reason: 'publication outcome is missing' })
+  vi.setSystemTime(NOW + 2000)
+  const observe = vi.fn(async () => observation(false))
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe, closedSeedHints: async () => [
+    { repository: stale.repository, number: stale.issue, updatedAt: NOW - 1000 },
+    ...[linked, unsettled].map(chain => ({ repository: chain.repository, number: chain.issue, updatedAt: NOW + 1000 })),
+  ] }))
+  await runtime.run()
+  expect(observe).not.toHaveBeenCalled()
+  expect(journal.active().map(chain => chain.id)).toEqual([stale.id, linked.id, unsettled.id])
+})
+
 function captureDiagnostics() {
   const root = mkdtempSync(join(tmpdir(), 'poise-chain-conflict-')); roots.push(root)
   vi.stubEnv('POISE_DB', join(root, 'cache.db'))

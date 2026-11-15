@@ -9,12 +9,12 @@ import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocatio
 import { chainCiDependency, chainReviewResponse, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
-import { datastoreViewOrCli } from './datastore-reader'
+import { datastoreViewOrCli, readDatastoreView } from './datastore-reader'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { isExpectedFailure, runFile, spawnDetached } from './process'
-import { runDatastoreHealth } from './datastore-health'
+import { runDatastoreHealth, validatedHealth } from './datastore-health'
 import { requireCallerReceipts } from './service/caller-calls'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
@@ -139,6 +139,20 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const existing = await hooks.existing(seeds)
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
+    async closedSeedHints(after) {
+      if (!org.datastorePath) return []
+      const rows = await readDatastoreView(org.datastorePath, ['view', 'issue', '--status', 'closed',
+        '--format', 'json', '--limit', '100', '--updated-since-datetime', new Date(Date.now() - 86_400_000).toISOString(),
+        '--after-repo', after?.repository ?? '', '--after-number', String(after?.number ?? 0)])
+      if (!rows?.length) return []
+      const { stdout } = await runDatastoreHealth(org, { timeoutMs: 5_000 })
+      if (validatedHealth(stdout, org)?.status !== 'healthy') return []
+      return rows.flatMap(row => {
+        const updatedAt = typeof row.updated_at === 'string' ? Date.parse(row.updated_at) : NaN
+        return typeof row.repo === 'string' && ownsRepository(row.repo) && row.status === 'closed' && Number.isFinite(updatedAt)
+          ? [{ repository: row.repo, number: positive(row.number, 'closed issue hint'), updatedAt }] : []
+      })
+    },
     readInvocations: readNativeInvocations,
     async observe(chain, verifyConflict): Promise<ChainObservation> {
       if (!ownsRepository(chain.repository)) throw new Error('behavior chain organization is no longer followed')
@@ -171,7 +185,9 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const settings = getBehaviorChainSettings()
       const labels = issue.labels.map((label) => typeof label === 'string' ? label : object(label, 'issue label').name)
       if (!Array.isArray(publication.existing_pulls) || publication.existing_pulls.some((url) => typeof url !== 'string')) throw new Error('native issue-to-PR ownership evidence is incomplete')
+      const issueUpdatedAt = typeof issue.updated_at === 'string' ? Date.parse(issue.updated_at) : NaN
       const observation: ChainObservation = { checkedAt: Date.now(), existingPulls: publication.existing_pulls, issue: { open: issue.state === 'open',
+        ...(Number.isFinite(issueUpdatedAt) ? { updatedAt: issueUpdatedAt } : {}),
         revision: chainBasis([issue.title, issue.body || '']), eligible: settings.seedMode === 'all' || labels.some((label) => typeof label === 'string' && label.toLowerCase() === settings.label.toLowerCase()),
         commentIds: rawComments.comments.map((comment) => positive(object(comment, 'issue comment').id, 'issue comment')) }, ...roster,
         publication: { pull_number: publication.pull_number === null ? null : positive(publication.pull_number, 'publication'),

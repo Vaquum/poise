@@ -18,6 +18,7 @@ export interface ChainRuntimeOperations {
   enabled(): boolean
   accounts(): { author: string, reviewer: string }
   discover(): Promise<ChainSeed[]>
+  closedSeedHints?(after: ChainSeed | null): Promise<Array<ChainSeed & { updatedAt: number }>>
   ownsRepository(repository: string): boolean
   observe(chain: BehaviorChain, verifyConflict?: boolean): Promise<ChainObservation>
   /** Also reports terminal uncertain publications and merges without a chain hold. */
@@ -289,6 +290,7 @@ export class BehaviorChainRuntime {
   private reconciliationCursor = ''
   private reconciliationFirst = false
   private authenticationCursor = ''
+  private closedSeedCursor: ChainSeed | null = null
 
   constructor(readonly journal: BehaviorChainJournal, private readonly operations: ChainRuntimeOperations) {}
 
@@ -300,6 +302,26 @@ export class BehaviorChainRuntime {
     const current = this.journal.read(chain.id)
     if (!current) throw new Error('behavior chain disappeared while its invocation was running')
     return current
+  }
+
+  private async recheckClosedSeed(began: number): Promise<void> {
+    if (!this.operations.closedSeedHints) return
+    const hints = await this.operations.closedSeedHints(this.closedSeedCursor)
+    if (!hints.length) this.closedSeedCursor = null
+    for (const hint of hints) {
+      const now = Date.now()
+      if (now - began > 45_000) break
+      this.closedSeedCursor = hint
+      if (!this.operations.ownsRepository(hint.repository) || hint.updatedAt > now) continue
+      const chain = this.journal.deferredSeedClosure(chainIdentity(hint.repository, hint.number), hint.updatedAt, now)
+      if (!chain) continue
+      // Use the usual observation, with no admission, reporting or recovery.
+      // An authoritative reopen also consumes the hint.
+      const observation = await this.operations.observe(chain)
+      try { this.append(chain, { type: 'chain.observed', observation }) }
+      catch (error) { if (!(error instanceof BehaviorChainRevisionConflict)) throw error }
+      break
+    }
   }
 
   /** The first capacity refusal for this uninterrupted behavior/basis/slot.
@@ -466,6 +488,14 @@ export class BehaviorChainRuntime {
       this.reconciliationFirst = !first
       for (const deferred of [first, !first]) {
         if (Date.now() - began > 45_000) break
+        if (deferred && this.operations.closedSeedHints) {
+          try { await this.recheckClosedSeed(began) }
+          catch (error) {
+            if (!staleDatastoreFailure(error)) observationError = preferObservationError(observationError,
+              new Error(`closed seed recheck failed: ${behaviorErrorMessage(error)}`, { cause: error }))
+          }
+          if (Date.now() - began > 45_000) break
+        }
         const cursorKey = deferred ? 'reconciliationCursor' : 'cursor'
         let page = this.journal.reconcilable(this[cursorKey], Date.now(), deferred)
         if (!page.length && this[cursorKey]) {
