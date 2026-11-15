@@ -3,7 +3,7 @@
 // verified with node:crypto alone.
 
 import { verify, type KeyObject } from 'node:crypto'
-import { MCP_READ_PATH, isMcpRepository, type McpGrantScope } from '../../gateway/src/mcp-contract'
+import { MCP_CONTROL_PATH, MCP_READ_PATH, isMcpRepository, type McpGrantScope } from '../../gateway/src/mcp-contract'
 
 export const IDENTITY_HEADER = 'x-poise-identity'
 export const ASSERTION_ISSUER = 'poise-gateway'
@@ -86,6 +86,7 @@ export function verifyIdentityAssertion(token: string, expected: AssertionExpect
       || !/^[a-f0-9-]{36}$/.test(value.grantId) || (value.chatMetadata !== undefined && value.chatMetadata !== true)
       || (value.chatList !== undefined && (value.chatList !== true || value.chatMetadata !== true))
       || (value.chatTranscript !== undefined && value.chatTranscript !== true)
+      || (value.managerClientId !== undefined && (typeof value.managerClientId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.managerClientId)))
       || (value.repository !== undefined && !isMcpRepository(value.repository))) {
       return refuse('the MCP assertion has an invalid grant or resource audience')
     }
@@ -97,7 +98,7 @@ export function verifyIdentityAssertion(token: string, expected: AssertionExpect
 /** MCP reads require their dedicated scope. Ordinary routes retain browser,
  *  Link API and gateway service authority. */
 export function scopeAllowsPath(scope: AssertionScope, path: string): boolean {
-  if (path === MCP_READ_PATH) return scope === 'mcp'
+  if (path === MCP_READ_PATH || path === MCP_CONTROL_PATH) return scope === 'mcp'
   if (scope === 'mcp') return false
   if (scope === 'browser') return true
   const prefix = scope === 'link' ? '/api/link/' : '/api/service/'
