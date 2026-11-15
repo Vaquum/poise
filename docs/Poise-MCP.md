@@ -98,6 +98,23 @@ metadata report partial coverage. A reset reports expired coverage for an
 older checkpoint and returns the retained boundary. `watermark` is the last
 sequence consumed. Pass `nextCursor` to continue or check for new events.
 
+## Read workspace operations
+
+With workspace-wide operational data consent, use `poise_get` with
+`kind: "workspace"` and a snapshot name from the workspace inventory. The
+available snapshots cover effective settings and model slots, followed accounts
+and recorded sign-in, behavior policy and capacity, release and dependency
+health, storage and GitHub quota, the analytics health cohort, notices and
+handling history, and extension, memory and snippet metadata.
+
+The same consent allows `kind: "call"` with the full Caller Call ID and
+`kind: "invocation"` with a retained chain invocation ID. Receipts include the
+known actor, action, outcome, head, settlement and available response link.
+Quarantined Call evidence is reported as partial. Caller prompts, diagnostics
+payloads, extension arguments and memory text stay in their owning surfaces.
+Snapshot timestamps report when the read was assembled. Underlying observations
+keep their own times, and bounded summaries report omitted records.
+
 ## Private plugin
 
 Render a private package for an installation's HTTPS apex into a new directory:

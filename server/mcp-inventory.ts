@@ -1,5 +1,7 @@
+import { MCP_WORKSPACE_VIEWS, type McpWorkspaceView } from '../gateway/src/mcp-contract'
 import { PARTS, PLACES, SECTIONS, placeHref, type Part, type Place, type Section } from '../src/ui/address'
 import { listCapabilities, type Capability } from './capabilities'
+import { workspaceViewSurface } from './mcp-workspace-views'
 import { runningRelease } from './running-release'
 
 interface Surface {
@@ -8,6 +10,8 @@ interface Surface {
   retention: string
   permission: string
   tool?: 'poise_work' | 'poise_get' | 'poise_list' | 'poise_changes'
+  requiresWorkspace?: true
+  requiresChat?: true
   reason: string
 }
 
@@ -15,35 +19,39 @@ const work: Surface = { kind: 'issue-work', source: 'GitHub mirror, chain journa
   retention: 'Current mirror rows and retained chain and ledger records', permission: 'Workspace work-trail grant',
   tool: 'poise_work', reason: 'Exact issues and bounded repository label pages' }
 const chat: Surface = { kind: 'chat', source: 'Chat sessions and timers', retention: 'Stored sessions and live timers',
-  permission: 'Chat metadata consent', tool: 'poise_get', reason: 'Exact Chat or live timer metadata' }
+  permission: 'Chat metadata consent', tool: 'poise_get', requiresChat: true, reason: 'Exact Chat or live timer metadata' }
+function workspace(id: McpWorkspaceView): Surface {
+  const { kind, source, retention, permission, tool, reason } = workspaceViewSurface(id)
+  return { kind, source, retention, permission, tool, reason, requiresWorkspace: true }
+}
 const browser = (kind: string, source: string, retention: string, reason: string): Surface =>
   ({ kind, source, retention, permission: 'Workspace browser session', reason })
 
 const places = {
-  overview: browser('overview', 'Notices, requests and work activity', 'Current and retained notices', 'Overview summary reads are pending'),
+  overview: workspace('notices'),
   board: work,
   chat,
   manager: { ...chat, reason: 'Exact Manager Chat metadata' },
   editor: browser('document', 'Editor versions, reviews and publication bindings', 'Current document and retained versions', 'Document reads are pending'),
   observe: work,
-  settings: browser('settings', 'Workspace settings and readiness', 'Current effective configuration', 'Settings reads are pending'),
+  settings: workspace('settings'),
 } satisfies Record<Place, Surface>
 
 const parts = {
   tasks: work,
-  behaviors: { ...work, reason: 'Issue-targeted chain receipts' },
+  behaviors: workspace('behaviors'),
   github: { ...work, reason: 'Issue mirror and recorded PR observations' },
   logging: browser('logging', 'Gateway Logging and workspace diagnostic evidence', 'Source retention and coverage windows', 'Logging reads are pending'),
 } satisfies Record<Part, Surface>
 
 const settings = {
-  general: browser('settings', 'Workspace configuration and release state', 'Current applied configuration', 'General settings reads are pending'),
-  accounts: browser('accounts', 'Connected account readiness and device state', 'Current account and live device state', 'Account reads are pending'),
-  models: browser('models', 'Model catalog and provider readiness', 'Latest model checks', 'Model reads are pending'),
-  extensions: browser('extensions', 'Workspace extension registrations', 'Current registrations', 'Extension metadata reads are pending'),
+  general: workspace('settings'),
+  accounts: workspace('accounts'),
+  models: workspace('models'),
+  extensions: workspace('extensions'),
   publishing: browser('publishing', 'Editor publication bindings', 'Current bindings and retained reviews', 'Publishing reads are pending'),
-  behaviors: browser('behavior-settings', 'Configured Behaviors and policy', 'Current applied settings', 'Behavior settings reads are pending'),
-  snippets: browser('snippets', 'Scoped workspace snippets', 'Current snippets', 'Snippet reads are pending'),
+  behaviors: workspace('behaviors'),
+  snippets: workspace('snippets'),
   admin: { ...browser('infrastructure', 'Gateway operator diagnostics', 'Current health and retained diagnostic windows',
     'Operator-only surface'), permission: 'Instance admin' },
   style: browser('style', 'Local browser preferences', 'Current browser preferences', 'Browser-local interface settings'),
@@ -58,7 +66,7 @@ const capabilities = {
   'organization-unfollow': browser('organization', 'Followed GitHub accounts', 'Current configured accounts', 'Interactive account control'),
   'behavior-estimates': browser('estimate', 'Caller evidence and behavior timing', 'Retained timing history', 'Estimate reads are pending'),
   'chat-requests': browser('chat-request', 'Chat owner requests', 'Current pending requests', 'Chat request reads are pending'),
-  'handled-log': browser('handling-event', 'Retained handling activity', 'Handling history retention', 'Handling history reads are pending'),
+  'handled-log': workspace('handling'),
   'publication-reviews': browser('publication-review', 'Editor review records', 'Retained publication reviews', 'Publication review reads are pending'),
   'settings-conflict': browser('settings-conflict', 'Browser settings version check', 'Current settings version', 'Interactive settings conflict'),
 } satisfies Record<Capability, Surface>
@@ -90,6 +98,10 @@ export function mcpInventory() {
         tool: 'poise_list', reason: 'Indexed pages by repository and update time' }),
       entry('chat/transcript', placeHref('chat'), { kind: 'chat-event', source: 'Retained Chat journal', retention: 'Events since the last context reset',
         permission: 'Chat transcript consent', tool: 'poise_changes', reason: 'Resumable transcript pages by stored sequence' }),
+      ...MCP_WORKSPACE_VIEWS.map(id => ({ id: 'workspace/' + id, ...workspaceViewSurface(id) })),
+      entry('workspace/caller', placeHref('observe', { part: 'tasks' }), { ...workspace('behaviors'), kind: 'call',
+        source: 'Caller retained Call log and Behavior chain journal', retention: 'Retained Call and invocation records',
+        reason: 'Exact full Call or invocation ID with settlement and quarantine coverage' }),
     ],
   }
 }

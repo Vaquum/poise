@@ -24,10 +24,13 @@ import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { db, setMeta } from '../server/db'
 import * as ledger from '../server/behavior-ledger'
+import * as agent from '../server/agent'
 import * as processes from '../server/process'
 import type { readMcpWork } from '../server/mcp-work'
 import { PARTS, PLACES, SECTIONS } from '../src/ui/address'
 import { listCapabilities } from '../server/capabilities'
+import { MCP_WORKSPACE_VIEWS } from '../gateway/src/mcp-contract'
+import { createServer as createExtension, deleteServer as deleteExtension } from '../server/extensions/store'
 import { createTimer } from '../server/chat/control-store'
 import { emptyCapabilities } from '../server/chat/runtime'
 import { appendEvent, deleteSession, getSession, insertSession, resetConversation } from '../server/chat/storage'
@@ -107,7 +110,7 @@ const fetcher: typeof fetch = async (input, init) => {
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
 async function connect(login: string, serverEndpoint = endpoint,
-  options: { chatMetadata?: boolean; chatTranscript?: boolean; repository?: string } = {}) {
+  options: { chatMetadata?: boolean; chatTranscript?: boolean; workspaceData?: boolean; repository?: string } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -139,6 +142,7 @@ async function connect(login: string, serverEndpoint = endpoint,
     cookie: signedIn.apexCookie, origin: new URL(endpoint).origin, 'content-type': 'application/x-www-form-urlencoded',
   }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
     ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.chatTranscript ? { chatTranscript: '1' } : {}),
+    ...(options.workspaceData ? { workspaceData: '1' } : {}),
     ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
@@ -376,7 +380,8 @@ it('reports the running workspace inventory through describe and the matching MC
   try {
     const result = await describe(client) as { inventory: { surfaces: Array<{ id: string; href: string }> } }
     const expected = [...PLACES, ...PARTS.map(id => `observe/${id}`), ...SECTIONS.map(id => `settings/${id}`),
-      ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript']
+      ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript',
+      ...MCP_WORKSPACE_VIEWS.map(id => 'workspace/' + id), 'workspace/caller']
     expect(result.inventory.surfaces.map(surface => surface.id)).toEqual(expected)
     expect(result.inventory.surfaces.every(surface => new URL(surface.href).origin === 'https://alice.poise.test')).toBe(true)
     expect(result).toMatchObject({ access: { resource: endpoint, scope: 'poise:read' }, instructions: expect.any(String),
@@ -399,6 +404,65 @@ it('reports the running workspace inventory through describe and the matching MC
       inventory: { surfaces: result.inventory.surfaces }, access: { resource: endpoint } })
     await expect(client.readResource({ uri: 'poise://workspace/bob' })).rejects.toThrow('resource not found')
   } finally { await client.close() }
+})
+
+it('keeps workspace settings consent separate and projects extension and memory metadata without stored content', async () => {
+  const scope = await connect('Alice', endpoint, { workspaceData: true })
+  const chat = await connect('Alice', endpoint, { chatMetadata: true })
+  const repository = await connect('Alice', endpoint, { chatMetadata: true, workspaceData: true, repository: 'Acme/Repo' })
+  const memory = 'fixture private memory text'
+  setMeta('chat_memories', JSON.stringify({ text: memory, revision: 12 }))
+  const extension = createExtension({ source: 'custom', name: 'fixture-extension', title: 'Fixture extension', transport: 'stdio',
+    command: 'fixture-private-command', args: ['fixture-private-arg'], auth: 'none',
+    env: [{ name: 'TOKEN', secret: true }] }, { 'env:TOKEN': 'fixture-private-token' }, { default: false, workspaces: {} })
+  const callId = 'e'.repeat(32)
+  const log = { id: callId, pr_id: '42', repo: 'Acme/Repo', actor: 'Alice', model: 'fixture', behavior: 'implement_issue',
+    session_id: null, started_at: new Date().toISOString(), time_elapsed: '0', status: 'completed', outcome: 'published',
+    head_sha: 'a'.repeat(40), expected_head: null, source: 'poise:behavior-chain', correlation_id: randomUUID(),
+    action: 'published', response: 'eeeeeeee', error: 'fixture-private-error', prompt: 'fixture-private-prompt' } satisfies agent.LogEntry
+  const calls = vi.spyOn(agent, 'fetchAgentLogById').mockResolvedValue({ entries: [log], quarantined: [] })
+  async function view(id: string) {
+    const result = await scope.client.callTool({ name: 'poise_get', arguments: { kind: 'workspace', id } })
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).lookup as unknown
+  }
+  try {
+    for (const client of [chat.client, repository.client]) {
+      expect((await client.callTool({ name: 'poise_get', arguments: { kind: 'workspace', id: 'settings' } })).isError).toBe(true)
+    }
+    expect((await scope.client.callTool({ name: 'poise_get', arguments: { kind: 'chat', id: randomUUID() } })).isError).toBe(true)
+    expect(await view('memories')).toMatchObject({ coverage: 'complete', record: { kind: 'workspace', id: 'memories',
+      value: { revision: 12, bytes: Buffer.byteLength(memory) } } })
+    const extensions = await view('extensions')
+    expect(extensions).toMatchObject({ link: 'https://alice.poise.test/?view=settings&settings=extensions',
+      record: { value: { items: [{ name: 'fixture-extension', id: extension.id, enabledByDefault: false }] } } })
+    expect(JSON.stringify(extensions)).not.toContain('fixture-private')
+    expect(await view('settings')).toMatchObject({ coverage: 'complete', record: { value: { manager: { rhythm: expect.any(Number) } } } })
+    const requestedCall = { name: 'poise_get', arguments: { kind: 'call', id: callId } }
+    expect((await repository.client.callTool(requestedCall)).isError).toBe(true)
+    const call = JSON.parse(((await scope.client.callTool(requestedCall)).content as { text: string }[])[0].text).lookup
+    expect(call).toMatchObject({ source: 'Caller retained Call log', coverage: 'complete',
+      link: 'https://alice.poise.test/api/agent-response/' + callId, record: { id: callId, repository: 'Acme/Repo',
+        invocationId: log.correlation_id, action: 'published' } })
+    expect(JSON.stringify(call)).not.toContain('fixture-private')
+    expect(calls).toHaveBeenCalledExactlyOnceWith(callId)
+    const inventory = await describe(scope.client)
+    expect(inventory).toMatchObject({ inventory: { surfaces: expect.arrayContaining([
+      expect.objectContaining({ id: 'settings', status: 'available' }),
+      expect.objectContaining({ id: 'chat', status: 'unavailable' }),
+    ]) } })
+    const mcp = { resource: endpoint, handle: 'alice', ownerId: 1001, grantId: randomUUID(), workspaceData: true as const, repository: 'Acme/Repo' }
+    const identity = signAssertion(h.keys.privateKey, { handle: 'alice', login: 'Alice', scope: 'mcp', mcp }, Date.now())
+    const direct = await send(workspacePort, { host: 'alice.poise.test', path: '/api/mcp/read', method: 'POST',
+      headers: { 'x-poise-identity': identity, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'poise_get', arguments: { kind: 'workspace', id: 'settings' } }) })
+    expect(direct.status).toBe(401)
+  } finally {
+    calls.mockRestore()
+    deleteExtension(extension.id)
+    db.prepare('DELETE FROM meta WHERE key = ?').run('chat_memories')
+    await Promise.all([scope.client.close(), chat.client.close(), repository.client.close()])
+  }
 })
 
 it('keeps a consented repository restriction at the gateway and signed workspace boundary after refresh', async () => {
