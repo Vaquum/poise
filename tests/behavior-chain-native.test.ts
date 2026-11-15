@@ -13,6 +13,7 @@ import type { NativeChainHooks } from '../server/behavior-chain-native'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { completedReviewCall } from './review-response-fixture'
 import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
+import { markReplacementPending, releaseReplacementPending } from '../server/release-background'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), health: vi.fn(async () => {}) }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn() }))
@@ -30,6 +31,7 @@ const { spawnDetached } = await import('../server/process')
 
 let directory = ''
 afterEach(() => {
+  markReplacementPending(false)
   vi.useRealTimers()
   vi.unstubAllEnvs()
   if (directory) rmSync(directory, { recursive: true, force: true })
@@ -41,6 +43,23 @@ const chain: BehaviorChain = { id: 'example/repo#7', repository: 'example/repo',
   author: 'author', reviewer: 'reviewer', sequence: 1, held: null, waiting: null, resumedAfterSequence: 0,
   mergeSha: null, observation: null, invocations: [] }
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+
+it('yields new native work throughout replacement recovery and rechecks after awaited preparation', async () => {
+  const operations = actionOperations({ prepare: async () => { markReplacementPending(true); return {} } })
+  const invocation = mergeInvocation()
+  const decision = { kind: 'invoke', behavior: 'merge-pr', actor: 'reviewer', basis: 'merge', reviewer: null, reason: 'ready' } as const
+  expect(operations.enabled()).toBe(true)
+  const spawned = vi.mocked(spawnDetached).mock.calls.length
+  await expect(operations.launch(invocation, () => {}, () => !releaseReplacementPending())).resolves.toBe(false)
+  expect(vi.mocked(spawnDetached).mock.calls).toHaveLength(spawned)
+  for (let admission = 0; admission < 3; admission++) {
+    expect(operations.enabled()).toBe(false)
+    expect(operations.permitted(chain, decision)).toBe(false)
+  }
+  markReplacementPending(false)
+  expect(operations.enabled()).toBe(true)
+  expect(operations.permitted(chain, decision)).toBe(true)
+})
 
 it('refuses managed admission and effects on unreadable receipts, including failure during preparation, and rechecks existing controls after recovery', async () => {
   directory = mkdtempSync(join(tmpdir(), 'poise-native-receipts-'))

@@ -61,7 +61,8 @@ export class CallerReceiptStoreError extends Error {
 let failure: CallerReceiptStoreError | null = null
 
 export interface NativeCleanupHold { callId: string, reason: string | null, retainedCalls?: number }
-interface CallerActivity { live: number, pendingResources: number | null, cleanupHold?: NativeCleanupHold, cause?: unknown }
+interface CallerActivity { live: number, pendingResources: number | null, cleanupHold?: NativeCleanupHold,
+  nativeWorkBlocker?: { callId: string, reason: string }, cause?: unknown }
 type ResourceRead = 'skip' | 'count' | 'health'
 const pendingNative = "source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)"
 
@@ -123,6 +124,12 @@ function readCallerActivity(path: string, behaviorOnly: boolean, resources: Reso
     try {
       const { count: pendingResources } = db.prepare(`select count(*) as count from calls where ${pendingNative}`).get() as { count: number }
       if (resources !== 'health' || pendingResources === 0) return { live, pendingResources }
+      const pending = db.prepare(`select id, status from calls where ${pendingNative}
+        and (status = 'running' or resource_cleanup is null) order by (status = 'running') desc, id limit 1`)
+        .get() as { id: string, status: string } | undefined
+      const nativeWorkBlocker = pending && /^[a-f0-9]{32}$/.test(pending.id)
+        ? { callId: pending.id, reason: pending.status === 'running' ? 'native Call is still running; waiting for its original completion and resource settlement'
+          : 'native Call is awaiting original resource settlement' } : undefined
       // Only the original namespace settlement can turn a cleanup failure
       // into disk work that may be retained across container replacement.
       const hold = db.prepare(`
@@ -146,9 +153,9 @@ function readCallerActivity(path: string, behaviorOnly: boolean, resources: Reso
           then count(*) over () end as retainedCalls
         from holds order by coalesce(processesSettled, 0), callId limit 1
       `).get() as { callId: string, reason: string | null, retainedCalls: number | null } | undefined
-      if (!hold || !/^[a-f0-9]{32}$/.test(hold.callId)) return { live, pendingResources }
+      if (!hold || !/^[a-f0-9]{32}$/.test(hold.callId)) return { live, pendingResources, nativeWorkBlocker }
       const { callId, reason, retainedCalls } = hold
-      return { live, pendingResources, cleanupHold: { callId, reason, ...(retainedCalls !== null && { retainedCalls }) } }
+      return { live, pendingResources, nativeWorkBlocker, cleanupHold: { callId, reason, ...(retainedCalls !== null && { retainedCalls }) } }
     } catch (cause) { return { live, pendingResources: null, cause } }
   } finally {
     db?.close()
@@ -167,9 +174,10 @@ export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR, 
 
 /** The Caller calls a restart would cut. `known` is false while Caller's
  *  records cannot be read; `count` then holds this server's own launches. */
-export function runningCallerCalls(behaviorOnly = false): { count: number, pendingResources: number, known: boolean, cleanupHold?: NativeCleanupHold } {
+export function runningCallerCalls(behaviorOnly = false): { count: number, pendingResources: number, known: boolean, cleanupHold?: NativeCleanupHold,
+  nativeWorkBlocker?: { callId: string, reason: string } } {
   const activity = callerActivity(process.env.AGENT_INTERFACE_DATA_DIR, behaviorOnly, behaviorOnly ? 'count' : 'health')
   return { count: Math.max(runningCallerLaunches(behaviorOnly) + (behaviorOnly ? 0 : debates), activity?.live ?? 0),
     pendingResources: activity?.pendingResources ?? 0, known: activity !== null && activity.pendingResources !== null,
-    cleanupHold: activity?.cleanupHold }
+    cleanupHold: activity?.cleanupHold, nativeWorkBlocker: activity?.nativeWorkBlocker }
 }

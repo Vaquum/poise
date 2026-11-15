@@ -80,6 +80,7 @@ export interface HarnessOptions {
   requireNetwork?: boolean
   serviceTimeoutMs?: number
   idleToReadyMs?: number
+  replacementDrainMs?: number
   shutdownGraceMs?: number
 }
 
@@ -190,6 +191,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     config, docker: dockerClient, store, keys, log, now, upstream, workspaceResolvConf,
     drainPollMs: options.drainPollMs ?? 10, drainRenewMs: options.drainRenewMs,
     serviceTimeoutMs: options.serviceTimeoutMs, idleToReadyMs: options.idleToReadyMs ?? 1000,
+    replacementDrainMs: options.replacementDrainMs,
   })
   const disk = new DiskWatch({ config, docker: dockerClient, log, now, space: async () => ({ free: 200 * 1024 ** 3, total: 290 * 1024 ** 3 }) })
   const gateway: Gateway = createGateway({

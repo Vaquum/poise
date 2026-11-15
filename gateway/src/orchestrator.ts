@@ -12,6 +12,8 @@ import { WORKSPACE_RESOLV_CONF } from './workspace-dns.js'
 
 export const WORKSPACE_PORT = 5555
 export const UPGRADE_INTERVAL_MS = 5 * 60_000
+/** Leaves room for service retries, rechecks and resume inside the ten-minute verifier. */
+export const REPLACEMENT_DRAIN_MS = 120_000
 
 const SERVICE_TIMEOUT_MS = 5_000
 const DRAIN_POLL_MS = 5_000
@@ -43,6 +45,8 @@ export interface ServiceHealth {
   /** Missing on older workspaces; null when their native resource records are unreadable. */
   unsettledNativeCalls?: number | null
   nativeCleanupHold?: { callId: string; reason: string | null; retainedCalls?: number }
+  nativeWorkBlocker?: { callId: string; reason: string }
+  replacement?: { target: string; waitingOn: string | null } | null
   backgroundWork: number
   /** True only when activeChatTurns, runningCallerCalls and backgroundWork are all 0. */
   idle: boolean
@@ -123,6 +127,7 @@ export interface OrchestratorDeps {
   serviceTimeoutMs?: number
   /** Stop-to-ready bound for a replacement; IDLE_TO_READY_MS in production, shorter in tests. */
   idleToReadyMs?: number
+  replacementDrainMs?: number
 }
 
 function parseHealth(text: string, what: string): ServiceHealth {
@@ -157,6 +162,18 @@ function parseHealth(text: string, what: string): ServiceHealth {
     throw new WorkspaceAnswerError(`the workspace answered ${what} idle with unsettled or unknown native resources`)
   }
   let nativeCleanupHold: ServiceHealth['nativeCleanupHold']
+  const blocker = value.nativeWorkBlocker
+  if (blocker !== undefined && (!blocker || typeof blocker !== 'object'
+    || !('callId' in blocker) || typeof blocker.callId !== 'string' || !/^[a-f0-9]{32}$/.test(blocker.callId)
+    || !('reason' in blocker) || typeof blocker.reason !== 'string' || blocker.reason.length > 2000)) {
+    throw new WorkspaceAnswerError(`the workspace answered ${what} with an invalid native work blocker`)
+  }
+  const replacement = value.replacement
+  if (replacement != null && (typeof replacement !== 'object' || !('target' in replacement)
+    || typeof replacement.target !== 'string' || replacement.target.length > 200
+    || !('waitingOn' in replacement) || (replacement.waitingOn !== null && typeof replacement.waitingOn !== 'string'))) {
+    throw new WorkspaceAnswerError(`the workspace answered ${what} with invalid replacement admission`)
+  }
   const hold = value.nativeCleanupHold
   if (hold !== undefined) {
     if (typeof nativeCalls !== 'number' || nativeCalls === 0
@@ -178,6 +195,8 @@ function parseHealth(text: string, what: string): ServiceHealth {
     runningCallerCalls: value.runningCallerCalls,
     ...(nativeCalls === undefined ? {} : { unsettledNativeCalls: nativeCalls }),
     ...(nativeCleanupHold && { nativeCleanupHold }),
+    ...(blocker && { nativeWorkBlocker: blocker as ServiceHealth['nativeWorkBlocker'] }),
+    ...(replacement && { replacement: replacement as ServiceHealth['replacement'] }),
     backgroundWork: value.backgroundWork,
     idle: value.idle,
     draining: value.draining,
@@ -262,6 +281,7 @@ export class Orchestrator {
   /** The release a stuck-switch warning was logged for, so it warns once per release, not per pass. */
   private readonly stuckWarned = new Map<string, string>()
   private readonly reportedCleanup = new Map<string, string>()
+  private readonly resumePending = new Map<string, string>()
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.drainPollMs = deps.drainPollMs ?? DRAIN_POLL_MS
@@ -494,6 +514,8 @@ export class Orchestrator {
         // The list shows a container's image but not its environment, which holds its drain timeout.
         const details = await docker.inspectContainer(summary.Id)
         const reason = details && this.outdated(details, imageId)
+        const resumeId = this.resumePending.get(summary.Labels['poise.workspace'] ?? '')
+        if (resumeId && (details?.Id !== resumeId || !details.State.Running)) this.resumePending.delete(summary.Labels['poise.workspace'] ?? '')
         if (!reason) {
           // A container of the current image whose volume still named an older release when it started runs
           // that one; it switches like any other.
@@ -507,6 +529,15 @@ export class Orchestrator {
           continue
         }
         try {
+          if (this.resumePending.has(handle)) {
+            const recovered = await this.withLock(handle, async () => {
+              const current = await docker.inspectContainer(workspaceNames(handle).container)
+              if (current?.Id !== details.Id || current.Config.Labels?.['poise.managed'] !== 'true'
+                || current.Config.Labels['poise.workspace'] !== handle) return false
+              return this.releaseDrain(handle, login, 'rechecking recovery before another replacement attempt', true, details.Id)
+            })
+            if (!recovered) continue
+          }
           // A running workspace on the same base takes a new release in place: only Poise restarts, and the
           // agents it started keep running. Anything else needs a new container.
           // Its inherited labels survive a rebuild that makes the original image unavailable for inspection.
@@ -581,6 +612,7 @@ export class Orchestrator {
     this.unreachableSince.delete(handle)
     if (health.release === null) return false
     await this.configureReporting(handle, login, health)
+    if (health.replacement) await this.releaseDrain(handle, login, 'the workspace can update in place')
     if (health.release === target.release) {
       await this.withdrawSwitch(handle, login, health, target)
       this.updating.delete(handle)
@@ -667,6 +699,7 @@ export class Orchestrator {
     try {
       const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
       await this.configureReporting(handle, login, health)
+      if (health.replacement) await this.releaseDrain(handle, login, 'replacement is no longer required')
       if (health.release !== null && health.release !== target.release) await this.updateInPlace(handle, login, target)
       else if (health.release === target.release) {
         await this.withdrawSwitch(handle, login, health, target)
@@ -793,8 +826,10 @@ export class Orchestrator {
 
   private async upgrade(handle: string, login: string, imageId: string, reason: string, target: ImageRelease | null, fallback: ImageRelease | null): Promise<void> {
     this.lifecycle('workspace.upgrade.started', handle, { image: imageId, reason })
-    // One budget for the whole workspace operation: every drain, recheck and re-drain shares it.
-    const deadline = this.deps.now() + this.deps.config.drainTimeoutSeconds * 1000
+    // Rechecks and re-drains share the same short replacement attempt.
+    const deadline = this.deps.now() + Math.min(this.deps.config.drainTimeoutSeconds * 1000,
+      this.deps.replacementDrainMs ?? REPLACEMENT_DRAIN_MS)
+    const replacement = target?.release ?? imageId
     this.upgradingHandle = handle
     this.upgradingPhase = 'upgrade'
     // null until drained; then whether the drain left the workspace idle rather than timing out.
@@ -808,7 +843,7 @@ export class Orchestrator {
     let originalId: string | null = null
     const owned = (details: ContainerDetails | null | undefined): boolean =>
       details?.Config?.Labels?.['poise.managed'] === 'true' && details.Config.Labels['poise.workspace'] === handle
-    const releaseOriginalDrain = async (reason: string): Promise<void> => {
+    const releaseOriginalDrain = async (reason: string, keepReplacement = true): Promise<void> => {
       await this.withLock(handle, async () => {
         try {
           const current = await this.deps.docker.inspectContainer(workspaceNames(handle).container)
@@ -818,7 +853,7 @@ export class Orchestrator {
             error: `cannot verify the original drain container: ${errorMessage(error)}` })
           return
         }
-        await this.releaseDrain(handle, login, reason)
+        await this.releaseDrain(handle, login, reason, keepReplacement, originalId)
       })
     }
     // Whether a drain POST left the gateway, visible even when drain() throws before returning.
@@ -826,7 +861,7 @@ export class Orchestrator {
     const abortUnknown = async (reason = 'the drain timed out without confirmed admission and idleness'): Promise<void> => {
       await releaseOriginalDrain(reason)
       // A failed admission is a deferred update, not routine: it warns so the owner can see it.
-      this.deps.log.warn('workspace.upgrade.aborted', { handle, reason,
+      this.deps.log.warn('workspace.upgrade.aborted', { handle, reason, release: replacement, image: imageId,
         activeChatTurns: lastCounts?.activeChatTurns ?? null,
         runningCallerCalls: lastCounts?.runningCallerCalls ?? null,
         backgroundWork: lastCounts?.backgroundWork ?? null })
@@ -859,13 +894,12 @@ export class Orchestrator {
           await this.activateRelease(handle, target)
           // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
           // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
-          // idle. A drain that timed out on confirmed busy work cuts it anyway; one that only timed out
-          // or was never admitted aborts instead of recreating a slow workspace blind. A forced stop
-          // still needs a fresh native-cleanup zero below.
+          // idle. An expired attempt still needs fresh cooperative settlement below;
+          // elapsed time cannot authorize cutting an original writer.
           let retainedCleanup: ServiceHealth['nativeCleanupHold']
           if (running && drainedIdle) {
             this.upgradingPhase = 'recheck'
-            const recheck = await this.idleUnderDrain(handle, login)
+            const recheck = await this.idleUnderDrain(handle, login, replacement)
             this.upgradingPhase = 'upgrade'
             retainedCleanup = recheck.retainedCleanup
             if (!recheck.idle) {
@@ -887,8 +921,8 @@ export class Orchestrator {
             }
           }
           if (running && !drainedIdle) {
-            const fresh = await this.idleUnderDrain(handle, login)
-            if (fresh.unknown || (!fresh.idle && !fresh.nativeIdle)) {
+            const fresh = await this.idleUnderDrain(handle, login, replacement)
+            if (fresh.unknown || !fresh.idle) {
               this.deps.log.warn('workspace.upgrade.native-pending', { handle,
                 unsettledNativeCalls: fresh.unsettledNativeCalls ?? null })
               return 'abort-unknown'
@@ -961,7 +995,7 @@ export class Orchestrator {
         })
         if (outcome === 'done') return
         if (outcome === 'skipped') {
-          if (drainAttempted && !recreated) await releaseOriginalDrain('the upgrade was skipped after a drain')
+          if (drainAttempted && !recreated) await releaseOriginalDrain('the upgrade was skipped after a drain', false)
           return
         }
         if (outcome === 'abort-unknown') {
@@ -969,8 +1003,7 @@ export class Orchestrator {
           return
         }
         if (this.deps.now() >= deadline) {
-          // Busy work is cut only behind an admitted drain; without admission nothing confirmed the
-          // workspace even saw the drain, so the pass aborts and the next one tries again.
+          // Recheck settlement behind a confirmed drain; the deadline alone authorizes no stop.
           if ((confirmedBusy && admitted) || sawDown) {
             drainedIdle = false
             continue
@@ -979,10 +1012,10 @@ export class Orchestrator {
           return
         }
         this.upgradingPhase = 'drain'
-        const result = await this.drain(handle, login, deadline, dispatched, fallback)
+        const result = await this.drain(handle, login, deadline, dispatched, fallback, replacement)
         this.upgradingPhase = 'upgrade'
         if (result.recovered) {
-          await releaseOriginalDrain('the workspace recovered on the target release')
+          await releaseOriginalDrain('the workspace recovered on the target release', false)
           this.updating.delete(handle)
           this.stuckWarned.delete(handle)
           return
@@ -1025,9 +1058,9 @@ export class Orchestrator {
    * reports the drain as this answer showed it, so the caller learns a lost admission even when the
    * recheck cannot proceed; null when nothing observed it.
    */
-  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean; draining: boolean | null; unsettledNativeCalls?: number | null; nativeIdle?: boolean; retainedCleanup?: ServiceHealth['nativeCleanupHold'] }> {
+  private async idleUnderDrain(handle: string, login: string, replacement: string): Promise<{ idle: boolean; unknown: boolean; down: boolean; draining: boolean | null; unsettledNativeCalls?: number | null; retainedCleanup?: ServiceHealth['nativeCleanupHold'] }> {
     try {
-      const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
+      const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain', { replacement })
       // The recheck is the last gate before the stop: only an idle answer behind an applied drain lets
       // it proceed. Without the drain on, new work stays unblocked and could arrive between this reply
       // and the stop, so a missing ack reads as unknown, never idle.
@@ -1037,8 +1070,6 @@ export class Orchestrator {
         return { idle: false, unknown: true, down: false, draining: health.ok ? health.draining : null }
       }
       return { idle: replacementIdle(health), unknown: false, down: false, draining: true,
-        // An admitted tick/launch can still be between spawn and Call registration.
-        nativeIdle: health.unsettledNativeCalls === 0 && health.runningCallerCalls === 0 && health.backgroundWork === 0,
         unsettledNativeCalls: health.unsettledNativeCalls,
         retainedCleanup: health.nativeCleanupHold?.retainedCalls === undefined ? undefined : health.nativeCleanupHold }
     } catch (error) {
@@ -1079,13 +1110,28 @@ export class Orchestrator {
     }
   }
 
-  /** Lifts a drain the gateway attempted but did not recreate past; best effort, the lapse is the backstop. */
-  private async releaseDrain(handle: string, login: string, reason: string): Promise<void> {
+  /** Observe recovery, including when the resume response was lost. The workspace lapse is the backstop. */
+  private async releaseDrain(handle: string, login: string, reason: string, replacement = false, container?: string): Promise<boolean> {
+    if (container) this.resumePending.set(handle, container)
     try {
-      await this.serviceCall(handle, login, 'POST', '/api/service/resume')
+      const health = await this.serviceCall(handle, login, 'POST', '/api/service/resume', replacement ? { replacement: true } : undefined)
+      if (!health.ok || health.draining) throw new WorkspaceAnswerError('resume did not confirm that the drain was lifted')
+      this.resumePending.delete(handle)
       this.lifecycle('workspace.drain.released', handle, { reason })
+      return true
     } catch (error) {
       this.deps.log.warn('workspace.drain.release.failed', { handle, reason, error: errorMessage(error) })
+      try {
+        const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+        if (health.ok && !health.draining) {
+          this.resumePending.delete(handle)
+          this.lifecycle('workspace.drain.released', handle, { reason })
+          return true
+        }
+      } catch (probeError) {
+        this.deps.log.warn('workspace.drain.recovery.failed', { handle, error: errorMessage(probeError) })
+      }
+      return false
     }
   }
 
@@ -1100,7 +1146,7 @@ export class Orchestrator {
    * idle answer alone never recreates the workspace. Admission is the drain as last observed; an
    * answer showing it off un-admits, and a round with no usable answer leaves it alone.
    */
-  private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }, fallback: ImageRelease | null): Promise<{
+  private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }, fallback: ImageRelease | null, replacement: string): Promise<{
     idle: boolean; nativePending: ServiceHealth | null; recovered: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; observed: boolean; sawDown: boolean;
     lastCounts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null
   }> {
@@ -1132,6 +1178,8 @@ export class Orchestrator {
         activeChatTurns: health.activeChatTurns,
         runningCallerCalls: health.runningCallerCalls,
         backgroundWork: health.backgroundWork,
+        release: replacement,
+        ...(health.nativeWorkBlocker && { callId: health.nativeWorkBlocker.callId, blocker: health.nativeWorkBlocker.reason }),
         elapsedSeconds: Math.round((now() - start) / 1000),
         remainingSeconds: Math.max(0, Math.round((deadline - now()) / 1000)),
       })
@@ -1140,6 +1188,9 @@ export class Orchestrator {
       activeChatTurns: health.activeChatTurns,
       runningCallerCalls: health.runningCallerCalls,
       backgroundWork: health.backgroundWork,
+      ...(health.nativeWorkBlocker && { callId: health.nativeWorkBlocker.callId, blocker: health.nativeWorkBlocker.reason }),
+      ...(health.replacement?.waitingOn && { blocker: health.replacement.waitingOn }),
+      release: replacement,
     })
     const note = (health: ServiceHealth): void => {
       // Anything that answers is not down: a transient failure stops authorizing a cut the moment
@@ -1176,7 +1227,7 @@ export class Orchestrator {
     const postDrain = async (): Promise<ServiceHealth> => {
       await this.ensureOnNetwork(handle)
       dispatched.value = true
-      return this.serviceCall(handle, login, 'POST', '/api/service/drain')
+      return this.serviceCall(handle, login, 'POST', '/api/service/drain', { replacement })
     }
     try {
       const health = await postDrain()
@@ -1232,7 +1283,9 @@ export class Orchestrator {
         log.warn(renew ? 'workspace.drain.renew.failed' : 'workspace.drain.health.failed', { handle, error: errorMessage(error) })
       }
     }
-    log.warn('workspace.drain.timeout', { handle, timeoutSeconds: config.drainTimeoutSeconds,
+    log.warn('workspace.drain.timeout', { handle, release: replacement,
+      timeoutSeconds: Math.min(config.drainTimeoutSeconds, (this.deps.replacementDrainMs ?? REPLACEMENT_DRAIN_MS) / 1000),
+      ...lastCounts.counts,
       activeChatTurns: lastCounts.counts?.activeChatTurns ?? null,
       runningCallerCalls: lastCounts.counts?.runningCallerCalls ?? null,
       backgroundWork: lastCounts.counts?.backgroundWork ?? null })
@@ -1362,7 +1415,7 @@ export class Orchestrator {
   }
 
   /** A call to the workspace's /api/service/* endpoints, carrying an admin-scope assertion. */
-  private async serviceCall(handle: string, login: string, method: 'GET' | 'POST', path: string, configuration?: { repairExhaustionRepositories: string }): Promise<ServiceHealth> {
+  private async serviceCall(handle: string, login: string, method: 'GET' | 'POST', path: string, configuration?: { repairExhaustionRepositories: string } | { replacement: string | true }): Promise<ServiceHealth> {
     await this.ensureOnNetwork(handle)
     const { config, keys, now } = this.deps
     const publicHost = `${handle}.${config.domain}`

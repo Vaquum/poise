@@ -55,7 +55,8 @@ export async function receiveDeployment(db: DiagnosticStore, stdin: AsyncIterabl
           budget: 'deployment-verifier', budgetSeconds, elapsedSeconds, admissionState: validHealth ? health.draining === true ? 'drained' : health.draining === false ? 'open' : 'unknown' : 'unknown',
           blocker, nextRetry: null, recovery: recovered ? complete ? 'rollout_complete' : 'admissions_restored' : null,
           health: validHealth ? Object.fromEntries(['version', 'release', 'draining', 'idle', 'activeChatTurns', 'runningCallerCalls', 'backgroundWork',
-            'unsettledNativeCalls', 'nativeCleanupHold', 'desiredRelease', 'installedRelease', 'switching', 'pendingSince', 'switchWaitingOn']
+            'unsettledNativeCalls', 'nativeCleanupHold', 'nativeWorkBlocker', 'replacement',
+            'desiredRelease', 'installedRelease', 'switching', 'pendingSince', 'switchWaitingOn']
             .map((name) => [name, health[name] ?? null])) : null },
       }) : null
       events = db.commitDelivery(event ? [event] : [], key, JSON.stringify({ state, observedAt }))

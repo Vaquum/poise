@@ -11,6 +11,8 @@ import type { SessionRecord } from '../server/chat/protocol'
 import type { RequestAuthority } from '../server/http'
 import { createCpuCapture } from '../server/production-cpu-profile'
 import Database from 'better-sqlite3'
+import { CURRENT_IMAGE_ID, OLD_IMAGE_ID, startHarness } from '../gateway/tests/harness'
+import { REPLACEMENT_DRAIN_MS } from '../gateway/src/orchestrator'
 
 let root = ''
 let control: typeof import('../server/service/control')
@@ -99,6 +101,113 @@ function call(method: string, path: string, authority: RequestAuthority, service
 }
 
 describe('service health', () => {
+  it('bounds replacement behind overlapping native Calls, recovers between attempts and eventually serves the retained target', async () => {
+    const h = await startHarness()
+    const records = join(root, 'replacement-records')
+    await mkdir(records)
+    const database = new Database(join(records, 'calls.sqlite3'))
+    database.exec('create table calls (id text, status text, pid integer, runner text, source text, resources_settled_at real, resource_cleanup text, resource_ownership text, correlation_id text)')
+    const insert = database.prepare('insert into calls values (?,?,?,?,?,?,?,?,?)')
+    const a = 'a'.repeat(32), b = 'b'.repeat(32), cleanup = 'c'.repeat(32)
+    for (const id of [a, b]) insert.run(id, 'running', process.pid, null, 'poise:behavior-chain', null, null, null, id)
+    insert.run(cleanup, 'failed', null, null, 'poise:behavior-chain', null,
+      JSON.stringify({ failures: 1, last_error: 'original cleanup handle unavailable' }),
+      JSON.stringify({ version: 2, process_pending: false, namespace: { state: 'settled', callId: cleanup, correlation: cleanup, settled_at: 1 } }), cleanup)
+    const cleanupReceipt = database.prepare('select * from calls where id=?').get(cleanup)
+    vi.stubEnv('AGENT_INTERFACE_DATA_DIR', records)
+    vi.stubEnv('POISE_MODE', 'service')
+    const runtime = fakeRuntime()
+    const timer = new FakeTimer()
+    let now = Date.now(), synced = false, reconciled = false
+    const recovery = () => !synced ? 'datastore refresh' : !reconciled ? 'journal settlement' : null
+    let service = new control.ServiceControl(runtime as unknown as ChatRuntime, {
+      drainTimeoutSeconds: 5400, timer, now: () => now, replacementRecovery: recovery,
+      release: { name: 'old-release', base: 'old-base' },
+    })
+    try {
+      await h.openWorkspace('Alice')
+      const original = h.docker.containers.get('poise-ws-alice')!
+      original.imageId = OLD_IMAGE_ID
+      h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'pending-release', 'poise.base': 'new-base' })
+      h.workspace.onServiceRequest = request => {
+        if (request.url === '/api/service/health' && service.draining) {
+          now += REPLACEMENT_DRAIN_MS + 1
+          h.advance(REPLACEMENT_DRAIN_MS + 1)
+        }
+        const body = JSON.parse(request.body || '{}') as { replacement?: string | boolean }
+        const health = request.url === '/api/service/drain' ? service.drain(String(body.replacement))
+          : request.url === '/api/service/resume' ? service.resume(body.replacement === true) : service.health()
+        delete h.workspace.health.nativeWorkBlocker
+        delete h.workspace.health.nativeCleanupHold
+        Object.assign(h.workspace.health, health)
+        h.workspace.drainApplies = health.draining
+      }
+      await h.orchestrator.upgradePass()
+      expect(h.docker.containers.get(original.name)?.id).toBe(original.id)
+      expect(service.health()).toMatchObject({ draining: false, runningCallerCalls: 2, unsettledNativeCalls: 3,
+        nativeWorkBlocker: { callId: a }, replacement: { target: 'pending-release', waitingOn: 'datastore refresh' } })
+      expect(background.releaseBackgroundPaused()).toBe(false)
+      expect(background.releaseReplacementPending()).toBe(true)
+      expect(service.admitLaunch('POST', '/api/pr-review')).toBe('draining')
+      expect(h.logs.find(entry => entry.event === 'workspace.drain.timeout')).toMatchObject({
+        timeoutSeconds: 120, callId: a, release: 'pending-release', blocker: expect.stringContaining('original completion'),
+      })
+      expect(h.logs.some(entry => entry.event === 'workspace.upgrade.finished')).toBe(false)
+      // A finishes while the overlapping B outlasts another attempt.
+      database.prepare("update calls set status='completed', resources_settled_at=1 where id=?").run(a)
+      expect(service.drain('pending-release')).toMatchObject({ draining: false, replacement: { waitingOn: 'datastore refresh' } })
+      synced = true
+      expect(service.drain('pending-release')).toMatchObject({ draining: false, replacement: { waitingOn: 'journal settlement' } })
+      reconciled = true
+      await h.orchestrator.upgradePass()
+      expect(service.health()).toMatchObject({ draining: false, runningCallerCalls: 1, nativeWorkBlocker: { callId: b } })
+      expect(h.docker.containers.get(original.name)?.id).toBe(original.id)
+      for (let candidate = 0; candidate < 4; candidate++) expect(service.admitLaunch('POST', '/api/pr-review')).toBe('draining')
+      database.prepare("update calls set status='completed', resources_settled_at=2 where id=?").run(b)
+      h.docker.onStart = name => {
+        if (name !== original.name) return
+        service.reset()
+        service = new control.ServiceControl(fakeRuntime() as unknown as ChatRuntime, {
+          drainTimeoutSeconds: 5400, timer, release: { name: 'pending-release', base: 'new-base' },
+        })
+      }
+      await h.orchestrator.upgradePass()
+      expect(h.docker.containers.get(original.name)).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+      expect(h.docker.containers.get(original.name)?.id).not.toBe(original.id)
+      expect(service.health()).toMatchObject({ release: 'pending-release', unsettledNativeCalls: 1 })
+      expect(database.prepare('select * from calls where id=?').get(cleanup)).toEqual(cleanupReceipt)
+      expect(database.prepare('select count(*) as count from calls').get()).toEqual({ count: 3 })
+      expect(h.docker.calls.filter(call => call.method === 'POST' && call.path.endsWith('/stop'))).toHaveLength(1)
+      expect(h.logs.filter(entry => entry.event === 'workspace.upgrade.finished')).toHaveLength(1)
+    } finally {
+      service.reset(); database.close(); vi.stubEnv('AGENT_INTERFACE_DATA_DIR', undefined); vi.stubEnv('POISE_MODE', undefined); await h.close()
+    }
+  })
+
+  it('expires the actual replacement pause despite renewals and a lost gateway, then releases its admission fence', () => {
+    const runtime = fakeRuntime(), timer = new FakeTimer(), log = vi.fn()
+    let now = 0
+    const service = new control.ServiceControl(runtime as unknown as ChatRuntime, {
+      drainTimeoutSeconds: 5400, timer, log, now: () => now, replacementRecovery: () => 'datastore refresh',
+    })
+    try {
+      service.drain('pending-release')
+      now = 60_000
+      service.drain('pending-release')
+      expect([...timer.timers.values()].map(entry => entry.delayMs)).toContain(control.REPLACEMENT_PAUSE_MS - now)
+      timer.fireDelay(control.REPLACEMENT_PAUSE_MS - now)
+      expect(service.health()).toMatchObject({ draining: false, replacement: { waitingOn: 'datastore refresh' } })
+      expect(background.releaseBackgroundPaused()).toBe(false)
+      expect(runtime.stopTurnsForDrain).not.toHaveBeenCalled()
+      expect(service.drain('pending-release').draining).toBe(false)
+      timer.fireDelay(control.REPLACEMENT_ADMISSION_MS)
+      expect(service.health().replacement).toBeNull()
+      expect(background.releaseReplacementPending()).toBe(false)
+      expect(runtime.releaseSwitchWait).toHaveBeenCalled()
+      expect(service.admitLaunch('POST', '/api/pr-review')).toBeTypeOf('function')
+    } finally { service.reset() }
+  })
+
   it('bounds an over-cap environment allowlist in the health echo', () => {
     const { service } = serviceOf()
     vi.stubEnv('POISE_MODE', undefined)
@@ -188,7 +297,7 @@ describe('service health', () => {
     session(runtime.instance, false)
     session('poise-dev:another-database', true)
     const { service } = serviceOf(runtime)
-    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, repairExhaustionRepositories: '', eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number), windowStartedAt: expect.any(String) }, desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
+    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, repairExhaustionRepositories: '', eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number), windowStartedAt: expect.any(String) }, desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null, replacement: null })
 
     let finish!: () => void
     const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))

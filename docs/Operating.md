@@ -561,7 +561,7 @@ After a proof timeout or interruption, Sync rechecks the current applied
 rollout using the original workspace inventory and image ID.
 A change to Poise alone then reaches the running workspaces within five more
 minutes. A change to the system under `deploy/runtime/` first waits for their
-running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
+running work to finish through bounded replacement attempts ([Upgrades](#upgrades)).
 
 **Release lag observation.** On that same five-minute schedule, the separate
 **Observe the production release** job runs for deployment-enabled forks even
@@ -1108,9 +1108,16 @@ An upgrade that changes the runtime recipe or the locked `playwright-core`
 version or integrity gets a new container instead, so Chromium and its system
 libraries match the new checkout. Unrelated lockfile changes keep the same
 base. Existing images take one replacement when this expanded fingerprint is
-introduced. The gateway drains a running workspace first:
-the workspace refuses new Chat turns and agent launches, which then answer
-that Poise is installing an update, and lets running work finish. In an ordinary
+introduced. The gateway drains a running workspace first, for at most two
+minutes per attempt (or `POISE_DRAIN_TIMEOUT` when shorter). The workspace
+restores background work within three minutes even if the gateway disappears
+or loses resume responses. Between the existing five-minute retries, new agent
+launches yield and Chat prompts wait while original Calls finish; datastore
+refresh and journal settlement recover. A new drain requires observed successful
+sync and reconciliation after resume. Replacement admission expires eight
+minutes after the last request if retries stop. The owner's resume also releases
+it. These bounds require replacement-aware workspace code; older releases keep
+their configured drain lapse. In an ordinary
 drain, one Chat turn holds the drain at most 30 minutes: past that the workspace stops it
 with a notice in its transcript, naming the update, and the agent keeps its
 context for the next prompt. After a fresh admitted drain confirms the workspace
@@ -1121,10 +1128,10 @@ disk and reservation stay held. The gateway logs the retained cleanup with
 `workspace.upgrade.cleanup-retained` after all live work has finished.
 With retained cleanup, the workspace lets Chat turns finish and the gateway
 defers replacement if they are still active at its deadline.
-Past `POISE_DRAIN_TIMEOUT` seconds (90 minutes by default), cutting confirmed
-busy work requires a fresh admitted drain with zero unsettled native Calls,
-Caller processes and background operations, including launches before Call
-registration.
+Past the replacement attempt budget, the gateway still requires fresh
+cooperative settlement of Chat turns, native Calls, Caller processes and
+background operations, including launches before Call registration. Elapsed
+time never permits cutting an unsettled writer.
 Cleanup without that process proof, unreadable cleanup records and unconfirmed
 drains defer replacement and release the drain (`workspace.upgrade.aborted`,
 `workspace.upgrade.native-pending`). An older workspace can still upgrade
@@ -1636,8 +1643,8 @@ an empty or stale result does not prove no work is running—check its `health`.
   start error, and the gateway logs `workspace.start.failed` with the reason.
   If the workspace image is missing, run `deploy/install.sh`.
 - **A workspace still runs the old image after an upgrade.** The gateway
-  waits up to `POISE_DRAIN_TIMEOUT` for a busy workspace. Look for
-  `workspace.drain.waiting` (what it waits on and the time left),
+  waits at most two minutes per replacement attempt for a busy workspace. Look for
+  `workspace.drain.waiting` (the live native Call, target and time left),
   `workspace.drain.unconfirmed` (the drain was never admitted),
   `workspace.upgrade.aborted` and `workspace.drain.released` (a slow workspace
   freed for the next pass), `workspace.update.waiting` and

@@ -16,6 +16,7 @@ import { resourceReleaseProven } from './behavior-resource-receipt'
 import { isExpectedFailure, runFile, spawnDetached } from './process'
 import { runDatastoreHealth } from './datastore-health'
 import { requireCallerReceipts } from './service/caller-calls'
+import { releaseReplacementPending } from './release-background'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
@@ -102,7 +103,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     return { author: settings.me, reviewer: settings.agentAccount }
   }
   return {
-    enabled: () => getBehaviorChainSettings().enabled,
+    enabled: () => getBehaviorChainSettings().enabled && !releaseReplacementPending(),
     accounts,
     ownsRepository,
     available: hooks.available,
@@ -110,7 +111,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     measureHeadroom: hooks.measureHeadroom,
     permitted(chain, decision) {
       requireCallerReceipts()
-      return hooks.permitted(chain, decision)
+      return !releaseReplacementPending() && hooks.permitted(chain, decision)
     },
     wake: hooks.wake,
     received: hooks.received,

@@ -200,6 +200,12 @@ export function readyOrganizations(): Organization[] {
   return getOrganizations().filter((org) => org.status === 'ready')
 }
 
+/** A replacement retry needs fresh successful syncs, rather than elapsed ticks. */
+export function organizationsSyncedSince(since: number): boolean {
+  return !cachedStatement(db, `SELECT 1 FROM organizations
+    WHERE managed = 1 AND (status <> 'ready' OR error IS NOT NULL OR last_sync_at <= ?) LIMIT 1`).get(since)
+}
+
 export function organizationArgs(org: Organization, args: readonly string[]): string[] {
   return org.datastorePath ? ['--db', org.datastorePath, ...args] : [...args]
 }
