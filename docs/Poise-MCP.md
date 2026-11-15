@@ -123,8 +123,10 @@ handling history, Current cards, repositories visible to the configured
 account, Switchboard check state and Manager Rhythm, and extension, memory
 and snippet metadata.
 
-The same consent allows `kind: "call"` with the full Caller Call ID and
-`kind: "invocation"` with a retained chain invocation ID. Receipts include the
+The same consent allows `poise_list` with `kind: "call"` to page the retained
+Caller archive newest first, or `poise_get` with the full Call ID. Use
+`kind: "invocation"` for a retained chain invocation. The archive total
+counts retained rows, including evidence the reader may need to quarantine. Receipts include the
 known actor, action, outcome, head, settlement and available response link.
 Quarantined Call evidence is reported as partial. Caller prompts, diagnostics
 payloads, extension arguments and memory text stay in their owning surfaces.

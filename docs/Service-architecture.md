@@ -302,6 +302,11 @@ client sent.
     bounded indexed reads. Cursors bind the grant and selector. Transcript
     projection follows the stored context reset boundary and reports when a
     previous checkpoint has expired.
+    Separate signed grants cover Chat artifacts, workspace operations and
+    workspace content. A restricted repository grant cannot read workspace-wide
+    snapshots. Logging and Link reads stay in the gateway. Instance Logging
+    requires explicit administrator consent and a live administrator check
+    before the read and response.
     The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
     PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and

@@ -1,7 +1,10 @@
+import type { McpCallerListArguments, McpGrantScope } from '../gateway/src/mcp-contract'
 import { placeHref } from '../src/ui/address'
-import { fetchAgentLogById, type LogEntry } from './agent'
+import { fetchAgentLogById, fetchAgentLogPage, type LogEntry } from './agent'
 import { BehaviorChainJournal } from './behavior-chain-store'
 import { db } from './db'
+import { HttpError } from './http'
+import { mcpCursor } from './mcp-cursor'
 
 function callDetails(row: LogEntry) {
   const { id, repo: repository, actor, model, behavior, status, action, outcome, source, runner,
@@ -10,6 +13,26 @@ function callDetails(row: LogEntry) {
     invocationId: correlation_id, startedAt: started_at_precise ?? started_at, completedAt: completed_at ?? null,
     resourceSettlementAt: resources_settled_at ?? null, expectedHead: expected_head, head: head_sha, reviewId: review_id ?? null,
     responseAvailable: response !== null }
+}
+
+export async function listCallerRecords(grant: McpGrantScope, args: McpCallerListArguments) {
+  const cursor = mcpCursor(grant, ['call', args.limit])
+  const after = args.cursor ? cursor.decode(args.cursor) : null
+  if (after !== null && (typeof after !== 'string' || !after || after.length > 512)) {
+    throw new HttpError(400, 'invalid Caller continuation')
+  }
+  const source = 'Caller retained Call log'
+  const retention = 'Rows retained by Caller, newest first'
+  try {
+    const page = await fetchAgentLogPage(args.limit, after)
+    return { observedAt: new Date().toISOString(), source, retention,
+      items: page.entries.map(callDetails), total: page.total, quarantined: page.quarantined.length,
+      coverage: page.quarantined.length ? 'partial' : 'complete',
+      nextCursor: page.nextCursor ? cursor.encode(page.nextCursor) : null }
+  } catch {
+    return { observedAt: new Date().toISOString(), source, retention, items: [], total: null, quarantined: null,
+      coverage: 'unavailable', nextCursor: null, reason: 'The retained Call log could not be read' }
+  }
 }
 
 export async function readCallerRecord(kind: 'call' | 'invocation', id: string) {

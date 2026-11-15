@@ -113,8 +113,8 @@ export function mcpInventory() {
         tool: 'poise_get', requiresChatArtifacts: true, reason: 'Exact artifact ID under the owning Chat' }),
       ...MCP_WORKSPACE_VIEWS.map(id => ({ id: 'workspace/' + id, ...workspaceViewSurface(id) })),
       entry('workspace/caller', placeHref('observe', { part: 'tasks' }), { ...workspace('behaviors'), kind: 'call',
-        source: 'Caller retained Call log and Behavior chain journal', retention: 'Retained Call and invocation records',
-        reason: 'Exact full Call or invocation ID with settlement and quarantine coverage' }),
+        tool: 'poise_list', source: 'Caller retained Call log and Behavior chain journal', retention: 'Retained Call and invocation records',
+        reason: 'Paged Caller archive and exact Call or invocation reads with settlement and quarantine coverage' }),
       entry('settings/link-devices', placeHref('settings', { settings: 'link' }), {
         ...workspace('accounts'), kind: 'gateway', source: 'Gateway Poise Link device inventory',
         retention: 'Current and retained pairings', reason: 'Exact link-devices snapshot' }),

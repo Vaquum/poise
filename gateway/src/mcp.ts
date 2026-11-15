@@ -225,6 +225,9 @@ export class McpGateway {
       ? !grant.chatMetadata : isMcpContentKind(read.arguments.kind) ? !mcpContentAllowed(grant) : !mcpWorkspaceAllowed(grant))) {
       return result({ isError: true, content: [{ type: 'text', text: 'this data is outside the owner’s selected consent' }] })
     }
+    if (read.name === 'poise_list' && read.arguments.kind === 'call' && !mcpWorkspaceAllowed(grant)) {
+      return result({ isError: true, content: [{ type: 'text', text: 'workspace data consent is required' }] })
+    }
     if (read.name === 'poise_list' && read.arguments.kind === 'document' && !mcpContentAllowed(grant)) {
       return result({ isError: true, content: [{ type: 'text', text: 'workspace content consent is required' }] })
     }
@@ -362,6 +365,14 @@ export class McpGateway {
         || !Array.isArray(page.items) || page.items.length > read.arguments.limit
         || (page.nextCursor !== null && (typeof page.nextCursor !== 'string' || page.nextCursor.length > 2048))) {
         throw new HttpError(502, 'invalid_workspace_chat_page')
+      }
+      if (read.arguments.kind === 'call') {
+        if (!['complete', 'partial', 'unavailable'].includes(String(page.coverage))
+          || page.items.some(item => item?.kind !== 'call' || typeof item.id !== 'string' || !/^[a-f0-9]{32}$/.test(item.id))) {
+          throw new HttpError(502, 'invalid_workspace_caller_page')
+        }
+        return { ...described, page: { ...page, items: page.items.map(item => ({ ...item, link: ctx.workspaceOrigin(owner.handle) +
+          (item.responseAvailable === true ? '/api/agent-response/' + item.id : '/?view=observe&part=tasks') })) } }
       }
       if (read.arguments.kind === 'document') {
         if (!['complete', 'partial', 'unavailable'].includes(String(page.coverage))

@@ -8,7 +8,7 @@ import { HttpError, readJson, type RequestAuthority } from './http'
 import { mcpInventory } from './mcp-inventory'
 import { readMcpWork } from './mcp-work'
 import { readMcpChatChanges, readMcpChatList } from './mcp-chat-pages'
-import { readCallerRecord } from './mcp-caller'
+import { listCallerRecords, readCallerRecord } from './mcp-caller'
 import { listContentDocuments, readContentRecord } from './mcp-editor-content'
 import { readWorkspaceView } from './mcp-workspace-views'
 import { readChatArtifact } from './mcp-chat-artifacts'
@@ -94,6 +94,9 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
     if (read.arguments.kind === 'document') {
       if (!mcpContentAllowed(authority.mcp)) throw new HttpError(403, 'workspace content consent is required')
       page = await listContentDocuments(authority.mcp, read.arguments)
+    } else if (read.arguments.kind === 'call') {
+      if (!mcpWorkspaceAllowed(authority.mcp)) throw new HttpError(403, 'workspace data consent is required')
+      page = await listCallerRecords(authority.mcp, read.arguments)
     } else if (read.arguments.kind === 'chat') {
       if (read.name === 'poise_list' ? !authority.mcp.chatList || !authority.mcp.chatMetadata : !authority.mcp.chatTranscript) {
         throw new HttpError(403, 'the selected Chat data consent is required')

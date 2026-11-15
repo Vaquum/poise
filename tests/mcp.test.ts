@@ -485,6 +485,9 @@ it('keeps workspace settings consent separate and projects extension and memory 
     head_sha: 'a'.repeat(40), expected_head: null, source: 'poise:behavior-chain', correlation_id: randomUUID(),
     action: 'published', response: 'eeeeeeee', error: 'fixture-private-error', prompt: 'fixture-private-prompt' } satisfies agent.LogEntry
   const calls = vi.spyOn(agent, 'fetchAgentLogById').mockResolvedValue({ entries: [log], quarantined: [] })
+  const pages = vi.spyOn(agent, 'fetchAgentLogPage')
+    .mockResolvedValueOnce({ entries: [log], quarantined: [], nextCursor: 'caller-watermark', total: 2 })
+    .mockResolvedValueOnce({ entries: [], quarantined: [], nextCursor: null, total: 2 })
   async function view(id: string) {
     const result = await scope.client.callTool({ name: 'poise_get', arguments: { kind: 'workspace', id } })
     expect(result.isError).not.toBe(true)
@@ -513,6 +516,14 @@ it('keeps workspace settings consent separate and projects extension and memory 
         invocationId: log.correlation_id, action: 'published' } })
     expect(JSON.stringify(call)).not.toContain('fixture-private')
     expect(calls).toHaveBeenCalledExactlyOnceWith(callId)
+    const request = { name: 'poise_list', arguments: { kind: 'call', limit: 1 } }
+    expect((await repository.client.callTool(request)).isError).toBe(true)
+    const page = JSON.parse(((await scope.client.callTool(request)).content as { text: string }[])[0].text).page
+    expect(page).toMatchObject({ coverage: 'complete', total: 2, items: [{ id: callId, link: call.link }], nextCursor: expect.any(String) })
+    expect(JSON.stringify(page)).not.toContain('fixture-private')
+    const continuation = { ...request, arguments: { ...request.arguments, cursor: page.nextCursor } }
+    await scope.client.callTool(continuation)
+    expect(pages.mock.calls).toEqual([[1, null], [1, 'caller-watermark']])
     const inventory = await describe(scope.client)
     expect(inventory).toMatchObject({ inventory: { surfaces: expect.arrayContaining([
       expect.objectContaining({ id: 'settings', status: 'available' }),
@@ -525,6 +536,7 @@ it('keeps workspace settings consent separate and projects extension and memory 
       body: JSON.stringify({ name: 'poise_get', arguments: { kind: 'workspace', id: 'settings' } }) })
     expect(direct.status).toBe(401)
   } finally {
+    pages.mockRestore()
     calls.mockRestore()
     deleteExtension(extension.id)
     removeCard(card.id)
@@ -721,7 +733,7 @@ conn.close()
       $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
       mcpServers: { poise: { type: 'streamable-http', url: endpoint } },
     })
-    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.2.0' })
+    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.3.0' })
     expect(JSON.parse(await readFile(join(bundle, '.agents/plugins/marketplace.json'), 'utf8')).plugins[0].source).toEqual({ source: 'local', path: './plugins/poise' })
     expect(await readFile(join(bundle, 'plugins/poise/skills/poise-manager/SKILL.md'), 'utf8')).toBe(await readFile('plugins/poise/skills/poise-manager/SKILL.md', 'utf8'))
     await expect(packagePoisePlugin('https://poise.test', bundle)).rejects.toThrow('EEXIST')

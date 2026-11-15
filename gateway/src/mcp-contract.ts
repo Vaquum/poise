@@ -31,9 +31,9 @@ export const MCP_TOOLS = [
       chatId: { type: 'string', pattern: MCP_RECORD_ID.source, description: 'Required for a Chat attachment or diff' },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
-  { name: 'poise_list', description: 'List a bounded page of current or archived Chat session records by repository and UTC update window.',
+  { name: 'poise_list', description: 'List a bounded page of Chat sessions, documents, Caller records or Logging events. Requires consent for the selected data.',
     inputSchema: { type: 'object', required: ['kind'], properties: {
-      kind: { enum: ['chat', 'document', ...LOG_KINDS] }, repository: { type: 'string', maxLength: 140 },
+      kind: { enum: ['chat', 'document', 'call', ...LOG_KINDS] }, repository: { type: 'string', maxLength: 140 },
       since: { type: 'string', format: 'date-time' }, until: { type: 'string', format: 'date-time' }, ...pageProperties,
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
@@ -71,13 +71,14 @@ export type McpGetArguments = McpChatMetadataArguments | McpChatArtifactArgument
   | { kind: 'document'; id: string } | { kind: 'snippet'; id: string } | { kind: 'memory'; id: 'current' }
 export interface McpChatListArguments { kind: 'chat'; repository: string | null; since: string | null; until: string | null; limit: number; cursor?: string }
 export interface McpDocumentListArguments { kind: 'document'; limit: number; cursor?: string }
+export interface McpCallerListArguments { kind: 'call'; limit: number; cursor?: string }
 export interface McpChatChangesArguments { kind: 'chat'; id: string; limit: number; afterSequence?: number; cursor?: string }
 export interface McpLoggingArguments { kind: McpLoggingKind; repository: string | null; since: string | null; until: string | null;
   limit: number; cursor?: string; afterWatermark?: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
   | { name: 'poise_work'; arguments: McpWorkArguments }
   | { name: 'poise_get'; arguments: McpGetArguments }
-  | { name: 'poise_list'; arguments: McpChatListArguments | McpDocumentListArguments | McpLoggingArguments }
+  | { name: 'poise_list'; arguments: McpChatListArguments | McpDocumentListArguments | McpCallerListArguments | McpLoggingArguments }
   | { name: 'poise_changes'; arguments: McpChatChangesArguments | McpLoggingArguments }
 
 export const isMcpRecordId = (value: unknown): value is string => typeof value === 'string' && MCP_RECORD_ID.test(value)
@@ -168,9 +169,9 @@ export function parseMcpRead(value: unknown): McpRead {
       return { name: row.name, arguments: { kind: page.kind, repository, since, until, limit: Number(limit),
         ...(typeof cursor === 'string' ? { cursor } : {}), ...(typeof afterWatermark === 'string' ? { afterWatermark } : {}) } }
     }
-    if (row.name === 'poise_list' && page.kind === 'document') {
-      if (Object.keys(page).some(key => !['kind', 'limit', 'cursor'].includes(key))) throw new Error('invalid document page selector')
-      return { name: row.name, arguments: { kind: 'document', limit: Number(limit), ...(typeof cursor === 'string' ? { cursor } : {}) } }
+    if (row.name === 'poise_list' && (page.kind === 'document' || page.kind === 'call')) {
+      if (Object.keys(page).some(key => !['kind', 'limit', 'cursor'].includes(key))) throw new Error('invalid retained record page selector')
+      return { name: row.name, arguments: { kind: page.kind, limit: Number(limit), ...(typeof cursor === 'string' ? { cursor } : {}) } }
     }
     if (page.kind !== 'chat') throw new Error('invalid Chat page selector')
     const bounds = { kind: 'chat' as const, limit: Number(limit), ...(typeof cursor === 'string' ? { cursor } : {}) }
