@@ -260,9 +260,9 @@ export function message(instance: string, recipient: string, sender: string, bod
   return db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at, sender_title, sender_role)
     VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now(), from?.title ?? null, from?.role ?? null).changes > 0
 }
-export function inbox(instance: string, recipient: string, after = 0): InternalMessage[] {
-  return db.prepare(`SELECT ${INBOX_COLUMNS} FROM chat_control_inbox
-    WHERE instance = ? AND recipient = ? AND seq > ? ORDER BY seq LIMIT 100`).all(instance, recipient, after) as InternalMessage[]
+export function inbox(instance: string, recipient: string, after = 0, limit = 100): InternalMessage[] {
+  return cachedStatement(db, `SELECT ${INBOX_COLUMNS} FROM chat_control_inbox
+    WHERE instance = ? AND recipient = ? AND seq > ? ORDER BY seq LIMIT ?`).all(instance, recipient, after, limit) as InternalMessage[]
 }
 export function settleOrphanedMessages(instance: string): void {
   db.prepare(`UPDATE chat_control_inbox SET state = 'recipient_deleted'
@@ -316,9 +316,9 @@ export function internalTurn(turnId: string): boolean {
   return !!db.prepare('SELECT 1 FROM chat_control_inbox WHERE turn_id = ?').get(turnId)
 }
 export interface Watch { id: string, owner: string, targets: string, instruction: string, interval_ms: number, next_at: number, enabled: number }
-export function watches(instance: string, owner?: string): Watch[] {
-  return cachedStatement(db, 'SELECT id, owner, targets, instruction, interval_ms, next_at, enabled FROM chat_control_watches WHERE instance = ? AND (? IS NULL OR owner = ?)')
-    .all(instance, owner ?? null, owner ?? null) as Watch[]
+export function watches(instance: string, owner?: string, limit = -1): Watch[] {
+  return cachedStatement(db, 'SELECT id, owner, targets, instruction, interval_ms, next_at, enabled FROM chat_control_watches WHERE instance = ? AND (? IS NULL OR owner = ?) LIMIT ?')
+    .all(instance, owner ?? null, owner ?? null, limit) as Watch[]
 }
 export function addWatch(instance: string, owner: string, targets: string[], minutes: number, instruction: string): string {
   if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) throw new HttpError(400, 'intervalMinutes must be an integer from 1 to 1440')

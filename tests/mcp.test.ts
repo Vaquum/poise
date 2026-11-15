@@ -30,9 +30,10 @@ import type { readMcpWork } from '../server/mcp-work'
 import { PARTS, PLACES, SECTIONS } from '../src/ui/address'
 import { listCapabilities } from '../server/capabilities'
 import { MCP_WORKSPACE_VIEWS } from '../gateway/src/mcp-contract'
+import { createCard, removeCard } from '../server/current'
 import { createServer as createExtension, deleteServer as deleteExtension } from '../server/extensions/store'
 import { deleteDoc, writeDoc } from '../server/editor'
-import { addChild, createTimer } from '../server/chat/control-store'
+import { addChild, addWatch, createTimer, message } from '../server/chat/control-store'
 import { attachmentPath, sha256Of } from '../server/chat/attachments'
 import { emptyCapabilities } from '../server/chat/runtime'
 import { appendEvent, deleteSession, getSession, insertAttachment, insertSession, resetConversation } from '../server/chat/storage'
@@ -241,6 +242,8 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
   const matching = await connect('Alice', endpoint, { chatMetadata: true, repository: 'acme/repo' })
   const outside = await connect('Alice', endpoint, { chatMetadata: true, repository: 'acme/other' })
   const args = { kind: 'chat', id }
+  message('alice-chat', id, foreignRepository, 'Private inbox message')
+  const watch = addWatch('alice-chat', id, [child, foreignRepository], 10, 'Private watch instruction')
   const request = { name: 'poise_get', arguments: args }
   async function lookup(client: Client, kind: 'chat' | 'timer', id: string) {
     const result = await client.callTool({ name: 'poise_get', arguments: { kind, id } })
@@ -270,7 +273,12 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     expect(JSON.stringify(timerLookup)).not.toContain('Private timer instruction')
     expect(await lookup(bob.client, 'chat', id)).toMatchObject({ record: null, link: null })
     expect(await lookup(bob.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
-    expect(await lookup(matching.client, 'chat', id)).toMatchObject({ record: { id, workerIds: [child] } })
+    const matchingChat = await lookup(matching.client, 'chat', id)
+    expect(matchingChat).toMatchObject({ record: { id, workerIds: [child], inbox: [{ delivery: 'pending', turnId: null, senderId: null }],
+      supervision: [{ id: watch, targetChatIds: [child] }] } })
+    expect(JSON.stringify(matchingChat)).not.toContain(foreignRepository)
+    expect(JSON.stringify(chat)).not.toContain('Private inbox message')
+    expect(JSON.stringify(chat)).not.toContain('Private watch instruction')
     expect(await lookup(matching.client, 'timer', timer.id)).toMatchObject({ record: { repository: 'Acme/Repo' } })
     expect(await lookup(outside.client, 'chat', id)).toMatchObject({ record: null, link: null })
     expect(await lookup(outside.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
@@ -282,6 +290,8 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     await outside.client.close()
     db.prepare('DELETE FROM chat_control_timers WHERE id = ?').run(timer.id)
     db.prepare('DELETE FROM chat_control_children WHERE manager = ?').run(id)
+    db.prepare('DELETE FROM chat_control_inbox WHERE recipient = ?').run(id)
+    db.prepare('DELETE FROM chat_control_watches WHERE id = ?').run(watch)
     for (const worker of [child, foreignRepository]) deleteSession(worker)
     deleteSession(id)
   }
@@ -463,6 +473,7 @@ it('keeps workspace settings consent separate and projects extension and memory 
   const scope = await connect('Alice', endpoint, { workspaceData: true })
   const chat = await connect('Alice', endpoint, { chatMetadata: true })
   const repository = await connect('Alice', endpoint, { chatMetadata: true, workspaceData: true, repository: 'Acme/Repo' })
+  const card = createCard('Current fixture source', 'idea', 'Acme/Repo')
   const memory = 'fixture private memory text'
   setMeta('chat_memories', JSON.stringify({ text: memory, revision: 12 }))
   const extension = createExtension({ source: 'custom', name: 'fixture-extension', title: 'Fixture extension', transport: 'stdio',
@@ -491,6 +502,9 @@ it('keeps workspace settings consent separate and projects extension and memory 
       record: { value: { items: [{ name: 'fixture-extension', id: extension.id, enabledByDefault: false }] } } })
     expect(JSON.stringify(extensions)).not.toContain('fixture-private')
     expect(await view('settings')).toMatchObject({ coverage: 'complete', record: { value: { manager: { rhythm: expect.any(Number) } } } })
+    expect(await view('current')).toMatchObject({ coverage: 'complete', record: { value: { items: [{ id: card.id,
+      repository: 'Acme/Repo', text: 'Current fixture source' }] } } })
+    expect(await view('switchboard')).toMatchObject({ record: { value: { switchboard: null, manager: { rhythm: expect.any(Number) } } } })
     const requestedCall = { name: 'poise_get', arguments: { kind: 'call', id: callId } }
     expect((await repository.client.callTool(requestedCall)).isError).toBe(true)
     const call = JSON.parse(((await scope.client.callTool(requestedCall)).content as { text: string }[])[0].text).lookup
@@ -513,6 +527,7 @@ it('keeps workspace settings consent separate and projects extension and memory 
   } finally {
     calls.mockRestore()
     deleteExtension(extension.id)
+    removeCard(card.id)
     db.prepare('DELETE FROM meta WHERE key = ?').run('chat_memories')
     await Promise.all([scope.client.close(), chat.client.close(), repository.client.close()])
   }

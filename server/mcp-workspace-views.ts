@@ -1,4 +1,4 @@
-import type { McpWorkspaceView } from '../gateway/src/mcp-contract'
+import { isMcpRepository, type McpWorkspaceView } from '../gateway/src/mcp-contract'
 import { placeHref, type Section } from '../src/ui/address'
 import { accountLogins } from './accounts/logins'
 import { HANDLING_RETENTION_MS, listHandling } from './alerts/handling'
@@ -8,6 +8,9 @@ import { BEHAVIOR_KEYS, getBehaviorChainRuntimeHealth, getBehaviorsRuntimeHealth
   getIssueRepositories, getPausedBy, getPausedUntil, getRepositorySkips, getSettingMap, isSkippableBehavior } from './behaviors'
 import { readWake } from './chat/manager-settings'
 import { readMemories } from './chat/memories'
+import { lastCommitted, openDecisions, outstandingCheck, readBoard } from './chat/switchboard-store'
+import { listCards } from './current'
+import { listOrganizationsRepos } from './gh'
 import { listServers } from './extensions/store'
 import { readGithubQuota } from './github-quota'
 import { dependencySnapshot, livenessSnapshot } from './health'
@@ -18,6 +21,7 @@ import { runningRelease } from './running-release'
 import { getBehaviorChainSettings, getModelSettings, getSettings } from './settings'
 import { readSwitches } from './snippet-library'
 import { storageStatus } from './storage-maintenance'
+import { getWorkerCapacity } from './worker-capacity'
 
 const settingsLink = (settings: Section) => '/' + placeHref('settings', { settings })
 const observeLink = (part: 'behaviors' | 'logging') => '/' + placeHref('observe', { part })
@@ -37,6 +41,9 @@ const sources = {
   extensions: ['Saved Poise extension registrations', 'Current registrations and latest status', settingsLink('extensions')],
   memories: ['Saved Chat memories', 'Current revision', '/' + placeHref('chat')],
   snippets: ['Saved snippet switches', 'Current revisions', settingsLink('snippets')],
+  current: ['Current cards', 'Current board cards', '/' + placeHref('board')],
+  repositories: ['Configured owner repository discovery', 'Latest GitHub account discovery', '/' + placeHref('board', { part: 'github' })],
+  switchboard: ['Switchboard and Manager runtime', 'Current checks, decisions and Rhythm slots', overview],
 } satisfies Record<McpWorkspaceView, [source: string, retention: string, href: string]>
 
 export function workspaceViewSurface(id: McpWorkspaceView) {
@@ -50,8 +57,34 @@ const bounded = <T>(items: readonly T[], limit = ITEM_LIMIT) => ({ items: items.
 const safeTitle = (value: string) => value.slice(0, 300)
 type Snapshot = { value: unknown; coverage?: 'partial' | 'stale' | 'unavailable' }
 
-async function view(id: McpWorkspaceView): Promise<Snapshot> {
+async function view(id: McpWorkspaceView, chatInstance?: string): Promise<Snapshot> {
   switch (id) {
+    case 'current': {
+      const cards = listCards(ITEM_LIMIT + 1)
+      const items = bounded(cards.map(({ id, text, lane, position, repo, created_at, updated_at }) => ({
+        id, text: text.slice(0, 1000), truncated: text.length > 1000, lane, position,
+        repository: repo && isMcpRepository(repo) ? repo : null, createdAt: created_at, updatedAt: updated_at,
+      })))
+      return { value: items, coverage: items.more || items.items.some(item => item.truncated) ? 'partial' : undefined }
+    }
+    case 'repositories': {
+      const result = await listOrganizationsRepos()
+      const repositories = bounded(result.repos.filter(isMcpRepository), 50)
+      return { value: { repositories, unavailableOrganizations: result.errors.map(row => row.org) },
+        coverage: repositories.more || result.errors.length ? 'partial' : undefined }
+    }
+    case 'switchboard': {
+      if (!chatInstance) return { value: null, coverage: 'unavailable' }
+      const board = readBoard(chatInstance)
+      const pending = outstandingCheck(chatInstance)
+      const lastCheck = lastCommitted(chatInstance)
+      const { rhythm, paused } = getSettings().manager
+      const capacity = getWorkerCapacity()
+      return { value: { switchboard: board ? { chatId: board.session, paused: board.paused === 1, revision: board.revision,
+        nextCheckAt: board.next_check_at || null, failures: board.failures, pendingCheck: pending?.id ?? null,
+        lastCheck: lastCheck ?? null, openDecisions: openDecisions(chatInstance) } : null,
+        manager: { rhythm, paused, capacity: { running: capacity.running, target: capacity.target, backlog: capacity.backlog, label: capacity.label } } } }
+    }
     case 'settings': {
       const { org, me, agentAccount, timezone, chat, notifications, manager, behaviorChain } = getSettings()
       return { value: { org, me, agentAccount, timezone, chat, notifications, manager: { ...manager,
@@ -147,10 +180,10 @@ async function view(id: McpWorkspaceView): Promise<Snapshot> {
   }
 }
 
-export async function readWorkspaceView(id: McpWorkspaceView) {
+export async function readWorkspaceView(id: McpWorkspaceView, chatInstance?: string) {
   const { source, retention, href } = workspaceViewSurface(id)
   try {
-    const snapshot = await view(id)
+    const snapshot = await view(id, chatInstance)
     return { observedAt: new Date().toISOString(), source, retention, href, coverage: snapshot.coverage ?? 'complete',
       record: { kind: 'workspace', id, value: snapshot.value } }
   } catch {

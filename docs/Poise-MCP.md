@@ -99,8 +99,10 @@ older checkpoint and returns the retained boundary. `watermark` is the last
 sequence consumed. Pass `nextCursor` to continue or check for new events.
 
 For exact Chat metadata, `poise_get` includes current worker and creator
-identities, work bindings and pending owner requests where the grant permits
-them. Each collection returns up to ten records and reports truncation. Plan
+identities, work bindings, inbox delivery with the admitted turn ID,
+supervision, Switchboard item states and pending owner requests. Each collection
+returns up to ten records and reports truncation. Cross-repository relationships
+are visible only with the applicable repository access. Plan
 updates appear in the retained Chat event stream.
 
 With separate artifact consent, call `poise_get` with `kind: "chat-attachment"`
@@ -117,7 +119,9 @@ With workspace-wide operational data consent, use `poise_get` with
 available snapshots cover effective settings and model slots, followed accounts
 and recorded sign-in, behavior policy and capacity, release and dependency
 health, storage and GitHub quota, the analytics health cohort, notices and
-handling history, and extension, memory and snippet metadata.
+handling history, Current cards, repositories visible to the configured
+account, Switchboard check state and Manager Rhythm, and extension, memory
+and snippet metadata.
 
 The same consent allows `kind: "call"` with the full Caller Call ID and
 `kind: "invocation"` with a retained chain invocation ID. Receipts include the

@@ -11,7 +11,7 @@ export type McpGatewayView = typeof GATEWAY_VIEWS[number]
 const CONTENT_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,119}$/
 const pageProperties = { limit: { type: 'integer', minimum: 1, maximum: 10 }, cursor: { type: 'string', maxLength: 2048 } } as const
 export const MCP_WORKSPACE_VIEWS = ['settings', 'accounts', 'models', 'behaviors', 'release', 'health', 'storage',
-  'github-quota', 'analytics-health', 'notices', 'handling', 'extensions', 'memories', 'snippets'] as const
+  'github-quota', 'analytics-health', 'notices', 'handling', 'extensions', 'memories', 'snippets', 'current', 'repositories', 'switchboard'] as const
 export type McpWorkspaceView = typeof MCP_WORKSPACE_VIEWS[number]
 export const MCP_TOOLS = [
   { name: 'poise_describe', description: 'Describe the authorized Poise workspace identity and available tools.',

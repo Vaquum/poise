@@ -77,8 +77,13 @@ const setPositionTouched = db.prepare(
   `UPDATE current_cards SET position = ?, updated_at = ? WHERE id = ?`
 )
 
-export function listCards(): CurrentCard[] {
-  return selectAll.all() as CurrentCard[]
+const selectBounded = db.prepare(`
+  SELECT id, text, lane, position, repo, created_at, updated_at
+  FROM current_cards ORDER BY lane, position, id LIMIT ?
+`)
+
+export function listCards(limit?: number): CurrentCard[] {
+  return (limit === undefined ? selectAll.all() : selectBounded.all(limit)) as CurrentCard[]
 }
 
 export function getCard(id: number): CurrentCard | null {
