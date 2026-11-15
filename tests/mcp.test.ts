@@ -718,6 +718,12 @@ conn.close()
   waitedMerge = append(waitedMerge, { type: 'chain.observed', observation: waitedObservation })
   append(waitedMerge, { type: 'chain.merged', mergeSha: 'b'.repeat(40), evidence: { repository: 'Acme/Repo', pull_number: 21,
     merged: true, merge_sha: 'b'.repeat(40), review_complete: true } })
+  let heldWithActive = admit(12)
+  heldWithActive = append(heldWithActive, { type: 'invocation.admitted', invocation: { id: 'original-active', behavior: 'implement-issue',
+    basis: 'issue', actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 1000,
+    request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
+  heldWithActive = append(heldWithActive, { type: 'invocation.started', invocationId: 'original-active' })
+  append(heldWithActive, { type: 'chain.held', reason: 'Pause new admission while the original worker finishes' })
   await ledger.startBehaviorLedger({ path: join(root, 'ledger.sqlite') })
   ledger.behaviorLedgerHeartbeat()
   const packagePoisePlugin = (apex: string, destination: string) => promisify(execFile)(process.execPath,
@@ -757,6 +763,9 @@ conn.close()
     expect(first.items[0].ledger.every(source => source.records.length === 0)).toBe(true)
     expect(first.items[0].ageMs).toBeGreaterThan(0)
     expect(first.items[1].blocker).toContain('capacity')
+    expect(first.items[1].next).toMatchObject({ actor: 'poise', action: 'recheck-admission' })
+    expect(first.items[0].intake).toMatchObject({ eligible: true, selectedLabel: 'poise', labelAppliedAt: null,
+      labelHistoryCoverage: { status: 'unavailable' } })
     expect(run.mock.calls.map(call => call[1])).toEqual([
       ['--db', path, 'health', '--max-age-seconds', '120'],
       ['--db', path, 'view', 'issue', '--repo', 'acme/repo', '--label=poise', '--after-repo', '', '--after-number', '0', '--limit', '3', '--format', 'json'],
@@ -782,6 +791,7 @@ conn.close()
       [3, 'complete', 'complete', 'b'.repeat(40)], [4, 'merged_review_pending', 'pending', 'b'.repeat(40)],
     ])
     expect(second.items[1].github?.mergeSha).toBe('b'.repeat(40))
+    expect(second.items[1].github).toMatchObject({ approved: null, changesRequested: null, unresolvedThreads: null })
     expect(second.items[1].links).toMatchObject({ issue: 'https://github.com/Acme/Repo/issues/4', pr: 'https://github.com/Acme/Repo/pull/14',
       ci: `https://github.com/Acme/Repo/pull/14/checks?sha=${'a'.repeat(40)}`, merge: `https://github.com/Acme/Repo/commit/${'b'.repeat(40)}` })
     expect(run.mock.calls).toHaveLength(2)
@@ -822,12 +832,24 @@ conn.close()
     const waited = await work({ repository: 'acme/repo', issue: 11 })
     expect(waited.items[0]).toMatchObject({ stage: 'complete', reviewStatus: 'complete' })
     expect(waited.items[0].blocker).toBeNull()
+    expect((await work({ repository: 'acme/repo', issue: 12 })).items[0]).toMatchObject({ stage: 'held',
+      next: { actor: 'author', action: 'await-original-receipt' } })
     run.mockClear()
     const dash = await work({ repository: 'acme/repo', label: '-blocked', limit: 2 })
     expect(dash.coverage.issues.status).toBe('fresh')
     expect(dash.items).toEqual([])
     expect(dash.nextCursor).toBeNull()
     expect(run.mock.calls[1][1]).toEqual(expect.arrayContaining(['--label=-blocked']))
+    const window = { repository: 'acme/repo', label: 'poise', limit: 2, since: '2026-11-01T00:00:00Z', until: '2026-11-02T00:00:00Z' }
+    const inWindow = await work(window)
+    expect(inWindow.window).toEqual({ basis: 'issue_created_at', since: window.since, until: window.until })
+    expect(inWindow.items.map(item => item.issue)).toEqual([1, 2])
+    expect((await work({ ...window, cursor: inWindow.nextCursor })).items.map(item => item.issue)).toEqual([3, 4])
+    expect((await work({ ...window, since: '2026-10-31T00:00:00Z', until: window.since })).items).toEqual([])
+    await expect(connection.client.callTool({ name: 'poise_work',
+      arguments: { ...window, since: '2026-10-31T00:00:00Z', cursor: inWindow.nextCursor! } })).rejects.toThrow()
+    expect((await connection.client.callTool({ name: 'poise_work',
+      arguments: { ...window, until: window.since } })).isError).toBe(true)
     receipts.mockClear()
     receipts.mockImplementation(async () => ({
       status: 503, body: { version: 1 as const, error: 'ledger_read_timeout',
