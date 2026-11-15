@@ -55,6 +55,16 @@ def provider_blocked(message: str) -> bool:
     return any(block in message for block in PROVIDER_BLOCKS)
 
 
+def credential_rejected(message: str) -> bool:
+    if re.search(r"github|\bgh:", message, re.I):
+        return False
+    return bool(re.search(
+        r"not\s+(?:signed|logged)\s+in|missing\s+credentials|invalid_grant|refresh_token_(?:reused|expired|revoked)"
+        r"|\b401\s+unauthorized\b|authentication[_ ](?:failed|error)"
+        r"|(?:refresh\s+token|credentials?)[^.\n]{0,160}(?:already\s+used|reused|revoked|expired|invalid|rejected)"
+        r"|(?:invalid|expired|revoked)\s+(?:refresh\s+)?(?:token|credentials?)", message, re.I))
+
+
 # Bounded, redacted provider cause. Never persist raw event streams or tool
 # output: prefer the provider's own error line, redact credential shapes, and
 # truncate. Mirrors the github-interface redactor's patterns without its env.

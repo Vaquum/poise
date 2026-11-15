@@ -2,6 +2,7 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 import { normalize, type LogEvent } from '../../gateway/src/diagnostics/contract'
 import { gatewayDiagnostic } from '../../gateway/src/diagnostics/collectors'
 import { callerDiagnostic, workspaceEnvelope } from '../../gateway/src/diagnostics/sources'
+import type { ChainNudge } from '../../src/behavior-chain-nudge'
 
 // Observe in the new interface (#556): Tasks with the chain's evidence,
 // Behaviors, GitHub and Logging, on main's endpoints. The isolated server has
@@ -29,10 +30,10 @@ const CHAINS = [
   chain(495, {}, [{ id: 'i495a', behavior: 'repair-pr', state: 'uncertain', outcome: 'a reply may have posted' }]),
   chain(501, { held: 'queue removal requires a decision: manual (q86)' }, [{ id: 'i501a', behavior: 'merge-pr', state: 'settled', outcome: 'enqueued' }]),
 ]
-const attention = (c: ReturnType<typeof chain>, progressAgo: number, blocker: string) => ({
+const attention = (c: ReturnType<typeof chain>, progressAgo: number, blocker: string, nudge?: ChainNudge) => ({
   id: c.id, repository: c.repository, issue: c.issue, pullNumber: c.pullNumber, step: 'step', progressAt: NOW - progressAgo, ageMs: progressAgo, blocker,
   evidence: { state: 'fresh', checkedAt: NOW - minutes(2), gates: ['Head 2aa6f19', 'Required CI passed'] }, nextAction: 'Resolve the durable hold, then explicitly resume the chain',
-  retryAt: null, reconciliation: { nextObservationAt: null, waitingForResourceRelease: false }, journal: `/api/behavior-chains?id=${encodeURIComponent(c.id)}&after=${c.sequence - 1}`,
+  retryAt: null, reconciliation: { nextObservationAt: null, waitingForResourceRelease: false }, journal: `/api/behavior-chains?id=${encodeURIComponent(c.id)}&after=${c.sequence - 1}`, nudge,
 })
 // Served out of order: the page orders Needs attention by the oldest verified progress itself.
 const ATTENTION = [attention(CHAINS[3], minutes(36), 'queue removal requires a decision'), attention(CHAINS[1], minutes(26 * 60), 'No verified progress for at least 24 hours'), attention(CHAINS[2], minutes(15), 'a reply may have posted')]
@@ -175,7 +176,7 @@ test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest 
   await expect(rows.nth(0)).toContainText('acme/site#493')
   await expect(rows.nth(0)).toContainText('no verified advance for 1d 2h')
   await expect(rows.nth(1)).toContainText('acme/site#501 → #502')
-  await expect(rows.nth(1)).toContainText('Needs you')
+  await expect(rows.nth(1)).toContainText('Blocked')
   await expect(rows.nth(2)).toContainText('acme/site#495')
   await expect(rows.nth(2)).toContainText('Blocked')
   await expect(rows.nth(2)).toContainText('Not confirmed: a reply may have posted')
@@ -185,6 +186,34 @@ test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest 
   await expect(head.locator('[data-ref="tk.evidence"]')).toContainText('Required CI passed')
   await expect(head.locator('[data-ref="side.hold"]')).toContainText('Queue removal requires a decision')
   expect(query(page).chain).toBe('acme/site#501')
+})
+
+test('Needs attention links to existing work and groups dependent tasks under the root blocker', async ({ page }) => {
+  const root = CHAINS[3], dependent = CHAINS[1]
+  const served: Served = { posts: [], attention: [
+    attention(root, minutes(26 * 60), 'Required validation is unresolved'),
+    attention(dependent, minutes(60), 'Waiting on the prerequisite', {
+      kind: 'prerequisite', action: 'Poise is waiting for verified delivery of the prerequisite.', prerequisite: root.id, work: null,
+    }),
+  ] }
+  await open(page, '/?view=observe&part=tasks&which=attention', served)
+  const panel = tasks(page)
+  await expect(panel.locator('.tk-row')).toHaveCount(1)
+  await panel.locator('.tk-row').click()
+  await expect(panel.getByRole('link', { name: dependent.id })).toBeVisible()
+
+  served.attention![0].nudge = { kind: 'unknown', action: 'No automatic next step verified. Inspect the recorded blocker.', prerequisite: null, work: null }
+  await panel.getByRole('button', { name: 'Active', exact: true }).click()
+  await panel.getByRole('button', { name: 'Needs attention 2' }).click()
+  await expect(panel.getByText('Ownership unverified')).toBeVisible()
+  await expect(panel.getByRole('link', { name: dependent.id })).toBeVisible()
+
+  served.attention![0].nudge!.work = { kind: 'chat', session: 'existing-owner', manager: false }
+  await panel.getByRole('button', { name: 'Active', exact: true }).click()
+  await panel.getByRole('button', { name: 'Needs attention 2' }).click()
+  await expect(panel.getByRole('link', { name: 'Open the bound Chat' })).toHaveAttribute('href', '?view=chat&chat=existing-owner&back=observe')
+  await expect(panel.getByText('Ownership unverified')).toHaveCount(0)
+  expect(served.posts).toEqual([])
 })
 
 test('retained capacity stays workspace-wide beyond page one and attention opens its original evidence', async ({ page }) => {

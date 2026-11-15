@@ -842,7 +842,7 @@ class TestGrokAnalysisCeiling(TestCase):
         self.assertEqual(run.error.diagnostic["submission"], "none")
         run.submit.assert_not_called()
 
-    def test_analysis_ceiling_expiring_during_inspection_is_a_handoff(self):
+    def test_analysis_ceiling_expiring_during_inspection_keeps_local_inspection(self):
         from agent_interface.process_diagnostic import command_failure
         clock = SimpleNamespace(now=1000.0)
         model = CATALOG.resolve("grok-4.6-xhigh")
@@ -883,11 +883,11 @@ class TestGrokAnalysisCeiling(TestCase):
                                       1413, repository=repository)
             except review_budget.ReviewLimitError as failure:
                 error = failure
-        self.assertEqual(str(error), GROK_HANDOFF)
+        self.assertEqual(str(error), "Local review repository inspection timed out; incomplete analysis; needs attention")
         self.assertEqual(error.code, "review_budget_exhausted")
-        self.assertEqual(error.diagnostic["operation"], "provider.review")
-        self.assertEqual(error.diagnostic["phase"], "analysis")
-        self.assertEqual(error.diagnostic["outcome"], "handoff")
+        self.assertEqual(error.diagnostic["operation"], "github-interface")
+        self.assertEqual(error.diagnostic["phase"], "provider_analysis")
+        self.assertEqual(error.diagnostic["outcome"], "timed_out")
         self.assertEqual(error.diagnostic["submission"], "none")
         submit.assert_not_called()
 
@@ -1758,6 +1758,54 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
         self.assertEqual(failure.exception.diagnostic["signal"], 9)
         self.assertIsNone(failure.exception.diagnostic["exit_code"])
         submit.assert_not_called()
+
+    def test_codex_credential_rejection_is_typed_as_authentication_failed(self):
+        reuse = ("Your refresh token could not be refreshed because it was already used. "
+                 "Authorization: Bearer fake-secret-123")
+        negatives = (
+            ("refresh token request failed: connection reset by peer", "connection reset by peer"),
+            ("HTTP 429 Too Many Requests", "HTTP 429 Too Many Requests"),
+            ("GitHub 401 Unauthorized", "GitHub 401 Unauthorized"),
+        )
+        cases = (
+            (101, reuse, "authentication_failed", "already used"),
+            (0, reuse, "authentication_failed", "already used"),
+            *[(101, message, "review_provider_exit", expected) for message, expected in negatives],
+            *[(0, message, "review_provider_error", expected) for message, expected in negatives],
+        )
+        for returncode, message, expected_code, expected_text in cases:
+            with self.subTest(returncode=returncode, message=message):
+                # The reuse text arrives solely in error.message, as the
+                # provider emits it; the turn path must not drop it.
+                stdout = json.dumps({"type": "turn.failed", "error": {"message": message}}) + "\n"
+                with patch.object(structured_review.subprocess, "run") as submit, \
+                        patch.object(ReviewWatch, "run", return_value=SimpleNamespace(
+                            returncode=returncode, stdout=stdout, stderr="")):
+                    with self.assertRaises(atoms.AgentPreflightError) as failure:
+                        structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                              "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60,
+                                              packet=COMPLETE_PACKET)
+                self.assertEqual(failure.exception.code, expected_code)
+                self.assertTrue(str(failure.exception).startswith("codex review failed: "))
+                self.assertIn(expected_text, str(failure.exception))
+                diagnostic = failure.exception.diagnostic
+                self.assertEqual(diagnostic["operation"], "provider.review")
+                self.assertEqual(diagnostic["provider"], "codex")
+                self.assertEqual(diagnostic["submission"], "none")
+                self.assertEqual(diagnostic["artifact"], "none")
+                self.assertEqual(diagnostic["exit_code"], 101 if returncode else None)
+                self.assertIn(expected_text, diagnostic["stderr"])
+                if expected_code == "authentication_failed":
+                    for field in (str(failure.exception), diagnostic["stderr"]):
+                        self.assertNotIn("fake-secret-123", field)
+                submit.assert_not_called()
+        # Other providers keep their existing codes for the same text.
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            structured_review.provider_failure(reuse, provider="grok")
+        self.assertEqual(failure.exception.code, "review_provider_exit")
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            structured_review.provider_error("grok", reuse)
+        self.assertEqual(failure.exception.code, "review_provider_error")
 
     def test_muse_server_error_is_typed_whether_exit_or_terminal(self):
         from agent_interface import review_receipt as receipt_mod

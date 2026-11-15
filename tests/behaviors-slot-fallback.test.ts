@@ -236,10 +236,13 @@ describe('reviewer trip classification', () => {
   it.each([
     { name: 'provider group deadline', diagnostic: FILE_GROUP_DIAGNOSTIC, expected: null },
     { name: 'inspection limited by group deadline', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, operation: 'github-interface' }, expected: null },
+    { name: 'inspection limited by overall deadline', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, operation: 'github-interface', phase: 'overall' }, expected: null },
+    { name: 'inspection limited by provider-analysis ceiling', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, operation: 'github-interface', phase: 'provider_analysis' }, expected: null },
     { name: 'older generic receipt', diagnostic: undefined, expected: 'budget' },
     { name: 'provider analysis deadline', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, phase: 'provider_analysis' }, expected: 'budget' },
     { name: 'overall deadline', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, phase: 'overall' }, expected: 'budget' },
     { name: 'missing no-submission proof', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, submission: undefined }, expected: 'budget' },
+    { name: 'local overall without no-submission proof', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, operation: 'github-interface', phase: 'overall', submission: undefined }, expected: 'budget' },
     { name: 'uncertain submission', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, submission: 'uncertain' }, expected: 'budget' },
     { name: 'non-timeout failure', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, outcome: 'exit' }, expected: 'budget' },
     { name: 'unrelated operation', diagnostic: { ...FILE_GROUP_DIAGNOSTIC, operation: 'other.operation' }, expected: 'budget' },
@@ -809,6 +812,92 @@ it.each(['initial review', 'approval'] as const)(
     runtime.startBehaviorsRuntime()
     await tick()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
+    const held = db.getFailedBehaviorLaunch(behavior, uncertainTarget)
+    expect(held?.launchCallId).toBe(uncertain.id)
+    expect(held?.launchError).toContain('could not prove a safe recovery')
+  },
+)
+
+it.each(['initial review', 'approval'] as const)(
+  'keeps local inspection ceilings scoped to the %s target while preserving provider and submission holds', async lane => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-13T12:00:00Z'))
+    const initial = lane === 'initial review'
+    const behavior = initial ? 'review-new-prs' : 'approve-prs'
+    const launchBehavior = initial ? 'pr_review' : 'pr_approve'
+    const model = 'opus-5-xhigh'
+    const slots = { primary: model, secondary: model, tertiary: model }
+    let { db, runtime } = initial ? await startPrReviews(slots) : await startApprovals(slots)
+    const tick = async () => { await resetLogCache(); await runtime.runEnabledBehaviorsOnce() }
+    const expireBackoff = () => vi.setSystemTime(Date.now() + 3_600_001)
+    const other = (number: number) => ({ ...pr, number, url: `https://github.com/${pr.repo}/pull/${number}` })
+    // Real typed Caller rows: local inspection hit the overall budget, then
+    // the provider-analysis ceiling. Same operation/outcome, limiting phase kept.
+    const LOCAL_OVERALL = { ...FILE_GROUP_DIAGNOSTIC, operation: 'github-interface', phase: 'overall' } as const
+    const LOCAL_CEILING = { ...FILE_GROUP_DIAGNOSTIC, operation: 'github-interface', phase: 'provider_analysis' } as const
+    let receiptId = 400
+    const receipt = (number = pr.number, overrides: Record<string, unknown> = {}) => {
+      const claim = db.listBehaviorLaunchClaims(behavior).find(row => row.launchPr === number)!
+      return agentLog({ id: (++receiptId).toString(16).padStart(32, '0'), behavior: launchBehavior,
+        repo: pr.repo, pr_id: String(number), model, status: 'failed',
+        started_at: claim.launchRequestedAt, started_at_precise: claim.launchRequestedAt,
+        completed_at: new Date().toISOString(), expected_head: claim.launchExpectedHead,
+        actor: claim.launchActor, source: claim.launchSource, correlation_id: claim.launchCorrelationId,
+        action: 'not_started', outcome: 'preflight_failed', review_policy: 'bounded-v1',
+        error_code: 'review_budget_exhausted', error: 'Review reached its total time limit; needs attention',
+        diagnostic: LOCAL_OVERALL, ...overrides })
+    }
+    const reviewerFailure = () => runtime.getBehaviorsRuntimeHealth().failures.find(row => row.target === `reviewer:${model}`)
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+    const target = db.listBehaviorLaunchClaims(behavior)[0].target
+    const first = receipt()
+    fixture.agentLogs.push(first)
+    await tick()
+    expect(db.getFailedBehaviorLaunch(behavior, target)?.launchCallId).toBe(first.id)
+    expect(reviewerFailure()).toBeUndefined()
+
+    // No backoff expiry: the same reviewer remains eligible on another PR.
+    fixture.listedPrs = [pr, other(18)]
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(mocks.spawnDetached.mock.calls[1][1]).toEqual(expect.arrayContaining(['#18', '--model', model]))
+    fixture.agentLogs.push(receipt(18, { status: 'completed', action: initial ? 'reviewed_clean' : 'approved',
+      outcome: initial ? 'clean' : 'approved', head_sha: first.expected_head, error: '', error_code: undefined, diagnostic: undefined }))
+    await tick()
+    fixture.listedPrs = [pr]
+    expireBackoff()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    const second = receipt(pr.number, { diagnostic: LOCAL_CEILING,
+      error: 'Local review repository inspection timed out; incomplete analysis; needs attention' })
+    fixture.agentLogs.push(second)
+    await tick()
+    expect(db.getFailedBehaviorLaunch(behavior, target)?.launchError).toContain('Automatic retries stopped after two review timeouts')
+    expect(db.getFailedBehaviorLaunch(behavior, target)?.launchCallId).toBe(second.id)
+    expect(reviewerFailure()).toBeUndefined()
+
+    // A provider-side overall timeout on another PR still trips the shared reviewer.
+    fixture.listedPrs = [pr, other(19)]
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(4)
+    const provider = receipt(19, { diagnostic: { ...FILE_GROUP_DIAGNOSTIC, phase: 'overall' },
+      error: 'Review reached its total time limit; needs attention' })
+    fixture.agentLogs.push(provider)
+    await tick()
+    expect(reviewerFailure()?.callId).toBe(provider.id)
+
+    // A new revision can run, but uncertain submission still fences its retry.
+    fixture.listedPrs = [pr]
+    arrangeCli(!initial, false, { headSha: NEXT_HEAD_SHA, reviewerReviewIdsSince: [], latestActivityAt: new Date().toISOString() },
+      { commits_after_request: 0, author_commits_after_request: 0, author_pr_comments_after_request: initial ? 0 : 1 })
+    expireBackoff()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(5)
+    const uncertainTarget = db.listBehaviorLaunchClaims(behavior).find(row => row.launchPr === pr.number)!.target
+    const uncertain = receipt(pr.number, { error: 'Review reached its total time limit; could not prove a safe recovery: a pending GitHub review requires reconciliation' })
+    fixture.agentLogs.push(uncertain)
+    await tick()
     const held = db.getFailedBehaviorLaunch(behavior, uncertainTarget)
     expect(held?.launchCallId).toBe(uncertain.id)
     expect(held?.launchError).toContain('could not prove a safe recovery')

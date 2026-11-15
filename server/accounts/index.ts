@@ -2,10 +2,12 @@
 // so opening Settings twice does not run six CLIs twice; a terminal exiting
 // drops them, since a login may have just changed one.
 
-import { homedir } from 'node:os'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runFile } from '../process'
-import { loadCatalog } from '../models'
-import { environmentSecrets, redact } from '../../gateway/src/diagnostics/redaction.mjs'
+import { agentInterfaceCwd, loadCatalog } from '../models'
+import { codexVerificationDetail, providerSignInVerificationFailed, type CodexVerificationReason } from '../alerts/producers'
 import { probeAccount } from './status'
 import { accountLogins, claimProviderVerification, recordObservedSignIn, recordProviderRecovery, releaseProviderVerification } from './logins'
 import { ACCOUNT_IDS, hasRecordedSignIn, type AccountId, type ConnectedAccount } from './types'
@@ -76,38 +78,55 @@ export async function listAccounts(id?: AccountId): Promise<ConnectedAccount[]> 
   })
 }
 
+function classifyCodexVerificationFailure(error: unknown): CodexVerificationReason {
+  const output = error as { stdout?: string, stderr?: string, message?: string }
+  const haystack = [output.stderr, output.stdout,
+    typeof output.message === 'string' ? output.message : (error instanceof Error ? error.message : String(error)),
+  ].filter((part): part is string => typeof part === 'string').join('\n')
+  if (haystack.includes('unavailable to the next Caller worker')) return 'credentials_unavailable'
+  if (/401|unauthorized|missing Authorization|not signed in|not logged in|invalid_grant|refresh_token|authentication[_ ](?:failed|error)|already used|rejected.*(login|credential|auth)|(login|credential).*rejected/i.test(haystack)) {
+    return 'authentication_failed'
+  }
+  return 'verification_incomplete'
+}
+
 async function verifyCodexRecovery(): Promise<void> {
   const failure = claimProviderVerification('codex')
   if (!failure) return
   // The claim reserves this reconnect; a failed or timed-out verification
   // must release it so a later Connect can be recorded and verified anew.
   const login = failure.reconnectedAt?.toString() ?? null
+  let work: string | undefined
   try {
     const model = (await loadCatalog()).models.find(model => model.identity === failure.model && model.provider === 'codex')
     if (!model) throw new Error('The rejected Codex model is absent from the catalog')
-    // Match issue review's ChatGPT route, ignoring configuration and API-key
-    // overrides. A login status response is not a successful provider request.
-    const { stdout } = await runFile(process.env.CODEX_CLI || 'codex', ['exec', '--ignore-user-config', '--ignore-rules',
-      '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--model', model.selector,
-      '-c', 'approval_policy="never"', '-c', 'forced_login_method="chatgpt"', '-c', 'web_search="disabled"',
-      '--disable', 'shell_tool', '--disable', 'unified_exec', '--disable', 'multi_agent',
-      '--json', 'Reply with exactly OK. Do not use tools.'], {
-      cwd: homedir(), timeoutMs: 30_000, maxOutputBytes: 64 * 1024,
+    work = await mkdtemp(join(tmpdir(), 'poise-codex-verification-'))
+    // Caller owns the worker credential home and tool-free request options.
+    // The probe owns its diagnostics: provider output never reaches Logging.
+    const { stdout } = await runFile('agent-interface', ['--verify-codex-login', model.identity, '--pwd', work], {
+      cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 64 * 1024, reportFailure: false,
       env: { CODEX_HOME: process.env.CODEX_HOME, OPENAI_API_KEY: undefined, CODEX_API_KEY: undefined, OPENAI_BASE_URL: undefined },
     })
     const events = stdout.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
     if (events.some(event => ['error', 'turn.failed'].includes(String(event.type)))
-      || !events.some(event => event.type === 'turn.completed')
+      || events.filter(event => event.type === 'turn.completed').length !== 1
+      || events.some(event => event.item && (typeof event.item !== 'object' || !('type' in event.item)
+        || !['agent_message', 'reasoning', 'todo_list', 'error'].includes(String(event.item.type))))
       || !events.some(event => event.type === 'item.completed' && event.item && typeof event.item === 'object'
         && 'type' in event.item && event.item.type === 'agent_message' && 'text' in event.item && event.item.text === 'OK')) {
-      throw new Error('Codex did not complete the native sign-in verification')
+      throw Object.assign(new Error('Codex did not complete the native sign-in verification'), { stdout })
     }
     // Record completion, not request start: a second Connect during verification
     // must still read as older than the verification it did not cause.
     recordProviderRecovery('codex', failure.callId, Date.now())
   } catch (error) {
-    console.error('[accounts] native Codex sign-in verification failed:', redact(String(error), environmentSecrets()))
+    // Never publish provider text: opaque auth.json values survive redaction.
+    const reason = classifyCodexVerificationFailure(error)
+    console.error('[accounts] native Codex sign-in verification failed:', codexVerificationDetail(reason))
+    providerSignInVerificationFailed('codex', failure.callId, reason)
     releaseProviderVerification('codex', login)
+  } finally {
+    if (work) await rm(work, { recursive: true, force: true })
   }
 }
 

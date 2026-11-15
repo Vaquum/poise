@@ -17,7 +17,11 @@ export default class FirstFailureReporter implements Reporter {
     if (this.reported || result.state !== 'failed') return
     this.reported = true
     const error = result.errors.find((error) => error.stack || error.message)
-    const record = `[poise] first test failure: ${relative(process.cwd(), test.module.moduleId)} > ${test.fullName}\n${error?.stack || error?.message || 'Assertion details unavailable'}`
+    // A timeout keeps its reason in the message and a registration stack under it.
+    const detail = error?.stack && error.message && !error.stack.includes(error.message)
+      ? `${error.message}\n${error.stack}`
+      : error?.stack || error?.message || 'Assertion details unavailable'
+    const record = `[poise] first test failure: ${relative(process.cwd(), test.module.moduleId)} > ${test.fullName}\n${detail}`
     // Redact the complete record: clipping a credential first could leave a secret fragment.
     const safe = redact(record, environmentSecrets())
     process.stderr.write((safe.length > LIMIT ? safe.slice(0, LIMIT - TRUNCATED.length) + TRUNCATED : safe) + '\n')

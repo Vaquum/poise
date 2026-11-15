@@ -85,7 +85,7 @@ export class ChatSocketServer {
     for (const connection of this.connections) this.send(connection, { kind: 'switches.updated', catalogue })
   }
   private readonly onEvent = (envelope: ChatEnvelope) => {
-    if (['session.created', 'session.updated', 'session.resumed', 'status.changed', 'model.updated', 'mode.updated', 'timer.changed'].includes(envelope.event.type)) {
+    if (['session.created', 'session.updated', 'session.resumed', 'status.changed', 'model.updated', 'mode.updated', 'timer.changed', 'question.escalated'].includes(envelope.event.type)) {
       const session = this.runtime.get(envelope.sessionId)
       if (session) for (const connection of this.connections) this.send(connection, {
         kind: envelope.event.type === 'session.created' ? 'session.created' : 'session.updated', session: { ...session, lastSeq: envelope.seq },
@@ -568,7 +568,7 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
       return json(res, 200, { sessions: runtime.list(), instance: runtime.instance }), true
     }
     // Every open permission and question request of this instance with
-    // its stored content, newest first: one consistent snapshot carrying
+    // its stored content, owner requests first, then newest: a snapshot carrying
     // its revision. Clients read again on `chatRequests.updated`, after a
     // reconnect or a restart, and discard a response older than a frame
     // they have seen.

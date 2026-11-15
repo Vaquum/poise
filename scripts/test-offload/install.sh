@@ -19,7 +19,7 @@ fi
 # On a first start this comes before the entrypoint, which makes ~/.poise private only when it creates it.
 [ -d "$HOME/.poise" ] || mkdir -m 700 "$HOME/.poise"
 mkdir -p "$target"
-for file in sitecustomize.py hook.cjs run.mjs; do
+for file in redaction.mjs sitecustomize.py hook.cjs run.mjs; do
   cp "$source/$file" "$target/.$file.new"
   mv "$target/.$file.new" "$target/$file"
 done

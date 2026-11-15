@@ -130,6 +130,10 @@ you cannot push to gets the pull request from your fork, which Poise makes
 when there is none. Each site's result shows under it: its pull request, or
 what is wrong.
 
+PR titles use `docs: <title>` on first publication. An existing Conventional
+Commits title is preserved, including its scope and breaking-change marker.
+Document headings and frontmatter titles keep their original text.
+
 ### Publishing again
 
 - While the pull request is open, publishing again commits to its branch. If
@@ -140,7 +144,8 @@ what is wrong.
   Should the pull request turn out to have been merged without that commit,
   every difference from the site is asked about before anything is replaced,
   and other sites name the address the piece still has there.
-- Once it is merged, an update gets a pull request of its own, `Update: <title>`.
+- Once it is merged, an update gets a pull request of its own, `docs: Update: <title>`
+  (or the unchanged title if it already uses Conventional Commits).
 - A pull request closed unmerged left nothing new on the site. A version
   merged before it stays the document's, and the next publish updates it;
   with none, the next publish is a first one again, and until then no other

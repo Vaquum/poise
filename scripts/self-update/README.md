@@ -90,7 +90,9 @@ configuration. Package edits are checked by field: changing ordinary
 dependencies is allowed; changing the validation/release commands is not.
 Then `npm ci` and `npm run check` run in a scrubbed environment; the head and
 working tree are re-verified, the exact head is pushed (never forced), and a
-PR is opened with the request and session.
+PR is opened with the request and session. Its title preserves an existing
+Conventional Commits title, including scope and breaking-change marker, or adds
+`feat: ` to the request title. Source-revert PRs use `revert: <request title>`.
 
 Merging: the controller verifies the repository identity, current PR head and
 base, and the successful `.github/workflows/ci.yml` aggregate `Verify (Node 22)` on

@@ -20,7 +20,7 @@ export const SHARED: Registry = {
 
   /* ---------- States: one meaning each, everywhere ---------- */
   'state.running': { name: STATE_WORDS.running, kind: 'State', what: 'Work is executing right now: an agent’s turn, a run or a review.' },
-  'state.needs-you': { name: STATE_WORDS['needs-you'], kind: 'State', what: 'Paused for your decision: a question, a permission, a review you were asked for, a merge that is yours to make, or a hold. A failure that only a changed input or your choice can fix comes here too, with the action named. Nothing more happens until you act.' },
+  'state.needs-you': { name: STATE_WORDS['needs-you'], kind: 'State', what: 'Waiting for a decision, permission, sign-in or formal GitHub review request addressed to you.' },
   'state.waiting': { name: STATE_WORDS.waiting, kind: 'State', what: 'Paused on something other than you: checks, a free slot, the queue, a provider, a quota, memory or another worker. It clears by itself, and says what it is waiting for.' },
   'state.blocked': { name: STATE_WORDS.blocked, kind: 'State', what: 'Cannot continue until a prerequisite is met, such as missing access, a merge conflict or work it depends on, or until an effect Poise cannot prove yet is reconciled: Not confirmed. It names what it needs.' },
   'state.idle': { name: STATE_WORDS.idle, kind: 'State', what: 'Nothing is in progress. Ready for the next instruction or step.' },
@@ -178,7 +178,7 @@ export const SHARED: Registry = {
   'diff.revert': { name: 'Revert', kind: 'Action', what: 'Restores this file to how it was before this change.', scope: 'This file’s change only.', when: 'Immediately.', unchanged: 'Other files and commits already pushed.', shows: 'The card says Reverted.' },
   plan: { name: 'Plan', kind: 'Activity', what: 'The agent’s plan for this turn, as it last reported it.', values: [['Filled', 'Done.'], ['Ringed', 'In progress.'], ['Hollow', 'Not started.']] },
   perm: { name: 'Permission', kind: 'Needs you', what: 'The agent asks before a step that needs your consent.', values: [['Allow once', 'This step only.'], ['Always allow in this session', 'Steps like this in this chat, until it ends.'], ['Deny', 'The agent continues without it.']], when: 'As soon as you choose. Keys 1–3 work too.' },
-  question: { name: 'Question', kind: 'Needs you', what: 'The agent asks something only you can answer.', does: 'Pick an option or answer in your own words.' },
+  question: { name: 'Question', kind: 'Request', what: 'The agent asks for an answer. The Manager can answer a worker with known task data or bring the question to you.', does: 'Pick an option or answer in your own words.' },
   'answered.who': { name: 'Who answered', kind: 'Action', what: 'Opens the chat that answered, with a route back. A chat since deleted is named, marked deleted, and opens nothing.' },
   answered: { name: 'Answered by the Manager', kind: 'Display', what: 'The Manager answered this under your Autonomy setting. The answer is recorded here.', source: 'The Manager’s record.' },
   'answered.why': { name: 'Why the Manager answered', kind: 'Display', what: 'The rule that let the Manager answer without you: your Autonomy setting and the standing instruction it applied.', now: (el: any) => el.textContent.trim(), does: 'To have questions like this come to you, lower Autonomy or change the standing instruction.' },

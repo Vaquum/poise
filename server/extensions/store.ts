@@ -6,6 +6,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { db } from '../db'
+import { connectionSignInCleared, connectionSignInNeeded } from '../alerts/producers'
 import { redact } from '../../gateway/src/diagnostics/redaction.mjs'
 import { secretSlots, type Enablement, type ServerEvent, type ServerSpec, type ServerStatus, type ServerView } from './types'
 
@@ -142,6 +143,7 @@ export function updateServer(id: string, spec: ServerSpec, secrets: Record<strin
     }
   })()
   secretCache = null
+  if (moved) connectionSignInCleared(`extension:${id}`)
   return serverView(id)
 }
 
@@ -171,6 +173,7 @@ export function deleteServer(id: string): void {
   storedServer(id)
   db.prepare('DELETE FROM extension_servers WHERE id = ?').run(id)
   secretCache = null
+  connectionSignInCleared(`extension:${id}`)
 }
 
 export function setStatus(id: string, status: ServerStatus): void {
@@ -197,6 +200,20 @@ export function writeSecret(id: string, slot: string, value: string): void {
 export function eraseSecret(id: string, slot: string): void {
   db.prepare('DELETE FROM extension_secrets WHERE server_id = ? AND slot = ?').run(id, slot)
   secretCache = null
+}
+
+export function extensionSignInLost(id: string, attemptedCredentials: string): void {
+  // A check or refresh can finish after someone has reconnected or removed
+  // the server. Only invalidate the credentials that were actually used.
+  db.transaction(() => {
+    const removed = db.prepare("DELETE FROM extension_secrets WHERE server_id = ? AND slot = 'oauth:tokens' AND value = ?")
+      .run(id, attemptedCredentials).changes
+    if (!removed) return
+    secretCache = null
+    const { spec } = storedServer(id)
+    connectionSignInNeeded(`extension:${id}`, `Reconnect ${spec.title}`,
+      'This extension’s sign-in has ended. Sign in from Settings → Extensions.', 'extensions')
+  }).immediate()
 }
 
 /** Every pending OAuth flow, for matching a returning `state`. */

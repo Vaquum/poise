@@ -951,11 +951,16 @@ class TestRecovery(TestCase):
                 self.assertEqual(row['error_code'], 'review_inspection_timeout' if phase == 'inspection'
                                  else 'review_budget_exhausted', row['error'])
                 diagnostic = row['diagnostic']
-                handoff = limiting_phase == 'provider_analysis'
+                handoff = phase == 'provider_analysis'
                 self.assertEqual(diagnostic['phase'], 'analysis' if handoff else limiting_phase)
                 self.assertEqual(diagnostic['outcome'], 'handoff' if handoff else 'timed_out')
                 if handoff:
                     self.assertEqual(diagnostic['operation'], 'provider.review')
+                if phase.endswith('_inspection'):
+                    self.assertEqual(diagnostic['operation'], 'github-interface')
+                if phase == 'provider_analysis_inspection':
+                    self.assertEqual(row['error'], 'Local review repository inspection timed out; incomplete analysis; needs attention')
+                    self.assertNotIn('handing off', row['error'])
                 self.assertEqual(diagnostic['submission'], 'none')
                 self.assertIn(f'file group {group} of 22', diagnostic['message'])
                 self.assertIn('Incomplete analysis', diagnostic['message'])

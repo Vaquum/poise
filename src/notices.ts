@@ -13,7 +13,7 @@ export interface ReadFailure { key: string, title: string, body: string, target?
 export type NoticeTarget =
   | { view: 'behaviors' }
   | { swarm: string }
-  | { settings: 'general' | 'accounts' }
+  | { settings: 'general' | 'accounts' | 'extensions' }
   | { chat: string }
   | { pullRequest: string }
 
@@ -53,7 +53,7 @@ function isTarget(value: unknown): value is NoticeTarget {
   if (Object.keys(target).length !== 1) return false
   if ('view' in target) return target.view === 'behaviors'
   if ('swarm' in target) return typeof target.swarm === 'string' && /^[A-Za-z0-9._:-]{1,200}$/.test(target.swarm)
-  if ('settings' in target) return target.settings === 'general' || target.settings === 'accounts'
+  if ('settings' in target) return target.settings === 'general' || target.settings === 'accounts' || target.settings === 'extensions'
   if ('chat' in target) return typeof target.chat === 'string' && target.chat.length > 0
   if ('pullRequest' in target) return typeof target.pullRequest === 'string' && PULL_REQUEST_URL.test(target.pullRequest)
   return false

@@ -129,7 +129,9 @@ function parseGhStatus(stdout: string): SignIn | null {
     if (!isRecord(entry) || typeof entry.login !== 'string' || !GITHUB_LOGIN.test(entry.login)) return null
     const signedIn = entry.state === 'success'
     const problem = typeof entry.error === 'string' && line(entry.error) ? line(entry.error) : `gh reports its state as ${line(String(entry.state)) || 'unknown'}`
-    accounts.push({ login: entry.login, active: entry.active === true, signedIn, detail: signedIn ? null : problem })
+    const credentialRejected = entry.state === 'refresh_expired' || entry.state === 'error' && /^HTTP 401\b/i.test(problem)
+    accounts.push({ login: entry.login, active: entry.active === true, signedIn, detail: signedIn ? null : problem,
+      ...(credentialRejected ? { credentialRejected: true } : {}) })
   }
   const failing = accounts.filter((account) => !account.signedIn).map((account) => account.login)
   return {

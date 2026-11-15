@@ -191,7 +191,14 @@ export async function resolveReviewCheckout(
       await rename(checkout, path)
       return path
     } finally {
-      await rm(temporary, { recursive: true, force: true })
+      // Staging cleanup must never replace the checkout failure the caller
+      // reports: both launch surfaces suppress child reporting and attribute
+      // this error, so a cleanup rejection would erase the original cause.
+      try {
+        await rm(temporary, { recursive: true, force: true })
+      } catch (cleanupError) {
+        console.error(`[review-checkout] could not remove ${temporary}:`, (cleanupError as Error).message)
+      }
     }
   })
 }

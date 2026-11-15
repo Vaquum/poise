@@ -923,6 +923,103 @@ it('reconciles live work on every pass despite 250 quiescent merged chains and o
   expect(observed).toContain(live.id)
 })
 
+it.each([1, 4])('alternates saturated active and due passes across runtime replacement with %s held PRs', async heldCount => {
+  const { db, journal } = setup()
+  const active = [1, 2, 3].map(issue => seed(journal, 'active/repo', issue))
+  const heldObservation = observation()
+  Object.assign(heldObservation.publication, { state: 'open', merged: false, merge_sha: null })
+  Object.assign(heldObservation.pull!, { state: 'open', merged: false, mergeSha: null })
+  heldObservation.checkedAt = NOW - 120_000
+  const held = Array.from({ length: heldCount }, (_, index) => {
+    let chain = seed(journal, 'held/repo', index + 1)
+    chain = record(journal, chain, { type: 'chain.observed', observation: heldObservation })
+    return record(journal, chain, { type: 'chain.held', reason: 'operator hold' })
+  })
+  const observe = vi.fn(async (chain: BehaviorChain) => {
+    vi.setSystemTime(Date.now() + 16_000)
+    return { ...structuredClone(chain.held ? heldObservation : observation(false)), checkedAt: Date.now() }
+  })
+  const reportHold = vi.fn<NonNullable<ChainRuntimeOperations['reportHold']>>(async () => null)
+  const native = operations({ observe, reportHold })
+  // With one held PR only the first two sweeps per runtime stay saturated;
+  // later sweeps are cursor-limited (one active plus one due). The populated
+  // due backlog keeps every sweep saturated to prove active progress too.
+  const passes = heldCount === 1 ? 2 : 4
+  for (let replacement = 0; replacement < 2; replacement++) {
+    const retained = new BehaviorChainJournal(db)
+    retained.rebuild()
+    const runtime = new BehaviorChainRuntime(retained, native)
+    const before = observe.mock.calls.length
+    for (let pass = 0; pass < passes; pass++) {
+      vi.setSystemTime(Date.now() + 120_000)
+      const began = Date.now(), offset = observe.mock.calls.length
+      await runtime.run()
+      expect(observe.mock.calls[offset][0].repository).toBe(pass % 2 ? 'held/repo' : 'active/repo')
+      expect(Date.now() - began).toBe(48_000)
+      if (pass === 1) {
+        const observed = observe.mock.calls.slice(before).map(([chain]) => chain.id)
+        expect(observed).toContain(held[0].id)
+        expect(active.every(chain => observed.includes(chain.id))).toBe(true)
+        expect(reportHold.mock.calls.slice(-Math.min(heldCount, 3)).map(([chain]) => chain.id)).toContain(held[0].id)
+      }
+    }
+  }
+  // Even the third expensive due observation crosses the budget and still
+  // reaches report evaluation; the due backlog cannot starve active work.
+  expect(reportHold.mock.calls.map(([chain]) => chain.id)).toEqual(observe.mock.calls
+    .filter(([chain]) => chain.held).map(([chain]) => chain.id))
+  for (const chain of held) expect(journal.read(chain.id)).toMatchObject({ held: 'operator hold', invocations: [] })
+})
+
+it.each(['active', 'due'].flatMap(first => ['recovery', 'ineligible', 'operator hold'].map(mode => ({ first, mode }))))(
+  'handles unsaturated $first-first passes without revisiting a new launch or granting recovery authority: $mode', async ({ first, mode }) => {
+    const { journal } = setup()
+    const obs = observation()
+    Object.assign(obs.publication, { state: 'open', merged: false, merge_sha: null })
+    Object.assign(obs.pull!, { state: 'open', merged: false, mergeSha: null, checksState: 'SUCCESS' })
+    obs.prReviewers = []
+    let chain = seed(journal)
+    chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'blocked-repair', behavior: 'repair-pr',
+      actor: chain.author, model: reviewer.model, slot: reviewer.slot, basis: 'failed-ci', admittedAt: NOW - 2000,
+      request: { command: 'agent-interface', cwd: '/fixture', argv: [],
+        context: { head: obs.pull!.head, reviewRevision: obs.pull!.reviewRevision } } } })
+    chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'blocked-repair', callId: 'a'.repeat(32),
+      outcome: 'preflight_failed', evidence: { status: 'failed', error_code: 'atomic_work_blocked', action: 'not_started',
+        artifact: { phase: 'executing' }, completedAt: NOW - 1000, resources_settled_at: new Date(NOW - 1000).toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] } } })
+    chain = record(journal, chain, { type: 'chain.observed', observation: obs })
+    chain = record(journal, chain, { type: 'chain.held', reason: 'CI failed; repair cannot continue',
+      ciHold: { invocationId: 'blocked-repair', callId: 'a'.repeat(32), head: obs.pull!.head } })
+    const original = structuredClone(chain.invocations[0])
+    if (mode === 'operator hold') chain = record(journal, chain, { type: 'chain.held', reason: chain.held! })
+    const launch = vi.fn(async () => true)
+    const observe = vi.fn(async (current: BehaviorChain) => {
+      const fresh = current.id === chain.id && mode !== 'ineligible' ? structuredClone(obs) : observation(false)
+      if (current.id !== chain.id || mode === 'ineligible') fresh.issue.eligible = false
+      return { ...fresh, checkedAt: Date.now() }
+    })
+    const runtime = new BehaviorChainRuntime(journal, operations({ enabled: () => true, available: () => true,
+      permitted: () => true, observe, launch,
+      request: async () => ({ command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] }) }))
+    if (first === 'due') {
+      await runtime.run()
+      expect(observe).not.toHaveBeenCalled()
+    }
+    const active = seed(journal, 'active/repo')
+    vi.setSystemTime(NOW + 120_000)
+    await runtime.run()
+    expect(observe.mock.calls.map(([current]) => current.id)).toEqual(first === 'due' ? [chain.id, active.id] : [active.id, chain.id])
+    chain = journal.read(chain.id)!
+    expect(chain.invocations[0]).toEqual(original)
+    if (mode === 'recovery') {
+      expect(launch).toHaveBeenCalledTimes(1)
+      expect(chain).toMatchObject({ held: null, invocations: [original, { behavior: 'approve-pr', state: 'started' }] })
+    } else {
+      expect(launch).not.toHaveBeenCalled()
+      expect(chain).toMatchObject({ held: 'CI failed; repair cannot continue', invocations: [original] })
+    }
+  })
+
 it('keeps merged journal-only uncertainty without repeatedly reading GitHub or sending another action', async () => {
   const { journal } = setup()
   let chain = seed(journal)

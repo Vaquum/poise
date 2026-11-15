@@ -6,8 +6,46 @@ import { nativeBehavior } from './behavior-chain-runtime'
 import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
 import type { ProcessDiagnostic } from './process-diagnostic'
+import type { ChainNudge, ChainWorkLink } from '../src/behavior-chain-nudge'
 
 export const CHAIN_ATTENTION_DELAY_MS = 24 * 60 * 60_000
+
+function waitingPrerequisite(chain: BehaviorChain, observation: ChainObservation | null, waiting: string | null): string | null {
+  const proof = observation?.prerequisites
+  if (chain.held || !proof?.wait || waiting !== proof.wait || !proof.base || !Array.isArray(proof.evidence)) return null
+  const links = proof.evidence[0]
+  const last = proof.evidence.length > 1 ? proof.evidence.at(-1) : undefined
+  const number = last?.issue_number
+  const repository = chain.repository.toLowerCase()
+  if (links?.found !== true || links.complete !== true || links.number !== chain.issue || String(links.repo).toLowerCase() !== repository
+    || !Array.isArray(links.prerequisites) || String(last?.repository).toLowerCase() !== repository
+    || !Number.isSafeInteger(number) || Number(number) < 1 || number === chain.issue || last?.base_sha !== proof.base
+    || last?.verified === true && last.state === 'closed' && /^[a-f0-9]{40}$/.test(String(last.merge_sha))
+      && Number.isSafeInteger(last.pull_number) && Number(last.pull_number) > 0
+    || !links.prerequisites.some((link) => String(link?.repo).toLowerCase() === repository && link?.number === number)) return null
+  return repository + '#' + number
+}
+
+function currentWork(chain: BehaviorChain, observation: ChainObservation | null, fresh: boolean,
+  chats: ReadonlyMap<string, Extract<ChainWorkLink, { kind: 'chat' }>>): ChainWorkLink | null {
+  const issue = 'https://github.com/' + chain.repository.toLowerCase() + '/issues/' + chain.issue
+  const pull = fresh ? exactPull(observation) : null
+  const links = new Set<string>()
+  if (fresh) {
+    if (!Array.isArray(observation?.existingPulls)) return null
+    for (const url of observation.existingPulls) {
+      if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/i.test(url)) return null
+      links.add(url.toLowerCase())
+    }
+    if (pull?.state === 'open' && !pull.merged) links.add('https://github.com/' + chain.repository.toLowerCase() + '/pull/' + pull.number)
+  }
+  if (links.size > 1) return null
+  const url = links.values().next().value
+  const issueChat = chats.get(issue)
+  const pullChat = url ? chats.get(url) : undefined
+  if (issueChat && pullChat && issueChat.session !== pullChat.session) return null
+  return pullChat ?? issueChat ?? (url ? { kind: 'pull', url } : null)
+}
 
 /** Effective blocking conversations, mirroring decideBehaviorChain: live
  * threads always block, outdated ones only while readiness stays red on
@@ -339,7 +377,8 @@ const attentionProgress = new WeakMap<BehaviorChainJournal, Map<string, { revisi
 
 /** Read-only attention across every active page, including unpublished issues
  * and merged chains whose original review obligation remains open. */
-export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date.now()) {
+export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date.now(),
+  chats: ReadonlyMap<string, Extract<ChainWorkLink, { kind: 'chat' }>> = new Map()) {
   let cache = attentionProgress.get(journal)
   if (!cache) { cache = new Map(); attentionProgress.set(journal, cache) }
   const entries = []
@@ -368,7 +407,14 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
             && chainReviewResponse(chain, invocation, observation, now)))
       const queueUnmergeable = state === 'fresh' && !!pull?.queueEntry && pull.queueEntryDetails?.id === pull.queueEntry
         && pull.queueEntryDetails.state === 'UNMERGEABLE'
-      if (!queueReviewConflict && !chain.held && !chain.reviewPending && active?.state !== 'uncertain' && ageMs < CHAIN_ATTENTION_DELAY_MS) continue
+      const prerequisite = state === 'fresh' ? waitingPrerequisite(chain, observation, waiting) : null
+      const reportDecision = !chain.held && !active && !!waiting && [
+        'Implementation hold report awaits a current explicit source-only or verified distinct-fix disposition',
+        'Repair hold report awaits a current explicit existing-remedy or verified distinct-fix disposition',
+        'PR review deadline report awaits a current explicit source-only or verified distinct-fix disposition',
+      ].some(reason => waiting === reason || waiting.startsWith(reason + ':'))
+      if (!queueReviewConflict && !chain.held && !chain.reviewPending && active?.state !== 'uncertain'
+        && !prerequisite && !reportDecision && ageMs < CHAIN_ATTENTION_DELAY_MS) continue
       const gates = pull ? [
         `Head ${pull.head.slice(0, 12)}`,
         pull.failing?.length ? `CI failing: ${pull.failing.join(', ')}` : pull.pending ? 'Required CI pending'
@@ -615,7 +661,33 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         }
       }
       const preview = (value: string) => value.length <= 1024 ? value : `${value.slice(0, 1023)}…`
+      const work = currentWork(chain, observation, state === 'fresh', chats)
+      const nudge: ChainNudge | null = !chain.held && !prerequisite && retryAt === null && active?.state !== 'uncertain'
+        && !chain.reviewPending && !reportDecision && !work && !queueReviewConflict && !resourceContradicted
+        ? null
+        : queueReviewConflict || chain.reviewPending || active?.state === 'uncertain' || resourceContradicted
+          ? { kind: 'reconcile', action: preview(next), prerequisite: null, work }
+          : prerequisite
+            ? { kind: 'prerequisite', action: 'Poise is waiting for verified delivery of the prerequisite.', prerequisite, work }
+            : retryAt !== null
+              ? { kind: 'automatic', action: 'Poise can retry after the backoff under its existing admission rules.', prerequisite: null, work }
+              : chain.ciHold
+                ? { kind: 'automatic', action: 'Poise checks the matching CI result for recovery.', prerequisite: null, work }
+                : chain.testHold
+                  ? { kind: 'automatic', action: 'Poise checks the original test failure for verified recovery.', prerequisite: null, work }
+                  : chain.held === 'New invocations held by the person'
+                    ? { kind: 'decision', action: 'Paused by the workspace owner.', prerequisite: null, work }
+                    : waiting?.startsWith('Implementation fixture recheck:')
+                      ? { kind: 'reconcile', action: 'Poise needs a verified fix for the original failing test.', prerequisite: null, work }
+                    : waiting?.startsWith('Repair report recovery pending:')
+                      ? { kind: 'reconcile', action: 'Poise needs a verified repair diagnosis for the original PR revision.', prerequisite: null, work }
+                    : reportDecision
+                      ? { kind: 'decision', action: 'This report awaits an explicit disposition from the workspace owner.', prerequisite: null, work }
+                      : last && chain.held === `${last.behavior} failed before publication three times: ${String(last.evidence?.error || 'native failure')}`
+                        ? { kind: 'decision', action: 'Retries exhausted. The owner needs to decide how to address the recorded blocker.', prerequisite: null, work }
+                        : { kind: 'unknown', action: 'No automatic next step verified. Inspect the recorded blocker.', prerequisite: null, work }
       entries.push({ id: chain.id, repository: chain.repository, issue: chain.issue,
+        held: chain.held, sequence: chain.sequence, mergeSha: chain.mergeSha,
         pullNumber: observation?.publication?.pull_number ?? null,
         step: active ? `${active.behavior}: ${active.state}` : chain.reviewPending ? 'Merged; review evidence pending'
           : !chain.held ? waiting || (pull ? 'PR merge gates' : 'Issue admission')
@@ -626,7 +698,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
           chain.reviewPending ? 'Original pre-merge review evidence pending' : null, waiting].filter(Boolean).join('; ')
           || 'No verified progress for at least 24 hours'),
         evidence: { state, checkedAt: observation?.checkedAt ?? null, gates: gates.map(preview) },
-        nextAction: preview(next), retryAt,
+        nextAction: preview(next), retryAt, nudge,
         reconciliation: { nextObservationAt: journal.reconciliationAt(chain), waitingForResourceRelease: chainWaitsForResourceRelease(chain) },
         journal: `/api/behavior-chains?${new URLSearchParams({ id: chain.id, after: String(Math.max(0, progress.sequence - 1)) })}` })
     }

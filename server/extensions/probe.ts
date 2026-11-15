@@ -13,7 +13,7 @@ import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontex
 import { SSEClientTransport, SseError } from '@modelcontextprotocol/sdk/client/sse.js'
 import type { Transport as McpTransport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { resolveServer } from './delivery'
-import { addEvent, eraseSecret, markOAuth, redactSecrets, setStatus, storedServer } from './store'
+import { addEvent, extensionSignInLost, markOAuth, readSecret, redactSecrets, setStatus, storedServer } from './store'
 import type { ResolvedServer, ServerStatus, ToolInfo } from './types'
 
 // npx and uvx download the package on first use.
@@ -79,6 +79,7 @@ async function run(id: string): Promise<ServerStatus> {
   const resolution = await resolveServer(stored)
   if (!('server' in resolution)) return done(resolution.signin ? { state: 'signin', checkedAt: checkedAt() } : { state: 'failed', checkedAt: checkedAt(), error: resolution.problem })
   const server = resolution.server
+  const oauth = stored.spec.auth === 'oauth' ? readSecret(id, 'oauth:tokens') : null
   const stderr: string[] = []
   const cwd = await mkdtemp(join(tmpdir(), 'poise-extension-'))
   const timeout = server.transport === 'stdio' ? LOCAL_TIMEOUT_MS : REMOTE_TIMEOUT_MS
@@ -91,7 +92,11 @@ async function run(id: string): Promise<ServerStatus> {
     const error = abort.signal.aborted ? new Error(`no answer within ${timeout / 1000} s`) : caught
     if (status401(error)) {
       const authorized = Object.keys(server.headers ?? {}).some((name) => name.toLowerCase() === 'authorization')
-      if (stored.spec.auth === 'oauth') { eraseSecret(id, 'oauth:tokens'); return done({ state: 'signin', checkedAt: checkedAt() }) }
+      if (stored.spec.auth === 'oauth') {
+        const bearer = Object.entries(server.headers ?? {}).find(([name]) => name.toLowerCase() === 'authorization')?.[1]
+        if (oauth && bearer === `Bearer ${(JSON.parse(oauth) as { tokens: { access_token: string } }).tokens.access_token}`) extensionSignInLost(id, oauth)
+        return done({ state: 'signin', checkedAt: checkedAt() })
+      }
       if (!authorized && (stored.spec.headers ?? []).length === 0) {
         if (await offersOAuth(server.url!)) { markOAuth(id); return done({ state: 'signin', checkedAt: checkedAt() }) }
         return done({ state: 'failed', checkedAt: checkedAt(), error: 'The server needs credentials (401) and offers no OAuth sign-in. Add its token or headers under Edit.' })

@@ -9,6 +9,10 @@ import {
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return { ...actual, rm: vi.fn(actual.rm) }
+})
 const owner = 'autonomio', repo = 'autonomio', actor = 'bit-mis', head = 'a'.repeat(40)
 const remote = `https://github.com/${owner}/${repo}.git`
 let root: string
@@ -71,6 +75,11 @@ describe('review checkout provisioning through Caller', () => {
     dirty = cause === 'dirty checkout'
     await expect(resolveCheckout()).rejects.toThrow()
     expect(await readdir(join(root, 'review-checkouts', head, owner))).toEqual([`${repo}.lock`])
+  })
+  it('keeps the checkout failure when staging cleanup fails', async () => {
+    failedFetch = true
+    vi.mocked(rm).mockRejectedValueOnce(new Error('staging cleanup failed'))
+    await expect(resolveCheckout()).rejects.toThrow('reviewer cannot read repository')
   })
   it('does not overwrite a managed checkout that was subsequently changed', async () => {
     const path = await resolveCheckout()

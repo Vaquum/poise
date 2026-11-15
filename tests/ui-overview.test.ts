@@ -4,7 +4,7 @@ import type { NotificationItem } from '../src/notification-items'
 import { bellTally, DEFAULT_LEVEL, LEVEL_KEY, noticeGroup, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from '../src/ui/places/overview/level'
 import { chatOpening, diagnosticHref, itemOf, journalStep, targetOpening, timelineHref } from '../src/ui/places/overview/targets'
 import { chatState, countStates, issueState, pullState, taskPhase, taskState, type ChainLike } from '../src/ui/places/overview/states'
-import { decisionEntries, diagnosticGroup, foldWaiting, itemEntries, keepEntries, ordered, prGroup, prStatusesFrom, requestEntries, requestsFrom, restoreEntries, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
+import { decisionEntries, diagnosticGroup, itemEntries, keepEntries, ordered, prGroup, prStatusesFrom, requestEntries, requestsFrom, restoreEntries, threadEntries, undismissed, type OpenRequest } from '../src/ui/places/overview/entries'
 import { STALLED_MESSAGE } from '../src/behavior-diagnostics'
 import type { ChainAttentionRow } from '../src/notification-items'
 import type { PrStatus } from '../src/ui/places/board/model'
@@ -73,15 +73,14 @@ describe('the level', () => {
   // stuck and automatic while it moves; finished work is not listed.
   it('groups every notice kind by who acts', () => {
     for (const kind of [...NOTICE_KINDS, ...LOCAL_NOTICE_KINDS]) expect(['needs-you', 'fault', 'auto', null]).toContain(noticeGroup(kind))
-    for (const kind of ['chat_waiting', 'sign_in_needed', 'review_requested', 'storage_low', 'action_needed', 'action_failed', 'pr_ready', 'pr_conflict', 'worker_idle'] as const) expect(noticeGroup(kind)).toBe('needs-you')
-    for (const kind of ['behavior_held', 'ledger_queue_stalled', 'ledger_capture_loss'] as const) expect(noticeGroup(kind)).toBe('fault')
-    for (const kind of ['datastore_sync_failing', 'github_quota_warning', 'github_quota_exhausted', 'read_failed'] as const) expect(noticeGroup(kind)).toBe('auto')
-    expect(noticeGroup('chat_turn_finished')).toBeNull()
-    expect(noticeGroup('action_finished')).toBeNull()
+    for (const kind of ['sign_in_needed', 'review_requested'] as const) expect(noticeGroup(kind)).toBe('needs-you')
+    for (const kind of ['storage_low', 'action_needed', 'action_failed', 'pr_conflict', 'behavior_held', 'ledger_queue_stalled', 'ledger_capture_loss'] as const) expect(noticeGroup(kind)).toBe('fault')
+    for (const kind of ['pr_ready', 'datastore_sync_failing', 'github_quota_warning', 'github_quota_exhausted', 'read_failed'] as const) expect(noticeGroup(kind)).toBe('auto')
+    for (const kind of ['chat_waiting', 'worker_idle', 'chat_turn_finished', 'action_finished'] as const) expect(noticeGroup(kind)).toBeNull()
   })
 
   it('has the bell count what the level shows: the same sources elsewhere, Overview’s own entries while it is mounted', () => {
-    const away = () => [notice('pr_ready'), notice('chat_turn_finished'), notice('ledger_queue_stalled')].flatMap((value) => noticeGroup(value.kind) ?? [])
+    const away = () => [notice('review_requested'), notice('chat_turn_finished'), notice('ledger_queue_stalled')].flatMap((value) => noticeGroup(value.kind) ?? [])
     expect(bellTally(away)).toEqual({ count: 2, tone: 'failed' })
     saveLevel(0)
     expect(bellTally(away)).toEqual({ count: 1, tone: 'needs-you' })
@@ -121,10 +120,11 @@ describe('the work in the seven states', () => {
     expect(chatState({ status: 'starting' })).toEqual({ state: 'running', note: 'Starting' })
     expect(chatState({ status: 'running' }).state).toBe('running')
     expect(chatState({ status: 'stopping' })).toEqual({ state: 'running', note: 'Stopping…' })
-    expect(chatState({ status: 'waiting', pendingRequests: ['a', 'b'] })).toEqual({ state: 'needs-you', note: '2 requests wait for you' })
+    expect(chatState({ status: 'waiting', ownerRequests: ['a', 'b'] })).toEqual({ state: 'needs-you', note: '2 requests wait for you' })
+    expect(chatState({ status: 'waiting', ownerRequests: [] })).toEqual({ state: 'waiting', note: 'Awaiting an answer' })
     expect(chatState({ status: 'queued', queuedBehind: 'waiting for a free agent slot' })).toEqual({ state: 'waiting', note: 'waiting for a free agent slot' })
     expect(chatState({ status: 'queued', queuedBehind: 'Fix the login' })).toEqual({ state: 'waiting', note: 'queued behind Fix the login' })
-    expect(chatState({ status: 'interrupted' }).state).toBe('needs-you')
+    expect(chatState({ status: 'interrupted' }).state).toBe('blocked')
     expect(chatState({ status: 'idle' }).state).toBe('idle')
     expect(chatState({ status: 'closed' })).toEqual({ state: 'idle', note: 'Closed' })
     expect(chatState({ status: 'error' }).state).toBe('failed')
@@ -142,7 +142,7 @@ describe('the work in the seven states', () => {
     const repairing = chain({ invocations: [{ behavior: 'repair-pr', state: 'settled', outcome: 'x' }, { behavior: 'review-pr', state: 'settled', outcome: 'x' }, { behavior: 'repair-pr', state: 'started', outcome: null }] })
     expect(taskPhase(repairing)).toEqual({ phase: 'Repair', round: 2 })
     expect(taskState(repairing)).toEqual({ state: 'running', note: 'Repair · round 2' })
-    expect(taskState(chain({ held: 'Removed from the merge queue by hand' }))).toEqual({ state: 'needs-you', note: 'Removed from the merge queue by hand' })
+    expect(taskState(chain({ held: 'Removed from the merge queue by hand' }))).toEqual({ state: 'blocked', note: 'Removed from the merge queue by hand' })
     expect(taskState(chain({ invocations: [{ behavior: 'review-pr', state: 'uncertain', outcome: 'a reply may have posted' }] })).state).toBe('blocked')
     expect(taskState(chain({ waiting: 'waiting for memory' }))).toEqual({ state: 'waiting', note: 'waiting for memory' })
     expect(taskState(chain({ mergeSha: 'abc' }))).toEqual({ state: 'done', note: 'Merged' })
@@ -152,10 +152,11 @@ describe('the work in the seven states', () => {
 
   it('maps a pull request and an issue as Board shows them', () => {
     expect(pullState({})).toBeNull()
-    expect(pullState({ status: 'green' })).toEqual({ state: 'needs-you', note: 'Ready to merge' })
+    expect(pullState({ status: 'green' })).toEqual({ state: 'waiting', note: 'Ready to merge' })
+    expect(pullState({ reviewRequested: true })).toEqual({ state: 'needs-you', note: 'GitHub requested your review' })
     expect(pullState({ status: 'yellow', reasons: ['checks_running'] })?.state).toBe('waiting')
     expect(pullState({ status: 'yellow', reasons: ['checks_failing'], failing: ['lint', 'e2e'] })).toEqual({ state: 'failed', note: 'failing: lint, e2e' })
-    expect(pullState({ status: 'yellow', reasons: ['changes_requested'] })?.state).toBe('needs-you')
+    expect(pullState({ status: 'yellow', reasons: ['changes_requested'] })?.state).toBe('waiting')
     expect(pullState({ status: 'yellow', reasons: ['conflict'] })?.state).toBe('blocked')
     expect(pullState({ status: 'yellow', reasons: ['draft'] })).toEqual({ state: 'idle', note: 'Draft' })
     expect(pullState({ status: 'yellow', reasons: ['unknown'], running: true })?.state).toBe('running')
@@ -168,7 +169,7 @@ describe('the work in the seven states', () => {
 
 describe('Answer here’s entries', () => {
   const role = (chat: string) => (chat === 'w1' ? 'worker' : null)
-  const request = (extra: Partial<OpenRequest>): OpenRequest => ({ id: 'r1', kind: 'permission', sessionId: 's1', sessionTitle: 'Muse', createdAt: '2026-11-11T08:00:00Z', content: null, escalation: null, ...extra })
+  const request = (extra: Partial<OpenRequest>): OpenRequest => ({ id: 'r1', kind: 'permission', sessionId: 's1', sessionTitle: 'Muse', createdAt: '2026-11-11T08:00:00Z', content: null, escalation: null, ownerAction: true, ...extra })
 
   it('reads only what it can draw', () => {
     expect(requestsFrom({ revision: 4, complete: true, requests: [request({}), { id: 2 }] })?.requests).toHaveLength(1)
@@ -197,26 +198,29 @@ describe('Answer here’s entries', () => {
     expect(requestEntries([request({ content: { title: 'broken' } })], role)).toEqual([])
   })
 
-  it('folds a chat’s waiting notice into its request entries', () => {
+  it('shows only live requests for the person and drops generic chat waiting notices', () => {
     const items = [{ id: 'n1', group: 'needs', tone: 'blue', icon: 'chat', title: 'Muse is waiting', body: '', source: 'Chat', scope: null, when: null, meta: '', details: [], behaviors: [], notice: notice('chat_waiting', { id: 'n1', target: { chat: 's1' } }) } as NotificationItem]
-    const asking = requestEntries([request({ content: { title: 'Run it', options: [{ id: 'a', name: 'Allow' }] } })], role)
-    expect(foldWaiting([...itemEntries(items, role, new Map()), ...asking]).map((entry) => entry.id)).toEqual(['request:r1'])
-    expect(foldWaiting(itemEntries(items, role, new Map())).map((entry) => entry.id)).toEqual(['notice:n1'])
+    const worker = request({ sessionId: 'w1', kind: 'question', ownerAction: false,
+      content: { questions: [{ id: 'q', question: 'Which branch?', options: [], freeText: true }] } })
+    expect(requestEntries([worker], role)).toEqual([])
+    expect(requestEntries([{ ...worker, ownerAction: true, escalation: 'Choose the release branch' }], role)[0])
+      .toMatchObject({ group: 'needs-you', why: 'Choose the release branch' })
+    expect(itemEntries(items, role, new Map())).toEqual([])
   })
 
-  it('offers Merge on a ready pull request, groups by who acts, and lists nothing finished', () => {
+  it('shows a ready pull request as status without asking the owner to merge it', () => {
     const items = (['pr_ready', 'ledger_queue_stalled', 'chat_turn_finished'] as const).map((kind) => ({
       id: kind, group: 'needs', tone: 'amber', icon: 'merge', title: kind, body: kind === 'pr_ready' ? 'Fix the login' : '', source: 'GitHub', scope: null, when: null, meta: '', details: [], behaviors: [],
       notice: notice(kind, { id: kind, body: kind === 'pr_ready' ? 'Fix the login' : '', target: kind === 'pr_ready' ? { pullRequest: 'https://github.com/acme/site/pull/14' } : null }),
     }) as NotificationItem)
     const entries = itemEntries(items, role, new Map())
-    expect(entries.map((entry) => entry.group)).toEqual(['needs-you', 'fault'])
-    expect(entries[0].options).toEqual([{ key: 'merge', label: 'Merge', primary: true }])
+    expect(entries.map((entry) => entry.group)).toEqual(['auto', 'fault'])
+    expect(entries[0].options).toEqual([])
     expect(entries[0].pull).toEqual({ repo: 'acme/site', number: 14, url: 'https://github.com/acme/site/pull/14' })
     // The pull request's own title; its kind and where say the rest.
     expect(entries[0]).toMatchObject({ title: 'Fix the login', where: 'acme/site #14', kind: 'Ready to merge' })
     expect(entries[1].state).toBe('failed')
-    expect(ordered([entries[1], entries[0]]).map((entry) => entry.group)).toEqual(['needs-you', 'fault'])
+    expect(ordered([entries[1], entries[0]]).map((entry) => entry.group)).toEqual(['fault', 'auto'])
   })
 
   const pullNotice = (kind: 'pr_ready' | 'pr_conflict', when: string | null = null) => ({
@@ -233,17 +237,17 @@ describe('Answer here’s entries', () => {
     for (const id of ['review_running', 'awaiting_review', 'ci_pending', 'behind', 'approved_not_enqueued', 'in_queue'] as const) expect(byStatus(status(id)).group).toBe('auto')
     expect(byStatus(status('conflicting', 'merge conflict on abc', 'acme/site#9')).group).toBe('auto')
     expect(byStatus(status('ci_failing', 'CI failing on abc · grey rerun pending')).group).toBe('auto')
-    // Nothing will move it unless you do.
-    for (const id of ['awaiting_author', 'conflicting', 'unresolved_threads', 'blocked', 'not_eligible', 'unknown'] as const) expect(byStatus(status(id), 'pr_conflict').group).toBe('needs-you')
-    expect(byStatus(status('ci_failing', 'CI failing on abc')).group).toBe('needs-you')
-    expect(byStatus(status('awaiting_review', 'awaiting review of abc · cap 5/5 · cap reached')).group).toBe('needs-you')
-    expect(byStatus(status('approved_not_enqueued', 'approved, not enqueued: merge-prs disabled')).group).toBe('needs-you')
-    expect(byStatus(null).group).toBe('needs-you')
+    for (const id of ['awaiting_author', 'conflicting', 'unresolved_threads', 'blocked', 'not_eligible'] as const) expect(byStatus(status(id), 'pr_conflict').group).toBe('fault')
+    expect(byStatus(status('ci_failing', 'CI failing on abc')).group).toBe('fault')
+    expect(byStatus(status('awaiting_review', 'awaiting review of abc · cap 5/5 · cap reached')).group).toBe('fault')
+    expect(byStatus(status('approved_not_enqueued', 'approved, not enqueued: merge-prs disabled')).group).toBe('fault')
+    expect(byStatus(status('unknown')).group).toBe('auto')
+    expect(byStatus(null)).toMatchObject({ group: 'auto', detail: 'Behavior status unavailable' })
     // A behavior held on it: stuck.
     expect(byStatus(status('held', 'held: merge-prs merge_failed since 08:00')).group).toBe('fault')
     // What moves it next is the line under its title.
     expect(byStatus(status('awaiting_author', 'changes requested on abc need author action'), 'pr_conflict')).toMatchObject({ detail: 'changes requested on abc need author action', kind: 'Merge conflict' })
-    expect(prGroup(undefined)).toBe('needs-you')
+    expect(prGroup(undefined)).toBe('auto')
   })
 
   it('makes automatic work that has not moved for four hours a fault', () => {
@@ -257,16 +261,29 @@ describe('Answer here’s entries', () => {
 
   it('never puts chain work on you: held or still for four hours it is a fault, moving it is automatic', () => {
     const now = Date.parse('2026-11-13T12:00:00Z')
-    const row = (progressAt: string): ChainAttentionRow => ({ id: 'acme/site#7', repository: 'acme/site', issue: 7, pullNumber: 12, step: 'repair-pr: uncertain', progressAt: Date.parse(progressAt), ageMs: now - Date.parse(progressAt),
+    const row = (progressAt: string, held: string | null, mergeSha: string | null = null): ChainAttentionRow => ({ id: 'acme/site#7', repository: 'acme/site', issue: 7,
+      held, sequence: 9, mergeSha, pullNumber: 12, step: 'repair-pr: uncertain', progressAt: Date.parse(progressAt), ageMs: now - Date.parse(progressAt),
       blocker: 'New invocations held by the person; Original pre-merge review evidence pending', evidence: { state: 'fresh', checkedAt: null, gates: [] }, nextAction: 'Resume', retryAt: null, journal: '/api/behavior-chains?id=acme%2Fsite%237&after=4',
       reconciliation: { nextObservationAt: null, waitingForResourceRelease: false } })
-    const chain = (progressAt: string, held: string | null) => itemEntries([{ id: 'chain:acme/site#7', group: 'needs', tone: 'amber', icon: 'held', title: 'acme/site#7 · repair-pr: uncertain', body: row(progressAt).blocker,
-      source: 'Behavior chain', scope: null, when: progressAt, meta: '', details: [], behaviors: [], notice: null, chainJournal: row(progressAt).journal, chain: row(progressAt) } as NotificationItem], role,
-    new Map([['acme/site#7', { sequence: 5, held }]]), new Map(), now)[0]
+    // The chains map holds only the first page; the hold comes from the attention row past it.
+    const chain = (progressAt: string, held: string | null, mergeSha: string | null = null,
+      chains: ReadonlyMap<string, { sequence: number, held: string | null }> = new Map()) => itemEntries([{ id: 'chain:acme/site#7', group: 'needs', tone: 'amber', icon: 'held', title: 'acme/site#7 · repair-pr: uncertain', body: row(progressAt, held, mergeSha).blocker,
+      source: 'Behavior chain', scope: null, when: progressAt, meta: '', details: [], behaviors: [], notice: null, chainJournal: row(progressAt, held, mergeSha).journal, chain: row(progressAt, held, mergeSha) } as NotificationItem], role,
+    chains, new Map(), now)[0]
     expect(chain('2026-11-13T11:00:00Z', 'New invocations held by the person')).toMatchObject({ group: 'fault', kind: 'Chain held', title: 'New invocations held by the person', detail: 'repair-pr: uncertain',
-      where: 'acme/site #7 → #12', options: [], quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] })
-    expect(chain('2026-11-13T11:00:00Z', null)).toMatchObject({ group: 'auto', kind: 'Behavior chain', quiet: undefined })
+      where: 'acme/site #7 → #12', options: [], quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }],
+      chain: { id: 'acme/site#7', sequence: 9 } })
+    expect(chain('2026-11-13T11:00:00Z', null)).toMatchObject({ group: 'auto', kind: 'Behavior chain', quiet: undefined, chain: undefined })
     expect(chain('2026-11-13T07:59:00Z', null)).toMatchObject({ group: 'fault', kind: 'Chain stuck' })
+    // A merged hold stays a fault but offers no Resume: the API rejects it with 409.
+    expect(chain('2026-11-13T11:00:00Z', 'New invocations held by the person', 'c'.repeat(40))).toMatchObject({ group: 'fault', kind: 'Chain held', quiet: undefined, chain: undefined })
+    // On page one the row still wins over a stale page entry, with its own sequence for Resume.
+    expect(chain('2026-11-13T11:00:00Z', 'New invocations held by the person', null,
+      new Map([['acme/site#7', { sequence: 5, held: null }]]))).toMatchObject({ group: 'fault', kind: 'Chain held',
+      quiet: [{ key: 'resume', label: 'Resume the chain', icon: 'play' }], chain: { id: 'acme/site#7', sequence: 9 } })
+    // ...in both directions: an unheld row beats a stale held page entry.
+    expect(chain('2026-11-13T11:00:00Z', null, null,
+      new Map([['acme/site#7', { sequence: 5, held: 'New invocations held by the person' }]]))).toMatchObject({ group: 'auto', kind: 'Behavior chain', quiet: undefined, chain: undefined })
   })
 
   it('reads pull requests’ status as a failed read when Poise could not read them, keeping what an unread organization had', () => {
@@ -291,8 +308,8 @@ describe('Answer here’s entries', () => {
   })
 
   it('puts a Behaviors diagnostic with whoever clears it', () => {
-    expect(diagnosticGroup('authentication', 'x')).toBe('needs-you')
-    expect(diagnosticGroup('github_access', 'x')).toBe('needs-you')
+    expect(diagnosticGroup('authentication', 'x')).toBe('fault')
+    expect(diagnosticGroup('github_access', 'x')).toBe('fault')
     for (const code of ['rate_limit', 'provider_capacity', 'network_interruption', 'upstream_unavailable', 'head_changed', 'approval_blocked_unresolved_conversations', 'datastore_stale', 'runtime_status_unknown']) expect(diagnosticGroup(code, 'x')).toBe('auto')
     expect(diagnosticGroup('unknown', STALLED_MESSAGE)).toBe('auto')
     for (const code of ['held_result', 'invalid_agent_result', 'runtime_unhealthy', 'review_contract_violation', 'review_budget_exhausted', 'unknown']) expect(diagnosticGroup(code, 'Command failed (1)')).toBe('fault')
@@ -329,7 +346,7 @@ describe('Answer here’s entries', () => {
       source: { sessionId: 'w1', title: 'W3', exists }, options: options ? [{ id: 'a', label: 'A', detail: null, recommended: true }] : [] }], role)[0]
     expect(decision(true, true)).toMatchObject({ dismissable: false, freeText: { label: 'Other' } })
     expect(decision(false, true)).toMatchObject({ dismissable: true, dismissWords: 'hides it from the Switchboard; the chat is told nothing' })
-    expect(decision(true, false).dismissable).toBe(true)
+    expect(decision(true, false)).toBeUndefined()
 
     const chain = itemEntries([{ id: 'chain:acme/site#7', group: 'needs', tone: 'amber', icon: 'held', title: 'acme/site#7 · repair-pr: uncertain', body: 'held', source: 'Behavior chain', scope: null,
       when: '2026-11-08T18:35:17.371Z', meta: 'No verified advance for 4d', details: [], behaviors: [], notice: null, chainJournal: '/api/behavior-chains?id=acme%2Fsite%237&after=4' } as NotificationItem], role,
@@ -341,7 +358,7 @@ describe('Answer here’s entries', () => {
     expect(diagnostic).toMatchObject({ dismissable: true, revision: '2026-11-12T10:00:00Z|Reviews time out' })
     const [thread] = threadEntries({ slug: 'doc', site: 'site', repo: 'acme/site', pr: 3, prUrl: 'u', checkedAt: null, active: true, stale: false, problems: [], openThreads: 1 },
       [{ id: 't1', kind: 'thread', repo: 'acme/site', site: 'site', pr: 3, prUrl: 'u', resolved: false, canReply: true, canResolve: true, messages: [{ author: 'ann', body: 'Typo', createdAt: '2026-11-12T09:00:00Z' }] }], (slug) => slug)
-    expect(thread).toMatchObject({ dismissable: true, revision: '1|2026-11-12T09:00:00Z', dismissWords: expect.stringContaining('the thread stays open on GitHub') })
+    expect(thread).toMatchObject({ group: 'auto', dismissable: true, revision: '1|2026-11-12T09:00:00Z', dismissWords: expect.stringContaining('the thread stays open on GitHub') })
 
     // A put-away entry stays away until what it reports changes; notices keep their own dismissal.
     const put = new Map([[chain.id, chain.revision], [diagnostic.id, 'an older occurrence']])

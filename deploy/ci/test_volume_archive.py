@@ -152,17 +152,17 @@ class VolumeArchiveTest(unittest.TestCase):
         with open(os.path.join(self.out, '.poise', 'token')) as file:
             self.assertEqual(file.read(), 'credential')
 
-    def test_archives_an_unreadable_database_as_it_is_and_says_so(self):
+    def test_refuses_an_unreadable_database_instead_of_copying_its_files(self):
         path = os.path.join(self.volume, 'broken.db')
         with open(path, 'wb') as file:
             file.write(b'SQLite format 3\x00' + b'\xff' * 200)
 
-        result = run_archiver(self.volume, self.archive)
-        extract(self.archive, self.out)
+        result = subprocess.run([sys.executable, ARCHIVER, self.volume, self.archive, OWNER],
+                                capture_output=True, text=True, timeout=5)
 
-        self.assertIn(f'{path}: SQLite cannot read it', result.stderr)
-        with open(os.path.join(self.out, 'broken.db'), 'rb') as file:
-            self.assertEqual(file.read(), b'SQLite format 3\x00' + b'\xff' * 200)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f'{path}: SQLite snapshot failed: file is not a database', result.stderr)
+        self.assertFalse(os.path.exists(self.archive))
 
     def test_refuses_a_host_fenced_database_instead_of_copying_live_files(self):
         path = os.path.join(self.volume, 'calls.sqlite3')

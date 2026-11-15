@@ -10,7 +10,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
-import { recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories } from './behavior-chain-report'
+import { implementationReportAdmission, recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories, waitForImplementationRechecks } from './behavior-chain-report'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
@@ -932,6 +932,18 @@ function isFileGroupBudgetExhaustion(call: LogEntry): boolean {
     && call.diagnostic.context.submission === 'none'
 }
 
+// A local inspection that hit the overall or provider-analysis ceiling stays
+// on its revision with its limiting phase. It still counts toward that
+// target's retry stop. Receipts without typed no-submission proof keep the
+// existing safe handling.
+function isLocalInspectionBudgetExhaustion(call: LogEntry): boolean {
+  return call.error_code === 'review_budget_exhausted'
+    && call.diagnostic?.operation === 'github-interface'
+    && (call.diagnostic.phase === 'overall' || call.diagnostic.phase === 'provider_analysis')
+    && call.diagnostic.outcome === 'timed_out'
+    && call.diagnostic.context.submission === 'none'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -941,6 +953,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // diagnostic takes precedence over provider-like text in older errors.
   if (call.diagnostic?.operation === 'github-interface' && call.diagnostic.phase === 'inspection'
     && call.diagnostic.outcome === 'timed_out') return null
+  if (isLocalInspectionBudgetExhaustion(call)) return null
   const account = reviewAccountFailure(call)
   if (account) return account
   const error = String(call.error || '')
@@ -3148,6 +3161,10 @@ function settleClaimAfterExit(
           const preflight503 = !call.error_code && /^(?:error: )?GitHub 503\b/.test(call.error)
             && call.action === 'not_started' && call.outcome === 'preflight_failed'
             && row.head_sha == null && row.review_id == null && row.review_comments == null && row.receipts == null
+          const authRejected = call.error_code === 'authentication_failed'
+            && call.action === 'not_started' && call.outcome === 'preflight_failed'
+            && call.diagnostic?.operation === 'provider.review' && call.diagnostic.context.submission === 'none'
+            && row.head_sha == null && row.review_id == null && row.review_comments == null && row.receipts == null
           let retryable503 = false
           if (preflight503) {
             // A single completion cannot prove remaining retry budget. Read
@@ -3170,7 +3187,7 @@ function settleClaimAfterExit(
               && !getMeta(repoHoldKey(claim.launchRepo, claim.launchActor))
               && !getMeta(`${REPO_ACCESS_HOLD_PREFIX}${claim.launchRepo.toLowerCase()}`)
           }
-          if (!timeout && !retryable503) { console.error(message); return }
+          if (!timeout && !retryable503 && !authRejected) { console.error(message); return }
           // Match periodic --diagnostics truncation and its 64 KiB envelope
           // fallback so delayed collection replays exactly.
           let error = typeof row.error === 'string' ? truncateCodePoints(row.error, 8192) : row.error
@@ -3922,7 +3939,10 @@ async function tickReviewNewPrs(): Promise<void> {
         if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
-        const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor)
+        const pwd = await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs',
+          repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: bundle.actor, phase: 'checkout',
+          expectedHead: bundle.expectedHead, progress: { slot, expectedHead: bundle.expectedHead } },
+        () => localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor, false))
         if (behaviorAborted() || !isRunnable('review-new-prs') || !prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
@@ -3941,15 +3961,50 @@ async function tickReviewNewPrs(): Promise<void> {
       } catch (err) {
         // A superseded spawn releases its claim like any other launch
         // failure; the exit settler tolerates the missing claim.
-        releaseOwnedClaim('review-new-prs', target, claimId)
-        releasePrOperationOwned(bundle.operationId)
-        if (behaviorAborted()) return
+        // Neither release may replace the failure below: child reporting
+        // is suppressed, so a throw here would erase the checkout cause
+        // the diagnostic attributes.
+        try {
+          releaseOwnedClaim('review-new-prs', target, claimId)
+        } catch (releaseError) {
+          console.error(`[behaviors] review-new-prs claim release failed for ${pr.repo}#${pr.number}:`, releaseError)
+        }
+        try {
+          releasePrOperationOwned(bundle.operationId)
+        } catch (releaseError) {
+          console.error(`[behaviors] review-new-prs operation release failed for ${pr.repo}#${pr.number}:`, releaseError)
+        }
         // A checkout failure leaves no worker behind its launch intent: the
         // claim above is released and the ledger records the preflight end.
+        // One attributed Error and a next-tick retry on timeout; other
+        // failures keep their backoff. Cancellation records nothing.
         if (!checkoutReady) {
-          captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
-            outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+          let retry: BehaviorFailureState | null = null
+          try {
+            try {
+              if (behaviorAborted()) return
+              if (err instanceof BehaviorLogFeedError) failure ??= err
+              else {
+                const timeout = isTimeoutCause(behaviorErrorMessage(err))
+                recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget,
+                  { actingAccount: bundle.actor, ...(timeout ? { noBackoff: true } : {}) })
+                retry = getBehaviorFailureState('review-new-prs', checkTarget)
+              }
+            } finally {
+              if (!behaviorAborted()) captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled',
+                stateSource: 'native', outcome: 'preflight_failed', head: bundle.expectedHead,
+                completedAt: new Date().toISOString() })
+            }
+          } finally {
+            if (!(err instanceof BehaviorLogFeedError) && !isAbortError(err)) {
+              const context = diagnosticIdentity(err)
+              diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err,
+                { ...context, ...context?.progress, timeoutMs: 30_000, retry })
+            }
+          }
+          return
         }
+        if (behaviorAborted()) return
         if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
@@ -4203,7 +4258,7 @@ function prReviewRetryState(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call))
   const timeouts = calls.filter((call) => call.model === model && budgetExhaustedProvenNoAction(call)
-    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call) || isLocalInspectionBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
   const stopped = timeouts.length >= 2 || retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
     claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head
@@ -4331,7 +4386,7 @@ function ensureBudgetStopHold(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call)
     && call.model === model && budgetExhaustedProvenNoAction(call)
-    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call) || isLocalInspectionBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
     .sort((a, b) => Date.parse(agentCallStartedAt(b)) - Date.parse(agentCallStartedAt(a)))
   const latest = timeouts[0]
@@ -7962,6 +8017,25 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       renewSeenOwned(claim.key, claim.target, claim.claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
       continue
     }
+    if (status === 'superseded'
+      && call.outcome === 'superseded'
+      && call.error_code === 'review_target_closed'
+      && call.action === null
+      && call.head_sha === null
+      && call.receipts == null
+      && Number.isFinite(Date.parse(call.completed_at || ''))
+      && unambiguousAgentCall(snapshot, call)) {
+      // Caller proved seed closure, not a no-publication outcome. Keep
+      // the terminal launch and Caller receipt evidence; do not release
+      // its seen marker or infer that a conflicting worker stopped.
+      if (completeClaimSafely(claim, call.error || 'review target closed')) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'superseded', activity: 'settled', stateSource: 'native',
+          outcome: 'review_target_closed', completedAt: call.completed_at })
+        clearBehaviorFailureKeepHold(ISSUES_KEY, claim.target)
+      }
+      continue
+    }
     const message = `unrecognized agent call status "${status || 'missing'}"`
     if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message, claim.target)
   }
@@ -8555,12 +8629,16 @@ async function runBehaviorChains(): Promise<void> {
       wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
     })
     runtime = new BehaviorChainRuntime(behaviorChainJournal(), { ...operations,
+      implementationAdmission: (chain, observation) => implementationReportAdmission(db, behaviorChainJournal(), chain, observation, async source => {
+        await requireFreshDatastore()
+        return operations.observe(source)
+      }),
       permitted: (chain, decision) => !repairReportImplementationFence(db, chain, decision.behavior) && operations.permitted(chain, decision),
       recoverReport: (chain, observation) => recoverReportedRepair(db, behaviorChainJournal(), chain, observation, async target => {
         await requireFreshDatastore()
         return operations.observe(target)
       }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
-        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled),
+        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled, behaviorAbortController?.signal),
       reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {
         await requireFreshDatastore()
         return operations.observe(chain)
@@ -9202,6 +9280,7 @@ export async function stopBehaviorsRuntime(): Promise<void> {
   behaviorAbortController?.abort()
   behaviorAbortController = null
   await Promise.allSettled([...behaviorOperationTails.values(), ...closedTargetReconciliations.values()])
+  await waitForImplementationRechecks()
   // Detached workers survive Poise itself, but spawn acceptance is not proof
   // of a successful side effect. Leave launched claims with their durable
   // identity so a later runtime reconciles exact log status before retrying;

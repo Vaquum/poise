@@ -892,6 +892,11 @@ depends on the others:
   ends itself within seconds of its next message going unanswered. A gateway that
   restarts ends every box it finds no run for, and does so again every 15 seconds.
 
+The relay keeps one cancellation request in flight per job, with a ten-second
+deadline. Failures and timeouts retain the cancellation-failure warning, and a
+later sweep retries an owned job that Render still lists. Run retirement frees
+its admission slot immediately, without waiting for cancellation.
+
 **When there is no result.** A suite can be too big for its box, by running out of
 memory or passing the time limit, and the box can also fail to start, the checkout
 can fail to arrive, or Render can be down. The agent's command then says on stderr
@@ -907,6 +912,11 @@ The runner prints the captured-candidate digest and suite, then the existing run
 at each admission, so observed failures can name the attempt that produced them.
 The digest covers the original command specification and uncompressed captured
 tar bytes, including uncommitted edits, on both dependency-cache upload routes.
+For the full Caller pytest gate, a completed failure also ends with one bounded,
+redacted summary of the first failure or setup error, its test and the original
+candidate digest and run ID. Atomic workers put that summary first in `blocked`,
+so the original Call's retained `diagnostic.stderr` survives console truncation.
+Later runs keep their own identities and cannot replace that completed failure.
 For new atomic Calls, completed direct Vitest assertion failures would retain
 bounded gateway-authenticated evidence before the relay deletes their run, but
 recovery is currently held for #1619: candidate-controlled reports cannot
@@ -1094,8 +1104,11 @@ Poise's menu (☰) says which commit a workspace runs, linked to it on
 autonomio/poise, and when the workspace was updated to it, as in
 `46815bf · 9 Oct 21:40`.
 
-An upgrade that changes the system itself, the files under `deploy/runtime/`,
-gets a new container instead. The gateway drains a running workspace first:
+An upgrade that changes the runtime recipe or the locked `playwright-core`
+version or integrity gets a new container instead, so Chromium and its system
+libraries match the new checkout. Unrelated lockfile changes keep the same
+base. Existing images take one replacement when this expanded fingerprint is
+introduced. The gateway drains a running workspace first:
 the workspace refuses new Chat turns and agent launches, which then answer
 that Poise is installing an update, and lets running work finish. In an ordinary
 drain, one Chat turn holds the drain at most 30 minutes: past that the workspace stops it
@@ -1237,8 +1250,10 @@ starts a stopped workspace on its owner's next visit. The script checks Docker's
 inventory before and after each volume. A failed inventory or safety check
 removes the entire new backup directory, including
 archives already completed. Live `runc` volumes still support the nightly command
-above without stopping the gateway. A busy or locked SQLite snapshot aborts the
-backup; it never falls back to copying that live database's files.
+above without stopping the gateway. Any failed SQLite snapshot, including an
+unreadable database or a busy or locked snapshot, aborts the backup and removes
+the entire new backup directory. The error names the database path and SQLite
+cause; it never falls back to copying that database's files.
 
 ## Live Caller diagnostics under gVisor
 
@@ -1460,15 +1475,28 @@ receipt, process-witness and pinned-directory cleanup path.
 
 Settings → General reads a cached storage summary: one scan answers
 concurrent requests, and its observation answers Settings opens for 60
-seconds. Each read walks at most 100,000 entries or 5 seconds across every
-category; a category past either bound reports partial (a measured prefix)
+seconds. Each read examines at most 100,000 entries/directory reads or 5 seconds across every
+category, including validation; a category past either bound reports partial (a measured prefix)
 or unavailable, while a missing directory still reads as zero. When a
 refresh fails, the panel keeps the last update, marked stale with its age
 and the refresh error; a failed first read, and a read that never answers
 within 15 seconds, show an error instead. Partial, stale and failed reads
-offer Retry, which re-measures at once (`GET /api/storage?fresh=1`). A
-completed maintenance run drops the cached summary, so the next open
-measures the reclaimed space.
+offer Retry (`GET /api/storage?fresh=1`). Retry and cache expiry resume the
+unfinished in-memory measurement, including unread entries within a wide
+directory; after completion the next refresh starts a new measurement. The
+displayed update time remains the start of the measurement while earlier
+totals are reused.
+
+Before a category is complete, a bounded second pass checks the identity,
+size, mode and modification/change times of every counted descendant. A
+detected change or read error keeps the category incomplete and is reported
+until a successful reread; its next retry restarts that category. This is a
+live-tree observation, not an atomic snapshot: changes after an entry's final
+validation, or after a category finishes while others continue, are measured
+on the next measurement. A completed maintenance run discards both the cached
+summary and unfinished progress, closes retained directory handles, and marks
+already-pending replies stale and incomplete. The next open measures the
+reclaimed space.
 
 Shared checkout coordination and provider state are retained, independently of
 age. The existing bounded storage scan includes the global lease directory,

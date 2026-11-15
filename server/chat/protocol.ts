@@ -182,6 +182,8 @@ export interface SessionRecord {
   lastSeq: number
   /** Unanswered permission/question requests, by id. */
   pendingRequests: string[]
+  /** The pending requests addressed to the workspace owner. */
+  ownerRequests?: string[]
   forkedFrom?: string
   /** The chat that created this one through the control create operation, frozen at creation. Never copied by fork. */
   createdBy?: ChatActor
@@ -487,6 +489,7 @@ export type ChatEvent =
   | { type: 'permission.requested', id: string, turnId: string, toolId?: string, title: string, description?: string, input?: unknown, options: PermissionOption[] }
   | { type: 'permission.resolved', id: string, optionId: string, by: 'user' | 'session' | 'auto_merge' | 'unrestricted' | 'cancelled' }
   | { type: 'question.asked', id: string, turnId: string, toolId?: string, questions: Question[] }
+  | { type: 'question.escalated', id: string, reason: string }
   | { type: 'question.answered', id: string, answers: Record<string, string | string[]>, by: 'user' | 'chat' | 'cancelled', fromSession?: string, source?: ChatActor }
   | { type: 'commands.updated', commands: CommandOption[] }
   | { type: 'mode.updated', mode: string, modes: ModeOption[] }
@@ -640,7 +643,7 @@ export interface SwitchboardItem {
   id: number
   kind: SwitchboardKind
   /** The chat the update is about: its live identity, or what it was when deleted. */
-  source: { sessionId: string, title: string, agent: AgentId, model: string, exists: boolean
+  source: { sessionId: string, title: string, agent: AgentId, model: string, exists: boolean, managed?: true
     /** For an open decision: turns the chat has started since it asked. */
     turnsSince?: number }
   /** The transcript event the update rests on. */

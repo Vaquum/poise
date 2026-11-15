@@ -105,7 +105,7 @@ export const SETTINGS: Registry = {
 
     /* ---------- General: Notifications ---------- */
     'set.notifications': {
-      name: 'Notifications', kind: 'Setting', what: 'Alerts for sign-ins, failed behaviors, chats waiting for you and pull requests ready to merge.',
+      name: 'Notifications', kind: 'Setting', what: 'Alerts for sign-ins, failed behaviors, open requests and GitHub status.',
       does: 'A pull request ready to merge reminds you every 15 minutes until it is merged or silenced.',
       now: nowOf, values: [['On', 'Default.'], ['Off', 'Stops notices and the check of pull requests at once. Answer here keeps Behaviors’ activity and your chats’ requests, and says that this is off.']],
       scope: 'Everywhere: kept by the server, which runs the checks whether or not a page is open.', when: 'Applies now, in every browser.', unchanged: 'Behaviors’ diagnostics, and Poise Link’s other alerts.'
@@ -155,7 +155,7 @@ export const SETTINGS: Registry = {
     'set.agents': { name: 'Agent sign-ins', kind: 'Setting', what: 'Each agent CLI and whether it is signed in. Chats, reviews and behaviors run on these sign-ins.', now: nowOf, source: 'Each CLI’s own status command, checked when you open this section.' },
     'set.agent.row': {
       name: 'Agent', kind: 'Display', what: 'One agent CLI: the command it signs in with, its version, and what its status command says.', now: itemNow,
-      values: [['Signed in as …', 'Ready to run.'], ['Signed in here', 'Signed in through Poise; the CLI cannot confirm it.'], ['Not signed in', 'Needs you: nothing runs on it until you Connect.'], ['Not installed', 'Not on this workspace.'], ['Running', 'A sign-in terminal is waiting for you.']]
+      values: [['Signed in as …', 'Ready to run.'], ['Signed in here', 'Signed in through Poise; the CLI cannot confirm it.'], ['Not signed in', 'Connect to run work on it.'], ['Not installed', 'Not on this workspace.'], ['Running', 'A sign-in terminal is waiting for you.']]
     },
     'set.agent.connect': {
       name: 'Connect', kind: 'Action', what: 'Opens a terminal under this agent that runs its sign-in command.', does: 'Finish in the browser it opens; the terminal says when you are signed in.',
@@ -249,7 +249,7 @@ export const SETTINGS: Registry = {
 
     /* ---------- Extensions ---------- */
     'set.ext.installed': { name: 'Servers by workspace', kind: 'Setting', what: 'Every MCP server you added, and the workspaces whose chats get it.', does: 'Each switch saves itself. A workspace is the repository a chat works in; chats without one share Poise · local.', when: 'From each chat’s next turn. A turn already running keeps the tools it started with.', source: 'Kept in Poise; secrets live only in the workspace database and are never sent back.' },
-    'set.ext.row': { name: 'Server', kind: 'Display', what: 'A server, how it connects, whether its last check connected, and where it is on.', now: (el: HTMLElement) => el.closest<HTMLElement>('[data-x]')?.dataset.now || '', values: [['Connected', 'The last check connected; it says how many tools it offers.'], ['Needs you', 'It asks for a sign-in; Sign in opens the provider.'], ['Failed', 'The last check did not connect, and says why.'], ['Running', 'A check, sign-in or removal is under way.']] },
+    'set.ext.row': { name: 'Server', kind: 'Display', what: 'A server, how it connects, whether its last check connected, and where it is on.', now: (el: HTMLElement) => el.closest<HTMLElement>('[data-x]')?.dataset.now || '', values: [['Connected', 'The last check connected; it says how many tools it offers.'], ['Needs sign-in', 'Sign in opens the provider.'], ['Failed', 'The last check did not connect, and says why.'], ['Running', 'A check, sign-in or removal is under way.']] },
     'set.ext.cell': { name: 'On in this workspace', kind: 'Setting', what: 'Whether chats in this workspace get this server.', values: [['On', 'Delivered before each turn.'], ['Off', 'Not delivered.']], when: 'From each chat’s next turn.', unchanged: 'Other workspaces. New workspaces covers only ones chats have not used yet.' },
     'set.ext.space': { name: 'Workspace', kind: 'Display', what: 'A repository chats work in. The columns are the most recently used, Poise · local, and any with a switch of its own.' },
     'set.ext.new': { name: 'New workspaces', kind: 'Setting', what: 'The switch for workspaces chats have not used yet.', unchanged: 'The workspaces already shown, which keep their own switches.' },
@@ -274,7 +274,7 @@ export const SETTINGS: Registry = {
     'set.ext.tools': { name: 'Tools', kind: 'Display', what: 'The tools the last check listed, as agents name them: mcp__name__tool.', unavailable: () => 'Tools appear after a successful check.' },
     'set.ext.activity': { name: 'Activity', kind: 'Display', what: 'The server’s last 100 events: added, edited, checked, signed in, and delivered to which chat or not, and why.' },
     'set.ext.edit': { name: 'Edit', kind: 'Action', what: 'Opens the server in the form below. A secret is replaced only when you type a new one.', unchanged: 'Its name for agents, so the tools they know keep their names; for a directory server, how it runs.', when: 'From each chat’s next turn.' },
-    'set.ext.signout': { name: 'Sign out', kind: 'Action', what: 'Forgets this server’s sign-in.', shows: 'Needs you: sign in to use it.', unchanged: 'The server and its switches; chats lose its tools from their next turn until you sign in again.' },
+    'set.ext.signout': { name: 'Sign out', kind: 'Action', what: 'Forgets this server’s sign-in.', shows: 'Needs sign-in.', unchanged: 'The server and its switches; chats lose its tools from their next turn until you sign in again.' },
     'set.ext.rdc': { name: 'Pairing your computers', kind: 'Display', what: 'Remote Desktop Commander reaches the computers you pair with it. They are managed and revoked on its dashboard, not in Poise.' },
     'set.ext.setup': { name: 'Set up', kind: 'Display', what: 'Only what this entry declares: how to run it, when it offers more than one way, and the values it needs. Secret values are stored write-only.' },
     'set.ext.option': { name: 'How to run it', kind: 'Control', what: 'The entry’s remote endpoint or its package.', unavailable: (el: HTMLElement) => el.dataset.why || 'Poise cannot run this option.' },
@@ -294,13 +294,13 @@ export const SETTINGS: Registry = {
     'set.sites': { name: 'Sites', kind: 'Setting', what: 'The sites Editor publishes to, each a GitHub repository.', now: nowOf, source: 'Each repository’s publish.yaml, or a description kept here.' },
     'set.site.row': {
       name: 'Site', kind: 'Display', what: 'A site, its repository, and whether Editor can publish to it.', now: itemNow,
-      values: [['Ready', 'Its repository’s publish.yaml reads.'], ['Ready · described here', 'Described in Poise, because the repository has no publish.yaml.'], ['Needs you', 'No publish.yaml yet: Describe it here.'], ['Running', 'Poise is reading the repository.']]
+      values: [['Ready', 'Its repository’s publish.yaml reads.'], ['Ready · described here', 'Described in Poise, because the repository has no publish.yaml.'], ['Missing publish.yaml', 'Describe the site here.'], ['Running', 'Poise is reading the repository.']]
     },
     'set.site.describe': { name: 'Describe', kind: 'Action', what: 'Opens this site’s publish.yaml, kept in Poise, under the site.', does: 'It is saved only when it reads; an error names the key.' },
     'set.site.save': { name: 'Save', kind: 'Action', what: 'Saves the description if it reads.', shows: 'Ready · described here, or the error under the box.', unchanged: 'The repository.' },
     'set.site.remove': { name: 'Remove', kind: 'Action', what: 'Removes this site from Editor’s choices.', unchanged: 'Pieces already published there, and the repository.', when: 'After you confirm with “Sure?”; Undo stays for eight seconds.' },
     'set.site.input': { name: 'Repository', kind: 'Control', what: 'owner/repository, or the repository’s GitHub address.', does: 'Enter adds it.' },
-    'set.site.add': { name: 'Add site', kind: 'Action', what: 'Adds this repository as a site.', shows: 'Running while Poise reads it, then Ready, or Needs you with Describe.' },
+    'set.site.add': { name: 'Add site', kind: 'Action', what: 'Adds this repository as a site.', shows: 'Running while Poise reads it, then Ready or a reason it could not read.' },
 
     /* ---------- Publishing: Google Docs ---------- */
     'set.gdocs': { name: 'Google accounts it publishes to', kind: 'Setting', what: 'The Google accounts Editor can publish a document to, each as a private Markdown file in that account’s My Drive.', now: nowOf, scope: 'Every document, from Editor’s Publish; one file per account per document.', source: 'The same accounts as Accounts → Google.' },

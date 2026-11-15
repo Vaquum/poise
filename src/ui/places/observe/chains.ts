@@ -4,6 +4,7 @@
 // projection's order, and the journal's events in words. Nothing here reads
 // the network or the page, so the unit tests read it directly.
 import type { BehaviorCutoverState } from '../../../behavior-cutover'
+import type { ChainNudge, ChainWorkLink } from '../../../behavior-chain-nudge'
 
 export type StateKey = 'running' | 'needs-you' | 'waiting' | 'blocked' | 'idle' | 'done' | 'failed'
 
@@ -60,6 +61,7 @@ export interface AttentionRow {
   blocker: string
   evidence: { state: string, checkedAt: number | null, gates: string[] }
   nextAction: string
+  nudge?: ChainNudge | null
   retryAt: number | null
   reconciliation: { nextObservationAt: number | null, waitingForResourceRelease: boolean }
   journal: string
@@ -159,9 +161,39 @@ function attentionRow(value: unknown): AttentionRow {
     pullNumber: Number.isSafeInteger(value.pullNumber) ? Number(value.pullNumber) : null,
     step: String(value.step ?? ''), progressAt: Number(value.progressAt), ageMs: Number(value.ageMs), blocker: String(value.blocker ?? ''),
     evidence: { state: String(e.state ?? 'unavailable'), checkedAt: count(e.checkedAt), gates: Array.isArray(e.gates) ? e.gates.map(String) : [] },
-    nextAction: String(value.nextAction ?? ''), retryAt: count(value.retryAt),
+    nextAction: String(value.nextAction ?? ''), retryAt: count(value.retryAt), nudge: readNudge(value.nudge),
     reconciliation: { nextObservationAt: count(r.nextObservationAt), waitingForResourceRelease: r.waitingForResourceRelease === true },
     journal: value.journal,
+  }
+}
+
+function readNudge(value: unknown): ChainNudge | null {
+  if (!object(value) || typeof value.action !== 'string') return null
+  const { kind, action } = value
+  if (kind !== 'automatic' && kind !== 'prerequisite' && kind !== 'decision' && kind !== 'reconcile' && kind !== 'unknown') return null
+  const prerequisite = typeof value.prerequisite === 'string' && REPOSITORY.test(value.prerequisite.split('#')[0])
+    && /^[^#]+#[1-9]\d*$/.test(value.prerequisite) ? value.prerequisite : null
+  let work: ChainWorkLink | null = null
+  if (object(value.work)) {
+    if (value.work.kind === 'chat' && typeof value.work.session === 'string' && value.work.session) {
+      work = { kind: 'chat', session: value.work.session, manager: value.work.manager === true }
+    } else if (value.work.kind === 'pull' && typeof value.work.url === 'string'
+      && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(value.work.url)) {
+      work = { kind: 'pull', url: value.work.url }
+    }
+  }
+  return { kind, action, prerequisite, work }
+}
+
+export function attentionRoot(id: string, byId: ReadonlyMap<string, AttentionRow>): string {
+  const visited = new Set([id])
+  let root = id
+  for (;;) {
+    const next = byId.get(root)?.nudge?.prerequisite
+    if (!next || !byId.has(next)) return root
+    if (visited.has(next)) return id
+    visited.add(next)
+    root = next
   }
 }
 
@@ -263,7 +295,7 @@ export function taskState(chain: ChainRow): { state: StateKey, reason: string } 
     if (chain.reviewStatus === 'not-recorded') return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · pre-merge review completion not recorded` }
     return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)}` }
   }
-  if (chain.held) return { state: 'needs-you', reason: chain.held === 'New invocations held by the person' ? 'Held by you: no new invocations' : `Held: ${reasonWords(chain.held)}` }
+  if (chain.held) return { state: 'blocked', reason: chain.held === 'New invocations held by the person' ? 'Held by you: no new invocations' : `Held: ${reasonWords(chain.held)}` }
   const active = chain.invocations.find((i) => i.state !== 'settled')
   if (active?.state === 'uncertain') return { state: 'blocked', reason: `Not confirmed: ${active.outcome || 'the original receipt is unverified'}; reconciling` }
   if (active?.state === 'started') {

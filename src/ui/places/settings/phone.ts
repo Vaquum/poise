@@ -72,7 +72,7 @@ export function phoneSection(account: GatewayAccount): PhoneSection {
     const busy = deciding === code.id
     const error = decideError?.id === code.id ? `<p class="fsub is-err">${esc(decideError.message)}</p>` : ''
     return `<div class="ph-request" data-ref="set.phone.request">
-      <div class="ph-line">${stateHTML('needs-you')}<span class="ph-lead"><b>${esc(code.device ?? 'A phone')}</b> wants to sign in as <b>${esc(account.login)}</b>.</span></div>
+      <div class="ph-line"><span class="ph-lead"><b>${esc(code.device ?? 'A phone')}</b> wants to sign in as <b>${esc(account.login)}</b>.</span></div>
       <p class="fsub">It opened the code ${esc(moment(code.scannedAt ?? code.createdAt))}. Approve only a phone you are holding.</p>
       <div class="fbtns">
         ${button('approve', busy ? 'Approving…' : 'Approve', 'set.phone.approve', 'primary', busy, code.id)}
