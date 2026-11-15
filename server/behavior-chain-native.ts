@@ -144,7 +144,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
     readInvocations: readNativeInvocations,
-    async observe(chain): Promise<ChainObservation> {
+    async observe(chain, verifyConflict): Promise<ChainObservation> {
       if (!ownsRepository(chain.repository)) throw new Error('behavior chain organization is no longer followed')
       const actor = ['--token-user', chain.author]
       const issueRef = `#${chain.issue}`
@@ -160,6 +160,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // loses budget; any facet failure still fails the whole observation.
       const [seed, roster] = await Promise.all([
         github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch,
+          ...(verifyConflict ? ['--verify-conflict'] : []),
           ...(testProof ? ['--test-dependency-json', JSON.stringify(testProof)] : []), ...actor], 3 * 2 * 1024 * 1024),
         hooks.roster(chainKey),
       ])
@@ -388,6 +389,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         // The existing readiness primitive already applies the repository's
         // queue policy: BEHIND needs a base update only without a merge queue.
         conflict: ci.mergeable === false, behind: ci.mergeable_state === 'behind' && readiness.blockers.includes('merge_state_not_clean') }
+      if (verifyConflict && publication.conflict_base !== undefined) {
+        const base = sha(publication.conflict_base, 'verified conflict base')
+        if (publication.base_sha !== base || observation.publication.head_sha !== head || observation.publication.pull_number !== number
+          || state.state !== 'open' || observation.publication.state !== 'open') throw new Error('Conflict proof differs from the observed PR, head or base')
+        observation.conflictBase = base
+      }
       if (baseUpdateFrom) {
         if (ci.repository !== chain.repository || readiness.repository !== chain.repository || readiness.pull_number !== number
           || ci.ref !== head || observation.publication.head_sha !== head || !('base_update' in ci)) {

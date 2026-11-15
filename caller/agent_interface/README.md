@@ -42,10 +42,14 @@ continues to use the original response bytes before the CLI's trailing newline.
 # Inspecting failed unpublished source
 
 For a managed `implement_issue`, the test-offload runner hands Caller the original
-archive and command specification after a completed nonzero suite exit, before
-deleting that archive. Caller verifies their combined candidate digest and
-checkout binding, then retains only changes against the prepared base: tracked
-files (including deletions) and new source files present in that archive. Ignored
+archive and command specification after a completed nonzero suite exit or an
+interrupted validation that reported a Vitest assertion. For interrupted
+validation it keeps the producing run's ID across relay recovery and gives
+Caller up to 15 seconds before deleting the archive. The private manifest
+marks that capture with `"validation": "interrupted"`, and the command still
+returns its no-result disposition. Caller verifies the combined candidate
+digest and checkout binding, then retains only changes against the prepared
+base: tracked files (including deletions) and new source files in that archive. Ignored
 dependencies, Git metadata and other untracked files are excluded. Symlinks retain
 their target text without following it. Unsupported or mismatched captures are
 unavailable; no cleanup-time diff substitutes for them.
@@ -92,12 +96,23 @@ used. Externally managed Chat turns retain Poise's existing Stop route.
 Interruption reconciliation checks the original supervisor's process identity.
 Only a reader that can observe the current workspace supervisor can reconcile
 a previous workspace epoch. A reader in a private PID namespace cannot do so.
+Identified legacy Calls remain running while their supervisor is alive or its
+epoch is unobservable to that reader. Same-epoch supervisor loss retains the
+six-hour orphan grace because providers can outlive it. An authorized workspace
+observer can recognize a replacement from a prior boot or an older PID
+namespace init on the same boot. Missing or unverified identities retain the
+historical init/age/command rule only for an authorized workspace observer.
+Reaper decisions retain a bounded reason, observer scope and identity result
+in `diagnostic` (under `reaper` when an earlier diagnostic is present), without
+raw process or environment data.
 Existing resource and publication receipts still govern recovery.
 
 New native registrations use process identity version 2. An older Caller
 still running through a workspace update cannot reap these registrations.
 The current Caller continues to read version 1 identities and settle their
-original Calls.
+original Calls. Legacy protection covers updated observers reading those older
+registrations; rollout must exclude unpatched legacy reapers. A prior executable
+that ignores legacy identity can still interrupt them.
 
 Native per-Call resource receipts live in `resource_ownership`, outside the
 replaceable publication artifact. Directory registration precedes allocation;

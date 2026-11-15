@@ -951,6 +951,14 @@ comment must supply that diagnosis. Creation, labeling, review completion or
 closure alone cannot admit recovery. The explanation remains worker-reported;
 the source repair verifies it.
 
+A settled report implementation refused before publication can also leave a
+receipted review of a source merge conflict. Recovery verifies the prerequisite
+named in the refusal on the current base and independently checks the exact
+source head against that base. A report removed from intake can supply this
+review while its own implementation stays fenced. The conflict base and
+prerequisite delivery are bound to the diagnosis and checked again after repair
+preparation. A resolved conflict, changed base or missing evidence keeps the wait.
+
 The original seed and branch remain unchanged. The existing `--note` carries the
 diagnosis, original Call, report reference and configured accounts' report guidance
 into exact-head repair preparation. The existing journal retains one recovery
@@ -1006,7 +1014,19 @@ disposition returns to the ordinary quiescent cadence; operator holds retain it.
 
 These pre-PR implementation-hold reports require explicit triage before their
 own implementation can prepare or start. A posted issue review alone cannot
-authorize implementation. Through the existing guarded `/api/behavior-chains`
+authorize implementation. This includes follow-up reports keyed by their original
+invocation and hold sequence, even after a lost creation acknowledgement or restart.
+After a lost acknowledgement, admission binds the earliest issue by the original
+source author whose GitHub creation body begins with the exact marker. A later
+issue can quote the marker without taking the binding. Missing or incomplete
+creation evidence for a possible report keeps its admission waiting.
+An independently authored markerless remedy verified against the source's blocked-by
+relationship and original failing file and test case retains ordinary intake.
+That path is only for intents the reporter linked as remedies: an issue the
+reporter created stays gated even if its marker is later removed.
+Intents stored before the adoption record verify independence by the
+remedy predating the source hold.
+Through the existing guarded `/api/behavior-chains`
 control, the workspace owner records `source-only` or `distinct-fix`, with a
 diagnosis and next action. Read `GET /api/behavior-chains?id=OWNER/REPO%23N` for
 the report chain's current sequence and `implementationReport` binding, then

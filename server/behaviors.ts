@@ -8773,9 +8773,9 @@ async function runBehaviorChains(): Promise<void> {
         return operations.observe(source)
       }),
       permitted: (chain, decision) => !repairReportImplementationFence(db, chain, decision.behavior) && operations.permitted(chain, decision),
-      recoverReport: (chain, observation) => recoverReportedRepair(db, behaviorChainJournal(), chain, observation, async target => {
+      recoverReport: (chain, observation) => recoverReportedRepair(db, behaviorChainJournal(), chain, observation, async (target, verifyConflict) => {
         await requireFreshDatastore()
-        return operations.observe(target)
+        return operations.observe(target, verifyConflict)
       }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
         && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled, behaviorAbortController?.signal),
       reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {

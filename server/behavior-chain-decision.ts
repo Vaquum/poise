@@ -31,6 +31,7 @@ export interface ChainObservation extends Record<string, unknown> {
     recheck?: string,
     recovery?: { merge: string, base: string, run: Record<string, unknown> } }
   prerequisites?: { wait: string | null, base: string | null, evidence: Record<string, unknown>[] }
+  conflictBase?: string
   ciBaseUpdate?: { from: string, head: string, base: string, tree: string }
   fullSuite?: Record<string, unknown>
   remediation?: Record<string, unknown>
