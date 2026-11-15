@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 from pathlib import Path
 
@@ -25,7 +26,8 @@ async def run(client, payload):
         raise RuntimeError("review checkout merge base differs from the PR packet")
     trees = await asyncio.gather(*(client.get(f"/repos/{owner}/{repo}/git/trees/{sha}", params={"recursive": 1})
                                    for sha in (head, merge_base)))
-    info = await asyncio.to_thread(checkout, owner, repo, head, merge_base, client.token, path, *trees)
+    options = {"diff_files": json.loads(payload["diff_files_json"])} if payload.get("diff_files_json") is not None else {}
+    info = await asyncio.to_thread(checkout, owner, repo, head, merge_base, client.token, path, *trees, **options)
     try:
         latest = await get_pull(client, owner, repo, number)
         if latest["head"]["sha"] != head or latest["base"]["sha"] != base:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shlex
 
-from . import atoms, review_receipt
+from . import atoms, review_continuation, review_receipt, review_repository
 from . import review_cap as followup
 from .pr_review import VERIFY_FIXES
 
@@ -134,6 +134,8 @@ def run(
     review_cap: int | None = None,
     review_scope: str = "",
 ) -> str:
+    if capped and review_continuation.enabled():
+        raise atoms.AgentPreflightError("review continuation requires an uncapped review round")
     if capped and (review_round is None or review_cap is None):
         raise ValueError("a capped approval round needs its round and cap numbers")
     spec = atoms.CATALOG.review_model("pr_approve", model)
@@ -142,6 +144,8 @@ def run(
     # the whole PR again. The same head (or no prior review) reviews everything.
     since = atoms.last_reviewed_head(pwd, pr, actor)
     if since is not None and since == expected_head.strip().lower():
+        since = None
+    if review_continuation.enabled():
         since = None
     lost_since = None
     try:
@@ -165,6 +169,8 @@ def run(
         # follow-up issue and approves only explicitly nonbreaking findings.
         policy = POLICY if spec.provider == "claude" else atoms.STRUCTURED_POLICY
         rules = RULES
+    if review_continuation.enabled():
+        policy += " " + review_repository.REQUEST_POLICY
     text = atoms.prompt(
         policy,
         SEVERITY,
@@ -177,6 +183,13 @@ def run(
     if lost_since is not None:
         text += (f"\n\nThe last reviewed head ({lost_since}) is no longer fetchable; "
                  "this round reviews the full diff instead.")
+    if review_continuation.enabled():
+        with review_repository.prepare(pwd, pr, actor, expected_head, packet_text) as repository:
+            return atoms.run_agent(pwd, SYSTEM + " " + review_repository.POLICY,
+                text + repository.prompt(), tools, "pr_approve", timeout_s,
+                model=spec.identity, pr=pr, actor_name=actor, head=expected_head, repository=repository,
+                packet=packet_text, note=note, capped=capped, review_round=review_round,
+                review_cap=review_cap, review_scope=review_scope)
     return atoms.run_agent(
         pwd, SYSTEM, text, tools, "pr_approve", timeout_s,
         model=spec.identity, pr=pr, actor_name=actor, head=expected_head,

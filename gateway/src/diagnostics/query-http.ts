@@ -2,7 +2,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { LogPolicy } from './store.js'
 import { EVENT_ID, LoggingQueryError, parseLoggingQuery } from './query-parser.js'
 import type { LoggingQueryPool } from './query-pool.js'
-import type { LoggingRead } from './query-types.js'
+import { LOGGING_QUERY_MS, type LoggingRead } from './query-types.js'
+import type { HandoffCandidate } from './query-handoff.js'
 
 interface QueryHost {
   pool: LoggingQueryPool
@@ -12,12 +13,14 @@ interface QueryHost {
   isAdmin: boolean
   now: number
   audit: (scope: string, operation: string) => void
+  handoffs?: (candidates: HandoffCandidate[], signal: AbortSignal) => Promise<string[]>
 }
 
 export async function serveLogging(req: IncomingMessage, res: ServerResponse, url: URL, route: string, host: QueryHost): Promise<void> {
   let release: (() => void) | null = null
+  let timer: ReturnType<typeof setTimeout> | undefined
   const abort = new AbortController()
-  const finish = () => { abort.abort(); release?.(); release = null }
+  const finish = () => { clearTimeout(timer); abort.abort(); release?.(); release = null }
   res.once('finish', finish)
   res.once('close', finish)
   req.once('aborted', finish)
@@ -50,7 +53,33 @@ export async function serveLogging(req: IncomingMessage, res: ServerResponse, ur
     const path = host.path
     if (!path) throw new LoggingQueryError(503, 'logging_unavailable', 'Diagnostic collection has not started.')
     if (scope === 'instance') host.audit(scope, operation)
-    const lease = await host.pool.read({ path, policy: host.policy, now: host.now, access, operation, filter, eventId }, host.workspace, abort.signal,
+    const request: LoggingRead = { path, policy: host.policy, now: host.now, access, operation, filter, eventId }
+    if (host.handoffs && operation !== 'health') {
+      timer = setTimeout(() => {
+        // The budget can expire mid-stream: a stalled half-sent response is
+        // destroyed instead of only releasing the pool timeout that would do it.
+        if (res.headersSent && !res.writableFinished) res.destroy()
+        else answer(503, { error: 'logging_query_timeout', message: 'The diagnostic query exceeded its two-second response budget.' })
+        finish()
+      }, LOGGING_QUERY_MS)
+      const candidates = await host.pool.read({ ...request, operation: 'handoffs' }, host.workspace, abort.signal, () => abort.abort())
+      let snapshot: { high: number; candidates: HandoffCandidate[] }
+      try { snapshot = JSON.parse(candidates.reply.body) as typeof snapshot } finally { candidates.release() }
+      const warnings: string[] = []
+      try {
+        for (let start = 0; start < snapshot.candidates.length; start += 10) {
+          const batch = snapshot.candidates.slice(start, start + 10)
+          const confirmed = await host.handoffs(batch, abort.signal)
+          if (!Array.isArray(confirmed) || confirmed.some(id => !batch.some(candidate => candidate.id === id))) throw new Error('Invalid handoff evidence response')
+          warnings.push(...confirmed)
+        }
+      } catch {
+        // Missing owner evidence retains source severity for the whole snapshot.
+        warnings.length = 0
+      }
+      request.classification = { high: snapshot.high, warnings }
+    }
+    const lease = await host.pool.read(request, host.workspace, abort.signal,
       () => { if (res.headersSent && !res.writableFinished) res.destroy() })
     release = lease.release
     if (res.destroyed || abort.signal.aborted) { release(); return }

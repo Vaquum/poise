@@ -36,3 +36,31 @@ it('holds admission through real HTTP backpressure and releases abandoned export
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
 })
+
+it('destroys a stalled mid-stream response when the query budget expires', async () => {
+  const pool = new LoggingQueryPool({ workerUrl: new URL('./fixtures/logging-worker.mjs', import.meta.url) })
+  const replies: ServerResponse[] = []
+  const server = createServer((req, res) => {
+    replies.push(res)
+    void serveLogging(req, res, new URL(req.url!, 'http://local'), '/export', {
+      pool, path: ':memory:', policy: DEFAULT_LOG_POLICY, workspace: 'alice', isAdmin: false, now: Date.now(),
+      audit: () => { throw new Error('unexpected instance request') }, handoffs: async () => [],
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address() as { port: number }
+  try {
+    const stalled = await new Promise<IncomingMessage>((resolve, reject) => {
+      const req = get(`http://127.0.0.1:${port}/?search=large`, (res) => { res.pause(); resolve(res) })
+      req.on('error', reject)
+    })
+    expect(stalled.statusCode).toBe(200)
+    expect(replies[0].writableFinished).toBe(false)
+    await new Promise((resolve) => setTimeout(resolve, 2500))
+    expect(replies[0].destroyed).toBe(true)
+    stalled.destroy()
+  } finally {
+    await pool.close(); server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+}, 10000)

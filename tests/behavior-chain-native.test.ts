@@ -24,7 +24,7 @@ vi.mock('../server/settings', () => ({ getSettings: () => ({ me: 'author', agent
 vi.mock('../server/organizations', () => ({ organizationForRepository: (repo: string) => ({ login: repo.split('/')[0] }),
   organizationArgs: (_org: unknown, argv: string[]) => argv }))
 const { nativeChainOperations } = await import('../server/behavior-chain-native')
-const { decideBehaviorChain } = await import('../server/behavior-chain-decision')
+const { decideBehaviorChain, exhaustedApprovalConversationHold } = await import('../server/behavior-chain-decision')
 const { CallerReceiptStoreError } = await import('../server/service/caller-calls')
 const { spawnDetached } = await import('../server/process')
 
@@ -293,6 +293,92 @@ it('discovers a verified external merge for a closed held seed without binding o
   } finally { db.close(); vi.useRealTimers() }
 }, 30_000)
 
+it('waits on actual typed approval refusals across observation, restart and legacy exhaustion', async () => {
+  const run = await deadlineChain('approve-pr', 'conversation_blocked')
+  try {
+    const obs = run.observed, pull = obs.pull!
+    const initial = run.current()
+    const repair = run.journal.append(chain.id, 'repair', initial.sequence, { type: 'invocation.admitted', invocation: {
+      id: 'repair', behavior: 'repair-pr', actor: chain.author, model: 'fixture', slot: 'primary', basis: 'repair',
+      admittedAt: Date.now(), request: { command: 'agent-interface', cwd: '/fixture', argv: [], context: {
+        head: pull.head, reviewRevision: pull.reviewRevision } } } })
+    run.journal.append(chain.id, 'answered', repair.sequence, { type: 'invocation.settled', invocationId: 'repair',
+      callId: null, outcome: 'no_changes', evidence: { status: 'completed', action: 'not_started' } })
+    // A managed reviewer's own thread can stay open after another closes.
+    pull.unresolved = 1
+    pull.checksState = 'SUCCESS'
+    pull.approvalBlocked = true
+    await run.run()
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const raw = run.results[attempt - 1].released
+      expect(raw).toMatchObject({ status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+        error_code: 'approval_blocked_unresolved_conversations', review_id: null, head_sha: null })
+      if (attempt === 1) {
+        await run.run()
+        expect(run.current().invocations.at(-1)?.state).toBe('uncertain')
+      }
+      run.release()
+      vi.setSystemTime(Date.now() + 300_001)
+      await run.run()
+      const waiting = run.current()
+      expect(waiting.held).toBeNull()
+      expect(waiting.waiting).toBe('Awaiting GitHub review conversation closure: ' + raw.error)
+      expect(waiting.invocations.at(-1)).toMatchObject({ state: 'settled', callId: raw.id })
+      run.restart()
+      await run.run()
+      expect(run.launch).toHaveBeenCalledTimes(attempt)
+      if (attempt < 3) {
+        // The GitHub observation clears, then a conversation reopens before
+        // the real Caller approval guard has a chance to submit.
+        pull.approvalBlocked = false
+        await run.run()
+        pull.approvalBlocked = true
+      }
+    }
+    expect(run.results.flatMap(result => result.posts)).toEqual([])
+    const current = run.current()
+    const last = current.invocations.at(-1)!
+    const reason = 'approve-pr failed before publication three times: ' + last.evidence!.error
+    const held = run.journal.append(chain.id, 'old-hold', current.sequence, { type: 'chain.held', reason })
+    const replacement = structuredClone(obs)
+    replacement.checkedAt = Date.now() + 120_001
+    replacement.pull!.head = replacement.publication.head_sha = 'e'.repeat(40)
+    replacement.prReviewers = [obs.approver]
+    expect(exhaustedApprovalConversationHold(held, replacement, replacement.checkedAt)).toBe(last.callId)
+    expect(decideBehaviorChain({ ...held, held: null }, replacement, replacement.checkedAt)).toMatchObject(invoke('review-pr'))
+    replacement.pull!.conflict = true
+    expect(decideBehaviorChain({ ...held, held: null }, replacement, replacement.checkedAt)).toMatchObject(invoke('repair-pr'))
+
+    const fresh = { ...obs, checkedAt: replacement.checkedAt }
+    for (const changed of [
+      { ...held, held: 'New invocations held by the person' },
+      { ...held, invocations: [...held.invocations.slice(0, -1), { ...last, evidence: { ...last.evidence, review_id: 1 } }] },
+      { ...held, invocations: [...held.invocations.slice(0, -1), { ...last, evidence: { ...last.evidence, resources_settled_at: null } }] },
+    ]) expect(exhaustedApprovalConversationHold(changed, fresh, fresh.checkedAt)).toBeNull()
+    expect(exhaustedApprovalConversationHold(held, fresh, fresh.checkedAt + 120_001)).toBeNull()
+
+    run.restart()
+    vi.setSystemTime(fresh.checkedAt)
+    delete pull.approvalBlocked
+    await run.run()
+    expect(run.current().held).toBe(reason)
+    pull.approvalBlocked = true
+    vi.setSystemTime(Date.now() + 120_001)
+    await run.run()
+    expect(run.current()).toMatchObject({ held: null, resumedAfterSequence: held.resumedAfterSequence, invocations: held.invocations })
+    vi.setSystemTime(Date.now() + 24 * 60 * 60_000)
+    await run.run()
+    expect(behaviorChainAttention(run.journal, Date.now())[0].nextAction).toBe(run.current().waiting)
+    expect(run.launch).toHaveBeenCalledTimes(3)
+
+    pull.approvalBlocked = false
+    await run.run()
+    expect(run.launch).toHaveBeenCalledTimes(4)
+    expect(run.current().invocations.at(-1)).toMatchObject({ behavior: 'approve-pr', state: 'started' })
+  } finally { run.close() }
+}, 30_000)
+
 async function deadlineChain(behavior: 'review-pr' | 'approve-pr', mode = 'quiet') {
   const root = directory = mkdtempSync(join(tmpdir(), 'poise-review-deadline-'))
   vi.useFakeTimers({ toFake: ['Date'] })
@@ -516,12 +602,14 @@ it.each([
   { name: 'behind requiring a base update', blockers: ['merge_state_not_clean'], mergeable: true, mergeState: 'behind', expected: 'review-pr' },
   { name: 'conflicting', blockers: ['not_mergeable'], mergeable: false, mergeState: 'dirty', expected: 'repair-pr' },
 ])('selects $expected for an unreviewed $name PR using exact-head native evidence', async ({ blockers, mergeable, mergeState, expected }) => {
-  let ciHead = HEAD
+  let ciHead = HEAD, proof: string | undefined
+  const base = 'c'.repeat(40)
   mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
     const evidence: Record<string, unknown> = {
       '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
         issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
-        publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
+        publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null,
+          base_sha: base, ...(argv.includes('--verify-conflict') ? { conflict_base: proof } : {}) } },
       '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
       '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: false,
         unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0, green: false, blockers: [...blockers, 'reviewer_not_approved_current_head'] },
@@ -547,6 +635,11 @@ it.each([
     expect(request).toMatchObject({ command: 'agent-interface', context: { head: HEAD, reviewRevision: 'reviews' } })
     expect(request?.argv).toEqual(expect.arrayContaining(['--atomic-work', 'example/repo#7', '--actor', 'author',
       '--pull-number', '21', '--expected-head', HEAD, '--merge-base']))
+    expect(observation.conflictBase).toBeUndefined()
+    proof = base
+    expect((await operations.observe(chain, true)).conflictBase).toBe(base)
+    proof = HEAD
+    await expect(operations.observe(chain, true)).rejects.toThrow('Conflict proof differs from the observed PR, head or base')
     ciHead = 'c'.repeat(40)
     await expect(operations.observe(chain)).rejects.toThrow('native PR observations changed head or are incomplete')
   }
@@ -1000,7 +1093,8 @@ it.each([
         issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
         publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
       '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
-      '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: approved,
+      '--pr-readiness': { repository: chain.repository, pull_number: 21, head_sha: HEAD, state: 'OPEN', draft: false, reviewer_approved_current_head: approved,
+        approval_blocked_by_conversations: false,
         unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 1, green: false, blockers },
       '--list-failing-ci': { head_sha: HEAD, pull_number: 21, failing: [], mergeable: true, mergeable_state: 'blocked' },
     }
@@ -1008,6 +1102,7 @@ it.each([
     return { stdout: JSON.stringify(evidence[argv[0]]) }
   })
   const observation = await actionOperations().observe(chain)
+  expect(observation.pull?.approvalBlocked).toBe(false)
   expect(decideBehaviorChain(chain, observation, Date.now())).toMatchObject(expected)
 })
 

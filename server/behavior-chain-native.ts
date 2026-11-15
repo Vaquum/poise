@@ -140,7 +140,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
     readInvocations: readNativeInvocations,
-    async observe(chain): Promise<ChainObservation> {
+    async observe(chain, verifyConflict): Promise<ChainObservation> {
       if (!ownsRepository(chain.repository)) throw new Error('behavior chain organization is no longer followed')
       const actor = ['--token-user', chain.author]
       const issueRef = `#${chain.issue}`
@@ -156,6 +156,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // loses budget; any facet failure still fails the whole observation.
       const [seed, roster] = await Promise.all([
         github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch,
+          ...(verifyConflict ? ['--verify-conflict'] : []),
           ...(testProof ? ['--test-dependency-json', JSON.stringify(testProof)] : []), ...actor], 3 * 2 * 1024 * 1024),
         hooks.roster(chainKey),
       ])
@@ -335,6 +336,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         github(chain.repository, ['--list-failing-ci', String(number),
           ...(baseUpdateFrom ? ['--base-update-from', baseUpdateFrom, ...(refresh ? ['--include-runs'] : [])] : []), ...reviewer]), hooks.reviews(chain.repository, number),
       ])
+      const approvalBlocked = readiness.approval_blocked_by_conversations
+      if (approvalBlocked != null && (typeof approvalBlocked !== 'boolean' || readiness.repository !== chain.repository
+        || readiness.pull_number !== number || readiness.state !== String(state.state).toUpperCase()
+        || approvalBlocked && readiness.unresolved_live_conversation_count === 0)) {
+        throw new Error('native approval conversation evidence is invalid')
+      }
       if (readiness.head_sha !== head || ci.head_sha !== head || ci.pull_number !== number || !Array.isArray(ci.failing)
         || !Array.isArray(state.my_reviews) || typeof readiness.draft !== 'boolean' || typeof readiness.reviewer_approved_current_head !== 'boolean'
         || !Number.isSafeInteger(readiness.unresolved_live_conversation_count) || Number(readiness.unresolved_live_conversation_count) < 0
@@ -380,6 +387,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           at: Date.parse(String(removal.createdAt)), actor: removal.actor ? String(object(removal.actor, 'queue actor').login) : null } : null,
         changesRequested: latest?.state === 'CHANGES_REQUESTED' && latest.commit_id === head,
         unresolved: Number(readiness.unresolved_live_conversation_count), unresolvedOutdated: Number(readiness.unresolved_outdated_conversation_count),
+        ...(typeof approvalBlocked === 'boolean' ? { approvalBlocked } : {}),
         approved: readiness.reviewer_approved_current_head,
         ready: readiness.green === true, reviewIds: reviews.filter((review) => review.commit_id === head && review.state !== 'DISMISSED').map((review) => positive(review.id, 'review')),
         checksState: typeof readiness.checks_state === 'string' ? readiness.checks_state : null,
@@ -389,6 +397,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         // The existing readiness primitive already applies the repository's
         // queue policy: BEHIND needs a base update only without a merge queue.
         conflict: ci.mergeable === false, behind: ci.mergeable_state === 'behind' && readiness.blockers.includes('merge_state_not_clean') }
+      if (verifyConflict && publication.conflict_base !== undefined) {
+        const base = sha(publication.conflict_base, 'verified conflict base')
+        if (publication.base_sha !== base || observation.publication.head_sha !== head || observation.publication.pull_number !== number
+          || state.state !== 'open' || observation.publication.state !== 'open') throw new Error('Conflict proof differs from the observed PR, head or base')
+        observation.conflictBase = base
+      }
       if (baseUpdateFrom) {
         if (ci.repository !== chain.repository || readiness.repository !== chain.repository || readiness.pull_number !== number
           || ci.ref !== head || observation.publication.head_sha !== head || !('base_update' in ci)) {
@@ -606,6 +620,17 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         || proof.actor !== invocation.actor || proof.repo !== chain.repository || proof.pr_id !== String(target) || proof.behavior !== behavior
         || proof.source !== 'poise:behavior-chain' || proof.correlation_id !== invocation.id || proof.expected_head !== expected) throw new Error('native closed-target fence conflicts with its original admission')
       return proof.outcome === 'fenced'
+    },
+    async retireClosedImplementation(chain, invocation, call) {
+      if (invocation.behavior !== 'implement-issue' || invocation.request.command !== 'agent-interface' || !invocation.model
+        || call.correlation_id !== invocation.id || call.behavior !== 'implement_issue' || call.repo !== chain.repository
+        || call.actor !== invocation.actor || call.source !== 'poise:behavior-chain') throw new Error('closed-target retirement requires the original running implementation')
+      requireCallerReceipts()
+      const { stdout } = await runFile('agent-interface', ['--retire-closed-implementation', call.id],
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 16 * 1024 })
+      const proof = object(JSON.parse(stdout), 'native closed-target retirement')
+      if (proof.id !== call.id || !['retiring', 'refused'].includes(String(proof.outcome))) throw new Error('native closed-target retirement conflicts with its original Call')
+      return proof.outcome === 'retiring'
     },
     async perform(invocation, chain) {
       requireCallerReceipts()

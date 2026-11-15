@@ -85,7 +85,7 @@ export type ChainEvent =
   | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'], testHold?: Omit<NonNullable<BehaviorChain['testHold']>, 'sequence'> }
   | { type: 'chain.waiting', reason: string }
   | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'],
-    repairRecovery?: BehaviorChain['repairRecovery'], recovery?: ChainRecoveryOrigin }
+    repairRecovery?: BehaviorChain['repairRecovery'], approvalRecovery?: string, recovery?: ChainRecoveryOrigin }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
@@ -184,6 +184,13 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (event.testHold) next.testHold = { ...event.testHold, sequence }
     else delete next.testHold
   } else if (event.type === 'chain.resumed') {
+    if (event.approvalRecovery) {
+      const original = next.invocations.at(-1)
+      if (!next.held || original?.behavior !== 'approve-pr' || original.state !== 'settled'
+        || original.callId !== event.approvalRecovery || event.ciRecovery || event.testRecovery || event.repairRecovery) {
+        throw new Error('approval conversation recovery requires its original automatic hold and Call')
+      }
+    }
     if (event.repairRecovery) {
       const recovery = event.repairRecovery, original = next.invocations.at(-1)
       if (!next.held || next.repairRecovery || recovery.admission || event.ciRecovery || event.testRecovery
@@ -196,7 +203,7 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
         throw new Error('repair report recovery requires its original automatic hold and pinned repair')
       }
       next.repairRecovery = recovery
-    } else if (!event.ciRecovery && !event.testRecovery) delete next.repairRecovery
+    } else if (!event.ciRecovery && !event.testRecovery && !event.approvalRecovery) delete next.repairRecovery
     if (event.testRecovery) {
       const recovery = event.testRecovery
       const proof = next.observation?.testDependency as { invocationId?: string, verified?: boolean, recovered?: boolean, recheck?: string,
@@ -214,9 +221,9 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
         || (!rechecked && chainBasis(recovery.hold) !== chainBasis(next.testHold ?? null))
         || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
       next.testRecovery = event.testRecovery
-    } else if (!event.ciRecovery && !event.repairRecovery) delete next.testRecovery
+    } else if (!event.ciRecovery && !event.repairRecovery && !event.approvalRecovery) delete next.testRecovery
     next.held = null
-    if (!event.ciRecovery && !event.testRecovery && !event.repairRecovery) next.resumedAfterSequence = sequence
+    if (!event.ciRecovery && !event.testRecovery && !event.repairRecovery && !event.approvalRecovery) next.resumedAfterSequence = sequence
     delete next.ciHold
     delete next.testHold
   }

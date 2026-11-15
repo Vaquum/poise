@@ -136,12 +136,101 @@ export async function reconcileRepairReport(repository: string, marker: string, 
       applied = labels(await request(['api', `repos/${repository}/issues/${issue.number}/labels`, '--method', 'POST', '-f', 'labels[]=poise']))
     }
     return { number: Number(issue.number), url: String(issue.html_url), state: String(issue.state), labels: applied,
-      title: issue.title, body: issue.body }
+      title: issue.title, body: issue.body, created_at: issue.created_at, author: author.login }
   } catch (error) {
     const failure = error as { stderr?: unknown, message?: string }
     const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)
     throw new Error(`Repair report reconciliation failed: ${message.split(token).join('***')}`)
   }
+}
+
+const ISSUE_CREATION_FIELDS = `
+  number author { login } body createdAt lastEditedAt includesCreatedEdit
+  userContentEdits(last: 1) { totalCount nodes { editedAt deletedAt diff } }
+`
+interface IssueCreationEvidence {
+  number?: unknown
+  author?: { login?: unknown }
+  body?: unknown
+  createdAt?: unknown
+  lastEditedAt?: unknown
+  includesCreatedEdit?: unknown
+  userContentEdits?: { totalCount?: unknown, nodes?: Array<{ editedAt?: unknown, deletedAt?: unknown, diff?: unknown }> }
+}
+
+/** GitHub's creation edit holds the original Markdown even after body edits. */
+function issueCreationBody(issue: IssueCreationEvidence | null | undefined) {
+  if (typeof issue?.number !== 'number' || !Number.isSafeInteger(issue.number) || issue.number < 1
+    || typeof issue.author?.login !== 'string' || !issue.author.login
+    || typeof issue.createdAt !== 'string' || !Number.isFinite(Date.parse(issue.createdAt))) {
+    throw new Error('Issue identity is unverified')
+  }
+  const edits = issue.userContentEdits
+  const creation = edits?.nodes?.[0]
+  let body: string | null = null
+  if (issue.lastEditedAt === null && issue.includesCreatedEdit === false && edits?.totalCount === 0
+    && Array.isArray(edits.nodes) && edits.nodes.length === 0 && typeof issue.body === 'string') body = issue.body
+  if (issue.includesCreatedEdit === true && Array.isArray(edits?.nodes) && edits.nodes.length === 1
+    && creation?.editedAt === issue.createdAt && creation.deletedAt === null && typeof creation.diff === 'string') body = creation.diff
+  return { number: issue.number, author: issue.author.login, createdAt: issue.createdAt, body }
+}
+
+async function readIssueCreationEvidence(repository: string, query: string, variables: string[]) {
+  requireConfiguredRepository(repository)
+  const me = getMeta('me')
+  if (!me) throw new Error('Repair reporting requires the configured GitHub account')
+  const token = await resolveMeToken(me)
+  const env = { GH_HOST: 'github.com', GH_TOKEN: token, GITHUB_TOKEN: undefined,
+    GH_ENTERPRISE_TOKEN: undefined, GITHUB_ENTERPRISE_TOKEN: undefined }
+  const [owner, repo] = repository.split('/')
+  try {
+    const { stdout } = await runFile(GH, ['api', 'graphql', '-f', `query=${query}`,
+      '-f', `owner=${owner}`, '-f', `repo=${repo}`, ...variables], {
+      env, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024,
+    })
+    const result = JSON.parse(stdout) as { data?: { repository?: {
+      nameWithOwner?: unknown, issue?: IssueCreationEvidence,
+      issues?: { nodes?: IssueCreationEvidence[], pageInfo?: { hasNextPage?: unknown } },
+    } } }
+    const repoEvidence = result?.data?.repository
+    if (typeof repoEvidence?.nameWithOwner !== 'string' || repoEvidence.nameWithOwner.toLowerCase() !== repository.toLowerCase()) {
+      throw new Error('Issue repository is unverified')
+    }
+    return repoEvidence
+  } catch (error) {
+    const failure = error as { stderr?: unknown, message?: string }
+    const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)
+    throw new Error(`Issue creation evidence read failed: ${message.split(token).join('***')}`)
+  }
+}
+
+export async function readIssueCreationBody(repository: string, number: number) {
+  const data = await readIssueCreationEvidence(repository, `query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      nameWithOwner issue(number: $number) { ${ISSUE_CREATION_FIELDS} }
+    }
+  }`, ['-F', `number=${number}`])
+  const issue = issueCreationBody(data.issue)
+  if (issue.number !== number) throw new Error('Issue identity is unverified')
+  return issue
+}
+
+/** Direct issue connection, in creation order, including closed issues. */
+export async function listIssueCreationBodies(repository: string, author: string, since: string | undefined) {
+  const data = await readIssueCreationEvidence(repository, `query($owner: String!, $repo: String!, $author: String!, $since: DateTime) {
+    repository(owner: $owner, name: $repo) {
+      nameWithOwner
+      issues(first: 100, states: [OPEN, CLOSED], filterBy: { createdBy: $author, since: $since }, orderBy: { field: CREATED_AT, direction: ASC }) {
+        pageInfo { hasNextPage }
+        nodes { ${ISSUE_CREATION_FIELDS} }
+      }
+    }
+  }`, ['-f', `author=${author}`, ...(since ? ['-f', `since=${since}`] : [])])
+  const page = data.issues
+  if (!Array.isArray(page?.nodes) || typeof page.pageInfo?.hasNextPage !== 'boolean') throw new Error('Issue creation listing is unverified')
+  const issues = page.nodes.map(issueCreationBody)
+  if (issues.some(issue => issue.author.toLowerCase() !== author.toLowerCase())) throw new Error('Issue creation listing has a different author')
+  return { issues, hasNextPage: page.pageInfo.hasNextPage }
 }
 
 // github-interface resolves the repo from cwd's last two path parts when
