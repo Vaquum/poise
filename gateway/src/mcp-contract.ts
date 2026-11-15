@@ -1,6 +1,7 @@
 export const MCP_READ_PATH = '/api/mcp/read'
 export const MCP_SCOPE = 'poise:read'
 export const MCP_RESPONSE_BYTES = 128 * 1024
+const MCP_RECORD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 export const MCP_TOOLS = [
   { name: 'poise_describe', description: 'Describe the authorized Poise workspace identity and available tools.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -12,12 +13,22 @@ export const MCP_TOOLS = [
       cursor: { type: 'string', maxLength: 2048 },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
+  { name: 'poise_get', description: 'Read a Chat session or a live Chat timer by its Poise record ID. Requires the owner’s Chat metadata grant.',
+    inputSchema: { type: 'object', required: ['kind', 'id'], properties: {
+      kind: { enum: ['chat', 'timer'] }, id: { type: 'string', pattern: MCP_RECORD_ID.source },
+    }, additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: false } },
 ] as const
 
-export interface McpGrantScope { resource: string; ownerId: number; handle: string; grantId: string }
+export const MCP_WORK_TOOL_NAMES = ['poise_describe', 'poise_work'] as const
+export interface McpGrantScope { resource: string; ownerId: number; handle: string; grantId: string; chatMetadata?: true }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
+export interface McpGetArguments { kind: 'chat' | 'timer'; id: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
   | { name: 'poise_work'; arguments: McpWorkArguments }
+  | { name: 'poise_get'; arguments: McpGetArguments }
+
+export const isMcpRecordId = (value: unknown): value is string => typeof value === 'string' && MCP_RECORD_ID.test(value)
 
 export function parseMcpRead(value: unknown): McpRead {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid tool request')
@@ -26,6 +37,11 @@ export function parseMcpRead(value: unknown): McpRead {
   const args = row.arguments ?? {}
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('invalid tool arguments')
   if (row.name === 'poise_describe' && !Object.keys(args).length) return { name: row.name, arguments: {} }
+  if (row.name === 'poise_get') {
+    const { kind, id } = args as Record<string, unknown>
+    if (Object.keys(args).length !== 2 || (kind !== 'chat' && kind !== 'timer') || !isMcpRecordId(id)) throw new Error('provide a Chat or timer record ID')
+    return { name: row.name, arguments: { kind, id } }
+  }
   if (row.name !== 'poise_work') throw new Error('unsupported tool or arguments')
   const work = args as Record<string, unknown>
   if (Object.keys(work).some(key => !['repository', 'issue', 'label', 'limit', 'cursor'].includes(key))

@@ -8,9 +8,8 @@ No default or deployed configuration is changed by this capability.
 
 `poise_describe`, with no arguments, returns
 `{ workspace, owner, capabilities: { tools: ["poise_describe", "poise_work"] } }`
-for the authorized workspace. `poise_work` reads its issue work trail. Neither
-tool grants Manager controls or reads chats, documents, credentials or raw
-process state.
+for the authorized workspace and its effective tools. `poise_work` reads its
+issue work trail. The owner can also grant Chat metadata during consent.
 
 ## Read work
 
@@ -65,6 +64,23 @@ Links open the issue, chain journal, known Calls, PR, reviews, exact observed-he
 checks, observed queue and recorded merge SHA under their existing browser access
 rules. Returned source text is data, not instructions. Coverage and receipt
 records grant no execution or publication authority.
+
+## Read Chat metadata
+
+On the Poise consent page, select **Allow Chat session and live timer metadata**
+to enable `poise_get`. The grant page shows the allowed tools. `poise_describe`
+reports the tools available with that grant.
+
+Call `poise_get` with `kind: "chat"` and a Chat record ID from its Poise link.
+The result includes the stored session state, role, repository, last sequence
+and live timer IDs. Call it with `kind: "timer"` and one of those IDs for its
+schedule and state, pending delivery and recorded failure and skip counts.
+The gateway builds the link to the owning Chat. Times use UTC.
+
+The exact lookup covers the connected workspace's stored Chats and active,
+held or tripped timers. An empty record means there is no matching record in
+that scope. This grant covers metadata. Transcript, attachment and timer
+message content and Manager actions require separate capabilities.
 
 ## Private plugin
 

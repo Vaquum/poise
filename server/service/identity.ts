@@ -83,7 +83,9 @@ export function verifyIdentityAssertion(token: string, expected: AssertionExpect
     const value = claims.mcp as Partial<McpGrantScope> | undefined
     if (!value || !expected.resource || value.resource !== expected.resource || value.handle !== expected.handle
       || !Number.isSafeInteger(value.ownerId) || Number(value.ownerId) < 1 || value.ownerId !== expected.ownerId || typeof value.grantId !== 'string'
-      || !/^[a-f0-9-]{36}$/.test(value.grantId)) return refuse('the MCP assertion has an invalid grant or resource audience')
+      || !/^[a-f0-9-]{36}$/.test(value.grantId) || (value.chatMetadata !== undefined && value.chatMetadata !== true)) {
+      return refuse('the MCP assertion has an invalid grant or resource audience')
+    }
     mcp = value as McpGrantScope
   } else if (claims.mcp !== undefined) return refuse('the identity assertion has an invalid MCP grant')
   return { ok: true, assertion: { subject: claims.sub, scope: claims.scope as AssertionScope, ...(mcp ? { mcp } : {}), ...(typeof claims.gport === 'number' ? { gatewayPort: claims.gport } : {}) } }

@@ -404,7 +404,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         } catch (err) {
           return json(res, httpStatus(err, 403), { error: (err as Error).message })
         }
-        if (path === '/api/mcp/read') return handleMcpRead(req, res, service, authority)
+        if (path === '/api/mcp/read') return handleMcpRead(req, res, service, authority, chatRuntime?.instance)
         if (path === '/api/behavior-ledger/pr-status') {
           return handleBehaviorPrStatus(req, res, url)
         }

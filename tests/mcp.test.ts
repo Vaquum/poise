@@ -26,6 +26,9 @@ import { db, setMeta } from '../server/db'
 import * as ledger from '../server/behavior-ledger'
 import * as processes from '../server/process'
 import type { readMcpWork } from '../server/mcp-work'
+import { createTimer } from '../server/chat/control-store'
+import { emptyCapabilities } from '../server/chat/runtime'
+import { deleteSession, insertSession } from '../server/chat/storage'
 
 const endpoint = 'https://poise.test/mcp'
 let h: Harness
@@ -65,7 +68,7 @@ beforeEach(async () => {
       expect(req.headers['x-poise-identity']).toBeUndefined()
       workspaceReads++
       beforeRead?.()
-      await handleMcpRead(req, res, service, authority)
+      await handleMcpRead(req, res, service, authority, bob ? 'bob-chat' : 'alice-chat')
     } catch (error) { res.statusCode = httpStatus(error, 400); res.end(JSON.stringify({ error: String(error) })) }
   })
   await new Promise<void>(resolve => workspace.listen(0, '127.0.0.1', resolve))
@@ -101,7 +104,7 @@ const fetcher: typeof fetch = async (input, init) => {
 }
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
-async function connect(login: string, serverEndpoint = endpoint) {
+async function connect(login: string, serverEndpoint = endpoint, chatMetadata = false) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -131,7 +134,8 @@ async function connect(login: string, serverEndpoint = endpoint) {
   const csrf = h.store.findSession(signedIn.apexCookie.slice('poise_gw='.length))!.csrf
   const approved = await fetcher(new URL('/mcp/authorize', endpoint), { method: 'POST', headers: {
     cookie: signedIn.apexCookie, origin: new URL(endpoint).origin, 'content-type': 'application/x-www-form-urlencoded',
-  }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve' }) })
+  }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
+    ...(chatMetadata ? { chatMetadata: '1' } : {}) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
   expect(callback.searchParams.get('state')).toBe('fixture-state')
@@ -203,6 +207,55 @@ it('rejects forged, expired, wrong-audience, cross-owner and wrong-scope workspa
     expect(reply.status).toBe(403)
   }
   expect(workspaceReads).toBe(0)
+})
+
+it('requires explicit Chat metadata consent and follows a Chat to its live timer in the same workspace', async () => {
+  const id = randomUUID()
+  const now = new Date().toISOString()
+  insertSession({ id, title: 'Fixture Chat', agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
+    repo: 'Acme/Repo', checkout: '/private/checkout', branch: { name: 'main', origin: 'existing', provisional: false },
+    createdAt: now, updatedAt: now, status: 'idle', capabilities: emptyCapabilities(), lastSeq: 0, pendingRequests: [], instance: 'alice-chat' })
+  const timer = createTimer('alice-chat', { sessionId: id, label: 'Fixture timer', message: 'Private timer instruction', delayMinutes: 5 },
+    { kind: 'person' }, Date.now())
+  const workGrant = await connect('Alice')
+  const alice = await connect('Alice', endpoint, true)
+  const bob = await connect('bob', endpoint, true)
+  const args = { kind: 'chat', id }
+  const request = { name: 'poise_get', arguments: args }
+  async function lookup(client: Client, kind: 'chat' | 'timer', id: string) {
+    const result = await client.callTool({ name: 'poise_get', arguments: { kind, id } })
+    expect(result.isError).not.toBe(true)
+    const content = result.content as { type: string; text: string }[]
+    return JSON.parse(content[0].text).lookup as unknown
+  }
+  try {
+    expect((await workGrant.client.callTool(request)).isError).toBe(true)
+    const bare = signAssertion(h.keys.privateKey, { handle: 'alice', login: 'Alice', scope: 'mcp',
+      mcp: { resource: endpoint, ownerId: 1001, handle: 'alice', grantId: randomUUID() } }, Date.now())
+    const workspaceReply = await send(workspacePort, { host: 'alice.poise.test', path: '/api/mcp/read', method: 'POST',
+      headers: { 'x-poise-identity': bare, 'content-type': 'application/json' }, body: JSON.stringify(request) })
+    expect(workspaceReply.status).toBe(403)
+    const tools = ['poise_describe', 'poise_work', 'poise_get']
+    expect((await alice.client.listTools()).tools.map(tool => tool.name)).toEqual(tools)
+    expect(await describe(alice.client)).toMatchObject({ capabilities: { tools } })
+    const chat = await lookup(alice.client, 'chat', id)
+    const link = `https://alice.poise.test/?view=chat&chat=${id}`
+    expect(chat).toMatchObject({ source: 'chat', coverage: 'complete', link,
+      record: { id, kind: 'chat', title: 'Fixture Chat', repository: 'Acme/Repo', status: 'idle', timerIds: [timer.id] } })
+    expect(JSON.stringify(chat)).not.toContain('/private/checkout')
+    const timerLookup = await lookup(alice.client, 'timer', timer.id)
+    expect(timerLookup).toMatchObject({ link,
+      record: { id: timer.id, kind: 'timer', chatId: id, state: timer.state, nextAt: timer.nextAt, pendingDelivery: null, failures: 0 } })
+    expect(JSON.stringify(timerLookup)).not.toContain('Private timer instruction')
+    expect(await lookup(bob.client, 'chat', id)).toMatchObject({ record: null, link: null })
+    expect(await lookup(bob.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
+  } finally {
+    await workGrant.client.close()
+    await alice.client.close()
+    await bob.client.close()
+    db.prepare('DELETE FROM chat_control_timers WHERE id = ?').run(timer.id)
+    deleteSession(id)
+  }
 })
 
 it('withholds an in-flight workspace response when its owner revokes the grant', async () => {
