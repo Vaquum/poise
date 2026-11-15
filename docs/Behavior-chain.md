@@ -916,6 +916,16 @@ Native `approve-pr` deadlines use the same two timeout codes, reviewer account,
 `reviewRevision` and their durable automatic hold must match the approval
 exhaustion. They file a distinct `approval_budget_exhausted` report intent and
 marker; an earlier review report never covers a current approval hold.
+These approval reports use the guarded `report-disposition` control described
+below with `source-only` or `distinct-fix`. Completed issue review alone cannot
+start implementation, including after a lost creation acknowledgement or when
+new report publishing is disabled. Triage binds the original PR/head, automatic
+approval hold, approval basis/slot and complete settled attempt list. Missing,
+source-only or stale dispositions start no report implementation; a current
+distinct-fix must pass the ordinary admission gates, including source verification
+after preparation and the source sequence guard at admission and launch. A changed
+approval basis on the same head or a replacement hold invalidates that binding.
+No disposition retries source approval or relaxes its approval and merge gates.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads, PR review contexts or approval bases

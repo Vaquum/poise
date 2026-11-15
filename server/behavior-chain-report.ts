@@ -599,7 +599,7 @@ function implementationReport(db: Database, chain: BehaviorChain): RepairReport 
     const report = JSON.parse(row.value) as RepairReport
     const keys = report.pull === null
       ? [chainBasis([IMPLEMENTATION_CAUSE, report.source]), chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])]
-      : [chainBasis([IMPLEMENTATION_CAUSE, report.source, report.pull])]
+      : [IMPLEMENTATION_CAUSE, APPROVAL_CAUSE].map(cause => chainBasis([cause, report.source, report.pull]))
     if (keys.some(key => row.key === PREFIX + key) && !keys.includes(report.key)) throw new Error('Blocked report conflicts with its durable source intent')
     return row.key === PREFIX + report.key && keys.includes(report.key)
   }).map(row => JSON.parse(row.value) as RepairReport)
@@ -660,7 +660,7 @@ function unconfirmedImplementationReports(db: Database, repository: string): Rep
     const report = JSON.parse(row.value) as RepairReport
     const keys = report.pull === null
       ? [chainBasis([IMPLEMENTATION_CAUSE, report.source]), chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])]
-      : [chainBasis([IMPLEMENTATION_CAUSE, report.source, report.pull])]
+      : [IMPLEMENTATION_CAUSE, APPROVAL_CAUSE].map(cause => chainBasis([cause, report.source, report.pull]))
     if (keys.some(key => row.key === PREFIX + key) && !keys.includes(report.key)) throw new Error('Blocked report conflicts with its durable source intent')
     return row.key === PREFIX + report.key && keys.includes(report.key) ? [report] : []
   })
@@ -668,10 +668,23 @@ function unconfirmedImplementationReports(db: Database, repository: string): Rep
 
 function boundImplementationSource(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain, report: RepairReport) {
   const source = journal.read(report.source)
-  const hold = db.prepare(`SELECT sequence FROM behavior_chain_events WHERE chain_id = ?
+  const hold = db.prepare(`SELECT sequence, at FROM behavior_chain_events WHERE chain_id = ?
     AND json_extract(payload, '$.type') = 'chain.held' ORDER BY sequence DESC LIMIT 1`)
-    .get(report.source) as { sequence: number } | undefined
+    .get(report.source) as { sequence: number, at: number } | undefined
   const accounts = getSettings()
+  if (!source || !hold || hold.sequence !== report.holdSequence || source.resumedAfterSequence >= hold.sequence
+    || !source.held || source.mergeSha || source.supersession || source.invocations.some(item => item.state !== 'settled')
+    || source.author.toLowerCase() !== chain.author.toLowerCase() || source.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()
+    || accounts.me.toLowerCase() !== source.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== source.reviewer.toLowerCase()) return null
+  if (report.pull !== null && report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])) {
+    const observation = source.observation as ChainObservation | null
+    const qualifying = observation && qualifyingAttempts(db, source, observation, Date.now())
+    return hold.at === report.heldAt && qualifying?.cause === APPROVAL_CAUSE
+      && observation?.pull?.number === report.pull && observation.pull.head === report.head
+      && qualifying.decision.basis === report.basis && qualifying.decision.reviewer?.slot === report.slot
+      && chainBasis(qualifying.attempts.map(item => ({ invocation: item.id, call: item.callId, completedAt: item.evidence?.completedAt }))) === chainBasis(report.attempts)
+      ? source : null
+  }
   const repair = report.pull !== null
   const budget = !repair && report.key === chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source])
   if (budget) {
@@ -698,19 +711,16 @@ function boundImplementationSource(db: Database, journal: BehaviorChainJournal, 
   const key = repair ? chainBasis([IMPLEMENTATION_CAUSE, report.source, report.pull])
     : chainBasis([IMPLEMENTATION_CAUSE, report.source])
   const argv = invocation?.request.argv ?? []
-  if (!source || report.key !== key || report.attempts.length !== 1
+  if (report.key !== key || report.attempts.length !== 1
     || repair !== (report.head !== null)
     || repair && (!Number.isSafeInteger(report.pull) || Number(report.pull) < 1 || !/^[a-f0-9]{40}$/i.test(report.head ?? ''))
-    || !hold || hold.sequence !== report.holdSequence || source.resumedAfterSequence >= hold.sequence
-    || !source.held || source.mergeSha || source.supersession || !invocation || invocation.id !== attempt.invocation
+    || !invocation || invocation.id !== attempt.invocation
     || invocation.callId !== attempt.call || invocation.basis !== report.basis || invocation.slot !== report.slot
     || (repair ? invocation.behavior !== 'repair-pr' : invocation.behavior !== 'implement-issue')
     || repair && (invocation.request.context?.head !== report.head
       || argv[argv.indexOf('--pull-number') + 1] !== String(report.pull)
       || argv[argv.indexOf('--expected-head') + 1] !== report.head)
-    || invocation.evidence?.error !== source.held || source.invocations.some(item => item.state !== 'settled')
-    || source.author.toLowerCase() !== chain.author.toLowerCase() || source.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()
-    || accounts.me.toLowerCase() !== source.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== source.reviewer.toLowerCase()) return null
+    || invocation.evidence?.error !== source.held) return null
   return source
 }
 
@@ -785,6 +795,9 @@ async function verifiedReport(chain: BehaviorChain, report: RepairReport, revisi
 
 function dispositionReason(chain: BehaviorChain, report: RepairReport) {
   const disposition = report.disposition!
+  if (report.pull !== null && report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])) {
+    return `Approval deadline report https://github.com/${chain.repository}/issues/${report.issueNumber}: ${disposition.kind} disposition for ${report.source} PR #${report.pull} head ${report.head}, reviewed revision ${disposition.revision}; original Calls ${report.attempts.map(attempt => attempt.call).join(', ')}. Diagnosis: ${disposition.diagnosis} Next action: ${disposition.nextAction} Source approval hold retained; any source retry requires explicit Resume. Original approval and merge gates remain required.`
+  }
   if (report.pull !== null) {
     return `Repair hold report https://github.com/${chain.repository}/issues/${report.issueNumber}: ${disposition.kind} disposition for ${report.source} PR #${report.pull} head ${report.head}, reviewed revision ${disposition.revision}; original Call ${report.attempts[0].call}${disposition.kind === 'existing-remedy' ? `; remedy https://github.com/${chain.repository}/issues/${disposition.remedy}` : ''}. Diagnosis: ${disposition.diagnosis} Next action: ${disposition.nextAction} Source hold retained; checkout availability is unverified. Any source retry requires existing recovery or explicit Resume.`
   }
@@ -812,7 +825,7 @@ export async function setImplementationReportDisposition(db: Database, journal: 
   const remedy = value && typeof value === 'object' && 'remedy' in value ? (value as { remedy: unknown }).remedy : undefined
   const sourceIssue = Number(report.source.split('#')[1])
   if (!value || typeof value !== 'object' || !('kind' in value)
-    || (review || report.pull === null
+    || (review || report.pull === null || report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])
       ? value.kind !== 'source-only' && value.kind !== 'distinct-fix'
       : value.kind !== 'existing-remedy' && value.kind !== 'distinct-fix')
     || (value.kind === 'existing-remedy'
@@ -872,13 +885,15 @@ export async function implementationReportAdmission(db: Database, journal: Behav
   observation: ChainObservation, observe: (source: BehaviorChain) => Promise<ChainObservation>) {
   const implWait = 'Implementation hold report awaits a current explicit source-only or verified distinct-fix disposition'
   const repairWait = 'Repair hold report awaits a current explicit existing-remedy or verified distinct-fix disposition'
+  const approvalWait = 'Approval deadline report awaits a current explicit source-only or verified distinct-fix disposition'
   let report = implementationReport(db, chain)
   if (!report) {
     // A lost creation acknowledgement leaves the stored intent without its
     // issue number while GitHub already serves the report to intake. Match
     // such intents against this chain before allowing implementation.
     for (const candidate of unconfirmedImplementationReports(db, chain.repository)) {
-      const candidateWait = candidate.pull === null ? implWait : repairWait
+      const candidateWait = candidate.pull === null ? implWait
+        : candidate.key === chainBasis([APPROVAL_CAUSE, candidate.source, candidate.pull]) ? approvalWait : repairWait
       let issue
       try {
         issue = await reconcileRepairReport(chain.repository, `<!-- poise-repair-exhaustion:${candidate.key} -->`, chain.issue)
@@ -896,9 +911,10 @@ export async function implementationReportAdmission(db: Database, journal: Behav
     }
   }
   if (report) {
-    const wait = report.pull === null ? implWait : repairWait
+    const approval = report.pull !== null && report.key === chainBasis([APPROVAL_CAUSE, report.source, report.pull])
+    const wait = report.pull === null ? implWait : approval ? approvalWait : repairWait
     const disposition = report.disposition
-    const allowed = report.pull === null ? ['source-only', 'distinct-fix'] : ['existing-remedy', 'distinct-fix']
+    const allowed = report.pull === null || approval ? ['source-only', 'distinct-fix'] : ['existing-remedy', 'distinct-fix']
     if (!disposition || !allowed.includes(disposition.kind)
       || (disposition.kind === 'existing-remedy' && (!Number.isSafeInteger(disposition.remedy) || Number(disposition.remedy) < 1))
       || !dispositionReview(chain, observation, disposition)) return { reason: wait }
@@ -923,14 +939,12 @@ export async function implementationReportAdmission(db: Database, journal: Behav
           : !qualifyingImplementationHold(db, source, fresh, Date.now()))) return { reason: `${wait}: source or reviewed report evidence changed` }
     } else {
       const qualifying = qualifyingAttempts(db, source, fresh, Date.now())
-      const attempt = qualifying?.attempts[0]
-      if (!fresh.issue.eligible || qualifying?.cause !== IMPLEMENTATION_CAUSE
+      if (!fresh.issue.eligible || qualifying?.cause !== (approval ? APPROVAL_CAUSE : IMPLEMENTATION_CAUSE)
         || qualifying.decision.basis !== report.basis || qualifying.decision.reviewer?.slot !== report.slot
         || fresh.pull?.head !== report.head || fresh.pull?.number !== report.pull
         || journal.read(source.id)?.sequence !== source.sequence
         || chainBasis(implementationReport(db, chain)) !== chainBasis(report)
-        || attempt?.id !== report.attempts[0]?.invocation || attempt?.callId !== report.attempts[0]?.call
-        || attempt?.evidence?.completedAt !== report.attempts[0]?.completedAt) return { reason: `${wait}: source or reviewed report evidence changed` }
+        || chainBasis(qualifying.attempts.map(item => ({ invocation: item.id, call: item.callId, completedAt: item.evidence?.completedAt }))) !== chainBasis(report.attempts)) return { reason: `${wait}: source or reviewed report evidence changed` }
     }
     if (disposition.kind === 'source-only' || disposition.kind === 'existing-remedy') return { reason: dispositionReason(chain, report) }
     return { reason: null, source: { id: source.id, sequence: source.sequence } }
@@ -1460,7 +1474,8 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     .all(PREFIX + '*', chain.id) as Array<{ value: string }>
   for (const row of repairRows) {
     const repair = JSON.parse(row.value) as RepairReport
-    if (repair.pull === null || repair.key !== chainBasis([IMPLEMENTATION_CAUSE, repair.source, repair.pull])) continue
+    if (repair.pull === null || ![IMPLEMENTATION_CAUSE, APPROVAL_CAUSE]
+      .some(cause => repair.key === chainBasis([cause, repair.source, repair.pull]))) continue
     const target = repair.issueNumber && journal.read(chainIdentity(chain.repository, repair.issueNumber))
     if (repair.disposition && target && boundImplementationSource(db, journal, target, repair)) return dispositionReason(target, repair)
   }
