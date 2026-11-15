@@ -933,11 +933,12 @@ export async function implementationReportAdmission(db: Database, journal: Behav
       // A stripped or mutated marker defeats exact reconciliation. If any
       // unconfirmed pre-PR intent could have filed this issue, bind the
       // earliest and require its disposition instead of ordinary intake.
-      // Generated reports embed their original invocation and Call IDs and
-      // are authored by the orphan's own source owner at creation; an
-      // ordinary post-hold issue lacks those IDs and must not consume the
-      // intent. Unknown authorship fails closed. Never bind an orphan to
-      // its own source.
+      // Generated reports anchor their source hold in the body and are
+      // authored by the orphan's own source owner at creation; the
+      // invocation and Call IDs are published and therefore quotable, so
+      // they cannot anchor the match. An ordinary post-hold issue lacks
+      // the source anchor and must not consume the intent. Unknown
+      // authorship fails closed. Never bind an orphan to its own source.
       const orphans = unconfirmedImplementationReports(db, chain.repository)
         .filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
         .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
@@ -954,7 +955,10 @@ export async function implementationReportAdmission(db: Database, journal: Behav
                 const owner = journal.read(candidate.source)?.author
                 if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
               }
-              if (!candidate.attempts.some(attempt => body.includes(attempt.invocation) && body.includes(attempt.call))) return false
+              const anchored = candidate.holdSequence === null
+                ? body.includes(`Source: ${candidate.source};`)
+                : body.includes(`Source: ${candidate.source}; hold event ${candidate.holdSequence};`)
+              if (!anchored) return false
               return !predatesHold(probe.created_at, candidate.heldAt)
             })
             if (match) {
