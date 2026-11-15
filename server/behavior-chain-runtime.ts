@@ -14,7 +14,7 @@ import { behaviorErrorMessage } from './behavior-diagnostics'
 import { classifyBehaviorDiagnostic } from '../src/behavior-failure-cause'
 import { CallerReceiptStoreError } from './service/caller-calls'
 import { diagnostic } from './logging'
-import { resumeReviewArgument, yieldedReview } from './review-continuation'
+import { resumeReviewArgument, yieldedFinalization, yieldedReview } from './review-continuation'
 
 export interface ChainSeed { repository: string, number: number }
 export interface ChainRuntimeOperations {
@@ -1190,7 +1190,7 @@ export class BehaviorChainRuntime {
         outcome: 'prerequisite_wait', evidence: { ...receipt(call), status: 'deferred', action: 'not_started', outcome: 'prerequisite_wait' } })
     }
     if (prReview && invocation.request.argv.includes('--review-slot')) {
-      const checkpoint = yieldedReview(call)
+      const checkpoint = yieldedReview(call) ?? yieldedFinalization(call)
       if (checkpoint) {
         const resume = invocation.request.argv.indexOf('--resume-review')
         const input = resume < 0 ? null : invocation.request.argv[resume + 1]

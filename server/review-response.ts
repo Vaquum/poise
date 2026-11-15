@@ -39,12 +39,18 @@ export function validReviewResponse(value: unknown, target: { repository: string
     && String(assessment.verdict).trim() !== 'Reviewed: no blocking findings.'
 }
 
-export function callReviewResponse(call: LogEntry, now: number): ReviewResponse | null {
-  const value = call.artifact?.review_response
-  const link = call.artifact?.review_resume as { publication_call?: unknown, publisher_started_at?: unknown } | undefined
-  const resumedFrom = typeof link?.publication_call === 'string' && typeof link?.publisher_started_at === 'string'
+/** A retained finalization's publisher identity and window, when the Call
+ * carries a well-formed publication link. */
+export function resumeLink(artifact: Record<string, unknown> | null | undefined): { callId: string, startedAt: number } | undefined {
+  const link = artifact?.review_resume as { publication_call?: unknown, publisher_started_at?: unknown } | undefined
+  return typeof link?.publication_call === 'string' && typeof link?.publisher_started_at === 'string'
     && Number.isFinite(Date.parse(link.publisher_started_at))
     ? { callId: link.publication_call, startedAt: Date.parse(link.publisher_started_at) } : undefined
+}
+
+export function callReviewResponse(call: LogEntry, now: number): ReviewResponse | null {
+  const value = call.artifact?.review_response
+  const resumedFrom = resumeLink(call.artifact)
   return call.status === 'completed' && ['reviewed_clean', 'approved'].includes(call.action || '')
     && call.repo !== null && call.pr_id !== null && call.head_sha !== null && call.actor !== null && call.expected_head === call.head_sha
     && !!call.source?.startsWith('poise:') && !!call.correlation_id && typeof call.review_id === 'number' && call.review_id > 0
