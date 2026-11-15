@@ -21,7 +21,7 @@ export const MCP_TOOLS = [
 ] as const
 
 export const MCP_WORK_TOOL_NAMES = ['poise_describe', 'poise_work'] as const
-export interface McpGrantScope { resource: string; ownerId: number; handle: string; grantId: string; chatMetadata?: true }
+export interface McpGrantScope { resource: string; ownerId: number; handle: string; grantId: string; chatMetadata?: true; repository?: string }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
 export interface McpGetArguments { kind: 'chat' | 'timer'; id: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
@@ -29,6 +29,12 @@ export type McpRead = { name: 'poise_describe'; arguments: Record<string, never>
   | { name: 'poise_get'; arguments: McpGetArguments }
 
 export const isMcpRecordId = (value: unknown): value is string => typeof value === 'string' && MCP_RECORD_ID.test(value)
+
+export const isMcpRepository = (value: unknown): value is string => typeof value === 'string' && value.length <= 140
+  && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/.test(value)
+
+export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
+  scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
 export function parseMcpRead(value: unknown): McpRead {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid tool request')
@@ -45,8 +51,7 @@ export function parseMcpRead(value: unknown): McpRead {
   if (row.name !== 'poise_work') throw new Error('unsupported tool or arguments')
   const work = args as Record<string, unknown>
   if (Object.keys(work).some(key => !['repository', 'issue', 'label', 'limit', 'cursor'].includes(key))
-    || typeof work.repository !== 'string' || work.repository.length > 140
-    || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/.test(work.repository)) throw new Error('invalid repository or work selector')
+    || !isMcpRepository(work.repository)) throw new Error('invalid repository or work selector')
   if (work.issue !== undefined) {
     if (!Number.isSafeInteger(work.issue) || Number(work.issue) < 1
       || Object.keys(work).some(key => !['repository', 'issue'].includes(key))) throw new Error('an exact issue accepts only repository and issue')
