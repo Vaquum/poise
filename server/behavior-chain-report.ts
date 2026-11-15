@@ -961,19 +961,20 @@ export async function implementationReportAdmission(db: Database, journal: Behav
           // implementationReport. If its marker was stripped before
           // reconciliation and a second hold adopted the stripped issue,
           // exempting here would bypass the original report's disposition.
-          // Block when any such orphan shares the failing file/test and
-          // could have filed this issue.
+          // File/test matching is bypassable by rewrite, so block when any
+          // such orphan could have filed this reporter-authored issue.
+          // Generated reports are authored by the main account; a
+          // reviewer-authored remedy cannot be an orphan's filed issue.
           let orphaned = false
           if (verified && failure) {
-            const file = failure.file, test = failure.test
-            orphaned = unconfirmedImplementationReports(db, chain.repository).some(candidate => {
-              if (candidate.pull !== null || candidate.adopted === true) return false
-              if (predatesHold(issue.created_at, candidate.heldAt)) return false
-              const origin = journal.read(candidate.source)
-              const original = origin?.invocations.find(item => item.id === candidate.attempts[0]?.invocation)
-              const candidateFailure = prePrFileAndTest(original?.evidence?.error)
-              return !!candidateFailure && candidateFailure.file === file && candidateFailure.test === test
-            })
+            const author = typeof (issue as { author?: unknown }).author === 'string'
+              ? ((issue as { author: string }).author.toLowerCase()) : null
+            if (author === null || author === chain.author.toLowerCase()) {
+              orphaned = unconfirmedImplementationReports(db, chain.repository).some(candidate => {
+                if (candidate.pull !== null || candidate.adopted === true) return false
+                return !predatesHold(issue.created_at, candidate.heldAt)
+              })
+            }
           }
           if (verified && (report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt)) && !orphaned) return { reason: null }
           if (!verified) return { reason: `${wait}: linked remedy source evidence changed` }
@@ -1765,7 +1766,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
           && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
           && !body.includes(implementation!.invocation.id) && !body.includes(implementation!.call)
-        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string, created_at: unknown }> = []
+        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string, created_at: unknown, author: string }> = []
         for (const entry of blockedBy) {
           const number = Number((entry as { number: number }).number)
           try {
