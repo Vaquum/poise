@@ -2791,6 +2791,118 @@ it('keeps a stripped lost-ack scoped report gated with no adoption', async () =>
   expect(posts()).toHaveLength(2)
 })
 
+it('keeps an ordinary post-hold issue ordinary without consuming its lost-ack intent', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedImplementation(journal)
+  call.error = ingressError('a'.repeat(64), 'b'.repeat(32)); call.diagnostic = prePrDiagnostic()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  const originalKey = chainBasis(['atomic_work_blocked', chain.id])
+  remote[0].state = 'closed'
+  record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  // Ordinary markerless issue by the source owner, unrelated content without
+  // the orphan's IDs. Pushed before the lost-ack so discovery meets it first.
+  const ordinary = issue(98, 'Ordinary follow-up work without generated content.')
+  ordinary.labels = [{ name: 'poise' }]; remote.push(ordinary)
+  const next = blockedImplementation(journal)
+  next.call.error = memoryError('c'.repeat(64), 'd'.repeat(32)); next.call.diagnostic = prePrDiagnostic()
+  fresh.prerequisites = prePrPrerequisites([])
+  loseCreation = true
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [next.call], quarantined: [] }) })).run()
+  loseCreation = false
+  const intents = reports(db).map(row => JSON.parse(row.value))
+  expect(intents).toHaveLength(2)
+  const scoped = intents.find(intent => intent.key !== originalKey)!
+  expect(scoped).toMatchObject({ source: chain.id, pull: null, issueNumber: null, adopted: false,
+    attempts: [{ invocation: next.call.correlation_id, call: next.call.id }] })
+  expect(posts()).toHaveLength(2)
+  // Strip only the marker from the actual report; IDs and file/test remain.
+  const lost = remote.find(row => row.number === 100)!
+  lost.body = lost.body.replace(`<!-- poise-repair-exhaustion:${scoped.key} -->`, '')
+  expect(lost.body).not.toContain('poise-repair-exhaustion')
+  expect(lost.body).toContain(MEMORY_FILE)
+  expect(lost.body).toContain('keeps memory warnings correlatable')
+  expect(lost.body).toContain(scoped.attempts[0].invocation)
+  expect(lost.body).toContain(scoped.attempts[0].call)
+  const plain = remote.find(row => row.number === 98)!
+  expect(plain.body).not.toContain('poise-repair-exhaustion')
+  expect(plain.body).not.toContain(MEMORY_FILE)
+  expect(plain.body).not.toContain(scoped.attempts[0].invocation)
+  expect(plain.body).not.toContain(scoped.attempts[0].call)
+  vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  const fixture = await reviewedImplementationReport(db, journal, next.call, 98)
+  expect(fixture.request).toHaveBeenCalledOnce()
+  expect(fixture.launch).toHaveBeenCalledOnce()
+  const admitted = journal.read('acme/repo#98')!.invocations.at(-1)!
+  expect(admitted).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+  expect(admitted.request.implementationSource).toBeUndefined()
+  expect(journal.read(chain.id)).toMatchObject({ held: next.call.error })
+  // The ordinary issue must not have consumed the unconfirmed intent.
+  expect(JSON.parse(reports(db).find(row => JSON.parse(row.value).key === scoped.key)!.value).issueNumber).toBeNull()
+  // The actual stripped report still gates with its binding intact.
+  const target = journal.read('acme/repo#100')!
+  const admission = await implementationReportAdmission(db, journal, target,
+    await fixture.overrides.observe(target), fixture.overrides.observe)
+  expect(admission.reason).toContain('awaits a current explicit')
+  expect(() => implementationReportBinding(db, target)).not.toThrow()
+  expect(implementationReportBinding(db, journal.read('acme/repo#100')!)).toMatchObject({ key: scoped.key, source: chain.id,
+    holdSequence: scoped.holdSequence, invocation: next.call.correlation_id, call: next.call.id })
+  expect(JSON.parse(reports(db).find(row => JSON.parse(row.value).key === scoped.key)!.value).issueNumber).toBe(100)
+  expect(posts()).toHaveLength(2)
+})
+
+it('keeps a lost-ack scoped report gated after its marker is mutated to another key', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedImplementation(journal)
+  call.error = ingressError('a'.repeat(64), 'b'.repeat(32)); call.diagnostic = prePrDiagnostic()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  const originalKey = chainBasis(['atomic_work_blocked', chain.id])
+  remote[0].state = 'closed'
+  record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  const next = blockedImplementation(journal)
+  next.call.error = memoryError('c'.repeat(64), 'd'.repeat(32)); next.call.diagnostic = prePrDiagnostic()
+  fresh.prerequisites = prePrPrerequisites([])
+  loseCreation = true
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [next.call], quarantined: [] }) })).run()
+  loseCreation = false
+  const intents = reports(db).map(row => JSON.parse(row.value))
+  expect(intents).toHaveLength(2)
+  const scoped = intents.find(intent => intent.key !== originalKey)!
+  expect(scoped).toMatchObject({ source: chain.id, pull: null, issueNumber: null, adopted: false,
+    attempts: [{ invocation: next.call.correlation_id, call: next.call.id }] })
+  expect(posts()).toHaveLength(2)
+  // Mutate the marker to another 64-hex key; exact reconciliation misses.
+  const mutated = 'f'.repeat(64)
+  expect(scoped.key).not.toBe(mutated)
+  remote[1].body = remote[1].body.replace(`<!-- poise-repair-exhaustion:${scoped.key} -->`, `<!-- poise-repair-exhaustion:${mutated} -->`)
+  expect(remote[1].body).toContain('poise-repair-exhaustion')
+  expect(remote[1].body).not.toContain(scoped.key)
+  expect(remote[1].body).toContain(MEMORY_FILE)
+  expect(remote[1].body).toContain('keeps memory warnings correlatable')
+  expect(remote[1].body).toContain(scoped.attempts[0].invocation)
+  expect(remote[1].body).toContain(scoped.attempts[0].call)
+  vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  const fixture = await reviewedImplementationReport(db, journal, next.call, 100)
+  const report = journal.read('acme/repo#100')!
+  expect(() => implementationReportBinding(db, report)).not.toThrow()
+  expect(implementationReportBinding(db, report)).toMatchObject({ key: scoped.key, source: chain.id,
+    holdSequence: scoped.holdSequence, invocation: next.call.correlation_id, call: next.call.id })
+  const admission = await implementationReportAdmission(db, journal, report,
+    await fixture.overrides.observe(report), fixture.overrides.observe)
+  expect(admission.reason).toContain('awaits a current explicit')
+  expect(fixture.request).not.toHaveBeenCalled()
+  expect(fixture.launch).not.toHaveBeenCalled()
+  expect(report.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
+  expect(journal.read(chain.id)).toMatchObject({ held: next.call.error })
+  expect(JSON.parse(reports(db).find(row => JSON.parse(row.value).key === scoped.key)!.value).issueNumber).toBe(100)
+  expect(posts()).toHaveLength(2)
+})
+
 it('keeps a stripped confirmed source-only report gated when a scoped hold adopts it', async () => {
   const { db, journal } = setup()
   const { chain, call } = blockedImplementation(journal)

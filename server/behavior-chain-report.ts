@@ -930,11 +930,13 @@ export async function implementationReportAdmission(db: Database, journal: Behav
       }
     }
     if (!report) {
-      // A stripped marker defeats marker reconciliation. If any unconfirmed
-      // pre-PR intent could have filed this markerless issue, bind the
+      // A stripped or mutated marker defeats exact reconciliation. If any
+      // unconfirmed pre-PR intent could have filed this issue, bind the
       // earliest and require its disposition instead of ordinary intake.
-      // Generated reports are authored by the orphan's own source owner at
-      // creation; unknown authorship fails closed. Never bind an orphan to
+      // Generated reports embed their original invocation and Call IDs and
+      // are authored by the orphan's own source owner at creation; an
+      // ordinary post-hold issue lacks those IDs and must not consume the
+      // intent. Unknown authorship fails closed. Never bind an orphan to
       // its own source.
       const orphans = unconfirmedImplementationReports(db, chain.repository)
         .filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
@@ -943,7 +945,8 @@ export async function implementationReportAdmission(db: Database, journal: Behav
       if (orphans.length) {
         try {
           const probe = await reconcileRepairReport(chain.repository, '<!-- poise-repair-exhaustion:probe -->', chain.issue, false, () => true)
-          if (probe && typeof probe.body === 'string' && !REPORT_MARKER.test(probe.body)) {
+          if (probe && typeof probe.body === 'string') {
+            const body = probe.body
             const author = typeof (probe as { author?: unknown }).author === 'string'
               ? ((probe as { author: string }).author.toLowerCase()) : null
             const match = orphans.find(candidate => {
@@ -951,6 +954,7 @@ export async function implementationReportAdmission(db: Database, journal: Behav
                 const owner = journal.read(candidate.source)?.author
                 if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
               }
+              if (!candidate.attempts.some(attempt => body.includes(attempt.invocation) && body.includes(attempt.call))) return false
               return !predatesHold(probe.created_at, candidate.heldAt)
             })
             if (match) {
