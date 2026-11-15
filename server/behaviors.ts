@@ -10,7 +10,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
-import { implementationReportAdmission, recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories } from './behavior-chain-report'
+import { implementationReportAdmission, recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories, waitForImplementationRechecks } from './behavior-chain-report'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
@@ -932,6 +932,18 @@ function isFileGroupBudgetExhaustion(call: LogEntry): boolean {
     && call.diagnostic.context.submission === 'none'
 }
 
+// A local inspection that hit the overall or provider-analysis ceiling stays
+// on its revision with its limiting phase. It still counts toward that
+// target's retry stop. Receipts without typed no-submission proof keep the
+// existing safe handling.
+function isLocalInspectionBudgetExhaustion(call: LogEntry): boolean {
+  return call.error_code === 'review_budget_exhausted'
+    && call.diagnostic?.operation === 'github-interface'
+    && (call.diagnostic.phase === 'overall' || call.diagnostic.phase === 'provider_analysis')
+    && call.diagnostic.outcome === 'timed_out'
+    && call.diagnostic.context.submission === 'none'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -941,6 +953,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // diagnostic takes precedence over provider-like text in older errors.
   if (call.diagnostic?.operation === 'github-interface' && call.diagnostic.phase === 'inspection'
     && call.diagnostic.outcome === 'timed_out') return null
+  if (isLocalInspectionBudgetExhaustion(call)) return null
   const account = reviewAccountFailure(call)
   if (account) return account
   const error = String(call.error || '')
@@ -4245,7 +4258,7 @@ function prReviewRetryState(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call))
   const timeouts = calls.filter((call) => call.model === model && budgetExhaustedProvenNoAction(call)
-    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call) || isLocalInspectionBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
   const stopped = timeouts.length >= 2 || retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
     claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head
@@ -4373,7 +4386,7 @@ function ensureBudgetStopHold(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call)
     && call.model === model && budgetExhaustedProvenNoAction(call)
-    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call) || isLocalInspectionBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
     .sort((a, b) => Date.parse(agentCallStartedAt(b)) - Date.parse(agentCallStartedAt(a)))
   const latest = timeouts[0]
@@ -8004,6 +8017,25 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       renewSeenOwned(claim.key, claim.target, claim.claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
       continue
     }
+    if (status === 'superseded'
+      && call.outcome === 'superseded'
+      && call.error_code === 'review_target_closed'
+      && call.action === null
+      && call.head_sha === null
+      && call.receipts == null
+      && Number.isFinite(Date.parse(call.completed_at || ''))
+      && unambiguousAgentCall(snapshot, call)) {
+      // Caller proved seed closure, not a no-publication outcome. Keep
+      // the terminal launch and Caller receipt evidence; do not release
+      // its seen marker or infer that a conflicting worker stopped.
+      if (completeClaimSafely(claim, call.error || 'review target closed')) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'superseded', activity: 'settled', stateSource: 'native',
+          outcome: 'review_target_closed', completedAt: call.completed_at })
+        clearBehaviorFailureKeepHold(ISSUES_KEY, claim.target)
+      }
+      continue
+    }
     const message = `unrecognized agent call status "${status || 'missing'}"`
     if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message, claim.target)
   }
@@ -8606,7 +8638,7 @@ async function runBehaviorChains(): Promise<void> {
         await requireFreshDatastore()
         return operations.observe(target)
       }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
-        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled),
+        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled, behaviorAbortController?.signal),
       reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {
         await requireFreshDatastore()
         return operations.observe(chain)
@@ -9248,6 +9280,7 @@ export async function stopBehaviorsRuntime(): Promise<void> {
   behaviorAbortController?.abort()
   behaviorAbortController = null
   await Promise.allSettled([...behaviorOperationTails.values(), ...closedTargetReconciliations.values()])
+  await waitForImplementationRechecks()
   // Detached workers survive Poise itself, but spawn acceptance is not proof
   // of a successful side effect. Leave launched claims with their durable
   // identity so a later runtime reconciles exact log status before retrying;

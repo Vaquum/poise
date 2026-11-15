@@ -503,6 +503,7 @@ describe('a suite on a test box', () => {
   let pendingTerminations: ServerResponse[] | null
   let pendingCancellations: ServerResponse[] | null
   let setups: number
+  let pendingSetups: (() => void)[] | null
   let setupExit: number
   let setupMs: number
   let listLagMs: number
@@ -543,11 +544,13 @@ describe('a suite on a test box', () => {
     if (command === SETUP_COMMAND) {
       setups += 1
       expect(readFileSync(join(box.dir, 'tmp/poise-setup.sh'))).toEqual(readFileSync('gateway/src/test-box-setup.sh'))
-      setTimeout(() => {
+      const finish = () => {
         event('output', { data: 'set up\n', stream: 'stdout' })
         event('exit', { exit_code: setupExit })
         res.end()
-      }, setupMs)
+      }
+      if (pendingSetups) pendingSetups.push(finish)
+      else setTimeout(finish, setupMs)
       return
     }
     expect(command).toBe(BOX_COMMAND)
@@ -702,6 +705,7 @@ describe('a suite on a test box', () => {
     pendingTerminations = null
     pendingCancellations = null
     setups = 0
+    pendingSetups = null
     setupExit = 0
     setupMs = 0
     listLagMs = 0
@@ -2297,15 +2301,23 @@ ${stderr}`
 
   it('builds once for suites that wait together, and all hear when that fails', async () => {
     setupExit = 1
-    setupMs = 200
+    pendingSetups = []
     await startAll()
-    const runs = await Promise.all([1, 2, 3].map(() => suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done))
+    await until(() => setups === 1, 'the startup setup to wait', 2_000)
+    const waiting = [1, 2].map(() => suite(repository(), [process.execPath, '-e', 'process.exit(0)']))
+    // Admission alone does not join provisioning; the output stream starts it.
+    await until(() => [...relay.runs.values()].filter((run) => run.output !== null).length === 2, 'the first two output streams to attach', 2_000)
+    waiting.push(suite(repository(), [process.execPath, '-e', 'process.exit(0)']))
+    await until(() => [...relay.runs.values()].filter((run) => run.output !== null).length === 3, 'the delayed output stream to attach', 2_000)
+    const held = pendingSetups
+    pendingSetups = null
+    for (const finish of held) finish()
+    const runs = await Promise.all(waiting.map((run) => run.done))
     for (const { code, stderr } of runs) {
       expect(code).toBe(125)
       expect(stderr).toContain('setting up the test box failed')
     }
-    // The one the relay began on starting, and then the one all three waited on.
-    expect(setups).toBeLessThanOrEqual(2)
+    expect(setups).toBe(1)
     expect(groups).toHaveLength(1)
   })
 

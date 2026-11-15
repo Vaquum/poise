@@ -417,8 +417,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             remaining = 0
         remaining = max(0, min(remaining, deadline - monotonic()))
         # A provider-ceiling expiry hands the review to the next model: type it
-        # as an analysis handoff, not a terminal timeout.
-        handoff = phase == "provider_analysis"
+        # as an analysis handoff, not a terminal timeout. A local inspection
+        # that hit the same ceiling keeps its operation and limiting phase.
+        is_local_inspection = isinstance(diagnostic, dict) and diagnostic.get("operation") == "github-interface"
+        handoff = phase == "provider_analysis" and not is_local_inspection
         emitted_phase = "analysis" if handoff else phase
         outcome = "handoff" if handoff else "timed_out"
         message = (f"Incomplete analysis in file group {group_number} of {total_groups}: {emitted_phase} deadline; "
@@ -432,7 +434,8 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
         if handoff:
             # An inspect timeout carries operation github-interface; handoffs are typed provider.review.
             diagnostic["operation"] = "provider.review"
-        return review_budget.ReviewLimitError(_time_limit_message(model.provider, phase),
+        message_phase = "inspection" if is_local_inspection and phase == "provider_analysis" else phase
+        return review_budget.ReviewLimitError(_time_limit_message(model.provider, message_phase),
                                              "review_inspection_timeout" if phase == "inspection" else "review_budget_exhausted",
                                              diagnostic)
 

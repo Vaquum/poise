@@ -91,14 +91,14 @@ export function recheckResults(stdout: string, cwd: string, names: string[], fai
 /** Fresh main sources, never the failed candidate or its historical reports.
  * Process deadlines also bound install, execution and cleanup failures. */
 export async function recheckImplementationTest(repository: string, actor: string, old: string, current: string,
-  merge: string, file: string, test: string): Promise<TestRecheckResult> {
+  merge: string, file: string, test: string, signal?: AbortSignal): Promise<TestRecheckResult> {
   if (!/^tests\/(?:[\w-]+\/)*[\w.-]+\.(?:test|spec)\.[tj]sx?$/.test(file)
     || ![old, current, merge].every(sha => /^[a-f0-9]{40}$/.test(sha))) throw new Error('recheck requires pinned fixture bases')
   const root = await mkdtemp(join(tmpdir(), 'poise-test-recheck-'))
   const cwd = join(root, 'repo')
-  const options = { cwd, timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 }
+  const options = { cwd, timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024, signal }
   try {
-    await runFile('github-interface', ['--checkout-repo', repository, '--path', cwd, '--token-user', actor], { timeoutMs: 120_000 })
+    await runFile('github-interface', ['--checkout-repo', repository, '--path', cwd, '--token-user', actor], { timeoutMs: 120_000, signal })
     await runFile('git', ['merge-base', '--is-ancestor', old, merge], options)
     await runFile('git', ['merge-base', '--is-ancestor', merge, current], options)
     const diff = await runFile('git', ['diff', `${merge}^1`, merge, '--', file], options)

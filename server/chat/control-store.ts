@@ -117,6 +117,12 @@ export interface Binding { target: string, session: string, created_at: number }
 export function bindings(instance: string): Binding[] {
   return db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? ORDER BY target').all(instance) as Binding[]
 }
+
+export function openWorkBindings(instance: string): Array<{ target: string, session: string, role: string | null }> {
+  if (!cachedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'chat_sessions'").get()) return []
+  return cachedStatement(db, "SELECT b.target, b.session, s.role FROM chat_work_bindings b JOIN chat_sessions s ON s.id = b.session AND s.instance = b.instance WHERE b.instance = ? AND s.status <> 'closed'")
+    .all(instance) as Array<{ target: string, session: string, role: string | null }>
+}
 export function bindingIsCurrent(instance: string, binding: Binding): boolean {
   return !!db.prepare('SELECT 1 FROM chat_work_bindings WHERE instance = ? AND target = ? AND session = ? AND created_at = ?')
     .get(instance, binding.target, binding.session, binding.created_at)

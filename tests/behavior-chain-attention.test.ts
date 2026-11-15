@@ -17,6 +17,26 @@ function admit(journal: BehaviorChainJournal, issue: number, at: number) {
     issue, branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' }, at)
 }
 
+it('links a prerequisite from current delivery evidence and drops the link when the observation expires', () => {
+  const journal = new BehaviorChainJournal(db)
+  let chain = admit(journal, 7, now)
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const base = 'a'.repeat(40)
+  const wait = 'Waiting for prerequisite autonomio/poise#6: prerequisite is open'
+  const observation: ChainObservation = { checkedAt: now, issue: { open: true, eligible: true, revision: 'seed', commentIds: [] },
+    issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer, existingPulls: [],
+    publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null,
+    prerequisites: { wait, base, evidence: [
+      { repo: 'autonomio/poise', number: 7, found: true, complete: true, prerequisites: [{ repo: 'autonomio/poise', number: 6 }] },
+      { repository: 'autonomio/poise', issue_number: 6, base_sha: base, verified: false, state: 'open' },
+    ] } }
+  chain = append(journal, chain, { type: 'chain.observed', observation })
+  chain = append(journal, chain, { type: 'chain.waiting', reason: wait })
+  expect(behaviorChainAttention(journal, now)[0].nudge).toMatchObject({ kind: 'prerequisite', prerequisite: 'autonomio/poise#6' })
+  expect(behaviorChainAttention(journal, now + 120_001)).toEqual([])
+  expect(journal.read(chain.id)).toEqual(chain)
+})
+
 it('freezes the three reported holds alongside exact-head CI and review gates, oldest progress first', () => {
   const journal = new BehaviorChainJournal(db)
   const snapshot = delayedChainFixture(journal, now)

@@ -300,3 +300,32 @@ it('retains Error for failed recovery and publication-uncertain timeouts despite
   expect(loggingSeverity(event, impact())).toBe('error')
   expect(impact()).toMatchObject({ impact: 'unknown', recovered: false })
 })
+
+it.each([
+  ['overall', 'Review reached its total time limit; needs attention'],
+  ['provider_analysis', 'Local review repository inspection timed out; incomplete analysis; needs attention'],
+])('retains Error for local inspection %s ceiling despite a successor admission', (phase, error) => {
+  const journal = new BehaviorChainJournal(db)
+  const fixture = loggingWorkFixture(journal, 'acme/repo', 7, correlation, call, at)
+  const id = '4'.repeat(32), callId = '5'.repeat(32), head = fixture.observation.pull!.head
+  const diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'github-interface', phase,
+    outcome: 'timed_out', submission: 'none', stderr: '', stderr_truncated: false,
+    expected_head: head, call_id: callId, correlation_id: id }
+  const row = { id: callId, correlation_id: id, repo: 'acme/repo', pr_id: '107', actor: 'reviewer', behavior: 'pr_review',
+    status: 'failed', error_code: 'review_budget_exhausted', expected_head: head,
+    error, completed_at: new Date(at + 5000).toISOString(), diagnostic }
+  const original: ChainAdmission = { id, behavior: 'review-pr', basis: chainBasis(['pr', head, fixture.observation.pull!.reviewContext]),
+    actor: 'reviewer', model: 'grok', slot: 'primary', admittedAt: at + 4000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture',
+      argv: ['--pr-review', 'https://github.com/acme/repo/pull/107', '--expected-head', head] } }
+  fixture.append({ type: 'invocation.admitted', invocation: original }, at + 4000)
+  fixture.append({ type: 'invocation.settled', invocationId: id, callId, outcome: 'review_budget_exhausted',
+    evidence: { status: 'failed', action: null, error_code: row.error_code, diagnostic: parseProcessDiagnostic(diagnostic), completedAt: at + 5000 } }, at + 5000)
+  const event = normalize(callerDiagnostic(row, 'local')!, at + 5000)!
+  const successor: ChainAdmission = { ...original, id: '6'.repeat(32), model: 'replacement', admittedAt: at + 6000 }
+  const impact = () => behaviorChainWorkImpact(journal, callId, id)
+  expect(event.operation).not.toBe('provider.review.handoff')
+  expect(loggingSeverity(event, impact())).toBe('error')
+  fixture.append({ type: 'invocation.admitted', invocation: successor }, at + 6000)
+  expect(loggingSeverity(event, impact())).toBe('error')
+})

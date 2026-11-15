@@ -9,7 +9,8 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, ReviewScopeIndexingError, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
-import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, implementationReportAdmission, implementationReportBinding, reviewReportBinding, setImplementationReportDisposition, recoverReportedRepair, repairReportImplementationFence, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, setRepairReportRepositories } from '../server/behavior-chain-report'
+import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, implementationReportAdmission, implementationReportBinding, reviewReportBinding, setImplementationReportDisposition, recoverReportedRepair, repairReportImplementationFence, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, setRepairReportRepositories, waitForImplementationRechecks } from '../server/behavior-chain-report'
+import { behaviorBackgroundBusy, releaseBackgroundBusy } from '../server/release-background'
 import { nativeChainOperations } from '../server/behavior-chain-native'
 import { nativeRequestSha } from '../server/behavior-chain-action'
 import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
@@ -518,15 +519,19 @@ it.each([false, true])('runs independent pinned clean bases and rejects an unrep
   expect(existsSync(cwd)).toBe(false)
 })
 
-it.each(['recover', 'memory recovery', 'restart before admission', 'failed recheck', 'interrupted recheck', 'operator hold', 'changed source',
+it.each(['recover', 'memory recovery', 'restart during recheck', 'failed recheck', 'interrupted recheck', 'operator hold', 'changed source',
   'ineligible', 'closed source', 'unsettled resources', 'possible publication', 'branch', 'PR', 'competing work',
-  'changed during recheck', 'changed during preparation', 'missing review'])(
+  'changed during recheck', 'changed after recheck', 'restart before admission', 'changed during preparation', 'missing review',
+  'base advances during recheck', 'base advances before admission', 'remedy is unverified on new base', 'recheck fails on new base'])(
   'revalidates the persisted #1778/#1782 incident once through normal admission: %s', async mode => {
     const { db, journal } = setup()
     mocks.accounts = { me: 'mikkokotila', agentAccount: 'bit-mis' }
     const memory = mode === 'memory recovery', number = memory ? 1754 : 1778, reportNumber = memory ? 99 : 1782, remedy = memory ? 1747 : 1765
     const repository = 'autonomio/poise', id = `${repository}#${number}`, call = memory ? 'f'.repeat(32) : '15b20584dcea402faeb94959a0e7f699'
     const old = 'd45773e5250787a9c6c6efea1fa320f986145237', base = 'e'.repeat(40), merge = 'c'.repeat(40)
+    const nextBase = 'f'.repeat(40)
+    const advancesDuringRecheck = ['base advances during recheck', 'remedy is unverified on new base', 'recheck fails on new base'].includes(mode)
+    const restartsBeforeAdmission = ['restart before admission', 'base advances during recheck', 'base advances before admission'].includes(mode)
     const test = 'a suite on a test box > ' + (memory ? 'keeps memory warnings correlatable without logging command bodies with base service null'
       : 'recovers mid-suite when only one suite may run')
     const blocker = memory ? `atomic behavior blocked: npm run check first failed at tests/test-offload.test.ts > ${test} (tests/test-offload.test.ts:2055): Test timed out in 20000ms.` : INCIDENT_1778
@@ -557,18 +562,23 @@ it.each(['recover', 'memory recovery', 'restart before admission', 'failed reche
       const number = Number(argv[1]), delivery = argv.includes('--delivery-base')
       return { stderr: '', stdout: JSON.stringify({ repository, issue_number: number,
         ...(argv[0] === '--issue-comments' ? { comments: [{ author: 'bit-mis', body: `#${remedy} owns that test; use its existing repair.` }] }
-          : delivery ? { verified: number === remedy, base_sha: base, merge_sha: merge }
+          : delivery ? { verified: number === remedy && !(mode === 'remedy is unverified on new base' && obs.prerequisites.base === nextBase),
+            base_sha: obs.prerequisites.base, merge_sha: merge }
             : { issue: { body: number === reportNumber
               ? `<!-- poise-repair-exhaustion:${key} -->\nSource: ${id}; hold event ${holdSequence}; basis ${basis}; slot primary.\n${blocker}\nCaller ${call}`
               : 'tests/test-offload.test.ts: ' + (memory ? 'keeps memory warnings correlatable without logging command bodies'
                 : 'recovers mid-suite when only one suite may run'), user: { login: 'mikkokotila' } } }) }) }
     })
+    let finishRecheck!: () => void
+    const recheckGate = new Promise<void>(resolve => { finishRecheck = resolve })
     mocks.recheck.mockReset()
-    mocks.recheck.mockImplementation(async () => {
-      if (mode === 'failed recheck') throw new Error('old-base recheck passed; shared failure was not reproduced')
+    mocks.recheck.mockImplementation(async (_repository, _actor, _old, checkedBase) => {
+      await recheckGate
+      if (advancesDuringRecheck && checkedBase === base) obs.prerequisites.base = nextBase
+      if (mode === 'failed recheck' || mode === 'recheck fails on new base' && checkedBase === nextBase) throw new Error('old-base recheck passed; shared failure was not reproduced')
       if (mode === 'changed during recheck') record(journal, journal.read(id)!, { type: 'chain.held', reason: INCIDENT_1778 })
       return { old: { base: old, tests: [test], failure: 'AssertionError: expected stdout to contain two started lines' },
-        current: { base, tests: memory ? ['node', 'sh', 'npm run check'].map(command => `${test} and command ${command}`) : [test] },
+        current: { base: checkedBase, tests: memory ? ['node', 'sh', 'npm run check'].map(command => `${test} and command ${command}`) : [test] },
         condition: memory ? '6650 ms before each memory-warning command' : '750 ms after first output, before relay interruption' }
     })
     if (mode === 'interrupted recheck') db.prepare('UPDATE meta SET value=? WHERE key=?').run(JSON.stringify({ ...report,
@@ -581,29 +591,99 @@ it.each(['recover', 'memory recovery', 'restart before admission', 'failed reche
     if (mode === 'PR') obs.publication.pull_number = 1871
     if (mode === 'competing work') obs.existingPulls = ['https://github.com/autonomio/poise/pull/1871']
     if (mode === 'missing review') obs.issueReviewers = [reviewer]
-    let permitted = mode !== 'restart before admission'
-    const launch = vi.fn(async () => true)
+    let permitted = !restartsBeforeAdmission
+    const launch = vi.fn(async (invocation: BehaviorChain['invocations'][number]) => {
+      if (invocation.basis === basis && (advancesDuringRecheck || mode === 'base advances before admission')) {
+        expect(journal.read(id)?.observation?.testDependency).toMatchObject({ recovery: { base: nextBase, merge } })
+      }
+      return true
+    })
+    const observe = vi.fn(async (current: BehaviorChain) => ({ ...structuredClone(current.id === id ? obs
+      : { ...unpublished(), prerequisites: { wait: null, base, evidence: [] } }), checkedAt: Date.now() }))
     const ops = operations(db, journal, { accounts: () => ({ author: 'mikkokotila', reviewer: 'bit-mis' }), discover: async () => [],
-      available: () => true, permitted: (_chain, decision) => permitted && decision.behavior === 'implement-issue', observe: async () => ({ ...structuredClone(obs), checkedAt: Date.now() }),
+      available: () => true, permitted: (_chain, decision) => permitted && decision.behavior === 'implement-issue', observe,
       launch, request: async () => {
         if (mode === 'changed during preparation') obs.existingPulls = ['https://github.com/autonomio/poise/pull/1871']
         return { command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] }
       } })
     ops.recoverReport = (current, observation) => recoverReportedRepair(db, journal, current, observation, ops.observe, () => true)
     let runtime = new BehaviorChainRuntime(journal, ops)
-    await runtime.run()
-    if (mode === 'restart before admission') {
-      expect(journal.read(id)).toMatchObject({ held: null, testRecovery: { recheck: key } })
+    let swept = false
+    const sweep = runtime.run().then(() => { swept = true })
+    try {
+      await vi.waitFor(() => expect(swept).toBe(true))
       expect(launch).not.toHaveBeenCalled()
+      if (!['unsettled resources', 'possible publication'].includes(mode)) expect(journal.read(id)?.invocations).toEqual([original])
+      const rechecked = restartsBeforeAdmission || advancesDuringRecheck
+        || ['recover', 'memory recovery', 'restart during recheck', 'failed recheck', 'changed during recheck',
+        'changed after recheck', 'changed during preparation', 'missing review'].includes(mode)
+      expect(mocks.recheck).toHaveBeenCalledTimes(rechecked ? 1 : 0)
+      expect(releaseBackgroundBusy()).toBe(rechecked ? 1 : 0)
+      expect(behaviorBackgroundBusy()).toBe(rechecked ? 1 : 0)
+      const readRecheck = () => JSON.parse((db.prepare('SELECT value FROM meta WHERE key=?').get(storageKey) as { value: string }).value).recheck
+      if (mode === 'restart during recheck') {
+        const unrelated = `${repository}#2000`
+        journal.append(unrelated, 'unrelated', 0, { type: 'chain.admitted', repository, issue: 2000,
+          branch: 'poise/issue-2000', author: chain.author, reviewer: chain.reviewer })
+        for (let tick = 0; tick < 2; tick++) {
+          const waiting = journal.read(id)!
+          expect(journal.reconciliationAt(waiting)).toBe(Number(waiting.observation!.checkedAt) + 120_000)
+          vi.setSystemTime(journal.reconciliationAt(waiting)!)
+          await runtime.run()
+          expect(journal.read(unrelated)?.observation).not.toBeNull()
+          expect(journal.read(unrelated)?.invocations).toMatchObject([{ behavior: 'implement-issue' }])
+          expect(launch).toHaveBeenCalledOnce()
+          expect(journal.read(id)?.invocations).toEqual([original])
+          expect(journal.read(id)?.held).toBe(blocker)
+          expect(journal.read(id)?.testRecovery).toBeUndefined()
+          expect(readRecheck()).toMatchObject({ state: 'running' })
+          expect(mocks.recheck).toHaveBeenCalledOnce()
+          journal.rebuild()
+          runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), ops)
+        }
+      }
+      const sequence = journal.read(id)!.sequence, reads = observe.mock.calls.length
+      let settled = false
+      const settling = waitForImplementationRechecks().then(() => { settled = true })
+      await Promise.resolve()
+      if (rechecked) expect(settled).toBe(false)
+      finishRecheck()
+      await settling
+      expect(releaseBackgroundBusy()).toBe(0)
+      expect(behaviorBackgroundBusy()).toBe(0)
+      expect(observe).toHaveBeenCalledTimes(reads)
+      if (mode !== 'changed during recheck') expect(journal.read(id)?.sequence).toBe(sequence)
+      if (rechecked) expect(readRecheck()).toMatchObject({ state: mode === 'failed recheck' ? 'failed' : 'passed' })
+      expect(journal.read(id)?.testRecovery).toBeUndefined()
+      if (mode === 'changed after recheck') obs.issue.revision = 'new revision'
+      if (restartsBeforeAdmission && !advancesDuringRecheck) {
+        vi.setSystemTime(Date.now() + 86_400_000)
+        await runtime.run()
+        expect(journal.read(id)).toMatchObject({ held: null, testRecovery: { base, recheck: key } })
+        expect(launch).not.toHaveBeenCalled()
+        if (mode === 'base advances before admission') obs.prerequisites.base = nextBase
+      }
       permitted = true
+      journal.rebuild()
+      runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), ops)
+      for (let tick = 0; tick < 3; tick++) {
+        vi.setSystemTime(Date.now() + 86_400_000)
+        await runtime.run()
+        await waitForImplementationRechecks()
+      }
+      const recovered = restartsBeforeAdmission || ['recover', 'memory recovery', 'restart during recheck'].includes(mode)
+      if (rechecked) expect(observe.mock.calls.length).toBeGreaterThan(reads)
+      expect(journal.read(id)?.invocations).toHaveLength(recovered ? 2 : 1)
+      expect(launch).toHaveBeenCalledTimes((recovered ? 1 : 0) + (mode === 'restart during recheck' ? 1 : 0))
+      const checkedBases = ['base advances during recheck', 'base advances before admission', 'recheck fails on new base'].includes(mode)
+        ? [base, nextBase] : rechecked ? [base] : []
+      expect(mocks.recheck.mock.calls).toEqual(checkedBases.map(checkedBase =>
+        [repository, 'mikkokotila', old, checkedBase, merge, 'tests/test-offload.test.ts', test, undefined]))
+    } finally {
+      finishRecheck()
+      await sweep
+      await waitForImplementationRechecks()
     }
-    journal.rebuild()
-    runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), ops)
-    for (let tick = 0; tick < 3; tick++) { vi.setSystemTime(Date.now() + 86_400_000); await runtime.run() }
-    expect(launch).toHaveBeenCalledTimes(['recover', 'memory recovery', 'restart before admission'].includes(mode) ? 1 : 0)
-    expect(mocks.recheck).toHaveBeenCalledTimes(['recover', 'memory recovery', 'restart before admission', 'failed recheck', 'changed during recheck',
-      'changed during preparation', 'missing review'].includes(mode) ? 1 : 0)
-    if (mocks.recheck.mock.calls.length) expect(mocks.recheck.mock.calls[0]).toEqual([repository, 'mikkokotila', old, base, merge, 'tests/test-offload.test.ts', test])
     if (!['unsettled resources', 'possible publication'].includes(mode)) expect(journal.read(id)?.invocations[0]).toEqual(original)
     const retained = JSON.parse((db.prepare('SELECT value FROM meta WHERE key=?').get(storageKey) as { value: string }).value)
     const { recheck, ...unchanged } = retained
@@ -5022,7 +5102,8 @@ it.each(['operator hold', 'changed basis', 'provider-only', 'submitting_review p
     expect(journal.read(chain.id)?.held).toBe(chain.held)
   })
 
-it('reports three native PR approval deadlines once after an earlier review report, surviving lost acknowledgement and restart', async () => {
+it.each(['missing', 'source-only', 'distinct-fix', 'approval-basis', 'hold', 'attempt-list', 'preparation', 'admission', 'launch', 'unlaunched', 'account-switch'] as const)(
+  'gates the actual approval deadline report through lost acknowledgement, review and restart (%s)', async kind => {
   const root = mkdtempSync(join(tmpdir(), 'approval-report-')); roots.push(root)
   const path = join(root, 'journal.sqlite')
   const initial = setup(path)
@@ -5047,7 +5128,11 @@ it('reports three native PR approval deadlines once after an earlier review repo
   }
   expect(source.held).toContain('approve-pr failed before publication three times')
   loseCreation = true
-  const overrides = { observe: async () => ({ ...fresh, checkedAt: Date.now() }) }
+  const observe = async (chain: BehaviorChain) => chain.issue === 7 ? { ...fresh, checkedAt: Date.now() } : {
+    ...unpublished(), issue: { open: true, eligible: true, revision: chainBasis([remote.find(row => row.number === chain.issue)!.title,
+      remote.find(row => row.number === chain.issue)!.body]), commentIds: [700] },
+    issueReviewers: chain.issue === 100 ? [reviewer] : [], prerequisites: { wait: null, base: HEAD, evidence: [] } }
+  const overrides = { observe }
   const runtime = new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal, overrides))
   await runtime.run()
   expect(posts()).toHaveLength(2)
@@ -5073,6 +5158,83 @@ it('reports three native PR approval deadlines once after an earlier review repo
   expect(remote[1].body.endsWith('Include this exact paragraph in the linked PR review.')).toBe(true)
   expect(remote[1].body).toContain(`<!-- poise-repair-exhaustion:${approvalKey} -->`)
   expect(initial.journal.read(source.id)).toMatchObject({ held: source.held, resumedAfterSequence: resumed.sequence, invocations: source.invocations })
+
+  // Intake sees the published issue before the source publisher reconciles its lost acknowledgement.
+  indexed = true
+  const request = vi.fn(async (chain: BehaviorChain, observation: ChainObservation, decision: { behavior: string }) => ({
+    command: 'agent-interface' as const, cwd: '/fixture', argv: [decision.behavior === 'review-issue' ? '--issue-review' : '--atomic-work',
+      chain.id, '--model', 'fixture', '--expected-issue-revision', observation.issue.revision] }))
+  const launch = vi.fn(async () => true)
+  let entries: LogEntry[] = []
+  const intakeOverrides = { observe, request, launch, available: () => true,
+    // Use the production exhaustion fence; the earlier review report is outside this issue's scope.
+    permitted: (chain: BehaviorChain, decision: { behavior: Parameters<typeof repairReportImplementationFence>[2] }) =>
+      chain.issue !== 99 && !repairReportImplementationFence(initial.db, chain, decision.behavior),
+    reportHold: async () => null, readInvocations: async () => ({ entries, quarantined: [] }) } as
+    Parameters<typeof operations>[2] & { accounts?: () => { author: string, reviewer: string } }
+  if (kind === 'account-switch') {
+    // The configured author changes after GitHub accepts the report POST but before intake.
+    mocks.accounts = { me: 'new-author', agentAccount: 'reviewer' }
+    intakeOverrides.accounts = () => ({ author: 'new-author', reviewer: 'reviewer' })
+  }
+  await new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal, intakeOverrides)).run()
+  let report = initial.journal.read('acme/repo#100')!
+  const review = report.invocations.at(-1)!
+  expect(review).toMatchObject({ behavior: 'review-issue', state: 'started' })
+  expect(JSON.parse(reports(initial.db).find(row => JSON.parse(row.value).key === approvalKey)!.value).issueNumber).toBeNull()
+  entries = [{ id: 'b'.repeat(32), correlation_id: review.id, source: 'poise:behavior-chain', repo: 'acme/repo', pr_id: '100',
+    actor: 'reviewer', model: 'fixture', behavior: 'issue_review', session_id: null, prompt: '', response: null,
+    started_at: new Date(review.admittedAt).toISOString(), completed_at: new Date(NOW).toISOString(), time_elapsed: '1s',
+    status: 'completed', action: 'commented', outcome: 'commented', error: '', error_code: null, head_sha: null, expected_head: null,
+    resources_settled_at: new Date(NOW).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] },
+    issue_revision: (await observe(report)).issue.revision,
+    receipts: [{ issue: report.id, comment_id: 700, author: 'reviewer', url: 'https://github.com/acme/repo/issues/100#issuecomment-700' }] }]
+  request.mockClear(); launch.mockClear()
+  await new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal, intakeOverrides)).run()
+  report = initial.journal.read(report.id)!
+  expect(report.invocations).toMatchObject([{ behavior: 'review-issue', state: 'settled', outcome: 'commented' }])
+  expect(request).not.toHaveBeenCalled()
+  expect(launch).not.toHaveBeenCalled()
+  expect(report.waiting).toContain('Approval deadline report awaits a current explicit')
+  if (kind === 'account-switch') {
+    expect(report.author).toBe('new-author')
+    expect(report.waiting).toContain('verification unavailable')
+    expect(implementationReportBinding(initial.db, report)).toBeNull()
+    expect(JSON.parse(reports(initial.db).find(row => JSON.parse(row.value).key === approvalKey)!.value).issueNumber).toBeNull()
+  } else {
+    expect(implementationReportBinding(initial.db, report)).toMatchObject({ key: approvalKey, source: source.id, disposition: null })
+    expect(JSON.parse(reports(initial.db).find(row => JSON.parse(row.value).key === approvalKey)!.value).issueNumber).toBe(100)
+  }
+
+  const disposition = { kind: kind === 'source-only' ? 'source-only' : 'distinct-fix', review: review.id, commentId: 700,
+    diagnosis: 'Inspect the original approval Calls; separately verified defect requires a distinct fix.',
+    nextAction: 'Keep source approval held until an explicit Resume; retain approval and merge gates.' }
+  if (kind !== 'missing' && kind !== 'unlaunched' && kind !== 'account-switch') {
+    await setImplementationReportDisposition(initial.db, initial.journal, report, report.sequence,
+      implementationReportBinding(initial.db, report), disposition)
+  }
+  if (kind === 'approval-basis') {
+    fresh.pull!.reviewRevision = chainBasis('changed approval basis on the same head')
+    record(initial.journal, initial.journal.read(source.id)!, { type: 'chain.observed', observation: fresh })
+  }
+  if (kind === 'hold') record(initial.journal, initial.journal.read(source.id)!, { type: 'chain.held', reason: source.held! })
+  if (kind === 'attempt-list') {
+    const row = reports(initial.db).find(row => JSON.parse(row.value).key === approvalKey)!
+    const intent = JSON.parse(row.value)
+    intent.attempts.pop()
+    initial.db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(intent), `behavior_chain_repair_report:${approvalKey}`)
+  }
+  if (['approval-basis', 'hold', 'attempt-list'].includes(kind)) {
+    report = initial.journal.read(report.id)!
+    await expect(setImplementationReportDisposition(initial.db, initial.journal, report, report.sequence,
+      implementationReportBinding(initial.db, report), disposition)).rejects.toThrow('Original blocked hold or Call changed')
+  }
+  if (kind === 'unlaunched') {
+    report = initial.journal.read(report.id)!
+    record(initial.journal, report, { type: 'invocation.admitted', invocation: { id: 'old-report-implementation', behavior: 'implement-issue',
+      actor: 'author', basis: chainBasis(['issue', (await observe(report)).issue.revision]), model: 'fixture', slot: reviewer.slot,
+      admittedAt: NOW - 20_000, request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+  }
   await runtime.run()
   expect(posts()).toHaveLength(2)
   initial.db.close(); databases.splice(databases.indexOf(initial.db), 1)
@@ -5083,9 +5245,62 @@ it('reports three native PR approval deadlines once after an earlier review repo
   expect(posts()).toHaveLength(2)
   const reconciled = reports(db).map(row => JSON.parse(row.value))
   expect(reconciled.find(report => report.key === reviewKey)).toMatchObject({ issueNumber: 99 })
-  expect(reconciled.find(report => report.key === approvalKey)).toMatchObject({ issueNumber: 100 })
+  expect(reconciled.find(report => report.key === approvalKey)).toMatchObject(
+    kind === 'account-switch' ? { issueNumber: null } : { issueNumber: 100 })
   expect(journal.read(source.id)).toMatchObject({ held: source.held, resumedAfterSequence: resumed.sequence, invocations: source.invocations })
   expect(decideBehaviorChain(journal.read(source.id)!, { ...fresh, checkedAt: Date.now() }, Date.now())).toMatchObject({ kind: 'wait', reason: source.held })
+
+  vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  const replaceHold = () => {
+    const current = journal.read(source.id)!
+    record(journal, current, { type: 'chain.held', reason: current.held! })
+  }
+  const ops = operations(db, journal, { ...intakeOverrides,
+    permitted: (chain, decision) => chain.issue !== 99 && !repairReportImplementationFence(db, chain, decision.behavior) })
+  if (kind === 'preparation') ops.request = async (chain, observation, decision) => { replaceHold(); return request(chain, observation, decision) }
+  if (kind === 'admission') {
+    const admission = ops.implementationAdmission!
+    ops.implementationAdmission = async (...args) => {
+      const result = await admission(...args)
+      if (result.source && request.mock.calls.length) replaceHold()
+      return result
+    }
+  }
+  if (kind === 'launch') ops.launch = async (_invocation, _onExit, allowed) => {
+    replaceHold(); expect(allowed()).toBe(false); return false
+  }
+  if (kind === 'distinct-fix' || kind === 'account-switch') remote.push({ ...issue(101, 'Plain issue'), labels: [{ name: 'poise' }] })
+  if (kind === 'account-switch') {
+    const empty = issue(102, '')
+    Object.assign(empty, { body: null })
+    empty.labels = [{ name: 'poise' }]
+    remote.push(empty)
+  }
+  await new BehaviorChainRuntime(journal, ops).run()
+  const current = journal.read(report.id)!
+  if (kind === 'distinct-fix') {
+    expect(request.mock.calls.map(call => call[0].issue).sort()).toEqual([100, 101])
+    expect(launch).toHaveBeenCalledTimes(2)
+    expect(current.invocations.at(-1)).toMatchObject({ behavior: 'implement-issue', state: 'started',
+      request: { implementationSource: { id: source.id } } })
+    expect(journal.read('acme/repo#101')?.invocations.at(-1)).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+  } else if (kind === 'account-switch') {
+    expect(request.mock.calls.map(call => call[0].issue).sort()).toEqual([101, 102])
+    expect(launch).toHaveBeenCalledTimes(2)
+    expect(current.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
+    expect(current.waiting).toContain('Approval deadline report awaits a current explicit')
+    expect(current.waiting).toContain('verification unavailable')
+    expect(JSON.parse(reports(db).find(row => JSON.parse(row.value).key === approvalKey)!.value).issueNumber).toBeNull()
+    expect(journal.read('acme/repo#101')?.invocations.at(-1)).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+    expect(journal.read('acme/repo#102')?.invocations.at(-1)).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+  } else {
+    expect(launch).not.toHaveBeenCalled()
+    expect(current.invocations.some(item => item.behavior === 'implement-issue' && item.state !== 'settled')).toBe(false)
+    if (kind === 'launch' || kind === 'unlaunched') expect(current.invocations.at(-1)?.outcome).toBe('launch_deferred')
+    else expect(current.waiting).toContain(kind === 'source-only' ? 'source-only disposition' : 'awaits a current explicit')
+  }
+  expect(journal.read(source.id)).toMatchObject({ held: source.held, resumedAfterSequence: resumed.sequence, invocations: source.invocations })
+  expect(posts()).toHaveLength(2)
   const retried = record(journal, journal.read(source.id)!, { type: 'chain.resumed' })
   expect(decideBehaviorChain(retried, { ...fresh, checkedAt: Date.now() }, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
 })

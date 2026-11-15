@@ -175,6 +175,11 @@ retain earlier responses and decoded snapshots alongside fresh reads. A retained
 guard before the second read rejects either preceding payload; the existing guard
 also bounds mock data still held after recovery.
 
+Verify this memory boundary with the whole `npm run check` on the configured
+test box, using the default two workers and existing time limit. Retain its
+captured-candidate digest, run ID and test/build completion. A focused suite or
+CI's one-worker run does not establish that the full offloaded gate fits.
+
 ## Agents' suites
 
 On a deployment with a test relay, a suite an agent starts in a workspace runs on a disposable test box, not beside Poise ([Agents' test suites](Operating.md#agents-test-suites)). `tests/test-offload.test.ts` runs the real hooks, runner, relay and box script against a stand-in for Render's API.

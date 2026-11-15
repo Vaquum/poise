@@ -137,15 +137,21 @@ polls, admission/start, failed attempts, holds and Resume do not reset it. Resta
 and projection rebuild derive the same clock without changing journal events.
 Fresh, stale, incomplete and unavailable evidence remain labelled. A known native
 failure backoff shows retry eligibility under existing admission gates; an unknown
-provider backoff has no invented deadline. Scheduled evidence rechecks never retry
-held work. CI or approval recovery cannot clear a hold or missing original receipt,
-and a queue entry cannot establish merge completion. Verified progress can remove
-a delayed entry; a durable hold remains until explicitly resumed, and a merged
-review obligation remains until its original evidence is verified. The first list
+provider backoff has no invented deadline. A scheduled evidence recheck is a read.
+The normal runtime can clear a hold when its specific recovery rule accepts new
+evidence. A merged review obligation remains until its original evidence is verified.
+A queue entry cannot establish merge completion. Verified progress can remove
+a delayed entry. The first list
 page's optional `attention` projection is independent of the ordinary chain-list
 cursor/filter; later list pages retain the existing pagination contract. Failed
 refreshes label retained attention entries stale. These are read-only summaries
 on the existing refresh clock, with no new observation or execution authority.
+In Observe → Tasks → Needs attention, a recovery nudge names the verified next
+condition or shows that it is unknown. A fresh linked PR or current Chat binding
+provides a link to existing work. Missing or conflicting ownership evidence stays
+unverified. A fresh prerequisite wait shares its root's row when the root is also
+in Needs attention. The affected chains remain available by search and direct
+link. Repeated refreshes preserve the original progress clock.
 Unchanged attention reads reuse the history-derived progress clock after
 validating the chain's current journal revision. A new event invalidates only
 that chain's cached clock; restart reconstructs it from the original history.
@@ -258,14 +264,18 @@ chains keep their original ownership, but cannot
 consume the normal-work page. Native model/resource receipts are still read
 while an original model lacks resource-release proof, including after a merge;
 only unnecessary GitHub observation waits.
-Before new model work takes a free slot, the same sweep offers it to older
-capacity waiters across all chain pages. Both the shared semaphore and durable
-invocation-capacity refusals count. Journal order dates the uninterrupted eligible
-behavior/basis/reviewer-slot episode; unchanged checks and restart retain its
-place, while changed work, other waits and Hold/Resume reset it. Each candidate
+Before model work or a direct native action takes capacity, the same sweep offers
+it to older capacity waiters across all chain pages. Shared semaphore, durable
+invocation-capacity, memory/disk budget and measured-headroom refusals count;
+measurement errors and incomplete resource accounting do not. Journal order
+dates the uninterrupted eligible behavior/basis/reviewer-slot episode;
+unchanged checks and restart retain its
+place across changing shortage reasons and byte counts, while changed work,
+other waits and Hold/Resume reset it. Each candidate
 passes fresh observation and the existing permission, provider, resource and
 atomic admission gates. An older candidate that cannot run leaves the slot for
-later eligible work. The reconciliation cursors, interactive reserve and
+later eligible work. Older model waiters yield without observation while model
+capacity is unavailable, so runnable direct work is still reached. The reconciliation cursors, interactive reserve and
 publication/merge gates remain unchanged; no worker or polling loop is added.
 Known closed PRs and closed seeds use the same native-only resource wait for
 their blocked model behaviors. A closed seed alone does not defer PR review or
@@ -392,7 +402,7 @@ must show no pushed branch, PR or competing work; this is checked again after
 provider preparation at admission.
 
 When the original assertion run did not finish, a saved automatic implementation
-hold report can instead authorize one fresh clean-base recheck. Its saved source,
+hold report can instead authorize a fresh clean-base recheck. Its saved source,
 Call, implementation basis/slot and hold sequence must still match the current
 failed-before-publication receipt and released resources. The current report and
 its author/reviewer comments identify a unique delivered remediation of the named
@@ -411,14 +421,22 @@ temporary observation conditions preserve assertions and production code. Other
 reported tests run unchanged. The completion reporter must witness the injected
 observation on both bases. A passing old case cannot prove a shared failure.
 
-The existing report saves intent before checkout or execution and retains the
-outcome. Restart, repeated observations, an interrupted attempt or a newer base
-cannot relaunch that recheck. Checkout and each dependency install have a
-120-second bound, each suite a 90-second bound, and Git reads a 30-second bound;
+The existing report saves `running` intent before checkout or execution. The
+bounded recheck runs outside the observation sweep, retaining its result without
+resuming the source. Release switching counts it as background work. Shutdown
+cancels the running command and waits for cleanup and result persistence.
+Sequential sweeps recheck a running source on the two-minute cadence and can
+advance unrelated chains while it runs. Restart and repeated observations do
+not rerun an interrupted or failed recheck or reuse a pass for a different
+base. If the base advances after a passing recheck, a later sweep can check
+the new base once the same remediation is verified on it. Checkout and each
+dependency install have a 120-second bound, each suite a 90-second bound,
+and Git reads a 30-second bound;
 suites use one worker without retries. An unverified correction or failed recheck
-states its blocker on the existing hold. A successful recheck feeds the same
-single-retry admission below, with source, publication, resources, controls and
-the pinned corrected base checked again after preparation. The new implementation
+states its blocker on the existing hold. A later sweep freshly verifies a saved
+pass before feeding the same single-retry admission below. After preparation it
+checks source, publication, resources, controls and the pinned corrected base.
+The new implementation
 still runs normal full required validation, review and CI.
 
 The automatic hold carries its original journal sequence. An operator Hold,
@@ -474,7 +492,7 @@ through the existing control after resolving the blocker.
 
 1. Each configured issue-review slot must finish successfully and its native receipt must identify an actually posted comment on the current issue revision. Before a new implementation, the authenticated Caller seed read must expose complete live same-repository GitHub `blockedBy` evidence; the mirror health gate still applies. This bounded connection is read again after awaited request preparation, immediately before admission, because dependency changes need not change the issue timestamp. A verified empty connection permits the ordinary path; absent or truncated evidence waits visibly. Each recorded prerequisite waits by issue number until it is closed and a linked closing PR's merge commit is verified as an ancestor of the observed implementation base. Closing an issue, queueing a PR or merging only into another branch is insufficient. The ordinary chain sweep rechecks this dependency wait without admitting a worker, recording an execution failure or creating a remediation issue. Existing holds still require Resume. No elapsed review delay authorizes implementation.
 2. Implementation reads the actual issue and comments, makes real changes in a fresh checkout and runs the repository's checks. After the model ends, Caller's publication primitive re-verifies those same live prerequisites on the prepared candidate base before the first push; a new unresolved dependency or incomplete evidence settles as a no-write `prerequisite_wait` deferral with the dependency recorded, so the ordinary wait above re-admits on a suitable base without Resume or failure-budget consumption. Otherwise it commits, pushes and opens the linked PR. Commit trailers and the PR's chain marker preserve artifact identity across lost responses. An already pushed branch still reconciles through the existing recovery.
-3. Fresh exact-head evidence of an actual branch conflict selects the existing scoped repair before PR review, after invocation, hold and queue guards. Clean or merely behind branches still receive the configured current-head reviews first. Repairs use a fresh model invocation and the actual review packet, CI evidence and branch state. They publish code and substantive model-written replies to original findings. A new head requires fresh reviews and approval. An unchanged-code repair still requires independent approval verification.
+3. Fresh exact-head evidence of an actual branch conflict or a completed exact-head CI failure (grey recovery excepted) selects the existing scoped repair before PR review, after invocation, hold and queue guards. Clean or merely behind branches still receive the configured current-head reviews first. Repairs use a fresh model invocation and the actual review packet, CI evidence and branch state. They publish code and substantive model-written replies to original findings. A new head requires fresh reviews and approval. An unchanged-code repair still requires independent approval verification.
 4. Existing native primitives handle grey CI, approved nonblocking conversation resolution, strict readiness, merge and merge-queue admission. Conversation resolution also covers outdated threads, because GitHub's merge rule counts them, but only when readiness is blocked solely by `merge_state_not_clean` or `required_reviews_not_approved`, the blockers an open conversation can explain. A PR that readiness reports green goes to merge with its outdated threads left alone. Their repository policy leaves a merely behind branch to native queue integration; an actual conflict still requires repair. Completion requires the actual GitHub merge SHA. Queue admission, a finished turn, approval or CLOSED alone cannot complete a chain.
 5. A removed queue entry requires its actual GitHub removal event. Failed integration checks or conflicts lead to fresh repair; manual or unknown removal holds for a decision. A `merged` removal alongside an earlier open-PR read waits for confirmed merge evidence; that event alone neither completes nor holds the chain. An unchanged-head repair requires a new independent approval before another native queue attempt. Only that attempt's actual integration result can establish acceptance. Deliberate dismissal of a current-head managed approval is also held.
 
@@ -898,6 +916,16 @@ Native `approve-pr` deadlines use the same two timeout codes, reviewer account,
 `reviewRevision` and their durable automatic hold must match the approval
 exhaustion. They file a distinct `approval_budget_exhausted` report intent and
 marker; an earlier review report never covers a current approval hold.
+These approval reports use the guarded `report-disposition` control described
+below with `source-only` or `distinct-fix`. Completed issue review alone cannot
+start implementation, including after a lost creation acknowledgement or when
+new report publishing is disabled. Triage binds the original PR/head, automatic
+approval hold, approval basis/slot and complete settled attempt list. Missing,
+source-only or stale dispositions start no report implementation; a current
+distinct-fix must pass the ordinary admission gates, including source verification
+after preparation and the source sequence guard at admission and launch. A changed
+approval basis on the same head or a replacement hold invalidates that binding.
+No disposition retries source approval or relaxes its approval and merge gates.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads, PR review contexts or approval bases

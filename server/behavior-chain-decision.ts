@@ -371,15 +371,18 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     queueVerification ??= chainBasis(['queue-verification', pull.head, removal.id, repair.id])
   }
   const repairBasis = chainBasis(['repair', pull.head, pull.failing, pull.conflict, pull.behind, pull.changesRequested, pull.unresolved, pull.reviewRevision, observation.issue.revision])
+  const grey = pull.greyRuns[0]
   if (pull.conflict) return propose(chain, 'repair-pr', repairBasis, chain.author, observation.repairer,
     'repair the confirmed branch conflict before reviewing the current head', now)
+  // Completed exact-head CI failures use the same scoped repair; grey recovery keeps its post-review guard below.
+  if (pull.failing.length && !grey) return propose(chain, 'repair-pr', repairBasis, chain.author, observation.repairer,
+    'repair the confirmed exact-head CI failure before reviewing the current head', now)
   const reviewedHeadBasis = chainBasis(['pr', pull.head, pull.reviewContext])
   for (const reviewer of observation.prReviewers) {
     const reviewed = reviewComplete(chain, 'review-pr', reviewedHeadBasis, reviewer, observation)
     if (reviewed === 'missing-artifact') return { kind: 'hold', reason: `PR review ${reviewer.slot} lacks its exact-head submission receipt` }
     if (reviewed === 'needed') return propose(chain, 'review-pr', reviewedHeadBasis, chain.reviewer, reviewer, 'review the actual current pull-request head', now)
   }
-  const grey = pull.greyRuns[0]
   if (grey) return propose(chain, 'rerun-grey-ci', chainBasis(['grey', pull.head, grey.id, grey.attempt]), chain.reviewer, null,
     `recover completed grey workflow ${grey.id} attempt ${grey.attempt} through the existing native guard`, now)
   const answered = chain.invocations.some((invocation) => invocation.behavior === 'repair-pr' && succeeded(invocation)
