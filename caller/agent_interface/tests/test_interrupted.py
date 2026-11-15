@@ -126,6 +126,34 @@ class InterruptedCallsCase(TestCase):
                 self.assertNotIn("private process details", self.row(call)["diagnostic"])
                 self.assertLess(len(self.row(call)["diagnostic"]), 500)
 
+    def test_an_authorized_parent_preserves_a_live_legacy_child(self):
+        parent = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+        child = {**parent, "init_start": "20", "namespace_ino": 3}
+        identity = json.dumps({"version": 1, "pid": 4242, "start": "42", "epoch": child})
+        call = self.call(started_ago=60, identity=identity)
+        with patch.object(agent_interface.process_identity, "epoch", return_value=parent), \
+                patch.object(agent_interface.process_identity, "_start") as start:
+            running = agent_interface.logs(status="running")
+            start.assert_not_called()
+        self.assertIn(call, {entry["id"] for entry in running})
+        self.assertEqual(self.row(call)["status"], "running")
+
+    def test_a_malformed_reapable_diagnostic_does_not_break_history_reads(self):
+        good = self.call(started_ago=60, status="completed")
+        for changed_only in (False, True):
+            with self.subTest(changed_only=changed_only):
+                bad = self.call(started_ago=2 * 3600)
+                malformed = '{"operation":'
+                with agent_interface.db() as conn:
+                    conn.execute("update calls set diagnostic=? where id=?", (malformed, bad))
+                entries = ([entry["row"] for entry in agent_interface.logs_changed(0, 20)["rows"]]
+                           if changed_only else agent_interface.logs())
+                by_id = {entry["id"]: entry for entry in entries}
+                self.assertEqual(by_id[good]["status"], "completed")
+                self.assertIn("history_read_error", by_id[bad])
+                self.assertEqual(self.row(bad)["diagnostic"], malformed)
+                self.assertEqual(self.row(bad)["error_code"], "interrupted")
+
     def test_authorized_legacy_replacement_preserves_publication_and_resource_fences(self):
         epoch = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
         identity = json.dumps({"version": 1, "pid": 4242, "start": "42", "epoch": epoch})
@@ -134,7 +162,7 @@ class InterruptedCallsCase(TestCase):
         with agent_interface.db() as conn:
             conn.execute("update calls set artifact=?,action_plan=?,receipts=?,diagnostic=? where id=?",
                          ('{"phase":"submitting_review"}', 'original publication plan', '[{"review_id":91}]', json.dumps(prior), call))
-        with patch.object(agent_interface.process_identity, "epoch", return_value={**epoch, "namespace_ino": 3}), \
+        with patch.object(agent_interface.process_identity, "epoch", return_value={**epoch, "init_start": "20", "namespace_ino": 3}), \
                 patch.object(agent_interface.process_identity, "_start") as start, \
                 patch.object(agent_interface, "init_started_at", return_value=self.now - 3600):
             self.assertEqual(agent_interface.reap_interrupted(), 1)

@@ -94,8 +94,9 @@ Only a reader that can observe the current workspace supervisor can reconcile
 a previous workspace epoch. A reader in a private PID namespace cannot do so.
 Identified legacy Calls remain running while their supervisor is alive or its
 epoch is unobservable to that reader. Same-epoch supervisor loss retains the
-six-hour orphan grace because providers can outlive it; a verified workspace
-replacement bypasses that grace. Missing or unverified identities retain the
+six-hour orphan grace because providers can outlive it. An authorized workspace
+observer can recognize a replacement from a prior boot or an older PID
+namespace init on the same boot. Missing or unverified identities retain the
 historical init/age/command rule only for an authorized workspace observer.
 Reaper decisions retain a bounded reason, observer scope and identity result
 in `diagnostic` (under `reaper` when an earlier diagnostic is present), without

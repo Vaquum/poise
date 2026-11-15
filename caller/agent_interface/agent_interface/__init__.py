@@ -782,6 +782,19 @@ def reap_interrupted() -> int:
             continue
         reason = "workspace_replaced" if observed == "unobservable" else "supervisor_lost"
         if not native:
+            if observed == "unobservable":
+                # A parent sees a live child namespace as unobservable too.
+                # Only an earlier kernel epoch proves replacement here.
+                try:
+                    registered = process_identity.decode(row["process_identity"], int(row["pid"]))["epoch"]
+                    workspace = process_identity.epoch()
+                    boot = registered["boot"]
+                    if not isinstance(boot, str) or not boot:
+                        continue
+                    if boot == workspace["boot"] and int(registered["init_start"]) >= int(workspace["init_start"]):
+                        continue
+                except (OSError, RuntimeError, KeyError, TypeError, ValueError, IndexError):
+                    continue
             started = float(row["started_at"] or 0)
             reason = "workspace_replaced" if observed == "unobservable" else "legacy_before_init"
             # Same-epoch supervisor loss does not prove its providers ended.
@@ -810,7 +823,8 @@ def reap_interrupted() -> int:
                 "update calls set status='failed', ended_at=?, "
                 "error=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error when error_code='stopping' then 'Stopped by user' else ? end, "
                 "error_code=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error_code when error_code='stopping' then 'stopped' else 'interrupted' end, "
-                "diagnostic=case when diagnostic is null then ? else json_set(diagnostic,'$.reaper',json(?)) end, "
+                "diagnostic=case when diagnostic is null then ? "
+                "when json_valid(diagnostic) then json_set(diagnostic,'$.reaper',json(?)) else diagnostic end, "
                 "progress=coalesce(?, progress) where id=? and status='running'",
                 (now, INTERRUPTED_ERROR, evidence, evidence, progress.terminal("failed"), id_),
             ).rowcount
