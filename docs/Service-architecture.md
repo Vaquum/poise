@@ -399,20 +399,21 @@ bytes before forwarding and retaining it. Earlier runners and relays still
 exchange the whole checkout through the existing tree upload. Jobs and
 sandboxes receive the same single tar stream from either route.
 
-New atomic Calls also pass a Caller-owned random capture binding through the
-test-offload hooks, outside the suite environment. The box independently hashes
-the captured archive and source files before running a direct Vitest command.
-Relay recovery is currently held for #1619: the suite UID owns the report files,
-so no assertion inventory is trusted and no evidence frame is emitted. The held
-design would post a complete bounded inventory from the private run credential to
-`POST /runs/:id/assertions`; workspace credentials cannot submit that result.
-Only a matching completed failure would emit an Ed25519-signed evidence frame
-before the relay deletes the run. The hook would retain the redacted receipt for
-Caller; `POST /evidence/verify` would authenticate it against the existing gateway
-key and workspace credential after run deletion or restart. There is no unsigned
-or partial-result fallback. Caller would retain the verified receipt in its
-original artifact before resource cleanup. This extends the existing relay
-interface, without a new identity scope, setting or runner-retention store.
+Atomic Calls pass a Caller-owned random capture binding outside the suite
+environment. The [standalone assertion command](Operating.md#agents-test-suites)
+uses a sandbox with Docker stopped. Its root collector verifies the archive
+digest and original Git commit/tree identities, then stages the sole text
+comparison using its installed Vitest and protected configuration. The uploaded
+test, config and dependencies cannot execute in that mode.
+
+The sandbox collector consumes its separate credential before unpacking.
+`POST /runs/:id/assertions` accepts only that credential for the active bound
+run. The gateway signs the bounded, redacted inventory only on a completed
+provider exit of 1 within the run deadline. The hook retains the receipt only
+after receiving the matching suite exit. `POST /evidence/verify` authenticates it
+with the existing gateway key and workspace credential after run deletion or
+restart. Caller retains the verified receipt in the original artifact before
+resource cleanup.
 
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
 gateway's, or with none, is recreated as one on an outdated image is: drained
@@ -1612,8 +1613,8 @@ merge gates still apply under the same [CI hold recovery](Behavior-chain.md#boun
 For a pre-PR implementation, the existing Caller artifact and seed read can
 instead verify an original CI assertion failure on its exact prepared base, and
 the delivered main recovery with validation of every original failing test and
-case. Relay assertions remain held for #1619 until the runner establishes their
-inventory independently of candidate-controlled reports.
+case. The same path accepts authenticated results from the standalone relay
+assertion command.
 The journal admits one fresh implementation for that automatic hold and recovery
 commit, independently of report publishing. An incomplete original assertion can
 instead use the saved automatic hold report and linked delivered fixture fix for

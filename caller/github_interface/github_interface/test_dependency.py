@@ -59,7 +59,7 @@ async def _relay_receipt(receipt: dict) -> dict:
             or sum(len(item.encode()) for item in receipt.values()) > 48 * 1024:
         raise ValueError("completed relay assertion receipt is missing or oversized")
     try:
-        relay, key = (Path.home() / ".poise/test-offload/relay").read_text().splitlines()
+        relay, key = (Path.home() / ".poise/test-offload/relay").read_text().splitlines()[:2]
         async with httpx.AsyncClient(timeout=10, trust_env=False) as relay_client:
             response = await relay_client.post(f"{relay}/evidence/verify", json=receipt,
                                                headers={"authorization": f"Bearer {key}"})
