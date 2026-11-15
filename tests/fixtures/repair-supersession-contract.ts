@@ -38,7 +38,7 @@ try {
   chain = journal.append(chain.id, 'original', chain.sequence, { type: 'invocation.admitted', invocation: {
     id: call.correlation_id!, behavior: 'repair-pr', actor: 'author', model: call.model, slot: 'primary', basis: 'old-head',
     admittedAt: Date.parse(call.started_at), reservation: { memoryBytes: 8, diskBytes: 16 }, request: { command: 'agent-interface',
-      cwd: '/isolated', argv: ['--atomic-work', 'example/repo#7'], context: { head: call.expected_head! } } } })
+      cwd: '/isolated', argv: ['--atomic-work', 'example/repo#7'], context: { head: call.expected_head!, reviewRevision: 'review' } } } })
   journal.append(chain.id, 'started', chain.sequence, { type: 'invocation.started', invocationId: call.correlation_id! })
   let snapshot = pending, permitted = false, launches = 0
   const forbidden = async (): Promise<never> => { throw new Error('unexpected external operation') }
@@ -48,7 +48,7 @@ try {
     request: async (_chain, obs, decision) => {
       assert.equal(decision.behavior, 'repair-pr')
       assert.equal(obs.pull!.head, call.head_sha)
-      return { command: 'agent-interface', cwd: '/isolated', argv: ['--atomic-work', 'example/repo#7'], context: { head: obs.pull!.head } }
+      return { command: 'agent-interface', cwd: '/isolated', argv: ['--atomic-work', 'example/repo#7'], context: { head: obs.pull!.head, reviewRevision: obs.pull!.reviewRevision } }
     }, launch: async () => { launches++; return true }, perform: forbidden, readActionResult: forbidden,
     resumePublication: forbidden, fenceClosedTarget: forbidden }
   const runtime = new BehaviorChainRuntime(journal, operations)

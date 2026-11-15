@@ -198,7 +198,7 @@ it.each(['executing', 'publishing'])('shows a changed head waiting on the origin
   let current = journal.append(chain.id, 'original', chain.sequence, { type: 'invocation.admitted', invocation: {
     id: 'original', behavior: 'repair-pr', actor: chain.author, model: call.model, slot: 'primary', basis: 'old-head',
     admittedAt: Date.now(), request: { command: 'agent-interface', cwd: '/isolated', argv: ['--atomic-work', 'example/repo#943'],
-      context: { head: HEAD } } } })
+      context: { head: HEAD, reviewRevision: 'review' } } } })
   journal.append(chain.id, 'started', current.sequence, { type: 'invocation.started', invocationId: 'original' })
   const before = structuredClone(call)
   const runtime = new BehaviorChainRuntime(journal, operations)
