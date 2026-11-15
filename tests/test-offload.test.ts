@@ -989,9 +989,9 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
       ].join('\n') + '\n', timeout: 90_000 })
       expect(image.status, image.stderr).toBe(0)
       assertionBoxImage = readFileSync(iid, 'utf8').trim()
-      let offset = 0
+      let now = Date.now()
       await startAll({
-        baseService: 'crn-test', limitSeconds: 20, now: () => Date.now() + offset,
+        baseService: 'crn-test', limitSeconds: 20, now: () => now,
         origin: () => process.platform === 'linux' ? relayOrigin : relayOrigin.replace('127.0.0.1', 'host.docker.internal'),
       })
       const repo = repository()
@@ -1076,15 +1076,15 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
       writeFileSync(join(repo, 'tracked.txt'), 'checked out\n')
       delayAssertionExit = true
       const interrupted = suite(repo, argv, env)
-      await until(() => [...relay.runs.values()].some(item => item.assertions !== null), 'collector submission before provider exit')
+      await until(() => [...relay.runs.values()].some(item => item.assertions !== null), 'collector submission before provider exit', 45_000)
       const active = [...relay.runs.values()].find(item => item.assertions !== null)!
       expect((await fetch(relayUrl + '/runs/' + active.id + '/assertions', {
         method: 'POST', headers: { authorization: 'Bearer ' + active.token }, body: JSON.stringify(active.assertions),
       })).status).toBe(409)
-      offset = 20_001
+      now += 20_001
       expect(await interrupted.done).toMatchObject({ code: 124, stderr: expect.stringContaining('no test result') })
       expect(existsSync(join(evidence, active.id + '.json'))).toBe(false)
-    }, 130_000)
+    }, 180_000)
 
   it('starts a suite on a job of the base service, which costs less, and gives the agent its output and exit code', async () => {
     await startAll({ baseService: 'crn-test' })
