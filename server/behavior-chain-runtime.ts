@@ -32,6 +32,7 @@ export interface ChainRuntimeOperations {
   authenticationRejected?(call: LogEntry): void
   authRecovered?(invocation: ChainInvocation): boolean | ChainRecoveryOrigin
   available(): boolean
+  availableSlots?(): number
   capacity(): number
   /** Override for the synchronous admission-boundary probe; production and
    *  local validation measure the actual host. Tests stub this. */
@@ -344,17 +345,26 @@ export class BehaviorChainRuntime {
 
   /** An organization's runtime cannot prepare another organization's review.
    * Honor its durable turn and let the existing workspace wake offer it. */
-  private earlierReviewWaitsElsewhere(chain: BehaviorChain, decision: Extract<ChainDecision, { kind: 'invoke' }>): boolean {
+  private earlierReviewWaitsElsewhere(chain: BehaviorChain, decision: Extract<ChainDecision, { kind: 'invoke' }>,
+    resources: BehaviorResourceAdmission | null, headroom: BehaviorResourceHeadroom | undefined): boolean {
     if (!decision.reviewer) return false
     const turn = (chain.waiting && capacityWait(chain.waiting) ? this.capacityWaitSequence(chain) : null) ?? Infinity
     const now = Date.now()
-    return this.journal.capacityWaiters().some(waiter => {
+    const earlierCount = this.journal.capacityWaiters().filter(waiter => {
       const observation = waiter.observation as ChainObservation | null
       if (this.operations.ownsRepository(waiter.repository) || !observation || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return false
       const earlier = admissionDecision(waiter, observation, now)
       if (!earlier?.reviewer || !decision.checkpoint && !earlier.checkpoint) return false
       return (this.capacityWaitSequence(waiter) ?? Infinity) < turn
-    })
+    }).length
+    if (!earlierCount) return false
+    const free = Math.min(this.operations.availableSlots?.() ?? 1, this.operations.capacity() - this.journal.liveModelInvocationCount())
+    if (earlierCount >= free) return true
+    if (!resources) return false
+    const needed = { memoryBytes: resources.reservation.memoryBytes * (earlierCount + 1),
+      diskBytes: resources.reservation.diskBytes * (earlierCount + 1) }
+    return !!budgetShortfall(resources.budget, this.journal.reservedResources(), needed)
+      || !!headroom && !!headroomShortfall(headroom, needed)
   }
 
   /** Resume retains waiting in hashed reducer state; a still-blocking reason
@@ -704,6 +714,7 @@ export class BehaviorChainRuntime {
                 // count check, so blocked work holds no native agent session and
                 // consumes no provider probe. Unset budgets skip every probe.
                 const resources = readBehaviorResourceAdmission()
+                let headroom: BehaviorResourceHeadroom | undefined
                 if (resources) {
                   const exhausted = this.resourceWaitReason(resources)
                   if (exhausted) {
@@ -712,7 +723,8 @@ export class BehaviorChainRuntime {
                     continue
                   }
                   try {
-                    const cramped = headroomShortfall((this.operations.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)
+                    headroom = (this.operations.measureHeadroom ?? measureBehaviorHeadroom)()
+                    const cramped = headroomShortfall(headroom, resources.reservation)
                     if (cramped) {
                       this.waitForCapacity(chain, cramped)
                       continue
@@ -723,7 +735,7 @@ export class BehaviorChainRuntime {
                     continue
                   }
                 }
-                if (this.earlierReviewWaitsElsewhere(chain, decision)) {
+                if (this.earlierReviewWaitsElsewhere(chain, decision, resources, headroom)) {
                   this.waitForCapacity(chain, REVIEW_CAPACITY_WAIT)
                   continue
                 }
@@ -833,7 +845,7 @@ export class BehaviorChainRuntime {
                 }
                 if (gate?.source) request = { ...request, implementationSource: gate.source }
                 if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
-                if (this.earlierReviewWaitsElsewhere(chain, decision)) {
+                if (this.earlierReviewWaitsElsewhere(chain, decision, resources, headroom)) {
                   this.waitForCapacity(chain, REVIEW_CAPACITY_WAIT)
                   continue
                 }

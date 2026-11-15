@@ -10,6 +10,7 @@ export interface ReviewCheckpoint {
   spent_ms: number
   allowance_ms: number
   last_progress_at: number
+  progress_call: string
 }
 
 const callId = /^[a-f0-9]{32}$/
@@ -21,7 +22,8 @@ export function parseReviewCheckpoint(artifact: Record<string, unknown> | null |
   if (artifact?.review_checkpoint === undefined) return null
   const value = artifact.review_checkpoint as ReviewCheckpoint | null
   const link = artifact.review_resume as Pick<ReviewCheckpoint, 'root_call' | 'basis' | 'generation'> | undefined
-  if (!value || !link || Object.keys(value).length !== 9 || typeof value.root_call !== 'string' || !callId.test(value.root_call)
+  if (!value || !link || Object.keys(value).length !== 10 || typeof value.root_call !== 'string' || !callId.test(value.root_call)
+    || typeof value.progress_call !== 'string' || !callId.test(value.progress_call)
     || typeof value.basis !== 'string' || !digest.test(value.basis)
     || ![value.generation, value.required_units, value.attempts, value.allowance_ms, value.last_progress_at]
       .every(number => Number.isSafeInteger(number) && number > 0)
@@ -51,8 +53,7 @@ export function yieldedReview(call: LogEntry): ReviewCheckpoint | null {
   if (!reviewContinuationNoWrite(call)
     || (call.error_code !== 'review_continuation_required' && call.error_code !== 'interrupted')) return null
   const checkpoint = parseReviewCheckpoint(call.artifact)
-  if (call.error_code === 'interrupted' && checkpoint
-    && !(checkpoint.last_progress_at >= Date.parse(call.started_at_precise ?? call.started_at))) return null
+  if (call.error_code === 'interrupted' && checkpoint?.progress_call !== call.id) return null
   return checkpoint
 }
 

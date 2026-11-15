@@ -37,6 +37,7 @@ export interface NativeChainHooks {
   prepare(identities: string[]): Promise<NodeJS.ProcessEnv>
   borrow(): (() => void) | null
   available(): boolean
+  availableSlots?(): number
   capacity(): number
   measureHeadroom?: () => BehaviorResourceHeadroom
   permitted(chain: BehaviorChain, decision: Invoke): boolean
@@ -108,6 +109,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     accounts,
     ownsRepository,
     available: hooks.available,
+    availableSlots: hooks.availableSlots,
     capacity: hooks.capacity,
     measureHeadroom: hooks.measureHeadroom,
     permitted(chain, decision) {
@@ -491,7 +493,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         const reviewNote = scope
           ? `${note}\n\nApply this scope directive when reviewing the remediation. Caller includes it once in the formal GitHub review.\n\n${scope}` : note
         const checkpoint = decision.checkpoint
-        if (checkpoint && (selected.model !== decision.reviewer?.model || !hooks.reviewContinuation?.(selected.model))) return null
+        if (checkpoint && (selected.model !== decision.reviewer?.model || selected.slot !== decision.reviewer.slot
+          || !hooks.reviewContinuation?.(selected.model))) return null
         const continuation = hooks.reviewContinuation?.(selected.model) ? reviewContinuationArgs(selected.slot, checkpoint) : []
         return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `https://github.com/${chain.repository}/pull/${pull.number}`,
           ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior),

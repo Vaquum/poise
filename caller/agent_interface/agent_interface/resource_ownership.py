@@ -22,6 +22,8 @@ MAX_ERROR_CHARACTERS = 512
 LEGACY_REVIEW_SOURCES = {"pr_review": "poise:review-new-prs", "pr_approve": "poise:approve-prs"}
 MANAGED_CALLS = "(source='poise:behavior-chain' or (resource_ownership is not null and " \
     "((source='poise:review-new-prs' and behavior='pr_review') or (source='poise:approve-prs' and behavior='pr_approve'))))"
+PENDING_CALLS = "((source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)) " \
+    "or (source in ('poise:review-new-prs','poise:approve-prs') and resource_cleanup is not null))"
 
 
 def initial(call_id: str | None = None, correlation: str | None = None) -> str:

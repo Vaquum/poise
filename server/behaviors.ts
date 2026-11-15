@@ -1502,9 +1502,9 @@ function tryLegacyReviewSlot(behavior: 'review-new-prs' | 'approve-prs', target:
       const key = waitForLegacyReviewSlot(behavior, target)
       const range = prefixRange(LEGACY_PR_WAITER)
       cachedStatement(db, 'DELETE FROM meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) < ?').run(...range, Date.now())
-      const first = cachedStatement(db, 'SELECT key FROM meta WHERE key >= ? AND key < ? ORDER BY rowid LIMIT 1')
-        .get(...range) as { key: string }
-      if (first.key !== key) return null
+      const { count } = cachedStatement(db, `SELECT count(*) AS count FROM meta WHERE key >= ? AND key < ?
+        AND rowid < (SELECT rowid FROM meta WHERE key = ?)`).get(...range, key) as { count: number }
+      if (count >= behaviorCheckSlots.availableSlots('behavior')) return null
       const release = behaviorCheckSlots.tryAcquire('behavior')
       if (!release) return null
       booking.release = release
@@ -8643,6 +8643,7 @@ async function runBehaviorChains(): Promise<void> {
         return behaviorCheckSlots.tryAcquire('behavior')
       },
       available: () => { const available = behaviorCheckSlots.available('behavior'); if (!available) checkSlotRetryPending = true; return available },
+      availableSlots: () => behaviorCheckSlots.availableSlots('behavior'),
       capacity: () => behaviorCheckSlots.laneCapacity('behavior'),
       permitted(chain, decision) {
         if (!tickerStarted || behaviorAbortController?.signal.aborted || !getBehaviorChainSettings().enabled || releaseBackgroundPaused()) return false

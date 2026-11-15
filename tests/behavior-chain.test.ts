@@ -549,7 +549,7 @@ describe('native admission and recovery', () => {
       fenceClosedTarget: async () => { throw new Error('unexpected closed-target fence') }, wake: () => {}, ...overrides }
   }
 
-  it.each(['one slot', 'bounded memory'] as const)('requeues four review Calls fairly across runtimes with %s', async limit => {
+  it.each(['one slot', 'bounded memory', 'spare slot'] as const)('preserves review admission order across runtimes with %s', async limit => {
     vi.spyOn(Date, 'now').mockReturnValue(NOW)
     if (limit === 'bounded memory') {
       vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '100')
@@ -565,8 +565,10 @@ describe('native admission and recovery', () => {
       }))
       const launches: ChainInvocation[] = []
       const calls: LogEntry[] = []
+      let capacity = limit === 'bounded memory' ? 2 : 1
       const shared = operations({
-        capacity: () => limit === 'one slot' ? 1 : 2,
+        capacity: () => capacity,
+        availableSlots: () => capacity,
         measureHeadroom: () => ({ freeMemoryBytes: 1000, freeDiskBytes: 1000, diskPath: '/fixture' }),
         observe: async chain => structuredClone(observations.get(chain.repository)!),
         readInvocations: async ids => ({ entries: calls.filter(call => ids.includes(call.correlation_id!)), quarantined: [] }),
@@ -590,7 +592,8 @@ describe('native admission and recovery', () => {
         const root = number === 1 ? call.id : calls[0].id
         const link = { root_call: root, generation: number * 12, basis: HEAD.padEnd(64, '0') }
         call.artifact = { phase: 'reviewing', review_resume: { ...link, slot: 'primary' }, review_checkpoint: { ...link, unit: number * 6,
-          required_units: 23, attempts: number * 6 + 1, spent_ms: number * 408_000, allowance_ms: 2_826_000, last_progress_at: NOW } }
+          required_units: 23, attempts: number * 6 + 1, spent_ms: number * 408_000, allowance_ms: 2_826_000,
+          last_progress_at: NOW, progress_call: call.id } }
         if (invocation.request.resourceLimits) call.resource_guard = { version: 1, limits: invocation.request.resourceLimits, state: 'measured',
           memoryModel: 'rss', peakMemoryBytes: 30, peakDiskBytes: 0, samples: 1, partialSamples: 0, lastCompleteAt: NOW,
           longestUnavailableSeconds: 0, failure: null }
@@ -601,7 +604,7 @@ describe('native admission and recovery', () => {
       expect(launches).toHaveLength(1)
       const first = addCall(1, large, launches[0])
       await b.run()
-      expect(journal.read(small.id)!.waiting).toContain(limit === 'one slot' ? 'capacity is occupied' : 'resource budget is exhausted')
+      expect(journal.read(small.id)!.waiting).toContain(limit === 'bounded memory' ? 'resource budget is exhausted' : 'capacity is occupied')
       await a.run()
       expect(journal.read(large.id)!.invocations[0].state).toBe('uncertain')
       journal.rebuild()
@@ -632,7 +635,17 @@ describe('native admission and recovery', () => {
           branch: `poise/issue-${number}`, author: large.author, reviewer: large.reviewer }, NOW)
         return obs.pull!
       })
+      if (limit === 'spare slot') capacity = 2
       await b.run()
+      if (limit === 'spare slot') {
+        await b.run()
+        expect(launches).toHaveLength(3)
+        expect(launches[2].request.argv[1]).toContain('Other/Later-')
+        await a.run()
+        expect(launches).toHaveLength(4)
+        expect(launches[3].request.argv).toContain(`${first.id}:12`)
+        return
+      }
       expect(launches).toHaveLength(2)
 
       for (const number of [2, 3, 4]) {

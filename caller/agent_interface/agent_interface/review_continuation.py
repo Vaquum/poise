@@ -242,7 +242,7 @@ class Session:
         current["review_resume"]["generation"] = self.generation
         if saved.get("last_progress_at") is not None:
             current["review_checkpoint"] = {"root_call": self.root, **{key: saved[key] for key in (
-                "basis", "generation", "unit", "required_units", "attempts", "spent_ms", "allowance_ms", "last_progress_at",
+                "basis", "generation", "unit", "required_units", "attempts", "spent_ms", "allowance_ms", "last_progress_at", "progress_call",
             )}}
         _write(conn, self.call, current)
 
@@ -254,6 +254,7 @@ class Session:
             saved.update(checkpoint=reference, generation=self.generation + 1, unit=self.state["unit"])
             if advanced:
                 saved["last_progress_at"] = max(saved.get("last_progress_at", 0), int(time() * 1000))
+                saved["progress_call"] = self.call
             self.generation += 1
             _write(conn, self.root, original)
             self.retain_progress(conn, saved, _artifact(conn, self.call))

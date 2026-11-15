@@ -131,7 +131,7 @@ def init_db():
                      "and json_extract(resource_ownership,'$.version')=2 "
                      "and (resources_settled_at is null or resource_cleanup is not null)")
         conn.execute("create index if not exists calls_managed_resource_pending on calls(id) "
-                     f"where {resource_ownership.MANAGED_CALLS} and (resources_settled_at is null or resource_cleanup is not null)")
+                     f"where {resource_ownership.PENDING_CALLS}")
         # Each insert and update gives its call the next change number, so a
         # reader asks only for calls changed since the last one it saw
         # (logs_changed). The triggers live in the file, so every writer, an

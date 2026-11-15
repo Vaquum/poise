@@ -66,7 +66,7 @@ describe('managed legacy review continuation', () => {
       const link = { root_call: 'a'.repeat(32), generation: 13, basis: '7'.repeat(64), slot: first.launchReviewSlot }
       expect(first.launchReviewSlot).toBeTruthy()
       const checkpoint = { root_call: link.root_call, generation: link.generation, basis: link.basis, unit: 6, required_units: 23,
-        attempts: 7, spent_ms: 408_000, allowance_ms: 2_826_000, last_progress_at: Date.now() }
+        attempts: 7, spent_ms: 408_000, allowance_ms: 2_826_000, last_progress_at: Date.now(), progress_call: link.root_call }
       const incomplete = agentLog({ id: link.root_call, model, behavior: first.launchBehavior, source: first.launchSource,
         correlation_id: first.claimId, status: 'failed', error: 'Saved the scheduled review units', error_code: 'review_continuation_required',
         action: 'not_started', outcome: 'incomplete', completed_at: new Date().toISOString(),
