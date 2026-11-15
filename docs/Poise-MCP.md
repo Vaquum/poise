@@ -106,6 +106,77 @@ metadata report partial coverage. A reset reports expired coverage for an
 older checkpoint and returns the retained boundary. `watermark` is the last
 sequence consumed. Pass `nextCursor` to continue or check for new events.
 
+For exact Chat metadata, `poise_get` includes current worker and creator
+identities, work bindings, inbox delivery with the admitted turn ID,
+supervision, Switchboard item states and pending owner requests. Each collection
+returns up to ten records and reports truncation. Cross-repository relationships
+are visible only with the applicable repository access. Plan
+updates appear in the retained Chat event stream.
+
+With separate artifact consent, call `poise_get` with `kind: "chat-attachment"`
+or `kind: "chat-diff"`, the artifact `id`, and the owning `chatId`. Attachment
+metadata includes original size and upload time. Text up to 16 KiB is served
+only when its saved content hash still matches. A diff uses the retained event
+and returns up to 6,144 characters on each side for a previewable checkout file.
+Missing or limited content carries an explicit coverage result.
+
+## Read workspace operations
+
+With workspace-wide operational data consent, use `poise_get` with
+`kind: "workspace"` and a snapshot name from the workspace inventory. The
+available snapshots cover effective settings and model slots, followed accounts
+and recorded sign-in, behavior policy and capacity, release and dependency
+health, storage and GitHub quota, the analytics health cohort, notices and
+handling history, Current cards, repositories visible to the configured
+account, Switchboard check state and Manager Rhythm, and extension, memory
+and snippet metadata. `analytics-history` reports seven complete UTC days
+from the app’s issue, pull request and Behavior activity cohorts. Missing
+organization reads mark the window partial. `behavior-estimates` uses
+completed Calls with the same behavior and model, and returns the original
+running Call ID and estimate basis. Review-request notices carry their
+recorded pull request target.
+
+The same consent allows `poise_list` with `kind: "call"` to page the retained
+Caller archive newest first, or `poise_get` with the full Call ID. Use
+`kind: "invocation"` for a retained chain invocation. The archive total
+counts retained rows, including evidence the reader may need to quarantine. Receipts include the
+known actor, action, outcome, head, settlement and available response link.
+Quarantined Call evidence is reported as partial. Caller prompts, diagnostics
+payloads, extension arguments and memory text stay in their owning surfaces.
+Snapshot timestamps report when the read was assembled. Underlying observations
+keep their own times, and bounded summaries report omitted records.
+
+## Read Logging and linked devices
+
+Use `poise_list` with `kind: "logging"` for bounded retained workspace events.
+The optional `repository`, `since` and `until` select a repository and UTC
+window. Counts refer to retained events. Each page includes retention bounds,
+source coverage and a continuation. Open a specific event with
+`poise_get`, `kind: "logging"` and the exact event ID.
+
+Read new observations with `poise_changes`, the same selector and the
+previous `watermark` as `afterWatermark`. Finish all continuation pages of a
+batch before advancing to its new watermark. The cursor and watermark are
+bound to the grant. An instance administrator can separately consent to
+`kind: "instance-logging"`, with access rechecked before every read.
+
+Use `poise_get` with `kind: "gateway"` for `logging-health`,
+`instance-logging-health` or `link-devices`. Device status carries pairing and
+connection metadata. It carries no device credentials.
+
+## Read workspace content
+
+With separate workspace content consent, use `poise_list` with
+`kind: "document"` to page the Editor library and `poise_get` with the document
+slug to read the current version, bounded text, publication versions and
+cached review status. Documents are ordered by slug. Continue with the same
+page size under the same grant.
+
+Use `poise_get` with `kind: "snippet"` and a switch name, or with
+`kind: "memory"` and `id: "current"` for the saved revision. Text is limited
+to an 8,000-character preview and reports truncation. Cached review coverage
+retains its original observation time.
+
 ## Delegate Manager controls
 
 The owner can separately delegate Manager actions in Connected agents consent.

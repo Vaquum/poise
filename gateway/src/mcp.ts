@@ -5,9 +5,10 @@ import { signAssertion } from './assertion.js'
 import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
 import { MCP_CONTROL_PATH, MCP_MANAGER_TOOLS, MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES,
-  isMcpManagerTool, isMcpRecordId, isMcpRepository, mcpRepositoryAllowed, mcpToolNames, parseMcpManagerRequest, parseMcpRead, type McpGrantScope, type McpRequest } from './mcp-contract.js'
+  isMcpContentKind, mcpContentAllowed, mcpWorkspaceAllowed, isMcpManagerTool, isMcpRecordId, isMcpRepository, mcpRepositoryAllowed, mcpToolNames, parseMcpManagerRequest, parseMcpRead, type McpGrantScope, type McpRequest } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
 import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
+import { gatewayMcpRead, instanceLoggingRead, readGatewayMcp } from './mcp-gateway-views.js'
 import { html, page } from './pages.js'
 import { hashSecret, newSecret, type User } from './store.js'
 
@@ -96,6 +97,10 @@ export class McpGateway {
         <input type="hidden" name="request" value="${url.searchParams.toString()}">
         <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata, including listings</label>
         <label><input type="checkbox" name="chatTranscript" value="1"> Allow Chat transcript and retained turn events</label>
+        <label><input type="checkbox" name="chatArtifacts" value="1"> Allow retained Chat attachment text and checkout diffs</label>
+        <label><input type="checkbox" name="workspaceData" value="1"> Allow workspace settings and operational data (workspace-wide grants)</label>
+        <label><input type="checkbox" name="contentData" value="1"> Allow document, snippet and saved memory content (workspace-wide grants)</label>
+        ${principal.isAdmin ? html`<label><input type="checkbox" name="operatorLogs" value="1"> Allow instance Logging as an administrator</label>` : ''}
         <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
         <label><input type="checkbox" name="managerControls" value="1"> Delegate Manager send, steer, stop and workspace-wide supervision</label>
         <button name="decision" value="approve">Allow read access and selected permissions</button><button name="decision" value="deny">Deny</button></form></div>`), authorizeHeaders)
@@ -118,6 +123,10 @@ export class McpGateway {
           scope: { resource: this.resource, handle: principal.user.handle, ownerId: principal.user.githubId,
             ...(form.get('chatMetadata') === '1' ? { chatMetadata: true, chatList: true } : {}),
             ...(form.get('chatTranscript') === '1' ? { chatTranscript: true } : {}),
+            ...(form.get('chatArtifacts') === '1' ? { chatArtifacts: true } : {}),
+            ...(!repository && form.get('workspaceData') === '1' ? { workspaceData: true } : {}),
+            ...(!repository && form.get('contentData') === '1' ? { contentData: true } : {}),
+            ...(!repository && principal.isAdmin && form.get('operatorLogs') === '1' ? { operatorLogs: true } : {}),
             ...(form.get('managerControls') === '1' ? { managerClientId: auth.client } : {}),
             ...(repository ? { repository } : {}) } })
         target.searchParams.set('code', code)
@@ -215,7 +224,18 @@ export class McpGateway {
     if (read.name === 'poise_work' && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
       return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     }
-    if (read.name === 'poise_list') {
+    const direct = gatewayMcpRead(read)
+    if (read.name === 'poise_get' && !direct && ('chatId' in read.arguments ? !grant.chatArtifacts : (read.arguments.kind === 'chat' || read.arguments.kind === 'timer')
+      ? !grant.chatMetadata : isMcpContentKind(read.arguments.kind) ? !mcpContentAllowed(grant) : !mcpWorkspaceAllowed(grant))) {
+      return result({ isError: true, content: [{ type: 'text', text: 'this data is outside the owner’s selected consent' }] })
+    }
+    if (read.name === 'poise_list' && read.arguments.kind === 'call' && !mcpWorkspaceAllowed(grant)) {
+      return result({ isError: true, content: [{ type: 'text', text: 'workspace data consent is required' }] })
+    }
+    if (read.name === 'poise_list' && read.arguments.kind === 'document' && !mcpContentAllowed(grant)) {
+      return result({ isError: true, content: [{ type: 'text', text: 'workspace content consent is required' }] })
+    }
+    if (read.name === 'poise_list' && read.arguments.kind === 'chat') {
       const repository = read.arguments.repository ?? grant.repository ?? null
       if (!mcpRepositoryAllowed(grant, repository)) {
         return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
@@ -229,10 +249,12 @@ export class McpGateway {
     if (rate.active >= 2 || rate.count >= 60) throw new HttpError(429, 'too_many_requests')
     rate.active++; rate.count++; this.reads.set(grant.grantId, rate)
     try {
-      const body = await this.dispatch(owner, grant, read, token!)
+      const body = direct ? await readGatewayMcp(ctx, owner, grant, direct) : await this.dispatch(owner, grant, read, token!)
       // Revocation/access changes during an upstream read must also withhold its result.
       if (!this.grants.find(token!, 'access')) throw new HttpError(401, 'invalid_token')
       this.owner(grant)
+      if (direct && instanceLoggingRead(direct) && !ctx.isAdmin(owner.handle)) throw new HttpError(403, 'operator_access_removed')
+      if (Buffer.byteLength(JSON.stringify(body)) > MCP_RESPONSE_BYTES) throw new HttpError(503, 'mcp_response_exceeds_bound')
       if (resource) return result({ contents: [{ uri: WORKSPACE_RESOURCE, mimeType: 'application/json', text: JSON.stringify(body) }] })
       return result({ content: [{ type: 'text', text: JSON.stringify(body) }] })
     } finally { rate.active-- }
@@ -252,6 +274,9 @@ export class McpGateway {
       ...(grant.chatMetadata && grant.tools.includes('poise_get') ? { chatMetadata: true } : {}),
       ...(grant.chatMetadata && grant.chatList && grant.tools.includes('poise_list') ? { chatList: true } : {}),
       ...(grant.chatTranscript && grant.tools.includes('poise_changes') ? { chatTranscript: true } : {}),
+      ...(grant.chatArtifacts && grant.tools.includes('poise_get') ? { chatArtifacts: true } : {}),
+      ...(mcpWorkspaceAllowed(grant) && grant.tools.includes('poise_get') ? { workspaceData: true } : {}),
+      ...(mcpContentAllowed(grant) && grant.tools.includes('poise_get') ? { contentData: true } : {}),
       ...(grant.managerClientId === grant.clientId && grant.tools.includes('poise_action_apply') ? { managerClientId: grant.clientId } : {}),
       ...(grant.repository === undefined ? {} : { repository: grant.repository }) }
     const identity = signAssertion(ctx.deps.keys.privateKey, { handle: owner.handle, login: owner.login, scope: 'mcp', mcp: scope }, ctx.deps.now())
@@ -315,24 +340,64 @@ export class McpGateway {
       || tools.some(tool => typeof tool !== 'string' || !allowedTools.includes(tool))) {
       throw new HttpError(502, 'invalid_workspace_capabilities')
     }
-    const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: grant.tools.filter(tool => tools.includes(tool)) } }
+    const operatorLogs = grant.operatorLogs === true && grant.repository === undefined && ctx.isAdmin(owner.handle)
+    const directTools = operatorLogs || mcpWorkspaceAllowed(grant) ? ['poise_get', 'poise_list', 'poise_changes'] : []
+    const described = { workspace: owner.handle, owner: owner.login,
+      capabilities: { tools: grant.tools.filter(tool => tools.includes(tool) || directTools.includes(tool)) } }
     if (read.name === 'poise_describe') return { ...described,
       access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString(),
-        repository: grant.repository ?? null, managerControls: scope.managerClientId !== undefined && tools.includes('poise_action_apply') },
-      inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools),
+        repository: grant.repository ?? null, workspaceData: mcpWorkspaceAllowed(grant), contentData: mcpContentAllowed(grant),
+        chatArtifacts: scope.chatArtifacts === true, operatorLogs,
+        managerControls: scope.managerClientId !== undefined && tools.includes('poise_action_apply') },
+      inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools,
+        { ...scope, ...(operatorLogs ? { operatorLogs: true } : {}) }),
       runbooks: RUNBOOKS, instructions: INSTRUCTIONS }
     if (read.name === 'poise_get') {
-      const lookup = body.lookup as { observedAt?: unknown; record?: Record<string, unknown> | null } | undefined
+      if (read.arguments.kind !== 'chat' && read.arguments.kind !== 'timer' && !('chatId' in read.arguments)) {
+        const lookup = body.lookup as Record<string, unknown> | undefined
+        const record = lookup?.record as Record<string, unknown> | null | undefined
+        const exactCallerLink = read.arguments.kind === 'call' ? '/api/agent-response/' + read.arguments.id : null
+        if (!lookup || typeof lookup.observedAt !== 'string' || !Number.isFinite(Date.parse(lookup.observedAt))
+          || typeof lookup.source !== 'string' || typeof lookup.retention !== 'string'
+          || !['complete', 'partial', 'stale', 'unavailable'].includes(String(lookup.coverage))
+          || (record !== null && (!record || record.kind !== read.arguments.kind || record.id !== read.arguments.id))
+          || (read.arguments.kind === 'workspace' && (!record || !('value' in record)))
+          || typeof lookup.href !== 'string' || (!lookup.href.startsWith('/?view=') && lookup.href !== exactCallerLink)) {
+          throw new HttpError(502, 'invalid_workspace_view_scope')
+        }
+        const { href, ...snapshot } = lookup
+        return { ...described, lookup: { ...snapshot, link: record ? new URL(href, ctx.workspaceOrigin(owner.handle)).href : null } }
+      }
+      const lookup = body.lookup as { observedAt?: unknown; coverage?: unknown; reason?: unknown; record?: Record<string, unknown> | null } | undefined
       const record = lookup?.record
-      if (!lookup || typeof lookup.observedAt !== 'string' || !Number.isFinite(Date.parse(lookup.observedAt)) || (record !== null && (!record
-        || record.kind !== read.arguments.kind || record.id !== read.arguments.id
-        || !mcpRepositoryAllowed(grant, typeof record.repository === 'string' ? record.repository : null)
-        || (record.kind === 'timer' && !isMcpRecordId(record.chatId))
-        || (record.kind === 'chat' && (!Array.isArray(record.timerIds) || !record.timerIds.every(isMcpRecordId)))))) {
+      const args = read.arguments
+      const artifact = 'chatId' in args
+      if (!lookup || typeof lookup.observedAt !== 'string' || !Number.isFinite(Date.parse(lookup.observedAt)) || record === undefined) {
         throw new HttpError(502, 'invalid_workspace_record_scope')
       }
-      const chatId = record?.kind === 'timer' ? String(record.chatId) : read.arguments.id
-      return { ...described, lookup: { source: 'chat', coverage: 'complete', observedAt: lookup.observedAt, record,
+      if (record && (record.kind !== args.kind || record.id !== args.id
+        || !mcpRepositoryAllowed(grant, typeof record.repository === 'string' ? record.repository : null)
+        || (artifact && record.chatId !== args.chatId) || (record.kind === 'timer' && !isMcpRecordId(record.chatId)))) {
+        throw new HttpError(502, 'invalid_workspace_record_scope')
+      }
+      if (record?.kind === 'chat') {
+        const { timerIds, workerIds, workBindings, createdByChatId, forkedFromChatId } = record
+        if (!Array.isArray(timerIds) || !timerIds.every(isMcpRecordId)
+          || [createdByChatId, forkedFromChatId].some(value => value != null && !isMcpRecordId(value))
+          || (workerIds !== undefined && (!Array.isArray(workerIds) || workerIds.length > 10 || !workerIds.every(isMcpRecordId)))) {
+          throw new HttpError(502, 'invalid_workspace_chat_links')
+        }
+        if (workBindings !== undefined && (!Array.isArray(workBindings) || workBindings.length > 10 || workBindings.some(binding => {
+          const link = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(?:issues|pull)\/[1-9]\d*$/.exec(String(binding?.target))
+          return !link || !mcpRepositoryAllowed(grant, link[1])
+        }))) throw new HttpError(502, 'invalid_workspace_work_links')
+      }
+      if (artifact && !['complete', 'partial', 'unavailable'].includes(String(lookup.coverage))) {
+        throw new HttpError(502, 'invalid_workspace_artifact_coverage')
+      }
+      const chatId = artifact ? args.chatId : record?.kind === 'timer' ? String(record.chatId) : args.id
+      return { ...described, lookup: { source: 'chat', coverage: artifact ? lookup.coverage : record?.truncated ? 'partial' : 'complete',
+        ...(artifact && typeof lookup.reason === 'string' ? { reason: lookup.reason } : {}), observedAt: lookup.observedAt, record,
         link: record === null ? null : `${ctx.workspaceOrigin(owner.handle)}/?view=chat&chat=${chatId}` } }
     }
     if (read.name === 'poise_list' || read.name === 'poise_changes') {
@@ -342,6 +407,22 @@ export class McpGateway {
         || (page.nextCursor !== null && (typeof page.nextCursor !== 'string' || page.nextCursor.length > 2048))) {
         throw new HttpError(502, 'invalid_workspace_chat_page')
       }
+      if (read.arguments.kind === 'call') {
+        if (!['complete', 'partial', 'unavailable'].includes(String(page.coverage))
+          || page.items.some(item => item?.kind !== 'call' || typeof item.id !== 'string' || !/^[a-f0-9]{32}$/.test(item.id))) {
+          throw new HttpError(502, 'invalid_workspace_caller_page')
+        }
+        return { ...described, page: { ...page, items: page.items.map(item => ({ ...item, link: ctx.workspaceOrigin(owner.handle) +
+          (item.responseAvailable === true ? '/api/agent-response/' + item.id : '/?view=observe&part=tasks') })) } }
+      }
+      if (read.arguments.kind === 'document') {
+        if (!['complete', 'partial', 'unavailable'].includes(String(page.coverage))
+          || page.items.some(item => !item || typeof item.slug !== 'string' || !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,119}$/.test(item.slug)
+            || item.href !== '/?view=editor&doc=' + item.slug)) throw new HttpError(502, 'invalid_workspace_document_page')
+        return { ...described, page: { ...page, items: page.items.map(({ href, ...item }) =>
+          ({ ...item, link: new URL(href, ctx.workspaceOrigin(owner.handle)).href })) } }
+      }
+      if (read.arguments.kind !== 'chat') throw new HttpError(502, 'invalid_gateway_read_dispatch')
       const chatLink = (id: string) => `${ctx.workspaceOrigin(owner.handle)}/?view=chat&chat=${id}`
       if (read.name === 'poise_list') {
         const { repository, since, until } = read.arguments

@@ -1,4 +1,5 @@
 import { HttpError } from './http.js'
+import { mcpContentAllowed, mcpWorkspaceAllowed, type McpGrantScope } from './mcp-contract.js'
 
 export const WORKSPACE_RESOURCE = 'poise://workspace/inventory'
 export const RUNBOOKS = [
@@ -13,7 +14,8 @@ const timestamp = (value: unknown): value is string => typeof value === 'string'
 
 /** The workspace owns the inventory. Publish only metadata and links back to
  *  the authorized workspace, after intersecting its tools with the owner grant. */
-export function workspaceInventory(value: unknown, origin: string, tools: readonly string[]) {
+export function workspaceInventory(value: unknown, origin: string, tools: readonly string[],
+  scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'chatArtifacts' | 'workspaceData' | 'operatorLogs' | 'contentData' | 'repository'> = {}) {
   if (value === undefined) return { coverage: 'unavailable', reason: 'The running workspace has no inventory projection' }
   if (!object(value) || !timestamp(value.observedAt) || !Array.isArray(value.surfaces) || value.surfaces.length > 128
     || !object(value.release) || typeof value.release.repo !== 'string' || !repoName.test(value.release.repo)
@@ -26,6 +28,13 @@ export function workspaceInventory(value: unknown, origin: string, tools: readon
       throw new HttpError(502, 'invalid_workspace_inventory_surface')
     }
     const available = typeof entry.tool === 'string' && tools.includes(entry.tool)
+      && (entry.requiresWorkspace !== true || mcpWorkspaceAllowed(scope))
+      && (entry.requiresChat !== true || scope.chatMetadata === true)
+      && (entry.requiresChatList !== true || scope.chatList === true)
+      && (entry.requiresChatTranscript !== true || scope.chatTranscript === true)
+      && (entry.requiresChatArtifacts !== true || scope.chatArtifacts === true)
+      && (entry.requiresOperator !== true || scope.operatorLogs === true)
+      && (entry.requiresContent !== true || mcpContentAllowed(scope))
     return { id: entry.id, kind: entry.kind, source: entry.source, permission: entry.permission, retention: entry.retention,
       href: new URL(entry.href, origin).href, status: available ? 'available' : 'unavailable',
       tool: available ? entry.tool : null, reason: typeof entry.tool === 'string' && !available

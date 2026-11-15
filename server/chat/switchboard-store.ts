@@ -60,9 +60,13 @@ export interface Board {
   instance: string, session: string | null, created_at: number | null,
   paused: number, revision: number, next_check_at: number, failures: number, error: string | null
 }
+export function readBoard(instance: string): Board | undefined {
+  return cachedStatement(db, 'SELECT * FROM chat_switchboard WHERE instance = ?').get(instance) as Board | undefined
+}
+
 export function board(instance: string): Board {
   cachedStatement(db, 'INSERT OR IGNORE INTO chat_switchboard(instance) VALUES(?)').run(instance)
-  return cachedStatement(db, 'SELECT * FROM chat_switchboard WHERE instance = ?').get(instance) as Board
+  return readBoard(instance)!
 }
 /** Every change the pane must see goes through here, inside its transaction.
  *  The row is never deleted, so the revision only ever grows. */

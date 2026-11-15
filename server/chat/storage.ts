@@ -50,6 +50,8 @@ db.exec(`
   -- planner needs no table statistics to use it.
   CREATE INDEX IF NOT EXISTS idx_chat_events_turn_finished ON chat_events(session_id, json_extract(event, '$.turnId'))
     WHERE json_extract(event, '$.type') = 'turn.finished';
+  CREATE INDEX IF NOT EXISTS idx_chat_events_diff ON chat_events(session_id, json_extract(event, '$.diffId'))
+    WHERE json_extract(event, '$.type') = 'diff';
 
   CREATE TABLE IF NOT EXISTS chat_pending (
     request_id TEXT PRIMARY KEY,

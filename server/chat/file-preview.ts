@@ -26,7 +26,7 @@ async function poiseSourceCheckout(): Promise<string> {
   return root
 }
 
-function visiblePath(relative: string): boolean {
+export function visibleChatPath(relative: string): boolean {
   return relative.split('/').every(part => !part.startsWith('.') && !/^(?:credentials|secrets)(?:\.|$)/i.test(part))
     && !/\.(?:pem|key|p12|pfx|sqlite3?|db)$/i.test(relative)
 }
@@ -34,7 +34,7 @@ function visiblePath(relative: string): boolean {
 async function scopedPath(root: string, path: string, trackedOnly: boolean): Promise<string | null> {
   let resolved: Awaited<ReturnType<typeof resolveInsideCheckout>>
   try { resolved = await resolveInsideCheckout(root, path) } catch { return null }
-  if (!visiblePath(resolved.relative)) throw new HttpError(403, 'Private files cannot be previewed')
+  if (!visibleChatPath(resolved.relative)) throw new HttpError(403, 'Private files cannot be previewed')
   if (trackedOnly) {
     const args = ['--literal-pathspecs', 'ls-files', '--cached', '-z', '--', resolved.relative]
     const result = await runFile('git', args, { cwd: root })

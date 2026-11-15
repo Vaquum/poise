@@ -242,6 +242,11 @@ async function refresh(me: string, record: PublishRecord, force: boolean, pollin
 export async function articleReviews(slug: string, synchronize = false, force = false, polling = false): Promise<ArticleReviews> {
   await readDoc(slug)
   const { records } = await readPublishLedger(slug)
+  return reviewsForPublications(records, { synchronize, force, polling })
+}
+
+export async function reviewsForPublications(records: PublishRecord[],
+  { synchronize = false, force = false, polling = false }: { synchronize?: boolean; force?: boolean; polling?: boolean } = {}): Promise<ArticleReviews> {
   const me = getMeta('me') ?? ''
   const result: ArticleReviews = { reviews: [], checkedAt: null, active: false, stale: false, problems: [] }
   let retryAt = 0
