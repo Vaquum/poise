@@ -182,6 +182,44 @@ def _reconcile_actual_receipt(directory, call, pending):
     assert consumed.returncode == 0, consumed.stderr
 
 
+@pytest.mark.parametrize("attempted", [False, True])
+def test_queue_blocker_finishes_without_claiming_publication(database, monkeypatch, attempted):
+    monkeypatch.setattr(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _: SimpleNamespace(identity="fixture")))
+    monkeypatch.setattr(issue_review, "sweep", lambda: None)
+    # This fixture runs no provider process. Use an empty owned inventory on all platforms.
+    monkeypatch.setattr(issue_review, "_cwd_pids", lambda *args, **kwargs: [])
+    plan = {"commitMessage": "fix: fixture", "title": "fix: fixture", "body": "Original repair plan", "replies": []}
+
+    def run(_spec, repo, _number, branch, _actor, _directory, call_id, record, pull, expected_head, *_):
+        receipt = {"phase": "preparing_publication", "publication": plan,
+                   "prepared": {"repository": repo, "branch": branch, "pull_number": pull,
+                                "head_sha": expected_head, "checkout_head": expected_head}}
+        record(receipt)
+        blocker = {"repository": repo, "pull_number": pull, "ref": f"refs/heads/{branch}", "head": expected_head,
+                   "call_id": call_id, "kind": "push_rejected" if attempted else "already_queued"}
+        if attempted:
+            review_receipt.work_publication(NEW_HEAD)
+            blocker.update(attempted_head=NEW_HEAD, rejection_code="GH006")
+        else:
+            blocker["entry_id"] = "queue-17"
+        record({**receipt, "phase": "repair_queue_blocked", "queue_blocker": blocker})
+        return {"outcome": "repair_queue_blocked", "head_sha": expected_head, "queue_blocker": blocker}
+
+    monkeypatch.setattr(api.atomic_work, "run", run)
+    monkeypatch.setattr(api, "_main", lambda: api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
+                        "original", "fixture", "poise/issue-7", pull=17, expected_head=HEAD))
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--fixture"])
+    api.main()
+    call, = api.logs_selected({"latest": [], "ids": [], "correlations": ["original"]})
+    assert (call["status"], call["outcome"], call["action"], call["head_sha"], call["receipts"]) == (
+        "completed", "repair_queue_blocked", "not_started", None, None)
+    assert call["resources_settled_at"]
+    assert call["artifact"].get("publication_head") == (NEW_HEAD if attempted else None)
+    saved = api.read_action_plan(call["id"])
+    assert saved["sha"] == call["artifact"]["plan_sha"]
+    assert saved["plan"] == {"kind": "atomic_work", "publication": plan}
+
+
 @pytest.mark.parametrize("winner", ["fence", "publication", "race"])
 def test_head_change_serializes_with_publication(database, winner):
     call = api.track("fixture", "", pr_id="17", repo="example/repo", actor="author", behavior="repair_pr",

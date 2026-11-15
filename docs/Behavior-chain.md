@@ -512,6 +512,15 @@ through the existing control after resolving the blocker.
 4. Existing native primitives handle grey CI, approved nonblocking conversation resolution, strict readiness, merge and merge-queue admission. Conversation resolution also covers outdated threads, because GitHub's merge rule counts them, but only when readiness is blocked solely by `merge_state_not_clean` or `required_reviews_not_approved`, the blockers an open conversation can explain. A PR that readiness reports green goes to merge with its outdated threads left alone. Their repository policy leaves a merely behind branch to native queue integration; an actual conflict still requires repair. Completion requires the actual GitHub merge SHA. Queue admission, a finished turn, approval or CLOSED alone cannot complete a chain.
 5. A removed queue entry requires its actual GitHub removal event. Failed integration checks or conflicts lead to fresh repair; manual or unknown removal holds for a decision. A `merged` removal alongside an earlier open-PR read waits for confirmed merge evidence; that event alone neither completes nor holds the chain. An unchanged-head repair requires a new independent approval before another native queue attempt. Only that attempt's actual integration result can establish acceptance. Deliberate dismissal of a current-head managed approval is also held.
 
+Caller checks the exact PR head for a GitHub queue entry before repair can push
+or post replies. An existing entry defers publication. If GitHub queues the PR
+during the push, Caller records a deferral only after GitHub explicitly rejects
+the single attempted ref for that queue reason and fresh PR and ref reads still
+show the original head. Poise settles the deferral after the original resources
+are released and waits for fresh GitHub queue removal or confirmed merge evidence.
+The original plan and rejection remain in the receipt. A lost response or
+contradictory evidence keeps the original publication uncertain.
+
 Live queue observations retain the entry ID, GitHub disposition and nullable
 integration base/head commits together through `pull_action_state --queue-evidence`.
 Exhausting its three head-matching reads fails rather than attaching another

@@ -1884,6 +1884,12 @@ private deadline artifact before restoring edits. The no-publication shape
 and retry requirements are defined in
 [Behavior chain](Behavior-chain.md#authority-and-recovery).
 
+At repair publication, Caller can return `repair_queue_blocked` with its
+original plan and exact queue membership or verified ref rejection. The Call
+has no published head or reply receipt. After positive resource release, the
+workspace journal settles it as deferred and applies the existing GitHub queue
+removal and merge rules. A lost or contradictory response remains uncertain.
+
 Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
 opt-in enables verified repair incomplete-reply, repair execution-budget

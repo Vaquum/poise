@@ -2106,7 +2106,8 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
       quarantineEvidence(snapshot, claim, call).hasLiveEvidence)
     return false
   }
-  if (call.outcome === 'published' || call.outcome === 'no_changes' || call.outcome === 'target_closed' || call.outcome === 'native_action') {
+  if (call.outcome === 'published' || call.outcome === 'no_changes' || call.outcome === 'target_closed'
+    || call.outcome === 'native_action' || call.outcome === 'repair_queue_blocked') {
     throw new Error('native chain outcomes cannot settle a legacy review claim')
   }
   // A recovered completion settles the launch record itself, not just the

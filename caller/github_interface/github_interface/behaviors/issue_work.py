@@ -9,14 +9,14 @@ import json
 import os
 import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
 from github_interface.atoms.local import _run, checkout_repo
 from github_interface.atoms.process_diagnostic import GitProcessError, STDERR_BYTES, redact
-from github_interface.atoms.pulls import get_pull
+from github_interface.atoms.pulls import get_pr_readiness_state, get_pull
 from github_interface.atoms.review_diff import _env, _git
 from github_interface.atoms.review_identity import work_publication
 from github_interface.behaviors import read_issue
@@ -143,6 +143,18 @@ async def confirmed_pull(client: GitHubClient, owner: str, repo: str, pull: dict
     if (pull.get("head") or {}).get("sha") != head:
         raise RuntimeError("published branch and pull-request heads disagree; reconcile before retry")
     return pull
+
+
+def queued_ref_rejection(error: GitProcessError, branch: str) -> bool:
+    evidence = error.diagnostic
+    if (evidence["operation"], evidence["outcome"], evidence["exit_code"], evidence["stderr_truncated"]) != ("push", "exit", 1, False):
+        return False
+    lines = evidence["stderr"].splitlines()
+    remote = " ".join(line.removeprefix("remote: ").strip() for line in lines if line.startswith("remote: "))
+    statuses = [line.strip() for line in lines if re.match(r"^ [ !+*=-] .+ -> ", line)]
+    return (any(line.rstrip() == f"remote: error: GH006: Protected branch update failed for refs/heads/{branch}." for line in lines)
+            and "A pull request for this branch has been added to a merge queue. Branches that are queued for merging cannot be updated." in remote
+            and len(statuses) == 1 and re.fullmatch(rf"! \[remote rejected\]\s+HEAD -> {re.escape(branch)} \(protected branch hook declined\)", statuses[0]) is not None)
 
 
 async def review_replies(client: GitHubClient, target: str, pull: int, actor: str, call_id: str, replies: list, *, publish: bool, head: str = "") -> list:
@@ -496,6 +508,21 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
                 reason = f"Waiting for prerequisite {target}#{dep['number']}: {delivery.get('reason') or 'delivery is not verified on the implementation base'}"
                 return {**result, "outcome": "prerequisite_wait", "prerequisite_wait": {
                     "base": base, "prerequisites": prereq, "deliveries": deliveries, "reason": reason}}
+    if pull is not None:
+        queue_checked_at = datetime.now(timezone.utc).isoformat()
+        readiness = await get_pr_readiness_state(client, owner, repo, pull["number"])
+        if readiness["state"] not in {"OPEN", "CLOSED", "MERGED"} or not SHA.fullmatch(readiness["headRefOid"]):
+            raise ValueError("repair publication requires the current GitHub pull request head and state")
+        if readiness["state"] != "OPEN" or readiness["headRefOid"] != starting_head:
+            return {**result, "outcome": "superseded", "head_sha": readiness["headRefOid"]}
+        queue_blocker = {"repository": target, "pull_number": pull["number"], "ref": f"refs/heads/{branch}",
+                         "head": starting_head, "call_id": call_id, "checked_at": queue_checked_at}
+        entry = readiness["mergeQueueEntry"]
+        if entry is not None:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+                raise ValueError("repair publication requires valid GitHub queue membership evidence")
+            return {**result, "outcome": "repair_queue_blocked", "queue_blocker": {
+                **queue_blocker, "kind": "already_queued", "entry_id": entry["id"]}}
     if not dirty:
         if replies and pull is not None:
             work_publication(current_head)
@@ -507,8 +534,26 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
     head = _run(["git", "-C", str(path), "rev-parse", "HEAD"], client.token)
     work_publication(head)
     basic = base64.b64encode(f"x-access-token:{client.token}".encode()).decode()
-    _run(["git", "-C", str(path), "-c", f"http.extraHeader=Authorization: Basic {basic}",
-          "push", "origin", f"HEAD:refs/heads/{branch}"], client.token, basic)
+    push_flags = ["--no-follow-tags", "--recurse-submodules=no"] if pull is not None else []
+    push_started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        _run(["git", "-C", str(path), "-c", f"http.extraHeader=Authorization: Basic {basic}",
+              "push", *push_flags, "origin", f"HEAD:refs/heads/{branch}"], client.token, basic)
+    except GitProcessError as error:
+        if pull is None or not queued_ref_rejection(error, branch):
+            raise
+        latest = await get_pull(client, owner, repo, pull["number"])
+        ref = await client.get(f"/repos/{target}/git/ref/heads/{branch}")
+        latest_head = latest.get("head") or {}
+        ref_object = ref.get("object") or {}
+        if latest.get("number") != pull["number"] or latest_head.get("ref") != branch \
+                or (latest_head.get("repo") or {}).get("full_name", "").lower() != target.lower() \
+                or latest_head.get("sha") != starting_head or ref.get("ref") != queue_blocker["ref"] \
+                or ref_object.get("sha") != starting_head or ref_object.get("type") != "commit":
+            raise
+        return {**result, "outcome": "repair_queue_blocked", "queue_blocker": {
+            **queue_blocker, "kind": "push_rejected", "checked_at": push_started_at,
+            "attempted_head": head, "rejection_code": "GH006"}}
     if pull is None:
         pull = await client.post(f"/repos/{target}/pulls", json={"title": title, "body": f"{body}\n\nCloses #{issue_number}\n\n{marker}",
                                                                  "head": branch, "base": default_branch, "draft": False})

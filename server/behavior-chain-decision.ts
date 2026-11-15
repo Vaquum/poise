@@ -343,14 +343,59 @@ function reviewComplete(chain: BehaviorChain, behavior: 'review-issue' | 'review
   }) ? 'complete' : 'missing-artifact'
 }
 
+/** A queue blocker is evidence from the original repair, with no new write or enqueue attribution. */
+export function repairQueueBlocker(chain: BehaviorChain, invocation: ChainInvocation) {
+  const { evidence, callId, request } = invocation
+  const artifact = evidence?.artifact as Record<string, unknown> | undefined
+  const blocker = artifact?.queue_blocker as Record<string, unknown> | undefined
+  const prepared = artifact?.prepared as Record<string, unknown> | undefined
+  const head = request.context?.head
+  const expected = request.argv.indexOf('--expected-head')
+  const pull = request.argv.indexOf('--pull-number')
+  const checkedAt = typeof blocker?.checked_at === 'string' ? Date.parse(blocker.checked_at) : NaN
+  const completedAt = evidence?.completedAt
+  if (invocation.behavior !== 'repair-pr' || request.command !== 'agent-interface' || request.argv[0] !== '--atomic-work'
+    || invocation.model === null || invocation.actor !== chain.author || !callId || !/^[a-f0-9]{32}$/.test(callId)
+    || !evidence || !['completed', 'deferred'].includes(String(evidence.status)) || evidence.action !== 'not_started'
+    || evidence.outcome !== 'repair_queue_blocked' || evidence.error || evidence.error_code
+    || artifact?.phase !== 'repair_queue_blocked' || typeof artifact.plan_sha !== 'string' || !/^[a-f0-9]{64}$/.test(artifact.plan_sha)
+    || [evidence.head_sha, evidence.receipts, evidence.review_id, evidence.publicationResume, evidence.publicationReceipt,
+      artifact.publication, artifact.result, artifact.receipts].some(value => value != null)
+    || !resourceReleaseProven(evidence, true) || !head || !/^[a-f0-9]{40}$/.test(head) || expected < 0 || request.argv[expected + 1] !== head
+    || pull < 0 || !blocker || blocker.call_id !== callId || blocker.repository !== chain.repository || blocker.head !== head
+    || blocker.ref !== `refs/heads/${chain.branch}` || !Number.isSafeInteger(blocker.pull_number) || Number(blocker.pull_number) < 1
+    || request.argv[pull + 1] !== String(blocker.pull_number) || prepared?.head_sha !== head || prepared.checkout_head !== head
+    || prepared.repository !== chain.repository || prepared.branch !== chain.branch || prepared.pull_number !== blocker.pull_number
+    || !Number.isFinite(checkedAt) || checkedAt < invocation.admittedAt || typeof completedAt !== 'number' || checkedAt > completedAt) return null
+  if (blocker.kind === 'already_queued') {
+    if (typeof blocker.entry_id !== 'string' || !blocker.entry_id || blocker.attempted_head != null || blocker.rejection_code != null
+      || artifact.publication_head != null || artifact.replies_started != null) return null
+  } else if (blocker.kind !== 'push_rejected' || blocker.rejection_code !== 'GH006' || blocker.entry_id != null
+    || typeof blocker.attempted_head !== 'string' || !/^[a-f0-9]{40}$/.test(blocker.attempted_head)
+    || blocker.attempted_head === head || artifact.publication_head !== blocker.attempted_head || artifact.replies_started !== false) return null
+  return { head, checkedAt, number: Number(blocker.pull_number) }
+}
+
 /** Queue participation is separate from attribution of its enqueue mutation. */
-export function lastChainQueueInvocation(chain: BehaviorChain): ChainInvocation | undefined {
+export function chainQueueSettlement(chain: BehaviorChain, pull: NonNullable<ChainObservation['pull']>) {
   for (let index = chain.invocations.length - 1; index >= 0; index--) {
     const invocation = chain.invocations[index]
+    const blocker = invocation.state === 'settled' && repairQueueBlocker(chain, invocation)
+    if (blocker) {
+      if (blocker.number !== pull.number || blocker.head !== pull.head) return null
+      const removal = pull.queueRemoval
+      return { removal: removal && removal.id !== invocation.request.context?.queueRemoval
+        && removal.at >= Math.floor(blocker.checkedAt / 1000) * 1000 ? removal : null }
+    }
     if (invocation.behavior === 'merge-pr' && (invocation.evidence?.status === 'completed'
       || (invocation.evidence?.status === 'deferred' && invocation.evidence.outcome === 'in_queue'))
-      && ['enqueued', 'in_queue'].includes(String(invocation.evidence?.outcome))) return invocation
+      && ['enqueued', 'in_queue'].includes(String(invocation.evidence?.outcome))) {
+      if (invocation.evidence?.head_sha !== pull.head) return null
+      const removal = pull.queueRemoval
+      return { removal: removal && removal.at >= invocation.admittedAt ? removal : null }
+    }
   }
+  return null
 }
 
 /** Closure fences effects, not adoption of original artifacts or receipts. */
@@ -433,10 +478,10 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   }
   if (chain.held) {
     const held = heldCiRepair(chain), proof = observation.ciRefresh, publication = observation.publication
-    const queue = pull && lastChainQueueInvocation(chain)
+    const queue = pull && chainQueueSettlement(chain, pull)
     if (held && !held.hold.queue && !held.refresh && proof && pull?.state === 'open' && !pull.draft && !pull.conflict
       && pull.queueEntry === null && !pull.pending && pull.failing.length && observation.issue.open && !observation.existingPulls.length
-      && (!queue || queue.evidence?.head_sha !== pull.head || pull.queueRemoval && pull.queueRemoval.at >= queue.admittedAt)
+      && (!queue || queue.removal)
       && publication.state === 'open' && publication.pull_number === pull.number && publication.head_sha === pull.head
       && pull.head === held.hold.head && proof.head === pull.head
       && observation.checkedAt >= held.completedAt && observation.checkedAt >= Date.parse(String(held.evidence.resources_settled_at))
@@ -479,7 +524,7 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   const dismissed = pull.reviewReceipts.find((review) => review.head === pull.head && review.state === 'DISMISSED'
     && chain.invocations.some((invocation) => invocation.behavior === 'approve-pr' && invocation.callId === review.invocation))
   if (dismissed) return { kind: 'hold', reason: `approval ${dismissed.id} was dismissed on the current head; a decision is required` }
-  const lastQueue = lastChainQueueInvocation(chain)
+  const queue = chainQueueSettlement(chain, pull)
   const dependency = chainCiDependency(chain, pull.queueRemoval?.id)
   const queueRecovery = recoveredQueueRepair(chain, observation)
   let queueVerification = queueRecovery
@@ -491,9 +536,9 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       reason: `shared baseline CI dependency: ${dependency.dependency.remediation}; candidate ${dependency.dependency.head}; integration ${dependency.dependency.integration}; base ${dependency.dependency.base}; ${dependency.dependency.failures.map(item => `${item.name} (run ${item.run}, check ${item.check})`).join(', ')}; awaiting verified base recovery` }
     queueVerification = chainBasis(['baseline-recovery', pull.head, dependency.invocation.id, recovery.base, pull.reviewContext])
   }
-  if (lastQueue?.evidence?.head_sha === pull.head) {
-    const removal = pull.queueRemoval
-    if (!removal || removal.at < lastQueue.admittedAt) return { kind: 'wait', reason: 'queue entry disappeared; awaiting GitHub removal evidence' }
+  if (queue) {
+    const removal = queue.removal
+    if (!removal) return { kind: 'wait', reason: 'queue entry disappeared; awaiting GitHub removal evidence' }
     if (removal.reason === 'merged') return { kind: 'wait', reason: 'GitHub queue reports a merge; awaiting confirmed merge evidence' }
     if (!['failed_checks', 'merge_conflict'].includes(removal.reason || '')) return { kind: 'hold', reason: `queue removal requires a decision: ${removal.reason || 'unknown reason'} (${removal.id})` }
     const repair = [...chain.invocations].reverse().find((invocation) => invocation.behavior === 'repair-pr' && succeeded(invocation)
