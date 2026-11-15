@@ -295,8 +295,17 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     || Buffer.byteLength(JSON.stringify(artifact)) > 128 * 1024)) throw new Error(`agent-interface log row ${index} has an invalid atomic artifact`)
   const reviewArtifact = artifact as Record<string, unknown> | null
   const checkpoint = parseReviewCheckpoint(reviewArtifact)
-  const reviewContinuation = reviewContinuationCode(errorCode) && reviewContinuationNoWrite({ behavior, status, action, outcome,
+  // An interrupted finalization carries a retained response, so it can never
+  // prove the no-write shape. Its checkpoint-bound response is the resumption
+  // evidence instead; this mirrors yieldedFinalization so the parser admits
+  // exactly the rows the runtime resumes.
+  const finalizationResponse = reviewArtifact?.review_response
+  const finalizationContinuation = errorCode === 'review_continuation_required' && checkpoint !== null
+    && (behavior === 'pr_review' || behavior === 'pr_approve') && status === 'failed'
+    && !!finalizationResponse && typeof finalizationResponse === 'object' && !Array.isArray(finalizationResponse)
+  const reviewContinuation = reviewContinuationCode(errorCode) && (reviewContinuationNoWrite({ behavior, status, action, outcome,
     head_sha: headSha, review_id: row.review_id, review_comments: row.review_comments, receipts: row.receipts, artifact: reviewArtifact })
+    || finalizationContinuation)
   if (reviewContinuationCode(errorCode) && (!reviewContinuation || errorCode === 'review_continuation_required' && !checkpoint)) {
     throw new Error(`agent-interface log row ${index} lacks its authoritative review continuation evidence`)
   }

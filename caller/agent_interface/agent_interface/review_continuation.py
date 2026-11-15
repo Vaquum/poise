@@ -260,7 +260,10 @@ class Session:
                                "publisher_started_at": publisher_started_at}
             else:
                 publication = {}
-            current["review_resume"] = {"root_call": self.root, "generation": self.generation, "basis": basis,
+            # The link names the basis the resumed computation ran against. A
+            # reconciling resume tolerates live packet drift, so the live basis
+            # would disagree with the checkpoint copied from saved progress.
+            current["review_resume"] = {"root_call": self.root, "generation": self.generation, "basis": saved["basis"],
                                        "slot": slot,
                                        "analysis_sha": current["review_context"]["analysis_sha"],
                                        "verification_sha": digest(current.get("verification_candidates", {})),

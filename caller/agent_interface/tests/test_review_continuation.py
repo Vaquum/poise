@@ -900,6 +900,25 @@ class TestReviewContinuation(TestCase):
             with self.assertRaisesRegex(RuntimeError, "complete, exclusively reserved"):
                 review_receipt.complete_response({**ASSESSMENT, "verified_fixes": [17]}, HEAD)
 
+    def test_reconciling_resume_after_packet_drift_keeps_link_and_checkpoint_on_the_original_basis(self):
+        node = packet()
+
+        def post_deadline(*_args, **_kwargs):
+            raise review_budget.ReviewLimitError("post-reservation deadline", "review_budget_exhausted")
+
+        with self.call(node) as root, patch.object(structured_review.subprocess, "run", side_effect=post_deadline):
+            with self.assertRaises(continuation.Continuation):
+                self.run_review(node, lambda *args: verdict(args[3]))
+        self.assertEqual(self.saved(root)["finalization"]["step"], "submitting")
+        changed = json.loads(json.dumps(node))
+        changed["reviews"] = [{"id": 1, "state": "commented", "body": "A new review landed during finalization"}]
+        with self.call(changed, self.resume(root)) as resumed:
+            continuation.Session(json.dumps(changed), MODEL.identity)
+            current = self.artifact(resumed)
+            self.assertEqual(current["review_resume"]["basis"], current["review_checkpoint"]["basis"])
+            self.assertEqual(current["review_resume"]["basis"], self.saved(root)["basis"])
+        self.assertEqual(self.posts, [])
+
     def test_omitting_resume_cannot_reset_the_saved_basis_budget(self):
         node = packet()
         with self.call(node) as root:
