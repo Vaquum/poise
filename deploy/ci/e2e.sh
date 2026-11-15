@@ -844,13 +844,13 @@ run() {
   pair_link
   check_inside_only
   second_user
-  check_mcp
   check_tls
   check_chat_socket
   check_public_pages
   revoke_link
   backup_and_restore
   check_persisted_public_pages
+  check_mcp
   check_gateway_recreated
   check_persisted_public_pages
   check_upgrade
