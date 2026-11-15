@@ -1080,40 +1080,26 @@ class TestProcessesAndErrors(TestCase):
                 (own / "environ").write_bytes(b"TMPDIR=/elsewhere\0")
                 self.assertEqual(issue_review._cwd_pids(root, require_complete=True), [])
 
-    def test_process_inventory_skips_unreadable_processes_predating_itself(self):
+    def test_process_inventory_cannot_release_an_unreadable_older_live_process(self):
         with tempfile.TemporaryDirectory() as work:
             root = Path(work) / "owned"
             root.mkdir()
-            old = Path(work) / "424241"
-            old.mkdir()
-            (old / "stat").write_text("424241 (aged) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 900 0 0")
-            young = Path(work) / "424242"
-            young.mkdir()
-            (young / "stat").write_text("424242 (fresh) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 1000 0 0")
+            older = Path(work) / "424241"
+            older.mkdir()
+            (older / "stat").write_text("424241 (older) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 1 0 0")
             proc = Mock()
             proc.is_dir.return_value = True
-            real_path, real_readlink = Path, os.readlink
+            proc.iterdir.side_effect = lambda: iter([older])
+            readlink = os.readlink
 
-            def readlink(path):
-                if "42424" in str(path):
-                    raise PermissionError(13, "Permission denied")
-                return real_readlink(path)
+            def read_owned_link(path):
+                if path == older / "cwd":
+                    raise PermissionError("cannot inspect the original process")
+                return readlink(path)
 
-            def listing(*entries):
-                proc.iterdir.side_effect = lambda: iter(entries)
-                return patch.object(issue_review, "Path",
-                                    side_effect=lambda value: proc if str(value) == "/proc" else real_path(value))
-
-            def check(entries):
-                return (listing(*entries), patch.object(issue_review, "_SELF_START_TICKS", 1000),
-                        patch.object(os, "readlink", side_effect=readlink))
-
-            path_patch, ticks_patch, link_patch = check([young])
-            with path_patch, ticks_patch, link_patch:
-                self.assertIs(issue_review._cwd_pids(root, require_complete=True), None)
-            path_patch, ticks_patch, link_patch = check([old])
-            with path_patch, ticks_patch, link_patch:
-                self.assertEqual(issue_review._cwd_pids(root, require_complete=True), [])
+            with patch.object(issue_review, "Path", side_effect=lambda value: proc if value == "/proc" else Path(value)), \
+                    patch.object(os, "readlink", side_effect=read_owned_link):
+                self.assertIsNone(issue_review._cwd_pids(root, require_complete=True))
 
     def test_non_proc_inventory_checks_open_files_and_environment_then_proves_an_idle_run(self):
         root = Path("/owned/run")

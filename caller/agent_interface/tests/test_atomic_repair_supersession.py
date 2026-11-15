@@ -28,8 +28,31 @@ def database(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def fixture_processes(monkeypatch):
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return
+
+    def identity(entry):
+        try:
+            return entry.name, entry.stat().st_ino
+        except FileNotFoundError:
+            return None
+
+    # The fixture owns a fresh work root. Include real processes created
+    # during the fixture without depending on the runner's inherited daemons.
+    existing = {identity(entry) for entry in proc.iterdir() if entry.name.isdigit()}
+
+    def entries():
+        return (entry for entry in proc.iterdir() if entry.name.isdigit() and identity(entry) not in existing)
+
+    inventory = SimpleNamespace(is_dir=proc.is_dir, iterdir=entries)
+    monkeypatch.setattr(issue_review, "Path", lambda value: inventory if value == "/proc" else Path(value))
+
+
 @pytest.mark.parametrize("evidence", ["analysis", "planning", "unchanged", "missing", "wrong-target", "unsettled"])
-def test_original_repair_supersession(database, monkeypatch, evidence):
+def test_original_repair_supersession(database, fixture_processes, monkeypatch, evidence):
     pending = []
     cleanup = resource_ownership.cleanup_remaining
 
