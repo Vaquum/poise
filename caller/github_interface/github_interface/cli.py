@@ -15,7 +15,7 @@ from .interface import chain_seed, checkout_review, review_context, approve_pr, 
 TOP_HELP = """usage: github-interface BEHAVIOR ...
 
 behaviors:
-  --pr-review PR [--p p2] [--since-head SHA] --expected-head SHA --token-user USER
+  --pr-review PR [--p p2] [--since-head SHA] [--manifest-only] --expected-head SHA --token-user USER
   --approve-pr PR --expected-head SHA --token-user USER
   --head-sha PR --token-user USER [--repository OWNER/REPO]
   --list-failing-ci PR [--repository OWNER/REPO]
@@ -62,7 +62,7 @@ behaviors:
   --comment-issue ISSUE --body BODY [--repository OWNER/REPO]
   --edit-issue-comment ISSUE --body BODY [--comment-id ID]
   --checkout-repo OWNER/REPO --path DIR
-  --checkout-review PR --path DIR --base-sha SHA --merge-base-sha SHA --expected-head SHA --token-user USER [--repository OWNER/REPO]
+  --checkout-review PR --path DIR --base-sha SHA --merge-base-sha SHA --expected-head SHA --token-user USER [--repository OWNER/REPO] [--diff-files-json JSON]
   --review-context --requests-json JSON
 
 accounts:
@@ -219,6 +219,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--pr-review":
         parser = argparse.ArgumentParser(prog="github-interface --pr-review PR")
         parser.add_argument("--p", default="p2", metavar="p2")
+        parser.add_argument("--manifest-only", action="store_true")
         parser.add_argument("--since-head", default=None, metavar="SHA",
                             help="diff since this previously reviewed head instead of the merge base")
         _add_expected_head(parser)
@@ -426,6 +427,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior == "--checkout-review":
         parser = argparse.ArgumentParser(prog="github-interface --checkout-review PR")
+        parser.add_argument("--diff-files-json")
         parser.add_argument("--path", required=True)
         parser.add_argument("--base-sha", required=True)
         parser.add_argument("--merge-base-sha", required=True)

@@ -6,6 +6,7 @@ import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 from threading import current_thread, main_thread
+from time import monotonic
 
 from . import atoms, progress, review_budget, resource_ownership
 from .process_diagnostic import command_failure, diagnostic_from_stderr, diagnostic_message
@@ -71,6 +72,41 @@ class Repository:
                   "Read/list return 200 entries; search returns 100 matches. Follow next_line "
                   "when truncated. Inspection cannot read .git, untracked files, or symlinks.")
 
+    def diff_packet(self, packet: str, byte_limit: int, *, timeout_s: float | None = None) -> str:
+        """Hydrate deferred required source through the bounded internal reader."""
+        node = json.loads(packet)
+        if not node.get("diff_deferred"):
+            return packet
+        deadline = monotonic() + (timeout_s if timeout_s is not None else review_budget.timeout(1413, reserve=120))
+        lines, size, start = [], 0, 1
+        while True:
+            request = {"operation": "diff", "path": ".", "query": "", "start_line": start}
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise review_budget.ReviewLimitError("required diff paging exhausted its cumulative allowance", "review_budget_exhausted")
+            response = self.inspect([request], timeout_s=min(30, remaining))
+            results = response.get("results")
+            if not isinstance(results, list) or len(results) != 1:
+                raise ValueError("required diff page lacks its inspection result")
+            result = results[0]
+            page = result.get("lines")
+            if result.get("request") != request or result.get("error") or not isinstance(page, list):
+                raise ValueError("required diff page is missing or malformed")
+            for number, entry in enumerate(page, start):
+                if entry.get("line") != number or not isinstance(entry.get("text"), str):
+                    raise ValueError("required diff pages are not contiguous")
+                line = entry["text"] + "\n"
+                size += len(line.encode())
+                if size > byte_limit:
+                    raise ValueError("required diff exceeds retained review storage allowance")
+                lines.append(line)
+            if result.get("truncated") is False and result.get("next_line") is None:
+                break
+            if not page or result.get("truncated") is not True or result.get("next_line") != start + len(page):
+                raise ValueError("required diff page has no valid continuation")
+            start += len(page)
+        return json.dumps({**node, "diff": "".join(lines), "diff_deferred": False, "coverage": "complete"})
+
 
 @contextmanager
 def prepare(pwd: str, pr: str, actor: str, head: str, packet: str):
@@ -88,10 +124,13 @@ def prepare(pwd: str, pr: str, actor: str, head: str, packet: str):
         limit = review_budget.timeout(240, reserve=review_budget.FINAL_CHECK_SECONDS)
         progress.stage("checking_out", "Preparing pinned PR checkout", timeout=limit)
         try:
-            done = subprocess.run(
-                [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), "--checkout-review", atoms.pr_ref(pr),
+            command = [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), "--checkout-review", atoms.pr_ref(pr),
                  "--repository", repo, "--path", str(root), "--expected-head", head,
-                 "--base-sha", base, "--merge-base-sha", merge_base, "--token-user", actor],
+                 "--base-sha", base, "--merge-base-sha", merge_base, "--token-user", actor]
+            if facts.get("diff_deferred"):
+                command.extend(["--diff-files-json", json.dumps([entry["filename"] for entry in facts["files"]])])
+            done = subprocess.run(
+                command,
                 cwd=pwd, text=True, capture_output=True, timeout=limit,
             )
             if done.returncode:

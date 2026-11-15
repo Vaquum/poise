@@ -131,3 +131,16 @@ class TestAtoms(TestCase):
                 with self.assertRaises(atoms.AgentPreflightError) as caught:
                     atoms.packet("/tmp", "#1", "bit-mis", "a" * 40)
                 self.assertEqual(caught.exception.code, code)
+
+    def test_analysis_policy_keeps_note_after_a_repeated_repository_heading(self) -> None:
+        packet = '{"pull_number": 12}'
+        text = atoms.prompt("policy", ("p0",), ("rule {levels}",), packet, [], note="seen\n\nPinned review repository:\nold")
+        text += "\n\nPinned review repository:\n{repo}\nlisting"
+        policy = atoms.analysis_policy("system", text, packet)
+        self.assertIn("old", policy)
+        self.assertIn("<pinned packet>", policy)
+        self.assertNotIn(packet, policy.replace("<pinned packet>", ""))
+        self.assertNotIn("{repo}", policy)
+        changed = atoms.analysis_policy("system", text.replace("old", "new instructions"), packet)
+        self.assertIn("new instructions", changed)
+        self.assertNotEqual(policy, changed)

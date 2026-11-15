@@ -34,6 +34,7 @@ from . import (
     process_identity,
     progress,
     review_budget,
+    review_continuation,
     review_receipt,
     resource_guard,
     resource_ownership,
@@ -1319,6 +1320,8 @@ def run_pr_review(
     model: str | None = None,
     recovery_model: str | None = None,
     review_scope: str = "",
+    review_slot: str | None = None,
+    resume_review: str | None = None,
 ):
     return run_governed_behavior(
         pr_review,
@@ -1335,6 +1338,7 @@ def run_pr_review(
         model,
         recovery_model,
         review_scope=review_scope,
+        review_slot=review_slot, resume_review=resume_review,
     )
 
 
@@ -1569,6 +1573,8 @@ def run_pr_approve(
     review_round: int | None = None,
     review_cap: int | None = None,
     review_scope: str = "",
+    review_slot: str | None = None,
+    resume_review: str | None = None,
 ):
     return run_governed_behavior(
         pr_approve,
@@ -1588,6 +1594,7 @@ def run_pr_approve(
         review_round,
         review_cap,
         review_scope=review_scope,
+        review_slot=review_slot, resume_review=resume_review,
     )
 
 
@@ -2044,6 +2051,8 @@ def run_governed_behavior(
     review_round: int | None = None,
     review_cap: int | None = None,
     review_scope: str = "",
+    review_slot: str | None = None,
+    resume_review: str | None = None,
 ):
     if capped and (behavior != "pr_approve" or review_round is None or review_cap is None):
         raise ValueError("a capped round needs pr_approve with its round and cap numbers")
@@ -2072,7 +2081,7 @@ def run_governed_behavior(
         conn.execute("update calls set review_policy=? where id=?", (review_budget.REVIEW_POLICY, id_))
     review_receipt.bind(DB, id_)
     with review_budget.ReviewBudget(timeout_s), progress.Progress(DB, id_), \
-            review_receipt.invocation_environment(DB, id_, True):
+            review_receipt.invocation_environment(DB, id_, True), review_continuation.request(review_slot, resume_review):
         response = ""
         try:
             before = review_facts(mod, pr, pwd, actor, expected_head, 0)
@@ -2214,6 +2223,11 @@ def run_governed_behavior(
             finish(id_, "failed", response=response, error=str(e), error_code="review_submission_failed")
             print(json.dumps({"id": id_, "error": str(e), "error_code": "review_submission_failed"}))
             raise SystemExit(1)
+        except review_continuation.Continuation as e:
+            finish(id_, "failed", error=str(e), error_code=e.code, action="not_started", outcome="incomplete")
+            print(json.dumps({"id": id_, "error": str(e), "error_code": e.code,
+                              "action": "not_started", "outcome": "incomplete", "continuation": e.result}))
+            raise SystemExit(1)
         except review_budget.ReviewLimitError as e:
             diagnostic = {**e.diagnostic, "call_id": id_, "correlation_id": correlation_id,
                           "repository": repo, "pr": mod.pr_number(pr), "reviewer": actor, "behavior": behavior,
@@ -2332,6 +2346,9 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
     try:
         return mod.run(pwd, pr, actor, head, note, seconds, p, model=spec.identity, **cap_kwargs), None
     except (review_budget.ReviewLimitError, atoms.ReviewVerdictError, subprocess.TimeoutExpired, review_receipt.SubmissionError) as error:
+        if isinstance(error, review_continuation.Continuation) or review_continuation.enabled() \
+                and not isinstance(error, review_receipt.SubmissionError):
+            raise
         verdict_failure = isinstance(error, atoms.ReviewVerdictError)
         if verdict_failure and behavior != "pr_approve":
             raise
@@ -3015,8 +3032,8 @@ behaviors:
   --read-response HASH
   --read-reasoning HASH
   --chat MESSAGE --model MODEL [--session ID] [--pwd DIR]
-  --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL]
-  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N]
+  --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-slot SLOT [--resume-review CALL_ID:GENERATION]]
+  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N] [--review-slot SLOT [--resume-review CALL_ID:GENERATION]]
   --fix-failing-ci PR [--pwd DIR]
   --issue-simplify ISSUE [--pwd DIR]
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--expected-issue-revision SHA256] [--note TEXT]
@@ -3377,6 +3394,7 @@ def _main():
             model=flag_value("--model"),
             recovery_model=flag_value("--recovery-model"),
             review_scope=flag_value("--review-scope") or "",
+            review_slot=flag_value("--review-slot"), resume_review=flag_value("--resume-review"),
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--pr-approve":
@@ -3400,6 +3418,7 @@ def _main():
             review_round=review_round,
             review_cap=review_cap,
             review_scope=flag_value("--review-scope") or "",
+            review_slot=flag_value("--review-slot"), resume_review=flag_value("--resume-review"),
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--fix-failing-ci":

@@ -55,7 +55,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "change_request_reviews": _change_request_summary(reviews, required_head),
         "linked_issues": issues,
     }
-    packet_diff = await review_diff(client, owner, repo, pull, context, since=since)
+    options = {"manifest_only": True} if payload.get("manifest_only") else {}
+    packet_diff = await review_diff(client, owner, repo, pull, context, since=since, **options)
     latest = await get_pull(client, owner, repo, pull_number)
     latest_head = expected_head({"expected_head": (latest.get("head") or {}).get("sha")})
     latest_base = expected_head({"expected_head": (latest.get("base") or {}).get("sha")})
