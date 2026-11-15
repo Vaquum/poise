@@ -41,6 +41,7 @@ tests/accounts.test.ts
 tests/behavior-chain.test.ts
 tests/behavior-resource-receipt.test.ts
 tests/behavior-chain-merge-basis.test.ts
+tests/review-clearance.test.ts
 tests/behavior-chain-reconciliation.test.ts
 tests/behavior-chain-report.test.ts
 tests/behavior-chain-resources.test.ts

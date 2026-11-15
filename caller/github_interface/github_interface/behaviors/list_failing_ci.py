@@ -15,6 +15,7 @@ from github_interface.identity import AGENT
 
 IDENTITY = AGENT
 OK_CHECKS = {"success", "neutral", "skipped"}
+REVIEW_CLEARANCE = "Poise review clearance"
 
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
@@ -50,7 +51,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                                   for run in runs]})
 
     failing_checks = [_check(check) for check in checks if _check_failing(check)]
-    failing_statuses = [_status(item) for item in status.get("statuses", []) if item.get("state") != "success"]
+    failing_statuses = [_status(item) for item in status.get("statuses", [])
+                        if item.get("state") != "success" and item.get("context") != REVIEW_CLEARANCE]
     if payload.get("held_ci_json") is not None:
         evidence["ci_refresh"] = await pr_ci_recovery.inspect(client, f"{owner}/{repo}", pull,
                                                             json.loads(payload["held_ci_json"]), failing_checks + failing_statuses)
@@ -115,7 +117,10 @@ async def _base_update(client, owner, repo, head, from_head, base, commit):
 
 
 def _check_failing(check: dict[str, Any]) -> bool:
-    return check.get("status") != "completed" or check.get("conclusion") not in OK_CHECKS
+    # Review evidence is produced by the review/repair path, not by CI repair.
+    # It remains a required GitHub check and is still included in raw evidence.
+    return check.get("name") != REVIEW_CLEARANCE and (
+        check.get("status") != "completed" or check.get("conclusion") not in OK_CHECKS)
 
 
 def _check(check: dict[str, Any]) -> dict[str, Any]:
