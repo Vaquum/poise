@@ -1814,8 +1814,11 @@ results, preserving receipt digests and publication/retry fences. The CLI's
 response-read contract is in [agent_interface](../caller/agent_interface/README.md#reading-a-response).
 
 Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
-code and existing v1 diagnostic into chain receipts and History. The unchanged
-no-publication shape and retry requirements are defined in
+code and existing v1 diagnostic into chain receipts and History. A native repair
+admission passes its repair basis and, for an eligible retry, the original
+Caller ID. Caller verifies that identity against the prior receipt and its
+private deadline artifact before restoring edits. The no-publication shape
+and retry requirements are defined in
 [Behavior chain](Behavior-chain.md#authority-and-recovery).
 
 Optional work-failure reporting uses the same chain reconciliation,

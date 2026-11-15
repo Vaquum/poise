@@ -1804,7 +1804,8 @@ def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
 
 def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, model: str,
                     branch: str, pull: int | None = None, expected_head: str | None = None, note: str = "", merge_base: bool = False,
-                    expected_issue_revision: str | None = None):
+                    expected_issue_revision: str | None = None, *, repair_basis: str | None = None,
+                    repair_predecessor: str | None = None):
     spec = CATALOG.issue_review_model(model)
     repo, number = issue_review.parse(issue)
     actor, source, correlation_id = atoms.actor(actor), atoms.source(source), atoms.correlation_id(correlation_id)
@@ -1846,7 +1847,9 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
             record(artifact)
             with review_receipt.managed_resources(run_dir):
                 try:
-                    result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
+                    result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head,
+                                             note, merge_base, expected_issue_revision, repair_basis=repair_basis,
+                                             repair_predecessor=repair_predecessor)
                 except Exception as error:
                     if getattr(error, "diagnostic", None) is None:
                         failure = atomic_work.failure_diagnostic(error)
@@ -1893,9 +1896,10 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         try:
-            if source == "poise:behavior-chain" and pull is None:
-                failed_source.discard_unless_failed(DB, id_)
-                failed_source.discard_deadline_unless_failed(DB, id_)
+            if source == "poise:behavior-chain":
+                if pull is None:
+                    failed_source.discard_unless_failed(DB, id_)
+                failed_source.discard_deadline_unless_failed(DB, id_, behavior)
         finally:
             if source == "poise:behavior-chain":
                 resource_ownership.cleanup_remaining(DB, id_)
@@ -3422,7 +3426,8 @@ def _main():
         run_atomic_work(sys.argv[2], required_flag("--actor"), required_flag("--source"), required_flag("--correlation-id"),
                         required_flag("--model"), required_flag("--branch"), int(pull) if pull else None,
                         flag_value("--expected-head"), flag_value("--note") or "", "--merge-base" in sys.argv,
-                        flag_value("--expected-issue-revision"))
+                        flag_value("--expected-issue-revision"), repair_basis=flag_value("--repair-basis"),
+                        repair_predecessor=flag_value("--repair-predecessor"))
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--issue-simplify":
         run_issue_simplify(sys.argv[2], flag_value("--pwd"))

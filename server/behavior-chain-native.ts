@@ -23,6 +23,28 @@ type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
 // Leave the outer client room for startup, receipt commits and teardown too.
 const NATIVE_ACTION_TIMEOUT_MS = 120_000
 
+function repairDeadlinePredecessor(chain: BehaviorChain, observation: ChainObservation, decision: Invoke): string | null {
+  const pull = observation.pull
+  if (!pull || chain.repairRecovery) return null
+  const original = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr'
+    && invocation.evidence?.status !== 'deferred')
+  const evidence = original?.evidence
+  const artifact = evidence?.artifact as Record<string, unknown> | null | undefined
+  const source = artifact?.deadline_source as { status?: unknown } | undefined
+  if (!original || original.state !== 'settled' || !original.callId || original.basis !== decision.basis
+    || original.slot !== decision.reviewer?.slot || original.actor !== decision.actor
+    || original.admissionSequence <= chain.resumedAfterSequence || original.request.command !== 'agent-interface'
+    || original.request.context?.head !== pull.head || original.request.context.reviewRevision !== pull.reviewRevision
+    || original.request.context.queueRemoval !== pull.queueRemoval?.id
+    || evidence?.status !== 'failed' || evidence.action !== 'not_started' || evidence.outcome !== 'preflight_failed'
+    || evidence.error_code !== 'atomic_work_execution_budget_exhausted' || artifact?.phase !== 'executing'
+    || source?.status !== 'available' || !resourceReleaseProven(evidence, true)
+    || [artifact.plan_sha, artifact.publication_head, artifact.replies_started, artifact.publication, artifact.result,
+      artifact.receipts, evidence.receipts, evidence.review_id, evidence.head_sha, evidence.publicationPlan,
+      evidence.publicationResume, evidence.publicationReceipt, evidence.nativeActionReceipt].some(value => value != null)) return null
+  return original.callId
+}
+
 export async function readNativeInvocations(ids: string[], mode: 'strict' | 'resource-recovery' = 'strict') {
   requireCallerReceipts()
   const { stdout } = await runFile('agent-interface', ['--logs', '--select', JSON.stringify({ latest: [], ids: [], correlations: ids,
@@ -478,12 +500,17 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         const model = ['--model', selected.model, '--recovery-model', selected.recovery]
         if (decision.behavior === 'review-issue') return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: ['--issue-review', `${chain.repository}#${chain.issue}`,
           ...common, ...model, '--expected-issue-revision', observation.issue.revision, '--note', note] }
-        if (decision.behavior === 'implement-issue' || decision.behavior === 'repair-pr') return { command: 'agent-interface', cwd: agentInterfaceCwd(),
-          ...(pull ? { context: { head: pull.head, reviewRevision: pull.reviewRevision,
-            ...(pull.queueRemoval ? { queueRemoval: pull.queueRemoval.id } : {}) } } : {}), argv: ['--atomic-work', `${chain.repository}#${chain.issue}`,
-          ...common, '--model', selected.model, '--branch', chain.branch, '--expected-issue-revision', observation.issue.revision,
-          ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head,
-            ...(pull.conflict || pull.behind || pull.queueRemoval?.reason === 'merge_conflict' ? ['--merge-base'] : [])] : []), '--note', note] }
+        if (decision.behavior === 'implement-issue' || decision.behavior === 'repair-pr') {
+          const predecessor = decision.behavior === 'repair-pr' ? repairDeadlinePredecessor(chain, observation, decision) : null
+          return { command: 'agent-interface', cwd: agentInterfaceCwd(),
+            ...(pull ? { context: { head: pull.head, reviewRevision: pull.reviewRevision,
+              ...(pull.queueRemoval ? { queueRemoval: pull.queueRemoval.id } : {}) } } : {}), argv: ['--atomic-work', `${chain.repository}#${chain.issue}`,
+            ...common, '--model', selected.model, '--branch', chain.branch, '--expected-issue-revision', observation.issue.revision,
+            ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head,
+              ...(pull.conflict || pull.behind || pull.queueRemoval?.reason === 'merge_conflict' ? ['--merge-base'] : []),
+              ...(decision.behavior === 'repair-pr' && !chain.repairRecovery ? ['--repair-basis', decision.basis] : []),
+              ...(predecessor ? ['--repair-predecessor', predecessor] : [])] : []), '--note', note] }
+        }
         if (!pull) throw new Error('PR behavior requires its actual pull request')
         const scope = await hooks.reviewScope?.(chain, pull) ?? ''
         const reviewNote = scope
