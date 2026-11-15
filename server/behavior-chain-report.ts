@@ -8,7 +8,7 @@ import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { runDatastoreHealth, validatedHealth } from './datastore-health'
-import { getHeadSha, handleGhBody, readIssueCreationBody, reconcileRepairReport } from './gh'
+import { getHeadSha, handleGhBody, listIssueCreationBodies, readIssueCreationBody, reconcileRepairReport } from './gh'
 import { HttpError } from './http'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
@@ -912,6 +912,41 @@ function hasCreationMarker(body: string | null, key: string): boolean {
   return body?.split(/\r?\n/, 1)[0] === `<!-- poise-repair-exhaustion:${key} -->`
 }
 
+async function earlierReportCreation(repository: string, report: RepairReport, issue: Awaited<ReturnType<typeof readIssueCreationBody>>) {
+  const since = report.heldAt !== null && Number.isFinite(report.heldAt) ? new Date(report.heldAt - 60_000).toISOString() : undefined
+  const { issues, hasNextPage } = await listIssueCreationBodies(repository, issue.author, since)
+  const created = Date.parse(issue.createdAt)
+  const earlier = issues.filter(other => {
+    const at = Date.parse(other.createdAt)
+    return !predatesHold(other.createdAt, report.heldAt) && (at < created || at === created && other.number < issue.number)
+  })
+  // A public marker can be copied into another issue's creation body.
+  if (earlier.some(other => hasCreationMarker(other.body, report.key))) return true
+  if (!issues.some(other => other.number === issue.number && other.createdAt === issue.createdAt)
+    || hasNextPage && !issues.some(other => Date.parse(other.createdAt) > created)) {
+    throw new Error('Issue creation listing is incomplete before the report')
+  }
+  if (earlier.some(other => other.body === null)) throw new Error('Earlier issue creation body is unavailable')
+  return false
+}
+
+async function findUnconfirmedPrePrReport(journal: BehaviorChainJournal, chain: BehaviorChain, unconfirmed: RepairReport[]) {
+  const orphans = unconfirmed.filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
+  if (!orphans.length) return null
+  const issue = await readIssueCreationBody(chain.repository, chain.issue)
+  const author = issue.author.toLowerCase()
+  const possible = orphans.filter(candidate => {
+    const creator = journal.read(candidate.source)?.author.toLowerCase()
+    return (!creator || creator === author) && !predatesHold(issue.createdAt, candidate.heldAt)
+  })
+  if (!possible.length) return null
+  if (issue.body === null) throw new Error('original issue body is unavailable')
+  const candidate = possible.find(candidate => hasCreationMarker(issue.body, candidate.key))
+  if (!candidate) return null
+  if (!journal.read(candidate.source)) throw new Error('original report author is unavailable')
+  return await earlierReportCreation(chain.repository, candidate, issue) ? null : candidate
+}
+
 /** Runs at implementation admission even when new report publishing is off. */
 export async function implementationReportAdmission(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   observation: ChainObservation, observe: (source: BehaviorChain) => Promise<ChainObservation>) {
@@ -942,26 +977,15 @@ export async function implementationReportAdmission(db: Database, journal: Behav
     if (!report) {
       // The report starts with its exact marker at publication. Current body
       // matches and edit times cannot distinguish later quotes and rewrites.
-      const orphans = unconfirmed.filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
-      if (orphans.length) {
-        try {
-          const issue = await readIssueCreationBody(chain.repository, chain.issue)
-          const author = issue.author.toLowerCase()
-          const possible = orphans.filter(candidate => {
-            const creator = journal.read(candidate.source)?.author.toLowerCase()
-            return (!creator || creator === author) && !predatesHold(issue.createdAt, candidate.heldAt)
-          })
-          if (possible.length && issue.body === null) return { reason: `${implWait}: verification unavailable: original issue body is unavailable` }
-          const candidate = possible.find(candidate => hasCreationMarker(issue.body, candidate.key))
-          if (candidate) {
-            if (!journal.read(candidate.source)) return { reason: `${implWait}: verification unavailable: original report author is unavailable` }
-            if (!bindReportIssue(db, candidate.key, chain.issue)) return { reason: `${implWait}: verification unavailable: report intent binding changed` }
-            report = implementationReport(db, chain)
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          return { reason: `${implWait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
+      try {
+        const candidate = await findUnconfirmedPrePrReport(journal, chain, unconfirmed)
+        if (candidate) {
+          if (!bindReportIssue(db, candidate.key, chain.issue)) return { reason: `${implWait}: verification unavailable: report intent binding changed` }
+          report = implementationReport(db, chain)
         }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { reason: `${implWait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
       }
     }
   }
@@ -994,33 +1018,11 @@ export async function implementationReportAdmission(db: Database, journal: Behav
             && deps.prerequisites.some(entry => typeof entry?.repo === 'string'
               && entry.repo.toLowerCase() === chain.repository.toLowerCase() && entry.number === chain.issue)
             && journal.read(source.id)?.sequence === source.sequence
-          // A lost-ack intent with null issueNumber is invisible to
-          // implementationReport. If its marker was stripped before
-          // reconciliation and a second hold adopted the stripped issue,
-          // exempting here would bypass the original report's disposition.
-          // File/test matching is bypassable by rewrite, so block when any
-          // such orphan could have filed this issue. Generated reports are
-          // authored by the orphan's own source owner at creation, so a
-          // later main/reviewer swap cannot launder a stripped report into
-          // an exemption; unknown authorship fails closed.
-          let orphaned = false
-          if (verified && failure) {
-            const author = typeof (issue as { author?: unknown }).author === 'string'
-              ? ((issue as { author: string }).author.toLowerCase()) : null
-            orphaned = unconfirmedImplementationReports(db, chain.repository).some(candidate => {
-              if (candidate.pull !== null || candidate.adopted === true) return false
-              if (author !== null) {
-                const owner = journal.read(candidate.source)?.author
-                if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
-              }
-              return !predatesHold(issue.created_at, candidate.heldAt)
-            })
-          }
-          if (verified && (report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt)) && !orphaned) return { reason: null }
           if (!verified) return { reason: `${wait}: linked remedy source evidence changed` }
-          // A verified pre-record link filed after its hold, or a link an
-          // orphaned lost-ack could own, cannot prove independent
-          // authorship. Fall through to disposition.
+          // A later adoption can link the issue from an unconfirmed report.
+          // Check its creation evidence before allowing the remedy exemption.
+          if ((report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt))
+            && !await findUnconfirmedPrePrReport(journal, chain, unconfirmedImplementationReports(db, chain.repository))) return { reason: null }
         }
       } catch (error) {
         return { reason: `${wait}: verification unavailable: ${behaviorErrorMessage(error instanceof Error ? error.message : String(error), 500)}` }
@@ -2034,7 +2036,7 @@ async function confirmReport(db: Database, journal: BehaviorChainJournal,
     if (report.pull === null && implementationReportIdentity(report)) {
       const creation = await readIssueCreationBody(chain.repository, issue.number)
       if (creation.author.toLowerCase() !== chain.author.toLowerCase() || predatesHold(creation.createdAt, report.heldAt)
-        || !hasCreationMarker(creation.body, report.key)) {
+        || !hasCreationMarker(creation.body, report.key) || await earlierReportCreation(chain.repository, report, creation)) {
         return `${label} report creation is unconfirmed; original issue body or author does not verify the report intent`
       }
     }

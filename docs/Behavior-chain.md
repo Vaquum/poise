@@ -980,10 +980,10 @@ These pre-PR implementation-hold reports require explicit triage before their
 own implementation can prepare or start. A posted issue review alone cannot
 authorize implementation. This includes follow-up reports keyed by their original
 invocation and hold sequence, even after a lost creation acknowledgement or restart.
-After a lost acknowledgement, admission checks the exact marker in the issue's
-creation body and its original source author. Later edits cannot transfer the
-binding to an issue that quotes the report. Missing creation evidence for a
-possible report keeps its admission waiting.
+After a lost acknowledgement, admission binds the earliest issue by the original
+source author whose GitHub creation body begins with the exact marker. A later
+issue can quote the marker without taking the binding. Missing or incomplete
+creation evidence for a possible report keeps its admission waiting.
 An independently authored markerless remedy verified against the source's blocked-by
 relationship and original failing file and test case retains ordinary intake.
 That path is only for intents the reporter linked as remedies: an issue the
