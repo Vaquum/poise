@@ -962,19 +962,22 @@ export async function implementationReportAdmission(db: Database, journal: Behav
           // reconciliation and a second hold adopted the stripped issue,
           // exempting here would bypass the original report's disposition.
           // File/test matching is bypassable by rewrite, so block when any
-          // such orphan could have filed this reporter-authored issue.
-          // Generated reports are authored by the main account; a
-          // reviewer-authored remedy cannot be an orphan's filed issue.
+          // such orphan could have filed this issue. Generated reports are
+          // authored by the orphan's own source owner at creation, so a
+          // later main/reviewer swap cannot launder a stripped report into
+          // an exemption; unknown authorship fails closed.
           let orphaned = false
           if (verified && failure) {
             const author = typeof (issue as { author?: unknown }).author === 'string'
               ? ((issue as { author: string }).author.toLowerCase()) : null
-            if (author === null || author === chain.author.toLowerCase()) {
-              orphaned = unconfirmedImplementationReports(db, chain.repository).some(candidate => {
-                if (candidate.pull !== null || candidate.adopted === true) return false
-                return !predatesHold(issue.created_at, candidate.heldAt)
-              })
-            }
+            orphaned = unconfirmedImplementationReports(db, chain.repository).some(candidate => {
+              if (candidate.pull !== null || candidate.adopted === true) return false
+              if (author !== null) {
+                const owner = journal.read(candidate.source)?.author
+                if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
+              }
+              return !predatesHold(issue.created_at, candidate.heldAt)
+            })
           }
           if (verified && (report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt)) && !orphaned) return { reason: null }
           if (!verified) return { reason: `${wait}: linked remedy source evidence changed` }
