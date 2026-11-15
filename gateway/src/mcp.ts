@@ -5,7 +5,7 @@ import { signAssertion } from './assertion.js'
 import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
 import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES, isMcpRecordId, isMcpRepository,
-  mcpRepositoryAllowed, mcpToolNames, mcpWorkspaceAllowed, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
+  isMcpContentKind, mcpContentAllowed, mcpRepositoryAllowed, mcpToolNames, mcpWorkspaceAllowed, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
 import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
 import { html, page } from './pages.js'
@@ -97,6 +97,7 @@ export class McpGateway {
         <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata, including listings</label>
         <label><input type="checkbox" name="chatTranscript" value="1"> Allow Chat transcript and retained turn events</label>
         <label><input type="checkbox" name="workspaceData" value="1"> Allow workspace settings and operational data (workspace-wide grants)</label>
+        <label><input type="checkbox" name="contentData" value="1"> Allow document, snippet and saved memory content (workspace-wide grants)</label>
         <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
         <button name="decision" value="approve">Allow read access</button><button name="decision" value="deny">Deny</button></form></div>`), authorizeHeaders)
     }
@@ -119,6 +120,7 @@ export class McpGateway {
             ...(form.get('chatMetadata') === '1' ? { chatMetadata: true, chatList: true } : {}),
             ...(form.get('chatTranscript') === '1' ? { chatTranscript: true } : {}),
             ...(!repository && form.get('workspaceData') === '1' ? { workspaceData: true } : {}),
+            ...(!repository && form.get('contentData') === '1' ? { contentData: true } : {}),
             ...(repository ? { repository } : {}) } })
         target.searchParams.set('code', code)
       }
@@ -214,10 +216,13 @@ export class McpGateway {
       return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     }
     if (read.name === 'poise_get' && ((read.arguments.kind === 'chat' || read.arguments.kind === 'timer')
-      ? !grant.chatMetadata : !mcpWorkspaceAllowed(grant))) {
+      ? !grant.chatMetadata : isMcpContentKind(read.arguments.kind) ? !mcpContentAllowed(grant) : !mcpWorkspaceAllowed(grant))) {
       return result({ isError: true, content: [{ type: 'text', text: 'this data is outside the owner’s selected consent' }] })
     }
-    if (read.name === 'poise_list') {
+    if (read.name === 'poise_list' && read.arguments.kind === 'document' && !mcpContentAllowed(grant)) {
+      return result({ isError: true, content: [{ type: 'text', text: 'workspace content consent is required' }] })
+    }
+    if (read.name === 'poise_list' && read.arguments.kind === 'chat') {
       const repository = read.arguments.repository ?? grant.repository ?? null
       if (!mcpRepositoryAllowed(grant, repository)) {
         return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
@@ -250,6 +255,7 @@ export class McpGateway {
       ...(grant.chatMetadata && grant.chatList && grant.tools.includes('poise_list') ? { chatList: true } : {}),
       ...(grant.chatTranscript && grant.tools.includes('poise_changes') ? { chatTranscript: true } : {}),
       ...(mcpWorkspaceAllowed(grant) && grant.tools.includes('poise_get') ? { workspaceData: true } : {}),
+      ...(mcpContentAllowed(grant) && grant.tools.includes('poise_get') ? { contentData: true } : {}),
       ...(grant.repository === undefined ? {} : { repository: grant.repository }) }
     const identity = signAssertion(ctx.deps.keys.privateKey, { handle: owner.handle, login: owner.login, scope: 'mcp', mcp: scope }, ctx.deps.now())
     let text: string
@@ -285,7 +291,7 @@ export class McpGateway {
     const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: grant.tools.filter(tool => tools.includes(tool)) } }
     if (read.name === 'poise_describe') return { ...described,
       access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString(),
-        repository: grant.repository ?? null, workspaceData: mcpWorkspaceAllowed(grant) },
+        repository: grant.repository ?? null, workspaceData: mcpWorkspaceAllowed(grant), contentData: mcpContentAllowed(grant) },
       inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools, scope),
       runbooks: RUNBOOKS, instructions: INSTRUCTIONS }
     if (read.name === 'poise_get') {
@@ -323,6 +329,13 @@ export class McpGateway {
         || !Array.isArray(page.items) || page.items.length > read.arguments.limit
         || (page.nextCursor !== null && (typeof page.nextCursor !== 'string' || page.nextCursor.length > 2048))) {
         throw new HttpError(502, 'invalid_workspace_chat_page')
+      }
+      if (read.arguments.kind === 'document') {
+        if (!['complete', 'partial', 'unavailable'].includes(String(page.coverage))
+          || page.items.some(item => !item || typeof item.slug !== 'string' || !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,119}$/.test(item.slug)
+            || item.href !== '/?view=editor&doc=' + item.slug)) throw new HttpError(502, 'invalid_workspace_document_page')
+        return { ...described, page: { ...page, items: page.items.map(({ href, ...item }) =>
+          ({ ...item, link: new URL(href, ctx.workspaceOrigin(owner.handle)).href })) } }
       }
       const chatLink = (id: string) => `${ctx.workspaceOrigin(owner.handle)}/?view=chat&chat=${id}`
       if (read.name === 'poise_list') {

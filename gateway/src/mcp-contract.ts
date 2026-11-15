@@ -3,6 +3,7 @@ export const MCP_SCOPE = 'poise:read'
 export const MCP_RESPONSE_BYTES = 128 * 1024
 const MCP_RECORD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 const CALL_ID = /^[a-fA-F0-9]{32}$/
+const CONTENT_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,119}$/
 const pageProperties = { limit: { type: 'integer', minimum: 1, maximum: 10 }, cursor: { type: 'string', maxLength: 2048 } } as const
 export const MCP_WORKSPACE_VIEWS = ['settings', 'accounts', 'models', 'behaviors', 'release', 'health', 'storage',
   'github-quota', 'analytics-health', 'notices', 'handling', 'extensions', 'memories', 'snippets'] as const
@@ -20,13 +21,13 @@ export const MCP_TOOLS = [
     annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_get', description: 'Read an exact Chat or timer record, or a named workspace snapshot. Requires consent for the selected data.',
     inputSchema: { type: 'object', required: ['kind', 'id'], properties: {
-      kind: { enum: ['chat', 'timer', 'workspace', 'call', 'invocation'] },
-      id: { anyOf: [{ type: 'string', pattern: MCP_RECORD_ID.source }, { type: 'string', pattern: CALL_ID.source }, { enum: MCP_WORKSPACE_VIEWS }] },
+      kind: { enum: ['chat', 'timer', 'workspace', 'call', 'invocation', 'document', 'snippet', 'memory'] },
+      id: { type: 'string', maxLength: 120 },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_list', description: 'List a bounded page of current or archived Chat session records by repository and UTC update window.',
     inputSchema: { type: 'object', required: ['kind'], properties: {
-      kind: { const: 'chat' }, repository: { type: 'string', maxLength: 140 },
+      kind: { enum: ['chat', 'document'] }, repository: { type: 'string', maxLength: 140 },
       since: { type: 'string', format: 'date-time' }, until: { type: 'string', format: 'date-time' }, ...pageProperties,
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
@@ -48,18 +49,21 @@ export interface McpGrantScope {
   chatList?: true
   chatTranscript?: true
   workspaceData?: true
+  contentData?: true
   repository?: string
 }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
 export interface McpChatGetArguments { kind: 'chat' | 'timer'; id: string }
 export type McpGetArguments = McpChatGetArguments | { kind: 'workspace'; id: McpWorkspaceView }
   | { kind: 'call'; id: string } | { kind: 'invocation'; id: string }
+  | { kind: 'document'; id: string } | { kind: 'snippet'; id: string } | { kind: 'memory'; id: 'current' }
 export interface McpChatListArguments { kind: 'chat'; repository: string | null; since: string | null; until: string | null; limit: number; cursor?: string }
+export interface McpDocumentListArguments { kind: 'document'; limit: number; cursor?: string }
 export interface McpChatChangesArguments { kind: 'chat'; id: string; limit: number; afterSequence?: number; cursor?: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
   | { name: 'poise_work'; arguments: McpWorkArguments }
   | { name: 'poise_get'; arguments: McpGetArguments }
-  | { name: 'poise_list'; arguments: McpChatListArguments }
+  | { name: 'poise_list'; arguments: McpChatListArguments | McpDocumentListArguments }
   | { name: 'poise_changes'; arguments: McpChatChangesArguments }
 
 export const isMcpRecordId = (value: unknown): value is string => typeof value === 'string' && MCP_RECORD_ID.test(value)
@@ -70,16 +74,22 @@ export const isMcpRepository = (value: unknown): value is string => typeof value
 export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
   scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
-export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'workspaceData' | 'repository'>): string[] {
+export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'workspaceData' | 'contentData' | 'repository'>): string[] {
   const tools: string[] = [...MCP_WORK_TOOL_NAMES]
-  if (scope.chatMetadata === true || mcpWorkspaceAllowed(scope)) tools.push('poise_get')
-  if (scope.chatMetadata === true && scope.chatList === true) tools.push('poise_list')
+  if (scope.chatMetadata === true || mcpWorkspaceAllowed(scope) || mcpContentAllowed(scope)) tools.push('poise_get')
+  if (scope.chatMetadata === true && scope.chatList === true || mcpContentAllowed(scope)) tools.push('poise_list')
   if (scope.chatTranscript === true) tools.push('poise_changes')
   return tools
 }
 
 export const mcpWorkspaceAllowed = (scope: Pick<McpGrantScope, 'repository' | 'workspaceData'>): boolean =>
   scope.repository === undefined && scope.workspaceData === true
+
+export const mcpContentAllowed = (scope: Pick<McpGrantScope, 'repository' | 'contentData'>): boolean =>
+  scope.repository === undefined && scope.contentData === true
+
+export const isMcpContentKind = (kind: string): kind is 'document' | 'snippet' | 'memory' =>
+  kind === 'document' || kind === 'snippet' || kind === 'memory'
 
 function pageTime(value: unknown): string | null {
   if (value === undefined || value === null) return null
@@ -109,6 +119,10 @@ export function parseMcpRead(value: unknown): McpRead {
         && (CALL_ID.test(id) || (kind === 'invocation' && isMcpRecordId(id)))) {
         return { name: row.name, arguments: { kind, id: id.toLowerCase() } }
       }
+      if ((kind === 'document' || kind === 'snippet') && typeof id === 'string' && CONTENT_ID.test(id)) {
+        return { name: row.name, arguments: { kind, id } }
+      }
+      if (kind === 'memory' && id === 'current') return { name: row.name, arguments: { kind, id } }
     }
     throw new Error('provide a supported workspace snapshot name or exact Chat or timer ID')
   }
@@ -116,8 +130,13 @@ export function parseMcpRead(value: unknown): McpRead {
     const page = args as Record<string, unknown>
     const limit = page.limit ?? 5
     const cursor = page.cursor
-    if (page.kind !== 'chat' || !Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 10
+    if (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 10
       || (cursor !== undefined && (typeof cursor !== 'string' || !cursor || cursor.length > 2048))) throw new Error('invalid Chat page selector')
+    if (row.name === 'poise_list' && page.kind === 'document') {
+      if (Object.keys(page).some(key => !['kind', 'limit', 'cursor'].includes(key))) throw new Error('invalid document page selector')
+      return { name: row.name, arguments: { kind: 'document', limit: Number(limit), ...(typeof cursor === 'string' ? { cursor } : {}) } }
+    }
+    if (page.kind !== 'chat') throw new Error('invalid Chat page selector')
     const bounds = { kind: 'chat' as const, limit: Number(limit), ...(typeof cursor === 'string' ? { cursor } : {}) }
     if (row.name === 'poise_list') {
       const repository = page.repository ?? null

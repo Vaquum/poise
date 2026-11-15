@@ -10,6 +10,7 @@
 // versioning / sync / backup they already have (git, Dropbox, iCloud,
 // etc.). No lock-in.
 
+import { constants } from 'node:fs'
 import { mkdir, open, unlink, readdir, rename, stat } from 'node:fs/promises'
 import { StringDecoder } from 'node:string_decoder'
 import { dirname, join } from 'node:path'
@@ -155,9 +156,10 @@ const editorReady = cleanStaleTmpFiles()
 // blow out memory on read. 5 MB is well past any prose document.
 export const MAX_DOC_BYTES = 5 * 1024 * 1024
 
-async function readTitle(path: string, maxBytes: number): Promise<string> {
-  const handle = await open(path, 'r')
+async function readTitle(path: string, maxBytes: number, noFollow = false): Promise<string> {
+  const handle = await open(path, noFollow ? constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK : 'r')
   try {
+    if (noFollow && !(await handle.stat()).isFile()) throw new Error('the retained document source is not a regular file')
     const buffer = Buffer.alloc(Math.min(4096, maxBytes))
     const decoder = new StringDecoder('utf8')
     const parts: string[] = []
@@ -185,10 +187,12 @@ async function readUtf8Limited(
   path: string,
   maxBytes: number,
   label: string,
+  noFollow = false,
 ): Promise<{ content: string, updatedAt: string, size: number }> {
-  const handle = await open(path, 'r')
+  const handle = await open(path, noFollow ? constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK : 'r')
   try {
     const fileStat = await handle.stat()
+    if (noFollow && !fileStat.isFile()) throw new Error('the retained document source is not a regular file')
     if (fileStat.size > maxBytes) throw new Error(`${label} too large (max ${maxBytes} bytes)`)
     const buffer = Buffer.alloc(fileStat.size)
     let offset = 0
@@ -331,16 +335,34 @@ export interface DocReadResult {
   version: EditorVersion
 }
 
-export async function readDoc(slug: string): Promise<DocReadResult> {
+export async function readDoc(slug: string, options: { noFollow?: boolean } = {}): Promise<DocReadResult> {
   await editorReady
   const path = fileFor(slug)
-  const loaded = await readUtf8Limited(path, MAX_DOC_BYTES, 'doc')
+  const loaded = await readUtf8Limited(path, MAX_DOC_BYTES, 'doc', options.noFollow)
   return {
     slug: canonicalSlug(slug),
     content: loaded.content,
     updated_at: loaded.updatedAt,
     version: versionFor(loaded.content),
   }
+}
+
+export async function pageDocumentSummaries(after: string, limit: number) {
+  await editorReady
+  const directory = await readdir(EDITOR_DIR, { withFileTypes: true })
+  const filenames = directory.filter(item => item.isFile() && item.name.endsWith('.md'))
+    .map(item => item.name.slice(0, -3)).filter(slug => isCanonicalSlug(slug) && slug > after).sort()
+  const selected = filenames.slice(0, limit)
+  const rows = await Promise.all(selected.map(async slug => {
+    try {
+      const path = fileFor(slug), metadata = await stat(path)
+      if (!metadata.isFile()) return null
+      return { slug, title: await readTitle(path, Math.min(metadata.size, 4096), true),
+        updatedAt: metadata.mtime.toISOString(), size: metadata.size }
+    } catch { return null }
+  }))
+  return { items: rows.filter(row => row !== null), missing: rows.some(row => row === null),
+    next: filenames.length > limit ? selected.at(-1) ?? null : null }
 }
 
 export interface EditorWriteContext {
@@ -780,12 +802,12 @@ function isLanded(value: unknown): boolean {
     && (landed.unknown === undefined || landed.unknown === true)
 }
 
-export async function readPublishLedger(slug: string): Promise<PublishLedger> {
+export async function readPublishLedger(slug: string, options: { noFollow?: boolean } = {}): Promise<PublishLedger> {
   await editorReady
   const path = publishLedgerFileFor(slug)
   let raw: string
   try {
-    raw = (await readUtf8Limited(path, MAX_PUBLISH_LEDGER_BYTES, 'publishing record')).content
+    raw = (await readUtf8Limited(path, MAX_PUBLISH_LEDGER_BYTES, 'publishing record', options.noFollow)).content
   } catch (err: any) {
     if (err.code === 'ENOENT') return { records: [] }
     throw err

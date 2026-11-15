@@ -115,6 +115,19 @@ payloads, extension arguments and memory text stay in their owning surfaces.
 Snapshot timestamps report when the read was assembled. Underlying observations
 keep their own times, and bounded summaries report omitted records.
 
+## Read workspace content
+
+With separate workspace content consent, use `poise_list` with
+`kind: "document"` to page the Editor library and `poise_get` with the document
+slug to read the current version, bounded text, publication versions and
+cached review status. Documents are ordered by slug. Continue with the same
+page size under the same grant.
+
+Use `poise_get` with `kind: "snippet"` and a switch name, or with
+`kind: "memory"` and `id: "current"` for the saved revision. Text is limited
+to an 8,000-character preview and reports truncation. Cached review coverage
+retains its original observation time.
+
 ## Private plugin
 
 Render a private package for an installation's HTTPS apex into a new directory:
