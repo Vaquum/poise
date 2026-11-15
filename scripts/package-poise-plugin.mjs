@@ -15,7 +15,7 @@ export async function packagePoisePlugin(apex, destination) {
   await mkdir(resolve(root, '.agents/plugins'), { recursive: true })
   const json = async (path, value) => writeFile(resolve(root, path), JSON.stringify(value, null, 2) + '\n', { flag: 'wx' })
   await json('plugins/poise/plugin.json', {
-    $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', name: 'poise', version: '1.0.1',
+    $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', name: 'poise', version: '1.1.0',
     description: `Read the Poise work trail at ${origin.origin}`,
   })
   // Codex desktop rejects extensions on portable MCP servers. The gateway
