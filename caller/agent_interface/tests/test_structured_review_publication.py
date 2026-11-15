@@ -50,7 +50,7 @@ def test_large_structured_review_reaches_one_head_pinned_post(tmp_path, monkeypa
 
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "remote", "add", "origin", "https://github.com/o/r.git"], cwd=tmp_path, check=True)
-    findings = [{"path": "src/main.py", "line": line, "side": "RIGHT", "body": f"[p1] Finding {line} " + "x" * 2800}
+    findings = [{"path": "src/main.py", "line": line, "side": "RIGHT", "body": f"[p1] Finding {line} café " + "x" * 2800}
                 for line in range(1, 81)]
     assert len(json.dumps(findings).encode()) > 128 * 1024
     verdict = {"action": "request_changes", "comments": findings, "assessment": {
@@ -64,6 +64,9 @@ def test_large_structured_review_reaches_one_head_pinned_post(tmp_path, monkeypa
     monkeypatch.setattr(structured_review.ReviewWatch, "check_closed", lambda _: None)
     monkeypatch.delenv("AGENT_INTERFACE_RECEIPT_CALL", raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("LC_ALL", "C")
+    monkeypatch.setenv("PYTHONUTF8", "0")
+    monkeypatch.setenv("PYTHONCOERCECLOCALE", "0")
     with ThreadingHTTPServer(("127.0.0.1", 0), ReviewEndpoint) as server:
         executable = tmp_path / "github-interface"
         path_log = tmp_path / "comments-path"

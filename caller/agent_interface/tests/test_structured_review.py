@@ -19,6 +19,7 @@ import agent_interface
 from agent_interface import atoms, pr_review, pr_approve, review_budget, review_stages, review_watch, structured_review, review_repository
 from agent_interface.model_catalog import CATALOG, ModelCatalogError
 from agent_interface.review_watch import ReviewSuperseded, ReviewWatch
+from review_submission_fixture import submission_args
 
 COMPLETE_PACKET = json.dumps({"coverage": "complete", "files": [{"filename": "src/main.py"}],
                              "diff": "diff --git a/src/main.py b/src/main.py\n--- a/src/main.py\n+++ b/src/main.py\n@@ -4 +4 @@\n-old\n+new\n"})
@@ -27,13 +28,6 @@ MUSE_SESSION_ERROR = "muse: local session messaging disabled: session logging is
 ASSESSMENT = {"verdict": "The changed validation paths have no remaining blocking defects.",
               "reviewed_context": "Inspected the supplied immutable diff and its affected callers.",
               "limitations": "Provider fixture; no application test execution."}
-
-
-def submission_args(args):
-    if "--comments" not in args:
-        return args
-    position = args.index("--comments") + 1
-    return [*args[:position], Path(args[position]).read_text(encoding="utf-8"), *args[position + 1:]]
 
 
 def scripted_muse(directory: Path) -> Path:

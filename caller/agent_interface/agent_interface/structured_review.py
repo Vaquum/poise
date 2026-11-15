@@ -726,7 +726,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             if verdict["action"] == "request_changes":
                 directory = files.enter_context(resource_ownership.temporary_directory(prefix="agent-interface-findings-"))
                 comments = Path(directory) / "comments.json"
-                comments.write_text(json.dumps(verdict["comments"], ensure_ascii=False), encoding="utf-8")
+                comments.write_text(json.dumps(verdict["comments"]), encoding="ascii")
                 args.extend(["--comments", str(comments)])
             args.extend(["--assessment-json", json.dumps(verdict["assessment"], ensure_ascii=False)])
             limit = review_budget.timeout(600, reserve=VERIFICATION_RESERVE_SECONDS)
