@@ -1935,9 +1935,10 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
             record(artifact)
             with review_receipt.managed_resources(run_dir):
                 try:
+                    repair_args = {"repair_basis": repair_basis, "repair_predecessor": repair_predecessor} \
+                        if pull is not None and repair_basis else {}
                     result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head,
-                                             note, merge_base, expected_issue_revision, repair_basis=repair_basis,
-                                             repair_predecessor=repair_predecessor)
+                                             note, merge_base, expected_issue_revision, **repair_args)
                 except ClosedImplementationRetired:
                     raise
                 except Exception as error:
