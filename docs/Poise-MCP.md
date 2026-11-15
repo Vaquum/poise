@@ -26,6 +26,12 @@ Call `poise_work` with one of these selectors:
 {"repository":"autonomio/poise","label":"poise","limit":5}
 ```
 
+Label pages also accept a UTC issue creation window. Pass `since` (inclusive)
+and `until` (exclusive) as `YYYY-MM-DDTHH:MM:SSZ`. Keep the window the same
+on continuation. Each row reports the known intake eligibility and selected
+label. The mirror does not retain label application times, so that history
+is reported separately as unavailable.
+
 The repository must belong to a ready followed account in the owner's workspace.
 Label pages include all matching issues, including closed issues and third-party
 authors without configured-account involvement, Calls or chains. They use the
@@ -49,8 +55,10 @@ The result carries `work.items`, observation time and per-source coverage:
 - `coverage.issues` reports mirror freshness. Stale rows remain readable;
   failed issue reads return no rows with their reason, never confirmed absence.
 - Each item's chain and GitHub observation coverage are independent. Stage,
-  issue age in milliseconds, latest invocation admission time, step and blocker
-  come from retained records. `not_recorded` means no chain or retained ledger
+  issue age in milliseconds, latest invocation admission time, step, blocker
+  and next actor and action come from retained records. The next action is an
+  observation of the current chain and can still require runtime admission.
+  `not_recorded` means no chain or retained ledger
   work within fresh coverage, not proof about execution before collection or
   retention. Missing work with incomplete coverage remains `unknown`.
 - The latest five invocation receipts retain original Call IDs, recorded action,

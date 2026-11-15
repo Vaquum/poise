@@ -365,9 +365,12 @@ export class McpGateway {
       return { ...described, page: { ...page, source: 'chat', link: page.found ? chatLink(read.arguments.id) : null } }
     }
     const work = body.work as Record<string, unknown> | undefined
+    const { since, until } = read.arguments
     if (!work || work.repository !== read.arguments.repository || !Array.isArray(work.items) || work.items.length > (read.arguments.issue ? 1 : read.arguments.limit!)
       || work.items.some(item => !item || typeof item !== 'object' || typeof item.repository !== 'string'
         || item.repository.toLowerCase() !== read.arguments.repository.toLowerCase()
+        || since !== undefined && !(Date.parse(String(item.createdAt)) >= Date.parse(since))
+        || until !== undefined && !(Date.parse(String(item.createdAt)) < Date.parse(until))
         || !Number.isSafeInteger(item.issue) || item.issue < 1 || read.arguments.issue !== undefined && item.issue !== read.arguments.issue)) {
       throw new HttpError(502, 'invalid_workspace_work_scope')
     }
