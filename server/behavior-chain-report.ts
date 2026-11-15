@@ -1089,7 +1089,7 @@ export function repairReportImplementationFence(db: Database, chain: BehaviorCha
  * Call proves provenance and no publication, not that its proposed fix is right;
  * the exact-head repair must validate it through the normal publication gates. */
 export async function recoverReportedRepair(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
-  observation: ChainObservation, verify: (target: BehaviorChain) => Promise<ChainObservation>,
+  observation: ChainObservation, verify: (target: BehaviorChain, verifyConflict?: boolean) => Promise<ChainObservation>,
   allowed: () => boolean, signal?: AbortSignal): Promise<string | null> {
   const implementation = await recoverReportedImplementation(db, journal, chain, observation, allowed, signal)
   if (implementation !== undefined) return implementation
@@ -1130,7 +1130,7 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
     return pending(`report #${report.issueNumber} has no unambiguous diagnostic owner`)
   }
   const freshReport = await verify(reportChain)
-  if (!freshReport.issue.open || !freshReport.issue.eligible || freshReport.pull || freshReport.existingPulls.length
+  if (!freshReport.issue.open || freshReport.pull || freshReport.existingPulls.length
     || freshReport.publication.pull_number !== null || freshReport.publication.head_sha !== null
     || freshReport.publication.head_invocation !== null || freshReport.publication.state !== null
     || freshReport.publication.merged || freshReport.publication.merge_sha !== null
@@ -1160,37 +1160,63 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
     || !Array.isArray(result.comments) || result.comments.some(comment => !Number.isSafeInteger(comment.id) || comment.id < 1
       || typeof comment.author !== 'string' || typeof comment.body !== 'string')) throw new Error('Repair report diagnosis comments are incomplete')
   const comments = result.comments.filter(comment => [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(comment.author.toLowerCase()))
-  // Review alone is insufficient: the original comment must name this exact
-  // source PR/head and a concrete code site. The repair validates the diagnosis.
+  // The code-site route retains its full head and file:line requirements.
   const repository = chain.repository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const actionable = (text: unknown): text is string => typeof text === 'string' && text.includes(report.head!)
-    && (new RegExp(`https://github\\.com/${repository}/pull/${report.pull}(?!\\d)`).test(text) || new RegExp(`\\bPR #${report.pull}\\b`, 'i').test(text))
+  const namesPull = (text: string) => new RegExp(`https://github\\.com/${repository}/pull/${report.pull}(?!\\d)`).test(text)
+    || new RegExp(`\\bPR #${report.pull}\\b`, 'i').test(text)
+  const actionable = (text: unknown): text is string => typeof text === 'string' && text.includes(report.head!) && namesPull(text)
     && /\b[\w.-]+(?:\/[\w.-]+)*\.[\w]+:\d+\b/.test(text)
-  const reviewed = !implementations.length ? reportChain.invocations.flatMap(invocation => {
+  const reviewed = reportChain.invocations.flatMap(invocation => {
     const evidence = invocation.evidence
     const receipts = evidence?.receipts as Array<{ issue: string, comment_id: number, author: string }> | undefined
     if (invocation.behavior !== 'review-issue' || !invocation.callId || invocation.actor !== chain.reviewer
       || evidence?.status !== 'completed' || evidence.action !== 'commented' || evidence.issue_revision !== freshReport.issue.revision
       || !Array.isArray(receipts)) return []
     return comments.filter(comment => comment.author.toLowerCase() === chain.reviewer.toLowerCase()
-      && freshReport.issue.commentIds.includes(comment.id) && actionable(comment.body)
+      && freshReport.issue.commentIds.includes(comment.id)
       && comment.body.includes(`<!-- agent-interface issue-review call=${invocation.callId} -->`)
       && receipts.some(receipt => receipt && typeof receipt.issue === 'string' && receipt.issue.toLowerCase() === reportChain.id
         && receipt.comment_id === comment.id && typeof receipt.author === 'string' && receipt.author.toLowerCase() === chain.reviewer.toLowerCase()))
       .map(comment => ({ call: invocation.callId!, text: comment.body }))
+  })
+  const codeSite = freshReport.issue.eligible && (implementations.length
+    ? diagnosis && actionable(diagnostic?.stderr) && { call: diagnosis.call, text: diagnostic.stderr }
+    : reviewed.find(review => actionable(review.text)))
+  // A report removed from intake can still supply this settled diagnostic
+  // receipt. Only the original source chain receives an admission.
+  const conflictReviews = !codeSite && diagnosis ? reviewed.filter(({ text }) => {
+    const head = /\b(?:reproduced|confirmed|verified)\b[^\n.!?]*\b(?:content|merge|branch) conflicts? (?:at|on) `?([a-f0-9]{8,40})\b/i.exec(text)
+    return head && report.head!.startsWith(head[1].toLowerCase()) && namesPull(text)
   }) : []
-  const text = implementations.length ? diagnostic?.stderr : reviewed[0]?.text
-  const call = implementations.length ? diagnosis?.call : reviewed[0]?.call
-  if (!call || !actionable(text)) return pending(`report #${report.issueNumber} lacks an actionable diagnosis pinned to the source PR/head`)
+  const selected = codeSite || (conflictReviews.length === 1 ? conflictReviews[0] : null)
+  if (!selected) return pending(`report #${report.issueNumber} lacks an actionable diagnosis pinned to the source PR/head`)
+  const { call, text } = selected
+  let delivery: Record<string, unknown> | undefined
+  if (!codeSite) {
+    const prerequisite = new RegExp(`\\bprerequisite\\s+\`?https://github\\.com/${repository}/issues/([1-9]\\d*)\\b`, 'i')
+      .exec(diagnostic!.stderr)
+    const prerequisites = freshReport.prerequisites
+    if (prerequisite && prerequisites?.wait === null && prerequisites.base) {
+      delivery = prerequisites.evidence.slice(1).find(item => item.issue_number === Number(prerequisite[1])
+        && item.base_sha === prerequisites.base && item.verified === true)
+    }
+    if (!delivery) return pending(`report #${report.issueNumber} prerequisite delivery is unverified`)
+  }
+  const fresh = await verify(chain, !codeSite)
+  const conflictBase = codeSite ? undefined : fresh.conflictBase
+  if (!codeSite && (!fresh.pull?.conflict || !conflictBase || conflictBase !== delivery?.base_sha)) {
+    return pending('the source conflict and report prerequisite do not verify on the same current base')
+  }
   const digest = chainBasis([report.key, reportChain.id, call, prepared ?? null,
-    diagnostic ?? null, text, freshReport.issue.revision, comments])
+    diagnostic ?? null, text, freshReport.issue.revision, comments,
+    ...(conflictBase ? [conflictBase, diagnosis!.call, delivery] : [])])
   if (chain.repairRecovery && chain.repairRecovery.diagnosis !== digest) return pending(`report #${report.issueNumber} diagnosis changed after recovery preparation`)
   const note = [`Repair-exhaustion diagnosis from ${issue.url}; original diagnostic Call ${call}.`,
     `Keep source ${chain.id}, branch ${chain.branch}, PR #${report.pull}, head ${report.head} and repair basis ${report.basis}.`,
+    ...(conflictBase ? [`The source head conflicts with the verified current base ${conflictBase}. Report implementation Call ${diagnosis!.call} settled before publication.`] : []),
     'Original repair Calls prove no publication; diagnostic work and resources are settled. Verify the worker-reported diagnosis on the source PR through normal validation, publication, review and CI.',
     text, ...comments.map(comment => `Report comment ${comment.id} (${comment.author}):\n${comment.body}`)].join('\n\n')
   if (Buffer.byteLength(note) > 32 * 1024) return pending('the complete diagnosis exceeds the bounded repair note')
-  const fresh = await verify(chain)
   const qualifying = qualifyingAttempts(db, { ...chain, held: hold!.reason, repairRecovery: undefined }, fresh, Date.now())
   const owners = db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE chain_id != ?
     AND lower(json_extract(state, '$.repository')) = ? AND
@@ -1198,7 +1224,7 @@ export async function recoverReportedRepair(db: Database, journal: BehaviorChain
     .all(chain.id, chain.repository.toLowerCase(), report.pull, report.pull)
   if (!qualifying || !['repair_incomplete_replies', 'repair_execution_budget_exhausted'].includes(qualifying.cause)
     || report.key !== chainBasis([qualifying.cause, chain.id, report.pull]) || qualifying.decision.basis !== report.basis
-    || qualifying.decision.reviewer?.slot !== report.slot || fresh.pull?.head !== report.head
+    || qualifying.decision.reviewer?.slot !== report.slot || fresh.pull?.head !== report.head || fresh.pull.number !== report.pull
     || fresh.pull.state !== 'open' || fresh.pull.merged || fresh.pull.queueEntry || fresh.existingPulls.length
     || fresh.publication.pull_number !== report.pull || fresh.publication.head_sha !== report.head
     || fresh.publication.state !== 'open' || fresh.publication.merged || fresh.publication.merge_sha !== null
