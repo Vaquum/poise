@@ -4,6 +4,7 @@ import { attributedNativeAction, matchingNativeActionReceipt, type NativeActionR
 import { chainWaitsForResourceRelease, currentChainWaiting } from './behavior-chain-summary'
 import type { PrBlockerId, PrStatusRow, PrStatusVerdict } from './behavior-pr-status'
 import type { DatastorePr } from './behaviors'
+import { parseReviewCheckpoint } from './review-continuation'
 
 /** Presentation only: no observation collection, admission or effect. */
 export function projectChainPrStatus(chain: BehaviorChain, journal: BehaviorChainJournal, pr: DatastorePr, org: string | null, now: number, enabled: boolean,
@@ -25,6 +26,16 @@ export function projectChainPrStatus(chain: BehaviorChain, journal: BehaviorChai
     && ['review-pr', 'approve-pr'].includes(invocation.behavior) && invocation.evidence?.status === 'completed'
     && chainReviewResponse(chain, invocation, observation, now)) : []
   const latest = reviews.at(-1)
+  let reviewProgress: PrStatusRow['reviewProgress']
+  for (let index = chain.invocations.length - 1; index >= 0; index--) {
+    const invocation = chain.invocations[index]
+    const headFlag = invocation.request.argv.indexOf('--expected-head')
+    const head = headFlag < 0 ? null : invocation.request.argv[headFlag + 1]
+    const callId = invocation.callId ?? invocation.evidence?.callId
+    if (head !== pull?.head || !head || typeof callId !== 'string') continue
+    const checkpoint = parseReviewCheckpoint(invocation.evidence?.artifact as Record<string, unknown> | undefined)
+    if (checkpoint) { reviewProgress = { ...checkpoint, callId, head }; break }
+  }
   const verdict: PrStatusVerdict | null = latest ? { action: String(latest.evidence!.action), outcome: latest.outcome ? preview(latest.outcome) : null,
     head: String(latest.evidence!.head_sha), completedAt: new Date(Number(latest.evidence!.completedAt)).toISOString(),
     key: latest.behavior, quarantine: null } : null
@@ -107,6 +118,7 @@ export function projectChainPrStatus(chain: BehaviorChain, journal: BehaviorChai
       mergeSha: chain.mergeSha, reviews: { completed: fresh ? completed : null, required: fresh ? required : null }, journal: `/api/behavior-chains?id=${encodeURIComponent(chain.id)}` },
     rounds: { completed: null, cap: null, next: null },
     verdict: verdict ? { ...verdict, onCurrentHead: fresh ? verdict.head === pull!.head : null } : null,
+    ...(reviewProgress ? { reviewProgress } : {}),
     ci: fresh && checksState ? { state: pull!.failing.length ? 'FAILURE' : pull!.pending ? 'PENDING' : checksState,
       head: pull!.head, asOf: new Date(observation!.checkedAt).toISOString() }
       : { state: 'unknown', reason: fresh ? 'native observation lacks a check rollup' : 'chain observation stale or unavailable' },

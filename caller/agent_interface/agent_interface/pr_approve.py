@@ -143,7 +143,7 @@ def run(
     since = atoms.last_reviewed_head(pwd, pr, actor)
     if since is not None and since == expected_head.strip().lower():
         since = None
-    if review_continuation.enabled():
+    if review_continuation.enabled() and not review_continuation.select_automatically():
         since = None
     lost_since = None
     try:
@@ -178,7 +178,7 @@ def run(
         note,
         p,
     )
-    if lost_since is not None:
+    if lost_since is not None and not review_continuation.enabled():
         text += (f"\n\nThe last reviewed head ({lost_since}) is no longer fetchable; "
                  "this round reviews the full diff instead.")
     if review_continuation.enabled():

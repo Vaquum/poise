@@ -24,6 +24,12 @@ node=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | sed -n '
 curl -fsSL "https://nodejs.org/dist/latest-v22.x/$node" | tar -xJ --strip-components=1 -C /usr/local
 hash -r
 
+# The standalone assertion collector never loads a checkout's Vitest, plugins or dependencies.
+install -d /opt/poise-assertions
+install -m 644 /tmp/poise-assertion-package.json /opt/poise-assertions/package.json
+install -m 644 /tmp/poise-assertion-lock.json /opt/poise-assertions/package-lock.json
+npm ci --prefix /opt/poise-assertions --include=dev --ignore-scripts --no-audit --no-fund
+
 # The workspace's user, so that a suite meets the same permissions and the same home.
 groupadd --gid 10001 poise
 useradd --uid 10001 --gid 10001 --home-dir /home/poise --create-home --shell /bin/bash poise

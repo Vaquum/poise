@@ -917,12 +917,30 @@ redacted summary of the first failure or setup error, its test and the original
 candidate digest and run ID. Atomic workers put that summary first in `blocked`,
 so the original Call's retained `diagnostic.stderr` survives console truncation.
 Later runs keep their own identities and cannot replace that completed failure.
-For new atomic Calls, completed direct Vitest assertion failures would retain
-bounded gateway-authenticated evidence before the relay deletes their run, but
-recovery is currently held for #1619: candidate-controlled reports cannot
-authorize it. Missing, interrupted, oversized, unaccounted or relay results cannot
-authorize the existing [pre-PR recovery](Behavior-chain.md#bounded-reconciliation)
-path; historical worker logs remain diagnostic evidence only.
+For atomic Calls, the standalone text assertion command can retain bounded
+gateway-authenticated evidence for the existing [pre-PR recovery](Behavior-chain.md#bounded-reconciliation).
+Run it from the checkout root with the prepared HEAD unchanged.
+
+```sh
+/usr/local/bin/node /opt/poise-assertions/node_modules/vitest/vitest.mjs run tests/example.test.mjs
+```
+
+The sandbox's installed Vitest runs one synchronous string comparison. The
+selected `.test.mjs` file under `tests/` must use this form with a simple test
+title, a regular captured repository text file and a JSON string literal.
+
+```js
+import { expect, test } from 'vitest'
+import { readFileSync } from 'node:fs'
+test("ships the expected text", () => expect(readFileSync("fixture.txt", "utf8")).toBe("expected\n"))
+```
+
+The collector derives the case from the captured data and uses its own
+configuration and dependencies. The matching clean replay uses the same command
+on the exact prepared base. The standalone command requires the atomic Call's
+capture and an eligible file. Ordinary suites and historical output remain
+diagnostic. An interrupted, oversized or incomplete result cannot authorize
+recovery.
 Poise's configured Vitest reporters also emit the first failed test's file, full
 name and assertion/error stack as soon as that test finishes, alongside the
 normal reporter. This failure-only stderr record is redacted in full before

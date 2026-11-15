@@ -7,6 +7,7 @@ import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal,
 import type { LoggingWorkImpact } from '../src/logging'
 import type { ProcessDiagnostic } from './process-diagnostic'
 import type { ChainNudge, ChainWorkLink } from '../src/behavior-chain-nudge'
+import { parseReviewCheckpoint } from './review-continuation'
 
 export const CHAIN_ATTENTION_DELAY_MS = 24 * 60 * 60_000
 
@@ -821,6 +822,7 @@ export function behaviorChainSummary(chain: BehaviorChain, journal?: BehaviorCha
       const proof = attributedNativeAction(invocation) ? matchingNativeActionReceipt(chain, invocation) : null
       const settlement = proof ? nativeActionSettlement(proof) : null
       const artifact = invocation.evidence?.artifact as Record<string, unknown> | undefined
+      const reviewProgress = parseReviewCheckpoint(artifact)
       const progress = artifact?.resolution_progress === undefined ? null : parseResolutionProgress(artifact.resolution_progress)
       if (progress && (invocation.behavior !== 'resolve-threads' || artifact?.request_sha !== nativeRequestSha(invocation.request))) {
         throw new Error('native resolution progress conflicts with its original request')
@@ -836,6 +838,7 @@ export function behaviorChainSummary(chain: BehaviorChain, journal?: BehaviorCha
           ...(progress ? { resolutionProgress: progress } : {}),
         },
         evidence: invocation.evidence ? { action: invocation.evidence.action, outcome: invocation.evidence.outcome,
+          ...(reviewProgress ? { reviewProgress } : {}),
           ...(invocation.evidence.publicationPlan ? { publicationPlan: invocation.evidence.publicationPlan } : {}),
           review_id: invocation.evidence.review_id, head_sha: invocation.evidence.head_sha,
           resources_settled_at: invocation.evidence.resources_settled_at, error: invocation.evidence.error,
