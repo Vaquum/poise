@@ -15,6 +15,7 @@ from contextlib import nullcontext, redirect_stdout
 import agent_interface as api
 from agent_interface import review_budget as budget, atoms, pr_approve, progress, structured_review
 from agent_interface.model_catalog import CATALOG
+from review_submission_fixture import submission_args
 
 HEAD = 'a' * 40
 APPROVAL = json.dumps({
@@ -670,7 +671,7 @@ class TestRecovery(TestCase):
                     return SimpleNamespace(returncode=1, stdout='', stderr='error: GitHub 422: Issues are disabled')
                 value = {'action': 'created_pr_linked_issue', 'issue': {'number': 8, 'html_url': 'https://github.com/o/r/issues/8'}}
             else:
-                observed.submissions.append(argv)
+                observed.submissions.append(submission_args(argv))
                 self.assertEqual(argv[argv.index('--expected-head') + 1], HEAD)
                 response = api.review_receipt.retained_response()
                 self.assertEqual(response['head_sha'], HEAD)
@@ -833,7 +834,7 @@ class TestRecovery(TestCase):
                 self.assertNotIn('resume', run.commands[0])
                 self.assertTrue(all('resume' in argv for argv in run.commands[1:]))
                 argv = run.submissions[0]
-                self.assertEqual(len(json.loads(argv[argv.index('--comments-json') + 1])), run.total)
+                self.assertEqual(len(json.loads(argv[argv.index('--comments') + 1])), run.total)
                 self.assertEqual(run.elapsed, 749 if files == 19 else 1237)
                 self.assertLess(run.elapsed, 1413)
                 self.assertEqual(row['progress']['budget']['total_seconds'], 1413)
@@ -861,7 +862,7 @@ class TestRecovery(TestCase):
         self.assertEqual(len(run.submissions), 1)
         self.assertEqual(len(run.threads), 1)
         argv = run.submissions[0]
-        findings = json.loads(argv[argv.index('--comments-json') + 1])
+        findings = json.loads(argv[argv.index('--comments') + 1])
         self.assertEqual([finding['body'] for finding in findings],
                          [f'[p1] Blocking defect in file group {group}.' for group in range(1, 6)])
         assessment = json.loads(argv[argv.index('--assessment-json') + 1])
@@ -895,7 +896,7 @@ class TestRecovery(TestCase):
                 self.assertEqual(run.lookups, [0, 1])
                 self.assertEqual(len(run.submissions), 1)
                 argv = run.submissions[0]
-                self.assertEqual(len(json.loads(argv[argv.index('--comments-json') + 1])), total)
+                self.assertEqual(len(json.loads(argv[argv.index('--comments') + 1])), total)
                 assessment = json.loads(argv[argv.index('--assessment-json') + 1])
                 self.assertEqual(assessment['reviewed_context'], '; '.join(
                     f'Pinned evidence for group {group}' for group in range(1, total + 1)))
@@ -935,7 +936,7 @@ class TestRecovery(TestCase):
                 self.assertEqual(len(run.submissions), 1)
                 self.assertEqual(row['head_sha'], HEAD)
                 argv = run.submissions[0]
-                self.assertEqual(len(json.loads(argv[argv.index('--comments-json') + 1])), 10)
+                self.assertEqual(len(json.loads(argv[argv.index('--comments') + 1])), 10)
                 assessment = json.loads(argv[argv.index('--assessment-json') + 1])
                 self.assertEqual(assessment['reviewed_context'], '; '.join(
                     f'Pinned evidence for group {group}' for group in range(1, 11)))

@@ -15,6 +15,7 @@ import agent_interface as api
 from agent_interface import issue_review, review_budget, review_continuation as continuation, review_receipt, \
     review_stages, structured_review
 from agent_interface.model_catalog import CATALOG
+from review_submission_fixture import submission_args
 
 HEAD, BASE = "a" * 40, "b" * 40
 MODEL = CATALOG.resolve("gpt-6-astra-ultra")
@@ -78,7 +79,7 @@ class TestReviewContinuation(TestCase):
         database, call_id = review_receipt._call.get()
         with review_receipt.invocation_environment(database, call_id, True, initialize=False):
             body = review_receipt.begin_submission("Verified final verdict", HEAD)
-        self.posts.append((command, body))
+        self.posts.append((submission_args(command), body))
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
             {"action": "requested_changes" if "--request-changes" in command else "reviewed_clean",
              "review_id": 91, "head_sha": HEAD}))
@@ -242,7 +243,7 @@ class TestReviewContinuation(TestCase):
         self.assertEqual(calls[:13], list(range(1, 14)))
         self.assertEqual([request["start_line"] for request in self.inspections], list(range(1, 15)))
         command = self.posts[0][0]
-        self.assertEqual(json.loads(command[command.index("--comments-json") + 1]), [finding])
+        self.assertEqual(json.loads(command[command.index("--comments") + 1]), [finding])
 
     def test_changed_answer_revision_same_head_and_changed_policy_invalidate_progress(self):
         node = packet()
@@ -303,7 +304,7 @@ class TestReviewContinuation(TestCase):
         self.assertEqual(sorted(outcomes), ["held", "published"])
         self.assertEqual(len(self.posts), 1)
         command = self.posts[0][0]
-        self.assertEqual(json.loads(command[command.index("--comments-json") + 1]), [finding])
+        self.assertEqual(json.loads(command[command.index("--comments") + 1]), [finding])
         self.assertIn(self.saved(root)["publisher"], ids)
 
     def test_lost_publication_ack_keeps_the_original_publisher_fence(self):
@@ -529,4 +530,4 @@ class TestReviewContinuation(TestCase):
         self.assertEqual(seen, additions)
         self.assertGreater(len(cross), 1)
         command = self.posts[0][0]
-        self.assertEqual(json.loads(command[command.index("--comments-json") + 1]), [finding, crossing])
+        self.assertEqual(json.loads(command[command.index("--comments") + 1]), [finding, crossing])

@@ -87,6 +87,8 @@ class TestReviewCoverage(TestCase):
                    "assessment": json.loads(argv[argv.index("--assessment-json") + 1])}
         if "--comments-json" in argv:
             payload["comments"] = json.loads(argv[argv.index("--comments-json") + 1])
+        elif "--comments" in argv:
+            payload["comments"] = json.loads(Path(argv[argv.index("--comments") + 1]).read_text(encoding="ascii"))
         result = asyncio.run(module.run(self.client, payload))
         return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
 
