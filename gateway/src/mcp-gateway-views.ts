@@ -21,7 +21,7 @@ export function gatewayMcpRead(read: McpRead): GatewayRead | null {
     if (read.arguments.kind === 'gateway') return { op: 'view', id: read.arguments.id }
     if (isMcpLoggingKind(read.arguments.kind)) return { op: 'event', kind: read.arguments.kind, id: read.arguments.id }
   }
-  if ((read.name === 'poise_list' || read.name === 'poise_changes') && read.arguments.kind !== 'chat') {
+  if ((read.name === 'poise_list' || read.name === 'poise_changes') && read.arguments.kind !== 'chat' && read.arguments.kind !== 'document') {
     return { op: 'list', args: read.arguments }
   }
   return null

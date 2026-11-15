@@ -31,6 +31,7 @@ import { PARTS, PLACES, SECTIONS } from '../src/ui/address'
 import { listCapabilities } from '../server/capabilities'
 import { MCP_WORKSPACE_VIEWS } from '../gateway/src/mcp-contract'
 import { createServer as createExtension, deleteServer as deleteExtension } from '../server/extensions/store'
+import { deleteDoc, writeDoc } from '../server/editor'
 import { createTimer } from '../server/chat/control-store'
 import { emptyCapabilities } from '../server/chat/runtime'
 import { appendEvent, deleteSession, getSession, insertSession, resetConversation } from '../server/chat/storage'
@@ -110,7 +111,7 @@ const fetcher: typeof fetch = async (input, init) => {
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
 async function connect(login: string, serverEndpoint = endpoint,
-  options: { chatMetadata?: boolean; chatTranscript?: boolean; workspaceData?: boolean; repository?: string } = {}) {
+  options: { chatMetadata?: boolean; chatTranscript?: boolean; workspaceData?: boolean; contentData?: boolean; repository?: string } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -143,6 +144,7 @@ async function connect(login: string, serverEndpoint = endpoint,
   }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
     ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.chatTranscript ? { chatTranscript: '1' } : {}),
     ...(options.workspaceData ? { workspaceData: '1' } : {}),
+    ...(options.contentData ? { contentData: '1' } : {}),
     ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
@@ -462,6 +464,33 @@ it('keeps workspace settings consent separate and projects extension and memory 
     deleteExtension(extension.id)
     db.prepare('DELETE FROM meta WHERE key = ?').run('chat_memories')
     await Promise.all([scope.client.close(), chat.client.close(), repository.client.close()])
+  }
+})
+
+it('uses independent workspace content consent for typed Editor pages and exact document versions', async () => {
+  const docs = await connect('Alice', endpoint, { contentData: true })
+  const operations = await connect('Alice', endpoint, { workspaceData: true })
+  const other = await connect('Alice', endpoint, { contentData: true })
+  const first = await writeDoc('fixture-one', '# First working note\nCurrent evidence')
+  await writeDoc('fixture-two', '# Second working note\nMore evidence')
+  const call = async (client: Client, name: string, args: Record<string, unknown>) => {
+    const result = await client.callTool({ name, arguments: args })
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text) as { page: { nextCursor: string }; lookup: unknown }
+  }
+  try {
+    const args = { kind: 'document', id: first.slug }
+    expect((await operations.client.callTool({ name: 'poise_get', arguments: args })).isError).toBe(true)
+    const detail = await call(docs.client, 'poise_get', args)
+    expect(detail.lookup).toMatchObject({ coverage: 'complete', link: 'https://alice.poise.test/?view=editor&doc=fixture-one',
+      record: { id: first.slug, value: { version: first.version, text: '# First working note\nCurrent evidence', publications: [] } } })
+    const page = await call(docs.client, 'poise_list', { kind: 'document', limit: 1 })
+    expect(page.page).toMatchObject({ items: [{ slug: 'fixture-one' }], nextCursor: expect.any(String) })
+    expect((await call(docs.client, 'poise_list', { kind: 'document', limit: 1, cursor: page.page.nextCursor })).page)
+      .toMatchObject({ items: [{ slug: 'fixture-two' }], nextCursor: null })
+    await expect(other.client.callTool({ name: 'poise_list', arguments: { kind: 'document', limit: 1, cursor: page.page.nextCursor } })).rejects.toThrow()
+  } finally {
+    await Promise.all([docs.client.close(), operations.client.close(), other.client.close(), deleteDoc('fixture-one'), deleteDoc('fixture-two')])
   }
 })
 

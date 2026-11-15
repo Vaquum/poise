@@ -87,6 +87,7 @@ export function verifyIdentityAssertion(token: string, expected: AssertionExpect
       || (value.chatList !== undefined && (value.chatList !== true || value.chatMetadata !== true))
       || (value.chatTranscript !== undefined && value.chatTranscript !== true)
       || (value.workspaceData !== undefined && (value.workspaceData !== true || value.repository !== undefined))
+      || (value.contentData !== undefined && (value.contentData !== true || value.repository !== undefined))
       || (value.repository !== undefined && !isMcpRepository(value.repository))) {
       return refuse('the MCP assertion has an invalid grant or resource audience')
     }

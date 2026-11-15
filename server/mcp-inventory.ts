@@ -13,6 +13,7 @@ interface Surface {
   requiresWorkspace?: true
   requiresChat?: true
   requiresOperator?: true
+  requiresContent?: true
   reason: string
 }
 
@@ -33,7 +34,8 @@ const places = {
   board: work,
   chat,
   manager: { ...chat, reason: 'Exact Manager Chat metadata' },
-  editor: browser('document', 'Editor versions, reviews and publication bindings', 'Current document and retained versions', 'Document reads are pending'),
+  editor: { kind: 'document', source: 'Editor, publication ledger and cached reviews', retention: 'Current document and retained publication versions',
+    permission: 'Workspace content consent', tool: 'poise_list', requiresContent: true, reason: 'Resumable document list and exact document contents' },
   observe: work,
   settings: workspace('settings'),
 } satisfies Record<Place, Surface>
@@ -70,7 +72,8 @@ const capabilities = {
   'behavior-estimates': browser('estimate', 'Caller evidence and behavior timing', 'Retained timing history', 'Estimate reads are pending'),
   'chat-requests': browser('chat-request', 'Chat owner requests', 'Current pending requests', 'Chat request reads are pending'),
   'handled-log': workspace('handling'),
-  'publication-reviews': browser('publication-review', 'Editor review records', 'Retained publication reviews', 'Publication review reads are pending'),
+  'publication-reviews': { kind: 'document', source: 'Cached publication reviews', retention: 'Retained publication reviews',
+    permission: 'Workspace content consent', tool: 'poise_get', requiresContent: true, reason: 'Exact document and retained review metadata' },
   'settings-conflict': browser('settings-conflict', 'Browser settings version check', 'Current settings version', 'Interactive settings conflict'),
 } satisfies Record<Capability, Surface>
 

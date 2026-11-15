@@ -8,6 +8,7 @@ const LOG_KINDS = ['logging', 'instance-logging'] as const
 const GATEWAY_VIEWS = ['link-devices', 'logging-health', 'instance-logging-health'] as const
 export type McpLoggingKind = typeof LOG_KINDS[number]
 export type McpGatewayView = typeof GATEWAY_VIEWS[number]
+const CONTENT_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,119}$/
 const pageProperties = { limit: { type: 'integer', minimum: 1, maximum: 10 }, cursor: { type: 'string', maxLength: 2048 } } as const
 export const MCP_WORKSPACE_VIEWS = ['settings', 'accounts', 'models', 'behaviors', 'release', 'health', 'storage',
   'github-quota', 'analytics-health', 'notices', 'handling', 'extensions', 'memories', 'snippets'] as const
@@ -25,14 +26,13 @@ export const MCP_TOOLS = [
     annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_get', description: 'Read an exact Chat or timer record, or a named workspace snapshot. Requires consent for the selected data.',
     inputSchema: { type: 'object', required: ['kind', 'id'], properties: {
-      kind: { enum: ['chat', 'timer', 'workspace', 'call', 'invocation', 'gateway', ...LOG_KINDS] },
-      id: { anyOf: [{ type: 'string', pattern: MCP_RECORD_ID.source }, { type: 'string', pattern: CALL_ID.source },
-        { type: 'string', pattern: DIAGNOSTIC_ID.source }, { enum: [...MCP_WORKSPACE_VIEWS, ...GATEWAY_VIEWS] }] },
+      kind: { enum: ['chat', 'timer', 'workspace', 'call', 'invocation', 'document', 'snippet', 'memory', 'gateway', ...LOG_KINDS] },
+      id: { type: 'string', maxLength: 120 },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_list', description: 'List a bounded page of current or archived Chat session records by repository and UTC update window.',
     inputSchema: { type: 'object', required: ['kind'], properties: {
-      kind: { enum: ['chat', ...LOG_KINDS] }, repository: { type: 'string', maxLength: 140 },
+      kind: { enum: ['chat', 'document', ...LOG_KINDS] }, repository: { type: 'string', maxLength: 140 },
       since: { type: 'string', format: 'date-time' }, until: { type: 'string', format: 'date-time' }, ...pageProperties,
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
@@ -57,6 +57,7 @@ export interface McpGrantScope {
   chatTranscript?: true
   workspaceData?: true
   operatorLogs?: true
+  contentData?: true
   repository?: string
 }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
@@ -64,14 +65,16 @@ export interface McpChatGetArguments { kind: 'chat' | 'timer'; id: string }
 export type McpGetArguments = McpChatGetArguments | { kind: 'workspace'; id: McpWorkspaceView }
   | { kind: 'call'; id: string } | { kind: 'invocation'; id: string }
   | { kind: 'gateway'; id: McpGatewayView } | { kind: McpLoggingKind; id: string }
+  | { kind: 'document'; id: string } | { kind: 'snippet'; id: string } | { kind: 'memory'; id: 'current' }
 export interface McpChatListArguments { kind: 'chat'; repository: string | null; since: string | null; until: string | null; limit: number; cursor?: string }
+export interface McpDocumentListArguments { kind: 'document'; limit: number; cursor?: string }
 export interface McpChatChangesArguments { kind: 'chat'; id: string; limit: number; afterSequence?: number; cursor?: string }
 export interface McpLoggingArguments { kind: McpLoggingKind; repository: string | null; since: string | null; until: string | null;
   limit: number; cursor?: string; afterWatermark?: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
   | { name: 'poise_work'; arguments: McpWorkArguments }
   | { name: 'poise_get'; arguments: McpGetArguments }
-  | { name: 'poise_list'; arguments: McpChatListArguments | McpLoggingArguments }
+  | { name: 'poise_list'; arguments: McpChatListArguments | McpDocumentListArguments | McpLoggingArguments }
   | { name: 'poise_changes'; arguments: McpChatChangesArguments | McpLoggingArguments }
 
 export const isMcpRecordId = (value: unknown): value is string => typeof value === 'string' && MCP_RECORD_ID.test(value)
@@ -82,11 +85,11 @@ export const isMcpRepository = (value: unknown): value is string => typeof value
 export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
   scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
-export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'workspaceData' | 'operatorLogs' | 'repository'>): string[] {
+export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'workspaceData' | 'operatorLogs' | 'contentData' | 'repository'>): string[] {
   const tools: string[] = [...MCP_WORK_TOOL_NAMES]
   const gatewayRead = mcpWorkspaceAllowed(scope) || (scope.operatorLogs === true && scope.repository === undefined)
-  if (scope.chatMetadata === true || gatewayRead) tools.push('poise_get')
-  if (scope.chatMetadata === true && scope.chatList === true || gatewayRead) tools.push('poise_list')
+  if (scope.chatMetadata === true || gatewayRead || mcpContentAllowed(scope)) tools.push('poise_get')
+  if (scope.chatMetadata === true && scope.chatList === true || gatewayRead || mcpContentAllowed(scope)) tools.push('poise_list')
   if (scope.chatTranscript === true || gatewayRead) tools.push('poise_changes')
   return tools
 }
@@ -95,6 +98,12 @@ export const mcpWorkspaceAllowed = (scope: Pick<McpGrantScope, 'repository' | 'w
   scope.repository === undefined && scope.workspaceData === true
 
 export const isMcpLoggingKind = (kind: unknown): kind is McpLoggingKind => (LOG_KINDS as readonly unknown[]).includes(kind)
+
+export const mcpContentAllowed = (scope: Pick<McpGrantScope, 'repository' | 'contentData'>): boolean =>
+  scope.repository === undefined && scope.contentData === true
+
+export const isMcpContentKind = (kind: string): kind is 'document' | 'snippet' | 'memory' =>
+  kind === 'document' || kind === 'snippet' || kind === 'memory'
 
 function pageTime(value: unknown): string | null {
   if (value === undefined || value === null) return null
@@ -128,6 +137,10 @@ export function parseMcpRead(value: unknown): McpRead {
       if (kind === 'gateway' && (GATEWAY_VIEWS as readonly unknown[]).includes(id)) {
         return { name: row.name, arguments: { kind, id: id as McpGatewayView } }
       }
+      if ((kind === 'document' || kind === 'snippet') && typeof id === 'string' && CONTENT_ID.test(id)) {
+        return { name: row.name, arguments: { kind, id } }
+      }
+      if (kind === 'memory' && id === 'current') return { name: row.name, arguments: { kind, id } }
     }
     throw new Error('provide a supported workspace snapshot name or exact Chat or timer ID')
   }
@@ -148,6 +161,10 @@ export function parseMcpRead(value: unknown): McpRead {
       if (since && until && since >= until) throw new Error('Logging requires since before until')
       return { name: row.name, arguments: { kind: page.kind, repository, since, until, limit: Number(limit),
         ...(typeof cursor === 'string' ? { cursor } : {}), ...(typeof afterWatermark === 'string' ? { afterWatermark } : {}) } }
+    }
+    if (row.name === 'poise_list' && page.kind === 'document') {
+      if (Object.keys(page).some(key => !['kind', 'limit', 'cursor'].includes(key))) throw new Error('invalid document page selector')
+      return { name: row.name, arguments: { kind: 'document', limit: Number(limit), ...(typeof cursor === 'string' ? { cursor } : {}) } }
     }
     if (page.kind !== 'chat') throw new Error('invalid Chat page selector')
     const bounds = { kind: 'chat' as const, limit: Number(limit), ...(typeof cursor === 'string' ? { cursor } : {}) }

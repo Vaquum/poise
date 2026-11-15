@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { MCP_READ_PATH, MCP_RESPONSE_BYTES, mcpRepositoryAllowed, mcpToolNames, mcpWorkspaceAllowed, parseMcpRead,
+import { MCP_READ_PATH, MCP_RESPONSE_BYTES, isMcpContentKind, mcpContentAllowed, mcpRepositoryAllowed, mcpToolNames, mcpWorkspaceAllowed, parseMcpRead,
   type McpChatGetArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
 import { getSession, sessionInstance } from './chat/storage'
 import { timerById, timerSummaries } from './chat/control-store'
@@ -8,6 +8,7 @@ import { mcpInventory } from './mcp-inventory'
 import { readMcpWork } from './mcp-work'
 import { readMcpChatChanges, readMcpChatList } from './mcp-chat-pages'
 import { readCallerRecord } from './mcp-caller'
+import { listContentDocuments, readContentRecord } from './mcp-editor-content'
 import { readWorkspaceView } from './mcp-workspace-views'
 import type { ServiceConfig } from './service/config'
 
@@ -46,6 +47,9 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
     } else if (read.arguments.kind === 'call' || read.arguments.kind === 'invocation') {
       if (!mcpWorkspaceAllowed(authority.mcp)) throw new HttpError(403, 'workspace data consent is required')
       lookup = await readCallerRecord(read.arguments.kind, read.arguments.id)
+    } else if (isMcpContentKind(read.arguments.kind)) {
+      if (!mcpContentAllowed(authority.mcp)) throw new HttpError(403, 'workspace content consent is required')
+      lookup = await readContentRecord(read.arguments.kind, read.arguments.id)
     } else if (read.arguments.kind === 'chat' || read.arguments.kind === 'timer') {
       if (!authority.mcp.chatMetadata) throw new HttpError(403, 'Chat metadata consent is required')
       if (!chatInstance) throw new HttpError(503, 'Chat metadata is unavailable until the workspace starts')
@@ -53,15 +57,19 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
     } else throw new HttpError(403, 'the selected read belongs to the gateway')
   }
   if (read.name === 'poise_list' || read.name === 'poise_changes') {
-    if (read.arguments.kind !== 'chat') throw new HttpError(403, 'the selected read belongs to the gateway')
-    if (read.name === 'poise_list' ? !authority.mcp.chatList || !authority.mcp.chatMetadata : !authority.mcp.chatTranscript) {
-      throw new HttpError(403, 'the selected Chat data consent is required')
-    }
-    if (!chatInstance) throw new HttpError(503, 'Chat data is unavailable until the workspace starts')
-    page = read.name === 'poise_list' ? readMcpChatList(chatInstance, authority.mcp, read.arguments)
-      : readMcpChatChanges(chatInstance, authority.mcp, read.arguments)
+    if (read.arguments.kind === 'document') {
+      if (!mcpContentAllowed(authority.mcp)) throw new HttpError(403, 'workspace content consent is required')
+      page = await listContentDocuments(authority.mcp, read.arguments)
+    } else if (read.arguments.kind === 'chat') {
+      if (read.name === 'poise_list' ? !authority.mcp.chatList || !authority.mcp.chatMetadata : !authority.mcp.chatTranscript) {
+        throw new HttpError(403, 'the selected Chat data consent is required')
+      }
+      if (!chatInstance) throw new HttpError(503, 'Chat data is unavailable until the workspace starts')
+      page = read.name === 'poise_list' ? readMcpChatList(chatInstance, authority.mcp, read.arguments)
+        : readMcpChatChanges(chatInstance, authority.mcp, read.arguments)
+    } else throw new HttpError(403, 'the selected read belongs to the gateway')
   }
-  const tools = mcpToolNames(chatInstance ? authority.mcp : { workspaceData: authority.mcp.workspaceData })
+  const tools = mcpToolNames(chatInstance ? authority.mcp : { workspaceData: authority.mcp.workspaceData, contentData: authority.mcp.contentData })
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },
     ...(read.name === 'poise_describe' ? { inventory: mcpInventory() } : {}),
     ...(work ? { work } : {}), ...(lookup ? { lookup } : {}), ...(page ? { page } : {}) })
