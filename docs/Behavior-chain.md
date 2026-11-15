@@ -1013,7 +1013,20 @@ of an unconfirmed creation intent without another POST. A verified report or ter
 disposition returns to the ordinary quiescent cadence; operator holds retain it.
 
 Pre-PR implementation-hold reports need a current disposition before their
-own implementation can prepare or start. After a generated report's native issue
+own implementation can prepare or start. The gate covers follow-up reports keyed by their original
+invocation and hold sequence, even after a lost creation acknowledgement or restart.
+After a lost acknowledgement, admission binds the earliest issue by the original
+source author whose GitHub creation body begins with the exact marker. A later
+issue can quote the marker without taking the binding. Missing or incomplete
+creation evidence for a possible report keeps its admission waiting.
+An independently authored markerless remedy verified against the source's blocked-by
+relationship and original failing file and test case retains ordinary intake.
+That path is only for intents the reporter linked as remedies: an issue the
+reporter created stays gated even if its marker is later removed.
+Intents stored before the adoption record verify independence by the
+remedy predating the source hold.
+
+After a generated report's native issue
 review settles, Poise can make one bounded read-only diagnosis for the same
 report revision and review, source hold and Call, configured accounts, base and
 retained capture. It runs the named Vitest assertion on clean, pinned main. A
