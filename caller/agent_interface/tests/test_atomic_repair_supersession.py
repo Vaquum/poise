@@ -36,6 +36,27 @@ def test_original_repair_supersession(database, monkeypatch, evidence):
     def _diag_cwd_pids(root, *, require_complete=False):
         result = _real_cwd_pids(root, require_complete=require_complete)
         print(f"CIDIAG evidence={evidence} cwd_pids={result} root={root}", flush=True)
+        if result is None and require_complete:
+            import subprocess as _sp
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                    continue
+                try:
+                    if entry.stat().st_uid != os.getuid():
+                        continue
+                    os.readlink(entry / "cwd")
+                    (entry / "environ").read_bytes()
+                    for fd in (entry / "fd").iterdir():
+                        try:
+                            os.readlink(fd)
+                        except FileNotFoundError:
+                            continue
+                except OSError as oserr:
+                    try:
+                        state = (entry / "stat").read_text().rpartition(") ")[2].split()[0]
+                    except Exception as serr:
+                        state = f"stat-failed {serr!r}"
+                    print(f"CIDIAG2 pid={entry.name} err={oserr!r} exists={entry.exists()} state={state}", flush=True)
         if result:
             for pid in result:
                 try:
