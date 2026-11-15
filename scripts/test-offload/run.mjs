@@ -520,7 +520,8 @@ async function main(args) {
         attempt -= 1
         continue
       }
-      if (failure?.code === 125 && failure.message === GATEWAY_RESTART) {
+      if (failure?.code === 125 && (failure.message === GATEWAY_RESTART
+        || failure.message.startsWith('sending the checkout to the box failed: '))) {
         say(`interrupted validation: candidate ${candidate}, suite ${suite}, run ${id}: no test result: ${failure.message}`)
         if (attempt === 0) {
           say('waiting up to 30 s for the authenticated relay handshake, then retrying this captured suite once within the remaining time budget')
