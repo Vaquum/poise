@@ -16,6 +16,7 @@ from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 from github_interface import cli, interface
 from github_interface.behaviors import checkout_review, pr_review as packet_review
+from review_submission_fixture import submission_args
 
 ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 HEAD, BASE = "a" * 40, "b" * 40
@@ -387,16 +388,23 @@ class TestStructuredInspection(TestCase):
             result = {"action": "review_context", "head_sha": HEAD,
                       "results": [{"lines": [{"line": 1, "text": "old_contract()"}]}]}
             model = CATALOG.resolve(identity)
+            submissions = []
+
+            def submit_review(args, **_kwargs):
+                submissions.append(submission_args(args))
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": "requested_changes", "review_id": 91, "head_sha": HEAD}), stderr="")
+
             with self.subTest(model=identity), patch.dict(sr.ASK, {model.provider: ask}), \
                     patch.object(repo, "inspect", return_value=result) as inspect, \
-                    patch.object(sr.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD}), stderr="")) as submit:
+                    patch.object(sr.subprocess, "run", side_effect=submit_review) as submit:
                 sr.run("/repo", "system", "packet", model, "pr_review", PR, "bot", HEAD, 60, repository=repo)
                 inspect.assert_called_once()
                 self.assertEqual(inspect.call_args.args, ([REQUEST],))
                 self.assertLessEqual(inspect.call_args.kwargs['timeout_s'], 30)
                 submit.assert_called_once()
                 self.assertEqual(submit.call_args.args[0][-4:], ["--expected-head", HEAD, "--token-user", "bot"])
-                self.assertEqual(json.loads(submit.call_args.args[0][4]), [FINDING])
+                self.assertEqual(json.loads(submissions[0][4]), [FINDING])
 
     def test_bad_or_unbounded_inspection_never_submits(self):
         cases = [{"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": []},

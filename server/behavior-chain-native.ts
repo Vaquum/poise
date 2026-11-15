@@ -6,23 +6,46 @@ import { agentInterfaceCwd } from './models'
 import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import { chainCiDependency, chainReviewResponse, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { chainCiDependency, chainReviewResponse, ciRefreshRequest, heldCiRepair, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
-import { datastoreViewOrCli } from './datastore-reader'
+import { datastoreViewOrCli, organizationDatastorePath, readDatastoreView } from './datastore-reader'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { isExpectedFailure, runFile, spawnDetached } from './process'
-import { runDatastoreHealth } from './datastore-health'
+import { runDatastoreHealth, validatedHealth } from './datastore-health'
 import { requireCallerReceipts } from './service/caller-calls'
 import { releaseReplacementPending } from './release-background'
+import { reviewContinuationArgs } from './review-continuation'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
 // Caller contains a 30-second GitHub command in a 60-second execution scope.
 // Leave the outer client room for startup, receipt commits and teardown too.
 const NATIVE_ACTION_TIMEOUT_MS = 120_000
+
+function repairDeadlinePredecessor(chain: BehaviorChain, observation: ChainObservation, decision: Invoke): string | null {
+  const pull = observation.pull
+  if (!pull || chain.repairRecovery) return null
+  const original = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr'
+    && invocation.evidence?.status !== 'deferred')
+  const evidence = original?.evidence
+  const artifact = evidence?.artifact as Record<string, unknown> | null | undefined
+  const source = artifact?.deadline_source as { status?: unknown } | undefined
+  if (!original || original.state !== 'settled' || !original.callId || original.basis !== decision.basis
+    || original.slot !== decision.reviewer?.slot || original.actor !== decision.actor
+    || original.admissionSequence <= chain.resumedAfterSequence || original.request.command !== 'agent-interface'
+    || original.request.context?.head !== pull.head || original.request.context.reviewRevision !== pull.reviewRevision
+    || original.request.context.queueRemoval !== pull.queueRemoval?.id
+    || evidence?.status !== 'failed' || evidence.action !== 'not_started' || evidence.outcome !== 'preflight_failed'
+    || evidence.error_code !== 'atomic_work_execution_budget_exhausted' || artifact?.phase !== 'executing'
+    || source?.status !== 'available' || !resourceReleaseProven(evidence, true)
+    || [artifact.plan_sha, artifact.publication_head, artifact.replies_started, artifact.publication, artifact.result,
+      artifact.receipts, evidence.receipts, evidence.review_id, evidence.head_sha, evidence.publicationPlan,
+      evidence.publicationResume, evidence.publicationReceipt, evidence.nativeActionReceipt].some(value => value != null)) return null
+  return original.callId
+}
 
 export async function readNativeInvocations(ids: string[], mode: 'strict' | 'resource-recovery' = 'strict') {
   requireCallerReceipts()
@@ -37,12 +60,14 @@ export interface NativeChainHooks {
   prepare(identities: string[]): Promise<NodeJS.ProcessEnv>
   borrow(): (() => void) | null
   available(): boolean
+  availableSlots?(): number
   capacity(): number
   measureHeadroom?: () => BehaviorResourceHeadroom
   permitted(chain: BehaviorChain, decision: Invoke): boolean
   note(behavior: ChainBehavior, chain: BehaviorChain, pull: { number: number } | null): string | Promise<string>
   reviewScope?(chain: BehaviorChain, pull: { number: number }): string | Promise<string>
   severity(behavior: ChainBehavior): string
+  reviewContinuation?(model: string): boolean
   received(invocation: ChainInvocation, call: LogEntry): void
   authenticationRejected?(call: LogEntry): void
   authRecovered?: ChainRuntimeOperations['authRecovered']
@@ -107,6 +132,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     accounts,
     ownsRepository,
     available: hooks.available,
+    availableSlots: hooks.availableSlots,
     capacity: hooks.capacity,
     measureHeadroom: hooks.measureHeadroom,
     permitted(chain, decision) {
@@ -140,8 +166,22 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const existing = await hooks.existing(seeds)
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
+    async closedSeedHints(after) {
+      const datastorePath = organizationDatastorePath(org)
+      const rows = await readDatastoreView(datastorePath, ['view', 'issue', '--status', 'closed',
+        '--format', 'json', '--limit', '100', '--updated-since-datetime', new Date(Date.now() - 86_400_000).toISOString(),
+        '--after-repo', after?.repository ?? '', '--after-number', String(after?.number ?? 0)])
+      if (!rows?.length) return []
+      const { stdout } = await runDatastoreHealth(org, { timeoutMs: 5_000 })
+      if (validatedHealth(stdout, { ...org, datastorePath })?.status !== 'healthy') return []
+      return rows.flatMap(row => {
+        const updatedAt = typeof row.updated_at === 'string' ? Date.parse(row.updated_at) : NaN
+        return typeof row.repo === 'string' && ownsRepository(row.repo) && row.status === 'closed' && Number.isFinite(updatedAt)
+          ? [{ repository: row.repo, number: positive(row.number, 'closed issue hint'), updatedAt }] : []
+      })
+    },
     readInvocations: readNativeInvocations,
-    async observe(chain): Promise<ChainObservation> {
+    async observe(chain, verifyConflict): Promise<ChainObservation> {
       if (!ownsRepository(chain.repository)) throw new Error('behavior chain organization is no longer followed')
       const actor = ['--token-user', chain.author]
       const issueRef = `#${chain.issue}`
@@ -157,6 +197,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // loses budget; any facet failure still fails the whole observation.
       const [seed, roster] = await Promise.all([
         github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch,
+          ...(verifyConflict ? ['--verify-conflict'] : []),
           ...(testProof ? ['--test-dependency-json', JSON.stringify(testProof)] : []), ...actor], 3 * 2 * 1024 * 1024),
         hooks.roster(chainKey),
       ])
@@ -171,7 +212,9 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const settings = getBehaviorChainSettings()
       const labels = issue.labels.map((label) => typeof label === 'string' ? label : object(label, 'issue label').name)
       if (!Array.isArray(publication.existing_pulls) || publication.existing_pulls.some((url) => typeof url !== 'string')) throw new Error('native issue-to-PR ownership evidence is incomplete')
+      const issueUpdatedAt = typeof issue.updated_at === 'string' ? Date.parse(issue.updated_at) : NaN
       const observation: ChainObservation = { checkedAt: Date.now(), existingPulls: publication.existing_pulls, issue: { open: issue.state === 'open',
+        ...(Number.isFinite(issueUpdatedAt) ? { updatedAt: issueUpdatedAt } : {}),
         revision: chainBasis([issue.title, issue.body || '']), eligible: settings.seedMode === 'all' || labels.some((label) => typeof label === 'string' && label.toLowerCase() === settings.label.toLowerCase()),
         commentIds: rawComments.comments.map((comment) => positive(object(comment, 'issue comment').id, 'issue comment')) }, ...roster,
         publication: { pull_number: publication.pull_number === null ? null : positive(publication.pull_number, 'publication'),
@@ -325,12 +368,23 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           reviewRevision: prior?.pull?.reviewRevision ?? '', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
         return observation
       }
-      const baseUpdateFrom = chain.held && chain.ciHold && chain.ciHold.head !== head ? chain.ciHold.head : null
+      const heldCi = heldCiRepair(chain)
+      const last = chain.invocations.at(-1)
+      const refresh = last?.behavior === 'refresh-pr-ci' && last.state !== 'admitted'
+        && (last.state !== 'settled' || heldCi?.refresh?.id === last.id) ? ciRefreshRequest(last) : null
+      const failedHead = refresh?.head ?? (chain.held ? chain.ciHold?.head : null)
+      const baseUpdateFrom = failedHead && failedHead !== head ? failedHead : null
       const [readiness, ci, reviewRevision] = await Promise.all([
         github(chain.repository, ['--pr-readiness', String(number), '--username', chain.reviewer, '--expected-head', head, ...reviewer]),
         github(chain.repository, ['--list-failing-ci', String(number),
-          ...(baseUpdateFrom ? ['--base-update-from', baseUpdateFrom] : []), ...reviewer]), hooks.reviews(chain.repository, number),
+          ...(baseUpdateFrom ? ['--base-update-from', baseUpdateFrom, ...(refresh ? ['--include-runs'] : [])] : []), ...reviewer]), hooks.reviews(chain.repository, number),
       ])
+      const approvalBlocked = readiness.approval_blocked_by_conversations
+      if (approvalBlocked != null && (typeof approvalBlocked !== 'boolean' || readiness.repository !== chain.repository
+        || readiness.pull_number !== number || readiness.state !== String(state.state).toUpperCase()
+        || approvalBlocked && readiness.unresolved_live_conversation_count === 0)) {
+        throw new Error('native approval conversation evidence is invalid')
+      }
       if (readiness.head_sha !== head || ci.head_sha !== head || ci.pull_number !== number || !Array.isArray(ci.failing)
         || !Array.isArray(state.my_reviews) || typeof readiness.draft !== 'boolean' || typeof readiness.reviewer_approved_current_head !== 'boolean'
         || !Number.isSafeInteger(readiness.unresolved_live_conversation_count) || Number(readiness.unresolved_live_conversation_count) < 0
@@ -376,6 +430,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           at: Date.parse(String(removal.createdAt)), actor: removal.actor ? String(object(removal.actor, 'queue actor').login) : null } : null,
         changesRequested: latest?.state === 'CHANGES_REQUESTED' && latest.commit_id === head,
         unresolved: Number(readiness.unresolved_live_conversation_count), unresolvedOutdated: Number(readiness.unresolved_outdated_conversation_count),
+        ...(typeof approvalBlocked === 'boolean' ? { approvalBlocked } : {}),
         approved: readiness.reviewer_approved_current_head,
         ready: readiness.green === true, reviewIds: reviews.filter((review) => review.commit_id === head && review.state !== 'DISMISSED').map((review) => positive(review.id, 'review')),
         checksState: typeof readiness.checks_state === 'string' ? readiness.checks_state : null,
@@ -385,6 +440,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         // The existing readiness primitive already applies the repository's
         // queue policy: BEHIND needs a base update only without a merge queue.
         conflict: ci.mergeable === false, behind: ci.mergeable_state === 'behind' && readiness.blockers.includes('merge_state_not_clean') }
+      if (verifyConflict && publication.conflict_base !== undefined) {
+        const base = sha(publication.conflict_base, 'verified conflict base')
+        if (publication.base_sha !== base || observation.publication.head_sha !== head || observation.publication.pull_number !== number
+          || state.state !== 'open' || observation.publication.state !== 'open') throw new Error('Conflict proof differs from the observed PR, head or base')
+        observation.conflictBase = base
+      }
       if (baseUpdateFrom) {
         if (ci.repository !== chain.repository || readiness.repository !== chain.repository || readiness.pull_number !== number
           || ci.ref !== head || observation.publication.head_sha !== head || !('base_update' in ci)) {
@@ -397,6 +458,37 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
             || ci.parents[0] !== baseUpdateFrom || ci.parents[1] !== update.base) throw new Error('CI base update proof differs from the retained failed head or parents')
           observation.ciBaseUpdate = { from: baseUpdateFrom, head,
             base: sha(update.base, 'CI base update parent'), tree: sha(update.tree, 'CI base update tree') }
+          if (refresh && observation.ciBaseUpdate.base === refresh.base && Array.isArray(ci.runs) && Array.isArray(ci.checks)) {
+            const run = ci.runs.map(item => object(item, 'candidate workflow'))
+              .filter(item => item.workflow_id === refresh.workflow && item.event === 'pull_request' && item.head_sha === head)
+              .sort((a, b) => Number(b.id) - Number(a.id))[0]
+            const gate = run && ci.checks.map(item => object(item, 'candidate check'))
+              .filter(item => item.head_sha === head && item.run_id === run.id && item.name === 'Verify (Node 22)')
+              .sort((a, b) => Number(b.check_run_id) - Number(a.check_run_id))[0]
+            if (run && Number.isSafeInteger(run.id) && Number(run.id) > refresh.failedRun && run.status === 'completed'
+              && run.conclusion === 'success' && gate?.state === 'completed' && gate.conclusion === 'success') observation.ciRefreshPassed = head
+          }
+        }
+      }
+      if (heldCi && !heldCi.hold.queue && !heldCi.refresh && heldCi.hold.head === head && observation.issue.open && state.state === 'open'
+        && state.queue_entry_id === null && !readiness.draft && ci.mergeable === true && !pending && failures.length
+        && observation.publication.head_sha === head && publication.base_sha === ci.base_sha && !observation.existingPulls.length) {
+        const blocker = object(heldCi.artifact.ci_blocker, 'original CI blocker')
+        if (blocker.repository === chain.repository && blocker.pull_number === number && blocker.head_sha === head
+          && Array.isArray(blocker.failing) && blocker.failing.length) {
+          const verified = await github(chain.repository, ['--list-failing-ci', String(number),
+            '--held-ci-json', JSON.stringify(blocker.failing), ...reviewer])
+          if (verified.repository === chain.repository && verified.pull_number === number && verified.head_sha === head
+            && verified.base_sha === ci.base_sha && verified.ci_refresh !== null) {
+            const proof = object(verified.ci_refresh, 'shared CI recovery')
+            if (proof.head !== head || proof.base !== ci.base_sha) throw new Error('CI refresh proof differs from the current candidate or base')
+            observation.ciRefresh = { head, base: sha(proof.base, 'recovered candidate base'),
+              remediation: sha(proof.remediation, 'delivered CI remediation'), report: positive(proof.report, 'full suite report'),
+              workflow: positive(proof.workflow, 'failed candidate CI workflow'), failedRun: positive(proof.failedRun, 'failed candidate CI run'),
+              baselineRun: positive(proof.baselineRun, 'independent failed main run'), passedRun: positive(proof.passedRun, 'passing main run'),
+              checks: Array.isArray(proof.checks) ? proof.checks.map(check => positive(check, 'original CI check')) : [] }
+            if (!observation.ciRefresh.checks.length) throw new Error('CI refresh proof has no original failed checks')
+          }
         }
       }
       const dependency = chainCiDependency(chain, observation.pull.queueRemoval?.id)
@@ -479,19 +571,28 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         const model = ['--model', selected.model, '--recovery-model', selected.recovery]
         if (decision.behavior === 'review-issue') return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: ['--issue-review', `${chain.repository}#${chain.issue}`,
           ...common, ...model, '--expected-issue-revision', observation.issue.revision, '--note', note] }
-        if (decision.behavior === 'implement-issue' || decision.behavior === 'repair-pr') return { command: 'agent-interface', cwd: agentInterfaceCwd(),
-          ...(pull ? { context: { head: pull.head, reviewRevision: pull.reviewRevision,
-            ...(pull.queueRemoval ? { queueRemoval: pull.queueRemoval.id } : {}) } } : {}), argv: ['--atomic-work', `${chain.repository}#${chain.issue}`,
-          ...common, '--model', selected.model, '--branch', chain.branch, '--expected-issue-revision', observation.issue.revision,
-          ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head,
-            ...(pull.conflict || pull.behind || pull.queueRemoval?.reason === 'merge_conflict' ? ['--merge-base'] : [])] : []), '--note', note] }
+        if (decision.behavior === 'implement-issue' || decision.behavior === 'repair-pr') {
+          const predecessor = decision.behavior === 'repair-pr' ? repairDeadlinePredecessor(chain, observation, decision) : null
+          return { command: 'agent-interface', cwd: agentInterfaceCwd(),
+            ...(pull ? { context: { head: pull.head, reviewRevision: pull.reviewRevision,
+              ...(pull.queueRemoval ? { queueRemoval: pull.queueRemoval.id } : {}) } } : {}), argv: ['--atomic-work', `${chain.repository}#${chain.issue}`,
+            ...common, '--model', selected.model, '--branch', chain.branch, '--expected-issue-revision', observation.issue.revision,
+            ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head,
+              ...(pull.conflict || pull.behind || pull.queueRemoval?.reason === 'merge_conflict' ? ['--merge-base'] : []),
+              ...(decision.behavior === 'repair-pr' && !chain.repairRecovery ? ['--repair-basis', decision.basis] : []),
+              ...(predecessor ? ['--repair-predecessor', predecessor] : [])] : []), '--note', note] }
+        }
         if (!pull) throw new Error('PR behavior requires its actual pull request')
         const scope = await hooks.reviewScope?.(chain, pull) ?? ''
         const reviewNote = scope
           ? `${note}\n\nApply this scope directive when reviewing the remediation. Caller includes it once in the formal GitHub review.\n\n${scope}` : note
+        const checkpoint = decision.checkpoint
+        if (checkpoint && (selected.model !== decision.reviewer?.model || selected.slot !== decision.reviewer.slot
+          || !hooks.reviewContinuation?.(selected.model))) return null
+        const continuation = hooks.reviewContinuation?.(selected.model) ? reviewContinuationArgs(selected.slot, checkpoint) : []
         return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `https://github.com/${chain.repository}/pull/${pull.number}`,
           ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior),
-          ...(scope ? ['--review-scope', scope] : []), '--note', reviewNote] }
+          ...(scope ? ['--review-scope', scope] : []), '--note', reviewNote, ...continuation] }
       }
       if (decision.behavior === 'publish-issue') {
         const partial = [...chain.invocations].reverse().find((invocation) => invocation.callId === observation.publication.head_invocation)
@@ -504,6 +605,11 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       }
       if (!pull) throw new Error('native PR action requires a verified pull request')
       const fixed = ['--expected-head', pull.head, '--token-user', decision.actor]
+      if (decision.behavior === 'refresh-pr-ci') {
+        if (!observation.ciRefresh) throw new Error('CI refresh lacks verified shared recovery')
+        return { command: 'github-interface', cwd, nativeResources: 2, argv: ['--update-branch-if-behind', String(pull.number),
+          '--author', chain.author, '--shared-ci-recovery-json', JSON.stringify(observation.ciRefresh), ...fixed] }
+      }
       if (decision.behavior === 'retire-pr') return { command: 'github-interface', cwd, nativeResources: 2,
         argv: ['--issue-work', String(chain.issue), '--mode', 'retire', '--branch', chain.branch, '--pull-number', String(pull.number),
           '--coverage-json', JSON.stringify(observation.fullSuite ?? observation.remediation), ...fixed] }
@@ -566,6 +672,17 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         || proof.actor !== invocation.actor || proof.repo !== chain.repository || proof.pr_id !== String(target) || proof.behavior !== behavior
         || proof.source !== 'poise:behavior-chain' || proof.correlation_id !== invocation.id || proof.expected_head !== expected) throw new Error('native closed-target fence conflicts with its original admission')
       return proof.outcome === 'fenced'
+    },
+    async retireClosedImplementation(chain, invocation, call) {
+      if (invocation.behavior !== 'implement-issue' || invocation.request.command !== 'agent-interface' || !invocation.model
+        || call.correlation_id !== invocation.id || call.behavior !== 'implement_issue' || call.repo !== chain.repository
+        || call.actor !== invocation.actor || call.source !== 'poise:behavior-chain') throw new Error('closed-target retirement requires the original running implementation')
+      requireCallerReceipts()
+      const { stdout } = await runFile('agent-interface', ['--retire-closed-implementation', call.id],
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 16 * 1024 })
+      const proof = object(JSON.parse(stdout), 'native closed-target retirement')
+      if (proof.id !== call.id || !['retiring', 'refused'].includes(String(proof.outcome))) throw new Error('native closed-target retirement conflicts with its original Call')
+      return proof.outcome === 'retiring'
     },
     async perform(invocation, chain) {
       requireCallerReceipts()

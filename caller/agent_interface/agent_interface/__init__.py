@@ -124,14 +124,14 @@ def init_db():
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e):
                         raise
-        conn.execute("create index if not exists calls_native_cleanup on calls "
+        conn.execute("create index if not exists calls_managed_cleanup on calls "
                      "(coalesce(json_extract(resource_cleanup,'$.next_attempt_at'),0),"
                      "coalesce(json_extract(resource_cleanup,'$.attempt_at'),0),started_at,id) "
-                     "where source='poise:behavior-chain' and json_valid(resource_ownership) "
+                     f"where {resource_ownership.MANAGED_CALLS} and json_valid(resource_ownership) "
                      "and json_extract(resource_ownership,'$.version')=2 "
                      "and (resources_settled_at is null or resource_cleanup is not null)")
-        conn.execute("create index if not exists calls_native_resource_pending on calls(id) "
-                     "where source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)")
+        conn.execute("create index if not exists calls_managed_resource_pending on calls(id) "
+                     f"where {resource_ownership.PENDING_CALLS}")
         # Each insert and update gives its call the next change number, so a
         # reader asks only for calls changed since the last one it saw
         # (logs_changed). The triggers live in the file, so every writer, an
@@ -237,11 +237,14 @@ def track(
     source: str | None = None,
     correlation_id: str | None = None,
     runner: str | None = None,
+    *,
+    managed_review: bool = False,
 ) -> str:
     """A row runs in this process unless `runner` names who runs it instead;
     such a row records no pid, because there is no local process to signal."""
     global _native_call_id
     id_ = uuid4().hex
+    owned = not runner and (source == "poise:behavior-chain" or managed_review and source == resource_ownership.LEGACY_REVIEW_SOURCES.get(behavior))
     ceilings = native_execution_limits() if _native_cli else None
     with db() as conn:
         conn.execute(
@@ -264,18 +267,18 @@ def track(
                 correlation_id,
                 None if runner else str(os.getpid()),
                 runner,
-                None if runner else process_identity.capture(os.getpid(), native=source == "poise:behavior-chain"),
-                resource_ownership.initial(id_, correlation_id) if _native_cli and source == "poise:behavior-chain" and not runner
-                else resource_ownership.initial() if source == "poise:behavior-chain" and not runner else None,
+                None if runner else process_identity.capture(os.getpid(), native=owned),
+                resource_ownership.initial(id_, correlation_id) if _native_cli and owned
+                else resource_ownership.initial() if owned else None,
                 json.dumps({"token": uuid4().hex, "owner": process_identity.capture(os.getpid()), "attempt_at": 0})
-                if _native_cli and source == "poise:behavior-chain" and not runner else None,
+                if _native_cli and owned else None,
             ),
         )
         if ceilings is not None:
             conn.execute("update calls set resource_guard=? where id=?", (resource_guard.initial(ceilings), id_))
-    if source == "poise:behavior-chain" and not runner:
+    if owned:
         _native_call_id = id_
-    if _native_cli and source == "poise:behavior-chain" and not runner:
+    if _native_cli and owned:
         _enter_native_call(id_, correlation_id)
     return id_
 
@@ -459,6 +462,57 @@ def fence_closed_behavior(model: str, actor: str, repository: str, number: int,
                      (id_, model, now, now, actor, repository, str(number), behavior, expected_head,
                       identity["source"], correlation_id, now, json.dumps({"phase": "admission_fenced"})))
     return {"id": id_, "correlation_id": correlation_id, "outcome": "fenced", **identity}
+
+
+RETIRE_BEFORE_PUBLICATION_PHASES = {"preparing", "prepared", "executing"}
+
+
+class ClosedImplementationRetired(RuntimeError):
+    """The original Call was fenced before it could retain a publication plan."""
+
+
+def retire_closed_implementation(call_id: str) -> dict:
+    """Fence a running first implementation against publication, then signal it.
+
+    Only a running implement_issue before its publication boundary can retire:
+    preparing/prepared/executing with no plan, head, publication or result and
+    no recorded resource error. Anything else is refused without changing the
+    row, so an already-publishing Call keeps its existing reconciliation. The
+    fence shares work_publication's transaction: whichever commits first wins.
+    Signalling is cooperative SIGTERM only; the original cleanup path settles
+    the typed receipt and its own resource release."""
+    if not re.fullmatch(r"[0-9a-f]{32}", call_id):
+        raise ValueError("retirement requires the original native call id")
+    with db() as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select status,behavior,source,error_code,artifact,pid,process_identity,action_plan,head_sha "
+                           "from calls where id=?", (call_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown call id")
+        if row["status"] != "running" or row["behavior"] != "implement_issue" \
+                or row["source"] != "poise:behavior-chain":
+            return {"id": call_id, "outcome": "refused", "reason": "not a running first implementation"}
+        if (row["error_code"] or "") in {"stopping", "stopped"}:
+            return {"id": call_id, "outcome": "refused", "reason": "already stopping"}
+        artifact = json.loads(row["artifact"] or "{}")
+        if isinstance(artifact.get("retirement"), dict) and artifact["retirement"].get("cause") == "target_closed":
+            return {"id": call_id, "outcome": "retiring", "reason": "already requested"}
+        if row["action_plan"] is not None or row["head_sha"] is not None \
+                or artifact.get("phase") not in RETIRE_BEFORE_PUBLICATION_PHASES \
+                or artifact.get("plan_sha") or artifact.get("publication_head") \
+                or artifact.get("publication") or artifact.get("result") or artifact.get("resource_error") \
+                or artifact.get("replies_started") is not None:
+            return {"id": call_id, "outcome": "refused", "reason": "already beyond the publication boundary"}
+        if not row["pid"]:
+            raise RuntimeError("retirement requires the original supervisor PID")
+        with process_identity.pinned(row["process_identity"], int(row["pid"])) as process:
+            if process is None:
+                return {"id": call_id, "outcome": "refused", "reason": "original supervisor exited"}
+            artifact["retirement"] = {"cause": "target_closed", "requested_at": time()}
+            conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), call_id))
+            conn.commit()
+            process.signal(signal.SIGTERM)
+    return {"id": call_id, "outcome": "retiring"}
 
 
 # ── --record-turn ──────────────────────────────────────────────────────
@@ -654,7 +708,9 @@ def finish(
     error_code: str | None = None,
     diagnostic: dict | None = None,
 ) -> float:
-    if _native_cli and id_ == _native_call_id and status == "failed":
+    if _native_cli and id_ == _native_call_id and status == "failed" and error_code not in {
+        "review_continuation_required", "review_continuation_held",
+    }:
         untyped = diagnostic is None
         original_error = error
         diagnostic = retain_native_failure(id_, sys.exception(), diagnostic=diagnostic)
@@ -748,7 +804,7 @@ def init_started_at() -> float | None:
 
 
 def reap_interrupted() -> int:
-    """Historical non-native calls retain their age-based status reaping.
+    """Legacy calls retain their orphan grace behind identity/scope guards.
     Native supervisor loss uses its recorded kernel identity, never wall-clock
     epoch order. Only a reader that can observe the current workspace
     supervisor can reconcile an earlier epoch. Interrupted status grants
@@ -759,48 +815,75 @@ def reap_interrupted() -> int:
     now = time()
     with db() as conn:
         rows = conn.execute(
-            "select id, pid, started_at, source, process_identity from calls "
+            f"select id, pid, started_at, {resource_ownership.MANAGED_CALLS} as managed, process_identity from calls "
             "where status='running' and runner is null and pid is not null"
         ).fetchall()
     ended = []
     workspace_observer = None
     for row in rows:
-        if row["source"] == "poise:behavior-chain":
-            try:
-                observed = process_identity.state(row["process_identity"], int(row["pid"]), True)
-            except (RuntimeError, TypeError, ValueError):
+        native = row["managed"]
+        try:
+            observed = process_identity.state(row["process_identity"], int(row["pid"]), True)
+        except (RuntimeError, TypeError, ValueError):
+            if native:
                 continue
-            if observed == "unobservable":
-                if workspace_observer is None:
-                    workspace_observer = caller_store.observes_workspace_supervisor()
-                if workspace_observer:
-                    observed = "different"
-            if observed in {"gone", "different"}:
-                ended.append(row["id"])
+            observed = "unverified" if row["process_identity"] else "missing"
+        observer = "same_epoch"
+        if observed in {"unobservable", "unverified", "missing"}:
+            if workspace_observer is None:
+                workspace_observer = caller_store.observes_workspace_supervisor()
+            if not workspace_observer:
+                continue
+            observer = "workspace"
+        if observed == "alive":
             continue
-        started = float(row["started_at"] or 0)
-        if init is None or started >= init:
-            if row["source"] != "poise:behavior-chain" and now - started < ORPHAN_AFTER_SECONDS:
-                continue
-            try:
-                pid = int(row["pid"])
-            except (TypeError, ValueError):
-                continue
-            command = process_command(pid)
-            if command is not None and STOP_COMMAND_MARK in command:
-                continue
-        ended.append(row["id"])
+        reason = "workspace_replaced" if observed == "unobservable" else "supervisor_lost"
+        if not native:
+            if observed == "unobservable":
+                # A parent sees a live child namespace as unobservable too.
+                # Only an earlier kernel epoch proves replacement here.
+                try:
+                    registered = process_identity.decode(row["process_identity"], int(row["pid"]))["epoch"]
+                    workspace = process_identity.epoch()
+                    boot = registered["boot"]
+                    if not isinstance(boot, str) or not boot:
+                        continue
+                    if boot == workspace["boot"] and int(registered["init_start"]) >= int(workspace["init_start"]):
+                        continue
+                except (OSError, RuntimeError, KeyError, TypeError, ValueError, IndexError):
+                    continue
+            started = float(row["started_at"] or 0)
+            reason = "workspace_replaced" if observed == "unobservable" else "legacy_before_init"
+            # Same-epoch supervisor loss does not prove its providers ended.
+            # A verified replacement does; older rows need the authorized
+            # workspace observer before retaining their historical init rule.
+            if observed != "unobservable" and (observed in {"gone", "different"} or init is None or started >= init):
+                if now - started < ORPHAN_AFTER_SECONDS:
+                    continue
+                try:
+                    pid = int(row["pid"])
+                except (TypeError, ValueError):
+                    continue
+                command = process_command(pid)
+                if command is not None and STOP_COMMAND_MARK in command:
+                    continue
+                reason = "legacy_orphan"
+        evidence = diagnostic_envelope(operation="call.reap", phase="reconciliation", outcome="interrupted",
+                                       message=f"{reason}; observer={observer}; identity={observed}", call_id=row["id"])
+        ended.append((row["id"], json.dumps(evidence)))
     count = 0
     with db() as conn:
-        for id_ in ended:
+        for id_, evidence in ended:
             # Whether it is being stopped is read by the update itself: stop_call
             # may have marked it, and ended its worker, since the select above.
             count += conn.execute(
                 "update calls set status='failed', ended_at=?, "
                 "error=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error when error_code='stopping' then 'Stopped by user' else ? end, "
                 "error_code=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error_code when error_code='stopping' then 'stopped' else 'interrupted' end, "
+                "diagnostic=case when diagnostic is null then ? "
+                "when json_valid(diagnostic) then json_set(diagnostic,'$.reaper',json(?)) else diagnostic end, "
                 "progress=coalesce(?, progress) where id=? and status='running'",
-                (now, INTERRUPTED_ERROR, progress.terminal("failed"), id_),
+                (now, INTERRUPTED_ERROR, evidence, evidence, progress.terminal("failed"), id_),
             ).rowcount
             mark_managed_no_write(conn, id_)
     return count
@@ -1322,6 +1405,7 @@ def run_pr_review(
     review_scope: str = "",
     review_slot: str | None = None,
     resume_review: str | None = None,
+    review_units_per_call: int | None = None,
 ):
     return run_governed_behavior(
         pr_review,
@@ -1338,7 +1422,7 @@ def run_pr_review(
         model,
         recovery_model,
         review_scope=review_scope,
-        review_slot=review_slot, resume_review=resume_review,
+        review_slot=review_slot, resume_review=resume_review, review_units_per_call=review_units_per_call,
     )
 
 
@@ -1575,6 +1659,7 @@ def run_pr_approve(
     review_scope: str = "",
     review_slot: str | None = None,
     resume_review: str | None = None,
+    review_units_per_call: int | None = None,
 ):
     return run_governed_behavior(
         pr_approve,
@@ -1594,7 +1679,7 @@ def run_pr_approve(
         review_round,
         review_cap,
         review_scope=review_scope,
-        review_slot=review_slot, resume_review=resume_review,
+        review_slot=review_slot, resume_review=resume_review, review_units_per_call=review_units_per_call,
     )
 
 
@@ -1608,7 +1693,10 @@ def persist_action_plan(call_id: str, plan: dict) -> str:
         raise ValueError("native publication plan exceeds its durable byte bound")
     with db() as conn:
         conn.execute("begin immediate")
-        row = conn.execute("select action_plan, status from calls where id=?", (call_id,)).fetchone()
+        row = conn.execute("select action_plan, status, json_extract(artifact,'$.retirement.cause') as retirement "
+                           "from calls where id=?", (call_id,)).fetchone()
+        if row is not None and row["retirement"] == "target_closed":
+            raise ClosedImplementationRetired("work publication fenced by verified target closure")
         if row is None or row["status"] != "running" or (row["action_plan"] is not None and row["action_plan"] != encoded):
             raise ValueError("native publication plan conflicts with its original durable record")
         if conn.execute("update calls set action_plan=? where id=? and status='running'", (encoded, call_id)).rowcount != 1:
@@ -1718,6 +1806,8 @@ def run_native_action(argv: list[str], cwd: str, repository: str, actor: str, co
         diagnostic = getattr(error, "diagnostic", None)
         no_action = not started or (argv[0] == "--merge-if-ready" and isinstance(error, native_action.ActionFailure)
                                    and diagnostic.get("submission") in {"none", "rejected"})
+        no_action = no_action or (argv[0] == "--update-branch-if-behind" and isinstance(error, native_action.ActionFailure)
+                                  and diagnostic.get("operation") == "update_branch_if_behind" and diagnostic.get("submission") == "none")
         finish(id_, "failed", error=str(error)[:2000], error_code="native_action_failed",
                outcome="preflight_failed" if no_action else None, action="not_started" if no_action else None,
                diagnostic=diagnostic)
@@ -1801,8 +1891,9 @@ def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
     # response was lost. Resource settlement is an independent prerequisite.
     # PR deadlines keep the governed completion's inventory-validated result.
     conn.execute("update calls set action='not_started', outcome='preflight_failed', head_sha=null "
-                 "where id=? and source='poise:behavior-chain' and status='failed' and resources_settled_at is not null and "
-                 "(behavior not in ('pr_review','pr_approve') or coalesce(error_code,'') != 'review_budget_exhausted') and "
+                 f"where id=? and {resource_ownership.MANAGED_CALLS} and status='failed' and resources_settled_at is not null and "
+                 "(behavior not in ('pr_review','pr_approve') or coalesce(error_code,'') not in "
+                 "('review_budget_exhausted','review_continuation_required','review_continuation_held')) and "
                  "coalesce(error_code,'') not in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable') and "
                  "json_valid(artifact) and (json_extract(artifact,'$.phase') in ('preparing','prepared','executing','reviewing','preparing_publication') "
                  "or (action_plan is null and behavior in ('issue_review','implement_issue','repair_pr')))",
@@ -1811,7 +1902,8 @@ def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
 
 def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, model: str,
                     branch: str, pull: int | None = None, expected_head: str | None = None, note: str = "", merge_base: bool = False,
-                    expected_issue_revision: str | None = None):
+                    expected_issue_revision: str | None = None, *, repair_basis: str | None = None,
+                    repair_predecessor: str | None = None):
     spec = CATALOG.issue_review_model(model)
     repo, number = issue_review.parse(issue)
     actor, source, correlation_id = atoms.actor(actor), atoms.source(source), atoms.correlation_id(correlation_id)
@@ -1853,7 +1945,12 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
             record(artifact)
             with review_receipt.managed_resources(run_dir):
                 try:
-                    result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
+                    repair_args = {"repair_basis": repair_basis, "repair_predecessor": repair_predecessor} \
+                        if pull is not None and repair_basis else {}
+                    result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head,
+                                             note, merge_base, expected_issue_revision, **repair_args)
+                except ClosedImplementationRetired:
+                    raise
                 except Exception as error:
                     if getattr(error, "diagnostic", None) is None:
                         failure = atomic_work.failure_diagnostic(error)
@@ -1868,9 +1965,15 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                     failure = retain_native_failure(id_, error, diagnostic=failure)
                     raise
             outcome = result.get("outcome")
-            if outcome not in {"published", "no_changes", "superseded", "prerequisite_wait"}:
+            if outcome not in {"published", "no_changes", "superseded", "target_closed", "prerequisite_wait"}:
                 raise RuntimeError("atomic behavior returned no publication outcome")
-            if outcome == "prerequisite_wait":
+            if outcome == "target_closed":
+                if pull is not None or behavior != "implement_issue":
+                    raise RuntimeError("target closure retirement requires the original first implementation")
+                record({**artifact, "retirement": {"cause": "target_closed", "detected_at": time()}})
+                finish(id_, "superseded", response=json.dumps(result), outcome="target_closed",
+                       head_sha=None, action="not_started", error_code="target_closed")
+            elif outcome == "prerequisite_wait":
                 if pull is not None or artifact.get("phase") != "prerequisite_wait" \
                         or artifact.get("publication_head") is not None or artifact.get("replies_started") is not None \
                         or artifact.get("result") is not None or result.get("head_sha") is not None:
@@ -1888,8 +1991,27 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                 resource_ownership.failure(DB, id_, "resources_unknown", run_dir)
             record({**artifact, "phase": "resources_unknown"})
         with db() as conn:
-            row = conn.execute("select error_code from calls where id=?", (id_,)).fetchone()
+            row = conn.execute("select error_code,artifact,action_plan from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
+        stored = json.loads(row["artifact"] or "{}") if row and row["artifact"] else {}
+        retired = (
+            source == "poise:behavior-chain" and pull is None and behavior == "implement_issue"
+            and row is not None and row["action_plan"] is None and failure is None
+            and (isinstance(error, ClosedImplementationRetired)
+                 or isinstance(error, SystemExit) and error.code == 128 + signal.SIGTERM)
+            and not stopped and stored.get("phase") in RETIRE_BEFORE_PUBLICATION_PHASES
+            and isinstance(stored.get("retirement"), dict) and stored["retirement"].get("cause") == "target_closed"
+            and not stored.get("plan_sha") and not stored.get("publication_head")
+            and not stored.get("publication") and not stored.get("result")
+            and not stored.get("resource_error") and stored.get("replies_started") is None
+        )
+        if retired:
+            finish(id_, "superseded", outcome="target_closed", head_sha=None,
+                   action="not_started", error_code="target_closed")
+            print(json.dumps({"id": id_, "behavior": behavior, "actor": actor, "source": source,
+                              "correlation_id": correlation_id, "model": spec.identity,
+                              "outcome": "target_closed"}))
+            return
         no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline", "prerequisite_wait"}
         finish(id_, "failed", error="Stopped by user" if stopped else failure_message or str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
@@ -1900,9 +2022,10 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         try:
-            if source == "poise:behavior-chain" and pull is None:
-                failed_source.discard_unless_failed(DB, id_)
-                failed_source.discard_deadline_unless_failed(DB, id_)
+            if source == "poise:behavior-chain":
+                if pull is None:
+                    failed_source.discard_unless_failed(DB, id_)
+                failed_source.discard_deadline_unless_failed(DB, id_, behavior)
         finally:
             if source == "poise:behavior-chain":
                 resource_ownership.cleanup_remaining(DB, id_)
@@ -2053,6 +2176,7 @@ def run_governed_behavior(
     review_scope: str = "",
     review_slot: str | None = None,
     resume_review: str | None = None,
+    review_units_per_call: int | None = None,
 ):
     if capped and (behavior != "pr_approve" or review_round is None or review_cap is None):
         raise ValueError("a capped round needs pr_approve with its round and cap numbers")
@@ -2076,12 +2200,14 @@ def run_governed_behavior(
         expected_head=expected_head,
         source=source,
         correlation_id=correlation_id,
+        managed_review=review_slot is not None,
     )
     with db() as conn:
         conn.execute("update calls set review_policy=? where id=?", (review_budget.REVIEW_POLICY, id_))
     review_receipt.bind(DB, id_)
     with review_budget.ReviewBudget(timeout_s), progress.Progress(DB, id_), \
-            review_receipt.invocation_environment(DB, id_, True), review_continuation.request(review_slot, resume_review):
+            review_receipt.invocation_environment(DB, id_, True), \
+            review_continuation.request(review_slot, resume_review, review_units_per_call):
         response = ""
         try:
             before = review_facts(mod, pr, pwd, actor, expected_head, 0)
@@ -3032,14 +3158,14 @@ behaviors:
   --read-response HASH
   --read-reasoning HASH
   --chat MESSAGE --model MODEL [--session ID] [--pwd DIR]
-  --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-slot SLOT [--resume-review CALL_ID:GENERATION]]
-  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N] [--review-slot SLOT [--resume-review CALL_ID:GENERATION]]
+  --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-slot SLOT [--resume-review CALL_ID:GENERATION] [--review-units-per-call N]]
+  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N] [--review-slot SLOT [--resume-review CALL_ID:GENERATION] [--review-units-per-call N]]
   --fix-failing-ci PR [--pwd DIR]
   --issue-simplify ISSUE [--pwd DIR]
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--expected-issue-revision SHA256] [--note TEXT]
   --atomic-work OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID --branch BRANCH [--pull-number N --expected-head SHA] [--merge-base] [--expected-issue-revision SHA256] [--note TEXT]
   --read-action-plan CALL_ID
-  --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID
+  --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID [--diagnosis DIGEST]
   --complete-atomic-publication CALL_ID PLAN_SHA HEAD_SHA
   --author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]
   --debate TOPIC [--rounds N]
@@ -3096,12 +3222,26 @@ def _review_cap_number(flag: str, capped: bool) -> int | None:
     return int(value)
 
 
+def _review_units_per_call() -> int | None:
+    value = flag_value("--review-units-per-call")
+    if value is None:
+        return None
+    if not re.fullmatch(r"[1-9][0-9]?", value) or int(value) > 32:
+        usage(error="--review-units-per-call must be between 1 and 32")
+    return int(value)
+
+
 def main():
     global _native_cli, _native_call_id
     previous_native_cli = _native_cli
     previous_native_call_id = _native_call_id
     _native_call_id = None
-    _native_cli = flag_value("--source") == "poise:behavior-chain" or sys.argv[1:2] == ["--complete-atomic-publication"]
+    source = flag_value("--source")
+    review_behavior = {"--pr-review": "pr_review", "--pr-approve": "pr_approve"}.get(sys.argv[1] if len(sys.argv) > 1 else "")
+    legacy_review = review_behavior is not None and source == resource_ownership.LEGACY_REVIEW_SOURCES[review_behavior] \
+        and flag_value("--review-slot") is not None
+    managed = source == "poise:behavior-chain" or legacy_review
+    _native_cli = managed or sys.argv[1:2] == ["--complete-atomic-publication"]
     try:
         _main()
     except Exception as error:
@@ -3113,7 +3253,7 @@ def main():
         # An accepted managed invocation also gets a durable no-effect receipt
         # if model/catalog preparation failed before its usual track() call.
         # The same unique correlation still arbitrates racing CLI starts.
-        if flag_value("--source") == "poise:behavior-chain" and flag_value("--correlation-id"):
+        if managed and flag_value("--correlation-id"):
             correlation = atoms.correlation_id(flag_value("--correlation-id"))
             with db() as conn:
                 existing = conn.execute("select id from calls where correlation_id=?", (correlation,)).fetchone()
@@ -3131,7 +3271,8 @@ def main():
                     else:
                         repository, number = atoms.repo_name(sys.argv[2], flag_value("--pwd")), int(atoms.pr_number(sys.argv[2]))
                     id_ = track(required_flag("--model"), "", str(number), repository, atoms.actor(required_flag("--actor")), behavior,
-                                expected_head=flag_value("--expected-head"), source="poise:behavior-chain", correlation_id=correlation)
+                                expected_head=flag_value("--expected-head"), source=source, correlation_id=correlation,
+                                managed_review=legacy_review)
                     evidence = {**escaped_failure(error, "call_preparation"), "correlation_id": correlation,
                                 "repository": repository, "pr": number, "behavior": behavior}
                     finish(id_, "failed", error=evidence["message"], outcome="preflight_failed", action="not_started",
@@ -3245,10 +3386,11 @@ def _main():
         print(json.dumps(read_action_plan(sys.argv[2]), ensure_ascii=False))
         return
     if len(sys.argv) == 7 and sys.argv[1] == "--capture-failed-source":
-        failed_source.capture(DB, Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6]))
+        exit_code = None if sys.argv[6] == "interrupted" else int(sys.argv[6])
+        failed_source.capture(DB, Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5], exit_code)
         return
-    if len(sys.argv) == 5 and sys.argv[1] == "--read-failed-source":
-        print(json.dumps(failed_source.inspect(DB, *sys.argv[2:])))
+    if sys.argv[1:2] == ["--read-failed-source"] and (len(sys.argv) == 5 or len(sys.argv) == 7 and sys.argv[5] == "--diagnosis"):
+        print(json.dumps(failed_source.inspect(DB, *sys.argv[2:5], diagnosis=sys.argv[6] if len(sys.argv) == 7 else None)))
         return
     if len(sys.argv) >= 5 and sys.argv[1] == "--complete-atomic-publication":
         import argparse
@@ -3264,6 +3406,12 @@ def _main():
         if not re.fullmatch(r"[0-9a-f]{32}", call_id):
             raise ValueError("stop requires a full call id")
         print(json.dumps(stop_call(call_id)))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--retire-closed-implementation":
+        call_id = sys.argv[2]
+        if not re.fullmatch(r"[0-9a-f]{32}", call_id):
+            raise ValueError("retirement requires a full call id")
+        print(json.dumps(retire_closed_implementation(call_id)))
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--read-reasoning":
         call_id = sys.argv[2]
@@ -3395,6 +3543,7 @@ def _main():
             recovery_model=flag_value("--recovery-model"),
             review_scope=flag_value("--review-scope") or "",
             review_slot=flag_value("--review-slot"), resume_review=flag_value("--resume-review"),
+            review_units_per_call=_review_units_per_call(),
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--pr-approve":
@@ -3419,6 +3568,7 @@ def _main():
             review_cap=review_cap,
             review_scope=flag_value("--review-scope") or "",
             review_slot=flag_value("--review-slot"), resume_review=flag_value("--resume-review"),
+            review_units_per_call=_review_units_per_call(),
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--fix-failing-ci":
@@ -3441,7 +3591,8 @@ def _main():
         run_atomic_work(sys.argv[2], required_flag("--actor"), required_flag("--source"), required_flag("--correlation-id"),
                         required_flag("--model"), required_flag("--branch"), int(pull) if pull else None,
                         flag_value("--expected-head"), flag_value("--note") or "", "--merge-base" in sys.argv,
-                        flag_value("--expected-issue-revision"))
+                        flag_value("--expected-issue-revision"), repair_basis=flag_value("--repair-basis"),
+                        repair_predecessor=flag_value("--repair-predecessor"))
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--issue-simplify":
         run_issue_simplify(sys.argv[2], flag_value("--pwd"))

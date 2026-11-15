@@ -575,7 +575,7 @@ def capability() -> dict:
         if scope.exit_code != 0:
             raise RuntimeError("native cleanup setup check did not complete")
         scope.release()
-        return {"version": 1, "supported": True, "resourceGuard": 1}
+        return {"version": 1, "supported": True, "resourceGuard": 1, "reviewContinuation": 1}
     except Exception as error:
         return {"version": 1, "supported": False, "error": str(error)[:500],
                 **({"unavailable": True} if not isinstance(error, NamespaceUnavailable) or not error.unsupported else {})}

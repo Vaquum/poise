@@ -20,6 +20,8 @@ you.poise.example.com (22 Oct: Plan 15 cards, Issue 21+, PR 179+). Round 13 re-r
 - C8 Add a card: text, an optional linked repository, Add or Cancel. ⌘Enter adds; Esc cancels. Tells you when the filter hides the new card.
 - C9 Add an issue: title, optional body and repository. "Open issue" opens it on GitHub as you. It is guarded while the write is out, appears at once, and tells you when the filter hides it.
 
+Repository fields in the Issue composer and Idea, Concept and Plan card writers filter the available `owner/repo` names by case-insensitive substring as you type. Clear the search to see all choices; click a choice or use the arrow keys and Enter to select it. Search text does not replace the selected repository. Cards can choose **No repository** and retain an existing link absent from the available list. Filtering keeps issue labels; selecting a different repository clears them. Escape dismisses suggestions first, then cancels the writer.
+
 **Your cards**
 - C10 Text, linked repository and last-updated time.
 - C11 Click or Enter edits in place. ⌘Enter saves; Esc cancels. A draft survives refreshes.

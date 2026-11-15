@@ -42,10 +42,14 @@ continues to use the original response bytes before the CLI's trailing newline.
 # Inspecting failed unpublished source
 
 For a managed `implement_issue`, the test-offload runner hands Caller the original
-archive and command specification after a completed nonzero suite exit, before
-deleting that archive. Caller verifies their combined candidate digest and
-checkout binding, then retains only changes against the prepared base: tracked
-files (including deletions) and new source files present in that archive. Ignored
+archive and command specification after a completed nonzero suite exit or an
+interrupted validation that reported a Vitest assertion. For interrupted
+validation it keeps the producing run's ID across relay recovery and gives
+Caller up to 15 seconds before deleting the archive. The private manifest
+marks that capture with `"validation": "interrupted"`, and the command still
+returns its no-result disposition. Caller verifies the combined candidate
+digest and checkout binding, then retains only changes against the prepared
+base: tracked files (including deletions) and new source files in that archive. Ignored
 dependencies, Git metadata and other untracked files are excluded. Symlinks retain
 their target text without following it. Unsupported or mismatched captures are
 unavailable; no cleanup-time diff substitutes for them.
@@ -63,7 +67,10 @@ The existing linked remediation report exposes availability and the command
 `agent-interface --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID`. This returns
 the private file location, never its contents, only inside the owning workspace
 to a running implementation Call for that report's issue, repository and actor.
-The original no-publication receipt, positive resource release, exact capture
+Poise's bounded pre-PR diagnosis uses the same reader with `--diagnosis DIGEST`.
+The saved diagnosis must still be running and bind the current source hold,
+original implementation Call, generated report, settled review and configured
+accounts. The original no-publication receipt, positive resource release, exact capture
 identity, private file permissions and digest must still match. Missing, expired,
 oversized, tampered or unauthorized evidence returns unavailable and requires a
 fresh reproduction. Historical deleted artifacts are not recovered.
@@ -92,12 +99,23 @@ used. Externally managed Chat turns retain Poise's existing Stop route.
 Interruption reconciliation checks the original supervisor's process identity.
 Only a reader that can observe the current workspace supervisor can reconcile
 a previous workspace epoch. A reader in a private PID namespace cannot do so.
+Identified legacy Calls remain running while their supervisor is alive or its
+epoch is unobservable to that reader. Same-epoch supervisor loss retains the
+six-hour orphan grace because providers can outlive it. An authorized workspace
+observer can recognize a replacement from a prior boot or an older PID
+namespace init on the same boot. Missing or unverified identities retain the
+historical init/age/command rule only for an authorized workspace observer.
+Reaper decisions retain a bounded reason, observer scope and identity result
+in `diagnostic` (under `reaper` when an earlier diagnostic is present), without
+raw process or environment data.
 Existing resource and publication receipts still govern recovery.
 
 New native registrations use process identity version 2. An older Caller
 still running through a workspace update cannot reap these registrations.
 The current Caller continues to read version 1 identities and settle their
-original Calls.
+original Calls. Legacy protection covers updated observers reading those older
+registrations; rollout must exclude unpatched legacy reapers. A prior executable
+that ignores legacy identity can still interrupt them.
 
 Native per-Call resource receipts live in `resource_ownership`, outside the
 replaceable publication artifact. Directory registration precedes allocation;
@@ -222,6 +240,15 @@ and publication fields, and a valid resource-release timestamp. Caller tests
 feed real `--logs --select` bytes into Poise's decoder and journal runtime for
 all five behaviors; malformed variants remain quarantined. These contract
 checks create no GitHub artifacts and are not workflow acceptance runs.
+
+`--retire-closed-implementation CALL_ID` handles a running first implementation
+after Poise verifies seed closure. It pins the original supervisor and records
+closure under the same database write lock as publication planning, then sends
+cooperative SIGTERM. A stored plan or publication receipt prevents retirement.
+Validation of a first implementation can also report a confirmed closed seed
+before planning. The original Call retains the typed `superseded` /
+`not_started` / `target_closed` receipt and its own resource ownership. Poise
+settles the invocation only after the original cleanup proves release.
 
 # Recording a Chat turn
 
@@ -673,8 +700,11 @@ Managed structured PR reviews and uncapped approvals accept `--review-slot SLOT`
 to opt into durable analysis. Resume with the same review arguments, a new
 `--correlation-id`, and
 `--resume-review ROOT_CALL_ID:GENERATION` from the returned `continuation` object.
-Automatic behavior admission does not select this protocol. Ordinary one-pass
-reviews retain their existing path; Claude and capped rounds do not use it.
+Poise adds `--review-units-per-call 6` for automatic admission. This keeps a
+complete ordinary-sized packet on the single-pass path and yields a checkpoint
+after six completed units on a larger obligation. Claude and capped rounds
+retain their existing path. Managed legacy review Calls preserve their original
+source and use the same native release proof as chain Calls.
 
 Caller binds progress to the repository, PR, exact head, base and merge base,
 complete material packet (including thread/repair-answer revisions and linked
@@ -703,6 +733,12 @@ unfinished required pages and incomplete source inventories grant no review
 authority. A required final integration unit receives every unit's assessment,
 findings and boundary evidence, and can inspect cross-file contracts before
 returning the single verdict.
+
+The Call's `artifact.review_checkpoint` retains the original root and generation
+with completed and required units, attempts, cumulative time and the last
+verified progress timestamp. Later Calls update the root while preserving each
+earlier Call's snapshot. The current Call rechecks the material packet before
+automatic publication.
 
 Each Call retains its existing 1,413-second ceiling and its prompt and
 inspection-round bounds. A review obligation has a separate cumulative ceiling

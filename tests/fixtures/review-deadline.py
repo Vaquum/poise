@@ -31,6 +31,10 @@ packet = json.dumps({"repository": "example/repo", "pull_number": 21, "head_sha"
 def command(args, **kwargs):
     global reads
     if args[1] in {"--reviewed-clean", "--approve-pr"}:
+        if mode == "conversation_blocked":
+            assert args[1] == "--approve-pr"
+            return SimpleNamespace(returncode=1, stdout="",
+                                   stderr="error: 1 unresolved review conversation(s) from other reviewers remain")
         response = review_receipt.retained_response()
         body = review_receipt.begin_submission(assessment["verdict"], head)
         posts.append({"id": 91, "invocation": response["invocation_id"], "head": head,
@@ -64,7 +68,7 @@ def command(args, **kwargs):
 
 
 def ask(*args):
-    if mode == "lost_ack":
+    if mode in {"lost_ack", "conversation_blocked"}:
         return json.dumps({"action": "reviewed_clean" if behavior == "pr_review" else "approve",
                            "comments": [], "assessment": assessment})
     if mode in {"missing_artifact", "submitting"}:

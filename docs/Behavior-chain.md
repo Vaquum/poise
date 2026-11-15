@@ -332,6 +332,27 @@ existing resume event records `ciRecovery`. The normal decision path then
 rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
+
+For a still-red, mergeable PR on `main`, the CI-only hold can authorize one
+head-pinned branch update. Caller matches every failed job to the original
+pull-request workflow attempt and compares its complete assertion failures
+with an independent failed full run on main. The full-suite report locates
+both runs and a merged fixture repair. The current base must contain that
+repair and have a full run that passed every original failing case. A closed
+report, a green base alone or additional unexplained failures leave the hold
+in place. Caller rechecks the proof, pinned head and base, and absence of
+queue ownership and auto-merge before submitting the update.
+
+The update admission consumes the allowance for the original failed Call and
+head across restarts and later base advances. An invalidated refresh that never
+started releases its journal reservation. An accepted response retains its
+own Call and response. If the PUT response is lost, the original Call and
+released resources must reconcile against a clean two-parent merge of the
+admitted candidate and base. The recorded observation preserves the original
+failure and the uncertainty of the response. Releasing the hold requires a
+later successful pull-request CI run on that exact updated head. Review,
+approval and merge queue admission then use their existing gates.
+
 When a fresh conflict on the retained failed head prevents a clean base update,
 the same settled receipt and resource proof can instead release the hold for
 the existing `repair-pr --merge-base` path. The ordinary repair, ownership,
@@ -370,24 +391,19 @@ with failure reporting disabled. The original-run proof path requires its Caller
 `test_dependency`: independently verified assertion evidence tying the original
 producing run to `prepared.checkout_head`, plus a distinct failing run on that
 exact base. CI proof requires both completed main runs' complete full-suite
-artifacts. Relay proof would require gateway-authenticated completed Vitest
-assertions bound to the original Call's retained random capture binding, but
-recovery is currently held for #1619: the suite UID owns the report files, so
-candidate code can replace them before signing. The box independently hashes the
-uploaded archive and actual source files before execution; the baseline would need
-a distinct capture and source digest and match the clean prepared base,
-independently of its uploaded index. Matching HEAD alone cannot make a dirty
-candidate into its baseline.
+artifacts. Relay proof requires gateway-authenticated completed assertions from
+the [standalone Vitest command](Operating.md#agents-test-suites), bound to the
+original Call's retained random capture binding. The box independently hashes
+the uploaded archive and source files. The baseline needs distinct capture and
+source digests and must match the original prepared Git tree.
 
-Both paths would compare the complete failure multiset and retain every case count
+Both paths compare the complete failure multiset and retain every case count
 under a failing title, including passing duplicate parameters. Mixed or non-test
 failures, missing/incomplete results, overflow, changed original evidence and
-worker diagnosis alone keep the hold. Relay inventories, including direct Vitest
-commands with runner-owned reporting of assertion, setup and unhandled errors,
-all retain their hold until the runner establishes them independently; wrappers
-and other runners retain theirs. The gateway would sign evidence only after
-genuine completion and return it before deleting the run. Caller would authenticate
-and retain those bounded, redacted receipts before checkout cleanup, then the
+worker diagnosis alone keep the hold. Other relay modes retain their hold.
+The gateway signs the standalone inventory after genuine completion and
+returns it before the run closes. Caller authenticates and retains the
+bounded, redacted receipts before checkout cleanup, then the
 existing seed observation would revalidate them. A log, archive digest alone,
 canceled run or historical output without this provenance grants no recovery.
 In particular, #1505 remains held when its original evidence is unavailable.
@@ -510,6 +526,15 @@ independent approval gates govern readmission.
 
 The chain intentionally does not use the legacy approval-round escape that files remaining findings as a follow-up issue and approves. Unresolved blockers remain blockers.
 
+A typed approval refusal before publication, with the original Call and native
+resource release verified, waits on fresh GitHub conversation evidence without
+using an approval failure attempt. The existing readiness read checks for live
+threads from other reviewers. Incomplete evidence cannot confirm closure.
+New heads, review obligations and verified conflicts go through the ordinary
+decision path. The chain can also release an existing automatic hold from
+three verified refusals once fresh PR evidence is available. The original
+Calls and retry boundary are retained, and a person's Hold still applies.
+
 ## Authority and recovery
 
 `behavior_chain_events` is immutable. It owns admissions, phase progression, retry history and ownership. `behavior_chain_current` is a rebuildable index whose state is checked against the authoritative event hash. Admissions and projection updates commit together with SQLite FULL durability. Existing observational behavior ledgers do not authorize this executor.
@@ -610,8 +635,8 @@ with no Call becomes `uncertain`: a partial receipt-store recovery can lose the
 unique correlation that once protected it. It cannot be relaunched or given a
 synthetic no-effect fence, even while held or disabled. Unreadable receipt
 snapshots also journal this uncertainty before reconciliation resumes.
-An existing Call is never altered, and normal validated receipt reconciliation
-must prove release. [Receipt-store recovery](Operating.md#caller-receipt-store-recovery)
+The no-worker fence leaves an existing Call alone. Normal validated receipt
+reconciliation must prove release. [Receipt-store recovery](Operating.md#caller-receipt-store-recovery)
 defines preservation and activation requirements.
 The receipt reader accepts only the fence's exact no-provider, no-publication
 shape with its native resource-release timestamp. Other superseded outcomes
@@ -620,10 +645,14 @@ retain their original validation; malformed fence rows stay quarantined.
 Original artifact/receipt adoption continues while paused or held. Incomplete
 publication after closure is held once; complete original comments, reviews or
 replies can still settle through read-only observation. Native exit or
-quarantined uncertainty is retained. A running Call, or a terminal Call without
-resource-release proof, keeps its existing cleanup owner and reservation; no
-new stop or signal is sent. Closure first seen after that running worker ends
-is not a retroactive guarantee about its in-flight publication.
+quarantined uncertainty is retained. A running first implementation before
+publication planning gets a bounded recheck when the previous observation is
+stale. Verified seed closure fences the original Call before requesting
+cooperative termination. A seed found closed during read-only validation
+produces the same `target_closed` outcome. The invocation settles as deferred
+after verified no-write closure and original resource release, preserving
+history without an Error or a failed attempt. Other Calls and uncertain
+publication or cleanup retain their original ownership and reconciliation.
 
 The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
@@ -755,6 +784,18 @@ seed issue/PR/head, without command arguments or provider output. Caller keeps
 the specific cause as its invocation outcome in History. Preparation timeouts
 remain distinct. Retry still requires positive resource release and the existing
 same-basis backoff; three failures hold the chain across restart until **Resume**.
+
+A repair that changes source before the deadline can retain its edits in
+Caller's private, size-limited deadline artifact after the original provider
+has stopped. Capture compares with the prepared checkout, including files
+staged by base integration and unresolved conflict markers. The existing retry
+can restore the artifact from its preceding settled Call in the same attempt
+window. It requires positive resource release and no publication effect, the
+same actor, seed revision, PR head, integration base and repair basis, and a
+matching fresh review packet and preparation. Missing or invalid source evidence
+leaves the next eligible repair fresh. Restored edits are unvalidated and the
+successor still supplies its own review replies and passes the normal validation
+and publication gates.
 
 Repair prompts receive `change_request_reviews` from the native
 `github-interface --pr-review` packet, even with no inline roots. The read selects each
@@ -951,6 +992,14 @@ comment must supply that diagnosis. Creation, labeling, review completion or
 closure alone cannot admit recovery. The explanation remains worker-reported;
 the source repair verifies it.
 
+A settled report implementation refused before publication can also leave a
+receipted review of a source merge conflict. Recovery verifies the prerequisite
+named in the refusal on the current base and independently checks the exact
+source head against that base. A report removed from intake can supply this
+review while its own implementation stays fenced. The conflict base and
+prerequisite delivery are bound to the diagnosis and checked again after repair
+preparation. A resolved conflict, changed base or missing evidence keeps the wait.
+
 The original seed and branch remain unchanged. The existing `--note` carries the
 diagnosis, original Call, report reference and configured accounts' report guidance
 into exact-head repair preparation. The existing journal retains one recovery
@@ -1004,36 +1053,52 @@ implementation age. This covers verification before reservation and reconciliati
 of an unconfirmed creation intent without another POST. A verified report or terminal
 disposition returns to the ordinary quiescent cadence; operator holds retain it.
 
-These pre-PR implementation-hold reports require explicit triage before their
-own implementation can prepare or start. A posted issue review alone cannot
-authorize implementation. Through the existing guarded `/api/behavior-chains`
-control, the workspace owner records `source-only` or `distinct-fix`, with a
-diagnosis and next action. Read `GET /api/behavior-chains?id=OWNER/REPO%23N` for
-the report chain's current sequence and `implementationReport` binding, then
-POST `{ id, sequence, operation: "report-disposition", binding, disposition }`.
-`binding` is that exact read value. `disposition` contains `kind`, `review`
-(the settled native issue-review invocation ID), `commentId` (its posted receipt),
-`diagnosis` and `nextAction`. Triage must identify an independently implementable,
-verified defect to select `distinct-fix`; source-candidate-only failures select
-`source-only`. The control verifies the publishing account and report marker,
-the reviewed title/body revision and native posted-review receipt, the source's
-exact original hold event and Call, and configured ownership. It persists the
-disposition inside the existing report intent and records the diagnosis and next
-action on both chains. Labels, comment wording and closure supply no disposition.
+Pre-PR implementation-hold reports need a current disposition before their
+own implementation can prepare or start. The gate covers follow-up reports keyed by their original
+invocation and hold sequence, even after a lost creation acknowledgement or restart.
+After a lost acknowledgement, admission binds the earliest issue by the original
+source author whose GitHub creation body begins with the exact marker. A later
+issue can quote the marker without taking the binding. Missing or incomplete
+creation evidence for a possible report keeps its admission waiting.
+An independently authored markerless remedy verified against the source's blocked-by
+relationship and original failing file and test case retains ordinary intake.
+That path is only for intents the reporter linked as remedies: an issue the
+reporter created stays gated even if its marker is later removed.
+Intents stored before the adoption record verify independence by the
+remedy predating the source hold.
 
-At implementation admission, missing or stale dispositions wait visibly, even
-when new report publishing is disabled. `source-only` leaves the source held and
-starts no report implementation on main. Checkout availability remains explicitly
-unverified; disposition does not depend on retaining the unpublished checkout.
-Only a current `distinct-fix` can pass through the ordinary implementation gates.
-Admission freshly verifies the original source's open state, no-publication and
-resource-release evidence before and after awaited preparation, and guards the
-source journal revision atomically with admission. Resume, a replacement Hold
-(even with identical text), a different failed Call, changed report revision or
-new source publication invalidates the old binding. The report link and generated
-issue recursion guard remain retained. No disposition retries the source: later
-source work still requires existing verified recovery or explicit Resume, original
-no-publication/resource evidence and absence of competing work.
+After a generated report's native issue
+review settles, Poise can make one bounded read-only diagnosis for the same
+report revision and review, source hold and Call, configured accounts, base and
+retained capture. It runs the named Vitest assertion on clean, pinned main. A
+matching assertion failure scopes a `distinct-fix` disposition. For
+`source-only`, the exact retained candidate must reproduce that assertion and
+the same test must pass against clean prepared and current source bases. The
+credential-free test box runs the candidate and any captured test used for a
+clean control. An unexercised test, a different failure or unavailable candidate
+evidence leaves the missing fact on the source hold. A restart or observation
+with the same evidence reuses the saved result or interrupted intent.
+
+The workspace owner can also record `source-only` or `distinct-fix` through
+`POST /api/behavior-chains`. Read `GET /api/behavior-chains?id=OWNER/REPO%23N`
+for the report chain's current `sequence` and `implementationReport` binding,
+then submit `{ id, sequence, operation: "report-disposition", binding, disposition }`.
+`disposition` contains `kind`, `review` (the settled native issue-review invocation
+ID), `commentId` (its posted receipt), `diagnosis` and `nextAction`. Both paths bind
+the publishing account and marker, reviewed revision, native posted-review
+receipt, original hold and Call. Poise records the disposition, diagnosis and next
+action on the linked chains.
+
+Only a current `distinct-fix` admits report implementation under the ordinary
+gates, including fresh source verification and the source journal precondition.
+An automatically verified `source-only` hands the diagnosis to one fresh
+implementation on the original chain through the same scheduler and validation
+gates. The retry requires fresh no-publication, released resources and a current
+report review after provider preparation. Its original hold, disposition and
+admission persist across restart. A repeated failure requires another operator
+decision. A manually recorded `source-only` leaves the source on its existing
+recovery or Resume path. Replacement Holds, changed Calls, stale reviews and new
+publication fence automatic work.
 
 Before a PR, `implementation_execution_budget_exhausted` separately qualifies three settled original
 `implement-issue` timeout receipts after the last Resume. Each must retain `status=failed`,

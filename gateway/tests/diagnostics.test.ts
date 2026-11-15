@@ -95,6 +95,15 @@ describe('one diagnostic contract', () => {
     expect(normalize(input, NOW)).toMatchObject({ severity: 'warning', source: 'caller', operation: 'provider.cli_update' })
   })
 
+  it('records a review checkpoint only when it has a separate diagnostic cause', () => {
+    const row = { id: 'a'.repeat(32), status: 'failed', behavior: 'pr_review', action: 'not_started', outcome: 'incomplete',
+      error_code: 'review_continuation_required', error: 'Saved the scheduled review units', head_sha: null }
+    expect(callerDiagnostic(row, 'alice')).toBeNull()
+    expect(callerDiagnostic({ ...row, diagnostic: { version: 1, severity: 'warning', operation: 'provider.cli_update',
+      message: 'Retained launcher usable' } }, 'alice')).toMatchObject({ level: 'warning', message: 'Retained launcher usable' })
+    expect(callerDiagnostic({ ...row, resource_error: 'cleanup failed' }, 'alice')).toMatchObject({ level: 'error' })
+  })
+
   it.each([
     { phase: 'overall', nested: true, group: 1, elapsed: 1144.8, remaining: 0, timeout: 0,
       error: 'Review reached its total time limit; needs attention' },

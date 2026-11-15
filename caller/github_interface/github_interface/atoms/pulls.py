@@ -49,7 +49,11 @@ _READINESS_QUERY = """
           }
           reviewThreads(first: 100) {
             pageInfo { hasNextPage }
-            nodes { isResolved isOutdated }
+            nodes {
+              isResolved
+              isOutdated
+              comments(first: 1) { nodes { author { login } } }
+            }
           }
           commits(last: 1) {
             nodes {
@@ -95,9 +99,14 @@ async def get_pr_readiness_state(
     repo: str,
     pull_number: int,
     include_contexts: bool = False,
+    *,
+    include_auto_merge: bool = False,
 ) -> dict[str, Any]:
+    query = readiness_query(include_contexts)
+    if include_auto_merge:
+        query = query.replace("reviewDecision", "reviewDecision autoMergeRequest { enabledAt }")
     data = await client.graphql(
-        readiness_query(include_contexts),
+        query,
         {"owner": owner, "repo": repo, "number": pull_number},
     )
     return _required_pull(data, pull_number)

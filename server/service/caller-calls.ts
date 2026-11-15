@@ -64,7 +64,8 @@ export interface NativeCleanupHold { callId: string, reason: string | null, reta
 interface CallerActivity { live: number, pendingResources: number | null, cleanupHold?: NativeCleanupHold,
   nativeWorkBlocker?: { callId: string, reason: string }, cause?: unknown }
 type ResourceRead = 'skip' | 'count' | 'health'
-const pendingNative = "source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)"
+const pendingNative = `((source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null))
+  or (source in ('poise:review-new-prs','poise:approve-prs') and resource_cleanup is not null))`
 
 /** Caller calls recorded as running whose process is alive, whichever server
  *  started them; null when the records exist but cannot be read. */

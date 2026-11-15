@@ -317,6 +317,8 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
         if behavior == "--merge-if-ready":
             parser.add_argument("--review-response-json", default=argparse.SUPPRESS)
+        else:
+            parser.add_argument("--shared-ci-recovery-json", default=argparse.SUPPRESS)
         parser.add_argument("--author", required=True)
         _add_expected_head(parser)
         return parser
@@ -350,6 +352,9 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
                             help="include checks, workflow identities and parents for an exact commit SHA or the current base")
         parser.add_argument("--base-update-from", default=argparse.SUPPRESS,
                             help="verify that the current head is a clean merge of this failed head and the PR base")
+        parser.add_argument("--held-ci-json", default=argparse.SUPPRESS,
+                            help="verify shared CI recovery against the original held check inventory")
+        parser.add_argument("--include-runs", action="store_true", default=argparse.SUPPRESS)
         _add_repository(parser)
         return parser
 
@@ -397,6 +402,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--chain-seed":
         parser = argparse.ArgumentParser(prog="github-interface --chain-seed ISSUE")
         parser.add_argument("--branch", required=True)
+        parser.add_argument("--verify-conflict", action="store_true", help="Verify a conflict on the owned PR against the current base")
         parser.add_argument("--test-dependency-json", help="Verify retained pre-publication exact-base test evidence")
         _add_repository(parser)
         return parser

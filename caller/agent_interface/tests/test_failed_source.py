@@ -11,13 +11,14 @@ import subprocess
 import sys
 import tarfile
 from tempfile import TemporaryDirectory
+from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 import agent_interface as api
-from agent_interface import atomic_work, failed_source, issue_review
+from agent_interface import atomic_work, failed_source, issue_review, resource_ownership
 from agent_interface import review_budget
 
 RUN = "b" * 32
@@ -101,13 +102,14 @@ def linked_reader(monkeypatch, original, issue=99):
     with sqlite3.connect(os.environ["POISE_DB"]) as conn:
         conn.execute("create table meta(key text primary key, value text)")
         conn.execute("insert into meta values (?,?)", ("behavior_chain_repair_report:" + key, json.dumps({
-            "source": source, "pull": None, "issueNumber": 99,
+            "key": key, "source": source, "pull": None, "issueNumber": 99,
             "attempts": [{"call": original["id"], "invocation": original["correlation_id"]}]})))
     return reader
 
 
 @pytest.mark.parametrize("publish", [False, True])
-def test_original_failed_candidate_survives_cleanup_only_for_blocked_unpublished_call(workspace, monkeypatch, publish):
+@pytest.mark.parametrize("disposition", ["1", "interrupted"])
+def test_original_failed_candidate_survives_cleanup_only_for_blocked_unpublished_call(workspace, monkeypatch, publish, disposition):
     validation = {}
 
     def interface(*args, **kwargs):
@@ -128,13 +130,13 @@ def test_original_failed_candidate_survives_cleanup_only_for_blocked_unpublished
         result = subprocess.run(["node", "--test", "tests/candidate.test.cjs"],
                                 cwd=box / str(checkout).lstrip("/"), capture_output=True, text=True)
         assert result.returncode == 1 and "candidate-only regression" in result.stdout and "1 !== 2" in result.stdout
-        saved = subprocess.run(["agent-interface", "--capture-failed-source", str(archive), str(spec), candidate, RUN, "1"],
+        (checkout / "source.cjs").write_text("module.exports=2; // untested B\n")
+        (checkout / "tests/candidate.test.cjs").write_text("// later untested B\n")
+        saved = subprocess.run(["agent-interface", "--capture-failed-source", str(archive), str(spec), candidate, RUN, disposition],
                                env=env, capture_output=True, text=True, timeout=30)
         assert saved.returncode == 0, saved.stderr
         assert not saved.stdout, "source must not enter Caller stdout"
         validation.update(candidate=candidate, run=RUN, checkout=checkout)
-        (checkout / "source.cjs").write_text("module.exports=2; // untested B\n")
-        (checkout / "tests/candidate.test.cjs").write_text("// later untested B\n")
         (checkout.parent / "publication.json").write_text(json.dumps({
             "commitMessage": "fix: fixture", "title": "fix: fixture", "body": "Fixture correction", "replies": [],
             "blocked": None if publish else f"candidate-only regression: 1 !== 2; candidate {candidate}; run {RUN}"}))
@@ -163,7 +165,9 @@ def test_original_failed_candidate_survives_cleanup_only_for_blocked_unpublished
         assert not list((workspace / ".poise/incident-recovery").iterdir())
         return
     assert evidence["status"] == "available"
+    assert "validation" not in original["artifact"]["failed_source"]
     manifest = json.loads(Path(evidence["path"]).read_bytes())
+    assert manifest.get("validation") == ("interrupted" if disposition == "interrupted" else None)
     changes = {change["path"]: change for change in manifest["changes"]}
     assert set(changes) == {"source.cjs", "deleted.cjs", "tests/candidate.test.cjs"}
     assert base64.b64decode(changes["source.cjs"]["content"]) == b"module.exports=1;\n"
@@ -199,18 +203,21 @@ def test_unbound_or_oversized_capture_is_explicitly_unavailable(retained, monkey
         outside = work / "outside"
         outside.mkdir()
         (Path(os.environ["POISE_DB"]).parent / "incident-recovery").symlink_to(outside, target_is_directory=True)
-    metadata = failed_source.capture(api.DB, archive, spec, candidate, RUN, 1)
+    metadata = failed_source.capture(api.DB, archive, spec, candidate, RUN, None)
     assert metadata["status"] == "unavailable" and "reason" in metadata
     assert "content" not in json.dumps(metadata)
 
 
-@pytest.mark.parametrize("cause", ["candidate", "run", "expiry", "missing", "tampered", "foreign workspace", "unlinked remediation"])
+@pytest.mark.parametrize("cause", ["candidate", "run", "expiry", "missing", "tampered", "foreign workspace",
+                                   "unlinked remediation", "unreleased", "possible publication"])
 def test_inspection_refuses_unavailable_or_unauthorized_evidence(retained, monkeypatch, cause):
     call, work, archive, spec, candidate = retained
-    assert failed_source.capture(api.DB, archive, spec, candidate, RUN, 1)["status"] == "available"
+    assert failed_source.capture(api.DB, archive, spec, candidate, RUN, None)["status"] == "available"
     with api.db() as conn:
         conn.execute("update calls set status='failed', error_code='atomic_work_blocked',action='not_started',outcome='preflight_failed',resources_settled_at=? where id=?",
-                     (failed_source.time(), call))
+                     (None if cause == "unreleased" else failed_source.time(), call))
+        if cause == "possible publication":
+            conn.execute("update calls set artifact=json_set(artifact,'$.plan_sha',?) where id=?", ("d" * 64, call))
     original, = api.logs_selected({"latest": [], "ids": [call]})
     linked_reader(monkeypatch, original, issue=100 if cause == "unlinked remediation" else 99)
     run = RUN
@@ -232,6 +239,75 @@ def test_inspection_refuses_unavailable_or_unauthorized_evidence(retained, monke
         with sqlite3.connect(database) as conn:
             conn.execute("create table calls(id text primary key)")
     assert failed_source.inspect(database, call, candidate, run)["status"] == "unavailable"
+
+
+def diagnosed_reader(original, capture, scoped):
+    source, target, hold = "example/repo#7", "example/repo#99", 5
+    attempt = original["correlation_id"]
+    parts = ["atomic_work_blocked", source, *([attempt, hold] if scoped else [])]
+
+    def compact(value):
+        return json.dumps(value, separators=(",", ":"))
+
+    key = hashlib.sha256(compact(parts).encode()).hexdigest()
+    revision, source_revision = "a" * 64, "b" * 64
+    inputs = {"source": source, "report": 99, "reportKey": key, "holdSequence": hold, "actor": original["actor"],
+              "reviewer": "reviewer", "sourceRevision": source_revision, "invocation": attempt, "call": original["id"],
+              "revision": revision, "review": "report-review", "reviewCall": "c" * 32, "commentId": 700,
+              "base": capture["base"], "prepared": capture["base"], "capture": capture, "assertion": None}
+    diagnosis = hashlib.sha256(compact(inputs).encode()).hexdigest()
+    report = {"key": key, "source": source, "pull": None, "holdSequence": hold, "issueNumber": 99,
+              "attempts": [{"call": original["id"], "invocation": attempt}]}
+    common = {"author": original["actor"], "reviewer": "reviewer", "mergeSha": None}
+
+    def observed(revision):
+        return {"pull": None, "existingPulls": [], "issue": {"open": True, "eligible": True, "revision": revision, "commentIds": [700]},
+                "publication": {"pull_number": None, "head_sha": None, "head_invocation": None, "state": None, "merged": False, "merge_sha": None}}
+
+    source_state = {**common, "resumedAfterSequence": 0, "held": original["error"], "observation": observed(source_revision),
+                    "invocations": [{"id": attempt, "callId": original["id"], "state": "settled", "evidence": {"error": original["error"]}}]}
+    target_state = {**common, "held": None, "observation": observed(revision),
+                    "invocations": [{"id": inputs["review"], "callId": inputs["reviewCall"], "behavior": "review-issue",
+                                     "state": "settled", "actor": "reviewer", "evidence": {"status": "completed", "action": "commented",
+                                     "issue_revision": revision, "receipts": [{"comment_id": 700, "issue": target, "author": "reviewer"}]}}]}
+    with sqlite3.connect(os.environ["POISE_DB"]) as conn:
+        conn.execute("create table meta(key text primary key, value text)")
+        conn.execute("create table behavior_chain_current(chain_id text primary key, state text)")
+        conn.execute("create table behavior_chain_events(sequence integer primary key, chain_id text, payload text)")
+        conn.executemany("insert into meta values (?,?)", [
+            ("me", original["actor"]), ("agentAccount", "reviewer"), ("behavior_chain_repair_report:" + key, compact(report)),
+            ("behavior_chain_implementation_triage:" + diagnosis, compact({
+                "inputs": inputs, "deadline": int(failed_source.time() * 1000) + 100_000, "outcome": None}))])
+        conn.executemany("insert into behavior_chain_current values (?,?)", [(source, compact(source_state)), (target, compact(target_state))])
+        conn.execute("insert into behavior_chain_events values (?,?,?)", (hold, source, '{"type":"chain.held"}'))
+    return diagnosis
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_diagnosis_reads_only_its_exact_current_hold_and_report_review(retained, monkeypatch, scoped):
+    call, _, archive, spec, candidate = retained
+    capture = failed_source.capture(api.DB, archive, spec, candidate, RUN, 1)
+    assert capture["status"] == "available"
+    with api.db() as conn:
+        conn.execute("update calls set status='failed', error_code='atomic_work_blocked',action='not_started',outcome='preflight_failed',"
+                     "error='original blocker',resources_settled_at=? where id=?", (failed_source.time(), call))
+    original, = api.logs_selected({"latest": [], "ids": [call]})
+    monkeypatch.delenv("AGENT_INTERFACE_FAILED_SOURCE_CALL")
+    diagnosis = diagnosed_reader(original, capture, scoped)
+    assert failed_source.inspect(api.DB, call, candidate, RUN)["status"] == "unavailable"
+    assert failed_source.inspect(api.DB, call, candidate, RUN, "0" * 64)["status"] == "unavailable"
+    evidence = failed_source.inspect(api.DB, call, candidate, RUN, diagnosis)
+    assert evidence["status"] == "available"
+    assert set(evidence) == set(capture) | {"path"}
+    with sqlite3.connect(os.environ["POISE_DB"]) as conn:
+        conn.execute("update behavior_chain_current set state=json_set(state, '$.observation.issue.revision', 'replacement') "
+                     "where chain_id='example/repo#99'")
+    assert failed_source.inspect(api.DB, call, candidate, RUN, diagnosis)["status"] == "unavailable"
+    with sqlite3.connect(os.environ["POISE_DB"]) as conn:
+        conn.execute("update behavior_chain_current set state=json_set(state, '$.observation.issue.revision', ?) "
+                     "where chain_id='example/repo#99'", ("a" * 64,))
+        conn.execute("insert into behavior_chain_events values (6,'example/repo#7','{\"type\":\"chain.held\"}')")
+    assert failed_source.inspect(api.DB, call, candidate, RUN, diagnosis)["status"] == "unavailable"
 
 
 def test_inspection_returns_unavailable_without_blocking_on_fifo_evidence(retained, monkeypatch):
@@ -449,6 +525,194 @@ def test_deadline_unreleased_cleanup_refuses_restore(workspace, monkeypatch):
 
     successor, _, _ = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False, mutate=mutate)
     assert "deadline_restored" not in successor["artifact"]
+
+
+@pytest.mark.parametrize("variant", [
+    "same", "conflict", "head", "base", "basis", "review", "seed", "actor", "no edits",
+    "oversized edit", "corrupt", "oversized artifact", "unreleased", "possible write", "missing reply",
+])
+def test_repair_deadline_continuation(workspace, monkeypatch, variant):
+    source = workspace / "source"
+    ancestor = prepared(source)["checkout_head"]
+    git(source, "switch", "-c", "integration")
+    (source / "integrated.cjs").write_text("module.exports='integration';\n")
+    if variant == "conflict":
+        (source / "source.cjs").write_text("module.exports='base';\n")
+    git(source, "add", ".")
+    git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "integrate base")
+    base = git(source, "rev-parse", "HEAD")
+    git(source, "switch", "-c", "repair", ancestor)
+    (source / "pr.cjs").write_text("module.exports='pr';\n")
+    if variant == "conflict":
+        (source / "source.cjs").write_text("module.exports='branch';\n")
+    git(source, "add", ".")
+    git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "PR changes")
+    head = git(source, "rev-parse", "HEAD")
+    seed = {"state": "open", "title": "Repair seed"}
+    basis, actor = "b" * 64, "author"
+    body = "Original finding"
+    reply = {"commentId": 123, "body": "The corrected source now returns the expected value."}
+    modes, checkouts = [], []
+    corrected = "module.exports=42;\n"
+    initial = ""
+
+    def interface(command, *args, **kwargs):
+        if command == "--pr-review":
+            return {"repository": "example/repo", "head_sha": head, "pull_number": 21,
+                    "pull": {"base": {"sha": base}}, "change_request_reviews": [], "author_pr_comments": [],
+                    "review_threads": [{"root_comment_id": 123, "is_resolved": False, "bodies": [body]}]}
+        if command != "--issue-work":
+            assert command in {"--list-failing-ci", "--pull-action-state"}
+            return {}
+        mode = args[args.index("--mode") + 1]
+        modes.append(mode)
+        checkout = Path(args[args.index("--path") + 1])
+        if mode == "prepare":
+            nonlocal initial
+            assert "--merge-base" in args and args[args.index("--expected-head") + 1] == head
+            git(source, "clone", "-q", "--branch", "repair", str(source), str(checkout))
+            merged = subprocess.run(["git", "-C", str(checkout), "-c", "user.name=fixture",
+                                     "-c", "user.email=fixture@example.test", "merge", "--no-commit", "--no-ff", base],
+                                    capture_output=True)
+            assert merged.returncode == (1 if variant == "conflict" else 0), merged.stderr
+            assert git(checkout, "rev-parse", "HEAD") == head
+            initial = (checkout / "source.cjs").read_text()
+            checkouts.append(checkout)
+            return {"outcome": "prepared", "checkout_head": head, "head_sha": head, "base_sha": base,
+                    "path": str(checkout), "repository": "example/repo", "issue_number": 7,
+                    "pull_number": 21, "actor": actor}
+        assert (checkout / "source.cjs").read_text() == corrected
+        assert git(checkout, "diff", "--name-only", "--diff-filter=U") == ""
+        assert json.loads(args[args.index("--replies-json") + 1]) == [reply]
+        return {"outcome": "validated" if mode == "validate" else "published", "head_sha": "d" * 40}
+
+    track = api.track
+
+    def track_with_fixture_resources(*args, **kwargs):
+        with monkeypatch.context() as binding:
+            binding.setattr(api, "_native_cli", False)
+            return track(*args, **kwargs)
+
+    def run_attempt(correlation, predecessor=None):
+        argv = ["agent-interface", "--atomic-work", "example/repo#7", "--actor", actor, "--source", "poise:behavior-chain",
+                "--correlation-id", correlation, "--model", "fixture", "--branch", "repair", "--pull-number", "21",
+                "--expected-head", head, "--expected-issue-revision", issue_review.revision(seed),
+                "--merge-base", "--repair-basis", basis]
+        if predecessor:
+            argv.extend(["--repair-predecessor", predecessor])
+        monkeypatch.setattr(sys, "argv", argv)
+        api.main()
+
+    monkeypatch.setattr(api, "track", track_with_fixture_resources)
+    monkeypatch.setattr(issue_review, "packet", lambda *args: {"issue": seed})
+    monkeypatch.setattr(issue_review, "_issue", lambda *args: seed)
+    monkeypatch.setattr(issue_review, "interface", interface)
+    monkeypatch.setattr(atomic_work.checkout_lock, "Lease", REAL_LEASE)
+    monkeypatch.setattr(review_budget, "timeout", lambda *args, **kwargs: 1)
+    edit = "" if variant == "no edits" else f"Path('source.cjs').write_text({corrected!r})"
+    if variant == "oversized edit":
+        edit = f"Path('source.cjs').write_bytes(b'x' * {failed_source.MAX_BYTES + 1})"
+    script = f"from pathlib import Path\nfrom threading import Event\n{edit}\nPath('../provider-ready').touch()\nEvent().wait()"
+    monkeypatch.setattr(issue_review, "command", lambda *args: (_deadline_provider(script), "", None))
+
+    def ready_deadline(lease, args, *, cwd, **kwargs):
+        ready = Path(cwd).parent / "provider-ready"
+        started = monotonic()
+
+        def gate_clock():
+            now = monotonic()
+            return now if ready.exists() or now - started >= 15 else started
+
+        # Give the stand-in time to write before expiring the real lease gate.
+        with monkeypatch.context() as gate:
+            gate.setattr(atomic_work.checkout_lock, "monotonic", gate_clock)
+            try:
+                return REAL_RUN_GATED(lease, args, cwd=cwd, **kwargs)
+            finally:
+                assert ready.is_file(), "the deadline fixture never reached its edit boundary"
+
+    with monkeypatch.context() as gate, pytest.raises(review_budget.ReviewLimitError):
+        gate.setattr(atomic_work.checkout_lock, "run_gated", ready_deadline)
+        run_attempt("repair-original")
+
+    original, = api.logs_selected({"latest": [], "ids": [], "correlations": ["repair-original"]})
+    assert (original["error_code"], original["action"], original["outcome"]) == (
+        "atomic_work_execution_budget_exhausted", "not_started", "preflight_failed")
+    assert modes == ["prepare"] and not checkouts[0].parent.exists()
+    assert resource_ownership.released(original["resource_ownership"]) and original["resources_settled_at"]
+    assert "plan_sha" not in original["artifact"] and original["receipts"] is None
+    metadata = original["artifact"]["deadline_source"]
+    capture = Path(os.environ["POISE_DB"]).parent / "incident-recovery" / f"deadline-source-{original['id']}.json"
+    if variant in {"no edits", "oversized edit"}:
+        assert metadata["status"] == "unavailable" and not capture.exists()
+    else:
+        assert metadata["status"] == "available" and metadata["repair"]["integration_base"] == base
+        payload = capture.read_bytes()
+        assert metadata["sha256"] == hashlib.sha256(payload).hexdigest()
+        change, = json.loads(payload)["changes"]
+        assert change["path"] == "source.cjs" and base64.b64decode(change["content"]).decode() == corrected
+
+    if variant in {"head", "base"}:
+        git(source, "switch", "repair" if variant == "head" else "integration")
+        git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "--allow-empty", "-qm", "advance")
+        if variant == "head":
+            head = git(source, "rev-parse", "HEAD")
+        else:
+            base = git(source, "rev-parse", "HEAD")
+    elif variant == "basis":
+        basis = "c" * 64
+    elif variant == "review":
+        body = "Finding edited while the PR head stays fixed"
+    elif variant == "seed":
+        seed = {**seed, "title": "Updated seed"}
+    elif variant == "actor":
+        actor = "another-author"
+    elif variant == "corrupt":
+        capture.write_bytes(payload.replace(b"source.cjs", b"forged.cjs"))
+    elif variant == "oversized artifact":
+        capture.write_bytes(b"x" * (failed_source.MAX_BYTES + 1))
+    elif variant in {"unreleased", "possible write"}:
+        with api.db() as conn:
+            if variant == "unreleased":
+                conn.execute("update calls set resources_settled_at=null where id=?", (original["id"],))
+            else:
+                conn.execute("update calls set action_plan='uncertain' where id=?", (original["id"],))
+
+    expects_restore = variant in {"same", "conflict", "missing reply"}
+    publishes = variant in {"same", "conflict"}
+    output = {"commitMessage": "fix: repair", "title": "fix: repair", "body": "Validate restored source",
+              "replies": [reply] if publishes else [], "blocked": None if expects_restore else "fresh repair needed"}
+
+    def successor_command(_model, instruction, _checkout, _work, _seconds, _unattended):
+        assert ("unvalidated file(s)" in instruction) is expects_restore
+        expected = corrected if expects_restore else initial
+        script = f"""from pathlib import Path
+import subprocess
+assert Path('source.cjs').read_text() == {expected!r}
+assert Path('integrated.cjs').is_file()
+subprocess.run(['git', 'add', 'source.cjs'], check=True)
+Path('../publication.json').write_text({json.dumps(output)!r})
+"""
+        return _deadline_provider(script), "", None
+
+    monkeypatch.setattr(review_budget, "timeout", lambda *args, **kwargs: 30)
+    monkeypatch.setattr(atomic_work.checkout_lock, "run_gated", REAL_RUN_GATED)
+    monkeypatch.setattr(issue_review, "command", successor_command)
+    if publishes:
+        run_attempt("repair-successor", original["id"])
+    elif expects_restore:
+        with pytest.raises(atomic_work.AtomicWorkFailed, match="did not answer every unresolved review finding"):
+            run_attempt("repair-successor", original["id"])
+    else:
+        with pytest.raises(atomic_work.AtomicWorkBlocked, match="fresh repair needed"):
+            run_attempt("repair-successor", original["id"])
+    successor, = api.logs_selected({"latest": [], "ids": [], "correlations": ["repair-successor"]})
+    assert modes == ["prepare", "prepare"] + (["validate", "publish"] if publishes else [])
+    if expects_restore:
+        assert successor["artifact"]["deadline_restored"]["predecessor"] == original["id"]
+        assert successor["artifact"]["deadline_restored"]["sha256"] == metadata["sha256"]
+    else:
+        assert "deadline_restored" not in successor["artifact"]
 
 
 def test_deadline_large_unchanged_file_does_not_veto_capture(workspace, monkeypatch):

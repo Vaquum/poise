@@ -399,20 +399,21 @@ bytes before forwarding and retaining it. Earlier runners and relays still
 exchange the whole checkout through the existing tree upload. Jobs and
 sandboxes receive the same single tar stream from either route.
 
-New atomic Calls also pass a Caller-owned random capture binding through the
-test-offload hooks, outside the suite environment. The box independently hashes
-the captured archive and source files before running a direct Vitest command.
-Relay recovery is currently held for #1619: the suite UID owns the report files,
-so no assertion inventory is trusted and no evidence frame is emitted. The held
-design would post a complete bounded inventory from the private run credential to
-`POST /runs/:id/assertions`; workspace credentials cannot submit that result.
-Only a matching completed failure would emit an Ed25519-signed evidence frame
-before the relay deletes the run. The hook would retain the redacted receipt for
-Caller; `POST /evidence/verify` would authenticate it against the existing gateway
-key and workspace credential after run deletion or restart. There is no unsigned
-or partial-result fallback. Caller would retain the verified receipt in its
-original artifact before resource cleanup. This extends the existing relay
-interface, without a new identity scope, setting or runner-retention store.
+Atomic Calls pass a Caller-owned random capture binding outside the suite
+environment. The [standalone assertion command](Operating.md#agents-test-suites)
+uses a sandbox with Docker stopped. Its root collector verifies the archive
+digest and original Git commit/tree identities, then stages the sole text
+comparison using its installed Vitest and protected configuration. The uploaded
+test, config and dependencies cannot execute in that mode.
+
+The sandbox collector consumes its separate credential before unpacking.
+`POST /runs/:id/assertions` accepts only that credential for the active bound
+run. The gateway signs the bounded, redacted inventory only on a completed
+provider exit of 1 within the run deadline. The hook retains the receipt only
+after receiving the matching suite exit. `POST /evidence/verify` authenticates it
+with the existing gateway key and workspace credential after run deletion or
+restart. Caller retains the verified receipt in the original artifact before
+resource cleanup.
 
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
 gateway's, or with none, is recreated as one on an outdated image is: drained
@@ -1636,8 +1637,8 @@ merge gates still apply under the same [CI hold recovery](Behavior-chain.md#boun
 For a pre-PR implementation, the existing Caller artifact and seed read can
 instead verify an original CI assertion failure on its exact prepared base, and
 the delivered main recovery with validation of every original failing test and
-case. Relay assertions remain held for #1619 until the runner establishes their
-inventory independently of candidate-controlled reports.
+case. The same path accepts authenticated results from the standalone relay
+assertion command.
 The journal admits one fresh implementation for that automatic hold and recovery
 commit, independently of report publishing. An incomplete original assertion can
 instead use the saved automatic hold report and linked delivered fixture fix for
@@ -1699,16 +1700,14 @@ through Caller completion and native resource settlement under those same
 [recovery rules](Behavior-chain.md#authority-and-recovery); a diagnostic or
 cleanup alone cannot release an unknown publication effect.
 
-Caller also exposes an explicitly requested structured review continuation via
-`--review-slot` and `--resume-review`. Its typed incomplete result names the
-original Call and checkpoint generation. The existing receipt and response store
-own the exclusive claim, evidence and cumulative allowance across independently
-bounded Calls; partial analysis grants no review authority. Complete source and
-cross-unit coverage reserve one
-head-pinned finalization, preserving the first publisher's Call ID on a lost
-acknowledgement. Poise does not automatically admit these continuations. See
-[Caller's protocol](../caller/agent_interface/README.md#explicit-review-continuation)
-for bounds, invalidation, holds and isolated proof.
+Poise schedules [resumable structured reviews](Behavior-Contract.md#resumable-structured-reviews)
+through the existing legacy and chain admission paths. Caller owns each exact
+review basis and reserves one finalization after full source and integration
+coverage. The original receipt proves worker release before re-admission and
+preserves the publisher's Call after a lost acknowledgement. Existing PR status
+and chain summary reads expose the compact checkpoint and cumulative spend.
+This uses the existing native cleanup capability, release barrier and review
+receipt interfaces.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
@@ -1719,8 +1718,12 @@ The existing in-flight review/approval poll also observes same-head closure.
 It waits for active submission and retains completed-turn results while preventing
 further analysis. Unattempted rounds use `review_target_closed`; attempted writes
 retain the original publication fence and receipt.
-Existing Calls and uncertain
-resources are never released by closure alone. Merged-chain Hold/Resume writes
+A bounded recheck can request cooperative retirement of the original first
+implementation. Caller serializes the retirement fence with publication
+planning, and Poise requires that Call's release proof before recording a
+deferred `target_closed` outcome. See [Behavior chain](Behavior-chain.md#authority-and-recovery).
+Existing Calls and uncertain resources are never released by closure alone.
+Merged-chain Hold/Resume writes
 return 409 and the GUI retains History and read-only reconciliation. No new
 endpoint, signal or journal event type is added; the Caller contract is in
 [agent_interface](../caller/agent_interface/README.md#fencing-a-closed-behavior).
@@ -1859,8 +1862,11 @@ results, preserving receipt digests and publication/retry fences. The CLI's
 response-read contract is in [agent_interface](../caller/agent_interface/README.md#reading-a-response).
 
 Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
-code and existing v1 diagnostic into chain receipts and History. The unchanged
-no-publication shape and retry requirements are defined in
+code and existing v1 diagnostic into chain receipts and History. A native repair
+admission passes its repair basis and, for an eligible retry, the original
+Caller ID. Caller verifies that identity against the prior receipt and its
+private deadline artifact before restoring edits. The no-publication shape
+and retry requirements are defined in
 [Behavior chain](Behavior-chain.md#authority-and-recovery).
 
 Optional work-failure reporting uses the same chain reconciliation,
@@ -1882,21 +1888,22 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
-Their own implementation additionally requires an explicit disposition through
-the existing guarded chain control, bound to the authenticated report, native
-issue review, reviewed revision and original source hold/Call. Source-only and
-missing or stale dispositions wait without starting report implementation;
-a verified distinct-fix disposition retains ordinary admission gates, including
-fresh source verification after preparation. Diagnosis and next action persist
-on the held source through the existing report metadata and journal waits.
-This adds no retry or checkout-retention authority; see
-[report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
+Their own implementation also requires a current disposition through the
+guarded chain contract, bound to the authenticated report, native issue review,
+reviewed revision and original source hold and Call. Poise can use a bounded
+reproduction to record that same disposition after the report review settles.
+Only a verified distinct-fix retains ordinary report admission. A verified
+automatic source-only diagnosis can authorize one fresh original implementation
+through the existing scheduler, with current review, no-publication and resource
+checks at admission. See [report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
 The existing linked remediation also exposes bounded private source evidence
-from the original failed validation capture, retained through normal checkout
-cleanup under the workspace's incident-artifact lifecycle. Only its availability
-and capture identity enter receipts and reports; source bytes stay in the owning
-workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
-defines binding, access, limits and expiry without granting recovery authority.
+from failed validation, including interrupted runs with a recorded Vitest
+assertion diagnostic. Caller retains it through normal checkout cleanup under
+the workspace's incident-artifact lifecycle. Receipts and reports carry its
+availability and capture identity. The interrupted marker and source bytes stay
+in the owning workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
+defines the diagnosis and implementation bindings, access, limits and expiry
+for inspection without granting recovery authority.
 Terminal repair reports require the matching automatic hold, settled original Call,
 positive release and unchanged open PR head and repair basis, without possible
 publication effects. They preserve repair ownership and exclude CI-only recovery holds.
@@ -1908,6 +1915,9 @@ hold and unchanged source/diagnosis are rechecked. An already-admitted report's
 original implementation must settle without publication before this handoff.
 The original seed/branch, normal publication, review and CI gates remain in force;
 missing evidence, changed heads and later operator holds retain the wait.
+For a conflict diagnosis, the existing Caller seed read verifies the owned PR
+head against the current default-branch tip with a bounded local Git probe.
+Admission rechecks the conflict base and prerequisite delivery after preparation.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,

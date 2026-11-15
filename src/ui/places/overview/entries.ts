@@ -4,7 +4,7 @@
 // requests, the Switchboard's open decisions, and review threads. Pure: it
 // turns what was read into entries; answers.ts reads, draws and acts.
 import { evidenceReferences, type DiagnosticEvidence } from '../../../../gateway/src/diagnostics/evidence-contract'
-import { STALLED_MESSAGE } from '../../../behavior-diagnostics'
+import { REVIEWER_BACKOFF_MESSAGE, REVIEWER_RETRY_DUE_MESSAGE, STALLED_MESSAGE } from '../../../behavior-diagnostics'
 import type { NotificationItem } from '../../../notification-items'
 import type { Notice, NoticeKind } from '../../../notices'
 import type { BlockerId, PrStatus } from '../board/model'
@@ -142,9 +142,12 @@ const RETRYING = new Set(['head_changed', 'provider_capacity', 'rate_limit', 'up
 
 /** Behavior diagnostics describe faults and retries. Confirmed account
  *  sign-in requests come from the accounts themselves. */
-export function diagnosticGroup(code: string | undefined, message: string): Group {
-  if (code && RETRYING.has(code)) return 'auto'
-  return code === 'unknown' && message === STALLED_MESSAGE ? 'auto' : 'fault'
+export function diagnosticGroup(code: string | undefined, message: string, since: string | null = null, now = Date.now()): Group {
+  // A model trip alone proves neither a blocked PR nor a stalled sweep. Its
+  // future retry can also reserve a probe without recording a new failure.
+  if (code === 'unknown' && (message === REVIEWER_BACKOFF_MESSAGE || message === REVIEWER_RETRY_DUE_MESSAGE)) return 'auto'
+  const automatic = code && RETRYING.has(code) || code === 'unknown' && message === STALLED_MESSAGE
+  return stuck(automatic ? 'auto' : 'fault', since, now)
 }
 
 /** Automatic work that has not moved for four hours is stuck. */
@@ -169,10 +172,10 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
       const notice = item.notice
       const pull = pullOf(notice)
       const status = pull ? prs.get(prKey(pull.repo, pull.number)) : undefined
-      const kept = item.details.length ? diagnosticGroup(item.code, item.body) : noticeGroup(notice.kind)
+      const kept = item.details.length ? diagnosticGroup(item.code, item.body, item.when, now) : noticeGroup(notice.kind)
       if (kept === null) return []
       const byPull = !item.details.length && pull && (notice.kind === 'pr_ready' || notice.kind === 'pr_conflict')
-      const group = stuck(byPull ? prGroup(status) : kept, item.when, now)
+      const group = item.details.length ? kept : stuck(byPull ? prGroup(status) : kept, item.when, now)
       return [{
         ...base, id: `notice:${notice.id}`, source: 'notice', group, kind: KIND_WORDS[notice.kind],
         // A pull request's own title; its notice's words are its kind and where.
@@ -207,7 +210,7 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
       }]
     }
     // A retry still failing four hours after it began is stuck.
-    const group = stuck(diagnosticGroup(item.code, item.title), item.began ?? null, now)
+    const group = diagnosticGroup(item.code, item.title, item.began ?? null, now)
     return [{
       ...base, id: item.id, source: 'diagnostic', group, kind: 'Behaviors', title: item.title, who: item.source,
       detail: [item.body, item.scope].filter(Boolean).join(' · ') || undefined,

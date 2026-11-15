@@ -34,7 +34,8 @@ def interface(*args, **_kwargs):
     commands.append(args[0])
     if args[0] == "--issue-work":
         assert args[args.index("--mode") + 1] == "prepare"
-        return {"outcome": "prepared", "checkout_head": ci["head_sha"]}
+        return {"outcome": "prepared", "checkout_head": ci["head_sha"],
+                "head_sha": ci["head_sha"], "base_sha": ci["base_sha"]}
     if args[0] == "--list-failing-ci" and "--ref" in args:
         return request["integration"] if args[-1] == request["integration"]["ref"] else request["baseline"]
     if args[0] == "--read-failing-ci-log":

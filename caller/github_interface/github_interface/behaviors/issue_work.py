@@ -37,6 +37,26 @@ def pre_pr_remediation(issue: dict, target: str) -> bool:
                 and source and int(source[1]) != issue.get("number"))
 
 
+async def _integration_conflicts(client: GitHubClient, target: str, base: str, head: str) -> bool:
+    env = _env(client.token)
+    with tempfile.TemporaryDirectory(prefix="caller-conflict-") as directory:
+        async def git(*args):
+            return await asyncio.to_thread(_git, directory, env, *args, timeout=20)
+
+        await git("init", "--bare", "--quiet", "--template=")
+        await git("remote", "add", "origin", f"https://github.com/{target}.git")
+        await git("config", "remote.origin.promisor", "true")
+        await git("config", "remote.origin.partialclonefilter", "blob:none")
+        await git("fetch", "--quiet", "--no-tags", "--filter=blob:none", "origin", base, head)
+        try:
+            await git("merge-tree", "--write-tree", base, head)
+        except GitProcessError as error:
+            if error.diagnostic["outcome"] == "exit" and error.diagnostic["exit_code"] == 1:
+                return True
+            raise
+    return False
+
+
 async def remediation_coverage(client: GitHubClient, target: str, issue: dict, pull: dict, base: str) -> dict:
     evidence = {"kind": "empty_integration", "verified": False,
                 "duplicate": {"number": pull["number"], "head": pull["head"]["sha"]}, "base": base, "covering": []}
@@ -314,6 +334,14 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
     if not isinstance(replies, list):
         raise ValueError("review replies must be an array")
     if mode == "inspect":
+        if payload.get("verify_conflict") and pull and pull.get("state") == "open" and not result["merged"] \
+                and not result["existing_pulls"] and pull["base"]["ref"] == default_branch \
+                and pull["base"]["repo"]["full_name"].lower() == target.lower() \
+                and SHA.fullmatch(base_head) and SHA.fullmatch(remote_head or "") and pull["head"]["sha"] == remote_head:
+            if await _integration_conflicts(client, target, base_head, remote_head):
+                latest_base = await client.get(f"/repos/{target}/git/ref/heads/{default_branch}")
+                if latest_base["object"]["sha"] == base_head:
+                    result["conflict_base"] = base_head
         if replies and pull is not None:
             result["reply_receipts"] = await review_replies(client, target, int(pull["number"]), actor, str(payload.get("invocation_id") or ""), replies, publish=False)
             result["replies_complete"] = len(result["reply_receipts"]) == len(replies)
@@ -371,6 +399,9 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
         # head, which Caller needs to decode and settle this no-write receipt.
         return {**result, "outcome": "superseded", "head_sha": merged_head, "merged": True}
     issue = await client.get(f"/repos/{target}/issues/{issue_number}")
+    if mode == "validate" and pull is None and remote_head is None \
+            and issue.get("state") == "closed" and "pull_request" not in issue:
+        return {**result, "outcome": "target_closed"}
     if issue.get("state") != "open" or "pull_request" in issue:
         raise ValueError("behavior chain seed is no longer an open issue")
     if pull is not None and (pull.get("state") != "open" or pull.get("merged_at") or pull.get("merged")):

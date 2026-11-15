@@ -8,7 +8,7 @@ import { nativeResourcesPending, resourceReleaseProven } from './behavior-resour
 const CUTOVER_ID = '@behavior-admission'
 interface CutoverEvent { type: 'admission.changed', state: BehaviorCutoverState }
 
-export type ChainBehavior = 'review-issue' | 'implement-issue' | 'publish-issue' | 'review-pr' | 'repair-pr' | 'approve-pr' | 'resolve-threads' | 'merge-pr' | 'rerun-grey-ci' | 'retire-pr'
+export type ChainBehavior = 'review-issue' | 'implement-issue' | 'publish-issue' | 'review-pr' | 'repair-pr' | 'approve-pr' | 'resolve-threads' | 'merge-pr' | 'rerun-grey-ci' | 'retire-pr' | 'refresh-pr-ci'
 export interface PublicationPlanCondition {
   code: 'original_publication_plan_missing'
   callId: string
@@ -41,6 +41,10 @@ export interface QueueCiBlocker {
   removal: string, integration: string, base: string,
   failures: Array<{ name: string, check: number, job: number, run: number, workflow: number, attempt: number, url: string }>
 }
+export interface CiRefreshProof {
+  head: string, base: string, remediation: string, report: number, workflow: number,
+  failedRun: number, baselineRun: number, passedRun: number, checks: number[]
+}
 export interface BehaviorChain {
   id: string
   repository: string
@@ -52,7 +56,9 @@ export interface BehaviorChain {
   held: string | null
   ciHold?: { invocationId: string, callId: string, head: string, queue?: QueueCiBlocker }
   testHold?: { invocationId: string, callId: string, sequence: number }
-  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string, recheck?: string }
+  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, base: string, admission?: string } & (
+    { merge: string, recheck?: string, triage?: never } | { merge?: never, recheck: string, triage: string }
+  )
   repairRecovery?: { report: number, key: string, holdSequence: number, head: string, basis: string, slot: string,
     diagnosis: string, note: string, admission?: string }
   waiting: string | null
@@ -70,13 +76,18 @@ export interface ChainRecoveryOrigin {
   origin: 'automatic' | 'operator' | 'unknown'
   intervention?: { callId: string, at: number, verifiedAt: number }
 }
+
+export function ciRefreshBasis(hold: NonNullable<BehaviorChain['ciHold']>): string {
+  // Advancing main does not change which failed Call owns this allowance.
+  return chainBasis(['refresh-pr-ci', hold.invocationId, hold.callId, hold.head])
+}
 export type ChainEvent =
   | { type: 'chain.admitted', repository: string, issue: number, branch: string, author: string, reviewer: string }
   | { type: 'chain.observed', observation: Record<string, unknown> }
   | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'], testHold?: Omit<NonNullable<BehaviorChain['testHold']>, 'sequence'> }
   | { type: 'chain.waiting', reason: string }
   | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'],
-    repairRecovery?: BehaviorChain['repairRecovery'], recovery?: ChainRecoveryOrigin }
+    repairRecovery?: BehaviorChain['repairRecovery'], approvalRecovery?: string, recovery?: ChainRecoveryOrigin }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
@@ -114,12 +125,29 @@ function resourceArtifact(prior: unknown, value: unknown): Record<string, unknow
 // cannot turn each capacity/observation read into a full journal scan.
 const LIVE_MODEL_SQL = 'resource_pending = 1'
 export const FIXTURE_RECHECK_WAIT = 'Implementation fixture recheck: waiting for its saved outcome'
+export const IMPLEMENTATION_TRIAGE_WAIT = 'Implementation hold report diagnosis pending:'
 /** Automatic holds for review-issue's authentication failures, which the
  *  runtime retires once Claude is signed in again: few chains, read every pass. */
 const AUTHENTICATION_HOLD_SQL = "merged = 0 AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%'"
 
 const ACTIVE_WORK_SQL = `CASE WHEN (json_extract(state, '$.mergeSha') IS NULL AND json_extract(state, '$.supersession') IS NULL AND json_extract(state, '$.held') IS NULL)
   OR (${LIVE_MODEL_SQL}) THEN 1 ELSE 0 END`
+const SETTLED_CLOSURE_SQL = `json_type(state, '$.observation.existingPulls') = 'array'
+  AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.observation.existingPulls') p
+    WHERE json_extract(state, '$.observation.externalMerge.merge_sha') IS NULL
+      OR lower(p.value) IS NOT lower('https://github.com/' || json_extract(state, '$.repository') || '/pull/' || json_extract(state, '$.observation.externalMerge.pull_number')))
+  AND resource_pending = 0 AND json_extract(state, '$.reviewPending') IS NOT 1
+  AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i WHERE json_extract(i.value, '$.state') IS NOT 'settled')
+  AND json_extract(state, '$.observation.publication.merged') IS 0
+  AND ((json_type(state, '$.observation.pull') = 'null'
+    AND json_type(state, '$.observation.publication.pull_number') = 'null'
+    AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
+    AND json_type(state, '$.observation.publication.state') = 'null')
+  OR (json_extract(state, '$.observation.pull.state') = 'closed'
+    AND json_extract(state, '$.observation.publication.state') = 'closed'
+    AND json_extract(state, '$.observation.pull.number') = json_extract(state, '$.observation.publication.pull_number')
+    AND json_extract(state, '$.observation.pull.merged') IS 0
+    AND json_extract(state, '$.observation.pull.mergeSha') IS NULL))`
 const RECHECK_AT_SQL = `CASE
   WHEN json_extract(state, '$.supersession') IS NOT NULL THEN NULL
   WHEN json_extract(state, '$.mergeSha') IS NOT NULL AND json_extract(state, '$.reviewPending') IS NOT 1 THEN NULL
@@ -143,6 +171,7 @@ const RECHECK_AT_SQL = `CASE
         OR json_extract(state, '$.waiting') LIKE 'Stage: implement-issue.% Next action: inspect the implementation Call, address the blocker, then explicitly Resume. Implementation hold reporting pending:%'
         OR json_extract(state, '$.waiting') LIKE 'Implementation hold report pending:%'
         OR json_extract(state, '$.waiting') = '${FIXTURE_RECHECK_WAIT}'
+        OR json_extract(state, '$.waiting') LIKE '${IMPLEMENTATION_TRIAGE_WAIT}%'
         OR json_extract(state, '$.waiting') LIKE 'Implementation hold report creation is unconfirmed;%'))
     THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,
@@ -175,6 +204,13 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (event.testHold) next.testHold = { ...event.testHold, sequence }
     else delete next.testHold
   } else if (event.type === 'chain.resumed') {
+    if (event.approvalRecovery) {
+      const original = next.invocations.at(-1)
+      if (!next.held || original?.behavior !== 'approve-pr' || original.state !== 'settled'
+        || original.callId !== event.approvalRecovery || event.ciRecovery || event.testRecovery || event.repairRecovery) {
+        throw new Error('approval conversation recovery requires its original automatic hold and Call')
+      }
+    }
     if (event.repairRecovery) {
       const recovery = event.repairRecovery, original = next.invocations.at(-1)
       if (!next.held || next.repairRecovery || recovery.admission || event.ciRecovery || event.testRecovery
@@ -187,15 +223,15 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
         throw new Error('repair report recovery requires its original automatic hold and pinned repair')
       }
       next.repairRecovery = recovery
-    } else if (!event.ciRecovery && !event.testRecovery) delete next.repairRecovery
+    } else if (!event.ciRecovery && !event.testRecovery && !event.approvalRecovery) delete next.repairRecovery
     if (event.testRecovery) {
       const recovery = event.testRecovery
       const proof = next.observation?.testDependency as { invocationId?: string, verified?: boolean, recovered?: boolean, recheck?: string,
-        recovery?: { merge: string, base: string } } | undefined
+        recovery?: { merge?: string, triage?: string, base: string } } | undefined
       const original = next.invocations.at(-1)
       const rechecked = !next.testHold && recovery.recheck && /^[a-f0-9]{64}$/.test(recovery.recheck)
         && proof?.recheck === recovery.recheck && proof.verified === true && proof.recovered === true
-        && proof.recovery?.merge === recovery.merge && proof.recovery.base === recovery.base
+        && proof.recovery?.merge === recovery.merge && proof.recovery?.triage === recovery.triage && proof.recovery?.base === recovery.base
         && proof.invocationId === recovery.hold.invocationId && original?.id === recovery.hold.invocationId
         && original.behavior === 'implement-issue' && original.callId === recovery.hold.callId && original.state === 'settled'
         && original.evidence?.status === 'failed' && original.evidence.action === 'not_started' && resourceReleaseProven(original.evidence, true)
@@ -203,11 +239,13 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
         && recovery.hold.sequence <= current.sequence
       if (!next.held || next.testRecovery || recovery.admission
         || (!rechecked && chainBasis(recovery.hold) !== chainBasis(next.testHold ?? null))
-        || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
+        || (recovery.triage === undefined ? !SHA.test(recovery.merge)
+          : !rechecked || recovery.merge !== undefined || !/^[a-f0-9]{64}$/.test(recovery.triage))
+        || !SHA.test(recovery.base)) throw new Error('test recovery requires its original automatic hold')
       next.testRecovery = event.testRecovery
-    } else if (!event.ciRecovery && !event.repairRecovery) delete next.testRecovery
+    } else if (!event.ciRecovery && !event.repairRecovery && !event.approvalRecovery) delete next.testRecovery
     next.held = null
-    if (!event.ciRecovery && !event.testRecovery && !event.repairRecovery) next.resumedAfterSequence = sequence
+    if (!event.ciRecovery && !event.testRecovery && !event.repairRecovery && !event.approvalRecovery) next.resumedAfterSequence = sequence
     delete next.ciHold
     delete next.testHold
   }
@@ -232,8 +270,17 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     next.supersession = event.evidence
     next.waiting = null
   } else if (event.type === 'invocation.admitted') {
-    if (next.held || next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
     const invocation = event.invocation
+    if (next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
+    if (invocation.behavior === 'refresh-pr-ci') {
+      const hold = next.ciHold, original = next.invocations.at(-1)
+      if (!next.held || !hold || hold.queue || original?.id !== hold.invocationId || original.callId !== hold.callId
+        || original.behavior !== 'repair-pr' || !resourceReleaseProven(original.evidence ?? {}, true)
+        || invocation.basis !== ciRefreshBasis(hold) || invocation.actor !== next.author || invocation.model !== null
+        || invocation.request.command !== 'github-interface' || invocation.request.nativeResources !== 2) {
+        throw new Error('CI refresh requires its original automatic hold and released repair Call')
+      }
+    } else if (next.held) throw new Error('behavior chain does not admit invocations')
     if (invocation.behavior === 'repair-pr' && next.repairRecovery) {
       const recovery = next.repairRecovery
       const prior = next.invocations.find(item => item.id === recovery.admission)
@@ -309,6 +356,11 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
       invocation.outcome = event.reason
     } else {
       if (invocation.state === 'settled' || !event.outcome.trim() || !Object.keys(event.evidence).length) throw new Error('behavior invocation settlement needs new native evidence')
+      if (invocation.behavior === 'refresh-pr-ci' && event.outcome === 'launch_deferred'
+        && (invocation.state !== 'admitted' || invocation.evidence !== null || event.callId !== null
+          || event.evidence.status !== 'deferred' || event.evidence.action !== 'not_started'
+          || event.evidence.outcome !== 'launch_deferred' || event.evidence.nativeCallId != null
+          || event.evidence.resource_ownership != null)) throw new Error('only a never-started CI refresh can settle without a Call')
       invocation.state = 'settled'
       invocation.callId = event.callId
       invocation.outcome = event.outcome
@@ -510,6 +562,16 @@ export class BehaviorChainJournal {
     return row.at
   }
 
+  /** Mirror hints only bring forward an otherwise deferred, settled seed. */
+  deferredSeedClosure(id: string, updatedAt: number, now: number): BehaviorChain | null {
+    const matches = cachedStatement(this.db, `SELECT 1 FROM behavior_chain_current WHERE chain_id = ? AND merged = 0
+      AND json_extract(state, '$.held') IS NOT NULL
+      AND json_type(state, '$.observation.issue.open') = 'true'
+      AND coalesce(json_extract(state, '$.observation.issue.updatedAt'), json_extract(state, '$.observation.checkedAt')) < ?
+      AND (${SETTLED_CLOSURE_SQL}) AND (${RECHECK_AT_SQL}) > ?`).get(id, updatedAt, now)
+    return matches ? this.read(id) : null
+  }
+
   /** Original recorded context/panel, never today's settings or a later
    * observation of an already-merged target. Old history stays immutable. */
   preMergeObservation(id: string, mergedAt: number): Record<string, unknown> | null {
@@ -620,22 +682,7 @@ export class BehaviorChainJournal {
       : cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current WHERE merged = ?
         ${merged ? '' : `AND json_extract(state, '$.supersession') IS NULL AND NOT coalesce((
           json_type(state, '$.observation.issue.open') = 'false'
-          AND json_type(state, '$.observation.existingPulls') = 'array'
-          AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.observation.existingPulls') p
-            WHERE json_extract(state, '$.observation.externalMerge.merge_sha') IS NULL
-              OR lower(p.value) IS NOT lower('https://github.com/' || json_extract(state, '$.repository') || '/pull/' || json_extract(state, '$.observation.externalMerge.pull_number')))
-          AND resource_pending = 0 AND json_extract(state, '$.reviewPending') IS NOT 1
-          AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i WHERE json_extract(i.value, '$.state') IS NOT 'settled')
-          AND json_extract(state, '$.observation.publication.merged') IS 0
-          AND ((json_type(state, '$.observation.pull') = 'null'
-            AND json_type(state, '$.observation.publication.pull_number') = 'null'
-            AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
-            AND json_type(state, '$.observation.publication.state') = 'null')
-          OR (json_extract(state, '$.observation.pull.state') = 'closed'
-            AND json_extract(state, '$.observation.publication.state') = 'closed'
-            AND json_extract(state, '$.observation.pull.number') = json_extract(state, '$.observation.publication.pull_number')
-            AND json_extract(state, '$.observation.pull.merged') IS 0
-            AND json_extract(state, '$.observation.pull.mergeSha') IS NULL))
+          AND (${SETTLED_CLOSURE_SQL})
         ), 0)`}
         AND chain_id > ? ORDER BY chain_id LIMIT ?`).all(merged ? 1 : 0, after, limit)) as Array<{ chain_id: string }>
     return rows.map((row) => this.read(row.chain_id)!)

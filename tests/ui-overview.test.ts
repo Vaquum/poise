@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { NOTICE_KINDS, LOCAL_NOTICE_KINDS, type Notice } from '../src/notices'
-import type { NotificationItem } from '../src/notification-items'
+import { notificationItems, type NotificationItem } from '../src/notification-items'
+import type { BehaviorDiagnostics } from '../src/behaviors'
 import { bellTally, DEFAULT_LEVEL, LEVEL_KEY, noticeGroup, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from '../src/ui/places/overview/level'
 import { chatOpening, diagnosticHref, itemOf, journalStep, targetOpening, timelineHref } from '../src/ui/places/overview/targets'
 import { chatState, countStates, issueState, pullState, taskPhase, taskState, type ChainLike } from '../src/ui/places/overview/states'
@@ -89,6 +90,79 @@ describe('the level', () => {
   })
 })
 
+describe('reviewer timeout presentation in Overview and its bell', () => {
+  const now = Date.parse('2026-11-14T08:35:00Z')
+  const trip = (extra: Partial<BehaviorDiagnostics['failures'][number]> = {}): BehaviorDiagnostics['failures'][number] => ({
+    org: 'acme', behavior: 'review-new-prs', target: 'reviewer:grok-4.7-xhigh', kind: 'operation', consecutiveFailures: 3,
+    failingSince: '2026-11-13T17:52:00Z', lastFailureAt: '2026-11-13T17:52:00Z', nextRetryAt: '2026-11-13T17:57:00Z',
+    error: 'grok-4.7-xhigh cannot review: it timed out before a verdict. Poise retries automatically.', callId: 'original-call', ...extra,
+  })
+  const snapshot = (extra: Partial<BehaviorDiagnostics> = {}): BehaviorDiagnostics => ({
+    status: 'ok', runtimeError: null, agentLogsError: null,
+    datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+    identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [], ...extra,
+  })
+  const entries = (diagnostics: BehaviorDiagnostics) => itemEntries(notificationItems([], diagnostics, now), () => null, new Map(), new Map(), now)
+  const due = 'The reviewer timed out. Recorded backoff elapsed; recovery unverified.'
+  const live = 'The reviewer timed out. Recorded backoff is active; recovery unverified.'
+
+  it('keeps an old due trip unverified without aging it into a fault, retaining its original evidence', () => {
+    const failure = trip({ nextRetryAt: new Date(now).toISOString() })
+    const original = structuredClone(failure)
+    const diagnostics = snapshot({ failures: [failure] })
+    const [item] = notificationItems([], diagnostics, now)
+    expect(item).toMatchObject({ title: due, began: failure.failingSince, when: failure.lastFailureAt,
+      details: [{ since: failure.failingSince, at: failure.lastFailureAt, next: failure.nextRetryAt, callId: 'original-call' }] })
+    expect(item.details[0].detail).toContain('3 consecutive operation failure(s)')
+    expect(item.details[0].detail).toContain(failure.error)
+    expect(entries(diagnostics)[0]).toMatchObject({ group: 'auto', title: due })
+    expect(bellTally(() => entries(diagnostics).map((entry) => entry.group))).toEqual({ count: 0, tone: '' })
+    setAnswerGroups(() => entries(diagnostics).map((entry) => entry.group))
+    expect(bellTally(() => ['fault'])).toEqual({ count: 0, tone: '' })
+    expect(diagnostics.failures[0]).toEqual(original)
+  })
+
+  it('separates an elapsed review trip from a live approval trip in the same organization and a reserved probe elsewhere', () => {
+    const diagnostics = snapshot({ failures: [trip(), trip({ behavior: 'approve-prs', nextRetryAt: new Date(now + 60_000).toISOString() }),
+      trip({ org: 'other', nextRetryAt: new Date(now + 120_000).toISOString() })] })
+    const items = notificationItems([], diagnostics, now)
+    expect(items.map((item) => [item.title, item.details.length])).toEqual([[due, 1], [live, 2]])
+    expect(items[1].details.map((entry) => entry.since)).toEqual([trip().failingSince, trip().failingSince])
+    expect(entries(diagnostics).map((entry) => entry.group)).toEqual(['auto', 'auto'])
+  })
+
+  it('does not let an older eligible organization age a newer active incident for the same model', () => {
+    const diagnostics = snapshot({ failures: [trip(), trip({ org: 'other', error: 'Selected model is at capacity.',
+      failingSince: new Date(now - 60 * 60_000).toISOString(), lastFailureAt: new Date(now - 60_000).toISOString(),
+      nextRetryAt: new Date(now + 60_000).toISOString() })] })
+    expect(entries(diagnostics).map((entry) => entry.group)).toEqual(['auto', 'auto'])
+    diagnostics.failures[1].failingSince = new Date(now - 4 * 60 * 60_000).toISOString()
+    expect(entries(diagnostics).map((entry) => entry.group)).toEqual(['auto', 'fault'])
+  })
+
+  it('keeps exhausted work, target holds, blocked review obligations and a stalled sweep as faults', () => {
+    const diagnostics = snapshot({ failures: [trip(),
+      trip({ target: 'acme/site#1', kind: 'worker' }),
+      trip({ target: 'acme/site#2', diagnostic: { severity: 'warning', code: 'approval_blocked_unresolved_conversations' } }),
+      trip({ target: undefined, error: 'The operation was aborted due to timeout' })],
+    deadLetters: [{ id: 'exhausted', behavior: 'review-new-prs', target: 'acme/site#3', createdAt: new Date(now).toISOString(),
+      error: 'Automatic retries stopped after two review timeouts', diagnostic: { severity: 'warning', code: 'review_budget_exhausted' } }] })
+    expect(entries(diagnostics).map((entry) => entry.group)).toEqual(['auto', 'fault', 'fault', 'fault', 'fault'])
+    const runtime = entries(snapshot({ failures: [trip()], runtimeError: 'The behavior scheduler is no longer responding.', status: 'degraded' }))
+    expect(runtime.map((entry) => entry.group)).toEqual(['auto', 'fault'])
+    const groups = () => entries(diagnostics).map((entry) => entry.group)
+    expect(bellTally(groups)).toEqual({ count: 4, tone: 'failed' })
+    setAnswerGroups(groups)
+    expect(bellTally(() => [])).toEqual({ count: 4, tone: 'failed' })
+  })
+
+  it('preserves authentication failures and refuses to infer due backoff from unreadable retry timing', () => {
+    const diagnostics = snapshot({ failures: [trip({ diagnostic: { severity: 'warning', code: 'authentication' } }), trip({ nextRetryAt: '' })] })
+    expect(entries(diagnostics).map((entry) => entry.group)).toEqual(['fault', 'fault'])
+    expect(entries(diagnostics)[1].title).toBe('The reviewer timed out. Retry timing and recovery are unverified.')
+  })
+})
+
 describe('where a notice’s target opens in the new places', () => {
   it('maps each of classic’s targets with a route back to Overview', () => {
     expect(targetOpening({ view: 'behaviors' })).toEqual({ href: '?view=settings&settings=behaviors&back=overview', label: 'Open Settings, Behaviors' })
@@ -142,6 +216,8 @@ describe('the work in the seven states', () => {
     const repairing = chain({ invocations: [{ behavior: 'repair-pr', state: 'settled', outcome: 'x' }, { behavior: 'review-pr', state: 'settled', outcome: 'x' }, { behavior: 'repair-pr', state: 'started', outcome: null }] })
     expect(taskPhase(repairing)).toEqual({ phase: 'Repair', round: 2 })
     expect(taskState(repairing)).toEqual({ state: 'running', note: 'Repair · round 2' })
+    expect(taskPhase(chain({ held: 'CI failed', invocations: [{ behavior: 'refresh-pr-ci', state: 'settled', outcome: 'updated' }] })))
+      .toEqual({ phase: 'Repair', round: 1 })
     expect(taskState(chain({ held: 'Removed from the merge queue by hand' }))).toEqual({ state: 'blocked', note: 'Removed from the merge queue by hand' })
     expect(taskState(chain({ invocations: [{ behavior: 'review-pr', state: 'uncertain', outcome: 'a reply may have posted' }] })).state).toBe('blocked')
     expect(taskState(chain({ waiting: 'waiting for memory' }))).toEqual({ state: 'waiting', note: 'waiting for memory' })

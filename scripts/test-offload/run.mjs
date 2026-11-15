@@ -20,6 +20,7 @@ import { cleanText, environmentSecrets, lineRedactor, redact } from './redaction
 const HERE = dirname(fileURLToPath(import.meta.url))
 const LEASE_MS = 10_000
 const RECOVERY_MS = 30_000
+const INTERRUPTED_CAPTURE_MS = 15_000
 const GATEWAY_RESTART = 'the gateway restarted'
 // A suite that reached for Docker on a job, which has none: it starts again on a sandbox, which has.
 const USES_DOCKER = 'this suite uses Docker'
@@ -30,6 +31,9 @@ const zip = promisify(gzip)
 // The first bytes go at once: a proxy gives up on a download that stays silent for long.
 const FIRST_CHUNK_BYTES = 64 * 1024
 const FRAME = { heartbeat: 0, stdout: 1, stderr: 2, exit: 3, fail: 4, ready: 5, evidence: 6 }
+// The first-failure reporter bounds its record to 8 KiB. Either diagnostic may follow unterminated stderr.
+const FIRST_ASSERTION = /\[poise\] first test failure: [^\n]+ > [^\n]+\nAssertionError: \S[^\n]*\n/
+const RUNNER_NO_RESULT = /\[poise\] no test result: [^\n]+\. This says nothing/
 // What a suite cannot run without although git ignores it.
 const DEPENDENCIES = new Set(['node_modules', '.venv', 'venv'])
 // Nothing a suite needs: credentials by name, and what only the provider CLIs and Poise read.
@@ -287,6 +291,9 @@ async function main(args) {
   const configuredMs = Number(configuredLimit) * 1000
   const limit = shellLimit > 0 ? Math.min(configuredMs, shellLimit) : configuredMs
   const lifetime = new AbortController()
+  const retainFailedSource = Boolean(process.env.AGENT_INTERFACE_FAILED_SOURCE_CALL)
+  let candidate
+  let assertionRun = null
   let current = null
   let ending = false
   const call = async (method, path, body, signal = lifetime.signal) => {
@@ -294,13 +301,17 @@ async function main(args) {
     if (!response.ok) throw Object.assign(new Error(`the test relay answered ${method} ${path} with HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`), { status: response.status })
     return response
   }
-  const stop = (code, message) => {
+  const stop = async (code, message, interrupted = Boolean(message)) => {
     if (ending) return
     ending = true
+    clearTimeout(deadline)
     lifetime.abort()
-    const exit = () => message ? die(message, code) : finish(code)
-    if (current) call('DELETE', `/runs/${current}`, undefined, AbortSignal.timeout(1_000)).then(exit, exit)
-    else exit()
+    await Promise.allSettled([
+      current && call('DELETE', `/runs/${current}`, undefined, AbortSignal.timeout(1_000)),
+      interrupted && assertionRun && retainSource(assertionRun, 'interrupted'),
+    ])
+    if (message) die(message, code)
+    else finish(code)
   }
   const deadline = setTimeout(() => stop(124, 'the test offload exhausted its total time budget'), limit)
   for (const [signal, number] of [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1]]) {
@@ -323,6 +334,18 @@ async function main(args) {
   writeFileSync(specification, spec, { mode: 0o600 })
   let dependencyRange
   process.once('exit', () => rmSync(directory, { recursive: true, force: true }))
+  const retainSource = async (id, result) => {
+    // The exact bytes sent to the box can differ from the checkout by now.
+    // Interrupted capture has its own deadline because the suite budget may already have aborted.
+    const options = result === 'interrupted' ? { timeout: INTERRUPTED_CAPTURE_MS, killSignal: 'SIGKILL' } : { signal: lifetime.signal }
+    const saved = await new Promise((done) => {
+      const child = spawn('agent-interface', ['--capture-failed-source', archive, specification, candidate, id, String(result)],
+        { stdio: 'ignore', ...options })
+      child.once('error', () => done(false))
+      child.once('close', (code) => done(code === 0))
+    }).catch(() => false)
+    if (!saved) say('failed source capture unavailable; remediation requires a fresh reproduction')
+  }
   const capture = async () => {
     const indexPath = join(directory, 'tar.index')
     const index = boundaries ? ['--block-number', '-v', '--quoting-style=escape', `--index-file=${indexPath}`] : []
@@ -451,7 +474,6 @@ async function main(args) {
     throw new Error(`the test relay did not recover within ${RECOVERY_MS / 1000} s${lastError ? `: ${lastError.message}` : ''}`)
   }
 
-  let candidate
   try {
     say('this suite runs on a disposable test box; files it changes stay there. Capturing the checkout.')
     candidate = await capture()
@@ -470,21 +492,28 @@ async function main(args) {
       let failure = null
       let upload = null
       let uploadError = null
+      let diagnosticTail = ''
+      let runnerNoResult = false
       const pytestFailure = callerPytest ? callerPytestFailure() : null
+      let evidence = null
       const read = frameReader((type, payload) => {
         if (type === FRAME.stdout || type === FRAME.stderr) pytestFailure?.write(type, payload)
+        if (type === FRAME.stderr && retainFailedSource) {
+          // This diagnostic selects bytes for inspection only. Assertion recovery requires signed evidence.
+          const diagnostic = diagnosticTail + payload.toString()
+          if (upload && !assertionRun && FIRST_ASSERTION.test(diagnostic)) assertionRun = id
+          runnerNoResult ||= RUNNER_NO_RESULT.test(diagnostic)
+          diagnosticTail = diagnostic.slice(-8193)
+        }
         if (type === FRAME.stdout) process.stdout.write(payload)
         else if (type === FRAME.stderr) process.stderr.write(payload)
-        else if (type === FRAME.exit) exitCode = Number(payload.toString())
+        else if (type === FRAME.exit) {
+          exitCode = Number(payload.toString())
+          // Once a terminal result is received, the deadline cannot replace it.
+          clearTimeout(deadline)
+        }
         else if (type === FRAME.evidence && binding && process.env.POISE_TEST_EVIDENCE_DIR && payload.length <= 48 * 1024) {
-          // Only the gateway can authenticate this receipt. Caller checks it
-          // independently and retains it before reclaiming this directory.
-          try {
-            writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, `${id}.json`), payload, { flag: 'wx', mode: 0o600 })
-          } catch (error) {
-            // A failed receipt must not replace the suite's genuine exit with a no-result handoff.
-            say(`assertion recovery evidence could not be retained: ${error.message}`)
-          }
+          evidence = payload
         }
         else if (type === FRAME.fail) failure = { code: payload[0], message: payload.subarray(1).toString() }
         else if (type === FRAME.ready && !upload) {
@@ -511,7 +540,8 @@ async function main(args) {
         controller.abort()
         await upload
       }
-      current = null
+      if (ending) return
+      if (failure || exitCode !== null) current = null
       if (failure?.code === 143) { finish(143); return }
       if (failure?.code === 125 && failure.message === USES_DOCKER && !docker) {
         say('the suite reached for Docker, which this box has not: running it again on a box with Docker.')
@@ -520,37 +550,37 @@ async function main(args) {
         attempt -= 1
         continue
       }
-      if (failure?.code === 125 && failure.message === GATEWAY_RESTART) {
+      if (failure?.code === 125 && (failure.message === GATEWAY_RESTART
+        || failure.message.startsWith('sending the checkout to the box failed: '))) {
         say(`interrupted validation: candidate ${candidate}, suite ${suite}, run ${id}: no test result: ${failure.message}`)
         if (attempt === 0) {
           say('waiting up to 30 s for the authenticated relay handshake, then retrying this captured suite once within the remaining time budget')
           continue
         }
       }
-      if (failure) die(failure.message, failure.code)
-      else if (exitCode === null) die('the connection to the test relay ended before the suite did')
+      if (failure) await stop(failure.code, failure.message)
+      else if (exitCode === null) await stop(125, 'the connection to the test relay ended before the suite did')
+      else if (exitCode === 125 && runnerNoResult) await stop(exitCode, undefined, true)
       else {
-        const summary = exitCode !== 0 ? pytestFailure?.summary() : null
-        if (summary) say(`completed Caller pytest failure: captured candidate ${candidate}, producing run ${id}, exit ${exitCode}\n${summary}`)
-        // The suite has its result; its budget must not replace it during source capture.
-        clearTimeout(deadline)
-        if (exitCode > 0 && process.env.AGENT_INTERFACE_FAILED_SOURCE_CALL) {
-          // Read the archive that was actually sent, while it still exists. A later
-          // edit under the same HEAD must never replace this validation's source.
-          const retained = spawn('agent-interface', ['--capture-failed-source', archive, specification, candidate, id, String(exitCode)],
-            { stdio: 'ignore', signal: lifetime.signal })
-          const saved = await new Promise((done) => {
-            retained.once('error', () => done(false))
-            retained.once('close', (code) => done(code === 0))
-          })
-          if (!saved) say('failed source capture unavailable; remediation requires a fresh reproduction')
+        // Receipt delivery can precede exit. Retain it only with the suite result.
+        if (exitCode === 1 && evidence) {
+          try {
+            writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, id + '.json'), evidence, { flag: 'wx', mode: 0o600 })
+          } catch (error) {
+            say('assertion recovery evidence could not be retained: ' + error.message)
+          }
+        }
+        if (exitCode !== 0) {
+          const summary = pytestFailure?.summary()
+          if (summary) say(`completed Caller pytest failure: captured candidate ${candidate}, producing run ${id}, exit ${exitCode}\n${summary}`)
+          if (exitCode > 0 && retainFailedSource) await retainSource(id, exitCode)
         }
         finish(exitCode)
       }
       return
     }
   } catch (error) {
-    if (!ending) stop(125, error.message)
+    if (!ending) await stop(125, error.message)
   } finally {
     clearTimeout(deadline)
   }

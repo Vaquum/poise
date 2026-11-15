@@ -318,6 +318,28 @@ describe('readPrStatus', () => {
     await (await import('../server/agent')).fetchAgentLogSnapshot()
   }
 
+  it('shows the latest legacy checkpoint when the snapshot also retains older slices', async () => {
+    const { runtime, status } = await setup()
+    const now = Date.now()
+    seedCache(runtime, new Date(now).toISOString())
+    const root = '1'.repeat(32)
+    const current = '2'.repeat(32)
+    fixture.agentLogs = [root, current].map((id, index) => {
+      const at = now - 1000 * (2 - index)
+      const link = { root_call: root, basis: '3'.repeat(64), generation: 13 * (index + 1) }
+      return agentLog({ id, status: 'failed', correlation_id: id, completed_at: new Date(at).toISOString(),
+        started_at: new Date(at - 100).toISOString(), started_at_precise: new Date(at - 100).toISOString(),
+        action: 'not_started', outcome: 'incomplete', error_code: 'review_continuation_required', error: 'Saved review units',
+        resources_settled_at: new Date(at).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] },
+        artifact: { phase: 'reviewing', review_resume: link, review_checkpoint: { ...link, unit: 6 * (index + 1),
+          required_units: 23, attempts: 7 + 6 * index, spent_ms: 10_000 * (index + 1),
+          allowance_ms: 2_826_000, last_progress_at: at, progress_call: id } } })
+    })
+    await (await import('../server/agent')).fetchAgentLogSnapshot({ fresh: true })
+    const { rows } = await status.readPrStatus(50, now)
+    expect(rows[0].reviewProgress).toMatchObject({ callId: current, root_call: root, generation: 26, unit: 12 })
+  })
+
   it.each([
     ['review-new-prs', ''], ['review-new-prs', ':secondary'], ['review-new-prs', ':tertiary'], ['approve-prs', ''],
   ] as const)('projects the scoped %s %s check retry before, at and after its due time until cleared', async (behavior, slot) => {

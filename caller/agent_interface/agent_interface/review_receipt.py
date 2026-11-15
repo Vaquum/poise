@@ -257,6 +257,8 @@ def work_publication(head: str, *, start_replies: bool = False) -> None:
                            "and behavior in ('implement_issue','repair_pr') and action_plan is not null "
                            "and coalesce(error_code,'') not in ('stopping','stopped')", (call_id,)).fetchone()
         artifact = json.loads(row[0]) if row and row[0] else {}
+        if isinstance(artifact.get("retirement"), dict) and artifact["retirement"].get("cause") == "target_closed":
+            raise RuntimeError("work publication fenced by verified target closure")
         if not row or artifact.get("phase") not in {"preparing_publication", "publishing"} or not artifact.get("plan_sha"):
             raise RuntimeError("work publication lacks its original native action plan")
         if start_replies:
