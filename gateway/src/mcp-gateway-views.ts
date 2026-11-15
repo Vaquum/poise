@@ -9,14 +9,14 @@ import type { LoggingRead } from './diagnostics/query-types.js'
 import { HttpError } from './http.js'
 import { listDevices } from './link.js'
 import { isMcpLoggingKind, mcpWorkspaceAllowed, type McpGatewayView, type McpGrantScope,
-  type McpLoggingArguments, type McpLoggingKind, type McpRead } from './mcp-contract.js'
+  type McpLoggingArguments, type McpLoggingKind, type McpRequest } from './mcp-contract.js'
 import type { User } from './store.js'
 
 type GatewayRead = { op: 'view'; id: McpGatewayView }
   | { op: 'event'; kind: McpLoggingKind; id: string }
   | { op: 'list'; args: McpLoggingArguments }
 
-export function gatewayMcpRead(read: McpRead): GatewayRead | null {
+export function gatewayMcpRead(read: McpRequest): GatewayRead | null {
   if (read.name === 'poise_get') {
     if (read.arguments.kind === 'gateway') return { op: 'view', id: read.arguments.id }
     if (isMcpLoggingKind(read.arguments.kind)) return { op: 'event', kind: read.arguments.kind, id: read.arguments.id }

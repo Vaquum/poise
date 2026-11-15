@@ -26,6 +26,12 @@ Call `poise_work` with one of these selectors:
 {"repository":"autonomio/poise","label":"poise","limit":5}
 ```
 
+Label pages also accept a UTC issue creation window. Pass `since` (inclusive)
+and `until` (exclusive) as `YYYY-MM-DDTHH:MM:SSZ`. Keep the window the same
+on continuation. Each row reports the known intake eligibility and selected
+label. The mirror does not retain label application times, so that history
+is reported separately as unavailable.
+
 The repository must belong to a ready followed account in the owner's workspace.
 Label pages include all matching issues, including closed issues and third-party
 authors without configured-account involvement, Calls or chains. They use the
@@ -49,8 +55,10 @@ The result carries `work.items`, observation time and per-source coverage:
 - `coverage.issues` reports mirror freshness. Stale rows remain readable;
   failed issue reads return no rows with their reason, never confirmed absence.
 - Each item's chain and GitHub observation coverage are independent. Stage,
-  issue age in milliseconds, latest invocation admission time, step and blocker
-  come from retained records. `not_recorded` means no chain or retained ledger
+  issue age in milliseconds, latest invocation admission time, step, blocker
+  and next actor and action come from retained records. The next action is an
+  observation of the current chain and can still require runtime admission.
+  `not_recorded` means no chain or retained ledger
   work within fresh coverage, not proof about execution before collection or
   retention. Missing work with incomplete coverage remains `unknown`.
 - The latest five invocation receipts retain original Call IDs, recorded action,
@@ -163,6 +171,26 @@ Use `poise_get` with `kind: "snippet"` and a switch name, or with
 `kind: "memory"` and `id: "current"` for the saved revision. Text is limited
 to an 8,000-character preview and reports truncation. Cached review coverage
 retains its original observation time.
+
+## Delegate Manager controls
+
+The owner can separately delegate Manager actions in Connected agents consent.
+The active workspace Manager's limits and Chat policies apply. A client can
+queue a message, steer a running turn, stop a Chat or schedule supervision of
+one Chat. Supervision persists across turns and requires a workspace-wide grant.
+
+Call `poise_action_preview` with `operation` and `sessionId`. Send and steer
+also take `text`. Supervision takes `text` and `intervalMinutes`. The result
+shows the target and sequence, current turn, acting Manager, delegated client,
+effect and any required human decision. Use the opaque `preview` with
+`poise_action_apply` after checking that the effect matches the requested task.
+
+An unused preview lasts five minutes. Apply checks the current Manager, Chat
+basis and grant again. Reusing the same preview returns the durable original
+outcome or explicitly reports uncertainty. The command receipt identifies the
+grant, client and target. Messages report queue admission, and stops report
+whether execution settled. A send or steering action cannot approve a native
+permission request or supply the person's answer.
 
 ## Private plugin
 

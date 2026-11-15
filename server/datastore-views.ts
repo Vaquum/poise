@@ -16,7 +16,7 @@ const COMMON = ['--format', '--repo', '--status', '--author', '--number', '--upd
 // and Caller ignores them, so a call naming one is left to the CLI.
 const FLAGS: Record<ViewName, readonly string[]> = {
   pr: COMMON,
-  issue: [...COMMON, '--label', '--after-repo', '--after-number'],
+  issue: [...COMMON, '--label', '--after-repo', '--after-number', '--created-before-datetime'],
   user: [...COMMON, '--username', '--item-type'],
 }
 const INTEGER_FLAGS = new Set(['--number', '--limit', '--after-number'])
@@ -32,6 +32,7 @@ export interface DatastoreViewQuery {
     number?: number
     updated_since?: string
     created_since?: string
+    created_before?: string
     label?: string
     after_repo?: string
     after_number?: number
@@ -71,7 +72,8 @@ export function parseViewArgs(args: readonly string[]): DatastoreViewQuery | nul
   // `_created_since`: either flag, never both.
   if (values.has('--created-since-datetime') && values.has('--created-at-datetime')) return null
   const createdSince = datetime(values.has('--created-at-datetime') ? '--created-at-datetime' : '--created-since-datetime')
-  if (updatedSince === null || createdSince === null) return null
+  const createdBefore = datetime('--created-before-datetime')
+  if (updatedSince === null || createdSince === null || createdBefore === null) return null
 
   const limit = integer('--limit')
   if (limit === 0) return null
@@ -93,6 +95,7 @@ export function parseViewArgs(args: readonly string[]): DatastoreViewQuery | nul
   set('number', integer('--number') ?? undefined)
   set('updated_since', updatedSince)
   set('created_since', createdSince)
+  set('created_before', createdBefore)
   set('label', label)
   set('after_repo', afterRepo)
   set('after_number', afterNumber ?? undefined)
@@ -139,6 +142,7 @@ export function selectView(db: Database.Database, query: DatastoreViewQuery): Re
   }
   if (filters.updated_since !== undefined) { where.push('updated_at >= ?'); params.push(filters.updated_since) }
   if (filters.created_since !== undefined) { where.push('created_at >= ?'); params.push(filters.created_since) }
+  if (filters.created_before !== undefined) { where.push('created_at < ?'); params.push(filters.created_before) }
   const paged = filters.after_repo !== undefined && filters.after_number !== undefined
   if (paged || filters.label !== undefined) {
     if (view !== 'issues') throw new Error(`${view} has no issue filters`)
