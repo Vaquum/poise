@@ -652,6 +652,9 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             record(receipt)
             progress.stage("publishing", "Publishing the verified checkout through github-interface")
             published = issue_review.interface(*publication_args, "--mode", "publish", seconds=120)
+            if published.get("outcome") == "repair_queue_blocked":
+                record({**receipt, "phase": "repair_queue_blocked", "queue_blocker": published.get("queue_blocker")})
+                return published
             if published.get("outcome") == "prerequisite_wait":
                 if pull is not None:
                     raise AtomicWorkFailed("prerequisite wait is only available for first publication")

@@ -5,7 +5,7 @@ import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-r
 import type { DetachedProcessExit } from './process'
 import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS,
   chainReviewResponse, ciRefreshRequest, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold,
-  heldCiRepair, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+  heldCiRepair, implementationTestDependency, queueCiBlocker, repairQueueBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -1202,6 +1202,27 @@ export class BehaviorChainRuntime {
       this.operations.received(invocation, call)
       return this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
         outcome: 'prerequisite_wait', evidence: { ...receipt(call), status: 'deferred', action: 'not_started', outcome: 'prerequisite_wait' } })
+    }
+    if (call.outcome === 'repair_queue_blocked') {
+      const evidence = { ...invocation.evidence, ...receipt(call), callId: call.id }
+      const prior = invocation.evidence?.artifact as Record<string, unknown> | undefined
+      const reason = 'repair queue blocker conflicts with the original publication admission or receipt'
+      if (call.model !== invocation.model || String(call.pr_id) !== invocation.request.argv[invocation.request.argv.indexOf('--pull-number') + 1]
+        || call.expected_head !== invocation.request.context?.head || invocation.evidence?.queueBlockerConflict === true
+        || prior?.replies_started === true || prior?.result != null
+        || (prior?.publication_head != null && prior.publication_head !== call.artifact?.publication_head)
+        || !repairQueueBlocker(chain, { ...invocation, callId: call.id, evidence })) {
+        const conflicted = { ...evidence, queueBlockerConflict: true }
+        if (!sameReceipt(invocation.evidence, conflicted)) chain = this.append(chain, {
+          type: 'invocation.reconciled', invocationId: invocation.id, evidence: conflicted })
+        return invocation.state === 'uncertain' && invocation.outcome === reason ? chain
+          : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id, reason })
+      }
+      this.operations.received(invocation, call)
+      chain = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
+        outcome: 'repair_queue_blocked', evidence: { ...evidence, nativeCallStatus: call.status, status: 'deferred' } })
+      this.operations.wake()
+      return chain
     }
     if (prReview && invocation.request.argv.includes('--review-slot')) {
       const checkpoint = yieldedReview(call)

@@ -63,6 +63,7 @@ def helper_cli():
         return {'repository': {'ref': {'target': {'oid': state['head'],
                 'message': f"fix: repair\n\nPoise-Invocation: {os.environ['AGENT_INTERFACE_RECEIPT_CALL']}"}},
                 'defaultBranchRef': {'target': {'oid': 'c' * 40}},
+                'pullRequest': {'id': 'pull-3', 'state': 'OPEN', 'headRefOid': state['head'], 'mergeQueueEntry': None},
                 'issue': {'closedByPullRequestsReferences': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}}}
 
     async def post(path, **payload):

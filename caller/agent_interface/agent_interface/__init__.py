@@ -1967,7 +1967,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                     failure = retain_native_failure(id_, error, diagnostic=failure)
                     raise
             outcome = result.get("outcome")
-            if outcome not in {"published", "no_changes", "superseded", "target_closed", "prerequisite_wait"}:
+            if outcome not in {"published", "no_changes", "superseded", "target_closed", "prerequisite_wait", "repair_queue_blocked"}:
                 raise RuntimeError("atomic behavior returned no publication outcome")
             if outcome == "target_closed":
                 if pull is not None or behavior != "implement_issue":
@@ -1975,6 +1975,28 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                 record({**artifact, "retirement": {"cause": "target_closed", "detected_at": time()}})
                 finish(id_, "superseded", response=json.dumps(result), outcome="target_closed",
                        head_sha=None, action="not_started", error_code="target_closed")
+            elif outcome == "repair_queue_blocked":
+                blocker = artifact.get("queue_blocker")
+                if pull is None or artifact.get("phase") != outcome or not isinstance(blocker, dict) \
+                        or blocker != result.get("queue_blocker") or blocker.get("call_id") != id_ \
+                        or (blocker.get("repository"), blocker.get("pull_number"), blocker.get("ref"), blocker.get("head")) \
+                        != (repo, pull, f"refs/heads/{branch}", expected_head) \
+                        or artifact.get("result") is not None or result.get("head_sha") != expected_head \
+                        or result.get("reply_receipts") is not None:
+                    raise RuntimeError("repair queue blocker lacks the original no-write publication evidence")
+                if blocker.get("kind") == "already_queued":
+                    valid = (isinstance(blocker.get("entry_id"), str) and bool(blocker["entry_id"])
+                             and artifact.get("publication_head") is None
+                             and artifact.get("replies_started") is None)
+                else:
+                    attempted = blocker.get("attempted_head")
+                    valid = (blocker.get("kind") == "push_rejected" and blocker.get("rejection_code") == "GH006"
+                             and isinstance(attempted, str) and re.fullmatch(r"[0-9a-f]{40}", attempted)
+                             and attempted != expected_head and attempted == artifact.get("publication_head")
+                             and artifact.get("replies_started") is False)
+                if not valid:
+                    raise RuntimeError("repair queue blocker contradicts the original push or reply checkpoint")
+                finish(id_, "completed", response=json.dumps(result), outcome=outcome, head_sha=None, action="not_started")
             elif outcome == "prerequisite_wait":
                 if pull is not None or artifact.get("phase") != "prerequisite_wait" \
                         or artifact.get("publication_head") is not None or artifact.get("replies_started") is not None \
