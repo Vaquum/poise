@@ -7,7 +7,8 @@ Use `poise_describe` to identify the authorized workspace, then `poise_work`
 with `repository` and either an exact `issue` number or `label`. Follow
 `nextCursor` with the same repository, label and limit to read another page.
 Keep stable issue, chain, invocation and Call identities in the explanation
-and use the returned links to open the owner's records.
+and use the returned links to open the owner's records. Request `live: true`
+for an exact issue to corroborate its recorded pull request with GitHub.
 
 When `poise_describe` lists `poise_get`, read a known Chat ID with `kind: "chat"`
 and follow its live timer IDs with `kind: "timer"`. Report pending delivery and

@@ -436,6 +436,12 @@ it('traces bounded label pages and exact issues through a packaged SDK connectio
   await mkdir(caller)
   // Run the repository's real read-only CLI; no provider or GitHub CLI can run.
   await writeFile(join(caller, 'github-datastore'), `#!/usr/bin/env python3\nimport sys\nsys.path.insert(0, ${JSON.stringify(resolve('caller/github_datastore'))})\nfrom github_datastore.cli import main\nmain()\n`, { mode: 0o755 })
+  await writeFile(join(caller, 'github-interface'), `#!/usr/bin/env python3
+import json, sys
+assert sys.argv[1:] == ['--pull-action-state', '14', '--repository', 'acme/repo', '--token-user', 'reviewer', '--queue-evidence']
+print(json.dumps({'repository': 'acme/repo', 'pull_number': 14, 'head_sha': 'a' * 40, 'state': 'closed', 'merged': True,
+                  'merge_sha': 'b' * 40, 'merged_at': '2026-11-10T00:00:00Z', 'queue_entry_id': None, 'queue_entry': None}))
+`, { mode: 0o755 })
   execFileSync('python3', ['-c', `
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -618,6 +624,12 @@ conn.close()
     expect(reads.mock.calls.map(call => call[0])).toEqual(['acme/repo#3', 'acme/repo#4'])
     expect(receipts.mock.calls).toHaveLength(4)
     expect(receipts.mock.calls.every(call => call[0].operation === 'list' && call[0].limit === 5 && call[0].repository === 'Acme/Repo')).toBe(true)
+    const live = await work({ repository: 'Acme/Repo', issue: 4, live: true })
+    expect(live.items[0]).toMatchObject({ reviewStatus: 'pending', liveGitHub: { coverage: 'complete',
+      record: { number: 14, head: 'a'.repeat(40), mergeSha: 'b'.repeat(40), recordedHeadMatches: true,
+        recordedMergeMatches: true, gates: null } } })
+    expect((await connection.client.callTool({ name: 'poise_work',
+      arguments: { repository: 'Acme/Repo', label: 'poise', live: true } })).isError).toBe(true)
     let inFlight = 0, maxInFlight = 0
     receipts.mockImplementation((request) => {
       inFlight += 1

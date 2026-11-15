@@ -9,7 +9,7 @@ export const MCP_TOOLS = [
     annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_work', description: 'Read an exact issue or a bounded repository and label page, with recorded work, receipt coverage and links. Missing or stale evidence does not establish completion.',
     inputSchema: { type: 'object', required: ['repository'], properties: {
-      repository: { type: 'string', maxLength: 140 }, issue: { type: 'integer', minimum: 1 },
+      repository: { type: 'string', maxLength: 140 }, issue: { type: 'integer', minimum: 1 }, live: { const: true, description: 'Read live GitHub gates for an exact issue’s recorded PR' },
       label: { type: 'string', minLength: 1, maxLength: 100 }, limit: { type: 'integer', minimum: 1, maximum: 10 },
       since: { type: 'string', description: 'Inclusive issue creation time in UTC (YYYY-MM-DDTHH:MM:SSZ)' },
       until: { type: 'string', description: 'Exclusive issue creation time in UTC (YYYY-MM-DDTHH:MM:SSZ)' },
@@ -46,7 +46,7 @@ export interface McpGrantScope {
   chatTranscript?: true
   repository?: string
 }
-export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string; since?: string; until?: string }
+export interface McpWorkArguments { repository: string; issue?: number; live?: true; label?: string; limit?: number; cursor?: string; since?: string; until?: string }
 export interface McpGetArguments { kind: 'chat' | 'timer'; id: string }
 export interface McpChatListArguments { kind: 'chat'; repository: string | null; since: string | null; until: string | null; limit: number; cursor?: string }
 export interface McpChatChangesArguments { kind: 'chat'; id: string; limit: number; afterSequence?: number; cursor?: string }
@@ -124,13 +124,15 @@ export function parseMcpRead(value: unknown): McpRead {
   }
   if (row.name !== 'poise_work') throw new Error('unsupported tool or arguments')
   const work = args as Record<string, unknown>
-  if (Object.keys(work).some(key => !['repository', 'issue', 'label', 'limit', 'cursor', 'since', 'until'].includes(key))
+  if (Object.keys(work).some(key => !['repository', 'issue', 'live', 'label', 'limit', 'cursor', 'since', 'until'].includes(key))
     || !isMcpRepository(work.repository)) throw new Error('invalid repository or work selector')
   if (work.issue !== undefined) {
     if (!Number.isSafeInteger(work.issue) || Number(work.issue) < 1
-      || Object.keys(work).some(key => !['repository', 'issue'].includes(key))) throw new Error('an exact issue accepts only repository and issue')
-    return { name: row.name, arguments: { repository: work.repository, issue: Number(work.issue) } }
+      || (work.live !== undefined && work.live !== true)
+      || Object.keys(work).some(key => !['repository', 'issue', 'live'].includes(key))) throw new Error('an exact issue accepts repository, issue and optional live=true')
+    return { name: row.name, arguments: { repository: work.repository, issue: Number(work.issue), ...(work.live ? { live: true } : {}) } }
   }
+  if (work.live !== undefined) throw new Error('live GitHub evidence requires one exact issue')
   if (typeof work.label !== 'string' || !work.label.trim() || work.label.length > 100
     || (work.limit !== undefined && (!Number.isSafeInteger(work.limit) || Number(work.limit) < 1 || Number(work.limit) > 10))
     || (work.cursor !== undefined && (typeof work.cursor !== 'string' || !work.cursor || work.cursor.length > 2048))) throw new Error('a label page requires a label and a limit from 1 to 10')
