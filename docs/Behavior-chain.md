@@ -994,36 +994,39 @@ implementation age. This covers verification before reservation and reconciliati
 of an unconfirmed creation intent without another POST. A verified report or terminal
 disposition returns to the ordinary quiescent cadence; operator holds retain it.
 
-These pre-PR implementation-hold reports require explicit triage before their
-own implementation can prepare or start. A posted issue review alone cannot
-authorize implementation. Through the existing guarded `/api/behavior-chains`
-control, the workspace owner records `source-only` or `distinct-fix`, with a
-diagnosis and next action. Read `GET /api/behavior-chains?id=OWNER/REPO%23N` for
-the report chain's current sequence and `implementationReport` binding, then
-POST `{ id, sequence, operation: "report-disposition", binding, disposition }`.
-`binding` is that exact read value. `disposition` contains `kind`, `review`
-(the settled native issue-review invocation ID), `commentId` (its posted receipt),
-`diagnosis` and `nextAction`. Triage must identify an independently implementable,
-verified defect to select `distinct-fix`; source-candidate-only failures select
-`source-only`. The control verifies the publishing account and report marker,
-the reviewed title/body revision and native posted-review receipt, the source's
-exact original hold event and Call, and configured ownership. It persists the
-disposition inside the existing report intent and records the diagnosis and next
-action on both chains. Labels, comment wording and closure supply no disposition.
+Pre-PR implementation-hold reports need a current disposition before their
+own implementation can prepare or start. After a generated report's native issue
+review settles, Poise can make one bounded read-only diagnosis for the same
+report revision and review, source hold and Call, configured accounts, base and
+retained capture. It runs the named Vitest assertion on clean, pinned main. A
+matching assertion failure scopes a `distinct-fix` disposition. For
+`source-only`, the exact retained candidate must reproduce that assertion and
+the same test must pass against clean prepared and current source bases. The
+credential-free test box runs the candidate and any captured test used for a
+clean control. An unexercised test, a different failure or unavailable candidate
+evidence leaves the missing fact on the source hold. A restart or observation
+with the same evidence reuses the saved result or interrupted intent.
 
-At implementation admission, missing or stale dispositions wait visibly, even
-when new report publishing is disabled. `source-only` leaves the source held and
-starts no report implementation on main. Checkout availability remains explicitly
-unverified; disposition does not depend on retaining the unpublished checkout.
-Only a current `distinct-fix` can pass through the ordinary implementation gates.
-Admission freshly verifies the original source's open state, no-publication and
-resource-release evidence before and after awaited preparation, and guards the
-source journal revision atomically with admission. Resume, a replacement Hold
-(even with identical text), a different failed Call, changed report revision or
-new source publication invalidates the old binding. The report link and generated
-issue recursion guard remain retained. No disposition retries the source: later
-source work still requires existing verified recovery or explicit Resume, original
-no-publication/resource evidence and absence of competing work.
+The workspace owner can also record `source-only` or `distinct-fix` through
+`POST /api/behavior-chains`. Read `GET /api/behavior-chains?id=OWNER/REPO%23N`
+for the report chain's current `sequence` and `implementationReport` binding,
+then submit `{ id, sequence, operation: "report-disposition", binding, disposition }`.
+`disposition` contains `kind`, `review` (the settled native issue-review invocation
+ID), `commentId` (its posted receipt), `diagnosis` and `nextAction`. Both paths bind
+the publishing account and marker, reviewed revision, native posted-review
+receipt, original hold and Call. Poise records the disposition, diagnosis and next
+action on the linked chains.
+
+Only a current `distinct-fix` admits report implementation under the ordinary
+gates, including fresh source verification and the source journal precondition.
+An automatically verified `source-only` hands the diagnosis to one fresh
+implementation on the original chain through the same scheduler and validation
+gates. The retry requires fresh no-publication, released resources and a current
+report review after provider preparation. Its original hold, disposition and
+admission persist across restart. A repeated failure requires another operator
+decision. A manually recorded `source-only` leaves the source on its existing
+recovery or Resume path. Replacement Holds, changed Calls, stale reviews and new
+publication fence automatic work.
 
 Before a PR, `implementation_execution_budget_exhausted` separately qualifies three settled original
 `implement-issue` timeout receipts after the last Resume. Each must retain `status=failed`,

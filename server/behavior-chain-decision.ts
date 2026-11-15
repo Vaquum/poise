@@ -28,7 +28,9 @@ export interface ChainObservation extends Record<string, unknown> {
   ciRecovery?: { invocationId: string, removal: string, integration: string, recovered: boolean, reason: string }
   testDependency?: { invocationId: string, verified: boolean, recovered: boolean, reason?: string,
     recheck?: string,
-    recovery?: { merge: string, base: string, run: Record<string, unknown> } }
+    recovery?: { base: string, run: Record<string, unknown> } & (
+      { merge: string, triage?: never } | { merge?: never, triage: string }
+    ) }
   prerequisites?: { wait: string | null, base: string | null, evidence: Record<string, unknown>[] }
   ciBaseUpdate?: { from: string, head: string, base: string, tree: string }
   fullSuite?: Record<string, unknown>

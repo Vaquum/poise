@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
@@ -20,12 +20,15 @@ import type { Organization } from '../server/organizations'
 import { completedReviewCall } from './review-response-fixture'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), settings: { enabled: true, seedMode: 'label', label: 'poise' },
-  recheck: vi.fn(),
+  recheck: vi.fn(), diagnose: vi.fn(),
   accounts: { me: 'author', agentAccount: 'reviewer' }, database: null as Database.Database | null,
   journal: null as BehaviorChainJournal | null }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn(), MAX_PROCESS_ARG_BYTES: 64 * 1024,
   isExpectedFailure: (error: { expected?: boolean }) => error?.expected === true }))
-vi.mock('../server/behavior-chain-test-recheck', () => ({ recheckImplementationTest: mocks.recheck }))
+vi.mock('../server/behavior-chain-test-recheck', async importOriginal => ({
+  ...await importOriginal<typeof import('../server/behavior-chain-test-recheck')>(),
+  recheckImplementationTest: mocks.recheck, diagnoseReportedAssertion: mocks.diagnose,
+}))
 vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? mocks.accounts.me : null,
   get db() { return mocks.database },
   writeObservation: (write: () => unknown) => write() }))
@@ -107,6 +110,7 @@ beforeEach(() => {
   seedState = 'open'; seedLabels = [{ name: 'poise' }]; priorBody = 'Closes #7'
   sourceComments = []; priorComments = []
   loseCreation = false; searchVisible = true; indexed = false; stale = false; prHead = HEAD; fresh = observation()
+  mocks.diagnose.mockReset()
   mocks.runFile.mockReset()
   mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
     const response = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' })
@@ -1295,8 +1299,9 @@ it.each([false, true])('reports one verified implementation hold before a PR wit
   expect(posts()).toHaveLength(1)
 })
 
-async function reviewedImplementationReport(db: Database.Database, journal: BehaviorChainJournal) {
+async function reviewedImplementationReport(db: Database.Database, journal: BehaviorChainJournal, prepare?: (call: LogEntry) => void) {
   const { call } = blockedImplementation(journal)
+  prepare?.(call)
   let entries = [call]
   const observe = async (chain: BehaviorChain) => chain.issue === 7 ? { ...fresh, checkedAt: Date.now() } : {
     ...unpublished(), issue: { open: true, eligible: true, revision: chainBasis([remote[0].title, remote[0].body]), commentIds: [700] },
@@ -1446,6 +1451,176 @@ async function reviewedBudgetReport(db: Database.Database, journal: BehaviorChai
   request.mockClear(); launch.mockClear()
   return { source, overrides, request, launch, review: review.id }
 }
+
+const INCIDENT_1855 = "atomic behavior blocked: Observed regression failure: tests/behavior-chain-reconciliation.test.ts > refreshes one held red candidate and reconciles its original Call across restart and another base advance: accepted response — AssertionError: expected 'CI failed' to be null. Captured candidate "
+  + 'd'.repeat(64) + '; producing run ' + 'c'.repeat(32) + '. The fixture resource receipt was corrected.'
+
+it.each(['clean failure', 'candidate-only', 'missing', 'different failure'] as const)(
+  'replays the exact named assertion against pinned code (%s)', async mode => {
+    const { diagnoseReportedAssertion } = await vi.importActual<typeof import('../server/behavior-chain-test-recheck')>('../server/behavior-chain-test-recheck')
+    const root = mkdtempSync(join(tmpdir(), 'triage-fixture-')); roots.push(root)
+    const box = join(homedir(), '.poise', 'test-offload')
+    if (mode === 'candidate-only') {
+      mkdirSync(box, { recursive: true })
+      roots.push(box)
+      writeFileSync(join(box, 'run.mjs'), '')
+      writeFileSync(join(box, 'relay'), '')
+    }
+    const file = 'tests/source.test.ts', name = 'reproduces the original assertion'
+    const testSource = "import { it, expect } from 'vitest'\nimport { actual } from './subject'\n"
+      + `it('${name}', () => expect(actual).toBe(2))\n`
+    const subject = (value: number) => `export const actual = ${value}\n`
+    const call = 'd'.repeat(32), candidate = 'e'.repeat(64), run = 'f'.repeat(32)
+    const payload = JSON.stringify({ call, candidate, run, base: HEAD, changes: [
+      { path: file, mode: '100644', content: Buffer.from(testSource).toString('base64') },
+      { path: 'tests/subject.ts', mode: '100644', content: Buffer.from(subject(1)).toString('base64') },
+    ] })
+    const path = join(root, 'capture.json')
+    writeFileSync(path, payload, { mode: 0o600 })
+    const capture = { status: 'available' as const, base: HEAD, candidate, run, bytes: Buffer.byteLength(payload),
+      sha256: createHash('sha256').update(payload).digest('hex'), expires_at: NOW / 1000 + 600 }
+    const probes: string[] = []
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: { cwd: string }) => {
+      if (command === 'github-interface') {
+        mkdirSync(join(args[3], 'tests'), { recursive: true })
+        symlinkSync(resolve('node_modules'), join(args[3], 'node_modules'), 'dir')
+      }
+      const cwd = options.cwd
+      if (command === 'git' && args[0] === 'checkout') {
+        expect(args.at(-1)).toBe(HEAD)
+        rmSync(join(cwd, '.poise-report-triage.mjs'), { force: true })
+        rmSync(join(cwd, file), { force: true })
+        writeFileSync(join(cwd, 'tests/subject.ts'), subject(mode === 'clean failure' ? 1 : mode === 'different failure' ? 3 : 2))
+        if (mode !== 'candidate-only') writeFileSync(join(cwd, file), mode === 'missing' ? testSource.replace(name, 'another test') : testSource)
+      }
+      if (command === 'node') {
+        const offloaded = args[0] === join(box, 'run.mjs')
+        if (mode === 'candidate-only') expect(offloaded).toBe(true)
+        probes.push(readFileSync(join(cwd, 'tests/subject.ts'), 'utf8').trim())
+        try {
+          return { stdout: execFileSync(process.execPath, offloaded ? args.slice(6) : args,
+            { cwd, encoding: 'utf8', timeout: 5000 }), stderr: '' }
+        } catch (error) {
+          if ((error as { status?: number }).status === 1) Object.assign(error as object, { expected: true })
+          throw error
+        }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const result = await diagnoseReportedAssertion('acme/repo', 'author', HEAD, HEAD, { file, test: name, message: 'expected 1 to be 2' },
+      mode === 'candidate-only' ? { capture, call, path } : null)
+    expect(result).toEqual(mode === 'candidate-only' ? { kind: 'source-only' }
+      : mode === 'clean failure' ? { kind: 'distinct-fix' } : { kind: 'inconclusive', reason: expect.stringContaining(mode === 'missing'
+        ? 'the named test is absent. Retained candidate source is unavailable' : 'a different assertion failed') })
+    if (mode === 'candidate-only') expect(probes).toEqual([subject(1).trim(), subject(2).trim()])
+  })
+
+it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'stale base', 'publication', 'operator hold', 'interrupted'] as const)(
+  'diagnoses the current reviewed pre-PR hold through ordinary admission (%s)', async mode => {
+    const root = mkdtempSync(join(tmpdir(), 'implementation-triage-')); roots.push(root)
+    const path = join(root, 'journal.sqlite')
+    let { db, journal } = setup(path)
+    const capture = { status: 'available', base: HEAD, candidate: 'd'.repeat(64), run: 'c'.repeat(32), bytes: 1024,
+      sha256: '6'.repeat(64), expires_at: NOW / 1000 + 86400 }
+    const fixture = await reviewedImplementationReport(db, journal, call => {
+      call.error = INCIDENT_1855
+      call.artifact = { ...call.artifact!, prepared: { repository: 'acme/repo', issue_number: 7, branch: 'poise/issue-7',
+        actor: 'author', checkout_head: HEAD, pull_number: null, head_sha: null },
+      ...(mode === 'source-only' ? { failed_source: capture } : {}) }
+      fresh.prerequisites = { wait: null, base: HEAD, evidence: [] }
+    })
+    const invoke = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'agent-interface') {
+        expect(mode).toBe('source-only')
+        expect(args).toEqual(['--read-failed-source', fixture.call.id, capture.candidate, capture.run, '--diagnosis', expect.stringMatching(/^[a-f0-9]{64}$/)])
+        return { stdout: JSON.stringify({ ...capture, path: '/private/fixture-capture' }), stderr: '' }
+      }
+      return invoke(command, args, options)
+    })
+    const source = journal.read('acme/repo#7')!
+    const runTriage = async () => {
+      const current = journal.read(source.id)!
+      return recoverReportedRepair(db, journal, current, await fixture.overrides.observe(current), fixture.overrides.observe, () => true)
+    }
+    const missing = 'current main: the named test is absent. Retained candidate source is unavailable'
+    let finish: (outcome: { kind: 'source-only' | 'distinct-fix' } | { kind: 'inconclusive', reason: string }) => void = () => {}
+    mocks.diagnose.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    mocks.diagnose.mockResolvedValue({ kind: 'inconclusive', reason: missing })
+    if (mode === 'publication') fresh.publication.head_sha = HEAD
+    if (mode === 'operator hold') record(journal, source, { type: 'chain.held', reason: 'New invocations held by the person' })
+    const blocked = mode === 'publication' || mode === 'operator hold'
+    if (blocked) {
+      await runTriage()
+      expect(mocks.diagnose).not.toHaveBeenCalled()
+    } else {
+      expect(await runTriage()).toContain('bounded reproduction')
+      expect(await runTriage()).toContain('bounded reproduction')
+      expect(mocks.diagnose).toHaveBeenCalledOnce()
+      expect(mocks.diagnose).toHaveBeenCalledWith('acme/repo', 'author', HEAD, HEAD,
+        { file: 'tests/behavior-chain-reconciliation.test.ts',
+          test: 'refreshes one held red candidate and reconciles its original Call across restart and another base advance: accepted response',
+          message: "expected 'CI failed' to be null" },
+        mode === 'source-only' ? { path: '/private/fixture-capture', call: fixture.call.id, capture } : null, expect.any(AbortSignal))
+      if (mode === 'stale report') remote[0].body += '\nRevised scope'
+      if (mode === 'stale base') fresh.prerequisites!.base = 'e'.repeat(40)
+      finish(mode === 'missing evidence' ? { kind: 'inconclusive', reason: missing }
+        : { kind: mode === 'source-only' ? 'source-only' : 'distinct-fix' })
+      await waitForImplementationRechecks()
+      if (mode === 'interrupted') db.prepare(`UPDATE meta SET value=json_set(value,'$.outcome',NULL)
+        WHERE key GLOB 'behavior_chain_implementation_triage:*'`).run()
+      if (mode === 'missing evidence') expect(await runTriage()).toContain(missing)
+      if (mode === 'interrupted') expect(await runTriage()).toContain('saved diagnosis was interrupted')
+    }
+    expect(fixture.launch).not.toHaveBeenCalled()
+    journal.rebuild()
+    db.close(); databases.splice(databases.indexOf(db), 1)
+    ;({ db, journal } = setup(path))
+    // The process restarts between the saved reproduction and any implementation.
+    if (!blocked) await runTriage()
+    const runtime = (receipts: LogEntry[] = []) => new BehaviorChainRuntime(journal, operations(db, journal, {
+      ...fixture.overrides, readInvocations: async () => ({ entries: receipts, quarantined: [] }),
+      recoverReport: (target, observation) => recoverReportedRepair(db, journal, target, observation, fixture.overrides.observe, () => true),
+    }))
+    await waitForImplementationRechecks()
+    await runtime().run()
+    const report = journal.read('acme/repo#99')!
+    const current = journal.read(source.id)!
+    const reportImplementations = report.invocations.filter(item => item.behavior === 'implement-issue')
+    const sourceImplementations = current.invocations.filter(item => item.behavior === 'implement-issue')
+    if (mode === 'source-only') {
+      expect(reportImplementations).toHaveLength(0)
+      expect(sourceImplementations).toHaveLength(2)
+      const retry = sourceImplementations[1]
+      expect(current.testRecovery).toMatchObject({ base: HEAD, admission: retry.id,
+        hold: { invocationId: fixture.call.correlation_id, callId: fixture.call.id } })
+      expect(retry.request.implementationSource?.id).toBe(report.id)
+      expect(retry.request.argv.at(-1)).toContain(report.id.replace('acme/repo#', 'github.com/acme/repo/issues/'))
+      expect(fixture.launch).toHaveBeenCalledOnce()
+      vi.setSystemTime(NOW + 300_000)
+      await runtime([{ ...fixture.call, id: '8'.repeat(32), correlation_id: retry.id,
+        started_at: new Date(retry.admittedAt).toISOString(), completed_at: new Date(Date.now() - 1000).toISOString(),
+        resources_settled_at: new Date(Date.now()).toISOString() }]).run()
+      await runtime().run()
+      expect(journal.read(source.id)?.held).toBe(fixture.call.error)
+      expect(journal.read(source.id)?.invocations.filter(item => item.behavior === 'implement-issue')).toHaveLength(2)
+      expect(fixture.launch).toHaveBeenCalledOnce()
+      expect(mocks.diagnose).toHaveBeenCalledOnce()
+    } else if (mode === 'distinct-fix') {
+      expect(reportImplementations).toHaveLength(1)
+      expect(reportImplementations[0].request.implementationSource?.id).toBe(source.id)
+      expect(reportImplementations[0].request.argv.at(-1)).toContain('https://github.com/acme/repo/issues/7')
+      expect(sourceImplementations).toHaveLength(1)
+      expect(current.held).toBe(source.held)
+      expect(fixture.launch).toHaveBeenCalledOnce()
+    } else {
+      expect(reportImplementations).toHaveLength(0)
+      expect(sourceImplementations).toHaveLength(1)
+      expect(current.held).toBeTruthy()
+      expect(implementationReportBinding(db, report)?.disposition).toBeNull()
+      expect(mocks.diagnose).toHaveBeenCalledTimes(blocked ? 0 : mode === 'stale base' ? 2 : 1)
+    }
+  })
 
 it.each(['source-only', 'distinct-fix', 'missing', 'stale'] as const)(
   'gates normally admitted and reviewed implementation reports across restart (%s)', async kind => {

@@ -222,30 +222,114 @@ def discard_unless_failed(database: Path, call_id: str) -> None:
         conn.execute("update calls set artifact=json_remove(artifact,'$.failed_source') where id=?", (call_id,))
 
 
-def inspect(database: Path, call_id: str, candidate: str, run: str) -> dict:
-    """Return a private file location, never source bytes, to the linked remediation Call."""
+def _report_matches(report: dict, source: str, call: str, invocation: str, key: str) -> bool:
+    parts = ["atomic_work_blocked", source]
+    keys = [hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()]
+    hold = report.get("holdSequence")
+    if type(hold) is int and hold > 0:
+        keys.append(hashlib.sha256(json.dumps([*parts, invocation, hold], separators=(",", ":")).encode()).hexdigest())
+    attempts = report.get("attempts", [])
+    return report.get("key") == key and key in keys and report.get("source") == source \
+        and report.get("pull") is None and len(attempts) == 1 \
+        and attempts[0].get("call") == call and attempts[0].get("invocation") == invocation
+
+
+def _diagnosis_report(conn: sqlite3.Connection, diagnosis: str, original: dict, metadata: dict) -> tuple[int, str, int]:
+    if not re.fullmatch(r"[0-9a-f]{64}", diagnosis) or original["error_code"] != "atomic_work_blocked":
+        raise ValueError("unbound failed source diagnosis")
+    row = conn.execute("select json_extract(value,'$.inputs'), json_extract(value,'$.deadline') from meta "
+                       "where key=? and json_type(value,'$.outcome')='null'", ("behavior_chain_implementation_triage:" + diagnosis,)).fetchone()
+    if not row or not row[0] or type(row[1]) is not int or row[1] <= time() * 1000 \
+            or hashlib.sha256(row[0].encode()).hexdigest() != diagnosis:
+        raise ValueError("diagnosis is unavailable or no longer running")
+    intent = json.loads(row[0])
+    source = f"{original['repo'].lower()}#{original['pr_id']}"
+    if intent.get("source") != source or intent.get("capture") != metadata \
+            or intent.get("prepared") != metadata["base"] or intent.get("actor") != original["actor"] \
+            or intent.get("call") != original["id"] or intent.get("invocation") != original["correlation_id"]:
+        raise ValueError("diagnosis belongs to different source evidence")
+    accounts = dict(conn.execute("select key, value from meta where key in ('me', 'agentAccount')"))
+    if accounts.get("me", "").lower() != intent["actor"].lower() \
+            or accounts.get("agentAccount", "").lower() != intent["reviewer"].lower():
+        raise ValueError("diagnosis owner changed")
+    number, key = intent["report"], intent["reportKey"]
+    target = f"{original['repo'].lower()}#{number}"
+    states = {ident: json.loads(state) for ident, state in conn.execute(
+        "select chain_id, state from behavior_chain_current where chain_id in (?,?)", (source, target))}
+    source_state, report_state = states[source], states[target]
+    if any(state.get("author") != intent["actor"] or state.get("reviewer") != intent["reviewer"]
+           or state.get("mergeSha") or state.get("supersession") for state in (source_state, report_state)):
+        raise ValueError("diagnosis chain ownership changed")
+    for state, revision in ((source_state, intent["sourceRevision"]), (report_state, intent["revision"])):
+        observation = state["observation"]
+        issue, publication = observation["issue"], observation["publication"]
+        if not issue["open"] or not issue["eligible"] or issue["revision"] != revision or observation["pull"] is not None \
+                or observation["existingPulls"] or observation.get("workPublication") or publication["merged"] is not False \
+                or any(publication[name] is not None for name in ("pull_number", "head_sha", "head_invocation", "state", "merge_sha")):
+            raise ValueError("diagnosis chain no longer verifies no publication")
+    latest = source_state["invocations"][-1]
+    hold = conn.execute("select sequence from behavior_chain_events where chain_id=? "
+                        "and json_extract(payload,'$.type')='chain.held' order by sequence desc limit 1", (source,)).fetchone()
+    if not hold or hold[0] != intent["holdSequence"] or source_state["resumedAfterSequence"] >= hold[0] \
+            or not source_state.get("held") or source_state["held"] != latest["evidence"]["error"] \
+            or latest["id"] != intent["invocation"] or latest["callId"] != original["id"] \
+            or any(item["state"] != "settled" for item in source_state["invocations"]):
+        raise ValueError("diagnosis source hold changed")
+    report_observation = report_state["observation"]
+    issue = report_observation["issue"]
+    pending = any(item["state"] != "settled" or (item["behavior"] in ("implement-issue", "publish-issue")
+                  and (item.get("outcome") != "launch_deferred" or item.get("callId") or item["evidence"].get("action") != "not_started"))
+                  for item in report_state["invocations"])
+    reviews = [item for item in report_state["invocations"] if item["id"] == intent["review"]]
+    if report_state.get("held") or pending or not issue["open"] or issue["revision"] != intent["revision"] \
+            or intent["commentId"] not in issue["commentIds"] or not reviews:
+        raise ValueError("diagnosis no longer owns its reviewed report")
+    review = reviews[0]
+    evidence = review["evidence"]
+    if review["callId"] != intent["reviewCall"] or review["behavior"] != "review-issue" or review["actor"] != intent["reviewer"] \
+            or evidence["status"] != "completed" or evidence["action"] != "commented" or evidence["issue_revision"] != intent["revision"] \
+            or not any(receipt["comment_id"] == intent["commentId"] and receipt["issue"].lower() == target
+                       and receipt["author"].lower() == intent["reviewer"].lower() for receipt in evidence["receipts"]):
+        raise ValueError("diagnosis no longer owns its review Call")
+    return number, key, hold[0]
+
+
+def inspect(database: Path, call_id: str, candidate: str, run: str, diagnosis: str | None = None) -> dict:
+    """Return a private file location to the bound report implementation or diagnosis."""
     unavailable = {"status": "unavailable", "reason": "source evidence is absent, expired, mismatched or not authorized; reproduce afresh"}
     fd = None
     try:
         original = _call(database, call_id)
-        reader = _call(database, os.environ.get("AGENT_INTERFACE_FAILED_SOURCE_CALL", ""))
         artifact = json.loads(original["artifact"] or "{}")
         metadata = artifact.get("failed_source", {})
         if not _failed_unpublished(original, artifact) or not resource_ownership.publication_released(
                 original["resources_settled_at"], original["resource_ownership"], artifact) \
-                or reader["status"] != "running" or reader["repo"] != original["repo"] or reader["actor"] != original["actor"] \
                 or metadata.get("status") != "available" or metadata.get("candidate") != candidate or metadata.get("run") != run \
                 or not re.fullmatch(r"[0-9a-f]{32}", run) or not re.fullmatch(r"[0-9a-f]{64}", candidate) \
                 or metadata.get("expires_at", 0) <= time():
             return unavailable
         source = f"{original['repo'].lower()}#{original['pr_id']}"
-        key = hashlib.sha256(json.dumps(["atomic_work_blocked", source], separators=(",", ":")).encode()).hexdigest()
         with closing(sqlite3.connect(f"{_poise_database().as_uri()}?mode=ro", uri=True, timeout=1)) as conn:
-            report = conn.execute("select value from meta where key=?", ("behavior_chain_repair_report:" + key,)).fetchone()
-        report = json.loads(report[0]) if report else {}
-        if report.get("source") != source or report.get("pull") is not None or report.get("issueNumber") != int(reader["pr_id"]) \
-                or not any(attempt.get("call") == call_id and attempt.get("invocation") == original["correlation_id"]
-                           for attempt in report.get("attempts", [])):
+            conn.execute("begin")
+            hold = None
+            if diagnosis is None:
+                reader = _call(database, os.environ.get("AGENT_INTERFACE_FAILED_SOURCE_CALL", ""))
+                if reader["status"] != "running" or reader["repo"] != original["repo"] or reader["actor"] != original["actor"]:
+                    return unavailable
+                number, selected = int(reader["pr_id"]), None
+            else:
+                number, selected, hold = _diagnosis_report(conn, diagnosis, original, metadata)
+            prefix = "behavior_chain_repair_report:"
+            rows = conn.execute("select key, value from meta where key glob ? and json_extract(value,'$.source')=? "
+                                "and json_extract(value,'$.issueNumber')=?", (prefix + "*", source, number)).fetchall()
+        reports = []
+        for storage_key, value in rows:
+            report = json.loads(value)
+            key = storage_key[len(prefix):]
+            if (hold is None or report.get("holdSequence") == hold) \
+                    and _report_matches(report, source, call_id, original["correlation_id"], key):
+                reports.append(key)
+        if len(reports) != 1 or selected is not None and reports[0] != selected:
             return unavailable
         fd = _directory()
         name = f"failed-source-{call_id}-{run}.json"

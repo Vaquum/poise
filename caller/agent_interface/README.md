@@ -63,7 +63,10 @@ The existing linked remediation report exposes availability and the command
 `agent-interface --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID`. This returns
 the private file location, never its contents, only inside the owning workspace
 to a running implementation Call for that report's issue, repository and actor.
-The original no-publication receipt, positive resource release, exact capture
+Poise's bounded pre-PR diagnosis uses the same reader with `--diagnosis DIGEST`.
+The saved diagnosis must still be running and bind the current source hold,
+original implementation Call, generated report, settled review and configured
+accounts. The original no-publication receipt, positive resource release, exact capture
 identity, private file permissions and digest must still match. Missing, expired,
 oversized, tampered or unauthorized evidence returns unavailable and requires a
 fresh reproduction. Historical deleted artifacts are not recovered.
