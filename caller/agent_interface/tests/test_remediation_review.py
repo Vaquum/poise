@@ -80,6 +80,8 @@ def test_remediation_review_submission(tmp_path, monkeypatch, model, action, sco
         payload = {"repository": "acme/repo", "pr": "22", "expected_head": HEAD, "token_user": "reviewer",
                    "assessment": json.loads(argv[argv.index("--assessment-json") + 1]),
                    "comments": json.loads(argv[argv.index("--comments-json") + 1]) if "--comments-json" in argv else []}
+        if "--comments" in argv:
+            payload["comments"] = json.loads(Path(argv[argv.index("--comments") + 1]).read_text(encoding="ascii"))
         module = {"reviewed_clean": reviewed_clean, "request_changes": request_changes, "approve": approve_pr}[action]
         receipt = asyncio.run(module.run(Client(), payload))
         receipts.append(receipt)
