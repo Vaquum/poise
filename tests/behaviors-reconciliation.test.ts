@@ -1,21 +1,45 @@
+import { execFileSync } from 'node:child_process'
+import { join, resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { mocks, pr, HEAD_SHA, restartModules, resetLogCache, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
 describe('durable launch reconciliation', () => {
 
-  it('links a unique running review call after restart and renews without duplicate launch', async () => {
+  it('retains a live legacy review and its launch claim after a foreign namespace reads it', async () => {
     const launched = await launchReviewBeforeCrash()
-    const callId = 'a'.repeat(32)
-    fixture.agentLogs = [agentLog({
-      id: callId,
-      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
-      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
-      status: 'running',
-      expected_head: launched.expectedHead,
-      actor: launched.actor,
-      source: launched.source,
-      correlation_id: launched.correlationId,
-    })]
+    fixture.agentLogs = JSON.parse(execFileSync('python3', ['-c', `
+import json, os, sys
+from unittest.mock import patch
+import agent_interface as api
+data = json.load(sys.stdin)
+outer = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+inner = {**outer, "init_start": "20", "namespace_ino": 3}
+with patch.object(api, "time", return_value=data["started"]), \\
+        patch.object(api.process_identity, "epoch", return_value=outer), \\
+        patch.object(api.process_identity, "_start", return_value="42"):
+    call = api.track("opus-4.7-max", "legacy review", repo=data["repo"], pr_id=str(data["number"]),
+                     behavior="pr_review", actor=data["actor"], source=data["source"],
+                     expected_head=data["expectedHead"], correlation_id=data["correlationId"])
+    with api.db() as conn:
+        recorded = conn.execute("select process_identity from calls where id=?", (call,)).fetchone()[0]
+    assert json.loads(recorded)["version"] == 1
+    assert api.process_identity.state(recorded, os.getpid(), True) == "alive"
+# Model a child procfs view: its newer PID 1 cannot establish workspace replacement.
+with patch.object(api.process_identity, "epoch", return_value=inner), \\
+        patch.object(api.process_identity, "_start") as start, \\
+        patch.object(api, "init_started_at", return_value=data["started"] + 1), \\
+        patch.object(api.caller_store, "observes_workspace_supervisor", return_value=False):
+    print(json.dumps(api.logs()))
+    start.assert_not_called()
+`], {
+      input: JSON.stringify({ repo: pr.repo, number: pr.number, actor: launched.actor, source: launched.source,
+        expectedHead: launched.expectedHead, correlationId: launched.correlationId,
+        started: (Date.parse(launched.requestedAt) + 1_001) / 1000 }),
+      encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, AGENT_INTERFACE_DATA_DIR: join(fixture.tempRoot, 'caller'),
+        PYTHONPATH: [resolve('caller/agent_interface'), process.env.PYTHONPATH].filter(Boolean).join(':') },
+    }))
+    const callId = fixture.agentLogs[0].id
 
     const { database: db, behaviors: runtime } = await restartModules()
     await runtime.runEnabledBehaviorsOnce()
@@ -25,7 +49,7 @@ describe('durable launch reconciliation', () => {
       SELECT claim_id, lease_until, launch_call_id, launch_error
       FROM behavior_seen WHERE key = 'review-new-prs' AND target = ?
     `).get(launched.target)).toMatchObject({
-      claim_id: expect.any(String),
+      claim_id: launched.correlationId,
       lease_until: expect.any(Number),
       launch_call_id: callId,
       launch_error: null,
@@ -34,6 +58,7 @@ describe('durable launch reconciliation', () => {
       SELECT lease_until FROM behavior_seen WHERE key = 'review-new-prs' AND target = ?
     `).pluck().get(launched.target) as number
     expect(leaseUntil).toBeGreaterThan(Date.now())
+    expect(fixture.agentLogs[0].status).toBe('running')
 
     fixture.agentLogs = []
     await resetLogCache()

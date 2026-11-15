@@ -748,7 +748,7 @@ def init_started_at() -> float | None:
 
 
 def reap_interrupted() -> int:
-    """Historical non-native calls retain their age-based status reaping.
+    """Legacy calls retain their orphan grace behind identity/scope guards.
     Native supervisor loss uses its recorded kernel identity, never wall-clock
     epoch order. Only a reader that can observe the current workspace
     supervisor can reconcile an earlier epoch. Interrupted status grants
@@ -765,42 +765,69 @@ def reap_interrupted() -> int:
     ended = []
     workspace_observer = None
     for row in rows:
-        if row["source"] == "poise:behavior-chain":
-            try:
-                observed = process_identity.state(row["process_identity"], int(row["pid"]), True)
-            except (RuntimeError, TypeError, ValueError):
+        native = row["source"] == "poise:behavior-chain"
+        try:
+            observed = process_identity.state(row["process_identity"], int(row["pid"]), True)
+        except (RuntimeError, TypeError, ValueError):
+            if native:
                 continue
-            if observed == "unobservable":
-                if workspace_observer is None:
-                    workspace_observer = caller_store.observes_workspace_supervisor()
-                if workspace_observer:
-                    observed = "different"
-            if observed in {"gone", "different"}:
-                ended.append(row["id"])
+            observed = "unverified" if row["process_identity"] else "missing"
+        observer = "same_epoch"
+        if observed in {"unobservable", "unverified", "missing"}:
+            if workspace_observer is None:
+                workspace_observer = caller_store.observes_workspace_supervisor()
+            if not workspace_observer:
+                continue
+            observer = "workspace"
+        if observed == "alive":
             continue
-        started = float(row["started_at"] or 0)
-        if init is None or started >= init:
-            if row["source"] != "poise:behavior-chain" and now - started < ORPHAN_AFTER_SECONDS:
-                continue
-            try:
-                pid = int(row["pid"])
-            except (TypeError, ValueError):
-                continue
-            command = process_command(pid)
-            if command is not None and STOP_COMMAND_MARK in command:
-                continue
-        ended.append(row["id"])
+        reason = "workspace_replaced" if observed == "unobservable" else "supervisor_lost"
+        if not native:
+            if observed == "unobservable":
+                # A parent sees a live child namespace as unobservable too.
+                # Only an earlier kernel epoch proves replacement here.
+                try:
+                    registered = process_identity.decode(row["process_identity"], int(row["pid"]))["epoch"]
+                    workspace = process_identity.epoch()
+                    boot = registered["boot"]
+                    if not isinstance(boot, str) or not boot:
+                        continue
+                    if boot == workspace["boot"] and int(registered["init_start"]) >= int(workspace["init_start"]):
+                        continue
+                except (OSError, RuntimeError, KeyError, TypeError, ValueError, IndexError):
+                    continue
+            started = float(row["started_at"] or 0)
+            reason = "workspace_replaced" if observed == "unobservable" else "legacy_before_init"
+            # Same-epoch supervisor loss does not prove its providers ended.
+            # A verified replacement does; older rows need the authorized
+            # workspace observer before retaining their historical init rule.
+            if observed != "unobservable" and (observed in {"gone", "different"} or init is None or started >= init):
+                if now - started < ORPHAN_AFTER_SECONDS:
+                    continue
+                try:
+                    pid = int(row["pid"])
+                except (TypeError, ValueError):
+                    continue
+                command = process_command(pid)
+                if command is not None and STOP_COMMAND_MARK in command:
+                    continue
+                reason = "legacy_orphan"
+        evidence = diagnostic_envelope(operation="call.reap", phase="reconciliation", outcome="interrupted",
+                                       message=f"{reason}; observer={observer}; identity={observed}", call_id=row["id"])
+        ended.append((row["id"], json.dumps(evidence)))
     count = 0
     with db() as conn:
-        for id_ in ended:
+        for id_, evidence in ended:
             # Whether it is being stopped is read by the update itself: stop_call
             # may have marked it, and ended its worker, since the select above.
             count += conn.execute(
                 "update calls set status='failed', ended_at=?, "
                 "error=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error when error_code='stopping' then 'Stopped by user' else ? end, "
                 "error_code=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error_code when error_code='stopping' then 'stopped' else 'interrupted' end, "
+                "diagnostic=case when diagnostic is null then ? "
+                "when json_valid(diagnostic) then json_set(diagnostic,'$.reaper',json(?)) else diagnostic end, "
                 "progress=coalesce(?, progress) where id=? and status='running'",
-                (now, INTERRUPTED_ERROR, progress.terminal("failed"), id_),
+                (now, INTERRUPTED_ERROR, evidence, evidence, progress.terminal("failed"), id_),
             ).rowcount
             mark_managed_no_write(conn, id_)
     return count
