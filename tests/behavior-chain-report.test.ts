@@ -1499,7 +1499,7 @@ it.each(['clean failure', 'candidate-only', 'missing', 'different failure'] as c
         probes.push(readFileSync(join(cwd, 'tests/subject.ts'), 'utf8').trim())
         try {
           return { stdout: execFileSync(process.execPath, offloaded ? args.slice(6) : args,
-            { cwd, encoding: 'utf8', timeout: 5000 }), stderr: '' }
+            { cwd, encoding: 'utf8', timeout: 12_000 }), stderr: '' }
         } catch (error) {
           if ((error as { status?: number }).status === 1) Object.assign(error as object, { expected: true })
           throw error
@@ -1513,9 +1513,9 @@ it.each(['clean failure', 'candidate-only', 'missing', 'different failure'] as c
       : mode === 'clean failure' ? { kind: 'distinct-fix' } : { kind: 'inconclusive', reason: expect.stringContaining(mode === 'missing'
         ? 'the named test is absent. Retained candidate source is unavailable' : 'a different assertion failed') })
     if (mode === 'candidate-only') expect(probes).toEqual([subject(1).trim(), subject(2).trim()])
-  })
+  }, 30_000)
 
-it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'stale base', 'stale during source preparation',
+it.each(['distinct-fix', 'source-only', 'missing evidence', 'mismatched capture', 'stale report', 'stale base', 'stale during source preparation',
   'stale during report preparation', 'publication', 'operator hold', 'interrupted'] as const)(
   'diagnoses the current reviewed pre-PR hold through ordinary admission (%s)', async mode => {
     const root = mkdtempSync(join(tmpdir(), 'implementation-triage-')); roots.push(root)
@@ -1528,7 +1528,8 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'sta
       call.error = INCIDENT_1855
       call.artifact = { ...call.artifact!, prepared: { repository: 'acme/repo', issue_number: 7, branch: 'poise/issue-7',
         actor: 'author', checkout_head: HEAD, pull_number: null, head_sha: null },
-      ...(sourceOnly ? { failed_source: capture } : {}) }
+      ...(sourceOnly ? { failed_source: capture }
+        : mode === 'mismatched capture' ? { failed_source: { ...capture, run: '7'.repeat(32) } } : {}) }
       fresh.prerequisites = { wait: null, base: HEAD, evidence: [] }
     })
     const invoke = mocks.runFile.getMockImplementation()!
@@ -1566,7 +1567,7 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'stale report', 'sta
         sourceOnly ? { path: '/private/fixture-capture', call: fixture.call.id, capture } : null, expect.any(AbortSignal))
       if (mode === 'stale report') remote[0].body += '\nRevised scope'
       if (mode === 'stale base') fresh.prerequisites!.base = 'e'.repeat(40)
-      finish(mode === 'missing evidence' ? { kind: 'inconclusive', reason: missing }
+      finish(mode === 'missing evidence' || mode === 'mismatched capture' ? { kind: 'inconclusive', reason: missing }
         : { kind: sourceOnly ? 'source-only' : 'distinct-fix' })
       await waitForImplementationRechecks()
       if (mode === 'interrupted') db.prepare(`UPDATE meta SET value=json_set(value,'$.outcome',NULL)

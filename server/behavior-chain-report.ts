@@ -1432,16 +1432,23 @@ function triageInputs(db: Database, source: BehaviorChain, observation: ChainObs
   const commentId = Array.isArray(receipts) && receipts.find(receipt => receipt?.issue?.toLowerCase() === chain.id
     && receipt.author?.toLowerCase() === chain.reviewer.toLowerCase() && reportObservation.issue.commentIds.includes(receipt.comment_id))
   if (!review?.callId || !commentId || !resourceReleaseProven(review.evidence ?? {}, true)
+    || typeof review.evidence?.completedAt !== 'number' || !Number.isFinite(review.evidence.completedAt)
+    || reportObservation.checkedAt < review.evidence.completedAt
+    || reportObservation.checkedAt < Date.parse(String(review.evidence.resources_settled_at))
     || !dispositionReview(chain, reportObservation, { kind: 'source-only', revision, review: review.id, commentId: commentId.comment_id,
       diagnosis: '', nextAction: '' })) return null
   const artifact = original.original.evidence?.artifact as { failed_source?: unknown }
+  const reported = String(original.original.evidence?.error ?? '')
   const capture = parseFailedSource(artifact.failed_source)
+  const named = /\bCaptured candidate\b(.*)/i.exec(reported)?.[1]
+  const identity = named?.match(/^(?: digest)?:?\s+([a-f0-9]{64});\s+(?:original producing relay run:|producing run)\s+([a-f0-9]{32})\b/i)
+  const retained = capture?.status === 'available' && capture.base === original.prepared && capture.expires_at * 1000 > Date.now()
+    && (named === undefined || capture.candidate === identity?.[1] && capture.run === identity[2]) ? capture : null
   return { source: source.id, report: chain.issue, reportKey: report.key, holdSequence: original.hold.sequence,
     actor: source.author, reviewer: source.reviewer, sourceRevision: observation.issue.revision,
     invocation: original.original.id, call: original.call,
     revision, review: review.id, reviewCall: review.callId, commentId: commentId.comment_id, base: original.base, prepared: original.prepared,
-    capture: capture?.status === 'available' && capture.base === original.prepared && capture.expires_at * 1000 > Date.now() ? capture : null,
-    assertion: reportedAssertion(String(original.original.evidence?.error ?? '')) }
+    capture: retained, assertion: reportedAssertion(reported) }
 }
 
 function currentTriage(db: Database, source: BehaviorChain, observation: ChainObservation, chain: BehaviorChain,
