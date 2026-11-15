@@ -29,6 +29,13 @@ ASSESSMENT = {"verdict": "The changed validation paths have no remaining blockin
               "limitations": "Provider fixture; no application test execution."}
 
 
+def submission_args(args):
+    if "--comments" not in args:
+        return args
+    position = args.index("--comments") + 1
+    return [*args[:position], Path(args[position]).read_text(encoding="utf-8"), *args[position + 1:]]
+
+
 def scripted_muse(directory: Path) -> Path:
     """A muse CLI that enforces the session-logging requirement: it fails
     exactly like the observed startup error when session logging is off,
@@ -224,9 +231,11 @@ class TestStructuredVerdict(TestCase):
 
     def _run(self, verdict, behavior="pr_review", event=None, code=0, *, correction=None, expected_attempts=1):
         responses = iter((verdict, correction)) if correction is not None else repeat(verdict)
+        submissions = []
 
         def process(args, **kwargs):
             if args[0] == "github-interface":
+                submissions.append(submission_args(args))
                 action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
                           "--approve-pr": "approved_pr"}[args[1]]
                 return SimpleNamespace(returncode=0, stdout=json.dumps(
@@ -241,6 +250,7 @@ class TestStructuredVerdict(TestCase):
                 self.assertEqual(run.call_count, expected_attempts)
                 self.assertFalse(any(call.args[0][0] == "github-interface" for call in run.call_args_list))
                 raise
+        run.submissions = submissions
         return result, run
 
     def test_submits_exactly_one_atomic_review_with_fixed_target(self):
@@ -262,9 +272,10 @@ class TestStructuredVerdict(TestCase):
         self.assertNotEqual(model_call.kwargs["cwd"], "/repo")
         self.assertNotIn("OPENAI_API_KEY", model_call.kwargs["env"])
         self.assertNotIn("CODEX_API_KEY", model_call.kwargs["env"])
-        self.assertEqual(mutation.args[0], ["github-interface", "--request-changes", "#12", "--comments-json",
+        self.assertEqual(run.submissions[0], ["github-interface", "--request-changes", "#12", "--comments",
                                           json.dumps([FINDING]), "--assessment-json", json.dumps(ASSESSMENT),
                                           "--expected-head", "a" * 40, "--token-user", "bit-mis"])
+        self.assertFalse(Path(mutation.args[0][4]).exists())
         self.assertEqual(mutation.kwargs["cwd"], "/repo")
 
     def test_invalid_verdict_gets_one_correction_in_the_same_codex_conversation(self):
@@ -281,14 +292,14 @@ class TestStructuredVerdict(TestCase):
                                         event={"type": "thread.started", "thread_id": thread})
                 self.assertIn('"review_id": 91', result)
                 self.assertEqual(run.call_count, 3)
-                first, retry, submission = run.call_args_list
+                first, retry, _ = run.call_args_list
                 self.assertEqual(retry.args[0], [*first.args[0][:-1], "resume", thread, "-"])
                 self.assertNotIn("packet", retry.kwargs["input"])
                 self.assertIn(json.dumps(invalid), retry.kwargs["input"])
                 self.assertIn(error, retry.kwargs["input"])
-                command = submission.args[0]
+                command = run.submissions[0]
                 self.assertEqual(command[:3], ["github-interface", "--request-changes", "#12"])
-                self.assertEqual(json.loads(command[command.index("--comments-json") + 1]), corrected["comments"])
+                self.assertEqual(json.loads(command[command.index("--comments") + 1]), corrected["comments"])
                 self.assertEqual(json.loads(command[command.index("--assessment-json") + 1]), corrected["assessment"])
 
     def test_invalid_correction_fails_explicitly_without_submitting(self):
@@ -541,7 +552,7 @@ class TestStagedReview(TestCase):
         calls = []
 
         def process(args, **kwargs):
-            calls.append((args, kwargs))
+            calls.append((submission_args(args), kwargs))
             if args[0] == "github-interface":
                 action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
                           "--approve-pr": "approved_pr"}[args[1]]
@@ -573,7 +584,7 @@ class TestStagedReview(TestCase):
         self.assertIn("file group 2 of 2", second_kwargs["input"])
         self.assertIn("Findings already recorded in earlier file groups", second_kwargs["input"])
         self.assertIn("first group defect", second_kwargs["input"])
-        self.assertEqual(mutation[:4], ["github-interface", "--request-changes", "#12", "--comments-json"])
+        self.assertEqual(mutation[:4], ["github-interface", "--request-changes", "#12", "--comments"])
         self.assertEqual(json.loads(mutation[4]), [first, second])
         self.assertEqual(mutation[5:], ["--assessment-json", json.dumps(ASSESSMENT, ensure_ascii=False),
                                        "--expected-head", "a" * 40, "--token-user", "bit-mis"])
@@ -658,10 +669,15 @@ class TestStagedReview(TestCase):
         packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
         text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
         receipt = json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40})
+        submissions = []
+
+        def submit_review(args, **kwargs):
+            submissions.append(submission_args(args))
+            return SimpleNamespace(returncode=0, stdout=receipt, stderr="")
+
         with patch.dict(structured_review.ASK, {"codex": ask}), \
                 patch.object(repo, "inspect", return_value=inspected) as inspect, \
-                patch.object(structured_review.subprocess, "run",
-                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit:
+                patch.object(structured_review.subprocess, "run", side_effect=submit_review) as submit:
             structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"), "pr_review",
                                   "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60,
                                   repository=repo, packet=packet)
@@ -671,7 +687,7 @@ class TestStagedReview(TestCase):
         submit.assert_called_once()
         self.assertEqual(len(calls), 3)
         self.assertIn("file group 2 of 2", calls[2])
-        self.assertEqual(len(json.loads(submit.call_args.args[0][4])), 2)
+        self.assertEqual(len(json.loads(submissions[0][4])), 2)
 
 
 GROK_HANDOFF = "grok review reached its analysis time limit; handing off so the next model can run instead"
@@ -1000,7 +1016,7 @@ class TestSincePositions(TestCase):
         calls = []
 
         def process(args, **kwargs):
-            calls.append((args, kwargs))
+            calls.append((submission_args(args), kwargs))
             if args[0] == "github-interface":
                 return SimpleNamespace(returncode=0, stdout=json.dumps(
                     {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}), stderr="")
@@ -1413,7 +1429,7 @@ class TestOtherProviderVerdicts(TestCase):
             return SimpleNamespace(returncode=code, stdout=stdout, stderr="provider failed" if code else "")
 
         def github(args, **kwargs):
-            calls.append((args, kwargs))
+            calls.append((submission_args(args), kwargs))
             action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
                       "--approve-pr": "approved_pr"}[args[1]]
             return SimpleNamespace(returncode=0, stdout=json.dumps(
@@ -1449,7 +1465,7 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertNotEqual(kwargs["cwd"], "/repo")
         self.assertIsNone(kwargs["provider"])
         self.assertNotIn("packet", " ".join(args))
-        self.assertEqual(mutation[:5], ["github-interface", "--request-changes", "#12", "--comments-json", json.dumps([FINDING])])
+        self.assertEqual(mutation[:5], ["github-interface", "--request-changes", "#12", "--comments", json.dumps([FINDING])])
 
     def test_grok_prompt_carries_the_packet_and_the_schema(self):
         seen = {}
