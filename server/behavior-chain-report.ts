@@ -607,19 +607,21 @@ function implementationReport(db: Database, chain: BehaviorChain): RepairReport 
     return implementationReportIdentity(report, row.key)
   }).map(row => JSON.parse(row.value) as RepairReport)
   if (reports.length > 1) {
-    const shared = reports.every(report => report.pull === null
-      && report.key !== chainBasis([IMPLEMENTATION_CAUSE, report.source])
-      && report.key !== chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source]))
+    const shared = reports.every(report => report.pull === null)
     if (shared) {
-      // Only an explicit generated record keeps its report gated. Intents
-      // persisted before the record cannot conflict with each other, but a
-      // pre-record generated report must still run its predatesHold gate
-      // instead of collapsing to ordinary intake when another source adopts
-      // its stripped issue. The earliest pre-record decides: it predates
-      // only when every pre-record does. All-explicit adoptions return
-      // their earliest so admission runs its orphan gate instead of
-      // collapsing when a lost-ack could own the issue.
-      const generated = reports.filter(report => report.adopted === false)
+      // Only an explicit generated record or a source-only/budget intent
+      // keeps its report gated. Source-only/budget keys never adopt, so
+      // they are always generated. Intents persisted before the record
+      // cannot conflict with each other, but a pre-record generated report
+      // must still run its predatesHold gate instead of collapsing to
+      // ordinary intake when another source adopts its stripped issue. The
+      // earliest pre-record decides: it predates only when every pre-record
+      // does. All-explicit adoptions return their earliest so admission runs
+      // its orphan gate instead of collapsing when a lost-ack could own the
+      // issue.
+      const generated = reports.filter(report => report.adopted === false
+        || report.key === chainBasis([IMPLEMENTATION_CAUSE, report.source])
+        || report.key === chainBasis([IMPLEMENTATION_BUDGET_CAUSE, report.source]))
       if (generated.length === 1) return generated[0]
       if (!generated.length) {
         const legacy = reports.filter(report => report.adopted === undefined)
@@ -925,6 +927,42 @@ export async function implementationReportAdmission(db: Database, journal: Behav
         db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(candidate), PREFIX + candidate.key)
         report = candidate
         break
+      }
+    }
+    if (!report) {
+      // A stripped marker defeats marker reconciliation. If any unconfirmed
+      // pre-PR intent could have filed this markerless issue, bind the
+      // earliest and require its disposition instead of ordinary intake.
+      // Generated reports are authored by the orphan's own source owner at
+      // creation; unknown authorship fails closed. Never bind an orphan to
+      // its own source.
+      const orphans = unconfirmedImplementationReports(db, chain.repository)
+        .filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
+        .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
+          || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+      if (orphans.length) {
+        try {
+          const probe = await reconcileRepairReport(chain.repository, '<!-- poise-repair-exhaustion:probe -->', chain.issue, false, () => true)
+          if (probe && typeof probe.body === 'string' && !REPORT_MARKER.test(probe.body)) {
+            const author = typeof (probe as { author?: unknown }).author === 'string'
+              ? ((probe as { author: string }).author.toLowerCase()) : null
+            const match = orphans.find(candidate => {
+              if (author !== null) {
+                const owner = journal.read(candidate.source)?.author
+                if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
+              }
+              return !predatesHold(probe.created_at, candidate.heldAt)
+            })
+            if (match) {
+              match.issueNumber = chain.issue
+              db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(match), PREFIX + match.key)
+              report = match
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (!message.includes('marker not found')) return { reason: `${implWait}: verification unavailable: ${behaviorErrorMessage(message, 500)}` }
+        }
       }
     }
   }
