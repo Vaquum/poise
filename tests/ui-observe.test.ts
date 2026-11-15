@@ -22,6 +22,7 @@ describe('a chain as a task', () => {
     expect(phaseOf(chain({ invocations: [invocation('review-issue', 'settled'), invocation('implement-issue', 'started')] })).word).toBe('Implementation')
     const twice = chain({ invocations: [invocation('review-pr', 'settled'), invocation('repair-pr', 'settled'), invocation('review-pr', 'settled'), invocation('repair-pr', 'settled'), invocation('review-pr', 'started')] })
     expect(phaseOf(twice)).toMatchObject({ index: 3, round: 3, word: 'PR review · round 3' })
+    expect(phaseOf(chain({ held: 'CI failed', invocations: [invocation('refresh-pr-ci', 'settled')] })).word).toBe('Repair · round 1')
     expect(phaseOf(chain({ mergeSha: 'abcdef1234567' })).word).toBe('Merged')
     expect(phaseOf(chain({ supersession: { covering: [], failures: [], recovery: null } })).word).toBe('Superseded')
   })

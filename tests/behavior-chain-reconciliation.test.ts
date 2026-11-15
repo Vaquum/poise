@@ -533,6 +533,13 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
       expect(chain.held).toBe('CI failed')
       expect(chain.invocations[1]).toMatchObject({ state: 'settled', callId: null, outcome: 'launch_deferred' })
       expect(perform).not.toHaveBeenCalled()
+      journal.rebuild()
+      expect(journal.pendingResourcePage({ chain: '', position: -1 })).toEqual([])
+      chain = record(journal, chain, { type: 'chain.resumed' })
+      Object.assign(obs.pull!, { checksState: 'SUCCESS', failing: [] })
+      chain = await tick()
+      expect(chain.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
+      expect(launch).toHaveBeenCalledTimes(1)
       return
     }
     chain = await tick()

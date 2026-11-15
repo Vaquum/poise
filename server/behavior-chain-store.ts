@@ -327,6 +327,11 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
       invocation.outcome = event.reason
     } else {
       if (invocation.state === 'settled' || !event.outcome.trim() || !Object.keys(event.evidence).length) throw new Error('behavior invocation settlement needs new native evidence')
+      if (invocation.behavior === 'refresh-pr-ci' && event.outcome === 'launch_deferred'
+        && (invocation.state !== 'admitted' || invocation.evidence !== null || event.callId !== null
+          || event.evidence.status !== 'deferred' || event.evidence.action !== 'not_started'
+          || event.evidence.outcome !== 'launch_deferred' || event.evidence.nativeCallId != null
+          || event.evidence.resource_ownership != null)) throw new Error('only a never-started CI refresh can settle without a Call')
       invocation.state = 'settled'
       invocation.callId = event.callId
       invocation.outcome = event.outcome

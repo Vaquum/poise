@@ -344,7 +344,8 @@ in place. Caller rechecks the proof, pinned head and base, and absence of
 queue ownership and auto-merge before submitting the update.
 
 The update admission consumes the allowance for the original failed Call and
-head across restarts and later base advances. An accepted response retains its
+head across restarts and later base advances. An invalidated refresh that never
+started releases its journal reservation. An accepted response retains its
 own Call and response. If the PUT response is lost, the original Call and
 released resources must reconcile against a clean two-parent merge of the
 admitted candidate and base. The recorded observation preserves the original
