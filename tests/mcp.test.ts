@@ -76,7 +76,7 @@ beforeEach(async () => {
       workspaceReads++
       beforeRead?.()
       if (req.url === '/api/mcp/manager') await handleMcpControl(req, res, authority, bob ? null : control)
-      else if (req.url === '/api/mcp/owner') await handleMcpOwner(req, res, authority)
+      else if (req.url === '/api/mcp/owner') await handleMcpOwner(req, res, authority, 'Alice')
       else await handleMcpRead(req, res, service, authority, bob ? 'bob-chat' : 'alice-chat', !bob && control?.status().running)
     } catch (error) { res.statusCode = httpStatus(error, 400); res.end(JSON.stringify({ error: String(error) })) }
   })
@@ -479,6 +479,68 @@ it('keeps owner chain consent separate and preserves the original hold and resum
   } finally {
     setMeta('org', originalOrg ?? '')
     await Promise.all([manager.client.close(), owner.client.close(), another.client.close()])
+  }
+})
+
+it('labels only a verified issue on its exact preview basis and preserves uncertain write receipts', async () => {
+  const originalOrg = getMeta('org'), originalMe = getMeta('me')
+  const repository = 'Fixture/Owner'
+  setMeta('org', 'Fixture')
+  setMeta('me', 'Alice')
+  const owner = await connect('Alice', endpoint, { ownerControls: true, repository })
+  const stranger = await connect('Alice', endpoint, { ownerControls: true, repository })
+  const run = vi.spyOn(processes, 'runFile')
+  const issue = { number: 7, id: 705, title: 'Verified issue', body: null, labels: [], state: 'open',
+    html_url: 'https://github.com/Fixture/Owner/issues/7', created_at: '2026-11-01T00:00:00Z', updated_at: '2026-11-02T00:00:00Z' }
+  let lost = false, writes = 0
+  run.mockImplementation(async (_command, args) => {
+    if (args[0] === 'auth') {
+      expect(args).toEqual(['auth', 'token', '--hostname', 'github.com', '--user', 'Alice'])
+      return { stdout: 'fixture-owner-token\n', stderr: '' }
+    }
+    if (args.includes('POST')) {
+      expect(args).toEqual(['api', 'repos/Fixture/Owner/issues/7/labels', '--method', 'POST', '-f', 'labels[]=poise'])
+      writes++
+      if (lost) throw new Error('response lost')
+      return { stdout: JSON.stringify([{ name: 'poise' }]), stderr: '' }
+    }
+    return { stdout: JSON.stringify(issue), stderr: '' }
+  })
+  async function control(name: string, arguments_: Record<string, unknown>, client = owner.client) {
+    const result = await client.callTool({ name, arguments: arguments_ })
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).action as { preview: string; requestId: string }
+  }
+  const preview = () => control('poise_chain_preview', { operation: 'label', repository, issue: 7 })
+  const apply = (value: string, client?: Client) => control('poise_chain_apply', { preview: value }, client)
+  try {
+    const stale = await preview()
+    expect(stale).toMatchObject({ status: 'preview', actor: 'Alice', issueBasis: { issueId: 705, label: 'poise', updatedAt: issue.updated_at },
+      link: issue.html_url })
+    expect(writes).toBe(0)
+    issue.title = 'Edited while preview was open'
+    expect(await apply(stale.preview)).toMatchObject({ status: 'refused' })
+    expect(writes).toBe(0)
+    const fresh = await preview()
+    expect(await apply(fresh.preview, stranger.client)).toMatchObject({ status: 'refused' })
+    const done = await apply(fresh.preview)
+    expect(done).toMatchObject({ status: 'applied', receipt: { issueId: 705, label: 'poise', actor: 'Alice' } })
+    expect(await apply(fresh.preview)).toEqual(done)
+    expect(writes).toBe(1)
+    const persisted = db.prepare('SELECT delegation FROM chat_command_receipts WHERE instance = ? AND request_id = ?')
+      .get('mcp-issue:alice', done.requestId) as { delegation: string }
+    const grant = gateway.context.mcp.grants.find((await owner.provider.tokens())!.access_token, 'access')!
+    expect(JSON.parse(persisted.delegation)).toMatchObject({ grantId: grant.grantId, clientId: grant.clientId, ownerId: 1001, issue: 7 })
+    lost = true
+    const uncertain = await preview()
+    expect(await apply(uncertain.preview)).toMatchObject({ status: 'uncertain' })
+    expect(await apply(uncertain.preview)).toMatchObject({ status: 'uncertain' })
+    expect(writes).toBe(2)
+  } finally {
+    run.mockRestore()
+    setMeta('org', originalOrg ?? '')
+    setMeta('me', originalMe ?? '')
+    await Promise.all([owner.client.close(), stranger.client.close()])
   }
 })
 

@@ -408,7 +408,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
         if (path === '/api/mcp/read') return handleMcpRead(req, res, service, authority, chatRuntime?.instance, chatControl?.status().running)
         if (path === '/api/mcp/manager') return handleMcpControl(req, res, authority, chatControl)
-        if (path === '/api/mcp/owner') return handleMcpOwner(req, res, authority)
+        if (path === '/api/mcp/owner' && service) return handleMcpOwner(req, res, authority, service.owner)
         if (path === '/api/behavior-ledger/pr-status') {
           return handleBehaviorPrStatus(req, res, url)
         }

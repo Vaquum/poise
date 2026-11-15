@@ -306,6 +306,10 @@ client sent.
     claim. Its typed actions use `POST /api/mcp/manager`, the native Manager
     authorization and budget, and the existing durable command receipts with
     delegated grant attribution.
+    Separate owner delegation uses `POST /api/mcp/owner`. A chain action
+    stores attribution in the journal entry. Adding the configured intake label
+    verifies the live issue and owner account and persists an attributed
+    reservation before GitHub can observe the write.
     The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
     PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and

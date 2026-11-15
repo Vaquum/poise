@@ -49,9 +49,9 @@ export const MCP_MANAGER_TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } },
 ] as const
 export const MCP_OWNER_TOOLS = [
-  { name: 'poise_chain_preview', description: 'Preview an owner-delegated hold or resume for one existing Behavior chain.',
+  { name: 'poise_chain_preview', description: 'Preview an owner-delegated hold or resume of a Behavior chain, or add the configured intake label to an exact open GitHub issue.',
     inputSchema: { type: 'object', required: ['operation', 'repository', 'issue'], properties: {
-      operation: { enum: ['hold', 'resume'] }, repository: { type: 'string', maxLength: 140 },
+      operation: { enum: ['hold', 'resume', 'label'] }, repository: { type: 'string', maxLength: 140 },
       issue: { type: 'integer', minimum: 1 },
     }, additionalProperties: false }, annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_chain_apply', description: 'Apply an exact owner-delegated chain preview. Reuse the preview to recover the original receipt.',
@@ -84,7 +84,7 @@ export type McpManagerAction = { operation: 'send' | 'steer'; sessionId: string;
   | { operation: 'supervise'; sessionId: string; text: string; intervalMinutes: number }
 export type McpManagerRequest = { name: 'poise_action_preview'; arguments: McpManagerAction }
   | { name: 'poise_action_apply'; arguments: { preview: string } }
-export interface McpOwnerAction { operation: 'hold' | 'resume'; repository: string; issue: number }
+export interface McpOwnerAction { operation: 'hold' | 'resume' | 'label'; repository: string; issue: number }
 export type McpOwnerRequest = { name: 'poise_chain_preview'; arguments: McpOwnerAction }
   | { name: 'poise_chain_apply'; arguments: { preview: string } }
 export type McpRequest = McpRead | McpManagerRequest | McpOwnerRequest
@@ -104,7 +104,7 @@ export function parseMcpOwnerRequest(value: unknown): McpOwnerRequest {
     return { name: value.name, arguments: { preview: args.preview } }
   }
   const { operation, repository, issue } = args
-  if (value.name === 'poise_chain_preview' && Object.keys(args).length === 3 && (operation === 'hold' || operation === 'resume')
+  if (value.name === 'poise_chain_preview' && Object.keys(args).length === 3 && (operation === 'hold' || operation === 'resume' || operation === 'label')
     && isMcpRepository(repository) && Number.isSafeInteger(issue) && Number(issue) >= 1) {
     return { name: value.name, arguments: { operation, repository, issue: Number(issue) } }
   }

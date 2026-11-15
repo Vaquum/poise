@@ -99,7 +99,7 @@ export class McpGateway {
         <label><input type="checkbox" name="chatTranscript" value="1"> Allow Chat transcript and retained turn events</label>
         <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
         <label><input type="checkbox" name="managerControls" value="1"> Delegate Manager send, steer, stop and workspace-wide supervision</label>
-        <label><input type="checkbox" name="ownerControls" value="1"> Delegate Behavior chain hold and resume</label>
+        <label><input type="checkbox" name="ownerControls" value="1"> Delegate chain hold, resume and verified GitHub issue intake labeling</label>
         <button name="decision" value="approve">Allow read access and selected permissions</button><button name="decision" value="deny">Deny</button></form></div>`), authorizeHeaders)
     }
     if (url.pathname === '/mcp/authorize' && req.method === 'POST') {
@@ -323,14 +323,18 @@ export class McpGateway {
       if (!action || !target || !scope.ownerClientId || action.clientId !== scope.ownerClientId || !isMcpRecordId(action.requestId)
         || !isMcpRepository(target.repository) || !mcpRepositoryAllowed(scope, target.repository)
         || !Number.isSafeInteger(target.issue) || Number(target.issue) < 1
-        || action.chainId !== target.repository.toLowerCase() + '#' + String(target.issue)
+        || (target.operation === 'label'
+          ? (!action.issueBasis || typeof action.issueBasis !== 'object' || !('issueId' in action.issueBasis)
+            || !Number.isSafeInteger(action.issueBasis.issueId) || Number(action.issueBasis.issueId) < 1)
+          : !['hold', 'resume'].includes(String(target.operation)) || action.chainId !== target.repository.toLowerCase() + '#' + String(target.issue))
         || (read.name === 'poise_chain_preview' ? action.status !== 'preview' || JSON.stringify(target) !== JSON.stringify(read.arguments)
           || typeof action.preview !== 'string' : !['applied', 'uncertain'].includes(String(action.status)))) {
         if (apply) return uncertain
         throw new HttpError(502, 'invalid_workspace_owner_scope')
       }
-      return { workspace: owner.handle, action: { ...action, link: ctx.workspaceOrigin(owner.handle)
-        + '/?view=observe&part=tasks&chain=' + encodeURIComponent(String(action.chainId)) } }
+      const link = target.operation === 'label' ? `https://github.com/${target.repository}/issues/${target.issue}`
+        : ctx.workspaceOrigin(owner.handle) + '/?view=observe&part=tasks&chain=' + encodeURIComponent(String(action.chainId))
+      return { workspace: owner.handle, action: { ...action, link } }
     }
     // GitHub logins are case-preserved but case-insensitive; the container keeps the case from its creation.
     const tools = body.capabilities && typeof body.capabilities === 'object' && 'tools' in body.capabilities ? body.capabilities.tools : null

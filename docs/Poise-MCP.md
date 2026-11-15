@@ -131,6 +131,12 @@ sequence. Repeating a valid applied preview recovers this exact receipt.
 Normal admission, capacity, GitHub and review gates still decide whether
 a resumed chain can start work.
 
+A label preview verifies the live open GitHub issue, its identity and
+revision, the configured intake label and the workspace owner's GitHub account.
+Apply rechecks that basis before adding the label. Poise records attribution
+before sending the write. A missing GitHub acknowledgement returns uncertainty
+and a repeated preview cannot send the write again.
+
 ## Private plugin
 
 Render a private package for an installation's HTTPS apex into a new directory:
