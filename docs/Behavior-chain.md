@@ -946,6 +946,14 @@ comment must supply that diagnosis. Creation, labeling, review completion or
 closure alone cannot admit recovery. The explanation remains worker-reported;
 the source repair verifies it.
 
+A settled report implementation refused before publication can also leave a
+receipted review of a source merge conflict. Recovery verifies the prerequisite
+named in the refusal on the current base and independently checks the exact
+source head against that base. A report removed from intake can supply this
+review while its own implementation stays fenced. The conflict base and
+prerequisite delivery are bound to the diagnosis and checked again after repair
+preparation. A resolved conflict, changed base or missing evidence keeps the wait.
+
 The original seed and branch remain unchanged. The existing `--note` carries the
 diagnosis, original Call, report reference and configured accounts' report guidance
 into exact-head repair preparation. The existing journal retains one recovery

@@ -1869,10 +1869,11 @@ on the held source through the existing report metadata and journal waits.
 This adds no retry or checkout-retention authority; see
 [report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
 The existing linked remediation also exposes bounded private source evidence
-from the original failed validation capture, retained through normal checkout
-cleanup under the workspace's incident-artifact lifecycle. Only its availability
-and capture identity enter receipts and reports; source bytes stay in the owning
-workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
+from failed validation, including interrupted runs with a recorded Vitest
+assertion diagnostic. Caller retains it through normal checkout cleanup under
+the workspace's incident-artifact lifecycle. Receipts and reports carry its
+availability and capture identity. The interrupted marker and source bytes stay
+in the owning workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
 defines binding, access, limits and expiry without granting recovery authority.
 Terminal repair reports require the matching automatic hold, settled original Call,
 positive release and unchanged open PR head and repair basis, without possible
@@ -1885,6 +1886,9 @@ hold and unchanged source/diagnosis are rechecked. An already-admitted report's
 original implementation must settle without publication before this handoff.
 The original seed/branch, normal publication, review and CI gates remain in force;
 missing evidence, changed heads and later operator holds retain the wait.
+For a conflict diagnosis, the existing Caller seed read verifies the owned PR
+head against the current default-branch tip with a bounded local Git probe.
+Admission rechecks the conflict base and prerequisite delivery after preparation.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,
