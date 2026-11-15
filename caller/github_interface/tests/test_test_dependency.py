@@ -6,7 +6,7 @@ import zipfile
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
-from github_interface import test_dependency
+from github_interface import pr_ci_recovery, test_dependency
 
 TARGET, BASE, MERGE, MAIN = "example/repo", "a" * 40, "b" * 40, "c" * 40
 
@@ -90,6 +90,60 @@ class TestDependency(IsolatedAsyncioTestCase):
                          "run": {"id": 3, "sha": MAIN, "attempt": 1, "url": self.runs[3]["html_url"]}})
         self.client.post.assert_not_awaited()
         self.client.patch.assert_not_awaited()
+
+    async def test_ordinary_pr_ci_requires_complete_matching_failure_and_delivered_recovery(self):
+        head, root = "d" * 40, f"/repos/{TARGET}"
+        self.runs[1].update(event="pull_request", head_sha=head, head_branch="candidate", workflow_id=40)
+        self.tests[1][0]["failureMessages"][0] += "\n[poise] candidate-specific checkout log"
+        self.tests[2][0]["failureMessages"][0] += "\n[poise] independent base checkout log"
+        jobs = [{"name": name, "id": ident, "status": "completed", "conclusion": "failure", "run_id": 1}
+                for ident, name in enumerate(("Unit & integration (1)", "Verify (Node 22)"), 11)]
+        checks = [{"type": "check_run", "name": job["name"], "state": "completed", "conclusion": "failure",
+                   "check_run_id": job["id"], "log_id": job["id"],
+                   "url": f"https://github.com/{TARGET}/actions/runs/1/job/{job['id']}"} for job in jobs]
+        pull = {"number": 17, "state": "open", "merged": False, "mergeable": True, "draft": False,
+                "head": {"sha": head, "ref": "candidate", "repo": {"full_name": TARGET}},
+                "base": {"sha": MAIN, "ref": "main", "repo": {"full_name": TARGET}}}
+        failing_file = "tests/test-relay.test.ts"
+        report = {"number": 18, "state": "closed", "title": "fix: the full test suite fails on main",
+                  "user": {"login": "github-actions[bot]"},
+                  "body": f"The full test suite failed on `main` at {BASE}: https://github.com/{TARGET}/actions/runs/2\n\n- {failing_file}"}
+        delivery = [{"number": 19, "merge_commit_sha": MAIN, "merged_at": "now", "base": pull["base"]}]
+        recovered = {"user": report["user"], "body": f"The full suite passed at {MAIN}: https://github.com/{TARGET}/actions/runs/3\n\nClosing."}
+
+        async def get(path, **kwargs):
+            if path == "/search/issues":
+                return {"items": [report]}
+            if path == f"{root}/issues/18/comments":
+                return [recovered]
+            if path == f"{root}/commits/{MAIN}/pulls":
+                return delivery
+            if path == f"{root}/pulls/19/files":
+                return [{"filename": failing_file}]
+            if path == f"{root}/pulls/17":
+                return pull
+            if path == f"{root}/compare/{MAIN}...{head}":
+                return {"status": "diverged", "base_commit": {"sha": MAIN}, "merge_base_commit": {"sha": BASE}}
+            if path == f"{root}/actions/runs/1/attempts/1/jobs":
+                return {"jobs": jobs, "total_count": len(jobs)}
+            if path == f"{root}/actions/runs/1/artifacts":
+                return {"artifacts": [{"id": 11, "name": "unit-timings-1", "expired": False}], "total_count": 1}
+            return await self.get(path, **kwargs)
+
+        self.client.get.side_effect = get
+        proof = await pr_ci_recovery.inspect(self.client, TARGET, pull, checks, checks)
+        self.assertEqual(proof, {"head": head, "base": MAIN, "report": 18, "remediation": MAIN, "workflow": 40,
+                                 "failedRun": 1, "baselineRun": 2, "passedRun": 3, "checks": [11, 12]})
+        self.assertIsNone(await pr_ci_recovery.inspect(self.client, TARGET, pull, checks, checks[:1]))
+        self.tests[1].append({"fullName": "candidate regression", "status": "failed",
+                              "failureMessages": ["AssertionError: candidate-specific failure"]})
+        self.assertIsNone(await pr_ci_recovery.inspect(self.client, TARGET, pull, checks, checks))
+        self.tests[1].pop()
+        self.tests[3].clear()
+        self.assertIsNone(await pr_ci_recovery.inspect(self.client, TARGET, pull, checks, checks))
+        delivery.clear()
+        self.assertIsNone(await pr_ci_recovery.inspect(self.client, TARGET, pull, checks, checks))
+        self.client.request.assert_not_awaited()
 
     async def test_wrong_base_original_rerun_missing_assertions_and_different_causes_keep_hold(self):
         proof = await self.inspect()

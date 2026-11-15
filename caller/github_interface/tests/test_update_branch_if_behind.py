@@ -26,7 +26,7 @@ class TestUpdateBranchIfBehind(IsolatedAsyncioTestCase):
         self.pull = deepcopy(PULL)
         self.ready = deepcopy(READY)
         self.pulls = AsyncMock(side_effect=lambda *_: deepcopy(self.pull))
-        self.readiness = AsyncMock(side_effect=lambda *_: deepcopy(self.ready))
+        self.readiness = AsyncMock(side_effect=lambda *_, **_kwargs: deepcopy(self.ready))
         self.patch_pull = patch.object(update_branch_if_behind, 'get_pull', self.pulls)
         self.patch_ready = patch.object(update_branch_if_behind, 'get_pr_readiness_state', self.readiness)
         self.patch_pull.start()
@@ -42,6 +42,32 @@ class TestUpdateBranchIfBehind(IsolatedAsyncioTestCase):
                                                      json={'expected_head_sha': HEAD})
         self.assertEqual(self.pulls.await_count, 2)
         self.readiness.assert_awaited_once()
+
+    async def test_refreshes_queue_enabled_red_candidate_only_with_current_proof(self):
+        proof = {"head": HEAD, "base": "b" * 40}
+        self.pull["base"] = {"sha": proof["base"], "ref": "main"}
+        self.pull["mergeable_state"] = "blocked"
+        self.ready.update(mergeQueue={"id": "queue"}, mergeQueueEntry=None, autoMergeRequest=None, mergeStateStatus="BLOCKED")
+        self.ready["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
+        payload = {**PAYLOAD, "shared_ci_recovery_json": json.dumps(proof)}
+        ci = {"head_sha": HEAD, "base_sha": proof["base"], "failing": []}
+        with patch.object(update_branch_if_behind.list_failing_ci, "run", AsyncMock(return_value=ci)), \
+                patch.object(update_branch_if_behind.pr_ci_recovery, "inspect", AsyncMock(return_value=None)) as verify:
+            self.assertEqual((await update_branch_if_behind.run(self.client, payload))["outcome"], "not_ready")
+            verify.return_value = proof
+            for field, value in (("mergeQueueEntry", {"id": "entry"}), ("autoMergeRequest", {"enabledAt": "now"})):
+                self.ready[field] = value
+                self.assertEqual((await update_branch_if_behind.run(self.client, payload))["outcome"], "not_ready")
+                self.ready[field] = None
+            changed_base = {**self.pull, "base": {**self.pull["base"], "sha": "e" * 40}}
+            self.pulls.side_effect = [self.pull, changed_base]
+            self.assertEqual((await update_branch_if_behind.run(self.client, payload))["outcome"], "not_ready")
+            self.client.request.assert_not_awaited()
+            self.pulls.side_effect = [self.pull, self.pull]
+            result = await update_branch_if_behind.run(self.client, payload)
+            self.assertEqual((result["outcome"], result["base_sha"]), ("updated", proof["base"]))
+            self.client.request.assert_awaited_once_with("PUT", "/repos/acme/app/pulls/7/update-branch",
+                                                         json={"expected_head_sha": HEAD})
 
     async def test_unsafe_unknown_or_current_pull_never_updates(self):
         for fields in [{'draft': True}, {'state': 'closed'}, {'mergeable': None}, {'mergeable': False},

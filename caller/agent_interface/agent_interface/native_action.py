@@ -22,7 +22,8 @@ TIMEOUT_SECONDS = 30
 # The command keeps its original 30 seconds. Its containing Call also needs
 # time to persist intent/response and unwind before the outer client expires.
 CALL_SECONDS = TIMEOUT_SECONDS + 30
-COMMANDS = {"--merge-if-ready", "--resolve-nonblocking-conversations-if-ready", "--rerun-grey-ci-if-ready", "--issue-work"}
+COMMANDS = {"--merge-if-ready", "--resolve-nonblocking-conversations-if-ready", "--rerun-grey-ci-if-ready", "--issue-work",
+            "--update-branch-if-behind"}
 
 
 class NotStarted(RuntimeError):
@@ -64,6 +65,10 @@ def validate(argv: list[str], cwd: str, repository: str, actor: str, *, resource
     if not re.fullmatch(r"#?[1-9][0-9]*", argv[1]):
         raise ValueError("native action requires its original positive target number")
     head = atoms.expected_head(argument(argv, "--expected-head"))
+    if argv[0] == "--update-branch-if-behind":
+        if argument(argv, "--author").lower() != actor.lower() or not resource_version:
+            raise ValueError("native CI refresh requires its author and physical resource receipt")
+        argument(argv, "--shared-ci-recovery-json")
     if argv[0] == "--issue-work" and argument(argv, "--mode") not in {"complete", "retire"}:
         raise ValueError("native action permits only issue publication completion or verified retirement")
     request = {"command": "github-interface", "cwd": cwd, "argv": argv}

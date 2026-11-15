@@ -1,8 +1,10 @@
 import asyncio
+import json
 import re
 import tempfile
 from typing import Any
 
+from github_interface import pr_ci_recovery
 from github_interface.atoms.process_diagnostic import GitProcessError
 from github_interface.atoms.pulls import get_combined_status, get_pull, list_check_runs
 from github_interface.atoms.review_diff import _env, _git
@@ -34,7 +36,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     if requested or from_head:
         commit = await client.get(f"/repos/{owner}/{repo}/commits/{ref}")
         evidence = {"ref": ref, "parents": [parent["sha"] for parent in commit["parents"]]}
-    if requested:
+    if requested or payload.get("include_runs"):
         runs, page = [], 1
         while True:
             batch = await client.get(f"/repos/{owner}/{repo}/actions/runs",
@@ -49,6 +51,9 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
 
     failing_checks = [_check(check) for check in checks if _check_failing(check)]
     failing_statuses = [_status(item) for item in status.get("statuses", []) if item.get("state") != "success"]
+    if payload.get("held_ci_json") is not None:
+        evidence["ci_refresh"] = await pr_ci_recovery.inspect(client, f"{owner}/{repo}", pull,
+                                                            json.loads(payload["held_ci_json"]), failing_checks + failing_statuses)
     # Merge state, author, draft flag and pull state ride the same get_pull
     # response the head SHA already comes from: the work monitor's
     # conflict/behind/terminal read costs zero additional GitHub requests.
