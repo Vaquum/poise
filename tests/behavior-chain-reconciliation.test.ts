@@ -450,7 +450,8 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     expect(launch).toHaveBeenCalledTimes(1)
   })
 
-it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed head', 'queue entry', 'unknown publication', 'missing proof'])(
+it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed head', 'queue entry', 'unknown publication',
+  'missing proof', 'head changes after admission'])(
   'revalidates one held red candidate through the original Call across restart and base advance: %s', async scenario => {
     const { db, journal } = setup()
     const obs = observation()
@@ -515,6 +516,25 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
     if (scenario === 'operator hold') chain = record(journal, chain, { type: 'chain.held', reason: chain.held! })
     if (scenario === 'changed head') { obs.pull!.head = updated; obs.publication.head_sha = updated }
     if (scenario === 'queue entry') obs.pull!.queueEntry = 'queue-entry'
+    if (scenario === 'head changes after admission') {
+      const append = journal.append.bind(journal)
+      const interruption = vi.spyOn(journal, 'append').mockImplementation((...args) => {
+        if (args[3].type === 'invocation.started') throw new Error('restart before starting the admitted refresh')
+        return append(...args)
+      })
+      await expect(tick()).rejects.toThrow('restart before starting the admitted refresh')
+      interruption.mockRestore()
+      expect(journal.read(chain.id)?.invocations[1]).toMatchObject({ behavior: 'refresh-pr-ci', state: 'admitted' })
+      journal.rebuild()
+      runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
+      obs.pull!.head = updated
+      obs.publication.head_sha = updated
+      chain = await tick()
+      expect(chain.held).toBe('CI failed')
+      expect(chain.invocations[1]).toMatchObject({ state: 'settled', callId: null, outcome: 'launch_deferred' })
+      expect(perform).not.toHaveBeenCalled()
+      return
+    }
     chain = await tick()
     if (scenario !== 'accepted response' && !lost) {
       expect(perform).not.toHaveBeenCalled()

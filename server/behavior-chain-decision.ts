@@ -344,7 +344,8 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       && publication.state === 'open' && publication.pull_number === pull.number && publication.head_sha === pull.head
       && pull.head === held.hold.head && proof.head === pull.head
       && observation.checkedAt >= held.completedAt && observation.checkedAt >= Date.parse(String(held.evidence.resources_settled_at))
-      && ![held.artifact.publication_head, held.artifact.result, held.artifact.replies_started, held.evidence.publicationReceipt].some(value => value != null)) {
+      && ![held.artifact.publication_head, held.artifact.publication, held.artifact.result, held.artifact.replies_started,
+        held.evidence.publicationPlan, held.evidence.publicationReceipt].some(value => value != null)) {
       return { kind: 'invoke', behavior: 'refresh-pr-ci', actor: chain.author, reviewer: null, basis: ciRefreshBasis(held.hold),
         reason: 'refresh the held PR after independently verified shared CI recovery' }
     }

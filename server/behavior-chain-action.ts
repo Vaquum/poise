@@ -14,7 +14,7 @@ const SHA = /^[a-f0-9]{40}$/i
 // without duplicating resolved thread IDs.
 const MAX_RECEIPT_BYTES = 256 * 1024 - 4096
 const RESULT_FIELDS = ['action', 'repository', 'pull_number', 'head_sha', 'outcome', 'merge_sha', 'merge_method', 'queue_entry_id',
-  'current_head_sha', 'ready_except_conversations', 'resolved_count', 'unresolved_count', 'issue_number', 'coverage', 'base_sha'] as const
+  'current_head_sha', 'ready_except_conversations', 'resolved_count', 'unresolved_count', 'issue_number', 'coverage'] as const
 interface ProcessFailure { code: number | string | null, signal: string | null }
 export interface NativeActionReceipt {
   version: 1
@@ -86,6 +86,7 @@ export function nativeActionReceipt(chain: BehaviorChain, invocation: ChainInvoc
     const proof = JSON.parse(argument(invocation, '--shared-ci-recovery-json')) as { head: string, base: string }
     if (proof.head !== head || !SHA.test(proof.base) || result.base_sha !== proof.base
       || !['updated', 'not_ready', 'superseded'].includes(String(result.outcome))) throw new Error('native CI refresh differs from its admitted candidate or base')
+    retained.base_sha = result.base_sha
   } else if (result.outcome !== 'superseded') {
     if (Object.hasOwn(result, 'outcome') || typeof result.ready_except_conversations !== 'boolean' || !Number.isSafeInteger(result.resolved_count) || Number(result.resolved_count) < 0
       || !Number.isSafeInteger(result.unresolved_count) || Number(result.unresolved_count) < 0 || !Array.isArray(result.conversations)

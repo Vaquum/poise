@@ -1286,13 +1286,21 @@ export class BehaviorChainRuntime {
         const refreshCall = invocation.evidence?.nativeCallId
         const artifact = invocation.evidence?.artifact as Record<string, unknown> | undefined
         if (invocation.state === 'admitted') {
+          if (snapshot.entries.some(call => call.correlation_id === invocation.id) || snapshot.quarantined.length) return
           const held = heldCiRepair(chain)
-          const current = decideBehaviorChain({ ...chain, invocations: chain.invocations.slice(0, -1) }, observation, Date.now())
+          // The original request re-verifies its pinned base inside Caller.
+          // A crash before start can only resume that admission or settle it without a write.
+          const current = decideBehaviorChain({ ...chain, invocations: chain.invocations.slice(0, -1) },
+            { ...observation, ciRefresh: ciRefreshRequest(invocation) }, Date.now())
+          if (held?.refresh?.id !== invocation.id || current.kind !== 'invoke' || current.behavior !== invocation.behavior
+              || current.basis !== invocation.basis) {
+            this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
+              evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
+            this.operations.wake()
+            return
+          }
           const accounts = this.operations.accounts()
-          if (held?.refresh?.id === invocation.id && current.kind === 'invoke' && current.behavior === invocation.behavior
-            && current.basis === invocation.basis && chainBasis(observation.ciRefresh) === chainBasis(ciRefreshRequest(invocation))
-            && !snapshot.entries.some(call => call.correlation_id === invocation.id) && !snapshot.quarantined.length
-            && accounts.author.toLowerCase() === chain.author.toLowerCase() && accounts.reviewer.toLowerCase() === chain.reviewer.toLowerCase()
+          if (accounts.author.toLowerCase() === chain.author.toLowerCase() && accounts.reviewer.toLowerCase() === chain.reviewer.toLowerCase()
             && this.operations.enabled() && this.operations.permitted(chain, current)) await this.start(chain, invocation)
         } else if (invocation.state === 'uncertain' && resourcesSettled && typeof refreshCall === 'string'
           && invocation.evidence?.action === null && invocation.evidence?.status === 'failed'

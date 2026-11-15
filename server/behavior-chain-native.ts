@@ -413,7 +413,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           }
         }
       }
-      if (heldCi && !heldCi.hold.queue && !refresh && heldCi.hold.head === head && observation.issue.open && state.state === 'open'
+      if (heldCi && !heldCi.hold.queue && !heldCi.refresh && heldCi.hold.head === head && observation.issue.open && state.state === 'open'
         && state.queue_entry_id === null && !readiness.draft && ci.mergeable === true && !pending && failures.length
         && observation.publication.head_sha === head && publication.base_sha === ci.base_sha && !observation.existingPulls.length) {
         const blocker = object(heldCi.artifact.ci_blocker, 'original CI blocker')
