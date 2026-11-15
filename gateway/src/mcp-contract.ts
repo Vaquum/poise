@@ -102,8 +102,7 @@ export function parseMcpRead(value: unknown): McpRead {
     if (row.name === 'poise_list') {
       const repository = page.repository ?? null
       if (Object.keys(page).some(key => !['kind', 'repository', 'since', 'until', 'limit', 'cursor'].includes(key))
-        || (repository !== null && (typeof repository !== 'string' || repository.length > 140
-          || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/.test(repository)))) throw new Error('invalid Chat list selector')
+        || (repository !== null && !isMcpRepository(repository))) throw new Error('invalid Chat list selector')
       const since = pageTime(page.since), until = pageTime(page.until)
       if (since && until && since >= until) throw new Error('Chat list requires since before until')
       return { name: row.name, arguments: { ...bounds, repository, since, until } }

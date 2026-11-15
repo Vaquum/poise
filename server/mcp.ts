@@ -42,12 +42,12 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
     lookup = { observedAt: new Date().toISOString(), record: readChatRecord(chatInstance, authority.mcp, read.arguments) }
   }
   if (read.name === 'poise_list' || read.name === 'poise_changes') {
-    if (read.name === 'poise_list' ? !authority.mcp.chatList : !authority.mcp.chatTranscript) {
+    if (read.name === 'poise_list' ? !authority.mcp.chatList || !authority.mcp.chatMetadata : !authority.mcp.chatTranscript) {
       throw new HttpError(403, 'the selected Chat data consent is required')
     }
     if (!chatInstance) throw new HttpError(503, 'Chat data is unavailable until the workspace starts')
     page = read.name === 'poise_list' ? readMcpChatList(chatInstance, authority.mcp, read.arguments)
-      : readMcpChatChanges(chatInstance, authority.mcp, read.arguments, null)
+      : readMcpChatChanges(chatInstance, authority.mcp, read.arguments)
   }
   const tools = mcpToolNames(chatInstance ? authority.mcp : {})
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },

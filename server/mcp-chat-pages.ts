@@ -1,11 +1,13 @@
-import { isMcpRecordId, type McpChatChangesArguments, type McpChatListArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
+import { isMcpRecordId, mcpRepositoryAllowed, type McpChatChangesArguments, type McpChatListArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
 import type { ChatEvent } from './chat/protocol'
 import { getSession, listEvents, pageChatSessions, sessionInstance, type ChatPageSelector } from './chat/storage'
 import { HttpError } from './http'
 import { mcpCursor } from './mcp-cursor'
 
 export function readMcpChatList(instance: string, grant: McpGrantScope, args: McpChatListArguments) {
-  const { repository, since, until, limit } = args
+  const { since, until, limit } = args
+  const repository = args.repository ?? grant.repository ?? null
+  if (!mcpRepositoryAllowed(grant, repository)) throw new HttpError(403, 'repository is outside this grant')
   const cursor = mcpCursor(grant, ['chat-list-v1', repository?.toLowerCase(), since, until, limit])
   let before: ChatPageSelector['before'] = null
   if (args.cursor) {
@@ -49,7 +51,7 @@ function eventDetail(event: ChatEvent) {
   }
 }
 
-export function readMcpChatChanges(instance: string, grant: McpGrantScope, args: McpChatChangesArguments, repository: string | null) {
+export function readMcpChatChanges(instance: string, grant: McpGrantScope, args: McpChatChangesArguments) {
   const cursor = mcpCursor(grant, ['chat-changes-v1', args.id, args.limit])
   const requested = args.cursor ? cursor.decode(args.cursor) : args.afterSequence ?? 0
   if (typeof requested !== 'number' || !Number.isSafeInteger(requested) || requested < 0) {
@@ -57,11 +59,12 @@ export function readMcpChatChanges(instance: string, grant: McpGrantScope, args:
   }
   const observedAt = new Date().toISOString()
   const session = sessionInstance(args.id) === instance ? getSession(args.id) : null
-  if (!session || (repository !== null && session.repo.toLowerCase() !== repository.toLowerCase())) {
+  if (!session || !mcpRepositoryAllowed(grant, session.repo || null)) {
     return { observedAt, chatId: args.id, found: false, coverage: 'complete', items: [], nextCursor: null }
   }
   if (session.contextResetting) {
-    return { observedAt, chatId: args.id, found: true, coverage: 'unavailable', reason: 'Chat context is resetting', items: [], nextCursor: null }
+    return { observedAt, chatId: args.id, repository: session.repo || null, found: true, coverage: 'unavailable',
+      reason: 'Chat context is resetting', items: [], nextCursor: null }
   }
   if (requested > session.lastSeq) throw new HttpError(400, 'requested sequence is ahead of the Chat journal')
   const floor = session.contextResetSeq ? session.contextResetSeq - 1 : 0

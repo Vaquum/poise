@@ -211,6 +211,13 @@ export class McpGateway {
     if (read.name === 'poise_work' && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
       return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     }
+    if (read.name === 'poise_list') {
+      const repository = read.arguments.repository ?? grant.repository ?? null
+      if (!mcpRepositoryAllowed(grant, repository)) {
+        return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
+      }
+      read = { ...read, arguments: { ...read.arguments, repository } }
+    }
     const minute = Math.floor(ctx.deps.now() / 60_000)
     for (const [key, value] of this.reads) if (value.minute !== minute && !value.active) this.reads.delete(key)
     const rate = this.reads.get(grant.grantId) ?? { minute, count: 0, active: 0 }
@@ -300,6 +307,9 @@ export class McpGateway {
         const { repository, since, until } = read.arguments
         if (page.repository !== repository || page.since !== since || page.until !== until || page.items.some(item =>
           !item || typeof item !== 'object' || !isMcpRecordId(item.id)
+          || typeof item.updatedAt !== 'string' || !Number.isFinite(Date.parse(item.updatedAt))
+          || since !== null && Date.parse(item.updatedAt) < Date.parse(since)
+          || until !== null && Date.parse(item.updatedAt) >= Date.parse(until)
           || (repository !== null && (typeof item.repository !== 'string' || item.repository.toLowerCase() !== repository.toLowerCase())))) {
           throw new HttpError(502, 'invalid_workspace_chat_list_scope')
         }
@@ -308,6 +318,7 @@ export class McpGateway {
       }
       if (page.chatId !== read.arguments.id || typeof page.found !== 'boolean'
         || (!page.found && page.items.length !== 0)
+        || (page.found && !mcpRepositoryAllowed(grant, typeof page.repository === 'string' ? page.repository : null))
         || page.items.some(item => !item || typeof item !== 'object' || !Number.isSafeInteger(item.sequence) || item.sequence <= 0)) {
         throw new HttpError(502, 'invalid_workspace_chat_change_scope')
       }

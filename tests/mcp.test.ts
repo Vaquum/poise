@@ -275,8 +275,9 @@ it('pages Chat records and retained transcript events with independent consent a
   const now = new Date().toISOString()
   const ids = [randomUUID(), randomUUID()].sort().reverse()
   const foreign = randomUUID()
-  for (const id of [...ids, foreign]) insertSession({ id, title: id, agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
-    repo: 'Acme/Repo', checkout: '/private/checkout', branch: { name: 'main', origin: 'existing', provisional: false },
+  const anotherRepo = randomUUID()
+  for (const id of [...ids, foreign, anotherRepo]) insertSession({ id, title: id, agent: 'codex', model: 'fixture', modelId: 'fixture', effort: 'high',
+    repo: id === anotherRepo ? 'Acme/Other' : 'Acme/Repo', checkout: '/private/checkout', branch: { name: 'main', origin: 'existing', provisional: false },
     createdAt: now, updatedAt: now, status: 'closed', capabilities: emptyCapabilities(), lastSeq: 0, pendingRequests: [],
     instance: id === foreign ? 'bob-chat' : 'alice-chat' })
   const turnId = randomUUID()
@@ -286,6 +287,7 @@ it('pages Chat records and retained transcript events with independent consent a
   const metadata = await connect('Alice', endpoint, { chatMetadata: true })
   const full = await connect('Alice', endpoint, { chatMetadata: true, chatTranscript: true })
   const other = await connect('bob', endpoint, { chatMetadata: true, chatTranscript: true })
+  const scoped = await connect('Alice', endpoint, { chatMetadata: true, chatTranscript: true, repository: 'Acme/Repo' })
   const changes = { kind: 'chat', id: ids[0], limit: 1 }
   async function page(client: Client, name: 'poise_list' | 'poise_changes', args: Record<string, unknown>) {
     const result = await client.callTool({ name, arguments: args })
@@ -295,6 +297,9 @@ it('pages Chat records and retained transcript events with independent consent a
   }
   try {
     expect((await metadata.client.callTool({ name: 'poise_changes', arguments: changes })).isError).toBe(true)
+    expect((await scoped.client.callTool({ name: 'poise_list', arguments: { kind: 'chat', repository: 'Acme/Other' } })).isError).toBe(true)
+    expect((await page(scoped.client, 'poise_list', { kind: 'chat' })).items.map(item => item.id)).toEqual(ids)
+    expect(await page(scoped.client, 'poise_changes', { ...changes, id: anotherRepo })).toMatchObject({ found: false, items: [] })
     const selector = { kind: 'chat', repository: 'acme/repo', since: now, limit: 1 }
     const first = await page(full.client, 'poise_list', selector)
     expect(first.items).toMatchObject([{ id: ids[0], status: 'closed', link: `https://alice.poise.test/?view=chat&chat=${ids[0]}` }])
@@ -313,8 +318,8 @@ it('pages Chat records and retained transcript events with independent consent a
       items: [{ sequence: envelope.seq, type: 'session.reset' }] })
     expect(JSON.stringify(afterReset)).not.toContain('Fixture prompt')
   } finally {
-    await Promise.all([metadata.client.close(), full.client.close(), other.client.close()])
-    for (const id of [...ids, foreign]) deleteSession(id)
+    await Promise.all([metadata.client.close(), full.client.close(), other.client.close(), scoped.client.close()])
+    for (const id of [...ids, foreign, anotherRepo]) deleteSession(id)
   }
 })
 
@@ -371,7 +376,7 @@ it('reports the running workspace inventory through describe and the matching MC
   try {
     const result = await describe(client) as { inventory: { surfaces: Array<{ id: string; href: string }> } }
     const expected = [...PLACES, ...PARTS.map(id => `observe/${id}`), ...SECTIONS.map(id => `settings/${id}`),
-      ...listCapabilities().map(id => `capability/${id}`)]
+      ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript']
     expect(result.inventory.surfaces.map(surface => surface.id)).toEqual(expected)
     expect(result.inventory.surfaces.every(surface => new URL(surface.href).origin === 'https://alice.poise.test')).toBe(true)
     expect(result).toMatchObject({ access: { resource: endpoint, scope: 'poise:read' }, instructions: expect.any(String),
