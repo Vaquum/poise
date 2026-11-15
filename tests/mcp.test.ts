@@ -486,6 +486,9 @@ conn.close()
     expect(first.items[0].ledger.every(source => source.records.length === 0)).toBe(true)
     expect(first.items[0].ageMs).toBeGreaterThan(0)
     expect(first.items[1].blocker).toContain('capacity')
+    expect(first.items[1].next).toMatchObject({ actor: 'poise', action: 'recheck-admission' })
+    expect(first.items[0].intake).toMatchObject({ eligible: true, selectedLabel: 'poise', labelAppliedAt: null,
+      labelHistoryCoverage: { status: 'unavailable' } })
     expect(run.mock.calls.map(call => call[1])).toEqual([
       ['--db', path, 'health', '--max-age-seconds', '120'],
       ['--db', path, 'view', 'issue', '--repo', 'acme/repo', '--label=poise', '--after-repo', '', '--after-number', '0', '--limit', '3', '--format', 'json'],
@@ -557,6 +560,16 @@ conn.close()
     expect(dash.items).toEqual([])
     expect(dash.nextCursor).toBeNull()
     expect(run.mock.calls[1][1]).toEqual(expect.arrayContaining(['--label=-blocked']))
+    const window = { repository: 'acme/repo', label: 'poise', limit: 2, since: '2026-11-01T00:00:00Z', until: '2026-11-02T00:00:00Z' }
+    const inWindow = await work(window)
+    expect(inWindow.window).toEqual({ basis: 'issue_created_at', since: window.since, until: window.until })
+    expect(inWindow.items.map(item => item.issue)).toEqual([1, 2])
+    expect((await work({ ...window, cursor: inWindow.nextCursor })).items.map(item => item.issue)).toEqual([3, 4])
+    expect((await work({ ...window, since: '2026-10-31T00:00:00Z', until: window.since })).items).toEqual([])
+    await expect(connection.client.callTool({ name: 'poise_work',
+      arguments: { ...window, since: '2026-10-31T00:00:00Z', cursor: inWindow.nextCursor! } })).rejects.toThrow()
+    expect((await connection.client.callTool({ name: 'poise_work',
+      arguments: { ...window, until: window.since } })).isError).toBe(true)
     receipts.mockClear()
     receipts.mockImplementation(async () => ({
       status: 503, body: { version: 1 as const, error: 'ledger_read_timeout',

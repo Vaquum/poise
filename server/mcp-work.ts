@@ -2,7 +2,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { McpGrantScope, McpWorkArguments } from '../gateway/src/mcp-contract'
 import { readBehaviorLedger } from './behavior-ledger'
 import type { LedgerHealth, LedgerReadReply, LedgerRecord } from './behavior-ledger-contract'
-import { CHAIN_OBSERVATION_MAX_AGE_MS, type ChainObservation } from './behavior-chain-decision'
+import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, chainIdentity, type BehaviorChain } from './behavior-chain-store'
 import { behaviorChainSummary } from './behavior-chain-summary'
 import { db } from './db'
@@ -13,6 +13,7 @@ import { organizationArgs, organizationForRepository, type Organization } from '
 import { datastoreViewOrCli } from './datastore-reader'
 import { runFile } from './process'
 import type { ServiceConfig } from './service/config'
+import { getBehaviorChainSettings, type BehaviorChainSettings } from './settings'
 
 type CoverageStatus = 'fresh' | 'stale' | 'partial' | 'unavailable'
 interface Coverage { status: CoverageStatus; observedAt: string | null; reason: string | null }
@@ -26,7 +27,8 @@ const preview = (value: string | null) => value === null ? null : value.slice(0,
 function pageCursor(args: McpWorkArguments, grant: McpGrantScope): { repo: string; number: number }
 function pageCursor(args: McpWorkArguments, grant: McpGrantScope, after: { repo: string; number: number }): string
 function pageCursor(args: McpWorkArguments, grant: McpGrantScope, after?: { repo: string; number: number }) {
-  const scope = JSON.stringify([grant.resource, grant.ownerId, grant.handle, args.repository.toLowerCase(), args.label, args.limit])
+  const scope = JSON.stringify([grant.resource, grant.ownerId, grant.handle, args.repository.toLowerCase(), args.label, args.limit,
+    ...(args.since || args.until ? [args.since ?? null, args.until ?? null] : [])])
   const sign = (payload: string) => createHmac('sha256', grant.grantId).update(scope).update(payload).digest()
   if (after) {
     const payload = Buffer.from(JSON.stringify(after)).toString('base64url')
@@ -67,7 +69,7 @@ function ledgerCoverage(reply: LedgerReadReply): Coverage {
 }
 
 async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Coverage, now: number,
-  ledgerShortCircuit: { reply: LedgerReadReply | null }) {
+  ledgerShortCircuit: { reply: LedgerReadReply | null }, label: string | undefined, intake: BehaviorChainSettings | null) {
   let chain: BehaviorChain | null = null
   let chainCoverage = coverage('fresh', new Date(now).toISOString())
   let summary: ReturnType<typeof behaviorChainSummary> | null = null
@@ -148,10 +150,18 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
   const reviews = receipts.flatMap(receipt => typeof receipt.evidence?.reviewId === 'number' && pullUrl
     ? [`${pullUrl}#pullrequestreview-${receipt.evidence.reviewId}`] : [])
   const created = Date.parse(issue.created_at)
+  const eligible = observationCoverage.status === 'fresh' && observation
+    ? typeof observation.issue?.eligible === 'boolean' ? observation.issue.open && observation.issue.eligible : null
+    : mirror.status !== 'fresh' || !intake ? null : issue.status !== 'open' ? false
+      : intake.seedMode === 'all' || label?.toLowerCase() === intake.label.toLowerCase() ? true : null
+  const next = nextWorkAction(stage, blocker, chain, active, observation, observationCoverage, now, eligible)
   return { repository: issue.repo, issue: issue.number, title: issue.title.slice(0, 1024), state: issue.status, author: issue.author,
-    ageMs: Number.isFinite(created) ? Math.max(0, now - created) : null,
+    createdAt: issue.created_at, ageMs: Number.isFinite(created) ? Math.max(0, now - created) : null,
+    intake: { eligible, enabled: intake?.enabled ?? null, seedMode: intake?.seedMode ?? null, configuredLabel: intake?.seedMode === 'label' ? intake.label : null,
+      selectedLabel: label ?? null, labelAppliedAt: null,
+      labelHistoryCoverage: coverage('unavailable', null, 'The mirror records current label membership; label application history is not retained') },
     stage, step: active?.behavior ?? latest?.behavior ?? null, stageSince: latest ? new Date(latest.admittedAt).toISOString() : null,
-    blocker, reviewStatus: summary?.reviewStatus ?? 'not-recorded', mergeSha: summary?.mergeSha ?? null,
+    blocker, next, reviewStatus: summary?.reviewStatus ?? 'not-recorded', mergeSha: summary?.mergeSha ?? null,
     chain: chain ? { id: chain.id, sequence: chain.sequence, author: chain.author, reviewer: chain.reviewer } : null,
     coverage: { chain: chainCoverage, observation: observationCoverage, receipts: coverage(missingReceipt || omittedInvocations ? 'partial' : chainCoverage.status,
       chainCoverage.observedAt, missingReceipt ? 'Original Call or receipt evidence is not recorded'
@@ -159,7 +169,8 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
     receipts, omittedInvocations, ledger,
     github: observation?.pull ? { observedAt: observationCoverage.observedAt, head, merged: observation.pull.merged,
       mergeSha: observation.pull.mergeSha, checks: { pending: observation.pull.pending, failing: observation.pull.failing.slice(0, 10) },
-      queueEntry: observation.pull.queueEntry } : null,
+      queueEntry: observation.pull.queueEntry, approved: observation.pull.approved, changesRequested: observation.pull.changesRequested,
+      unresolvedThreads: observation.pull.unresolved, conflicts: observation.pull.conflict, behind: observation.pull.behind } : null,
     links: { issue: `${github}/issues/${issue.number}`,
       chain: chain ? `${origin}/api/behavior-chains?id=${encodeURIComponent(chain.id)}` : null,
       calls: calls.map(id => ({ id, url: `${origin}/api/agent-response/${id}` })), pr: pullUrl,
@@ -171,6 +182,27 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
   }
 }
 
+function nextWorkAction(stage: string, blocker: string | null, chain: BehaviorChain | null, active: BehaviorChain['invocations'][number] | undefined,
+  observation: ChainObservation | null, source: Coverage, now: number, eligible: boolean | null) {
+  if (stage === 'complete' || stage === 'superseded' || stage === 'merged_review_not_recorded') return null
+  if (stage === 'unknown') return { actor: 'workspace-owner', action: 'inspect-evidence', reason: blocker ?? 'Coverage is incomplete' }
+  if (stage === 'held') return { actor: 'workspace-owner', action: 'inspect-hold', reason: blocker }
+  if (active) return { actor: active.actor, action: 'await-original-receipt', reason: blocker }
+  if (stage === 'merged_review_pending') return { actor: 'workspace-owner', action: 'inspect-original-review', reason: blocker }
+  if (stage === 'delayed') return { actor: 'poise', action: 'recheck-admission', reason: blocker }
+  if (observation?.pull?.queueEntry && source.status === 'fresh') return { actor: 'github', action: 'observe-queue', reason: blocker }
+  if (chain && observation && source.status === 'fresh' && !chain.mergeSha) {
+    try {
+      const decision = decideBehaviorChain(chain, observation, now)
+      if (decision.kind === 'invoke') return { actor: decision.actor, action: decision.behavior, reason: preview(decision.reason) }
+      if (decision.kind === 'wait') return { actor: 'poise', action: 'observe', reason: preview(decision.reason) }
+      if (decision.kind === 'hold') return { actor: 'workspace-owner', action: 'inspect-prerequisites', reason: preview(decision.reason) }
+    } catch { return { actor: 'poise', action: 'refresh-observation', reason: 'The retained observation cannot establish the next action' } }
+  }
+  if (chain) return { actor: 'poise', action: 'refresh-observation', reason: source.reason }
+  return eligible === true ? { actor: 'poise', action: 'check-intake', reason: null } : null
+}
+
 export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig, grant: McpGrantScope) {
   requireConfiguredRepository(args.repository)
   const org = organizationForRepository(args.repository)
@@ -180,7 +212,8 @@ export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig
   // Pass the label as one --label=value argument so accepted labels starting
   // with a dash are not mistaken for another option by argparse.
   const filters = args.issue ? ['--number', String(args.issue)] : [`--label=${args.label!}`,
-    '--after-repo', after!.repo, '--after-number', String(after!.number)]
+    '--after-repo', after!.repo, '--after-number', String(after!.number),
+    ...(args.since ? ['--created-since-datetime', args.since] : []), ...(args.until ? ['--created-before-datetime', args.until] : [])]
   let source = await mirrorCoverage(org)
   let rows: WorkIssue[] = []
   try {
@@ -192,17 +225,22 @@ export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig
     if (rows.length > (args.issue ? 1 : limit + 1) || rows.some(row => row.repo.toLowerCase() !== args.repository.toLowerCase()
       || !Number.isSafeInteger(row.number) || row.number < 1 || args.issue !== undefined && row.number !== args.issue
       || typeof row.title !== 'string' || typeof row.created_at !== 'string'
+      || args.since !== undefined && !(Date.parse(row.created_at) >= Date.parse(args.since))
+      || args.until !== undefined && !(Date.parse(row.created_at) < Date.parse(args.until))
       || row.author !== null && typeof row.author !== 'string')) throw new Error('datastore returned an invalid work page')
   } catch (error) { rows = []; source = coverage('unavailable', source.observedAt, message(error)) }
   const selected = rows.slice(0, limit)
   const now = Date.now()
   const ledgerShortCircuit: { reply: LedgerReadReply | null } = { reply: null }
   const items: Array<Awaited<ReturnType<typeof workItem>>> = []
+  let intake: BehaviorChainSettings | null = null
+  try { intake = getBehaviorChainSettings() } catch { /* corrupt intake settings cannot establish eligibility */ }
   for (const issue of selected) {
-    items.push(await workItem(issue, service, source, now, ledgerShortCircuit))
+    items.push(await workItem(issue, service, source, now, ledgerShortCircuit, args.label, intake))
   }
   const last = selected.at(-1)
   return { repository: args.repository, issue: args.issue ?? null, label: args.label ?? null, observedAt: new Date(now).toISOString(),
+    window: { basis: 'issue_created_at', since: args.since ?? null, until: args.until ?? null },
     coverage: { issues: source }, items,
     nextCursor: rows.length > limit && last ? pageCursor(args, grant, { repo: last.repo, number: last.number }) : null }
 }

@@ -10,6 +10,8 @@ export const MCP_TOOLS = [
     inputSchema: { type: 'object', required: ['repository'], properties: {
       repository: { type: 'string', maxLength: 140 }, issue: { type: 'integer', minimum: 1 },
       label: { type: 'string', minLength: 1, maxLength: 100 }, limit: { type: 'integer', minimum: 1, maximum: 10 },
+      since: { type: 'string', description: 'Inclusive issue creation time in UTC (YYYY-MM-DDTHH:MM:SSZ)' },
+      until: { type: 'string', description: 'Exclusive issue creation time in UTC (YYYY-MM-DDTHH:MM:SSZ)' },
       cursor: { type: 'string', maxLength: 2048 },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
@@ -22,13 +24,17 @@ export const MCP_TOOLS = [
 
 export const MCP_WORK_TOOL_NAMES = ['poise_describe', 'poise_work'] as const
 export interface McpGrantScope { resource: string; ownerId: number; handle: string; grantId: string; chatMetadata?: true }
-export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
+export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string; since?: string; until?: string }
 export interface McpGetArguments { kind: 'chat' | 'timer'; id: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
   | { name: 'poise_work'; arguments: McpWorkArguments }
   | { name: 'poise_get'; arguments: McpGetArguments }
 
 export const isMcpRecordId = (value: unknown): value is string => typeof value === 'string' && MCP_RECORD_ID.test(value)
+
+const workWindowTime = (value: unknown): value is string => typeof value === 'string'
+  && /^[1-9][0-9]{3}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/.test(value)
+  && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().replace('.000Z', 'Z') === value
 
 export function parseMcpRead(value: unknown): McpRead {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid tool request')
@@ -44,7 +50,7 @@ export function parseMcpRead(value: unknown): McpRead {
   }
   if (row.name !== 'poise_work') throw new Error('unsupported tool or arguments')
   const work = args as Record<string, unknown>
-  if (Object.keys(work).some(key => !['repository', 'issue', 'label', 'limit', 'cursor'].includes(key))
+  if (Object.keys(work).some(key => !['repository', 'issue', 'label', 'limit', 'cursor', 'since', 'until'].includes(key))
     || typeof work.repository !== 'string' || work.repository.length > 140
     || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/.test(work.repository)) throw new Error('invalid repository or work selector')
   if (work.issue !== undefined) {
@@ -55,6 +61,10 @@ export function parseMcpRead(value: unknown): McpRead {
   if (typeof work.label !== 'string' || !work.label.trim() || work.label.length > 100
     || (work.limit !== undefined && (!Number.isSafeInteger(work.limit) || Number(work.limit) < 1 || Number(work.limit) > 10))
     || (work.cursor !== undefined && (typeof work.cursor !== 'string' || !work.cursor || work.cursor.length > 2048))) throw new Error('a label page requires a label and a limit from 1 to 10')
+  const { since, until } = work
+  if ((since !== undefined && !workWindowTime(since)) || (until !== undefined && !workWindowTime(until))
+    || (since && until && since >= until)) throw new Error('provide a valid UTC issue creation window')
   return { name: row.name, arguments: { repository: work.repository, label: work.label,
-    limit: work.limit === undefined ? 5 : Number(work.limit), ...(typeof work.cursor === 'string' ? { cursor: work.cursor } : {}) } }
+    limit: work.limit === undefined ? 5 : Number(work.limit), ...(typeof work.cursor === 'string' ? { cursor: work.cursor } : {}),
+    ...(since ? { since } : {}), ...(until ? { until } : {}) } }
 }
