@@ -60,7 +60,7 @@ import { WAKE_OPTIONS, wakeStatusText, type ManagerWakeView, type WakeMinutes } 
 import { deriveSessionTitle } from '../../../chat-title'
 import { applyWorklogOrder, compareWorklog } from '../../../chat-worklog'
 import { term } from '../../registry'
-import { chatState } from '../overview/states'
+import { chatState, type Placed } from '../overview/states'
 import { shortElapsed } from '../../../chat-turn-time'
 import { createDeployCard, type DeployCard, type LocalPendingChange } from '../../../views/chat-deploy-card'
 import { recognisePoiseRequest } from '../../../poise-request-intent'
@@ -280,8 +280,7 @@ function stallSummary(stall: StallState): string {
 }
 
 /** A chat's state in the registry's words, as Overview and Board say them (#556's vocabulary). */
-function stateWords(s: SessionRecord): string {
-  const placed = chatState(s)
+function stateWords(placed: Placed): string {
   return `${term(`state.${placed.state}`)}${placed.note ? ` · ${placed.note}` : ''}`
 }
 
@@ -776,7 +775,7 @@ function sidebarHtml(): string {
     const bulkArmed = armed && armedDelete!.bulk && armedDelete!.bulk.length > 1 ? armedDelete!.bulk : null
     const confirm = armed ? (bulkArmed ? deleteBulkConfirmCopy(bulkArmed.length) : deleteConfirmCopy(s, records)) : null
     const placed = chatState(s)
-    const said = stateWords(s)
+    const said = stateWords(placed)
     const pinned = pins.has(id) && s.role !== 'manager'
     const selected = selectedIds.has(id)
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}${pinned ? ' pinned' : ''}${selected ? ' selected' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0" draggable="${s.role !== 'manager'}">`
@@ -2574,11 +2573,13 @@ function headerHtml(): string {
   const e = entry()
   if (!e) return `<div class="chat-h-row chat-h-fresh"><span class="chat-controls-spacer"></span>${reasoningButton()}${autoMergeButton(freshAutoMerge, !!quickSessionPromise || firstPromptPending)}${safeModeButton(freshSafeMode, !!quickSessionPromise || firstPromptPending)}${memoriesButton()}</div>`
   const s = e.record
+  const status = chatState(s)
+  const statusHtml = `<span class="chat-h-status" data-state="${status.state}">${escapeHtml(stateWords(status))}</span>`
   // Poise runs the Switchboard's chat: it can be followed and its own questions
   // answered, but its model, settings and messages are not the person's to change.
   if (!listed(s.id)) {
     return `<div class="chat-h-row"><span class="chat-pill chat-h-agent">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)}</span><span class="chat-h-model">${escapeHtml(s.model)}</span>`
-      + `<span class="chat-h-status" data-status="${s.status}">${escapeHtml(stateWords(s))}</span> ${sinceHtml(e, s)}<span class="chat-controls-spacer"></span>`
+      + `${statusHtml} ${sinceHtml(e, s)}<span class="chat-controls-spacer"></span>`
       + `${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" data-help="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}</div>`
       + '<div class="st-help st-help-info chat-observer-note">Poise runs this chat for the Switchboard pane. It takes no messages; answer here only what it asks you.</div>'
   }
@@ -2604,7 +2605,7 @@ function headerHtml(): string {
       </span>
       <span class="chat-h-repo" data-help="${escapeHtml(s.checkout || '')}">${s.workspaceKind === 'poise-local' ? '<span>Poise · local</span>' : s.workspaceKind === 'poise-change' ? `<span>Poise · change</span> · <code>${escapeHtml(s.branch?.name || '')}</code>` : `<code>${escapeHtml(s.repo || 'local')}</code> · <code>${escapeHtml(s.branch?.name || '')}</code>`}${ws.text ? ` <span class="chat-h-ws ${ws.cls}">${escapeHtml(ws.text)}</span>` : ''}</span>
       ${modeSel}
-      <span class="chat-h-status" data-status="${s.status}">${escapeHtml(stateWords(s))}</span>
+      ${statusHtml}
       ${sinceHtml(e, s)}
       <span class="chat-controls-spacer"></span>
       ${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" data-help="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}

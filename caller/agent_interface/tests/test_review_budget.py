@@ -171,7 +171,7 @@ class TestRecovery(TestCase):
         return api.logs()[-1]
 
     def execute_verdicts(self, replies, checks, submission=None):
-        packet = json.dumps({'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD,
+        packet = json.dumps({'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD, 'coverage': 'complete', 'files': [],
                              'pull': {'title': 'Pinned approval target', 'base': {'sha': 'b' * 40}}})
         replies = iter(replies)
         self.verdict_snapshots = []
@@ -187,7 +187,7 @@ class TestRecovery(TestCase):
         def github(args, **kwargs):
             self.assertEqual(args[args.index('--token-user') + 1], 'bit-mis')
             if args[1] == '--review-activity-since':
-                return SimpleNamespace(returncode=0, stdout=json.dumps({'reviewer_latest_commit': HEAD}), stderr='')
+                return SimpleNamespace(returncode=0, stdout=json.dumps({'reviewer_latest_complete_commit': HEAD}), stderr='')
             self.assertEqual(args[args.index('--expected-head') + 1], HEAD)
             if args[1] == '--pr-review':
                 return SimpleNamespace(returncode=0, stdout=packet, stderr='')
@@ -588,7 +588,7 @@ class TestRecovery(TestCase):
         # Latencies are bounded fixture costs, not measured production timings.
         paths = [f'src/f{i:03d}.py' for i in range(files)]
         lines = max(finding_counts) if finding_counts else 1
-        packet = {'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD,
+        packet = {'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD, 'coverage': 'complete',
                   'merge_base_sha': 'b' * 40,
                   'pull': {'title': 'Pinned staged review', 'body': 'Review every group',
                            'base': {'sha': 'b' * 40}},
@@ -951,11 +951,16 @@ class TestRecovery(TestCase):
                 self.assertEqual(row['error_code'], 'review_inspection_timeout' if phase == 'inspection'
                                  else 'review_budget_exhausted', row['error'])
                 diagnostic = row['diagnostic']
-                handoff = limiting_phase == 'provider_analysis'
+                handoff = phase == 'provider_analysis'
                 self.assertEqual(diagnostic['phase'], 'analysis' if handoff else limiting_phase)
                 self.assertEqual(diagnostic['outcome'], 'handoff' if handoff else 'timed_out')
                 if handoff:
                     self.assertEqual(diagnostic['operation'], 'provider.review')
+                if phase.endswith('_inspection'):
+                    self.assertEqual(diagnostic['operation'], 'github-interface')
+                if phase == 'provider_analysis_inspection':
+                    self.assertEqual(row['error'], 'Local review repository inspection timed out; incomplete analysis; needs attention')
+                    self.assertNotIn('handing off', row['error'])
                 self.assertEqual(diagnostic['submission'], 'none')
                 self.assertIn(f'file group {group} of 22', diagnostic['message'])
                 self.assertIn('Incomplete analysis', diagnostic['message'])

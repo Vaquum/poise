@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, patch
 
 from github_interface import cli
 from github_interface.behaviors import review_activity_since
+from github_interface.atoms.review_response import response_body
+from review_response_fixture import response
 
 HEAD = "c" * 40
 PAGE = {"pageInfo": {"hasNextPage": False, "endCursor": None}}
@@ -51,6 +53,24 @@ def payload(since: str) -> dict[str, Any]:
 
 
 class TestReviewActivitySince(IsolatedAsyncioTestCase):
+    async def test_baseline_skips_partial_actionable_reviews_and_retains_the_last_proven_complete_head(self) -> None:
+        full = review(90, "CHANGES_REQUESTED", "2026-09-17T09:00:00Z", commit="a" * 40)
+        proof = response({"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40}, "title": "Review ordering", "body": ""},
+                         repo="Vaquum/repo", number=68, actor="bit-mis")
+        proof.pop("review_id")
+        proof["completed_at"] = 1_789_635_599_000
+        full["body"] = response_body(proof) + f"\n\n<!-- poise-invocation {proof['invocation_id']} -->"
+        for coverage in ("incomplete", None, True, {}):
+            partial = review(91, "CHANGES_REQUESTED", "2026-09-17T10:05:00Z")
+            partial["body"] = response_body({**proof, "head_sha": HEAD, "coverage": coverage}) \
+                + f"\n\n<!-- poise-invocation {proof['invocation_id']} -->"
+            with self.subTest(coverage=coverage):
+                facts = await review_activity_since.run(FakeClient([partial]), payload("1970-01-01T00:00:00Z"))
+                self.assertEqual(facts["reviewer_latest_commit"], HEAD)
+                self.assertIsNone(facts["reviewer_latest_complete_commit"])
+                facts = await review_activity_since.run(FakeClient([full, partial]), payload("1970-01-01T00:00:00Z"))
+                self.assertEqual(facts["reviewer_latest_complete_commit"], "a" * 40)
+
     async def test_lists_each_reviewer_review_since_with_its_submission_id(self) -> None:
         client = FakeClient([
             review(90, "COMMENTED", "2026-09-17T09:00:00Z"),

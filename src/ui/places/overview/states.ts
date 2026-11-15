@@ -16,14 +16,14 @@ export interface ChatLike {
   status: 'starting' | 'idle' | 'queued' | 'running' | 'waiting' | 'stopping' | 'interrupted' | 'closed' | 'error'
   role?: 'manager' | 'worker'
   queuedBehind?: string
-  pendingRequests?: string[]
+  ownerRequests?: string[]
   /** A bound session's last turn left work behind. */
   stall?: { repos?: unknown[], truncatedRepos?: number } | null
 }
 
 export function chatState(chat: ChatLike): Placed {
   // A stalled worker cannot go on until what its turn left is dealt with (#587, #619).
-  if (chat.role === 'worker' && chat.stall && chat.status !== 'running' && chat.status !== 'starting' && chat.status !== 'stopping') {
+  if (chat.role === 'worker' && chat.stall && !chat.ownerRequests?.length && chat.status !== 'running' && chat.status !== 'starting' && chat.status !== 'stopping') {
     const repos = (chat.stall.repos?.length ?? 0) + (chat.stall.truncatedRepos ?? 0)
     return { state: 'blocked', note: repos ? `left work behind in ${repos} ${repos === 1 ? 'repository' : 'repositories'}` : 'left work behind' }
   }
@@ -32,11 +32,13 @@ export function chatState(chat: ChatLike): Placed {
     case 'running': return { state: 'running', note: '' }
     case 'stopping': return { state: 'running', note: 'Stopping…' }
     case 'waiting': {
-      const asks = chat.pendingRequests?.length ?? 0
-      return { state: 'needs-you', note: asks > 1 ? `${asks} requests wait for you` : 'a request waits for you' }
+      const asks = chat.ownerRequests?.length ?? 0
+      return asks
+        ? { state: 'needs-you', note: asks > 1 ? `${asks} requests wait for you` : 'a request waits for you' }
+        : { state: 'waiting', note: 'Awaiting an answer' }
     }
     case 'queued': return { state: 'waiting', note: queuedStatusText(chat.queuedBehind) }
-    case 'interrupted': return { state: 'needs-you', note: 'Interrupted: Resume continues' }
+    case 'interrupted': return { state: 'blocked', note: 'Interrupted: Resume continues' }
     case 'closed': return { state: 'idle', note: 'Closed' }
     case 'error': return { state: 'failed', note: 'its last turn failed' }
     default: return { state: 'idle', note: '' }
@@ -93,7 +95,7 @@ export function phaseWords(phase: Phase, round: number | null): string {
 export function taskState(chain: ChainLike): Placed {
   if (chain.supersession) return { state: 'done', note: 'Superseded' }
   if (chain.mergeSha) return chain.reviewPending ? { state: 'waiting', note: 'Merged; review evidence pending' } : { state: 'done', note: 'Merged' }
-  if (chain.held) return { state: 'needs-you', note: chain.held }
+  if (chain.held) return { state: 'blocked', note: chain.held }
   const active = [...chain.invocations].reverse().find((invocation) => invocation.state !== 'settled')
   if (active?.state === 'uncertain') return { state: 'blocked', note: `Not confirmed: ${active.outcome || 'an effect Poise cannot prove yet'}` }
   const { phase, round } = taskPhase(chain)
@@ -109,15 +111,16 @@ const HELD: Record<Exclude<HeldReason, 'unknown'>, Placed> = {
   draft: { state: 'idle', note: 'Draft' },
   conflict: { state: 'blocked', note: 'a merge conflict' },
   checks_failing: { state: 'failed', note: 'checks failing' },
-  changes_requested: { state: 'needs-you', note: 'changes requested' },
-  review_required: { state: 'needs-you', note: 'a review is required' },
-  conversation_open: { state: 'needs-you', note: 'a conversation is open' },
+  changes_requested: { state: 'waiting', note: 'changes requested' },
+  review_required: { state: 'waiting', note: 'a review is required' },
+  conversation_open: { state: 'waiting', note: 'a conversation is open' },
   checks_running: { state: 'waiting', note: 'checks running' },
   behind: { state: 'blocked', note: 'behind its base' },
   blocked: { state: 'blocked', note: 'blocked' },
 }
 
 export interface PullLike {
+  reviewRequested?: boolean | null
   /** green or yellow as the status check read it; undefined while not read. */
   status?: 'green' | 'yellow'
   /** Why it is held, in the service's display order. */
@@ -130,14 +133,16 @@ export interface PullLike {
 
 /** A pull request's state, or null when it could not be read: that has no state word. */
 export function pullState(pull: PullLike): Placed | null {
+  if (pull.reviewRequested === true) return { state: 'needs-you', note: 'GitHub requested your review' }
+  if (pull.running) return { state: 'running', note: 'a run is on it' }
   if (pull.status === undefined) return null
-  if (pull.status === 'green') return { state: 'needs-you', note: 'Ready to merge' }
+  if (pull.status === 'green') return { state: 'waiting', note: 'Ready to merge' }
   const reason = (pull.reasons ?? []).find((value): value is Exclude<HeldReason, 'unknown'> => value !== 'unknown')
   if (reason) {
     const placed = HELD[reason]
     return reason === 'checks_failing' && pull.failing?.length ? { ...placed, note: `failing: ${pull.failing.join(', ')}` } : placed
   }
-  return pull.running ? { state: 'running', note: 'a run is on it' } : { state: 'idle', note: '' }
+  return { state: 'idle', note: '' }
 }
 
 export function issueState(issue: { running?: boolean }): Placed {

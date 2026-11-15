@@ -4,6 +4,94 @@ import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture, datastoreHealthOutput } from './behaviors-runtime-fixture'
 
 describe('review outcome evidence and registration', () => {
+  it('settles a receipted partial change request without quarantining or clearing its coverage', async () => {
+    const launched = await launchReviewBeforeCrash()
+    fixture.agentLogs = [agentLog({ started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      actor: launched.actor, source: launched.source, correlation_id: launched.correlationId,
+      status: 'completed', action: 'requested_changes', outcome: 'incomplete', head_sha: launched.expectedHead,
+      review_id: 91, artifact: { review_response: { coverage: 'incomplete' } } })]
+    await resetLogCache()
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(launched.database.db.prepare('SELECT launch_action, launch_outcome, launch_quarantine FROM behavior_seen WHERE key = ? AND target = ?')
+      .get('review-new-prs', launched.target)).toMatchObject({ launch_action: 'requested_changes', launch_outcome: 'changes_requested', launch_quarantine: null })
+    expect(fixture.agentLogs[0]).toMatchObject({ outcome: 'incomplete', artifact: { review_response: { coverage: 'incomplete' } } })
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: launched.correlationId, state: 'completed', activity: 'settled', outcome: 'incomplete',
+    }))
+  })
+
+  it('releases a held launch from a published partial review without losing its coverage disposition', async () => {
+    const launched = await launchReviewBeforeCrash()
+    const callId = 'f'.repeat(32)
+    fixture.agentLogs = [agentLog({ id: callId,
+      started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1', error_code: 'review_provider_blocked', error: 'account blocked',
+      expected_head: launched.expectedHead, actor: launched.actor,
+      source: launched.source, correlation_id: launched.correlationId })]
+    await resetLogCache()
+    let modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+    expect(modules.database.listBehaviorDeadLetters()).toHaveLength(1)
+    mocks.captureOutcome.mockClear()
+    fixture.agentLogs = [agentLog({ id: callId,
+      started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'completed', action: 'requested_changes', outcome: 'incomplete',
+      head_sha: launched.expectedHead, review_id: 91,
+      artifact: { review_response: { coverage: 'incomplete' } },
+      expected_head: launched.expectedHead, actor: launched.actor,
+      source: launched.source, correlation_id: launched.correlationId })]
+    await resetLogCache()
+    modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).toBeNull()
+    expect(modules.database.db.prepare('SELECT launch_action, launch_outcome FROM behavior_seen WHERE key = ? AND target = ?')
+      .get('review-new-prs', launched.target)).toMatchObject({ launch_action: 'requested_changes', launch_outcome: 'changes_requested' })
+    expect(modules.database.listBehaviorDeadLetters()).toEqual([])
+    expect(modules.database.countReviewRounds(pr.repo, pr.number)).toBe(1)
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: launched.correlationId, callId, state: 'completed', activity: 'settled', outcome: 'incomplete',
+    }))
+  })
+
+  it('adopts a verified partial replay for a held review without granting it clearance', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-07T12:00:00Z'))
+    const launched = await launchReviewBeforeCrash()
+    fixture.agentLogs = [agentLog({
+      id: 'f'.repeat(32), started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1', error_code: 'review_provider_blocked', error: 'account blocked',
+      expected_head: launched.expectedHead, actor: launched.actor,
+      source: launched.source, correlation_id: launched.correlationId,
+    })]
+    await resetLogCache()
+    let modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+    vi.setSystemTime(Date.now() + 2_000)
+    fixture.agentLogs.push(agentLog({
+      id: 'e'.repeat(32), model: 'opus-5-xhigh', status: 'completed',
+      action: 'requested_changes', outcome: 'incomplete', head_sha: HEAD_SHA,
+      artifact: { review_response: { coverage: 'incomplete' } },
+      source: 'poise:replay', correlation_id: 'explicit-replay', review_id: 91,
+    }))
+    await resetLogCache()
+    arrangeCli(false, false, { reviewerReviewIdsSince: [91] })
+    modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).toBeNull()
+    expect(modules.database.db.prepare('SELECT launch_action, launch_outcome, launch_source FROM behavior_seen WHERE key = ? AND target = ?')
+      .get('review-new-prs', launched.target)).toMatchObject({ launch_action: 'requested_changes', launch_outcome: 'changes_requested', launch_source: 'poise:replay' })
+    expect(modules.database.listBehaviorDeadLetters()).toEqual([])
+    expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
+  })
 
   it.each(['unclaimed', 'pending', 'incomplete', 'unavailable', 'stopped'] as const)(
     'retains the legacy publication refusal across head changes, ticks and restart (%s)', async (evidence) => {

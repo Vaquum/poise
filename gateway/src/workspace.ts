@@ -107,21 +107,21 @@ function refuse(ctx: Context, req: IncomingMessage, res: ServerResponse, owner: 
 }
 
 /** Starts the workspace in the background and tells the caller to come back shortly. */
-function starting(ctx: Context, req: IncomingMessage, res: ServerResponse, owner: User, problem: string | null): void {
+function starting(ctx: Context, req: IncomingMessage, res: ServerResponse, owner: User, problem: string | null): 'workspace_updating' | 'workspace_starting' {
   ctx.deps.orchestrator.startInBackground(owner.handle, owner.login)
   // Restarting onto a new release takes seconds; the page says so and reloads into the new version.
   if (ctx.deps.orchestrator.updatingTo(owner.handle) !== null) {
     if (!isNavigation(req)) {
       sendJson(res, 503, UPDATING, { 'retry-after': '2', [UPDATING_HEADER]: '1' })
-      return
+      return 'workspace_updating'
     }
     sendHtml(res, 503, updatingPage({ workspaceHost: `${owner.handle}.${ctx.deps.config.domain}` }),
       { ...ctx.pageHeaders, 'retry-after': '2', [UPDATING_HEADER]: '1' })
-    return
+    return 'workspace_updating'
   }
   if (!isNavigation(req)) {
     sendJson(res, 503, STARTING, { 'retry-after': '2' })
-    return
+    return 'workspace_starting'
   }
   sendHtml(res, 503, startingPage({
     workspaceHost: `${owner.handle}.${ctx.deps.config.domain}`,
@@ -130,6 +130,7 @@ function starting(ctx: Context, req: IncomingMessage, res: ServerResponse, owner
     // Settings → Admin lives in the workspace; when it cannot start, the apex admin page still works.
     adminHref: ctx.isAdmin(owner.handle) ? `${ctx.apexOrigin}/admin` : null,
   }), { ...ctx.pageHeaders, 'retry-after': '2' })
+  return 'workspace_starting'
 }
 
 function redeemTicket(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL, owner: User): void {
@@ -209,7 +210,10 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
   if (auth.session) ctx.holdOpen(auth.session.parentHash ?? auth.session.idHash, res)
   const { log, orchestrator } = ctx.deps
   const readiness = await orchestrator.readiness(owner.handle, owner.login)
-  if (!readiness.ready) return starting(ctx, req, res, owner, readiness.problem)
+  if (!readiness.ready) {
+    starting(ctx, req, res, owner, readiness.problem)
+    return
+  }
   const headers = forwardHeaders(req, {
     assertion: ctx.assertion(owner, auth.scope, auth.session),
     proto: ctx.scheme,
@@ -234,6 +238,7 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
   const evidence = () => ({ requestId, method: req.method, route, upstream: `${target.host}:${target.port}`,
     container: target.host, durationMs: Math.round(performance.now() - requestStarted), disconnect: 'upstream error reported while client remains answerable' })
   proxyRequest(req, res, target, headers, ctx.agent, async (error) => {
+    const release = orchestrator.updatingTo(owner.handle)
     // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
     try {
       if (error instanceof RequestTooLargeError) {
@@ -248,20 +253,23 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
         starting(ctx, req, res, owner, null)
         return
       }
-      log.error('proxy.failed', { handle: owner.handle, error: error.message, errno: error.code ?? null,
-        release: orchestrator.updatingTo(owner.handle), ...evidence() })
+      let disposition = 'bad_gateway'
       if (error.code === 'ECONNRESET' && (req.method === 'GET' || req.method === 'HEAD')
         && await orchestrator.restartingForUpdate(owner.handle, owner.login)) {
-        starting(ctx, req, res, owner, null)
-        return
-      }
-      if (isNavigation(req)) {
+        disposition = starting(ctx, req, res, owner, null)
+      } else if (isNavigation(req)) {
         sendHtml(res, 502, messagePage('Your workspace did not answer', 'The connection to your workspace failed. Reload to try again.'), ctx.pageHeaders)
       } else {
         sendJson(res, 502, { error: 'bad_gateway', message: 'The connection to the workspace failed.' })
       }
+      const answered = res.writableEnded && !res.destroyed
+      log[answered && disposition === 'workspace_updating' ? 'warn' : 'error']('proxy.failed', {
+        handle: owner.handle, error: error.message, errno: error.code ?? null, release, ...evidence(),
+        disconnect: answered ? `responded ${res.statusCode} ${disposition}` : 'response unanswered (client closed)',
+      })
     } catch (failure) {
-      log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure) })
+      log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure), errno: error.code ?? null,
+        release, ...evidence(), disconnect: 'response unanswered' })
       res.destroy()
     }
   }, (error, bytesSent) => {

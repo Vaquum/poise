@@ -34,15 +34,24 @@ whose immutable plan, pushed head, unattempted replies and released worker
 resources are proven. It starts no model and cannot replace that plan.
 Shared baseline CI dependencies use that same atomic repair artifact and the
 existing chain tick ([dependency evidence and recovery](../docs/Behavior-chain.md)).
-Before new implementation, Poise reads `github-datastore view issue-dependencies`
-under the existing freshness gate. For each explicit same-repository prerequisite,
+Before new implementation, Poise reads live `blockedBy` evidence in the existing
+authenticated `--chain-seed` / `--issue-work` GraphQL preflight, bounded to 100
+nodes with a matching total count and complete page. The mirror health gate
+remains required. After awaited request preparation, the same observation and
+decision run again before implementation admission; missing or truncated live
+evidence waits. For each explicit same-repository prerequisite,
 `github-interface --read-issue ISSUE --delivery-base SHA --token-user USER`
 reads its state and linked closing PRs, including closed PRs. It returns
 `verified: true` only for a closed issue with a linked closing PR's merge commit
 verified on that exact base by GitHub's commit comparison; missing or incomplete
 evidence returns an explicit unverified reason. The result retains the base, PR
 number and merge SHA. [Dependency waits](../docs/Behavior-chain.md#handoffs-and-outcomes)
-preserve ordinary chain holds and admission gates.
+preserve ordinary chain holds and admission gates. Before the first push,
+`--issue-work --mode publish` re-verifies those same live prerequisites on
+`--starting-head` (the prepared candidate base, not current main); a new
+unresolved dependency or incomplete evidence returns `prerequisite_wait`
+without committing, pushing or opening a PR. Already pushed branches still
+reconcile through `--mode complete`.
 `github-interface --list-failing-ci PR --repository OWNER/REPO --ref SHA`
 includes the exact commit's checks, parent SHAs and workflow identities while
 retaining the current candidate head. `--ref base` reads the current base.
@@ -65,8 +74,14 @@ work and rechecks the owned head immediately before closing. It returns `closed`
 them. The chain invokes it only through the original native action/resource
 path after settling prior writes and native ownership. See
 [full-suite reconciliation](../docs/Behavior-chain.md#bounded-reconciliation).
+The same retirement action accepts verified empty-integration coverage for
+Poise-generated pre-PR failure remediations, including queued PRs with open
+seeds. `--chain-seed` retains the pinned Git trees and distinct covering merge;
+the close action rechecks the current head and base. Independent work and
+unverified coverage retain ordinary processing. The source issue is untouched.
 
-An atomic repair blocked solely by the supplied head's failed CI can return
+An atomic repair blocked solely by failed CI on the supplied PR head or a
+verified merge-group integration can return
 `blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains
 its own supplied CI snapshot as `artifact.ci_blocker`, including the failed
 check and job IDs that identify the original run attempt. Other blockers remain
@@ -86,6 +101,19 @@ retaining `artifact.test_dependency`. `github-interface --chain-seed ISSUE
 proof and the delivered recovery on the current implementation base. See
 [pre-PR recovery](../docs/Behavior-chain.md#bounded-reconciliation) for admission
 and evidence limits. Relay prose and digests alone remain actionable holds.
+
+For new Calls, `source: "relay"` would identify the original and clean-base
+completed relay run IDs, but recovery is currently held for #1619: the suite UID
+owns the report files, so candidate code can replace them before signing.
+Caller supplies its own retained Call/capture binding and reads the signed runner
+receipts saved by the hook; worker-supplied receipt text cannot replace them.
+The gateway would authenticate both complete assertion inventories. A distinct run
+at the same HEAD is insufficient: the baseline must independently match a clean
+prepared-base source capture. Direct Vitest commands, wrappers, other runners,
+canceled/incomplete results and evidence overflow all retain the hold until the
+runner establishes the inventory independently. The same delivered-fix and
+full-suite CI validation gates would apply, including every duplicate parameter
+under a failing title.
 
 ## Accounts
 

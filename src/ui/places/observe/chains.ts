@@ -4,6 +4,7 @@
 // projection's order, and the journal's events in words. Nothing here reads
 // the network or the page, so the unit tests read it directly.
 import type { BehaviorCutoverState } from '../../../behavior-cutover'
+import type { ChainNudge, ChainWorkLink } from '../../../behavior-chain-nudge'
 
 export type StateKey = 'running' | 'needs-you' | 'waiting' | 'blocked' | 'idle' | 'done' | 'failed'
 
@@ -24,6 +25,13 @@ export interface ChainSupersession {
   recovery: { id: number } | null
 }
 
+interface ReviewReceipt { id: number, head: string, submittedAt: number, url: string }
+export interface MergedReviewWarning {
+  head: string
+  reviews: Array<ReviewReceipt & { verdict: string }>
+  githubApproval: (ReviewReceipt & { client: 'unknown' }) | null
+}
+
 export interface ChainRow {
   id: string
   repository: string
@@ -34,6 +42,7 @@ export interface ChainRow {
   mergeSha: string | null
   reviewPending: boolean | null
   reviewStatus: 'pending' | 'complete' | 'not-recorded'
+  mergedReviewWarning: MergedReviewWarning | null
   supersession: ChainSupersession | null
   reconciliation: { nextObservationAt: number | null, waitingForOriginalResponse: boolean, waitingForResourceRelease: boolean } | null
   pullNumber: number | null
@@ -52,6 +61,7 @@ export interface AttentionRow {
   blocker: string
   evidence: { state: string, checkedAt: number | null, gates: string[] }
   nextAction: string
+  nudge?: ChainNudge | null
   retryAt: number | null
   reconciliation: { nextObservationAt: number | null, waitingForResourceRelease: boolean }
   journal: string
@@ -62,6 +72,7 @@ export interface ChainCapacity {
   error: string | null
   modelInvocationLimit: number | null
   reservedModelInvocations: number | null
+  retainedModelInvocations: number | null
   mode: string | null
   enabled: boolean | null
   intake: { seedMode: string, label: string | null } | null
@@ -101,6 +112,21 @@ function invocation(value: unknown): ChainInvocation {
     slot: text(value.slot), outcome: text(value.outcome), admittedAt: count(value.admittedAt) }
 }
 
+function reviewReceipt(value: unknown): ReviewReceipt {
+  if (!object(value) || !Number.isSafeInteger(value.id) || typeof value.head !== 'string'
+    || typeof value.submittedAt !== 'number' || !Number.isFinite(value.submittedAt) || typeof value.url !== 'string') return incomplete('a review receipt')
+  return { id: Number(value.id), head: value.head, submittedAt: value.submittedAt, url: value.url }
+}
+
+function mergedReviewWarning(value: unknown): MergedReviewWarning | null {
+  if (value == null) return null
+  if (!object(value) || typeof value.head !== 'string' || !Array.isArray(value.reviews) || !value.reviews.length) return incomplete('merged review clearance')
+  return { head: value.head, reviews: value.reviews.map(review => {
+    if (!object(review) || typeof review.verdict !== 'string') return incomplete('a retained review verdict')
+    return { ...reviewReceipt(review), verdict: review.verdict }
+  }), githubApproval: value.githubApproval == null ? null : { ...reviewReceipt(value.githubApproval), client: 'unknown' } }
+}
+
 export function readChain(value: unknown): ChainRow {
   if (!object(value) || typeof value.id !== 'string' || typeof value.repository !== 'string' || !Number.isSafeInteger(value.issue)
     || !Number.isSafeInteger(value.sequence) || !Array.isArray(value.invocations)) return incomplete('a chain')
@@ -116,6 +142,7 @@ export function readChain(value: unknown): ChainRow {
     held: text(value.held), waiting: text(value.waiting), mergeSha: text(value.mergeSha),
     reviewPending: typeof value.reviewPending === 'boolean' ? value.reviewPending : null,
     reviewStatus: value.reviewStatus === 'pending' || value.reviewStatus === 'complete' ? value.reviewStatus : 'not-recorded',
+    mergedReviewWarning: mergedReviewWarning(value.mergedReviewWarning),
     supersession,
     reconciliation: object(r) ? { nextObservationAt: count(r.nextObservationAt), waitingForOriginalResponse: r.waitingForOriginalResponse === true, waitingForResourceRelease: r.waitingForResourceRelease === true } : null,
     pullNumber: Number.isSafeInteger(value.pullNumber) ? Number(value.pullNumber) : null,
@@ -134,9 +161,39 @@ function attentionRow(value: unknown): AttentionRow {
     pullNumber: Number.isSafeInteger(value.pullNumber) ? Number(value.pullNumber) : null,
     step: String(value.step ?? ''), progressAt: Number(value.progressAt), ageMs: Number(value.ageMs), blocker: String(value.blocker ?? ''),
     evidence: { state: String(e.state ?? 'unavailable'), checkedAt: count(e.checkedAt), gates: Array.isArray(e.gates) ? e.gates.map(String) : [] },
-    nextAction: String(value.nextAction ?? ''), retryAt: count(value.retryAt),
+    nextAction: String(value.nextAction ?? ''), retryAt: count(value.retryAt), nudge: readNudge(value.nudge),
     reconciliation: { nextObservationAt: count(r.nextObservationAt), waitingForResourceRelease: r.waitingForResourceRelease === true },
     journal: value.journal,
+  }
+}
+
+function readNudge(value: unknown): ChainNudge | null {
+  if (!object(value) || typeof value.action !== 'string') return null
+  const { kind, action } = value
+  if (kind !== 'automatic' && kind !== 'prerequisite' && kind !== 'decision' && kind !== 'reconcile' && kind !== 'unknown') return null
+  const prerequisite = typeof value.prerequisite === 'string' && REPOSITORY.test(value.prerequisite.split('#')[0])
+    && /^[^#]+#[1-9]\d*$/.test(value.prerequisite) ? value.prerequisite : null
+  let work: ChainWorkLink | null = null
+  if (object(value.work)) {
+    if (value.work.kind === 'chat' && typeof value.work.session === 'string' && value.work.session) {
+      work = { kind: 'chat', session: value.work.session, manager: value.work.manager === true }
+    } else if (value.work.kind === 'pull' && typeof value.work.url === 'string'
+      && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(value.work.url)) {
+      work = { kind: 'pull', url: value.work.url }
+    }
+  }
+  return { kind, action, prerequisite, work }
+}
+
+export function attentionRoot(id: string, byId: ReadonlyMap<string, AttentionRow>): string {
+  const visited = new Set([id])
+  let root = id
+  for (;;) {
+    const next = byId.get(root)?.nudge?.prerequisite
+    if (!next || !byId.has(next)) return root
+    if (visited.has(next)) return id
+    visited.add(next)
+    root = next
   }
 }
 
@@ -147,6 +204,7 @@ export function readChainsPage(value: unknown): ChainsPage {
   const capacity = object(value.capacity) ? {
     status: value.capacity.status === 'available' ? 'available' as const : 'unavailable' as const, error: text(value.capacity.error),
     modelInvocationLimit: count(value.capacity.modelInvocationLimit), reservedModelInvocations: count(value.capacity.reservedModelInvocations),
+    retainedModelInvocations: count(value.capacity.retainedModelInvocations),
     mode: text(value.capacity.mode), enabled: typeof value.capacity.enabled === 'boolean' ? value.capacity.enabled : null,
     intake: object(value.capacity.intake) ? { seedMode: String(value.capacity.intake.seedMode), label: text(value.capacity.intake.label) } : null,
   } : null
@@ -233,10 +291,11 @@ export function taskState(chain: ChainRow): { state: StateKey, reason: string } 
   }
   if (chain.mergeSha) {
     if (chain.reviewPending) return { state: 'waiting', reason: `Merged as ${sha(chain.mergeSha)} · review evidence pending` }
+    if (chain.mergedReviewWarning) return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · native review clearance unmet` }
     if (chain.reviewStatus === 'not-recorded') return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · pre-merge review completion not recorded` }
     return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)}` }
   }
-  if (chain.held) return { state: 'needs-you', reason: chain.held === 'New invocations held by the person' ? 'Held by you: no new invocations' : `Held: ${reasonWords(chain.held)}` }
+  if (chain.held) return { state: 'blocked', reason: chain.held === 'New invocations held by the person' ? 'Held by you: no new invocations' : `Held: ${reasonWords(chain.held)}` }
   const active = chain.invocations.find((i) => i.state !== 'settled')
   if (active?.state === 'uncertain') return { state: 'blocked', reason: `Not confirmed: ${active.outcome || 'the original receipt is unverified'}; reconciling` }
   if (active?.state === 'started') {

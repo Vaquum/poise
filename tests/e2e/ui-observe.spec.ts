@@ -1,6 +1,8 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 import { normalize, type LogEvent } from '../../gateway/src/diagnostics/contract'
+import { gatewayDiagnostic } from '../../gateway/src/diagnostics/collectors'
 import { callerDiagnostic, workspaceEnvelope } from '../../gateway/src/diagnostics/sources'
+import type { ChainNudge } from '../../src/behavior-chain-nudge'
 
 // Observe in the new interface (#556): Tasks with the chain's evidence,
 // Behaviors, GitHub and Logging, on main's endpoints. The isolated server has
@@ -28,10 +30,10 @@ const CHAINS = [
   chain(495, {}, [{ id: 'i495a', behavior: 'repair-pr', state: 'uncertain', outcome: 'a reply may have posted' }]),
   chain(501, { held: 'queue removal requires a decision: manual (q86)' }, [{ id: 'i501a', behavior: 'merge-pr', state: 'settled', outcome: 'enqueued' }]),
 ]
-const attention = (c: ReturnType<typeof chain>, progressAgo: number, blocker: string) => ({
+const attention = (c: ReturnType<typeof chain>, progressAgo: number, blocker: string, nudge?: ChainNudge) => ({
   id: c.id, repository: c.repository, issue: c.issue, pullNumber: c.pullNumber, step: 'step', progressAt: NOW - progressAgo, ageMs: progressAgo, blocker,
   evidence: { state: 'fresh', checkedAt: NOW - minutes(2), gates: ['Head 2aa6f19', 'Required CI passed'] }, nextAction: 'Resolve the durable hold, then explicitly resume the chain',
-  retryAt: null, reconciliation: { nextObservationAt: null, waitingForResourceRelease: false }, journal: `/api/behavior-chains?id=${encodeURIComponent(c.id)}&after=${c.sequence - 1}`,
+  retryAt: null, reconciliation: { nextObservationAt: null, waitingForResourceRelease: false }, journal: `/api/behavior-chains?id=${encodeURIComponent(c.id)}&after=${c.sequence - 1}`, nudge,
 })
 // Served out of order: the page orders Needs attention by the oldest verified progress itself.
 const ATTENTION = [attention(CHAINS[3], minutes(36), 'queue removal requires a decision'), attention(CHAINS[1], minutes(26 * 60), 'No verified progress for at least 24 hours'), attention(CHAINS[2], minutes(15), 'a reply may have posted')]
@@ -43,7 +45,10 @@ const JOURNAL = [
   { sequence: 260, at: NOW - minutes(20), type: 'chain.waiting', reason: 'exact-head CI is still running' },
 ]
 
-interface Served { chainsFail?: boolean, posts?: unknown[], diagnostics?: ReturnType<typeof diagnostic>[] }
+interface Served {
+  chainsFail?: boolean, posts?: unknown[], diagnostics?: ReturnType<typeof diagnostic>[],
+  chains?: typeof CHAINS, attention?: typeof ATTENTION, next?: string, capacity?: Record<string, unknown> | null
+}
 async function serveChains(page: Page, served: Served = {}): Promise<void> {
   await page.route((url) => url.pathname === '/api/behavior-chains', async (route: Route) => {
     const url = new URL(route.request().url())
@@ -61,16 +66,18 @@ async function serveChains(page: Page, served: Served = {}): Promise<void> {
         nextAction: 'Reconcile the original invocation receipt before retrying', journal: '/api/behavior-chains?id=acme%2Fsite%23493&after=159',
       } : null) } })
     }
+    const chains = served.chains ?? CHAINS
     const meta = { cutover: { sequence: 1, mode: 'v2', requestedAt: null, legacyPulls: ['acme/site#471'], support: { status: 'supported', error: null }, blockers: [] },
       settings: { enabled: true, seedMode: 'label', label: 'poise' }, runtime: [],
-      capacity: { status: 'available', error: null, modelInvocationLimit: 8, reservedModelInvocations: 3, mode: 'v2', enabled: true, intake: { seedMode: 'label', label: 'poise' } } }
+      capacity: served.capacity !== undefined ? served.capacity : { status: 'available', error: null, modelInvocationLimit: 8,
+        reservedModelInvocations: 3, retainedModelInvocations: 1, mode: 'v2', enabled: true, intake: { seedMode: 'label', label: 'poise' } } }
     const id = url.searchParams.get('id')
     if (id) {
       const after = Number(url.searchParams.get('after') ?? 0)
       const events = (id === 'acme/site#493' ? JOURNAL : []).filter((e) => e.sequence > after).slice(0, 20)
-      return route.fulfill({ json: { chain: CHAINS.find((c) => c.id === id) ?? null, events, next: events.length === 20 ? events[19].sequence : null, ...meta } })
+      return route.fulfill({ json: { chain: chains.find((c) => c.id === id) ?? null, events, next: events.length === 20 ? events[19].sequence : null, ...meta } })
     }
-    return route.fulfill({ json: { chains: CHAINS, next: null, attention: ATTENTION, ...meta } })
+    return route.fulfill({ json: { chains: served.next ? chains.slice(0, 1) : chains, next: served.next ?? null, attention: served.attention ?? ATTENTION, ...meta } })
   })
 }
 
@@ -160,7 +167,7 @@ const logging = (page: Page) => page.locator('[data-panel="logging"]')
 
 test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest progress first, each saying how long', async ({ page }) => {
   await open(page, '/?view=observe&part=tasks')
-  await expect(tasks(page).locator('[data-ref="tk.status"]')).toContainText('v2 owns new work · 3 of 8 model runs in use, shared with other heavy work')
+  await expect(tasks(page).locator('[data-ref="tk.status"]')).toContainText('v2 owns new work · 3 of 8 model slots occupied across the workspace, shared with other heavy work · 1 retained for unresolved cleanup, awaiting original resource evidence')
   await expect(tasks(page).locator('[data-ref="tk.legacy"]')).toContainText('1 pull request kept by v1 at cutover')
   await expect(tasks(page).locator('.tk-row')).toHaveCount(4)
   await tasks(page).getByRole('button', { name: 'Needs attention 3' }).click()
@@ -169,7 +176,7 @@ test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest 
   await expect(rows.nth(0)).toContainText('acme/site#493')
   await expect(rows.nth(0)).toContainText('no verified advance for 1d 2h')
   await expect(rows.nth(1)).toContainText('acme/site#501 → #502')
-  await expect(rows.nth(1)).toContainText('Needs you')
+  await expect(rows.nth(1)).toContainText('Blocked')
   await expect(rows.nth(2)).toContainText('acme/site#495')
   await expect(rows.nth(2)).toContainText('Blocked')
   await expect(rows.nth(2)).toContainText('Not confirmed: a reply may have posted')
@@ -180,6 +187,81 @@ test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest 
   await expect(head.locator('[data-ref="side.hold"]')).toContainText('Queue removal requires a decision')
   expect(query(page).chain).toBe('acme/site#501')
 })
+
+test('Needs attention links to existing work and groups dependent tasks under the root blocker', async ({ page }) => {
+  const root = CHAINS[3], dependent = CHAINS[1]
+  const served: Served = { posts: [], attention: [
+    attention(root, minutes(26 * 60), 'Required validation is unresolved'),
+    attention(dependent, minutes(60), 'Waiting on the prerequisite', {
+      kind: 'prerequisite', action: 'Poise is waiting for verified delivery of the prerequisite.', prerequisite: root.id, work: null,
+    }),
+  ] }
+  await open(page, '/?view=observe&part=tasks&which=attention', served)
+  const panel = tasks(page)
+  await expect(panel.locator('.tk-row')).toHaveCount(1)
+  await panel.locator('.tk-row').click()
+  await expect(panel.getByRole('link', { name: dependent.id })).toBeVisible()
+
+  served.attention![0].nudge = { kind: 'unknown', action: 'No automatic next step verified. Inspect the recorded blocker.', prerequisite: null, work: null }
+  await panel.getByRole('button', { name: 'Active', exact: true }).click()
+  await panel.getByRole('button', { name: 'Needs attention 2' }).click()
+  await expect(panel.getByText('Ownership unverified')).toBeVisible()
+  await expect(panel.getByRole('link', { name: dependent.id })).toBeVisible()
+
+  served.attention![0].nudge!.work = { kind: 'chat', session: 'existing-owner', manager: false }
+  await panel.getByRole('button', { name: 'Active', exact: true }).click()
+  await panel.getByRole('button', { name: 'Needs attention 2' }).click()
+  await expect(panel.getByRole('link', { name: 'Open the bound Chat' })).toHaveAttribute('href', '?view=chat&chat=existing-owner&back=observe')
+  await expect(panel.getByText('Ownership unverified')).toHaveCount(0)
+  expect(served.posts).toEqual([])
+})
+
+test('retained capacity stays workspace-wide beyond page one and attention opens its original evidence', async ({ page }) => {
+  const retained = chain(999, { pullNumber: null, held: 'original cleanup handle missing' }, [
+    { id: 'retained', behavior: 'implement-issue', state: 'uncertain', outcome: 'original resource release unverified' },
+  ])
+  const released = chain(998, { held: 'original publication receipt missing' }, [
+    { id: 'released', behavior: 'implement-issue', state: 'uncertain', outcome: 'original publication receipt missing' },
+  ])
+  const pending = attention(retained, minutes(30), 'original cleanup handle missing; original resource release unverified')
+  pending.nextAction = 'Reconcile the original invocation receipt before any retry'
+  await open(page, '/?view=observe&part=tasks', { chains: [CHAINS[0], released, retained], next: CHAINS[0].id,
+    attention: [attention(released, minutes(20), 'original publication receipt missing'), pending],
+    capacity: { status: 'available', modelInvocationLimit: 8, reservedModelInvocations: 2, retainedModelInvocations: 1 } })
+  const status = tasks(page).locator('[data-ref="tk.status"]')
+  await expect(tasks(page).locator('.tk-row')).toHaveCount(1)
+  await expect(status).toContainText('2 of 8 model slots occupied across the workspace')
+  await expect(status).toContainText('1 retained for unresolved cleanup, awaiting original resource evidence')
+  await page.locator('[data-menu="obv-org-menu"]').click()
+  await page.locator('#obv-org-menu [data-org="umbrella"]').click()
+  await expect(tasks(page).locator('.tk-row')).toHaveCount(0)
+  await expect(status).toContainText('2 of 8 model slots occupied across the workspace')
+  await expect(status).toContainText('1 retained for unresolved cleanup')
+  await page.locator('[data-menu="obv-org-menu"]').click()
+  await page.locator('#obv-org-menu [data-org=""]').click()
+  await tasks(page).getByRole('button', { name: 'Needs attention 2' }).click()
+  await expect(tasks(page).locator('.tk-row')).toHaveCount(2)
+  await tasks(page).locator('.tk-row').filter({ hasText: 'acme/site#999' }).click()
+  await expect(tasks(page).locator('[data-ref="tk.evidence"]')).toContainText(pending.blocker)
+  await expect(tasks(page).locator('[data-ref="tk.evidence"]')).toContainText(pending.nextAction)
+  await expect(tasks(page).locator('[data-ref="side.timeline"]')).toBeVisible()
+  expect(query(page).chain).toBe(retained.id)
+  await expect(status).toContainText('1 retained for unresolved cleanup')
+})
+
+for (const [label, capacity] of [
+  ['absent', null],
+  ['unavailable', { status: 'unavailable', error: 'journal unavailable', reservedModelInvocations: null, retainedModelInvocations: null }],
+  ['missing retained count', { status: 'available', modelInvocationLimit: 8, reservedModelInvocations: 3 }],
+] as const) {
+  test(`capacity evidence is unknown when ${label}`, async ({ page }) => {
+    await open(page, '/?view=observe&part=tasks', { capacity })
+    const status = tasks(page).locator('[data-ref="tk.status"]')
+    await expect(status).toContainText('retained cleanup count unknown')
+    await expect(status).not.toContainText('0 retained')
+    if (label !== 'missing retained count') await expect(status).toContainText('model capacity unavailable')
+  })
+}
 
 test('a notice’s journal link opens the task’s timeline at its step, newest first, with Resume where the hold is', async ({ page }) => {
   const posts: unknown[] = []
@@ -202,6 +284,37 @@ test('a notice’s journal link opens the task’s timeline at its step, newest 
   await tasks(page).getByRole('button', { name: 'Resume' }).click()
   await expect(tasks(page).locator('.tk-act-note')).toContainText('Resumed.')
   expect(posts).toEqual([{ id: 'acme/site#501', sequence: 901, operation: 'resume' }])
+})
+
+test('completed merged tasks retain unmet native clearance and separately identify the later GitHub approval', async ({ page }) => {
+  await open(page, '/?view=observe&part=tasks')
+  const head = 'a'.repeat(40)
+  const completed = chain(1635, { mergeSha: 'c'.repeat(40), reviewPending: false, reviewStatus: 'complete', invocationCount: 22,
+    mergedReviewWarning: { head, reviews: [{ id: 91, head, submittedAt: NOW - 7000,
+      url: 'https://github.com/acme/site/pull/1636#pullrequestreview-91',
+      verdict: 'Changes requested: retain the original native review clearance after merge.' }],
+    githubApproval: { id: 93, head, submittedAt: NOW - 4000, url: 'https://github.com/acme/site/pull/1636#pullrequestreview-93', client: 'unknown' } } })
+  const writes: string[] = []
+  await page.route(url => url.pathname === '/api/behavior-chains', route => {
+    if (route.request().method() !== 'GET') writes.push(route.request().method())
+    const id = new URL(route.request().url()).searchParams.get('id')
+    return route.fulfill({ json: id ? { chain: completed, events: [], next: null }
+      : { chains: [completed], attention: [], next: null, cutover: { mode: 'v2', legacyPulls: [] } } })
+  })
+  await page.goto('/?view=observe&part=tasks&which=merged')
+  const row = tasks(page).locator('.tk-row')
+  await expect(row).toContainText('Merged as ccccccc · native review clearance unmet')
+  await row.click()
+  const evidence = tasks(page).locator('[data-ref="tk.evidence"]')
+  await expect(evidence).toContainText(`Unmet at merge on head ${head}`)
+  await expect(evidence).toContainText('Changes requested: retain the original native review clearance after merge.')
+  await expect(evidence.getByRole('link', { name: 'Changes requested', exact: true })).toHaveAttribute('href', 'https://github.com/acme/site/pull/1636#pullrequestreview-91')
+  await expect(evidence.getByRole('link', { name: 'Review #93' })).toHaveAttribute('href', 'https://github.com/acme/site/pull/1636#pullrequestreview-93')
+  await expect(evidence).toContainText(`submitted ${iso(NOW - 4000)} · submitting client unknown`)
+  await expect(tasks(page).getByRole('button', { name: /Hold new invocations|Resume/ })).toHaveCount(0)
+  await page.reload()
+  await expect(tasks(page).locator('[data-ref="tk.evidence"]')).toContainText('Native review clearance')
+  expect(writes).toEqual([])
 })
 
 test('a settlement link names original review completion and keeps the earlier merge and run links', async ({ page }) => {
@@ -259,6 +372,20 @@ test('Logging’s entry addresses open the exact diagnostic, an incident or say 
 
   await page.goto('/?view=logging&event=evt_nope')
   await expect(logging(page).locator('[data-ref="lg.linked"]')).toContainText('The diagnostic link is invalid.')
+})
+
+test('Logging shows workspace disk usage and budget in the existing Warning detail', async ({ page }) => {
+  const event = normalize(gatewayDiagnostic('warn', 'disk.workspace.over_budget', {
+    handle: 'local', bytes: 189628338659, budget: 53687091200,
+  }), NOW)!
+  await open(page, `/?view=observe&part=logging&event=${event.id}`, { diagnostics: [{ ...event, occurrences: 1 }] })
+  const row = logging(page).locator(`tr[data-ev="${event.id}"]`)
+  await expect(row.locator('[data-ref="lg.severity"]')).toHaveText('Warning')
+  const detail = logging(page).locator(`#lg-detail-${event.id}`)
+  await expect(detail).toBeVisible()
+  const context = detail.locator('.lg-ev', { has: page.getByRole('heading', { name: 'Context · as recorded', exact: true }) }).locator('pre')
+  await expect(context).toContainText('"bytes": 189628338659')
+  await expect(context).toContainText('"budget": 53687091200')
 })
 
 test('Logging keeps review deadline group and budget causes in the existing event detail', async ({ page }) => {

@@ -30,11 +30,16 @@ export interface ChainInvocation {
   admittedAt: number
   admissionSequence: number
   request: { command: 'agent-interface' | 'github-interface', argv: string[], cwd: string, nativeResources?: 2, resourceLimits?: BehaviorExecutionLimits,
+    implementationSource?: { id: string, sequence: number },
     context?: { head: string, reviewRevision: string, queueRemoval?: string } }
   state: 'admitted' | 'started' | 'uncertain' | 'settled'
   callId: string | null
   outcome: string | null
   evidence: (Record<string, unknown> & { publicationPlan?: PublicationPlanCondition }) | null
+}
+export interface QueueCiBlocker {
+  removal: string, integration: string, base: string,
+  failures: Array<{ name: string, check: number, job: number, run: number, workflow: number, attempt: number, url: string }>
 }
 export interface BehaviorChain {
   id: string
@@ -45,9 +50,11 @@ export interface BehaviorChain {
   reviewer: string
   sequence: number
   held: string | null
-  ciHold?: { invocationId: string, callId: string, head: string }
+  ciHold?: { invocationId: string, callId: string, head: string, queue?: QueueCiBlocker }
   testHold?: { invocationId: string, callId: string, sequence: number }
-  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string }
+  testRecovery?: { hold: NonNullable<BehaviorChain['testHold']>, merge: string, base: string, admission?: string, recheck?: string }
+  repairRecovery?: { report: number, key: string, holdSequence: number, head: string, basis: string, slot: string,
+    diagnosis: string, note: string, admission?: string }
   waiting: string | null
   resumedAfterSequence: number
   mergeSha: string | null
@@ -68,7 +75,8 @@ export type ChainEvent =
   | { type: 'chain.observed', observation: Record<string, unknown> }
   | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'], testHold?: Omit<NonNullable<BehaviorChain['testHold']>, 'sequence'> }
   | { type: 'chain.waiting', reason: string }
-  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'], recovery?: ChainRecoveryOrigin }
+  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'],
+    repairRecovery?: BehaviorChain['repairRecovery'], recovery?: ChainRecoveryOrigin }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
@@ -105,6 +113,7 @@ function resourceArtifact(prior: unknown, value: unknown): Record<string, unknow
 // contradictory historical releases. Index the projection so settled history
 // cannot turn each capacity/observation read into a full journal scan.
 const LIVE_MODEL_SQL = 'resource_pending = 1'
+export const FIXTURE_RECHECK_WAIT = 'Implementation fixture recheck: waiting for its saved outcome'
 /** Automatic holds for review-issue's authentication failures, which the
  *  runtime retires once Claude is signed in again: few chains, read every pass. */
 const AUTHENTICATION_HOLD_SQL = "merged = 0 AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%'"
@@ -122,7 +131,20 @@ const RECHECK_AT_SQL = `CASE
   WHEN json_extract(state, '$.observation.checkedAt') IS NULL THEN 0
   WHEN json_extract(state, '$.ciHold') IS NOT NULL OR json_extract(state, '$.testHold') IS NOT NULL
     OR (json_extract(state, '$.held') IS NOT NULL AND json_extract(state, '$.mergeSha') IS NULL
-      AND json_extract(state, '$.observation.pull.state') = 'open') THEN json_extract(state, '$.observation.checkedAt') + 120000
+      AND json_extract(state, '$.observation.pull.state') = 'open')
+    OR (json_extract(state, '$.mergeSha') IS NULL AND json_type(state, '$.observation.pull') = 'null'
+      AND json_extract(state, '$.invocations[#-1].behavior') = 'implement-issue'
+      AND json_extract(state, '$.invocations[#-1].state') = 'settled'
+      AND json_extract(state, '$.invocations[#-1].admissionSequence') > json_extract(state, '$.resumedAfterSequence')
+      AND json_extract(state, '$.invocations[#-1].evidence.error_code') = 'atomic_work_blocked'
+      AND json_extract(state, '$.held') = json_extract(state, '$.invocations[#-1].evidence.error')
+      AND (json_extract(state, '$.waiting') LIKE 'Work-failure reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Stage: implement-issue.% Next action: inspect the implementation Call, address the blocker, then explicitly Resume. Implementation hold reporting pending:%'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold report pending:%'
+        OR json_extract(state, '$.waiting') = '${FIXTURE_RECHECK_WAIT}'
+        OR json_extract(state, '$.waiting') LIKE 'Implementation hold report creation is unconfirmed;%'))
+    THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,
     json_extract(state, '$.observation.checkedAt') - coalesce(json_extract(state, '$.observation.pull.mergedAt'),
       json_extract(state, '$.invocations[0].admittedAt'), 0))) END`
@@ -153,14 +175,39 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (event.testHold) next.testHold = { ...event.testHold, sequence }
     else delete next.testHold
   } else if (event.type === 'chain.resumed') {
+    if (event.repairRecovery) {
+      const recovery = event.repairRecovery, original = next.invocations.at(-1)
+      if (!next.held || next.repairRecovery || recovery.admission || event.ciRecovery || event.testRecovery
+        || !Number.isSafeInteger(recovery.report) || recovery.report < 1 || !SHA.test(recovery.head)
+        || !/^[a-f0-9]{64}$/.test(recovery.key) || !/^[a-f0-9]{64}$/.test(recovery.diagnosis)
+        || !Number.isSafeInteger(recovery.holdSequence) || recovery.holdSequence <= next.resumedAfterSequence
+        || recovery.holdSequence > current.sequence || !recovery.note.trim()
+        || original?.behavior !== 'repair-pr' || original.state !== 'settled' || original.basis !== recovery.basis
+        || original.slot !== recovery.slot || original.request.context?.head !== recovery.head) {
+        throw new Error('repair report recovery requires its original automatic hold and pinned repair')
+      }
+      next.repairRecovery = recovery
+    } else if (!event.ciRecovery && !event.testRecovery) delete next.repairRecovery
     if (event.testRecovery) {
-      if (!next.held || !next.testHold || next.testRecovery || event.testRecovery.admission
-        || chainBasis(event.testRecovery.hold) !== chainBasis(next.testHold)
+      const recovery = event.testRecovery
+      const proof = next.observation?.testDependency as { invocationId?: string, verified?: boolean, recovered?: boolean, recheck?: string,
+        recovery?: { merge: string, base: string } } | undefined
+      const original = next.invocations.at(-1)
+      const rechecked = !next.testHold && recovery.recheck && /^[a-f0-9]{64}$/.test(recovery.recheck)
+        && proof?.recheck === recovery.recheck && proof.verified === true && proof.recovered === true
+        && proof.recovery?.merge === recovery.merge && proof.recovery.base === recovery.base
+        && proof.invocationId === recovery.hold.invocationId && original?.id === recovery.hold.invocationId
+        && original.behavior === 'implement-issue' && original.callId === recovery.hold.callId && original.state === 'settled'
+        && original.evidence?.status === 'failed' && original.evidence.action === 'not_started' && resourceReleaseProven(original.evidence, true)
+        && next.held === original.evidence?.error && recovery.hold.sequence > next.resumedAfterSequence
+        && recovery.hold.sequence <= current.sequence
+      if (!next.held || next.testRecovery || recovery.admission
+        || (!rechecked && chainBasis(recovery.hold) !== chainBasis(next.testHold ?? null))
         || !SHA.test(event.testRecovery.merge) || !SHA.test(event.testRecovery.base)) throw new Error('test recovery requires its original automatic hold')
       next.testRecovery = event.testRecovery
-    } else if (!event.ciRecovery) delete next.testRecovery
+    } else if (!event.ciRecovery && !event.repairRecovery) delete next.testRecovery
     next.held = null
-    if (!event.ciRecovery && !event.testRecovery) next.resumedAfterSequence = sequence
+    if (!event.ciRecovery && !event.testRecovery && !event.repairRecovery) next.resumedAfterSequence = sequence
     delete next.ciHold
     delete next.testHold
   }
@@ -187,6 +234,16 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
   } else if (event.type === 'invocation.admitted') {
     if (next.held || next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
     const invocation = event.invocation
+    if (invocation.behavior === 'repair-pr' && next.repairRecovery) {
+      const recovery = next.repairRecovery
+      const prior = next.invocations.find(item => item.id === recovery.admission)
+      if (recovery.admission && prior?.evidence?.status !== 'completed') throw new Error('repair report recovery already consumed its single admission')
+      if (!recovery.admission) {
+        if (invocation.basis !== recovery.basis || invocation.slot !== recovery.slot || invocation.actor !== next.author
+          || invocation.request.context?.head !== recovery.head) throw new Error('repair report recovery admits only its pinned source repair')
+        next.repairRecovery = { ...recovery, admission: invocation.id }
+      }
+    }
     if (invocation.behavior === 'implement-issue' && next.testRecovery) {
       const original = next.invocations.find(item => item.id === next.testRecovery!.hold.invocationId)
       if (next.testRecovery.admission || !original || original.basis !== invocation.basis || original.slot !== invocation.slot
@@ -196,6 +253,9 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (!invocation.id || !invocation.basis || !invocation.actor || !Number.isSafeInteger(invocation.admittedAt)
       || invocation.admittedAt < 0 || next.invocations.some((prior) => prior.id === invocation.id)
       || next.invocations.some((prior) => prior.state !== 'settled')) throw new Error('behavior chain already owns an invocation or admission is invalid')
+    const source = invocation.request.implementationSource
+    if (source && (invocation.behavior !== 'implement-issue' || !source.id || source.id === next.id
+      || !Number.isSafeInteger(source.sequence) || source.sequence < 1)) throw new Error('invalid implementation report source precondition')
     const reservation = invocation.reservation ?? null
     if (reservation !== null && (!Number.isSafeInteger(reservation.memoryBytes) || reservation.memoryBytes < 0
       || !Number.isSafeInteger(reservation.diskBytes) || reservation.diskBytes < 0)) throw new Error('behavior invocation carries an invalid resource reservation')
@@ -414,7 +474,9 @@ export class BehaviorChainJournal {
   capacityWaiters(): BehaviorChain[] {
     const rows = cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current WHERE merged = 0
       AND json_extract(state, '$.held') IS NULL
-      AND json_extract(state, '$.waiting') IN (?, ?)
+      AND (json_extract(state, '$.waiting') IN (?, ?)
+        OR json_extract(state, '$.waiting') LIKE 'shared native resource budget is exhausted: %'
+        OR json_extract(state, '$.waiting') LIKE 'insufficient behavior resource headroom: %')
       AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i
         WHERE json_extract(i.value, '$.state') != 'settled')`)
       .all('shared native invocation capacity is occupied', 'waiting for the shared native behavior capacity') as Array<{ chain_id: string }>
@@ -501,7 +563,49 @@ export class BehaviorChainJournal {
       .all(correlationId, callId, callId, callId) as Array<{ chain_id: string, position: number }>
     if (rows.length !== 1) return null
     const chain = this.read(rows[0].chain_id)!
-    const invocation = chain.invocations[rows[0].position]
+    return this.invocationMatch(chain, rows[0].position, callId, correlationId)
+  }
+
+  /** One request-scoped scan for all selectors, including retained merged chains. */
+  forInvocations(identities: Array<{ callId: string | null, correlationId: string | null }>): Array<{ chain: BehaviorChain, invocation: ChainInvocation } | null> {
+    if (!identities.length) return []
+    const calls = JSON.stringify([...new Set(identities.map(identity => identity.callId).filter(Boolean))])
+    const correlations = JSON.stringify([...new Set(identities.map(identity => identity.correlationId).filter(Boolean))])
+    const rows = cachedStatement(this.db, `SELECT c.chain_id, CAST(i.key AS INTEGER) AS position,
+      json_extract(i.value, '$.id') AS correlation_id, json_extract(i.value, '$.callId') AS call_id,
+      json_extract(i.value, '$.evidence.nativeCallId') AS native_call_id, json_extract(i.value, '$.evidence.callId') AS evidence_call_id
+      FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+      WHERE json_extract(i.value, '$.id') IN (SELECT value FROM json_each(?))
+        OR json_extract(i.value, '$.callId') IN (SELECT value FROM json_each(?))
+        OR json_extract(i.value, '$.evidence.nativeCallId') IN (SELECT value FROM json_each(?))
+        OR json_extract(i.value, '$.evidence.callId') IN (SELECT value FROM json_each(?))`)
+      .all(correlations, calls, calls, calls) as Array<{ chain_id: string, position: number, correlation_id: string,
+        call_id: unknown, native_call_id: unknown, evidence_call_id: unknown }>
+    const byCall = new Map<string, typeof rows[number] | null>()
+    const byCorrelation = new Map<string, typeof rows[number] | null>()
+    for (const row of rows) {
+      byCorrelation.set(row.correlation_id, byCorrelation.has(row.correlation_id) ? null : row)
+      // Multiple aliases on one invocation count once; multiple invocations are ambiguous.
+      for (const call of new Set([row.call_id, row.native_call_id, row.evidence_call_id])) {
+        if (typeof call === 'string') byCall.set(call, byCall.has(call) ? null : row)
+      }
+    }
+    const chains = new Map<string, BehaviorChain>()
+    return identities.map(({ callId, correlationId }) => {
+      const call = callId ? byCall.get(callId) : undefined
+      const correlation = correlationId ? byCorrelation.get(correlationId) : undefined
+      // The original OR lookup rejects ambiguity before checking selector agreement.
+      if (call === null || correlation === null || call && correlation && call !== correlation) return null
+      const row = call ?? correlation
+      if (!row) return null
+      let chain = chains.get(row.chain_id)
+      if (!chain) { chain = this.read(row.chain_id)!; chains.set(row.chain_id, chain) }
+      return this.invocationMatch(chain, row.position, callId, correlationId)
+    })
+  }
+
+  private invocationMatch(chain: BehaviorChain, position: number, callId: string | null, correlationId: string | null): { chain: BehaviorChain, invocation: ChainInvocation } | null {
+    const invocation = chain.invocations[position]
     const calls = new Set([invocation.callId, invocation.evidence?.nativeCallId, invocation.evidence?.callId].filter(value => typeof value === 'string'))
     if (correlationId && invocation.id !== correlationId
       || calls.size > 1 || callId && !calls.has(callId)) return null
@@ -549,6 +653,8 @@ export class BehaviorChainJournal {
     this.durable()
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('native invocation capacity must be positive')
     return this.db.transaction(() => {
+      const source = invocation.request.implementationSource
+      if (source && this.read(source.id)?.sequence !== source.sequence) throw new BehaviorChainRevisionConflict('implementation report source changed before admission')
       if (this.cutover().mode === 'draining') return null
       if (chain.invocations.some(prior => nativeResourcesPending({ ...prior }))) return null
       if (invocation.model !== null && !this.modelCapacityAvailable(capacity)) return null
@@ -591,7 +697,12 @@ export class BehaviorChainJournal {
   }
 
   capacitySnapshot() {
-    return this.db.transaction(() => ({ modelInvocations: this.liveModelInvocationCount(), reservations: this.reservedResources() }))()
+    return this.db.transaction(() => {
+      const retained = cachedStatement(this.db, `SELECT count(*) AS count FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+        WHERE c.resource_pending = 1 AND json_extract(i.value, '$.model') IS NOT NULL
+          AND json_extract(i.value, '$.state') = 'uncertain' AND behavior_native_resources_pending(i.value) = 1`).get() as { count: number }
+      return { modelInvocations: this.liveModelInvocationCount(), retainedModelInvocations: retained.count, reservations: this.reservedResources() }
+    })()
   }
 
   /** Resource allowances held by live native invocations, over the same

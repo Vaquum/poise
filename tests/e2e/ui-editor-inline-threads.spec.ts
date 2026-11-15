@@ -738,12 +738,16 @@ test('keeps a newly created passage annotation with an unsent private draft', as
   expect(state.sessions).toHaveLength(0)
 })
 
-test('shows the attention notice, never the finished turn, after navigating away from an open passage chat', async ({ page }) => {
+test('shows the open question after navigating away from a passage chat', async ({ page }) => {
   const { sock } = await editor(page, [annotation({ id: 'ann-1' })])
   await openThreadForMark(page, 'ann-1')
   const id = await sendThreadMessage(page, sock, 'Keep working')
   await page.getByRole('navigation', { name: 'Poise' }).getByRole('link', { name: 'Board' }).click()
   const now = new Date().toISOString()
+  await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [{
+    id: 'passage-question', kind: 'question', sessionId: id, sessionTitle: 'Passage chat', createdAt: now, escalation: null, ownerAction: true,
+    content: { questions: [{ id: 'q1', question: 'Which source should this passage cite?', options: [], freeText: true, multiSelect: false }] },
+  }] } }))
   await page.route('**/api/notices', (route) => route.fulfill({ json: { enabled: true, notices: [
     { id: 'passage-finished', kind: 'chat_turn_finished', title: 'Passage reply finished', body: 'A reply is ready.', since: now, due: now, silenceable: false, target: { chat: id } },
     { id: 'passage-waiting', kind: 'chat_waiting', title: 'Passage needs an answer', body: 'An answer is needed.', since: now, due: now, silenceable: false, target: { chat: id } },
@@ -753,8 +757,8 @@ test('shows the attention notice, never the finished turn, after navigating away
   await page.mouse.move(0, 0)
   const held = page.getByRole('button', { name: 'Show now' })
   if (await held.isVisible().catch(() => false)) await held.click()
-  await expect(page.locator('[data-answers] [data-notice="notice:passage-waiting"]')).toBeVisible()
-  // A finished turn is done: Answer here never lists it (#1463).
+  await expect(page.locator('[data-answers] [data-notice="request:passage-question"]')).toContainText('Which source should this passage cite?')
+  await expect(page.locator('[data-answers] [data-notice="notice:passage-waiting"]')).toHaveCount(0)
   await expect(page.locator('[data-answers] [data-notice="notice:passage-finished"]')).toHaveCount(0)
 })
 

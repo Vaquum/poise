@@ -73,7 +73,8 @@ class TestCodexReviewStaging(TestCase):
     @staticmethod
     def review(text):
         return structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
-                                     "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                                     "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60,
+                                     packet=json.dumps({"coverage": "complete", "files": []}))
 
     def test_at_limit_keeps_the_original_single_message(self):
         text = "x" * (LIMIT - len("system\n\n"))

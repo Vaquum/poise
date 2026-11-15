@@ -100,8 +100,7 @@ function pullOf(notice: Notice): Entry['pull'] {
 }
 
 function noticeOptions(notice: Notice): Option[] {
-  if (notice.kind === 'pr_ready') return [{ key: 'merge', label: 'Merge', primary: true }]
-  if (notice.kind === 'review_requested') return [{ key: 'review', label: 'Ask an agent to review', primary: true }, { key: 'approve', label: 'Approve' }]
+  if (notice.kind === 'review_requested') return [{ key: 'approve', label: 'Approve', primary: true }]
   return []
 }
 
@@ -112,19 +111,15 @@ export const prKey = (repo: string, number: number): string => `${repo.toLowerCa
 // A behavior moves the pull request on its own (server/behavior-pr-status.ts).
 const PR_MOVING: readonly BlockerId[] = ['review_running', 'awaiting_review', 'ci_pending', 'behind', 'approved_not_enqueued', 'in_queue']
 
-/** A pull request's notice by who acts on it next. A chain or a behavior
- *  moving it is automatic and a held behavior is a fault. Changes requested,
- *  a conflict, failing checks, unresolved conversations, a refusal, a review
- *  cap reached, merging turned off, or no status at all: only you. */
+/** Group operational PR notices by the recorded behavior blocker. */
 export function prGroup(row: PrStatus | undefined): Group {
-  if (!row) return 'needs-you'
+  if (!row) return 'auto'
   if (row.ownership?.chainId) return 'auto'
   const { id, line } = row.blocker
-  if (id === 'held') return 'fault'
-  if (id === 'ci_failing') return /grey rerun pending/.test(line) ? 'auto' : 'needs-you'
-  if (id === 'awaiting_review' && /cap reached/.test(line)) return 'needs-you'
-  if (id === 'approved_not_enqueued' && /merge-prs (disabled|paused)/.test(line)) return 'needs-you'
-  return PR_MOVING.includes(id) ? 'auto' : 'needs-you'
+  if (id === 'ci_failing') return /grey rerun pending/.test(line) ? 'auto' : 'fault'
+  if (id === 'awaiting_review' && /cap reached/.test(line)) return 'fault'
+  if (id === 'approved_not_enqueued' && /merge-prs (disabled|paused)/.test(line)) return 'fault'
+  return PR_MOVING.includes(id) || id === 'unknown' ? 'auto' : 'fault'
 }
 
 /** What /api/behavior-ledger/pr-status answered, as pull requests' next actors.
@@ -141,15 +136,13 @@ export function prStatusesFrom(value: unknown, previous: PrStatuses | null): Map
   return next
 }
 
-/** Diagnostics only you can clear: a sign-in, or access only you can grant. */
-const YOURS = new Set(['authentication', 'github_access'])
 /** Diagnostics Poise retries on its own. */
 const RETRYING = new Set(['head_changed', 'provider_capacity', 'rate_limit', 'upstream_unavailable', 'network_interruption',
   'approval_blocked_unresolved_conversations', 'datastore_stale', 'runtime_status_unknown'])
 
-/** A Behaviors diagnostic by who clears it: you, Poise retrying, or nobody: a fault. */
+/** Behavior diagnostics describe faults and retries. Confirmed account
+ *  sign-in requests come from the accounts themselves. */
 export function diagnosticGroup(code: string | undefined, message: string): Group {
-  if (code && YOURS.has(code)) return 'needs-you'
   if (code && RETRYING.has(code)) return 'auto'
   return code === 'unknown' && message === STALLED_MESSAGE ? 'auto' : 'fault'
 }
@@ -184,7 +177,7 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
         ...base, id: `notice:${notice.id}`, source: 'notice', group, kind: KIND_WORDS[notice.kind],
         // A pull request's own title; its notice's words are its kind and where.
         title: pull && notice.body ? notice.body : notice.title,
-        detail: byPull && status ? status.blocker.line : pull ? undefined : firstLine(notice.body) || undefined,
+        detail: byPull ? status?.blocker.line ?? 'Behavior status unavailable' : pull ? undefined : firstLine(notice.body) || undefined,
         who: item.source, where: pull ? `${pull.repo} #${pull.number}` : item.scope ?? '', state: GROUP_STATE[group], body: notice.body, options: noticeOptions(notice),
         open: notice.target ? targetOpening(notice.target, role) : undefined, github: pull?.url,
         dismissable: true, dismissWords: NOTICE_DISMISS, revision: notice.due, silenceable: notice.silenceable, notice, pull,
@@ -192,20 +185,25 @@ export function itemEntries(items: readonly NotificationItem[], role: Role, chai
     }
     if (item.chainJournal) {
       const step = journalStep(item.chainJournal)
-      const chain = step ? chains.get(step.chain) : undefined
       const row = item.chain
+      // The attention row covers every active page; the chains map only its first 100.
+      const paged = step ? chains.get(step.chain) : undefined
+      const held = row && row.held !== undefined ? row.held : paged?.held ?? null
+      const mergeSha = row?.mergeSha ?? null
+      const sequence = typeof row?.sequence === 'number' ? row.sequence : paged?.sequence
       const progressed = row ? row.progressAt : Date.parse(item.when ?? '')
-      const group: Group = chain?.held || !Number.isFinite(progressed) || now - progressed >= STUCK_MS ? 'fault' : 'auto'
+      const group: Group = held || !Number.isFinite(progressed) || now - progressed >= STUCK_MS ? 'fault' : 'auto'
+      const resume = step && held && !mergeSha && typeof sequence === 'number' ? { id: step.chain, sequence } : undefined
       return [{
-        ...base, id: item.id, source: 'chain', group, kind: chain?.held ? 'Chain held' : group === 'fault' ? 'Chain stuck' : 'Behavior chain',
+        ...base, id: item.id, source: 'chain', group, kind: held ? 'Chain held' : group === 'fault' ? 'Chain stuck' : 'Behavior chain',
         // Its first reason as the title; every reason, and the evidence, under More.
         title: row?.blocker ? firstLine(row.blocker).split('; ')[0] : item.title, detail: row ? row.step : item.meta,
         who: 'the chain', where: row ? `${row.repository} #${row.issue}${row.pullNumber ? ` → #${row.pullNumber}` : ''}` : '', state: GROUP_STATE[group], body: item.body,
-        options: [], quiet: step && chain?.held ? [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] : undefined,
+        options: [], quiet: resume ? [{ key: 'resume', label: 'Resume the chain', icon: 'play' }] : undefined,
         timeline: step ? timelineHref(step.chain, step.after) : undefined, silenceable: false,
-        dismissable: true, dismissWords: chain?.held ? 'hides it until the chain moves; the chain stays held' : 'hides it until the chain moves; nothing is retried',
+        dismissable: true, dismissWords: held ? 'hides it until the chain moves; the chain stays held' : 'hides it until the chain moves; nothing is retried',
         revision: `${item.when}|${item.title}|${item.body}`,
-        chain: step && chain ? { id: step.chain, sequence: chain.sequence } : undefined,
+        chain: resume,
       }]
     }
     // A retry still failing four hours after it began is stuck.
@@ -229,6 +227,8 @@ export interface OpenRequest {
   createdAt: string
   content: unknown
   escalation: string | null
+  /** True when the request is for the workspace owner. */
+  ownerAction: boolean
 }
 
 export interface RequestsRead { revision: number, complete: boolean, requests: OpenRequest[] }
@@ -263,6 +263,7 @@ function questionFields(content: unknown): QuestionField[] | null {
 /** One entry per open request, in the request's own words and options. */
 export function requestEntries(requests: readonly OpenRequest[], role: Role): Entry[] {
   return requests.flatMap((request): Entry[] => {
+    if (request.ownerAction !== true) return []
     const base = {
       id: `request:${request.id}`, source: 'request' as const, group: 'needs-you' as const, who: request.sessionTitle,
       since: request.createdAt, state: null, details: [], behaviors: [], silenceable: false,
@@ -293,7 +294,7 @@ export function requestEntries(requests: readonly OpenRequest[], role: Role): En
     const managerPrompt = role(request.sessionId) === 'manager' && questions.some((q) => q.options.length > 0) && other
     return [{
       ...base, kind: 'Question', title: questions.length === 1 ? questions[0].question : `${questions.length} questions`,
-      where: request.sessionTitle, detail: questions.length === 1 && questions[0].header ? questions[0].header : undefined, body: '',
+      where: request.sessionTitle, detail: request.escalation || (questions.length === 1 ? questions[0].header : undefined), body: '',
       options: quick ? quick.options.map((o, i) => ({ key: o.label, label: o.label, primary: i === 0, detail: o.description ?? null })) : [],
       questions: quick ? undefined : questions,
       freeText: quick?.freeText ? { label: quick.options.length ? 'Other' : 'Answer…', placeholder: `Your answer to ${request.sessionTitle}`, send: 'Send answer' } : undefined,
@@ -310,13 +311,13 @@ export interface DecisionItem {
   text: string
   detail: string | null
   createdAt: string
-  source: { sessionId: string, title: string, exists: boolean, turnsSince?: number }
+  source: { sessionId: string, title: string, exists: boolean, managed?: true, turnsSince?: number }
   options?: { id: string, label: string, detail: string | null, recommended: boolean }[]
   answer?: { label: string, freeText: boolean, at: string, relay: 'queued' | 'delivered' | 'held' }
   resolved?: { at: string, reason: string }
 }
 
-export const openDecision = (item: DecisionItem): boolean => item.kind === 'decision' && !item.answer && !item.resolved
+export const openDecision = (item: DecisionItem): boolean => item.kind === 'decision' && item.source.exists && !item.source.managed && !item.answer && !item.resolved
 
 export function decisionEntries(items: readonly DecisionItem[], role: Role): Entry[] {
   return items.filter(openDecision).map((item): Entry => {
@@ -327,10 +328,8 @@ export function decisionEntries(items: readonly DecisionItem[], role: Role): Ent
       where: item.source.title, detail: stale || undefined, state: null, since: item.createdAt, body: [item.detail, stale].filter(Boolean).join('\n'), details: [],
       options: options.map((o) => ({ key: o.id, label: o.recommended ? `${o.label} (recommended)` : o.label, primary: o.recommended, detail: o.detail })),
       freeText: { label: options.length ? 'Other' : 'Answer…', placeholder: `Your answer to ${item.source.title}`, send: 'Send answer' },
-      open: item.source.exists ? chatOpening(item.source.sessionId, role(item.source.sessionId)) : undefined,
-      // A decision that offers options always takes Other, in your own words, so
-      // it needs no Dismiss while its chat exists; any other can be put away.
-      dismissable: !options.length || !item.source.exists, dismissWords: 'hides it from the Switchboard; the chat is told nothing',
+      open: chatOpening(item.source.sessionId, role(item.source.sessionId)),
+      dismissable: !options.length, dismissWords: 'hides it from the Switchboard; the chat is told nothing',
       revision: 'open', silenceable: false, behaviors: [], decision: { id: item.id },
     }
   })
@@ -352,7 +351,7 @@ export function threadEntries(publication: Publication, reviews: readonly Thread
   return reviews.filter((review) => review.kind === 'thread' && !review.resolved).map((review): Entry => {
     const first = review.messages[0]
     return {
-      id: `thread:${publication.slug}:${review.id}`, source: 'thread', group: 'needs-you', kind: 'Review comment',
+      id: `thread:${publication.slug}:${review.id}`, source: 'thread', group: 'auto', kind: 'Review comment',
       title: first ? clip(first.body, 140) : 'An open review thread', who: first?.author ?? 'a reviewer',
       where: `${review.repo} #${review.pr}`, detail: `${first?.author ?? 'A reviewer'} on ${publication.site}${review.path ? ` · ${review.path}` : ''}`, state: null,
       since: review.messages[review.messages.length - 1]?.createdAt ?? null,
@@ -368,16 +367,6 @@ export function threadEntries(publication: Publication, reviews: readonly Thread
 }
 
 // ---------- Together ----------
-/** A chat's waiting notice folds into its request entries, one per request;
- *  it stands on its own only while none of its requests is listed. */
-export function foldWaiting(entries: readonly Entry[]): Entry[] {
-  const asking = new Set(entries.flatMap((entry) => entry.request ? [entry.request.sessionId] : []))
-  return entries.filter((entry) => {
-    const target = entry.notice?.kind === 'chat_waiting' ? entry.notice.target : null
-    return !(target && 'chat' in target && asking.has(target.chat))
-  })
-}
-
 const GROUP_ORDER: Record<Group, number> = { 'needs-you': 0, fault: 1, auto: 2 }
 
 /** By who acts, then newest first (#1379); an entry without a time goes last,

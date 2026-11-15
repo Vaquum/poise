@@ -13,11 +13,14 @@ export interface ReviewResponse extends Record<string, unknown> {
 }
 
 export function validReviewResponse(value: unknown, target: { repository: string, number: number, head: string,
-  actor: string, callId: string, model: string, recoveryModel?: string | null, context?: string, startedAt: number, completedAt: number }, now: number): value is ReviewResponse {
+  actor: string, callId: string, model: string, recoveryModel?: string | null, context?: string, startedAt: number, completedAt: number,
+  incompleteFindings?: boolean, legacyNegative?: boolean }, now: number): value is ReviewResponse {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const response = value as Record<string, unknown>
   const assessment = response.assessment as Record<string, unknown> | null
   return response.repository === target.repository && response.pull_number === target.number && response.head_sha === target.head
+    && (response.coverage === 'complete' || target.incompleteFindings === true && response.coverage === 'incomplete'
+      || target.legacyNegative === true && response.coverage === undefined)
     && response.reviewer === target.actor && response.invocation_id === target.callId && /^[0-9a-f]{32}$/.test(target.callId)
     && (response.model === target.model || (typeof target.recoveryModel === 'string' && response.model === target.recoveryModel))
     && typeof response.context_sha === 'string' && /^[0-9a-f]{64}$/.test(response.context_sha)

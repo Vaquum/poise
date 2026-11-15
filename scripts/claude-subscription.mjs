@@ -202,7 +202,7 @@ const env = Object.fromEntries(inheritedEnv
 // Poise's hooks that take agents' test suites off the workspace (docs/Operating.md, "Agents' test suites").
 // Nothing else on these variables may reach the CLI, so they pass only with the hooks on them.
 if ((process.env.PYTHONPATH ?? '').split(delimiter).includes(join(homedir(), '.poise', 'test-offload'))) {
-  for (const key of ['PYTHONPATH', 'NODE_OPTIONS', 'BASH_DEFAULT_TIMEOUT_MS', 'BASH_MAX_TIMEOUT_MS']) {
+  for (const key of ['PYTHONPATH', 'NODE_OPTIONS', 'BASH_DEFAULT_TIMEOUT_MS', 'BASH_MAX_TIMEOUT_MS', 'POISE_TEST_BINDING', 'POISE_TEST_EVIDENCE_DIR']) {
     if (process.env[key] !== undefined) env[key] = process.env[key]
   }
 }

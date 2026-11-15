@@ -314,6 +314,18 @@ describe('Rerun Grey CI', () => {
     enable(); await runtime.runEnabledBehaviorsOnce()
     expect(runtime.getGreyCiLastSucceeded()).toEqual({ at: expect.any(String) })
   })
+  it('records its last scan off the main connection, whose commits wait for the disk', async () => {
+    enable(); await runtime.runEnabledBehaviorsOnce()
+    const last = runtime.getGreyCiLastSucceeded()
+    // A temporary trigger belongs to the main connection alone: it refuses the last scan written through it.
+    for (const event of ['INSERT', 'UPDATE']) {
+      db.db.exec(`CREATE TEMP TRIGGER main_last_scan_${event.toLowerCase()} BEFORE ${event} ON main.meta
+        WHEN new.key LIKE '%behavior_rerun_grey_ci_last_success' BEGIN SELECT RAISE(ABORT, 'written through the main connection'); END`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(runtime.getGreyCiLastSucceeded()).not.toEqual(last)
+  })
   it('resumes beyond a timed-out batch and does not drop PRs after the first fifty', async () => {
     enable(); pulls = Array.from({ length: 51 }, (_, i) => pull(REPO, i + 1)); greyNumbers = new Set([51])
     vi.useFakeTimers(); const held = await heldBatch()

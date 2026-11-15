@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
+import { connectionSignInCleared, connectionSignInNeeded } from '../alerts/producers'
 import { db, getMeta, setMeta } from '../db'
 import { HttpError } from '../http'
 import { isServiceMode } from '../service/config'
@@ -40,7 +41,17 @@ export function validateGoogleEnvironment(service: boolean): void { if (!service
 export function googleAccountSettings() {
   const context = googleRequest()
   const configured = context ? context.settings.configured : !!(localEnvironment() ?? read<Config>(CONFIG))
-  return { configured, accounts: googleAccounts() }
+  const accounts = googleAccounts()
+  for (const account of accounts) {
+    if (configured && account.state === 'expired') googleSignInNeeded(account)
+    else connectionSignInCleared(`google:${account.id}`)
+  }
+  return { configured, accounts }
+}
+
+function googleSignInNeeded(account: GoogleAccount): void {
+  connectionSignInNeeded(`google:${account.id}`, `Reconnect Google account ${account.email}`,
+    'This Google sign-in has ended. Reconnect it in Settings → Accounts.', 'accounts')
 }
 export function configureGoogle(input: Record<string, unknown>): void {
   if (typeof input.clientId !== 'string' || !/^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$/.test(input.clientId)) throw new HttpError(400, 'Enter the Google web OAuth client ID.')
@@ -149,7 +160,16 @@ export async function googleAccessToken(id: string, forceRefresh = false): Promi
   if (context) {
     const a = context.settings.accounts.find(a => a.id === id && a.connected)
     if (!a) throw new HttpError(422, 'Reconnect this Google account in Accounts.')
-    const result = await context.call<{ accessToken: string }>('token', { accountId: id, connectionVersion: a.connectionVersion, ...(forceRefresh ? { forceRefresh: true } : {}) })
+    let result: { accessToken: string }
+    try {
+      result = await context.call('token', { accountId: id, connectionVersion: a.connectionVersion, ...(forceRefresh ? { forceRefresh: true } : {}) })
+    } catch (error) {
+      if (error instanceof HttpError && error.statusCode === 422) {
+        try { await context.reload(); googleAccountSettings() }
+        catch (observationError) { console.warn('[google] Could not confirm account status:', (observationError as Error).message) }
+      }
+      throw error
+    }
     if (typeof result.accessToken !== 'string' || !result.accessToken || result.accessToken.length > 16384) throw new HttpError(502, 'Google returned no usable access token.')
     return result.accessToken
   }
@@ -165,7 +185,11 @@ export async function googleAccessToken(id: string, forceRefresh = false): Promi
     let t: Awaited<ReturnType<typeof tokenRequest>>
     try { t = await tokenRequest({ grant_type: 'refresh_token', refresh_token: a.refreshToken, client_id: config.clientId, client_secret: config.clientSecret }) }
     catch (error) {
-      if (error instanceof HttpError && error.statusCode === 422) db.prepare('UPDATE meta SET value=? WHERE key=? AND value=?').run(JSON.stringify({ id: a.id, email: a.email, connected: false, state: 'expired' }), PREFIX + id, JSON.stringify(a))
+      if (error instanceof HttpError && error.statusCode === 422) {
+        const expired = { id: a.id, email: a.email, connected: false, state: 'expired' as const }
+        const result = db.prepare('UPDATE meta SET value=? WHERE key=? AND value=?').run(JSON.stringify(expired), PREFIX + id, JSON.stringify(a))
+        if (result.changes) googleSignInNeeded(expired)
+      }
       throw error
     }
     const current = googleConfig()

@@ -362,11 +362,27 @@ volume by running `/opt/poise/scripts/test-offload/install.sh` in a short-lived
 container of the image. With `POISE_TEST_RENDER_API_KEY` and
 `POISE_TEST_WORKSPACE` set, it passes `POISE_TEST_RELAY_URL`, which is
 `/api/link/test-relay` on the workspace's host or on `POISE_PROXY_LISTEN`, and
-`POISE_TEST_RELAY_KEY`, the workspace's handle signed by the gateway. That writes the hooks and `relay`, holding those
-two, to `~/.poise/test-offload`; without them it removes `relay`. Poise starts its
+`POISE_TEST_RELAY_KEY`, the workspace's handle signed by the gateway, and the
+validated `POISE_TEST_LIMIT_SECONDS`. That writes the hooks and `relay`, holding
+URL, key and limit on successive lines, to `~/.poise/test-offload`; without them it removes `relay`. Poise starts its
 children with the hooks while `relay` exists
 ([Agents' test suites](Operating.md#agents-test-suites)). The settings travel this
 way because only a new container would take an environment variable.
+The limit defaults to 540 seconds and accepts whole seconds from 1 to 3540.
+The runner reads it from this installed configuration for one command lifetime,
+including capture and retries. Workspace children get a shell default of that
+budget plus 60 seconds for reporting and cleanup, within the existing 3600000 ms
+shell maximum. Explicit shorter shell deadlines still cap the command. Older
+two-line relay files retain the 540-second default.
+
+The relay retains the last 1,024 retired run IDs, their workspace owners and, for
+jobs, SHA-256 runner-token digests in memory, outside active admission slots.
+After the signed-key and current-access
+checks, the owner's exact `DELETE /runs/:id` returns 204 even while box termination
+is pending. An exact `POST /runs/:id/output` with a constant-time digest match
+returns 410 without processing output or logging a redundant request warning.
+Unknown, evicted and foreign IDs, invalid tokens and other requests retain their
+failure warnings. Run-stop, missing-result and box-termination diagnostics remain independent.
 
 The relay's run admission advertises `dependencyCache: true`. The authenticated
 workspace can send `POST /runs/:id/dependency?sha256=…` between checkout parts
@@ -376,6 +392,21 @@ member, which the relay verifies against the SHA-256 of its uncompressed tar
 bytes before forwarding and retaining it. Earlier runners and relays still
 exchange the whole checkout through the existing tree upload. Jobs and
 sandboxes receive the same single tar stream from either route.
+
+New atomic Calls also pass a Caller-owned random capture binding through the
+test-offload hooks, outside the suite environment. The box independently hashes
+the captured archive and source files before running a direct Vitest command.
+Relay recovery is currently held for #1619: the suite UID owns the report files,
+so no assertion inventory is trusted and no evidence frame is emitted. The held
+design would post a complete bounded inventory from the private run credential to
+`POST /runs/:id/assertions`; workspace credentials cannot submit that result.
+Only a matching completed failure would emit an Ed25519-signed evidence frame
+before the relay deletes the run. The hook would retain the redacted receipt for
+Caller; `POST /evidence/verify` would authenticate it against the existing gateway
+key and workspace credential after run deletion or restart. There is no unsigned
+or partial-result fallback. Caller would retain the verified receipt in its
+original artifact before resource cleanup. This extends the existing relay
+interface, without a new identity scope, setting or runner-retention store.
 
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
 gateway's, or with none, is recreated as one on an outdated image is: drained
@@ -410,7 +441,12 @@ networks the one it replaced had joined, so the gateway joins them itself:
 
 A workspace takes a new image without a new container when the image's
 system base is the one its container runs, so the agents in it are never cut
-off. Agent calls (behavior runs, manual reviews, replays) are processes Poise
+off. The container's inherited `poise.base` and `poise.release` labels retain
+that proof even when a cached rebuild changes an attestation/index digest and
+the original image can no longer be inspected. A healthy workspace already on
+the requested release keeps its container; missing base/release labels and
+changed container settings retain the drained replacement path.
+Agent calls (behavior runs, manual reviews, replays) are processes Poise
 starts detached; they keep running while Poise restarts, and the next Poise
 reconciles them as after any restart. Chat turns survive the same way: each
 session's agent runs under a per-session relay that owns its stdio and
@@ -470,7 +506,12 @@ its own instead of refusing with dirty_unowned.
   `poise.release` (the commit `deploy/lib.sh` built it from) and `poise.base`
   (a digest of the files that build the system around it:
   `deploy/runtime/Dockerfile`, `entrypoint.sh`, `install-clis.sh`,
-  `supervisor.mjs` and `install-release.sh`).
+  `supervisor.mjs`, `resource-witness.mjs` and `install-release.sh`, plus the
+  locked `node_modules/playwright-core` version and integrity from
+  `package-lock.json`). That package supplies Chromium's revision and browser
+  system dependencies. An unrelated dependency change keeps the same base;
+  a Playwright identity change takes the drained replacement path. Images from
+  before this browser identity was included take one replacement on introduction.
 - **The supervisor.** `entrypoint.sh` becomes `supervisor.mjs`, which runs
   Poise from `~/.poise/releases/current` when that release is installed for
   its base, and from the image's own release otherwise. When Poise exits with
@@ -500,7 +541,14 @@ its own instead of refusing with dirty_unowned.
 - **Switching.** The gateway then sends `POST /api/service/switch` with
   `{ release }` (`admin` scope or loopback; 202 `{ release, switching }`,
   409 for a release not installed for this base or a server started without
-  the supervisor). Poise writes `next` and restarts at the first moment no unheld Chat turn and no work of its own
+  the supervisor). While someone is using Poise in a browser (input on a
+  visible page, reported by `POST /api/service/activity` at most every 30
+  seconds), the switch is held, not queued: nothing is written, new Chat
+  turns keep starting, and health names the release with `switchWaitingOn:
+  "someone using Poise"`. It is queued after 90 quiet seconds, or five
+  minutes after it was first asked for, well inside the deploy's ten-minute
+  proof, so the restart and the minutes its caches take to warm land in a
+  quiet moment. Poise then writes `next` and restarts at the first moment no unheld Chat turn and no work of its own
   runs; it waits for no agent call and no turn a healthy relay holds, since
   the relay keeps the turn running and the next server adopts it. While the
   switch is pending, new Chat turns
@@ -585,8 +633,13 @@ its own instead of refusing with dirty_unowned.
   only for a known switch whose fresh health probe cannot reach the workspace
   or finds it healthy on the requested release. A healthy old release keeps
   the ordinary 502. The reset invalidates cached readiness, so recovery freshly
-  verifies `/api/service/health` on the requested release. `proxy.failed` retains
-  its Error with request and requested-release evidence; no request is replayed.
+  verifies `/api/service/health` on the requested release. `proxy.failed` is one
+  Warning only after the retryable update response is produced; unverified
+  resets, interrupted mutations and unanswered failures retain an Error.
+  Request, requested release and actual response disposition are retained in
+  diagnostics (`disconnect` records the status/disposition or an unanswered
+  response). Failed rollout evidence remains in the existing rollout diagnostics;
+  no request is replayed.
 - **Everything else.** An image of another base, a workspace started without
   the supervisor, or a changed container setting still gets a new container,
   drained first ([Deployment](#deployment)). The gateway makes the new image's
@@ -611,7 +664,7 @@ computer.
   call it.
   The native command can also use the normal loopback Poise APIs under their
   existing policy. Creating-chat and worker relationships, the workspace Manager's role, inbox admission, supervision,
-  explicit issue/PR ownership, durable timers and their holds persist in the
+  explicit issue/PR ownership, pending owner escalations, durable timers and their holds persist in the
   workspace's SQLite store.
   Dispatch pauses while draining; running monitor reads join the existing
   background-work barrier. New observation passes, including queued follow-ups,
@@ -910,7 +963,8 @@ not use the gateway's discarded OAuth token.
   - Every read records sign-in alerts (`sign_in_needed`): one for an
     installed, configured CLI that says it is not signed in, and one each for
     the person's own account and the GitHub automation account while gh does
-    not hold it signed in. A provider with no configuration record raises no
+    not hold it signed in. A rejected saved GitHub account also raises one.
+    A provider with no configuration record raises no
     sign-in demand, and a stale demand clears once the provider reads as
     unconfigured. Status-based conditions clear once signed in again; Claude's alert stays its
     auth monitor's, gated on the same participation. In service mode Poise
@@ -919,11 +973,17 @@ not use the gateway's discarded OAuth token.
     A native Codex credential rejection raises the same condition immediately,
     retaining the affected stage, issue and redacted cause. It survives a status
     poll that still reports signed in. After a fresh successful Connect,
-    Accounts attempts one native verification (30 seconds, 64 KiB), forcing the
-    review's ChatGPT login route and removing API-key/base-URL overrides.
+    Accounts attempts one native verification (30 seconds, 64 KiB) through
+    Caller's `--verify-codex-login`, using the review's private credential home
+    and tool-free ChatGPT request options, without API-key/base-URL overrides.
+    Canonical-home success alone cannot clear the block. A refresh retained
+    only in the disposable home also cannot prove the next worker can sign in;
+    verification never writes its credentials back to the canonical sign-in.
     A successful response after the latest rejection clears the condition and
     permits one early review probe through existing admission. Failed
-    verification requires another Connect; a failed review probe cannot reuse
+    verification keeps its fixed typed reason in the existing sign-in
+    alert and requires another Connect; one completed during a failed
+    verification remains eligible. A failed review probe cannot reuse
     old recovery evidence. Successful native reviews on that route also prove
     recovery. Quota backoff and uncertain publication retain their own gates.
   - Participation: a provider takes part in model maintenance when
@@ -1179,8 +1239,8 @@ alerts once, and again only after it has cleared:
   an initial low reading. Recovery to 6 GB clears and rearms the warning so
   fluctuations near a threshold do not repeat it. Measurements and
   warnings never pause, reject or stop work;
-- a Claude or other provider sign-in is needed, or the person's own GitHub
-  account or the agent account is not signed in to gh;
+- a configured agent, GitHub, Google or extension account needs to sign in
+  again ([Connected accounts](Connected-accounts.md#alerts));
 - a behavior failed and is held, with a fresh alert when its cause materially
   changes even if the previous alert was dismissed. Repeats of the same cause
   remain deduplicated ([Notifications](Notifications.md));
@@ -1189,13 +1249,13 @@ alerts once, and again only after it has cleared:
   exhausted (`github_quota_exhausted`), while notifications are on. These use
   the same alert event envelope; [Notifications](Notifications.md#github-api-quota)
   defines their reset, recovery and dismissal behavior;
-- a Chat agent is waiting for a permission or an answer;
+- a Chat agent is waiting for the owner's permission or answer;
 - a Chat turn that ran longer than two minutes has finished;
 - a pull request of the person's own has become ready to merge, while
   notifications are on ([Notifications](Notifications.md)).
 
-With the browser open, Overview's *Answer here* shows the unresolved alerts too,
-and the bell on every place counts them.
+With the browser open, Overview's *Answer here* and the bell apply the
+[selected notification level](Notifications.md#answer-here).
 
 **Poise Link** runs on macOS, Windows and Linux from one Tauri codebase.
 - **First run:** asks for the server address, runs device pairing, keeps the
@@ -1249,8 +1309,10 @@ The supporting reads behind those names:
 - `GET /api/behavior-estimates`: each running behavior run with its remaining
   time from similar runs (same behavior and model, last 30 days, at least
   five); an overrun reads `overrun`, never below zero.
-- `GET /api/chat/requests`: every open chat request with a revision, kept
-  current by the `chatRequests.updated` frame.
+- `GET /api/chat/requests`: up to 200 open chat requests with a revision,
+  kept current by the `chatRequests.updated` frame. `ownerAction` identifies
+  requests for the owner and sorts them first. `escalation` carries the
+  Manager's reason when it escalates a pending question.
 - `GET /api/notices/handled?since=<ISO>`: the append-only handling log, kept
   30 days from each entry's time. It answers from the stored log at once and
   starts the notices check without waiting for it, so what that check
@@ -1383,7 +1445,11 @@ then attribution and normalization run again at the gateway. See the
 The host deployment verifier also sends bounded observations through that
 private operator socket. The gateway retains rollout/workspace deadline and
 recovery diagnostics using the existing v1 envelope/store, without a public
-ingestion route or a release/replacement control change; [Logging](Logging.md#collection-and-operation)
+ingestion route or a release/replacement control change. Only deployment delivery
+retries a complete response containing only the writer's exact busy refusal,
+replaying the same bounded observation within one 30-second deadline; other
+refusals retain a bounded, redacted cause.
+[Logging](Logging.md#collection-and-operation)
 defines the budget, deduplication and recovery contract.
 The edge also derives the fixed `/api/link/events` route label before removing
 the URI. All ingress paths apply the narrow native cancellation exception and
@@ -1445,9 +1511,11 @@ reconnect/provider-verification evidence; these optional fields do not change
 reducer state or old event hashes. Ambiguous older events stay unknown. See
 [System health](Analytics.md#system-health).
 
-New implementation admission also consumes Caller's captured forward GitHub
+New implementation admission also consumes Caller's complete live forward GitHub
 prerequisites and verified delivery on the implementation base through the
-existing chain sweep. [Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
+existing chain sweep, including a final observation after awaited request
+preparation. The mirror health gate remains required.
+[Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
 dependency wait; no gateway route, journal event or poller is added.
 
 The workspace's existing `/api/behavior-chains` controls also expose an explicit
@@ -1516,8 +1584,8 @@ and its native close receipt; summaries expose that evidence separately from
 `mergeSha`. Original writes and native resources must settle first. Unclear or
 independent work remains open with its decision visible. The existing Caller
 action performs head-checked retirement; a lost close response stays uncertain.
-The normal-work page precedes due quiescent
-reconciliation; observation failures remain reported after unrelated progress.
+The normal-work and due quiescent reconciliation pages alternate first use of
+the shared sweep budget; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
 operation or authority; a deliberate wait keeps GitHub facets unknown without
@@ -1525,20 +1593,40 @@ declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 The same reconciliation can release a CI-only hold after a proven clean base
-update, retaining the original Call, resource-release proof and remaining gates
+update, or admit the existing scoped repair when a fresh conflict on the retained
+failed head blocks that update, retaining the original Call, resource-release
+proof, repair retry bound and remaining gates
 as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
+Queue-only CI holds retain their original removal, integration, workflow and
+failed attempt in the existing Caller blocker. Recovery requires later matching
+integration success or independently verified shared-baseline recovery; green
+PR-head checks alone retain the hold. The original no-write Call and native
+resource settlement remain required, and current-head review and current-base
+merge gates still apply under the same [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 For a pre-PR implementation, the existing Caller artifact and seed read can
-instead verify an original CI assertion failure on its exact prepared base and
-the delivered main recovery with validation of the original failing tests.
+instead verify an original CI assertion failure on its exact prepared base, and
+the delivered main recovery with validation of every original failing test and
+case. Relay assertions remain held for #1619 until the runner establishes their
+inventory independently of candidate-controlled reports.
 The journal admits one fresh implementation for that automatic hold and recovery
-commit, independently of report publishing. Missing original evidence and later
-operator holds retain their authority; no gateway route or new poller is added.
+commit, independently of report publishing. An incomplete original assertion can
+instead use the saved automatic hold report and linked delivered fixture fix for
+a persisted clean-base recheck, requiring reproduction on the old base and an
+executed pass on the corrected base. Execution and result persistence run outside
+the observation sweep under the existing release/shutdown background barrier;
+a later sweep freshly verifies the saved pass. This uses the same single-retry
+admission and normal validation gates, as defined in [bounded reconciliation](Behavior-chain.md#bounded-reconciliation).
+Unverified rechecks and later operator holds retain their authority; no gateway
+route or new poller is added.
 
 The first `/api/behavior-chains` list page also includes read-only `attention`
 across all active chain pages. It joins durable progress age, holds, exact-head
 merge gates and the next known retry/intervention, including pending original
 review obligations after merge. The existing journal history supplies the clock;
 unchanged polls cannot refresh it. Stale/incomplete evidence stays explicit.
+Entries can include a read-only `nudge` with the type of next step, its
+description, a verified prerequisite, and a current Chat or open PR link when
+available. Chat bindings are read within the active workspace instance.
 This adds no observation, scheduler, event type, scope or execution authority.
 [Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
 
@@ -1595,6 +1683,10 @@ Poise's existing log decoder validates the fence's exact terminal no-effect
 shape and native resource-release timestamp before the journal can settle its
 reservation. Closed-target native resource waits are separate from public
 GitHub recheck times; unrelated open-PR review/approval stays eligible.
+An in-flight managed issue review whose final live seed read observes closure
+settles superseded without a PR head or publication plan. The reader accepts this
+unattempted receipt while retaining its original resource-release requirement;
+[Issue review](Issue-review.md) defines the publication race and reconciliation.
 Managed native admissions recheck the bounded receipt reader at their final
 launch, action and publication boundaries. Its independent diagnostics retain
 the first typed SQLite cause and affected workspace; confirmed integrity failure
@@ -1731,7 +1823,8 @@ configured-account issue publisher and datastore intake. An explicit per-reposit
 opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review timeout exhaustion, including retained legacy review/approval stops
 from their existing reconciliation independently of model readiness or v2 mode,
-verified automatic implementation holds before a PR,
+verified automatic implementation holds before a PR and terminal repair holds
+before publication,
 terminal uncertain implementation publication,
 open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
@@ -1744,6 +1837,32 @@ entry after recovery, retaining the original invocation's uncertainty and owners
 Implementation reports require the current automatic hold's settled blocked receipt,
 positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
+Their own implementation additionally requires an explicit disposition through
+the existing guarded chain control, bound to the authenticated report, native
+issue review, reviewed revision and original source hold/Call. Source-only and
+missing or stale dispositions wait without starting report implementation;
+a verified distinct-fix disposition retains ordinary admission gates, including
+fresh source verification after preparation. Diagnosis and next action persist
+on the held source through the existing report metadata and journal waits.
+This adds no retry or checkout-retention authority; see
+[report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
+The existing linked remediation also exposes bounded private source evidence
+from the original failed validation capture, retained through normal checkout
+cleanup under the workspace's incident-artifact lifecycle. Only its availability
+and capture identity enter receipts and reports; source bytes stay in the owning
+workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
+defines binding, access, limits and expiry without granting recovery authority.
+Terminal repair reports require the matching automatic hold, settled original Call,
+positive release and unchanged open PR head and repair basis, without possible
+publication effects. They preserve repair ownership and exclude CI-only recovery holds.
+Verified repair-exhaustion reports fence ordinary report implementation and can
+hand a pinned actionable diagnosis to the source chain's existing exact-head
+repair owner. The existing journal bounds that recovery to one admission without
+resetting retries; original no-publication/resource receipts, the saved automatic
+hold and unchanged source/diagnosis are rechecked. An already-admitted report's
+original implementation must settle without publication before this handoff.
+The original seed/branch, normal publication, review and CI gates remain in force;
+missing evidence, changed heads and later operator holds retain the wait.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,

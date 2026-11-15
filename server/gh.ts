@@ -118,18 +118,25 @@ export async function reconcileRepairReport(repository: string, marker: string, 
     }
     if (typeof issue.body !== 'string') {
       if (number !== null && linked) return null
+      // A missing body cannot contain the marker, so an unconfirmed report
+      // reconciled against an unrelated null-body issue must skip it rather
+      // than block it as an identity mismatch.
+      if (number !== null) throw new Error(`Repair report marker not found in issue #${issue.number}`)
       throw new Error('Repair report issue identity differs from its durable intent')
     }
     if (!issue.body.includes(marker) && number !== null && linked) {
       if (!linked(issue.body, author.login)) return null
-    } else if (!issue.body.includes(marker) || author.login.toLowerCase() !== me.toLowerCase()) {
+    } else if (!issue.body.includes(marker)) {
+      throw new Error(`Repair report marker not found in issue #${issue.number}`)
+    } else if (author.login.toLowerCase() !== me.toLowerCase()) {
       throw new Error('Repair report issue identity differs from its durable intent')
     }
     let applied = labels(issue.labels)
     if (label && issue.state === 'open' && !applied.some(name => name.toLowerCase() === 'poise')) {
       applied = labels(await request(['api', `repos/${repository}/issues/${issue.number}/labels`, '--method', 'POST', '-f', 'labels[]=poise']))
     }
-    return { number: Number(issue.number), url: String(issue.html_url), state: String(issue.state), labels: applied }
+    return { number: Number(issue.number), url: String(issue.html_url), state: String(issue.state), labels: applied,
+      title: issue.title, body: issue.body }
   } catch (error) {
     const failure = error as { stderr?: unknown, message?: string }
     const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)

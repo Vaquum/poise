@@ -26,6 +26,16 @@ Logging event. Unknown levels or invalid source timestamps produce visible
 collection warnings with the original source identity. Notification colors and
 successful change-request reviews do not determine technical severity.
 
+For future collection, a failed `pr_approve` with
+`approval_blocked_unresolved_conversations` is Warning only when the complete
+original flat Caller Error envelope records `provider.review`, `submitting`,
+`exit`, `submission: blocked` and explicitly untruncated stderr, with the original
+`not_started` / `preflight_failed` result and null executed head. Missing or
+conflicting evidence, publication receipts and process or cleanup failures retain
+their authoritative severity. The shared source classification governs storage,
+delivery, filters, counts and export; retained events remain immutable. Approval,
+backoff and resource gates are unchanged.
+
 Repair preflight refusals are retained as Warnings when a failed `repair_pr`
 Call has `not_started` / `preflight_failed`, no executed head, and either
 `atomic_work_blocked` or `atomic_work_failed` with the exact cause
@@ -83,6 +93,10 @@ pairs open GitHub. Unrecorded targets have no link.
 
 Each list snapshot also reads the owner's existing managed chain journal in one
 batch for retained Poise/Caller records with exact Call or correlation identities.
+Each batch scans retained invocation candidates once and validates matching chains
+against the journal. Ambiguity across either selector is rejected before checking
+that both selectors agree; repeated input positions retain their order. The next
+request reads current journal state, including changes since the preceding batch.
 The Work impact column leads with retrying/blocked/recovered/unknown, the verified
 target and stage. Duplicate diagnostics retain their event rows and identify the
 same work target; Count still measures retained diagnostic occurrences.
@@ -238,13 +252,14 @@ erase that original failure; independent wrapper and invalid-output failures
 remain visible. Resolve uses Warning only for a confirmed no-action transient
 exit with a recorded safe retry. Uncertain outcomes, timeouts and policy
 refusals remain Errors. Separate attempts retain separate event IDs.
-Legacy approval batch reads, the final head check and checkout preparation retain one Error
-per failed child after recording the scheduler consequence. The fixed primitive,
-phase, checked targets, available expected heads, correlation, original process
-timing/result and recorded retry state travel together. Two failed children
-remain separate even within one sweep correlation; cancellation or failed retry
-bookkeeping cannot erase either cause. These diagnostics do not change backoff,
-launch progress or the exact-head publication checks.
+Legacy approval batch reads, the final head check and checkout preparation, and review
+launch checkout, retain one Error per failed child after recording the scheduler
+consequence. The fixed primitive, phase, checked targets, available expected heads,
+correlation, original process timing/result and recorded retry state travel together.
+Two failed children remain separate even within one sweep correlation; cancellation
+or failed retry bookkeeping cannot erase either cause. These diagnostics do not change
+backoff, launch progress or the exact-head publication checks, except a stalled review
+checkout defers without backoff and retries on the next tick.
 Checkout failures use phase `checkout` and fixed operations
 `github-interface.local-checkout-path` or `github-interface.checkout-repo`;
 other checkout callers retain default process reporting.
@@ -282,6 +297,11 @@ without another process error. The existing sign-in notice stays until the
 monitor verifies recovery with its canary. Status JSON must contain a boolean
 `loggedIn`; unrecognized output (including exit 0), other exit-1 failures,
 start failures and timeouts remain diagnostic errors.
+The auth monitor also keeps a missing optional Claude CLI unavailable without an
+Error only when the wrapper reports `spawn claude ENOENT`, the strict account
+record has no Claude connection, no sign-in was previously observed by the
+monitor, and no launcher entry exists on its launch PATH. Broken launchers and
+unreadable account or path evidence retain the Error; the launch gate is unchanged.
 The live canary owns its failure diagnostic, retaining a fixed recognized reason
 from bounded probe evidence, or `cause unavailable`, with the process outcome.
 It retains no provider output. Unchanged reason/outcome repeats are suppressed;
@@ -291,6 +311,12 @@ is retained again. This recognition changes neither readiness nor retry policy.
 The gateway retains its separate central `logging.db` in `poise-gateway-data`.
 Existing volume backup/restore snapshots it with the other SQLite databases.
 Gateway warnings/errors are redacted before Docker stdout and retained directly.
+New `disk.workspace.over_budget` Warnings retain measured usage as `context.bytes`
+and the configured threshold as `context.budget`, in bytes, in the existing
+expanded detail. Each count is independently validated as a non-negative safe
+integer; zero is kept, while missing or invalid counts remain unknown without
+coercion. Previously retained entries cannot recover discarded fields.
+Recovery remains `disk.workspace.within_budget` at Info and is not retained.
 Every 15 seconds the independent collector reads bounded Docker logs/lifecycle
 windows for managed workspaces, Poise Compose services and release-install
 tasks. Only validated structured workspace envelopes enter private history;
@@ -301,6 +327,10 @@ Workspace backfill reads three durable events per authenticated maintenance
 page and commits its checkpoint only with central persistence. Replacement or
 removal of the source does not delete central records. Query/collection outages
 never become empty successful reads.
+Caller ingestion waits for the runtime's scheduled 100-event persistence batches,
+leaving event-loop turns for queued maintenance requests within the collector's
+five-second complete response budget. Its completion checkpoint still waits for
+durable local ingestion.
 
 The gateway reads native host kernel and `docker.service` Warning-or-higher
 journal records using `journalctl`, with a durable native cursor. Compose mounts
@@ -345,6 +375,18 @@ completion proof; missing health, supersession and another rollout's completion
 cannot establish recovery. The rollout stays pending until its existing release
 and build/image verification gates pass. Diagnostic delivery failure is visible
 on stderr and does not change those gates.
+Only a complete response containing solely the private writer's exact busy
+refusal is retried for `deployment`: at most five connections, waiting 250,
+500, 1,000 and 2,000 milliseconds between attempts.
+The writer drains refused connections until client EOF or the existing 30-second
+connection deadline, preserving the reply when the client writes before reading it.
+The complete observation frame, including its original timestamp and health
+snapshot, is read once within 64 KiB and replayed unchanged. Input, attempts and
+waits share one 30-second delivery deadline; the verifier's proof clock is
+unchanged. Other refusals retain a bounded, redacted cause and fail immediately;
+an ambiguous disconnect, bare write error or incomplete reply is not retried.
+Exhausted contention leaves the verifier's warning visible. Manual ingress and
+the continuous reader keep single attempts and their existing input/handshake behavior.
 
 External Caddy installations can instead run the bounded continuous
 [operator reader](../deploy/ingress/README.md). A dedicated forced-command SSH

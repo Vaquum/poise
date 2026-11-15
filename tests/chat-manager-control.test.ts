@@ -805,4 +805,24 @@ describe('the workspace Manager through the native control', () => {
     const answered = runtime.events(worker, 0).events.find(e => e.event.type === 'question.answered' && e.event.id === secondId)!
     expect(seen.find(n => n.type === 'turn.finished')!.others).toEqual([{ type: 'question.answered', by: 'the person', seq: answered.seq }])
   }, 120_000)
+
+  it('lets only the workspace Manager escalate an open worker question', async () => {
+    const boss = await workspaceManager()
+    const created = await command(boss.id, { operation: 'create', title: 'Worker', task: 'Wait for a decision' })
+    const worker = (created.session as { id: string }).id
+    await control.tick()
+    await until(() => prompts.has(worker))
+    const pending = hosts.get(worker)!.askQuestion({ questions: [{ id: 'choice', question: 'Which target?', options: [], freeText: true, multiSelect: false }] })
+    void pending.catch(() => undefined)
+    await until(() => !!runtime.get(worker)?.pendingRequests.length)
+    const questionId = questionIdOf(worker)
+    const escalation = { operation: 'escalate', sessionId: worker, questionId, reason: 'The owner must pick a target.' }
+    expect((await request(worker, escalation)).status).toBe(403)
+    expect(runtime.get(worker)?.ownerRequests).toEqual([])
+    expect(await command(boss.id, escalation)).toEqual({ escalated: true, sessionId: worker })
+    expect(runtime.get(worker)?.ownerRequests).toEqual([questionId])
+    runtime.answerQuestion(worker, questionId, { choice: 'main' })
+    await expect(pending).resolves.toEqual({ choice: 'main' })
+    expect((await request(boss.id, escalation)).status).toBe(409)
+  })
 })

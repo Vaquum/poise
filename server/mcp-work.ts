@@ -70,15 +70,14 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
   ledgerShortCircuit: { reply: LedgerReadReply | null }) {
   let chain: BehaviorChain | null = null
   let chainCoverage = coverage('fresh', new Date(now).toISOString())
+  let summary: ReturnType<typeof behaviorChainSummary> | null = null
   try {
     // Exact verified projection read: the ordinary singleton's initial whole-
     // journal verification is not a request-scoped work-trail scan.
     const journal = new BehaviorChainJournal(db)
     chain = journal.read(chainIdentity(issue.repo, issue.number))
-  } catch (error) { chainCoverage = coverage('unavailable', null, message(error)) }
-  let summary: ReturnType<typeof behaviorChainSummary> | null = null
-  try { if (chain) summary = behaviorChainSummary(chain) }
-  catch (error) { chainCoverage = coverage('unavailable', null, message(error)); chain = null }
+    if (chain) summary = behaviorChainSummary(chain, journal)
+  } catch (error) { chainCoverage = coverage('unavailable', null, message(error)); chain = null }
   const observation = chain?.observation as ChainObservation | null
   const checkedAt = observation?.checkedAt
   const observationCoverage = typeof checkedAt !== 'number' || !Number.isFinite(checkedAt) || checkedAt > now
@@ -129,10 +128,10 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
   if (chain) {
     stage = chain.mergeSha ? chain.reviewPending === false ? 'complete' : chain.reviewPending === true ? 'merged_review_pending' : 'merged_review_not_recorded'
       : chain.supersession ? 'superseded' : chain.held ? 'held' : active?.state === 'uncertain' ? 'unknown'
-        : active ? active.state === 'admitted' ? 'admitted' : missingReceipt ? 'unknown' : 'running' : chain.waiting ? 'delayed'
-          : latest?.evidence?.status === 'failed' ? 'failed' : 'waiting'
+        : active ? active.state === 'admitted' ? 'admitted' : missingReceipt ? 'unknown' : 'running' : summary?.waiting ? 'delayed'
+          : latest?.evidence?.status === 'failed' && latest.admissionSequence > chain.resumedAfterSequence ? 'failed' : 'waiting'
     // A merge preserves the earlier wait reason; it is not the current blocker once merged.
-    blocker = preview(chain.held ?? (chain.mergeSha ? null : chain.waiting) ?? (chain.reviewPending ? 'Original pre-merge review proof is pending'
+    blocker = preview(chain.held ?? (chain.mergeSha ? null : summary?.waiting) ?? (chain.reviewPending ? 'Original pre-merge review proof is pending'
       : active?.state === 'uncertain' ? active.outcome ?? 'Original invocation receipt is unavailable'
         : missingReceipt ? 'Original Call or receipt evidence is not recorded' : null))
   } else if (chainCoverage.status === 'fresh' && mirror.status === 'fresh' && ledger.every(source => source.coverage.status === 'fresh')) {

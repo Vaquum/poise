@@ -222,25 +222,24 @@ test('Motion off reaches the motion runtime; Copy as CSS says whether it copied;
 
 test('the bell counts what needs you and opens Answer here with a route back', async ({ page }) => {
   const at = new Date().toISOString()
-  const notice = (id: string) => ({ id, kind: 'pr_ready', title: `acme/site#${id} is ready to merge`, body: 'Checks passed.', since: at, due: at, silenceable: true, target: null })
+  const notice = (id: string, kind: string) => ({ id, kind, title: id, body: '', since: at, due: at, silenceable: false, target: null })
   await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
-  // Answer here's other sources, which the bell reads on every place: one open review thread.
   await page.route('**/api/behaviors', (route) => route.fulfill({ json: {} }))
   await page.route('**/api/behavior-chains**', (route) => route.fulfill({ json: { chains: [], attention: [] } }))
   await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [] } }))
   await page.route('**/api/chat/switchboard', (route) => route.fulfill({ json: { revision: 1, items: [] } }))
   await page.route('**/api/editor/reviews', (route) => route.fulfill({ json: { publications: [{ slug: 'notes', openThreads: 1 }] } }))
-  await open(page, '/?view=board', { notices: [notice('1'), notice('2')] })
+  await open(page, '/?view=board', { notices: [notice('Formal GitHub review', 'review_requested'), notice('Reconnect Google', 'sign_in_needed'), notice('Ready to merge', 'pr_ready')] })
   const bell = page.getByRole('button', { name: /^Notifications/ })
-  await expect(bell.locator('[data-bell]')).toHaveText('3')
-  await expect(bell).toHaveAccessibleName('Notifications, 3 open. Opens Answer here in Overview.')
+  await expect(bell.locator('[data-bell]')).toHaveText('2')
+  await expect(bell).toHaveAccessibleName('Notifications, 2 open. Opens Answer here in Overview.')
   await bell.click()
   await expect(nav(page).getByRole('link', { name: 'Overview' })).toHaveAttribute('aria-current', 'page')
   expect(Object.fromEntries(query(page))).toEqual({ view: 'overview', back: 'board' })
   expect(new URL(page.url()).hash).toBe('#answer')
 })
 
-test('opening Overview reads Answer here’s sources once: the bell reads them itself once you leave', async ({ page }) => {
+test('Overview shares attention reads with the bell, and only Overview fetches publication threads', async ({ page }) => {
   const reads: string[] = []
   const read = (name: string, json: unknown) => (route: Route) => { reads.push(name); return route.fulfill({ json }) }
   const count = (name: string) => reads.filter((each) => each === name).length
@@ -258,54 +257,32 @@ test('opening Overview reads Answer here’s sources once: the bell reads them i
   expect(count('reviews')).toBe(1)
 
   await nav(page).getByRole('link', { name: 'Board' }).click()
-  await expect.poll(() => count('reviews')).toBe(2)
-  await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('1')
+  await expect.poll(() => count('chains')).toBe(2)
+  expect(count('reviews')).toBe(1)
+  expect(count('threads')).toBe(1)
+  await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('0')
 })
 
 test('leaving Overview before it has mounted, the bell reads Answer here’s sources at once', async ({ page }) => {
-  let reviews = 0
+  let requests = 0
   await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
   await page.route('**/api/behaviors', (route) => route.fulfill({ json: {} }))
   await page.route('**/api/behavior-chains**', (route) => route.fulfill({ json: { chains: [], attention: [] } }))
-  await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [] } }))
+  await page.route('**/api/chat/requests', (route) => {
+    requests++
+    return route.fulfill({ json: { revision: 1, complete: true, requests: [{ id: 'p1', kind: 'permission', sessionId: 's1', sessionTitle: 'Chat', content: { title: 'Approve deploy', options: [{ id: 'yes', name: 'Allow once' }] }, createdAt: new Date().toISOString(), ownerAction: true }] } })
+  })
   await page.route('**/api/chat/switchboard', (route) => route.fulfill({ json: { revision: 1, items: [] } }))
-  await page.route('**/api/editor/reviews', (route) => { reviews++; return route.fulfill({ json: { publications: [{ slug: 'notes', openThreads: 1 }] } }) })
   // Overview waits on its settings, so it never mounts before the move.
   let release = () => {}
   const held = new Promise<void>((resolve) => { release = resolve })
   await page.route('**/api/settings', async (route) => { if (route.request().method() === 'GET') await held; return route.fallback() })
   await open(page, '/?view=overview')
-  expect(reviews).toBe(0)
+  expect(requests).toBe(0)
   await nav(page).getByRole('link', { name: 'Board' }).click()
-  await expect.poll(() => reviews).toBe(1)
+  await expect.poll(() => requests).toBe(1)
   await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('1')
   release()
-})
-
-test('away from Overview, the bell drops a put-away review thread until a checked reply brings it back (#1379)', async ({ page }) => {
-  let replies = 1
-  let checkedAt = '2026-11-12T09:30:00Z'
-  const thread = (id: string, messages: number) => ({ id, kind: 'thread', repo: 'acme/site', site: 'site', pr: 3, prUrl: 'https://github.com/acme/site/pull/3', resolved: false, canReply: true, canResolve: true,
-    messages: Array.from({ length: messages }, (_, i) => ({ author: 'ann', body: `note ${i}`, createdAt: `2026-11-12T09:0${i}:00Z` })) })
-  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
-  await page.route('**/api/behaviors', (route) => route.fulfill({ json: {} }))
-  await page.route('**/api/behavior-chains**', (route) => route.fulfill({ json: { chains: [], attention: [] } }))
-  await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [] } }))
-  await page.route('**/api/chat/switchboard', (route) => route.fulfill({ json: { revision: 1, items: [] } }))
-  await page.route('**/api/editor/reviews', (route) => route.fulfill({ json: { publications: [{ slug: 'notes', site: 'site', repo: 'acme/site', pr: 3, prUrl: '', checkedAt, active: true, stale: false, problems: [], openThreads: 2 }] } }))
-  await page.route('**/api/editor/doc/notes/reviews', (route) => route.fulfill({ json: { reviews: [thread('t1', replies), thread('t2', 1)] } }))
-  await page.route('**/api/answers/dismissals', (route) => route.fulfill({ json: { dismissals: [{ key: 'thread:notes:t1', revision: '1|2026-11-12T09:00:00Z', at: new Date().toISOString() }] } }))
-  await open(page, '/?view=board')
-  const bell = page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')
-  await expect(bell).toHaveText('1', { timeout: 10_000 })
-  // Someone replies; the next sweep checks it, and the next read counts it again.
-  replies = 2
-  checkedAt = '2026-11-12T09:45:00Z'
-  await page.clock.install()
-  await page.clock.fastForward(61_000)
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-  await page.clock.fastForward(3_000)
-  await expect(bell).toHaveText('2', { timeout: 10_000 })
 })
 
 test('the bell reads after the place it opens on, so the place’s own reads go first', async ({ page }) => {
@@ -316,10 +293,9 @@ test('the bell reads after the place it opens on, so the place’s own reads go 
   await page.route('**/api/behavior-chains**', (route) => route.fulfill({ json: { chains: [], attention: [] } }))
   await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [] } }))
   await page.route('**/api/chat/switchboard', (route) => route.fulfill({ json: { revision: 1, items: [] } }))
-  await page.route('**/api/editor/reviews', (route) => route.fulfill({ json: { publications: [{ slug: 'notes', openThreads: 1 }] } }))
   await page.route('**/api/current**', (route) => { mark('board'); return route.fallback() })
   await open(page, '/?view=board')
-  await expect(page.getByRole('button', { name: /^Notifications/ }).locator('[data-bell]')).toHaveText('1', { timeout: 10_000 })
+  await expect.poll(() => at.bell, { timeout: 10_000 }).toBeTruthy()
   // Away from Overview the bell says it opens Answer here there (#1433).
   await expect(page.getByRole('button', { name: /^Notifications/ })).toHaveAccessibleName(/Opens Answer here in Overview\.$/)
   expect(at.board).toBeTruthy()

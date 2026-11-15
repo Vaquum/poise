@@ -7,7 +7,8 @@
 import { randomBytes } from 'node:crypto'
 import { auth, type OAuthClientProvider, type OAuthDiscoveryState } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js'
-import { ExtensionError, addEvent, eraseSecret, oauthFlows, readSecret, storedServer, writeSecret } from './store'
+import { connectionSignInCleared } from '../alerts/producers'
+import { ExtensionError, addEvent, eraseSecret, extensionSignInLost, oauthFlows, readSecret, storedServer, writeSecret } from './store'
 
 /** Where the provider sends the browser back: a page of the app, because an
  *  API route refuses a cross-site navigation. */
@@ -27,7 +28,8 @@ class StoredProvider implements OAuthClientProvider {
   authorizationUrl: URL | null = null
   /** `fresh`: start a new authorization even with tokens stored, which stay in
    *  use until the new sign-in completes. */
-  constructor(private readonly id: string, private readonly redirect: string, private flow?: Flow, private readonly fresh = false) {}
+  constructor(private readonly id: string, private readonly redirect: string, private flow?: Flow, private readonly fresh = false,
+    private readonly refreshingCredentials?: string) {}
 
   get redirectUrl(): string { return this.redirect }
   get clientMetadata(): OAuthClientMetadata {
@@ -45,7 +47,11 @@ class StoredProvider implements OAuthClientProvider {
   saveClientInformation(info: OAuthClientInformationMixed): void { writeSecret(this.id, 'oauth:client', JSON.stringify(info)) }
   tokens(): OAuthTokens | undefined { return this.fresh ? undefined : json<Stored>(this.id, 'oauth:tokens')?.tokens }
   saveTokens(tokens: OAuthTokens): void {
+    if (this.refreshingCredentials !== undefined && readSecret(this.id, 'oauth:tokens') !== this.refreshingCredentials) {
+      throw new Error('The extension sign-in changed during refresh.')
+    }
     writeSecret(this.id, 'oauth:tokens', JSON.stringify({ tokens, obtainedAt: Date.now(), redirectUrl: this.redirect } satisfies Stored))
+    connectionSignInCleared(`extension:${this.id}`)
   }
   redirectToAuthorization(url: URL): void { this.authorizationUrl = url }
   saveCodeVerifier(verifier: string): void {
@@ -60,6 +66,12 @@ class StoredProvider implements OAuthClientProvider {
   discoveryState(): OAuthDiscoveryState | undefined { return json<OAuthDiscoveryState>(this.id, 'oauth:discovery') }
   saveDiscoveryState(state: OAuthDiscoveryState): void { writeSecret(this.id, 'oauth:discovery', JSON.stringify(state)) }
   invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery'): void {
+    if (this.refreshingCredentials !== undefined) {
+      // The SDK calls this for a rejected OAuth credential, then starts a
+      // browser sign-in. Preserve any newer sign-in or pending browser flow.
+      if (scope === 'all' || scope === 'tokens') extensionSignInLost(this.id, this.refreshingCredentials)
+      return
+    }
     const slots = { all: ['oauth:client', 'oauth:tokens', 'oauth:discovery', 'oauth:flow'], client: ['oauth:client'], tokens: ['oauth:tokens'], verifier: ['oauth:flow'], discovery: ['oauth:discovery'] }[scope]
     for (const slot of slots) eraseSecret(this.id, slot)
   }
@@ -145,6 +157,7 @@ export async function finishSignIn(input: { state?: unknown, code?: unknown, err
 export function signOut(id: string): void {
   for (const slot of ['oauth:tokens', 'oauth:flow']) eraseSecret(id, slot)
   addEvent(id, 'info', 'Signed out')
+  connectionSignInCleared(`extension:${id}`)
 }
 
 const refreshing = new Map<string, Promise<string | null>>()
@@ -152,19 +165,23 @@ const refreshing = new Map<string, Promise<string | null>>()
 /** A current access token, refreshed when it is about to expire; null when
  *  the server needs a sign-in. */
 export function accessToken(id: string): Promise<string | null> {
-  const stored = json<Stored>(id, 'oauth:tokens')
-  if (!stored) return Promise.resolve(null)
+  const raw = readSecret(id, 'oauth:tokens')
+  if (!raw) return Promise.resolve(null)
+  const stored = JSON.parse(raw) as Stored
   const expires = stored.tokens.expires_in ? stored.obtainedAt + stored.tokens.expires_in * 1000 : Infinity
-  if (expires - REFRESH_MARGIN_MS > Date.now()) return Promise.resolve(stored.tokens.access_token)
-  if (!stored.tokens.refresh_token) return Promise.resolve(null)
+  if (expires - REFRESH_MARGIN_MS > Date.now() || (!stored.tokens.refresh_token && expires > Date.now())) return Promise.resolve(stored.tokens.access_token)
+  if (!stored.tokens.refresh_token) {
+    extensionSignInLost(id, raw)
+    return Promise.resolve(null)
+  }
   const running = refreshing.get(id)
   if (running) return running
   const attempt = (async () => {
-    const provider = new StoredProvider(id, stored.redirectUrl)
+    const provider = new StoredProvider(id, stored.redirectUrl, undefined, false, raw)
     try {
       const result = await auth(provider, { serverUrl: serverUrl(id) })
       // A refused refresh falls through to a new authorization: that needs the person.
-      if (result !== 'AUTHORIZED') { eraseSecret(id, 'oauth:tokens'); addEvent(id, 'warning', 'The sign-in expired; sign in again'); return null }
+      if (result !== 'AUTHORIZED') return null
       return provider.tokens()?.access_token ?? null
     } catch (error) {
       addEvent(id, 'error', `Refreshing the sign-in failed: ${reason(error)}`)

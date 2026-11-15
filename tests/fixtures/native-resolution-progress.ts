@@ -45,7 +45,7 @@ try {
     }, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {} }
   await new BehaviorChainRuntime(journal, operations).run()
   assert.equal(journal.read(chain.id)!.invocations[0].state, 'uncertain', 'progress cannot bypass resource release')
-  assert.deepEqual(behaviorChainSummary(journal.read(chain.id)!).invocations[0].nativeAction?.resolutionProgress,
+  assert.deepEqual(behaviorChainSummary(journal.read(chain.id)!, journal).invocations[0].nativeAction?.resolutionProgress,
     call.artifact!.resolution_progress)
   db.close()
   db = new Database(path)
@@ -61,7 +61,7 @@ try {
   assert.equal(current.invocations.length, 1)
   assert.equal(current.invocations[0].state, data.mode === 'complete' ? 'settled' : 'uncertain')
   assert.equal(current.mergeSha, null)
-  const summary = behaviorChainSummary(current).invocations[0]
+  const summary = behaviorChainSummary(current, journal).invocations[0]
   assert.equal(summary.callId, call.id)
   assert.deepEqual(summary.nativeAction?.resolutionProgress, call.artifact!.resolution_progress)
   assert.equal(summary.nativeAction?.attribution, data.mode === 'complete' ? 'accepted-response' : 'uncertain')

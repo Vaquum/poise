@@ -24,7 +24,7 @@ export interface LogEntry {
   time_elapsed: string
   status: string
   progress?: ModelProgress | null
-  outcome: 'clean' | 'changes_requested' | 'approved' | 'superseded' | 'preflight_failed' | 'commented' | 'published' | 'no_changes' | 'target_closed' | 'native_action' | null
+  outcome: 'clean' | 'changes_requested' | 'approved' | 'incomplete' | 'superseded' | 'preflight_failed' | 'commented' | 'published' | 'no_changes' | 'prerequisite_wait' | 'target_closed' | 'native_action' | null
   head_sha: string | null
   expected_head: string | null
   source: string | null
@@ -61,6 +61,31 @@ export interface IssueCommentReceipt {
   comment_id: number
   url: string | null
   author: string
+}
+
+export type FailedSourceEvidence = { status: 'unavailable', candidate: string, run: string, reason: string }
+  | { status: 'available', candidate: string, run: string, base: string, bytes: number, sha256: string, expires_at: number }
+
+/** Source bytes and arbitrary text must never enter the exported Caller artifact. */
+export function parseFailedSource(value: unknown): FailedSourceEvidence | null {
+  if (value === undefined) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid failed source receipt')
+  const entry = value as Record<string, unknown>
+  if (typeof entry.candidate !== 'string' || !/^[a-f0-9]{64}$/.test(entry.candidate)
+    || typeof entry.run !== 'string' || !/^[a-f0-9]{32}$/.test(entry.run)) throw new Error('invalid failed source capture identity')
+  if (entry.status === 'unavailable' && Object.keys(entry).length === 4
+    && entry.reason === 'capture could not be bound or safely retained within the source limit') {
+    return { status: entry.status, candidate: entry.candidate, run: entry.run, reason: entry.reason }
+  }
+  if (entry.status !== 'available' || Object.keys(entry).length !== 7
+    || typeof entry.base !== 'string' || !/^[a-f0-9]{40}$/.test(entry.base)
+    || typeof entry.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256)
+    || typeof entry.bytes !== 'number' || !Number.isSafeInteger(entry.bytes) || entry.bytes < 1 || entry.bytes > 2 * 1024 * 1024
+    || typeof entry.expires_at !== 'number' || !Number.isSafeInteger(entry.expires_at) || entry.expires_at < 1 || entry.expires_at > 8_640_000_000_000) {
+    throw new Error('invalid failed source availability receipt')
+  }
+  return { status: entry.status, candidate: entry.candidate, run: entry.run, base: entry.base,
+    sha256: entry.sha256, bytes: entry.bytes, expires_at: entry.expires_at }
 }
 
 export interface ResolutionProgress {
@@ -267,6 +292,14 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
   const managedReview = behavior === 'pr_review' || behavior === 'pr_approve' || (source === 'poise:behavior-chain' && issueReview)
   if (artifact !== null && ((!atomicWork && !managedReview && !nativeAction) || typeof artifact !== 'object' || Array.isArray(artifact)
     || Buffer.byteLength(JSON.stringify(artifact)) > 128 * 1024)) throw new Error(`agent-interface log row ${index} has an invalid atomic artifact`)
+  const incompleteReview = (behavior === 'pr_review' || behavior === 'pr_approve') && headSha === expectedHead
+    && (status === 'failed' && action === null && errorCode === 'review_incomplete'
+      || status === 'completed' && action === 'requested_changes'
+        && ((artifact as Record<string, unknown> | null)?.review_response as Record<string, unknown> | undefined)?.coverage === 'incomplete')
+  if (artifact !== null && typeof artifact === 'object' && 'failed_source' in artifact) {
+    if (behavior !== 'implement_issue' || source !== 'poise:behavior-chain') throw new Error('failed source lacks its managed implementation')
+    parseFailedSource(artifact.failed_source)
+  }
   if (nativeAction && artifact !== null) {
     const value = artifact as Record<string, unknown>
     if (!['preparing_native_action', 'performing_native_action', 'received_native_action'].includes(String(value.phase))
@@ -297,6 +330,10 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     && row.runner == null && row.review_id == null && row.review_comments == null && row.receipts == null && row.response == null
     && artifact !== null && typeof artifact === 'object' && !Array.isArray(artifact)
     && (artifact as Record<string, unknown>).phase === 'admission_fenced' && Object.keys(artifact).length === 1
+  const closedIssueReview = issueReview && source?.startsWith('poise:') && errorCode === 'review_target_closed'
+    && headSha === null && expectedHead === null && row.review_id == null && row.review_comments == null && row.receipts == null
+    && (artifact === null ? source !== 'poise:behavior-chain' : (artifact as Record<string, unknown>).phase === 'reviewing'
+      && !(artifact as Record<string, unknown>).plan_sha)
   if (!LOG_CALL_ID.test(id)
     || (prId !== null && !LOG_PR_ID.test(prId))
     || (repo !== null && !LOG_REPO.test(repo))
@@ -305,7 +342,8 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     || !Number.isFinite(Date.parse(startedAt))
     || (startedAtPrecise !== null && !Number.isFinite(Date.parse(startedAtPrecise)))
     || (completedAt !== null && !Number.isFinite(Date.parse(completedAt)))
-    || !['clean', 'changes_requested', 'approved', 'superseded', 'preflight_failed', 'commented', 'published', 'no_changes', 'target_closed', 'native_action', null].includes(outcome)
+    || !['clean', 'changes_requested', 'approved', 'incomplete', 'superseded', 'preflight_failed', 'commented', 'published', 'no_changes', 'prerequisite_wait', 'target_closed', 'native_action', null].includes(outcome)
+    || (outcome === 'incomplete' && !incompleteReview)
     || (outcome === 'target_closed' && !closedFence)
     || (headSha !== null && !/^[0-9a-f]{40}$/.test(headSha))
     || (expectedHead !== null && !/^[0-9a-f]{40}$/.test(expectedHead))
@@ -313,8 +351,9 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     || (action === 'native_action' || outcome === 'native_action') && (!nativeAction || action !== 'native_action'
       || outcome !== 'native_action' || status !== 'completed' || !(artifact as Record<string, unknown> | null)?.response_sha)
     || ((action === 'published' || action === 'no_changes' || outcome === 'published' || outcome === 'no_changes') && !atomicWork)
+    || (outcome === 'prerequisite_wait' && (behavior !== 'implement_issue' || action !== 'not_started' || status !== 'completed'))
     || ((action === 'commented' || outcome === 'commented') && !issueReview)
-    || ((action === 'not_started' || outcome === 'preflight_failed') && !preflightFailed && !closedFence)
+    || ((action === 'not_started' || outcome === 'preflight_failed') && !preflightFailed && !closedFence && outcome !== 'prerequisite_wait')
     || (source !== null && !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(source))
     || (correlationId !== null && !LOG_CORRELATION_ID.test(correlationId))) {
     throw new Error(`agent-interface log row ${index} violates the schema`)
@@ -342,14 +381,14 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
       || !repo || !/^[^/\s]+\/[^/\s]+$/.test(repo) || !prId) {
       throw new Error(`agent-interface log row ${index} has incomplete Poise provenance`)
     }
-    if (status === 'completed' && (!completedAt || !action || !outcome || (!headSha && !issueReview && !(atomicWork && outcome === 'no_changes')))) {
+    if (status === 'completed' && (!completedAt || !action || !outcome || (!headSha && !issueReview && !(atomicWork && (outcome === 'no_changes' || outcome === 'prerequisite_wait'))))) {
       throw new Error(`agent-interface log row ${index} has incomplete terminal outcome`)
     }
     if (status === 'failed' && !error) {
       throw new Error(`agent-interface log row ${index} has no terminal error`)
     }
     if (status === 'superseded' && !closedFence
-      && (!completedAt || outcome !== 'superseded' || !headSha || action !== null)) {
+      && (!completedAt || outcome !== 'superseded' || !headSha && !closedIssueReview || action !== null)) {
       throw new Error(`agent-interface log row ${index} has incomplete superseded outcome`)
     }
   }

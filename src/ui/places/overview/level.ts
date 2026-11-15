@@ -10,7 +10,7 @@ export type Group = 'needs-you' | 'fault' | 'auto'
 export const GROUPS: readonly (readonly [Group, string, string])[] = [
   ['needs-you', 'Only you', 'Nothing moves until you act.'],
   ['fault', 'Faults', 'Stuck: broken, or not moved in 4 hours.'],
-  ['auto', 'Handled automatically', 'Poise is on it.'],
+  ['auto', 'Handled automatically', 'What Poise is handling and what it has observed.'],
 ]
 
 /** Each level includes the ones before it: [name, gloss]. */
@@ -38,21 +38,18 @@ export function readLevel(): number {
 export const groupRank = (group: Group): number => GROUPS.findIndex(([key]) => key === group)
 export const shownAt = (group: Group, level: number): boolean => groupRank(group) <= level
 
-// Only you is what stays put until you act. Poise's own work never is: when it
-// is stuck it is a fault, and while it moves it is handled automatically. A
-// pull request's notice is decided by who acts on it next (prGroup, in
-// entries.ts); finished work (null) is not listed.
+// Requests use the live Chat feed. Server notices are for the owner only
+// when they name a sign-in or a formal GitHub review request.
 const NOTICE_GROUPS: Record<NoticeKind, Group | null> = {
-  chat_waiting: 'needs-you',
+  chat_waiting: null,
   sign_in_needed: 'needs-you',
   review_requested: 'needs-you',
-  storage_low: 'needs-you',
-  action_needed: 'needs-you',
-  action_failed: 'needs-you',
-  pr_ready: 'needs-you',
-  pr_conflict: 'needs-you',
-  // Idle slots with an empty backlog: only you label an issue or file one.
-  worker_idle: 'needs-you',
+  storage_low: 'fault',
+  action_needed: 'fault',
+  action_failed: 'fault',
+  pr_ready: 'auto',
+  pr_conflict: 'fault',
+  worker_idle: null,
   behavior_held: 'fault',
   ledger_queue_stalled: 'fault',
   ledger_capture_loss: 'fault',
@@ -94,7 +91,7 @@ export function saveLevel(level: number): void {
 }
 
 // While Overview is mounted it hands over its open entries' groups, chat
-// requests, decisions and threads included; elsewhere away.ts reads them.
+// requests and decisions included; elsewhere away.ts reads them.
 let answerGroups: (() => readonly Group[]) | null = null
 
 export const onOverview = (): boolean => answerGroups !== null

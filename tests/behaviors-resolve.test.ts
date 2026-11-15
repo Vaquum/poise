@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { mocks, HEAD_SHA, arrangeCli, fixture, loadModules, pr, resetLogCache } from './behaviors-runtime-fixture'
 import type { ReviewActivityFixture } from './behaviors-runtime-fixture'
 
@@ -25,6 +25,9 @@ async function enableResolve(reviewActivity: ReviewActivityFixture = {}) {
 
 describe('resolve-unblocking run lineage', () => {
   it('resolves an independent PR within one second while issue history is unavailable, retaining its original worker', async () => {
+    // Poll retries advance fake timers; keep the minute ticker outside this sweep's one-second check.
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
     const { behaviors, database } = await enableResolve({ resolveResolvedCount: 2 })
     const target = 'Vaquum/poise-test#500'
     const claimId = database.claimSeenOwned('review-new-issues', target)!
@@ -40,9 +43,9 @@ describe('resolve-unblocking run lineage', () => {
     await resetLogCache()
     const tick = behaviors.runEnabledBehaviorsOnce()
     try {
-      await expect.poll(() => resolveCalls().length, { timeout: 1000 }).toBe(1)
-      expect(database.db.prepare("SELECT outcome FROM behavior_runs WHERE behavior='resolve-unblocking'").get())
-        .toEqual({ outcome: 'resolved' })
+      await expect.poll(() => database.db.prepare("SELECT outcome FROM behavior_runs WHERE behavior='resolve-unblocking'").get(),
+        { timeout: 1000 }).toEqual({ outcome: 'resolved' })
+      expect(resolveCalls()).toHaveLength(1)
       expect(database.listBehaviorLaunchClaims('review-new-issues')[0]!.claimId).toBe(claimId)
     } finally {
       failRead(new Error('Command timed out after 30000ms'))

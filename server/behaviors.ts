@@ -2,6 +2,7 @@ import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-cont
 import { diagnostic, diagnosticFailure, loggingWorkspace } from './logging'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { parseAgentLogList } from './agent-log-parse'
+import { parseProcessDiagnostic } from './process-diagnostic'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
 import { behaviorChainForPull, behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
@@ -9,7 +10,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
-import { repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories } from './behavior-chain-report'
+import { implementationReportAdmission, recoverReportedRepair, repairReportImplementationFence, repairReportReviewScope, reportRepairExhaustion, reportLegacyReviewTimeout, repairReportRepositories, waitForImplementationRechecks } from './behavior-chain-report'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
@@ -89,6 +90,7 @@ import {
   renewPrOperationOwned,
   setBehaviorLaunchErrorOwned,
   setMeta as databaseSetMeta,
+  writeObservation,
   type BehaviorAgentLaunch,
   type BehaviorLaunchClaim,
   type CompletedApprovalBasisLaunch,
@@ -930,6 +932,18 @@ function isFileGroupBudgetExhaustion(call: LogEntry): boolean {
     && call.diagnostic.context.submission === 'none'
 }
 
+// A local inspection that hit the overall or provider-analysis ceiling stays
+// on its revision with its limiting phase. It still counts toward that
+// target's retry stop. Receipts without typed no-submission proof keep the
+// existing safe handling.
+function isLocalInspectionBudgetExhaustion(call: LogEntry): boolean {
+  return call.error_code === 'review_budget_exhausted'
+    && call.diagnostic?.operation === 'github-interface'
+    && (call.diagnostic.phase === 'overall' || call.diagnostic.phase === 'provider_analysis')
+    && call.diagnostic.outcome === 'timed_out'
+    && call.diagnostic.context.submission === 'none'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -939,6 +953,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // diagnostic takes precedence over provider-like text in older errors.
   if (call.diagnostic?.operation === 'github-interface' && call.diagnostic.phase === 'inspection'
     && call.diagnostic.outcome === 'timed_out') return null
+  if (isLocalInspectionBudgetExhaustion(call)) return null
   const account = reviewAccountFailure(call)
   if (account) return account
   const error = String(call.error || '')
@@ -2006,6 +2021,14 @@ function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry |
   })()
 }
 
+// A published change request from a capacity-bounded packet: genuine
+// findings with required source still uncovered. Launch records settle it
+// as a change request; the ledger keeps the `incomplete` disposition.
+function partialReviewFindings(call: LogEntry): boolean {
+  return call.action === 'requested_changes' && call.outcome === 'incomplete'
+    && (call.artifact?.review_response as Record<string, unknown> | undefined)?.coverage === 'incomplete'
+}
+
 function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry, snapshot: AgentLogSnapshot): boolean {
   if (claim.launchQuarantine === 'invalid_result') return false
   const actions = claim.launchBehavior === 'issue_review'
@@ -2026,7 +2049,7 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
     || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
     || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)
     || call.status.toLowerCase() !== 'completed'
-    || actions.get(call.action || '') !== call.outcome
+    || actions.get(call.action || '') !== (partialReviewFindings(call) ? 'changes_requested' : call.outcome)
     || !Number.isFinite(Date.parse(call.completed_at || ''))
     || (claim.launchBehavior !== 'issue_review' && call.head_sha !== claim.launchExpectedHead)) {
     quarantineFailedClaim(claim, 'invalid_result',
@@ -2046,7 +2069,7 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
       launch_outcome = ?, launch_action = ?, launch_completed_at = ?, launch_head_sha = ?
     WHERE key = ? AND target = ? AND claim_id = '' AND launch_outcome IS NULL AND launch_error IS NOT NULL
       AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
-  `).run(call.outcome, call.action, call.completed_at, call.head_sha,
+  `).run(partialReviewFindings(call) ? 'changes_requested' : call.outcome, call.action, call.completed_at, call.head_sha,
     claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
   if (settled.changes !== 1) return false
   captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
@@ -2157,7 +2180,7 @@ async function reconcileBehaviorLaunchClaims(
     }
     const completedAt = String(call?.completed_at || '')
     const action = String(call?.action || '')
-    const outcome = String(call?.outcome || '')
+    const outcome = call && partialReviewFindings(call) ? 'changes_requested' : String(call?.outcome || '')
     if (call?.status.toLowerCase() === 'completed'
       && !logQuarantine(snapshot, { id: call.id, correlationId: call.correlation_id }, true)
       && call.behavior === upstreamBehavior(behavior)
@@ -2427,7 +2450,8 @@ async function reconcileBehaviorLaunchClaims(
         ? new Map([['reviewed_clean', 'clean'], ['requested_changes', 'changes_requested']])
         : new Map([['approved', 'approved'], ['requested_changes', 'changes_requested']])
       const action = String(call.action || '')
-      const outcome = String(call.outcome || '')
+      const partialFindings = partialReviewFindings(call)
+      const outcome = partialFindings ? 'changes_requested' : String(call.outcome || '')
       const completedAt = String(call.completed_at || '')
       const headSha = String(call.head_sha || '').toLowerCase()
       if (expectedActions.get(action) !== outcome
@@ -2454,7 +2478,7 @@ async function reconcileBehaviorLaunchClaims(
       if (completed) {
         captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
           state: 'completed', activity: 'settled', stateSource: 'native',
-          outcome: outcome as 'clean' | 'changes_requested' | 'approved', head: headSha, completedAt })
+          outcome: (partialFindings ? 'incomplete' : outcome) as 'clean' | 'changes_requested' | 'approved' | 'incomplete', head: headSha, completedAt })
         if (claim.launchQuarantine === 'unreadable') retireQuarantineIncident(claim)
         dropActiveClaim(claim.claimId)
         clearBehaviorFailure(behavior, claim.target, claim.launchActor)
@@ -3137,6 +3161,10 @@ function settleClaimAfterExit(
           const preflight503 = !call.error_code && /^(?:error: )?GitHub 503\b/.test(call.error)
             && call.action === 'not_started' && call.outcome === 'preflight_failed'
             && row.head_sha == null && row.review_id == null && row.review_comments == null && row.receipts == null
+          const authRejected = call.error_code === 'authentication_failed'
+            && call.action === 'not_started' && call.outcome === 'preflight_failed'
+            && call.diagnostic?.operation === 'provider.review' && call.diagnostic.context.submission === 'none'
+            && row.head_sha == null && row.review_id == null && row.review_comments == null && row.receipts == null
           let retryable503 = false
           if (preflight503) {
             // A single completion cannot prove remaining retry budget. Read
@@ -3159,7 +3187,7 @@ function settleClaimAfterExit(
               && !getMeta(repoHoldKey(claim.launchRepo, claim.launchActor))
               && !getMeta(`${REPO_ACCESS_HOLD_PREFIX}${claim.launchRepo.toLowerCase()}`)
           }
-          if (!timeout && !retryable503) { console.error(message); return }
+          if (!timeout && !retryable503 && !authRejected) { console.error(message); return }
           // Match periodic --diagnostics truncation and its 64 KiB envelope
           // fallback so delayed collection replays exactly.
           let error = typeof row.error === 'string' ? truncateCodePoints(row.error, 8192) : row.error
@@ -3911,7 +3939,10 @@ async function tickReviewNewPrs(): Promise<void> {
         if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
-        const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor)
+        const pwd = await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs',
+          repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: bundle.actor, phase: 'checkout',
+          expectedHead: bundle.expectedHead, progress: { slot, expectedHead: bundle.expectedHead } },
+        () => localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor, false))
         if (behaviorAborted() || !isRunnable('review-new-prs') || !prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
@@ -3930,15 +3961,50 @@ async function tickReviewNewPrs(): Promise<void> {
       } catch (err) {
         // A superseded spawn releases its claim like any other launch
         // failure; the exit settler tolerates the missing claim.
-        releaseOwnedClaim('review-new-prs', target, claimId)
-        releasePrOperationOwned(bundle.operationId)
-        if (behaviorAborted()) return
+        // Neither release may replace the failure below: child reporting
+        // is suppressed, so a throw here would erase the checkout cause
+        // the diagnostic attributes.
+        try {
+          releaseOwnedClaim('review-new-prs', target, claimId)
+        } catch (releaseError) {
+          console.error(`[behaviors] review-new-prs claim release failed for ${pr.repo}#${pr.number}:`, releaseError)
+        }
+        try {
+          releasePrOperationOwned(bundle.operationId)
+        } catch (releaseError) {
+          console.error(`[behaviors] review-new-prs operation release failed for ${pr.repo}#${pr.number}:`, releaseError)
+        }
         // A checkout failure leaves no worker behind its launch intent: the
         // claim above is released and the ledger records the preflight end.
+        // One attributed Error and a next-tick retry on timeout; other
+        // failures keep their backoff. Cancellation records nothing.
         if (!checkoutReady) {
-          captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
-            outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+          let retry: BehaviorFailureState | null = null
+          try {
+            try {
+              if (behaviorAborted()) return
+              if (err instanceof BehaviorLogFeedError) failure ??= err
+              else {
+                const timeout = isTimeoutCause(behaviorErrorMessage(err))
+                recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget,
+                  { actingAccount: bundle.actor, ...(timeout ? { noBackoff: true } : {}) })
+                retry = getBehaviorFailureState('review-new-prs', checkTarget)
+              }
+            } finally {
+              if (!behaviorAborted()) captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled',
+                stateSource: 'native', outcome: 'preflight_failed', head: bundle.expectedHead,
+                completedAt: new Date().toISOString() })
+            }
+          } finally {
+            if (!(err instanceof BehaviorLogFeedError) && !isAbortError(err)) {
+              const context = diagnosticIdentity(err)
+              diagnosticFailure(processFailureEvidence(err)?.operation ?? 'application.behaviors', err,
+                { ...context, ...context?.progress, timeoutMs: 30_000, retry })
+            }
+          }
+          return
         }
+        if (behaviorAborted()) return
         if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
@@ -4192,7 +4258,7 @@ function prReviewRetryState(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call))
   const timeouts = calls.filter((call) => call.model === model && budgetExhaustedProvenNoAction(call)
-    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call) || isLocalInspectionBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
   const stopped = timeouts.length >= 2 || retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
     claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head
@@ -4320,7 +4386,7 @@ function ensureBudgetStopHold(
     && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
     && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call)
     && call.model === model && budgetExhaustedProvenNoAction(call)
-    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call))
+    && (reviewerTripKind(call) === 'budget' || isFileGroupBudgetExhaustion(call) || isLocalInspectionBudgetExhaustion(call))
     && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
     .sort((a, b) => Date.parse(agentCallStartedAt(b)) - Date.parse(agentCallStartedAt(a)))
   const latest = timeouts[0]
@@ -4525,7 +4591,7 @@ async function releaseFailedBehaviorIfNoAction(
       && Date.parse(row.completed_at!) >= Date.parse(agentCallStartedAt(row))
       && !!row.correlation_id && unambiguousAgentCall(snapshot, row)
       && Number.isSafeInteger(row.review_id) && (row.review_id || 0) > 0
-      && (row.action === 'requested_changes' && row.outcome === 'changes_requested'
+      && (row.action === 'requested_changes' && (row.outcome === 'changes_requested' || partialReviewFindings(row))
         || launchBehavior === 'pr_review' && row.action === 'reviewed_clean' && row.outcome === 'clean'
         || launchBehavior === 'pr_approve' && row.action === 'approved' && row.outcome === 'approved'))
       .sort((a, b) => Date.parse(b.completed_at!) - Date.parse(a.completed_at!))
@@ -4538,7 +4604,7 @@ async function releaseFailedBehaviorIfNoAction(
           headSha: failed.launchExpectedHead, callId: replay.id, correlationId: replay.correlation_id!,
           startedAt: agentCallStartedAt(replay), completedAt: replay.completed_at!,
           action: replay.action as 'reviewed_clean' | 'requested_changes' | 'approved',
-          outcome: replay.outcome as 'clean' | 'changes_requested' | 'approved' })) {
+          outcome: (partialReviewFindings(replay) ? 'changes_requested' : replay.outcome) as 'clean' | 'changes_requested' | 'approved' })) {
         captureBehaviorOutcome({ nativeId: failed.launchCorrelationId, callId: call.id,
           state: 'completed', activity: 'settled', stateSource: 'native', outcome: 'adopted',
           head: replay.head_sha, completedAt: replay.completed_at,
@@ -5077,8 +5143,11 @@ function approveCheckFresh(pr: DatastorePr, snapshot: ApproveCheckSnapshot): boo
   }
 }
 
+// A watermark the gate can lose: a commit lost to a power cut only checks the
+// pull request again, so it never waits for the disk on the server's thread
+// (up to 0.8 s on production).
 function recordApproveCheck(pr: DatastorePr, snapshot: ApproveCheckSnapshot): void {
-  setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() }))
+  writeObservation(() => setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() })))
 }
 
 // A dismissed approval that never gets re-selected is invisible without a
@@ -6370,6 +6439,23 @@ function retireClosedQueueAdmissions(open: ReadonlySet<string>): void {
   }
 }
 
+function branchUpdateFailureDiagnostic(error: unknown) {
+  const failure = error as { code?: unknown; signal?: unknown; killed?: unknown; stderr?: unknown } | null
+  // A last-seen stage cannot prove that a killed process never reached the PUT.
+  if (failure?.code !== 1 || failure.signal != null || failure.killed === true || typeof failure.stderr !== 'string') return null
+  const prefix = 'caller_diagnostic: '
+  const line = failure.stderr.trim()
+  if (!line.startsWith(prefix) || Buffer.byteLength(line) > 64 * 1024) return null
+  try {
+    const evidence = parseProcessDiagnostic(JSON.parse(line.slice(prefix.length)))
+    return evidence?.operation === 'update_branch_if_behind'
+      && ['read_pull', 'read_readiness', 'recheck_pull', 'update_branch'].includes(evidence.phase) ? evidence : null
+  } catch {
+    // Unreadable terminal evidence leaves the original process failure unknown.
+    return null
+  }
+}
+
 async function tickMergePrs(): Promise<void> {
   if (!isEnabled('merge-prs')) return
   const author = getMeta('me') || ''
@@ -6566,10 +6652,11 @@ async function tickMergePrs(): Promise<void> {
       source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
       actor, repository: updatePr.repo, number: updatePr.number, head: expectedHead, startedAt: new Date().toISOString() })
     updatePhase = 'command'
-    const { stdout } = await runFile(GH_INTERFACE, [
+    const { stdout } = await withNoticeDiagnosticIdentity({ correlationId: updateRunId, behavior: 'merge-prs',
+      repository: updatePr.repo, target: updateTarget, account: actor, phase: updatePhase, expectedHead }, () => runFile(GH_INTERFACE, [
       '--update-branch-if-behind', `#${updatePr.number}`, '--expected-head', expectedHead,
       '--author', updatePr.author, '--token-user', actor,
-    ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false })
+    ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal(), reportFailure: false }))
     updatePhase = 'validation'
     const result = objectValue(parseJson(stdout, 'github-interface --update-branch-if-behind'), 'update-branch-if-behind')
     if (result.action !== 'update_branch_if_behind' || result.repository !== updatePr.repo
@@ -6590,20 +6677,31 @@ async function tickMergePrs(): Promise<void> {
     }
     clearBehaviorFailure('merge-prs', updateTarget, actor)
   } catch (error) {
+    const evidence = updatePhase === 'command' ? branchUpdateFailureDiagnostic(error) : null
+    const readOnly = evidence?.context.submission === 'none' && evidence.outcome === 'failed'
+      && ['read_pull', 'read_readiness', 'recheck_pull'].includes(evidence.phase)
     let retry: BehaviorFailureState | null = null
+    let safeRetry = false
     try {
       if (updateRunId) {
-        captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
-        updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${update.head ?? 'unknown'} op=update-branch-if-behind error=${behaviorErrorMessage(error)}`
+        updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${update.head ?? 'unknown'} op=update-branch-if-behind phase=${evidence?.phase ?? updatePhase} side_effects=${readOnly ? 'none' : 'uncertain'} error=${behaviorErrorMessage(error)}`
+        captureBehaviorOutcome({ nativeId: updateRunId, state: readOnly ? 'failed' : 'unknown',
+          activity: readOnly ? 'settled' : 'unknown', stateSource: 'native',
+          ...(readOnly ? { outcome: 'read_failed', completedAt: new Date().toISOString() } : {}) })
       }
       if (behaviorAborted()) return
       recordBehaviorFailure('merge-prs', 'operation', error, updateTarget, { actingAccount: actor })
       retry = getBehaviorFailureState('merge-prs', updateTarget)
+      safeRetry = readOnly && retry?.kind === 'operation' && retry.correlationId === updateNativeId
+        && Date.parse(retry.nextRetryAt) > Date.now()
+        && ['rate_limit', 'upstream_unavailable', 'network_interruption'].includes(retry.diagnostic?.code ?? '')
+        && isRunnable('merge-prs') && !behaviorAborted() && stillEligible('merge-prs', updatePr, actor)
     } finally {
       diagnosticFailure('github-interface.update-branch-if-behind', error, {
         behavior: 'merge-prs', repository: updatePr.repo, target: updateTarget, account: actor, correlationId: updateNativeId,
-        primitive: 'update-branch-if-behind', nativeId: updateNativeId, phase: updatePhase, timeoutMs: 30_000, retry,
-      })
+        primitive: 'update-branch-if-behind', nativeId: updateNativeId, phase: evidence?.phase ?? updatePhase,
+        timeoutMs: 30_000, sideEffects: readOnly ? 'none' : 'uncertain', retry, safeRetry,
+      }, { level: safeRetry ? 'warning' : 'error' })
     }
   } finally {
     if (updateRunId) finishDirectBehaviorRun(updateRunId, false, null, updateRunNote ?? undefined)
@@ -6817,7 +6915,10 @@ async function tickRerunGreyCi(): Promise<void> {
   // The scan completed: per-target failures above are recorded individually,
   // and this stamp proves the behavior itself is alive. A stale stamp with no
   // failures is a silent stop, not a quiet queue.
-  setMeta('behavior_rerun_grey_ci_last_success', new Date().toISOString())
+  // What the page shows as the last scan, written by every tick: a commit lost
+  // to a power cut only shows the tick before, so it never waits for the disk
+  // on the server's thread (up to 0.8 s on production).
+  writeObservation(() => setMeta('behavior_rerun_grey_ci_last_success', new Date().toISOString()))
 }
 
 // ── Close old pull requests ────────────────────────────────────────────
@@ -7916,6 +8017,25 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       renewSeenOwned(claim.key, claim.target, claim.claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
       continue
     }
+    if (status === 'superseded'
+      && call.outcome === 'superseded'
+      && call.error_code === 'review_target_closed'
+      && call.action === null
+      && call.head_sha === null
+      && call.receipts == null
+      && Number.isFinite(Date.parse(call.completed_at || ''))
+      && unambiguousAgentCall(snapshot, call)) {
+      // Caller proved seed closure, not a no-publication outcome. Keep
+      // the terminal launch and Caller receipt evidence; do not release
+      // its seen marker or infer that a conflicting worker stopped.
+      if (completeClaimSafely(claim, call.error || 'review target closed')) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'superseded', activity: 'settled', stateSource: 'native',
+          outcome: 'review_target_closed', completedAt: call.completed_at })
+        clearBehaviorFailureKeepHold(ISSUES_KEY, claim.target)
+      }
+      continue
+    }
     const message = `unrecognized agent call status "${status || 'missing'}"`
     if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message, claim.target)
   }
@@ -8249,6 +8369,7 @@ export interface BehaviorChainCapacity {
   status: 'available' | 'unavailable'
   error: string | null
   reservedModelInvocations: number | null
+  retainedModelInvocations: number | null
   modelInvocationLimit: number
   enabled: boolean | null
   mode: 'v1' | 'draining' | 'v2' | null
@@ -8270,7 +8391,7 @@ export function getBehaviorChainCapacity(): BehaviorChainCapacity {
     const admission = readBehaviorResourceAdmission()
     const mode = journal.cutover().mode
     return { status: 'available', error: null, modelInvocationLimit, processLocal,
-      reservedModelInvocations: usage.modelInvocations, mode,
+      reservedModelInvocations: usage.modelInvocations, retainedModelInvocations: usage.retainedModelInvocations, mode,
       enabled: settings.enabled && mode === 'v2' && nativeCleanupSupport().status === 'supported',
       resources: { budget: admission?.budget ?? null,
         reserved: { memoryBytes: usage.reservations.memoryBytes, diskBytes: usage.reservations.diskBytes },
@@ -8278,7 +8399,7 @@ export function getBehaviorChainCapacity(): BehaviorChainCapacity {
       intake: { seedMode: settings.seedMode, label: settings.seedMode === 'label' ? settings.label : null } }
   } catch (error) {
     return { status: 'unavailable', error: error instanceof Error ? error.message : String(error),
-      modelInvocationLimit, processLocal, reservedModelInvocations: null, mode: null, enabled: null, intake: null, resources: null }
+      modelInvocationLimit, processLocal, reservedModelInvocations: null, retainedModelInvocations: null, mode: null, enabled: null, intake: null, resources: null }
   }
 }
 
@@ -8322,7 +8443,7 @@ async function runBehaviorChains(): Promise<void> {
     }
     const operations = nativeChainOperations(org, {
       roster,
-      async resolve(decision, chainKey) {
+      async resolve(decision, chainKey, chain, observation) {
         if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
           const place = decision.behavior === 'review-issue' ? 'issue_review' : 'pr_review'
           const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), place, `${chainKey}:${place}:panel`)
@@ -8342,10 +8463,32 @@ async function runBehaviorChains(): Promise<void> {
         const slots = resolveSlots(catalog, getModelSettings().slots)
         const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
         const ordered = stored === 'random' ? [...MODEL_SLOTS] : MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(selected.slot))
+        const attempts = chain.invocations.filter(invocation => invocation.behavior === 'repair-pr' && invocation.basis === decision.basis
+          && invocation.slot === decision.reviewer?.slot && invocation.admissionSequence > chain.resumedAfterSequence
+          && invocation.evidence?.status !== 'deferred')
+        const exhausted = decision.behavior === 'repair-pr' && attempts.length === 2 && attempts.every(invocation => {
+          const evidence = invocation.evidence
+          const artifact = evidence?.artifact as Record<string, unknown> | null | undefined
+          const argv = invocation.request.argv
+          return invocation.state === 'settled' && !!invocation.callId && invocation.actor === decision.actor
+            && invocation.model === selected.model && invocation.slot === selected.slot
+            && invocation.request.context?.head === observation.pull?.head
+            && invocation.request.context?.reviewRevision === observation.pull?.reviewRevision
+            && argv.includes('--expected-issue-revision') && argv[argv.indexOf('--expected-issue-revision') + 1] === observation.issue.revision
+            && evidence?.status === 'failed' && evidence.action === 'not_started' && evidence.outcome === 'preflight_failed'
+            && evidence.error_code === 'atomic_work_execution_budget_exhausted'
+            && artifact?.phase === 'executing'
+            && [artifact.plan_sha, artifact.publication_head, artifact.replies_started, artifact.publication, artifact.result,
+              artifact.receipts, evidence.receipts, evidence.review_id, evidence.head_sha, evidence.publicationPlan,
+              evidence.publicationResume, evidence.publicationReceipt, evidence.nativeActionReceipt].every(value => value == null)
+            && resourceReleaseProven(evidence, true)
+        })
         const candidates = [selected.model, ...ordered.map((slot) => slots[slot])]
-        const model = candidates.find((identity) => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
+          .filter(identity => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
+        // Spend the existing final attempt on an alternate without changing its retry slot or basis.
+        const model = (exhausted ? candidates.find(identity => identity !== selected.model) : null) ?? candidates[0]
         if (!model || !claimReviewerTripProbe(model)) return null
-        const slot = stored === 'random' ? (MODEL_SLOTS.find((candidate) => slots[candidate] === model) ?? selected.slot) : selected.slot
+        const slot = stored === 'random' && !exhausted ? (MODEL_SLOTS.find((candidate) => slots[candidate] === model) ?? selected.slot) : selected.slot
         return { slot, model, recovery: model }
       },
       async prepare(identities) {
@@ -8486,6 +8629,16 @@ async function runBehaviorChains(): Promise<void> {
       wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
     })
     runtime = new BehaviorChainRuntime(behaviorChainJournal(), { ...operations,
+      implementationAdmission: (chain, observation) => implementationReportAdmission(db, behaviorChainJournal(), chain, observation, async source => {
+        await requireFreshDatastore()
+        return operations.observe(source)
+      }),
+      permitted: (chain, decision) => !repairReportImplementationFence(db, chain, decision.behavior) && operations.permitted(chain, decision),
+      recoverReport: (chain, observation) => recoverReportedRepair(db, behaviorChainJournal(), chain, observation, async target => {
+        await requireFreshDatastore()
+        return operations.observe(target)
+      }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
+        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled, behaviorAbortController?.signal),
       reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {
         await requireFreshDatastore()
         return operations.observe(chain)
@@ -8990,21 +9143,48 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
 export function getBehaviorDiagnosticIncidents(snapshot: AgentLogSnapshot | null) {
   const scoped = () => {
     const failed = BEHAVIOR_KEYS.flatMap((behavior) => failedBehaviorLaunches(behavior))
-    return behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot,
-      [...BEHAVIOR_KEYS.flatMap((behavior) => listBehaviorLaunchClaims(behavior)), ...failed])
-    // A held row shows when its automatic retry runs: the failure clock for
-    // this exact attempt, never a newer attempt's clock on an older row.
+    const launches = [...BEHAVIOR_KEYS.flatMap((behavior) => listBehaviorLaunchClaims(behavior)), ...failed]
+    return behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot, launches)
+    // A failure clock identifies an attempt, but does not authorize its retry.
     .map((incident): typeof incident & { nextRetryAt?: string } => {
       const stopped = incident.error === REVIEW_BUDGET_STOPPED
       const launch = failed.find((claim) => claim.key === incident.behavior && claim.target === incident.target
         && claim.launchCallId === incident.callId && claim.launchCorrelationId === incident.correlationId
         && !claim.launchQuarantine)
       const refusal = launch && getMeta(`${META_PREFIX}review_recovery:${launch.key}:${launch.target}:${launch.launchCallId}:${launch.launchCorrelationId}`)
-      const current = refusal ? { ...incident, error: `${incident.error} ${refusal}` } : incident
+      const unresolved = snapshot?.entries.some((call) => call.id === incident.callId && call.action === null && call.outcome === null)
+        || snapshot?.quarantined.some((call) => call.id === incident.callId)
+      const current = refusal ? { ...incident, error: `${incident.error} ${refusal}` }
+        : launch && unresolved && !stopped && (incident.behavior === 'review-new-prs' || incident.behavior === 'approve-prs')
+          ? { ...incident, error: `${incident.error} Publication disposition unverified for Call ${incident.callId}. Inspect the original Call and reconcile publication before retrying.` } : incident
       if (stopped || !incident.callId
         || !(BEHAVIOR_KEYS as readonly string[]).includes(incident.behavior)) return current
       const failure = readBehaviorFailure(incident.behavior as BehaviorKey, incident.target)
       if (failure?.callId !== incident.callId) return current
+      if (incident.behavior === 'review-new-prs' || incident.behavior === 'approve-prs') {
+        const call = snapshot?.entries.find((row) => row.id === incident.callId)
+        if (!snapshot || !call || !unambiguousAgentCall(snapshot, call)
+          || call.behavior !== upstreamBehavior(incident.behavior)
+          || !incident.repo || incident.pr === null || call.repo !== incident.repo || String(call.pr_id) !== String(incident.pr)
+          || !incident.actor || call.actor?.toLowerCase() !== incident.actor.toLowerCase()
+          || incident.source !== `poise:${incident.behavior}` || call.source !== incident.source
+          || !incident.correlationId || call.correlation_id !== incident.correlationId
+          || !call.expected_head || !SHA_PATTERN.test(call.expected_head) || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase())
+          || call.action !== 'not_started' || call.outcome !== 'preflight_failed'
+          || !postedNothing(call) || call.review_comments != null || refusal
+          || launches.some((claim) => (claim.launchCallId === call.id || claim.launchCorrelationId === call.correlation_id)
+            && (claim.key !== incident.behavior || claim.target !== incident.target
+              || claim.launchQuarantine || claim.launchExpectedHead !== call.expected_head
+              || claim.launchActor.toLowerCase() !== call.actor?.toLowerCase() || claim.launchRepo !== call.repo
+              || String(claim.launchPr) !== String(call.pr_id) || claim.launchBehavior !== call.behavior
+              || claim.launchSource !== call.source || claim.launchCorrelationId !== call.correlation_id
+              || claim.launchCallId !== call.id || !Number.isFinite(Date.parse(claim.launchRequestedAt))
+              || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)))
+          || call.error_code === 'invalid_agent_result' || call.error_code === 'review_packet_too_large'
+          || boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call)
+          || prReviewRetryState(snapshot, incident.behavior, incident.repo, incident.pr, call.expected_head,
+            incident.actor, call.model, incident.target).stopped) return current
+      }
       return { ...current, nextRetryAt: new Date(failure.nextRetryAtMs).toISOString() }
     })
   }
@@ -9100,6 +9280,7 @@ export async function stopBehaviorsRuntime(): Promise<void> {
   behaviorAbortController?.abort()
   behaviorAbortController = null
   await Promise.allSettled([...behaviorOperationTails.values(), ...closedTargetReconciliations.values()])
+  await waitForImplementationRechecks()
   // Detached workers survive Poise itself, but spawn acceptance is not proof
   // of a successful side effect. Leave launched claims with their durable
   // identity so a later runtime reconciles exact log status before retrying;

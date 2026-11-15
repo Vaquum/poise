@@ -37,7 +37,8 @@ def context_sha(pull: dict) -> str:
 
 def response_body(response: dict) -> str:
     value = assessment(response["assessment"])
-    return (f"{value['verdict']}\n\nReviewed context: {value['reviewed_context']}\n\n"
+    coverage = "Coverage: incomplete; required source remains unreviewed.\n\n" if response.get("coverage") == "incomplete" else ""
+    return (f"{coverage}{value['verdict']}\n\nReviewed context: {value['reviewed_context']}\n\n"
             f"Limitations: {value['limitations']}\n\n<!-- poise-review-response "
             + json.dumps(response, ensure_ascii=False, separators=(",", ":")) + " -->")
 
@@ -54,7 +55,8 @@ def parse_body(body: str) -> dict | None:
     return value
 
 
-def submission_response(payload: dict, pull: dict, repo: str, number: int, head: str, actor: str) -> dict:
+def submission_response(payload: dict, pull: dict, repo: str, number: int, head: str, actor: str,
+                        *, require_complete: bool = False) -> dict:
     raw = payload.get("assessment")
     roots = raw.get("verified_fixes", []) if isinstance(raw, dict) else []
     value = assessment({key: item for key, item in raw.items() if key != "verified_fixes"} if isinstance(raw, dict) else raw)
@@ -70,6 +72,8 @@ def submission_response(payload: dict, pull: dict, repo: str, number: int, head:
                 or not isinstance(roots, list) or any(type(root) is not int for root in roots) \
                 or sorted(roots) != sorted(int(root) for root in response.get("verified_fixes", {})):
             raise RuntimeError("retained review response differs from the current PR context")
+        if require_complete and response.get("coverage") != "complete":
+            raise RuntimeError("review_incomplete: required source coverage is not complete; clearance refused")
         return response
     if roots != []:
         raise ValueError("verified fixes require a managed review")
@@ -130,6 +134,7 @@ def qualifying_response(response: object, pull: dict, repo: str, number: int, he
     try:
         assessment(response.get("assessment"))
         return (response.get("repository", "").lower() == repo.lower() and response.get("pull_number") == number
+                and response.get("coverage") == "complete"
                 and response.get("head_sha") == head and response.get("context_sha") == context_sha(pull)
                 and response.get("reviewer", "").lower() == actor.lower()
                 and isinstance(response.get("invocation_id"), str)

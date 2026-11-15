@@ -48,7 +48,7 @@ def test_remediation_review_submission(tmp_path, monkeypatch, model, action, sco
     pull = {"state": "open", "draft": False, "user": {"login": "author"}, "head": {"sha": HEAD},
             "base": {"sha": "b" * 40}, "title": "Repair the report",
             "body": "Closes #99" if scoped else f"Closes #88\n<!-- poise-repair-exhaustion:{'d' * 64} -->\n{SCOPE}"}
-    packet = json.dumps({"repository": "acme/repo", "pull_number": 22, "head_sha": HEAD, "pull": pull,
+    packet = json.dumps({"repository": "acme/repo", "pull_number": 22, "head_sha": HEAD, "pull": pull, "coverage": "complete",
                          "files": [{"filename": "src/main.py"}],
                          "diff": "diff --git a/src/main.py b/src/main.py\n--- a/src/main.py\n+++ b/src/main.py\n@@ -1 +1 @@\n-old\n+new\n"})
     assessment = {"verdict": "The changed state handling was inspected against its consumers." + ("\n\n" + SCOPE) * echoes,

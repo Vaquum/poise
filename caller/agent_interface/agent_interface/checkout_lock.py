@@ -559,8 +559,8 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                     if fd != -1:
                         os.close(fd)
                 _settle(lease, process.pid if process is not None else None, gate_unsettled=gate_unsettled)
-    if lease.retained:
-        raise WorkerOrphaned(lease.retained)
+                if lease.retained:
+                    raise WorkerOrphaned(lease.retained)
     return result
 
 

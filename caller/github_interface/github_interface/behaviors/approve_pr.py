@@ -39,7 +39,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
 
     if "GITHUB_INTERFACE_AUTOMATED_REVIEWS" in os.environ:
         require_owned_reviews(await list_reviews(client, owner, repo, number), actor)
-    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor) \
+    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor, require_complete=True) \
         if payload.get("assessment") or os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") else None
     latest = await get_pull(client, owner, repo, number)
     if (latest.get("head") or {}).get("sha") != required_head \

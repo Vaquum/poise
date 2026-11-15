@@ -94,16 +94,23 @@ check.
 ## Alerts
 
 Each read also records a sign-in alert, which Poise Link shows on the desktop:
-for an installed, configured CLI that says it is not signed in (Codex, today),
-and for your GitHub account or the GitHub automation account while gh does not
-hold it signed in. A provider that was never configured raises no sign-in
-demand, and a stale demand clears once the provider reads as unconfigured.
+for an installed, configured CLI that says it is not signed in, for your
+personal or automation GitHub account when gh cannot sign in as it, and for
+any other saved GitHub account whose credential gh rejects. A timed-out or
+unavailable status check leaves the last observation in place. A provider
+that was never configured raises no sign-in demand.
 An alert comes once and again only after it has cleared, which happens when
 the CLI or the account is signed in again; a CLI that cannot say changes
 nothing. Claude's alert comes from Poise's own Claude sign-in check instead,
 gated on the same participation. In service mode Poise reads the accounts
 every 15 minutes as well, so the alerts come while no browser is open. Each
 one opens the workspace on Settings → Accounts (`/?settings=accounts`).
+
+Google connections raise the same alert when the account record reports an
+expired grant or a token refresh confirms it. OAuth extensions raise a reconnect
+alert when refresh or an authenticated check confirms the connection was lost.
+The extension alert opens Settings → Extensions. Reconnecting or deliberately
+disconnecting clears the alert.
 
 ## The terminal
 

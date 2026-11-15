@@ -277,7 +277,8 @@ export interface PrStatusRow {
   verdict: (PrStatusVerdict & { onCurrentHead: boolean | null }) | null
   ci: { state: string | null, head: string | null, asOf: string | null } | { state: 'unknown', reason: string }
   queue: { state: PrStatusQueueState, entryId: string | null, since: string | null,
-    attribution?: 'accepted-response' | 'observed', invocationId?: string }
+    attribution?: 'accepted-response' | 'observed', invocationId?: string,
+    disposition?: string, integrationBase?: string | null, integrationHead?: string | null }
   blocker: { id: PrBlockerId, line: string, since: string, sinceRestart: boolean, details: string[] }
   flags: { age: boolean, staleBlocker: boolean }
   eligibility: { refusal: string | null, skippedBy: string[] }
@@ -483,7 +484,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       const skippable = phaseKey && (SKIPPABLE_BEHAVIORS as readonly string[]).includes(phaseKey) ? phaseKey as SkippableBehavior : null
       const refusal = skippable && observation?.pull ? scoped(() => pullRequestRefusal(pullRequestPolicy(skippable), chain.repository, pr.number,
         { author: chain.author, status: observation.pull!.state, draft: observation.pull!.draft })) : null
-      const projected = projectChainPrStatus(chain, pr, org, now, chainAdmissionsEnabled, pauses,
+      const projected = projectChainPrStatus(chain, behaviorChainJournal(), pr, org, now, chainAdmissionsEnabled, pauses,
         { refusal, skippedBy: skippable && skips.get(skippable)?.has(pr.repo.toLowerCase()) ? [skippable] : [] },
         behaviorChainJournal().reconciliationAt(chain))
       const tracked = trackBlocker(key, projected.row.blocker.id, projected.key, asOf)

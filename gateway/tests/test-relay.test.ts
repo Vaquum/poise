@@ -64,6 +64,23 @@ describe('the relay agents\' test suites meet at', () => {
     expect((await h.request({ host: workspaceHost('alice'), path: '/api/link/events' })).status).not.toBe(200)
   })
 
+  it('accepts repeated retired-run cleanup only while the owner still has access', async () => {
+    await start()
+    await h.openWorkspace('Alice')
+    h.store.noteWorkspace('alice', 'Alice')
+    const headers = { authorization: `Bearer ${workspaceKey(h.keys.privateKey, 'alice')}` }
+    const created = await h.request({ host: workspaceHost('alice'), path: RUNS, method: 'POST', headers, body: '{"argv":["x"],"cwd":"/","env":{}}' })
+    expect(created.status).toBe(201)
+    const path = `${RUNS}/${created.json<{ id: string }>().id}`
+    for (let repeat = 0; repeat < 2; repeat += 1) {
+      expect((await h.request({ host: workspaceHost('alice'), path, method: 'DELETE', headers })).status).toBe(204)
+    }
+    expect(h.logs.filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
+    h.store.disableUser('alice', 'root')
+    expect((await h.request({ host: workspaceHost('alice'), path, method: 'DELETE', headers })).status).toBe(401)
+    expect(h.logs).toContainEqual(expect.objectContaining({ event: 'test_relay.request.failed', method: 'DELETE', path, status: 401 }))
+  })
+
   it('is not there when unset, and a request gets what any path gets', async () => {
     h = await startHarness()
     const reply = await h.request({ host: workspaceHost('alice'), path: RUNS, ...POST })

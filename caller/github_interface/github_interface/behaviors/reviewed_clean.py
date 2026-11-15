@@ -25,7 +25,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             f"pull-request head changed: expected {required_head}, got {actual_head or 'missing'}"
         )
 
-    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor)
+    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor, require_complete=True)
     review = await comment_review(
         client,
         owner,

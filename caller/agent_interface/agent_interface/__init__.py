@@ -22,6 +22,7 @@ from . import (
     caller_store,
     chat,
     debate,
+    failed_source,
     fix_failing_ci,
     issue_review,
     issue_simplify,
@@ -1464,8 +1465,16 @@ def run_issue_review(
                 fail(issue_review.InvalidReview("the review has no comment for the requested issue"),
                      issue_review.InvalidReview.code)
             try:
-                if expected_issue_revision and issue_review.revision(issue_review._issue(repo, number, actor)) != observed_revision:
-                    fail(ValueError("seed issue changed during review; no comments posted"), "issue_revision_changed", preflight=True)
+                if expected_issue_revision or source.startswith("poise:"):
+                    latest = issue_review._issue(repo, number, actor)
+                    if source.startswith("poise:") and latest["state"] == "closed":
+                        ended_at = finish(id_, "superseded", outcome="superseded", error_code=REVIEW_TARGET_CLOSED_CODE,
+                                          error="seed issue closed during review; no comments posted")
+                        print(json.dumps({**stamp_, "model": name, "completed_at": utc_stamp(ended_at),
+                                          "action": None, "outcome": "superseded", "error_code": REVIEW_TARGET_CLOSED_CODE}, indent=2))
+                        return
+                    if expected_issue_revision and issue_review.revision(latest) != observed_revision:
+                        fail(ValueError("seed issue changed during review; no comments posted"), "issue_revision_changed", preflight=True)
                 if source == "poise:behavior-chain":
                     digest = persist_action_plan(id_, {"kind": "issue_review", "posts": posts, "model": name, "issue_revision": observed_revision})
                     with db() as conn:
@@ -1865,11 +1874,18 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                     failure = retain_native_failure(id_, error, diagnostic=failure)
                     raise
             outcome = result.get("outcome")
-            if outcome not in {"published", "no_changes", "superseded"}:
+            if outcome not in {"published", "no_changes", "superseded", "prerequisite_wait"}:
                 raise RuntimeError("atomic behavior returned no publication outcome")
-            status = "superseded" if outcome == "superseded" else "completed"
-            finish(id_, status, response=json.dumps(result), outcome=outcome, head_sha=result.get("head_sha"),
-                   action=None if outcome == "superseded" else outcome)
+            if outcome == "prerequisite_wait":
+                if pull is not None or artifact.get("phase") != "prerequisite_wait" \
+                        or artifact.get("publication_head") is not None or artifact.get("replies_started") is not None \
+                        or artifact.get("result") is not None or result.get("head_sha") is not None:
+                    raise RuntimeError("prerequisite wait lacks its proven no-write receipt")
+                finish(id_, "completed", response=json.dumps(result), outcome=outcome, head_sha=None, action="not_started")
+            else:
+                status = "superseded" if outcome == "superseded" else "completed"
+                finish(id_, status, response=json.dumps(result), outcome=outcome, head_sha=result.get("head_sha"),
+                       action=None if outcome == "superseded" else outcome)
             print(json.dumps({"id": id_, "behavior": behavior, "actor": actor, "source": source,
                               "correlation_id": correlation_id, "model": spec.identity, "artifact": artifact, **result}))
     except BaseException as error:
@@ -1880,7 +1896,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         with db() as conn:
             row = conn.execute("select error_code from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
-        no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline"}
+        no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline", "prerequisite_wait"}
         finish(id_, "failed", error="Stopped by user" if stopped else failure_message or str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
                action="not_started" if no_publication else None,
@@ -1889,10 +1905,15 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
-        if source == "poise:behavior-chain":
-            resource_ownership.cleanup_remaining(DB, id_)
-        elif not issue_review.cleanup(run_dir):
-            record_cleanup_failure(id_)
+        try:
+            if source == "poise:behavior-chain" and pull is None:
+                failed_source.discard_unless_failed(DB, id_)
+                failed_source.discard_deadline_unless_failed(DB, id_)
+        finally:
+            if source == "poise:behavior-chain":
+                resource_ownership.cleanup_remaining(DB, id_)
+            elif not issue_review.cleanup(run_dir):
+                record_cleanup_failure(id_)
 
 
 def run_issue_simplify(issue: str, pwd: str | None = None, note: str = "", timeout_s: int = 3600):
@@ -2210,8 +2231,9 @@ def run_governed_behavior(
             diagnostic = {**e.diagnostic, "call_id": id_, "correlation_id": correlation_id,
                           "repository": repo, "pr": mod.pr_number(pr), "reviewer": actor, "behavior": behavior,
                           "expected_head": expected_head} if e.diagnostic else None
-            finish(id_, "failed", response=response, error=str(e), error_code=e.code, diagnostic=diagnostic)
-            print(json.dumps({"id": id_, "error": str(e), "error_code": e.code, "diagnostic": diagnostic}))
+            incomplete = {"outcome": "incomplete", "head_sha": expected_head} if e.code == "review_incomplete" else {}
+            finish(id_, "failed", response=response, error=str(e), error_code=e.code, diagnostic=diagnostic, **incomplete)
+            print(json.dumps({"id": id_, "error": str(e), "error_code": e.code, "diagnostic": diagnostic, **incomplete}))
             raise SystemExit(1)
         except atoms.AgentPreflightError as e:
             diagnostic = {**e.diagnostic, "call_id": id_, "correlation_id": correlation_id,
@@ -2626,7 +2648,9 @@ def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: di
     elif state == "APPROVED":
         return {"action": "approved", "outcome": "approved", "head_sha": expected_head}
     if state == "CHANGES_REQUESTED":
-        return {"action": "requested_changes", "outcome": "changes_requested", "head_sha": expected_head}
+        incomplete = receipt is not None and isinstance(receipt.get("review_response"), dict) \
+            and receipt["review_response"].get("coverage") != "complete"
+        return {"action": "requested_changes", "outcome": "incomplete" if incomplete else "changes_requested", "head_sha": expected_head}
     raise RuntimeError("latest review state does not match the terminal behavior action")
 
 
@@ -2991,6 +3015,7 @@ HELP = """usage: agent-interface BEHAVIOR ...
 behaviors:
   --models
   --refresh-models [--families claude,codex]
+  --verify-codex-login MODEL --pwd DIR
   --logs [--status running] [--limit 1..1000] [--cursor CURSOR] [--org OWNER] [--search TEXT]
   --logs --id CALL_ID
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
@@ -3010,6 +3035,7 @@ behaviors:
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--expected-issue-revision SHA256] [--note TEXT]
   --atomic-work OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID --branch BRANCH [--pull-number N --expected-head SHA] [--merge-base] [--expected-issue-revision SHA256] [--note TEXT]
   --read-action-plan CALL_ID
+  --read-failed-source CALL_ID CANDIDATE_SHA256 RUN_ID
   --complete-atomic-publication CALL_ID PLAN_SHA HEAD_SHA
   --author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]
   --debate TOPIC [--rounds N]
@@ -3187,6 +3213,14 @@ def _main():
     if sys.argv[1:] == ["--models"]:
         print(json.dumps({**CATALOG.export(), "policy": review_budget.REVIEW_POLICY}, indent=2))
         return
+    if len(sys.argv) == 5 and sys.argv[1] == "--verify-codex-login" and sys.argv[3] == "--pwd":
+        from .structured_review import verify_codex_login
+        try:
+            code = verify_codex_login(Path(sys.argv[4]), CATALOG.resolve(sys.argv[2]))
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+            print(atoms.bounded_cause(str(error)), file=sys.stderr)
+            code = 1
+        raise SystemExit(code)
     if len(sys.argv) >= 2 and sys.argv[1] == "--refresh-models":
         from . import catalog_refresh
         rest = sys.argv[2:]
@@ -3205,6 +3239,12 @@ def _main():
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--read-action-plan":
         print(json.dumps(read_action_plan(sys.argv[2]), ensure_ascii=False))
+        return
+    if len(sys.argv) == 7 and sys.argv[1] == "--capture-failed-source":
+        failed_source.capture(DB, Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6]))
+        return
+    if len(sys.argv) == 5 and sys.argv[1] == "--read-failed-source":
+        print(json.dumps(failed_source.inspect(DB, *sys.argv[2:])))
         return
     if len(sys.argv) >= 5 and sys.argv[1] == "--complete-atomic-publication":
         import argparse

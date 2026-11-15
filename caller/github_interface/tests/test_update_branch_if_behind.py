@@ -1,7 +1,10 @@
+import json
 from copy import deepcopy
 from io import StringIO
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from github_interface import cli, interface
 from github_interface.behaviors import update_branch_if_behind
@@ -115,6 +118,31 @@ class TestUpdateBranchIfBehind(IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, 'did not update'):
             await update_branch_if_behind.run(self.client, PAYLOAD)
 
+    async def test_timeouts_retain_the_terminal_read_or_possible_put_boundary(self):
+        self.client.token = 'private-credential'
+        for phase in ['read_pull', 'read_readiness', 'recheck_pull', 'update_branch']:
+            with self.subTest(phase=phase):
+                timeout = httpx.ReadTimeout('delayed request: private-credential')
+                self.pulls.side_effect = [timeout] if phase == 'read_pull' else [PULL, timeout if phase == 'recheck_pull' else PULL]
+                self.readiness.side_effect = timeout if phase == 'read_readiness' else None
+                self.readiness.return_value = READY
+                self.client.request.reset_mock()
+                self.client.request.side_effect = timeout if phase == 'update_branch' else None
+                with self.assertRaises(update_branch_if_behind.BranchUpdateError) as caught:
+                    await update_branch_if_behind.run(self.client, PAYLOAD)
+                error = caught.exception
+                self.assertIs(error.__cause__, timeout)
+                self.assertEqual(error.diagnostic['phase'], phase)
+                self.assertEqual(error.diagnostic['submission'], 'uncertain' if phase == 'update_branch' else 'none')
+                self.assertEqual(error.diagnostic['outcome'], 'unknown' if phase == 'update_branch' else 'failed')
+                self.assertIn('httpx.ReadTimeout', error.diagnostic['stderr'])
+                self.assertNotIn('private-credential', str(error))
+                if phase == 'update_branch':
+                    self.client.request.assert_awaited_once_with('PUT', '/repos/acme/app/pulls/7/update-branch',
+                                                                 json={'expected_head_sha': HEAD})
+                else:
+                    self.client.request.assert_not_awaited()
+
     async def test_missing_author_or_head_is_refused(self):
         for key in ['author', 'expected_head']:
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -127,6 +155,18 @@ class TestUpdateBranchIfBehind(IsolatedAsyncioTestCase):
 
 
 class TestUpdateBranchCli(TestCase):
+    def test_cli_emits_terminal_boundary_evidence_with_the_transport_cause(self):
+        error = update_branch_if_behind.BranchUpdateError(httpx.ReadTimeout(''), 'read_readiness')
+        stderr = StringIO()
+        with patch('sys.argv', ['github-interface', '--update-branch-if-behind', '#7', '--expected-head', HEAD,
+                                '--author', 'octocat', '--token-user', 'review-bot']), \
+                patch.object(cli, 'update_branch_if_behind', AsyncMock(side_effect=error)), \
+                patch('sys.stderr', stderr), self.assertRaises(SystemExit) as stopped:
+            cli.main()
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(json.loads(stderr.getvalue().removeprefix('caller_diagnostic: ')), error.diagnostic)
+        self.assertIn('httpx.ReadTimeout', stderr.getvalue())
+
     def test_cli_routes_the_pinned_update_contract(self):
         operation = AsyncMock(return_value={'outcome': 'updated'})
         with patch('sys.argv', ['github-interface', '--update-branch-if-behind', '#7', '--expected-head', HEAD,

@@ -72,15 +72,17 @@ it('lets later workspaces and subsequent Docker passes progress when a source tr
   const h = await startHarness(); await h.openWorkspace('alice'); await h.openWorkspace('bob')
   const directory = mkdtempSync(join(tmpdir(), 'poise-workspace-deadline-'))
   const event = normalize({ id: 'later-workspace', source: 'poise', level: 'error', workspace: 'bob', operation: 'fixture.failure', message: 'later workspace cause' })!
+  const replay = normalize({ id: 'recovered-workspace', source: 'poise', level: 'error', workspace: 'alice', operation: 'fixture.failure', message: 'replayed workspace cause' })!
+  let recovered = false
   const heldResponses = new Set<http.ServerResponse>()
   const server = http.createServer((req, res) => {
-    if (req.headers.host?.startsWith('alice.')) {
+    if (req.headers.host?.startsWith('alice.') && !recovered) {
       heldResponses.add(res)
       res.writeHead(200); res.write(' ')
       const trickle = setInterval(() => res.write(' '), 10)
       // Only the collector deadline can release this source during the proof.
       res.once('close', () => { clearInterval(trickle); heldResponses.delete(res) })
-    } else res.end(JSON.stringify({ version: 1, events: [event], cursor: 'fixture-bob-cursor', coverage: { status: 'connected' } }))
+    } else res.end(JSON.stringify({ version: 1, events: [req.headers.host?.startsWith('alice.') ? replay : event], cursor: 'fixture-recovered-cursor', coverage: { status: 'connected' } }))
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const docker = new DockerClient('/unused-fixture-socket')
@@ -90,12 +92,19 @@ it('lets later workspaces and subsequent Docker passes progress when a source tr
   const runtime = new DiagnosticRuntime({ path: join(directory, 'central.db'), report: () => undefined })
   const collector = new EnvironmentCollectors(runtime, docker, ctx, 120)
   try {
+    runtime.deliver([], 'workspace:alice', 'before-timeout')
     collector.start()
     await vi.waitFor(() => expect(runtime.query((db) => db.lookup({ workspace: 'bob', operator: false }, event.id)).status).toBe('found'), { timeout: 2500 })
     expect(runtime.health().sources.find((row) => row.id === 'workspace:alice')?.error).toContain('absolute deadline')
+    expect(runtime.query(db => db.checkpoint('workspace:alice'))).toBe('before-timeout')
     await vi.waitFor(() => expect(heldResponses.size).toBe(0))
-    await collector.stop(); collector.start()
+    await collector.stop(); recovered = true; collector.start()
     await vi.waitFor(() => expect(discovery.mock.calls.length).toBeGreaterThanOrEqual(2))
+    await vi.waitFor(() => expect(runtime.health().sources.find(row => row.id === 'workspace:alice')).toMatchObject({
+      status: 'partial', currentStatus: 'connected', error: null, gaps: [expect.objectContaining({ to: expect.any(String) })],
+    }))
+    expect(runtime.query(db => db.checkpoint('workspace:alice'))).toBe('fixture-recovered-cursor')
+    expect(runtime.query(db => db.lookup({ workspace: 'alice', operator: false }, replay.id)).status).toBe('found')
   } finally {
     for (const response of heldResponses) response.destroy()
     await collector.stop(); runtime.stop(); ctx.agent.destroy()
@@ -252,8 +261,17 @@ it('preserves recovered upstream history through the production maintenance proj
   const collector = new EnvironmentCollectors(central, docker, context)
   try {
     expect(diagnosticDeliveryPage(source, 'alice', null).coverage).toMatchObject({ status: 'partial', currentStatus: 'connected', historyIncomplete: true })
+    source.partial('caller', 'caller', 'alice', 'Current observation is pending', 'initializing')
+    collector.start()
+    await vi.waitFor(() => expect(central.health().sources.find(row => row.id === 'workspace:alice')).toMatchObject({
+      currentStatus: 'initializing', error: 'Workspace current observation is unestablished',
+    }))
+    await collector.stop()
+    expect(central.query(db => db.checkpoint('workspace:alice'))).not.toBeNull()
+    source.observe('caller', 'caller', 'alice')
     collector.start()
     await vi.waitFor(() => expect(central.health().sources.find((row) => row.id === 'workspace:alice')).toMatchObject({ status: 'partial', currentStatus: 'connected', historyIncomplete: true }))
+    expect(central.health().sources.find(row => row.id === 'workspace:alice')?.error).toBeNull()
     await collector.stop(); central.flush()
     const coverage = central.query((db) => db.readCoverage({ workspace: 'alice', operator: false })).find((row) => row.id === 'workspace:alice')!
     expect(coverage.gaps).toEqual([expect.objectContaining({ to: expect.any(String), reason: 'poise: actual local application capture failure' })])

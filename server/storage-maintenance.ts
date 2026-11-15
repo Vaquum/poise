@@ -11,7 +11,7 @@
 // like a real run without deleting anything.
 
 import { lstat, opendir, readdir, readFile, rm } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, type Stats } from 'node:fs'
 import { statfs } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -203,6 +203,8 @@ export interface MeasureOptions {
   /** Epoch milliseconds the walk may run until; checked before each entry. */
   deadlineMs?: number
   now?: () => number
+  /** Retained only by the shared Settings measurement. */
+  measurement?: DirectoryMeasurement
 }
 
 export interface MeasuredDir {
@@ -210,6 +212,71 @@ export interface MeasuredDir {
   status: StorageCategoryStatus
   entries: number
   error?: string
+}
+
+interface DirectoryMeasurement {
+  bytes: number
+  entries: number
+  complete: boolean
+  cancelled: boolean
+  walk: AsyncGenerator<void> | null
+  error?: string
+}
+
+interface StorageMeasurement {
+  at: string
+  directories: Map<string, DirectoryMeasurement>
+  cancelled: boolean
+}
+
+function directoryMeasurement(): DirectoryMeasurement {
+  return { bytes: 0, entries: 0, complete: false, cancelled: false, walk: null }
+}
+
+/** Retain the open directory cursor, including unread entries in a wide
+ *  directory. Each yield bounds another path examination or directory read.
+ *  A second, bounded stat pass checks every counted descendant; this is a
+ *  live-tree measurement, not an atomic filesystem snapshot. */
+async function* walkMeasuredDir(path: string, top: Stats, measurement: DirectoryMeasurement): AsyncGenerator<void> {
+  const observed = new Map<string, Stats>()
+  const pending: string[] = []
+  const verify = async (current: string, before: Stats) => {
+    const after = await lstat(current)
+    if (before.dev !== after.dev || before.ino !== after.ino || before.mode !== after.mode
+      || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw new Error(`${current}: the storage tree changed during measurement`)
+    }
+  }
+  const record = (current: string, info: Stats) => {
+    observed.set(current, info)
+    measurement.bytes += info.size
+    measurement.entries += 1
+    if (info.isDirectory() && !info.isSymbolicLink()) pending.push(current)
+  }
+  record(path, top)
+  yield
+  while (pending.length) {
+    const current = pending.pop()!
+    await verify(current, observed.get(current)!)
+    const dir = await opendir(current)
+    try {
+      yield
+      let entry = await dir.read()
+      while (entry) {
+        const child = join(current, entry.name)
+        record(child, await lstat(child))
+        yield
+        entry = await dir.read()
+      }
+    } finally {
+      await dir.close()
+    }
+    yield
+  }
+  for (const [current, before] of observed) {
+    await verify(current, before)
+    yield
+  }
 }
 
 /** Logical bytes under a path, following no symlinks, within a shared entry
@@ -226,87 +293,56 @@ export async function measureDir(path: string, options: MeasureOptions = {}): Pr
     if (clock() >= deadlineMs) return 'the storage scan timed out'
     return null
   }
-  let top
-  try {
-    top = await lstat(path)
-  } catch (error) {
-    if (errorCode(error) === 'ENOENT') return { bytes: 0, status: 'ok', entries: 0 }
-    return { bytes: null, status: 'unavailable', entries: 0, error: messageOf(error) }
-  }
-  const beforeStart = expired()
-  if (beforeStart) return { bytes: null, status: 'unavailable', entries: 0, error: beforeStart }
-  if (!top.isDirectory() || top.isSymbolicLink()) {
-    budget.entries += 1
-    return { bytes: top.size, status: 'ok', entries: 1 }
-  }
-  let total = 0
-  let entries = 0
+  const measurement = options.measurement ?? directoryMeasurement()
   let failure: string | null = null
-  const stack: string[] = [path]
-  while (stack.length) {
-    const limit = expired()
-    if (limit) {
-      failure = limit
-      break
-    }
-    const current = stack.pop()!
-    let info
-    try {
-      info = current === path ? top : await lstat(current)
-    } catch (error) {
-      if (errorCode(error) === 'ENOENT') continue
-      failure ??= `${current}: ${messageOf(error)}`
-      continue
-    }
-    entries += 1
-    budget.entries += 1
-    total += info.size
-    if (!info.isDirectory() || info.isSymbolicLink()) continue
-    try {
-      // Read incrementally: one readdir call would load and queue every
-      // child of a wide directory before either budget is checked again.
-      // Queueing past what the entry budget can still visit is pointless,
-      // so the budget gates pushes as well as pops. Manual reads, not
-      // for-await: the iterator closes the handle by itself, which would
-      // make the explicit close below throw.
-      const dir = await opendir(current)
+  try {
+    if (!measurement.walk && !measurement.complete && !measurement.cancelled) {
+      measurement.bytes = 0
+      measurement.entries = 0
+      let top
       try {
-        let sinceCheck = 0
-        let entry = await dir.read()
-        while (entry) {
-          stack.push(join(current, entry.name))
-          sinceCheck += 1
-          if (sinceCheck >= 64) {
-            sinceCheck = 0
-            const limit = expired()
-              ?? (stack.length > budget.maxEntries - budget.entries + 64 ? `the storage scan stopped after ${budget.maxEntries} entries` : null)
-            // Stops reading, not examining: what is already queued is still
-            // measured below, up to the budget.
-            if (limit) {
-              failure = limit
-              break
-            }
-          }
-          entry = await dir.read()
-        }
-      } finally {
-        await dir.close()
+        top = await lstat(path)
+      } catch (error) {
+        if (errorCode(error) !== 'ENOENT') throw error
+        measurement.complete = true
+        measurement.error = undefined
       }
-    } catch (error) {
-      if (errorCode(error) === 'ENOENT') continue
-      failure ??= `${current}: ${messageOf(error)}`
+      if (top && !measurement.cancelled) measurement.walk = walkMeasuredDir(path, top, measurement)
     }
+    while (measurement.walk && !measurement.cancelled) {
+      failure = expired()
+      if (failure) break
+      // Reserve before awaiting so concurrent categories cannot overspend the
+      // shared budget. Validation and directory reads use the same allowance.
+      budget.entries += 1
+      const next = await measurement.walk.next()
+      if (next.done) {
+        measurement.walk = null
+        measurement.complete = true
+        measurement.error = undefined
+      }
+    }
+  } catch (error) {
+    measurement.walk = null
+    measurement.error = `${path}: ${messageOf(error)}`
+  } finally {
+    // A standalone read has no future owner to resume or close its cursor.
+    if (!options.measurement && measurement.walk) await measurement.walk.return(undefined)
   }
-  if (!failure) return { bytes: total, status: 'ok', entries }
+  if (measurement.complete) return { bytes: measurement.bytes, status: 'ok', entries: measurement.entries }
+  const error = measurement.error ?? failure ?? 'the storage measurement was invalidated by maintenance'
   // Only the category root itself was seen: its content is entirely unknown.
-  if (entries <= 1) return { bytes: null, status: 'unavailable', entries, error: failure }
-  return { bytes: total, status: 'partial', entries, error: failure }
+  return {
+    bytes: measurement.entries > 1 ? measurement.bytes : null,
+    status: measurement.entries > 1 ? 'partial' : 'unavailable', entries: measurement.entries, error,
+  }
 }
 
 export interface StorageBreakdownOptions {
   maxEntries?: number
   timeoutMs?: number
   now?: () => number
+  measurement?: StorageMeasurement
 }
 
 function retainedStateDirs(home: string): Array<{ key: string, label: string, path: string }> {
@@ -332,6 +368,7 @@ export async function storageBreakdown(
   const clock = options.now ?? Date.now
   const budget = { entries: 0, maxEntries: options.maxEntries ?? STORAGE_SCAN_MAX_ENTRIES }
   const deadlineMs = clock() + (options.timeoutMs ?? STORAGE_SCAN_TIMEOUT_MS)
+  const at = options.measurement?.at ?? new Date(clock()).toISOString()
   const measured = await Promise.all([
     { key: 'chat-workers', label: 'Chat worker workspaces', path: join(chatRoot, 'workers') },
     { key: 'review-checkouts', label: 'Review checkouts', path: join(root, 'review-checkouts') },
@@ -344,11 +381,17 @@ export async function storageBreakdown(
     { key: 'mirrors', label: 'GitHub mirrors', path: caches.mirrors },
     ...retainedStateDirs(home),
   ].map(async (category) => {
-    const dir = await measureDir(category.path, { budget, deadlineMs, now: clock })
+    let measurement = options.measurement?.directories.get(category.key)
+    if (options.measurement && !measurement) {
+      measurement = directoryMeasurement()
+      measurement.cancelled = options.measurement.cancelled
+      options.measurement.directories.set(category.key, measurement)
+    }
+    const dir = await measureDir(category.path, { budget, deadlineMs, now: clock, measurement })
     return { ...category, bytes: dir.bytes, status: dir.status, error: dir.error }
   }))
   return {
-    at: new Date().toISOString(), categories: measured, disk: { path: home, ...(await diskUsage(home)) },
+    at, categories: measured, disk: { path: home, ...(await diskUsage(home)) },
     complete: measured.every((category) => category.status === 'ok'),
   }
 }
@@ -835,6 +878,13 @@ export async function runStorageMaintenance(options: MaintenanceOptions = {}): P
     storageCache = null
     storageEpoch += 1
     storageInflight = null
+    const abandoned = storageMeasurement
+    storageMeasurement = null
+    if (abandoned) {
+      abandoned.cancelled = true
+      for (const measurement of abandoned.directories.values()) measurement.cancelled = true
+      await Promise.all([...abandoned.directories.values()].map((measurement) => measurement.walk?.return(undefined)))
+    }
   }
   if (!dryRun) {
     try {
@@ -876,7 +926,7 @@ export function lastMaintenanceRun(): MaintenanceReport | null {
 export interface StorageStatus extends StorageBreakdown {
   pressure: boolean
   lastRun: MaintenanceReport | null
-  /** True when this is the previous observation, served because a refresh failed. */
+  /** True when refresh failed or maintenance overtook this observation. */
   stale: boolean
   /** Why a stale observation could not be refreshed. */
   error?: string
@@ -887,7 +937,7 @@ export interface StorageStatusOptions {
   fresh?: boolean
   now?: number
   /** Injectable scan; production measures the real trees. */
-  breakdown?: () => Promise<StorageBreakdown>
+  breakdown?: (options: StorageBreakdownOptions) => Promise<StorageBreakdown>
 }
 
 /** The Settings and diagnostics payload: breakdown, disk, pressure, last run.
@@ -896,23 +946,32 @@ export interface StorageStatusOptions {
  *  opens until STORAGE_STATUS_TTL_MS passes. A refresh that fails serves the
  *  previous observation marked stale; only a failure with nothing cached
  *  throws. A maintenance run drops the in-flight scan, so reads issued after
- *  it re-measure; the dropped scan answers its own waiters without
- *  repopulating the cache. */
+ *  it re-measure; the dropped scan answers its own waiters as stale without
+ *  repopulating the cache. Fresh reads and cache expiry resume an unfinished
+ *  measurement, preserving the age of its earliest totals. */
 export async function storageStatus(options: StorageStatusOptions = {}): Promise<StorageStatus> {
   const now = options.now ?? Date.now()
   if (!options.fresh && storageCache && now - storageCache.at < STORAGE_STATUS_TTL_MS) return storageCache.status
   if (!storageInflight) {
     const epoch = storageEpoch
+    const measurement = storageMeasurement ??= { at: new Date(now).toISOString(), directories: new Map(), cancelled: false }
     const scan = (async (): Promise<StorageStatus> => {
       try {
-        const breakdown = await (options.breakdown ?? storageBreakdown)()
+        const breakdown = await (options.breakdown
+          ? options.breakdown({ measurement })
+          : storageBreakdown(undefined, undefined, undefined, { measurement }))
+        const invalidated = epoch !== storageEpoch
         const status: StorageStatus = {
           ...breakdown, pressure: breakdown.disk.usedPercent >= PRESSURE_USED_PCT,
-          lastRun: lastMaintenanceRun(), stale: false, error: undefined,
+          lastRun: lastMaintenanceRun(), complete: breakdown.complete && !invalidated, stale: invalidated,
+          error: invalidated ? 'the storage measurement was invalidated by maintenance' : undefined,
         }
         // A maintenance run that finished mid-scan invalidated the cache; its
         // sizes are stale, so this observation answers its own waiters only.
-        if (epoch === storageEpoch) storageCache = { at: now, status }
+        if (!invalidated) {
+          storageCache = { at: now, status }
+          if (breakdown.complete) storageMeasurement = null
+        }
         return status
       } catch (error) {
         if (storageCache) {
@@ -936,6 +995,7 @@ let lastPressureRun = 0
 let storageCache: { at: number, status: StorageStatus } | null = null
 let storageInflight: Promise<StorageStatus> | null = null
 let storageEpoch = 0
+let storageMeasurement: StorageMeasurement | null = null
 
 /** One pass unless one is already running, in which case the running report. */
 export function runStorageMaintenanceOnce(options: MaintenanceOptions = {}): Promise<MaintenanceReport> {

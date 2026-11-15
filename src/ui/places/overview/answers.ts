@@ -20,7 +20,7 @@ import { paintTerms } from '../../reference'
 import { lifeHTML, toast, type Stage } from '../../shell'
 import type { PrStatus } from '../board/model'
 import {
-  decisionEntries, foldWaiting, itemEntries, keepEntries, KEPT_DISMISSALS, openDecision, ordered, prStatusesFrom, requestEntries, requestsFrom, restoreEntries, threadEntries, undismissed,
+  decisionEntries, itemEntries, keepEntries, KEPT_DISMISSALS, openDecision, ordered, prStatusesFrom, requestEntries, requestsFrom, restoreEntries, threadEntries, undismissed,
   type DecisionItem, type Entry, type Publication, type RequestsRead, type Role, type ThreadReview,
 } from './entries'
 import { answersChanged, GROUPS, LEVELS, readLevel, saveLevel, setAnswerGroups, shownAt, tally, type Group } from './level'
@@ -34,7 +34,7 @@ export const HOLD_MS = 8000
  *  paints it at once, calm and unanswerable, and each source's fresh read
  *  replaces its own entries. It stands only for the GitHub user and the
  *  organizations configured, each with its status, it was read under. */
-export const LAST_ANSWERS_KEY = 'poise-overview-answers'
+export const LAST_ANSWERS_KEY = 'poise-overview-answers-v2'
 /** A kept read is written a moment after what is drawn settles, and again at most this often when nothing changed. */
 const KEEP_AFTER_MS = 2_000
 const KEEP_AGAIN_MS = 60_000
@@ -136,12 +136,12 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const notices = feed.notices.filter((notice) => feed.enabled || (LOCAL_NOTICE_KINDS as readonly string[]).includes(notice.kind))
     const items = notificationItems(notices, getBehaviorDiagnostics(), Date.now(), attention)
     const reviewed = (reviews.data ?? []).flatMap((publication) => threadEntries(publication, threads.get(publication.slug)?.reviews ?? [], editorHref))
-    const read = ordered(undismissed(foldWaiting([
+    const read = ordered(undismissed([
       ...itemEntries(items, options.role, chains, prs.data ?? new Map(), Date.now()),
       ...requestEntries(requests.data?.requests ?? [], options.role),
       ...decisionEntries(board.data ?? [], options.role),
       ...reviewed,
-    ]), dismissals.data ?? new Map()))
+    ], dismissals.data ?? new Map()))
     if (!remembered.length) return read
     // A source not yet read afresh in this page shows what it had last time; once every one has, the last read is gone.
     const unreadSources = (Object.keys(readAfresh) as Entry['source'][]).filter((source) => !readAfresh[source]())
@@ -173,7 +173,6 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   // ---------- Why a request can no longer be answered here ----------
   function unavailable(entry: Entry): string {
     if (entry.source === 'request' && chatClient.connectionState() !== 'open') return 'The connection to Poise dropped. Answers wait until it is back; nothing is sent meanwhile.'
-    if (entry.decision && board.data?.find((item) => item.id === entry.decision!.id)?.source.exists === false) return 'The chat that asked no longer exists, so it can no longer be answered.'
     return ''
   }
   function goneWords(entry: Entry): string {
@@ -182,6 +181,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       const item = board.data?.find((value) => `decision:${value.id}` === entry.id)
       if (item?.answer) return `Answered elsewhere: “${item.answer.label}”, at ${clockAt(item.answer.at)}. These choices no longer apply.`
       if (item?.resolved) return `Settled in its chat at ${clockAt(item.resolved.at)}: ${item.resolved.reason}`
+      if (item?.source.exists === false) return 'The chat that asked no longer exists.'
       return 'No longer open in the Switchboard.'
     }
     if (entry.source === 'thread') return 'Resolved elsewhere, or no longer open on GitHub.'
@@ -286,7 +286,6 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       entry.silenceable && !busy && acting ? ib(icon('mute', 'sm'), 'Silence reminders', 'data-act="silence" data-ref="ov.silence"') : '',
       entry.dismissable && !busy && acting ? ib(icon('cross', 'sm'), 'Dismiss', `data-act="dismiss" data-ref="ov.dismiss" data-words="${esc(entry.dismissWords)}"`) : '',
     ].join('')
-    const ref = entry.notice?.kind === 'worker_idle' ? 'ov.idle' : 'ov.notice'
     const titleId = `nt-${slug(entry.id)}`
     const title = entry.open && !p?.settled
       ? `<a class="card-title" id="${titleId}" href="${esc(entry.open.href)}"${entry.open.external ? ' target="_blank" rel="noopener"' : ''} data-act="open">${esc(entry.title)}</a>`
@@ -294,7 +293,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     const edge = p?.settled || gone ? 'done' : EDGE[entry.group]
     // Its title and line are cut short only where More shows them whole, and never on a question you answer here.
     const clamped = !!more && !isOpenDetail && !(entry.options.length || entry.freeText || entry.questions)
-    return `<article class="card nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}${clamped ? ' is-clamped' : ''}${entry.remembered ? ' is-remembered' : ''}" data-state="${edge}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="${ref}" tabindex="0" aria-labelledby="${titleId}">
+    return `<article class="card nc is-${entry.group}${p?.settled ? ' is-answered' : ''}${fresh.has(entry.id) ? ' is-fresh' : ''}${gone ? ' is-gone' : ''}${clamped ? ' is-clamped' : ''}${entry.remembered ? ' is-remembered' : ''}" data-state="${edge}" data-key="e:${esc(entry.id)}"${ringed === entry.id ? ' data-focus-ring' : ''} data-notice="${esc(entry.id)}" data-ref="ov.notice" tabindex="0" aria-labelledby="${titleId}">
       <h3 class="nc-t">${title}</h3>
       ${entry.detail ? `<p class="nc-d">${esc(entry.detail)}</p>` : ''}
       ${closed && !p?.settled ? `<p class="nc-gone" data-ref="ov.gone">${esc(closed)}</p>` : ''}
@@ -317,7 +316,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   function coverage(): string {
     const lines = [
       readLine('Your chats’ requests', requests),
-      requests.data && !requests.data.complete ? 'Only the newest 200 chat requests are listed; open Chat for the rest.' : '',
+      requests.data && !requests.data.complete ? 'The first 200 chat requests were read, with owner requests first. Open Chat for the rest.' : '',
       readLine('The Switchboard’s decisions', board),
       readLine('Review threads', reviews),
       readLine('Pull requests’ status', prs),
@@ -533,11 +532,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
         await json('/api/behavior-chains', { method: 'POST', body: JSON.stringify({ id: entry.chain.id, sequence: entry.chain.sequence, operation: 'resume' }) })
         settle(entry, label, 'Resumed: the chain proceeds under its own gates')
         options.chainsChanged()
-      } else if (entry.pull && (key === 'merge' || key === 'approve')) {
-        await pullAction(entry, key, label)
-      } else if (entry.pull && key === 'review') {
-        await json('/api/pr-review', { method: 'POST', body: JSON.stringify({ url: entry.pull.url }) })
-        settle(entry, label, 'Started: the review runs in Observe → Behaviors')
+      } else if (entry.pull && key === 'approve') {
+        await approvePull(entry, label)
       } else {
         throw new Error('This answer is not available here.')
       }
@@ -548,35 +544,32 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     }
   }
 
-  // Approve and Merge act as you, on the head Poise read, under one actionId
+  // Approval acts as you, on the head Poise read, under one actionId
   // that a repeat reuses: the service reconciles and never acts twice.
-  async function pullAction(entry: Entry, kind: 'merge' | 'approve', label: string): Promise<void> {
+  async function approvePull(entry: Entry, label: string): Promise<void> {
     const pull = entry.pull!
-    const actionKey = `${kind}:${pull.repo}#${pull.number}`
+    const actionKey = `${pull.repo}#${pull.number}`
     setProgress(entry.id, { stage: 'Accepted', label, words: 'reading its head commit', at: Date.now() })
     const read = await json<{ held?: { repo: string, number: number, head: string | null }[] }>('/api/gh', { method: 'POST', body: JSON.stringify({ operation: 'green_pr' }) })
     const head = read.held?.find((row) => row.repo.toLowerCase() === pull.repo.toLowerCase() && row.number === pull.number)?.head
     if (!head) throw new Error('Poise could not read this pull request’s head commit, so nothing was sent. Open it on GitHub.')
     const actionId = actionIds.get(actionKey) ?? uid()
     actionIds.set(actionKey, actionId)
-    setProgress(entry.id, { stage: 'Executing', label, words: kind === 'merge' ? 'merging, as you' : 'approving, as you', at: Date.now() })
-    const response = await fetch(`/api/pull-requests/${kind}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ repo: pull.repo, number: pull.number, expectedHeadSha: head, actionId }) })
+    setProgress(entry.id, { stage: 'Executing', label, words: 'approving, as you', at: Date.now() })
+    const response = await fetch('/api/pull-requests/approve', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ repo: pull.repo, number: pull.number, expectedHeadSha: head, actionId }) })
     const body = await response.json().catch(() => null) as Record<string, any> | null
     const outcome = String(body?.outcome ?? '')
     const short = (sha: unknown) => typeof sha === 'string' ? sha.slice(0, 7) : 'unknown'
     if (outcome === 'unknown') {
-      setProgress(entry.id, { stage: 'Failed', label, words: `Not confirmed: GitHub ${body?.github?.merged ? 'reports it merged' : 'did not say whether it acted'}. Pressing again checks under the same action and never acts twice.`, at: Date.now() })
+      setProgress(entry.id, { stage: 'Failed', label, words: 'Not confirmed: GitHub did not confirm the approval. Pressing again checks under the same action and never acts twice.', at: Date.now() })
       return
     }
     actionIds.delete(actionKey)
     const words: Record<string, string> = {
       approved: `Approved as ${body?.actor ?? 'you'}`, already_approved: `Already approved as ${body?.actor ?? 'you'}`,
-      merged: `Merged${body?.mergeMethod ? ` (${body.mergeMethod})` : ''}`, enqueued: 'In the merge queue', in_queue: 'Already in the merge queue',
-      already_merged: `Already merged${body?.mergedBy ? ` by ${body.mergedBy}` : ''}`,
     }
     if (response.ok && words[outcome]) { settle(entry, label, words[outcome]); return }
-    if (outcome === 'superseded') throw new Error(`New commits arrived: its head moved from ${short(body?.expectedHead)} to ${short(body?.actualHead)}, so nothing was merged.`)
-    if (outcome === 'not_ready') throw new Error('GitHub says it is not ready to merge yet; nothing was merged.')
+    if (outcome === 'superseded') throw new Error(`New commits arrived: its head moved from ${short(body?.expectedHead)} to ${short(body?.actualHead)}. Review the current head before approving.`)
     throw new ServiceError(typeof body?.error === 'string' ? body.error : `HTTP ${response.status}`, response.status, body)
   }
 
@@ -605,7 +598,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   function forgetCleared(): void {
     if (!dismissals.data || !isBehaviorStateLoaded() || !getBehaviorDiagnostics()) return
     const listed = new Set(current.filter((entry) => entry.source === 'diagnostic').map((entry) => entry.id))
-    const hidden = new Set(foldWaiting(itemEntries(notificationItems([], getBehaviorDiagnostics(), Date.now(), []), options.role, chains)).map((entry) => entry.id))
+    const hidden = new Set(itemEntries(notificationItems([], getBehaviorDiagnostics(), Date.now(), []), options.role, chains).map((entry) => entry.id))
     const keys = [...dismissals.data.keys()].filter((key) => key.startsWith('diagnostic:') && !listed.has(key) && !hidden.has(key) && !forgetting.has(key)).slice(0, 200)
     if (!keys.length) return
     // Gone from its source, it leaves this tab's settled list too, so a recurrence shows.

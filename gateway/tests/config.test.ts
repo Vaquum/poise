@@ -135,6 +135,11 @@ describe('configuration', () => {
     expect(problems({ ...BASE, POISE_TEST_RENDER_API_KEY: 'k' })).toContain(together)
     expect(problems({ ...BASE, POISE_TEST_WORKSPACE: 'tea-x' })).toContain(together)
     expect(problems({ ...BASE, ...pair, POISE_TEST_LIMIT_SECONDS: 'soon' })).toContainEqual(expect.stringContaining('POISE_TEST_LIMIT_SECONDS'))
+    for (const value of ['0', '-1', '1.5', '3541', String(Number.MAX_SAFE_INTEGER)]) {
+      expect(problems({ ...BASE, ...pair, POISE_TEST_LIMIT_SECONDS: value }))
+        .toContainEqual(expect.stringContaining('POISE_TEST_LIMIT_SECONDS must be a whole number from 1 to 3540'))
+    }
+    expect(loadConfig({ ...BASE, ...pair, POISE_TEST_LIMIT_SECONDS: '3540' }).testRelay?.limitSeconds).toBe(3540)
   })
 
   it('starts suites on a job of the base service when one is named, which needs the sandbox settings for a suite that wants Docker', () => {

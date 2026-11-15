@@ -385,6 +385,7 @@ test('answers a permission with the keyboard and a question with its options', a
   sock.push('s1', { type: 'permission.requested', id: 'p1', turnId: 't1', title: 'Run npm test', description: 'Execute a command', input: { command: 'npm test' },
     options: [{ id: 'once', name: 'Allow once', kind: 'allow_once' }, { id: 'always', name: 'Allow for this session', kind: 'allow_always' }, { id: 'no', name: 'Reject', kind: 'reject_once' }] })
   sock.push('s1', { type: 'status.changed', status: 'waiting' })
+  sock.ws!.send(JSON.stringify({ kind: 'session.updated', session: session({ status: 'waiting', pendingRequests: ['p1'], ownerRequests: ['p1'], lastSeq: sock.seq }) }))
   const card = page.locator('.chat-permission')
   await expect(card).toHaveClass(/pending/)
   await expect(card.locator('.chat-card-btn')).toHaveText(['1Allow once', '2Allow for this session', '3Reject'])
@@ -678,8 +679,8 @@ test('renders an unanswered permission from history after a reload, and an inter
   await expect.poll(() => sock.framesOf('subscribe').map((f) => f.command)).toContainEqual({ type: 'subscribe', sessionId: 's1', afterSeq: 2 })
   await page.locator('.chat-session-item[data-id="s2"]').click()
   await expect(page.locator('.chat-turn-footer')).toHaveText('Interrupted')
-  await expect(page.locator('.chat-h-status')).toHaveText('Needs you · Interrupted: Resume continues')
-  await expect(page.locator('.chat-h-status')).toHaveCSS('color', 'rgb(168, 121, 43)')
+  await expect(page.locator('.chat-h-status')).toHaveText('Blocked · Interrupted: Resume continues')
+  await expect(page.locator('.chat-h-status')).toHaveAttribute('data-state', 'blocked')
   await expect(input(page)).toBeEnabled() // /reset can recover without the old native log.
   await expect(page.locator('.chat-send')).toBeDisabled()
   await input(page).fill('Do not submit until resumed'); await input(page).press('Enter')

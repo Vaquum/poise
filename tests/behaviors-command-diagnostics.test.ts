@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { CheckSemaphore } from '../server/check-semaphore'
@@ -75,6 +75,13 @@ async function start(primitive = RESOLVE, script = "setInterval(() => {}, 1000)"
 
 function failureScript(stderr: string): string {
   return `process.stdout.write('private-output'); process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = 1`
+}
+
+function branchUpdateDiagnostic(phase: string, submission = phase === 'update_branch' ? 'uncertain' : 'none') {
+  const message = `${phase}: httpx.ReadTimeout: delayed request timed out`
+  return 'caller_diagnostic: ' + JSON.stringify({ version: 1, source: 'caller', severity: 'error',
+    operation: 'update_branch_if_behind', phase, outcome: phase === 'update_branch' ? 'unknown' : 'failed',
+    submission, message, stderr: message, stderr_truncated: false })
 }
 
 function events() {
@@ -297,6 +304,100 @@ it.each(['merge-if-ready', 'update-branch-if-behind'])('persists one policy refu
     .toMatchObject({ status: 'failed', note: expect.stringContaining(`op=${primitive}`) })
 })
 
+it.each(['read_pull', 'read_readiness', 'recheck_pull', 'update_branch'])('attributes a terminal branch-update timeout at %s to its retry and ledger attempt', async (phase) => {
+  const stderr = branchUpdateDiagnostic(phase)
+  const { database, behaviors } = await start('update-branch-if-behind', failureScript(stderr))
+  await behaviors.runEnabledBehaviorsOnce()
+  const admission = mocks.captureAdmission.mock.calls[0]![0]
+  const retry = behaviors.getBehaviorFailureState('merge-prs', TARGET)!
+  const readOnly = phase !== 'update_branch'
+  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: admission.nativeId,
+    error: expect.stringContaining(phase), diagnostic: { code: 'network_interruption' } })
+  expect(Date.parse(retry.nextRetryAt) - Date.parse(retry.lastFailureAt)).toBe(60_000)
+  expect(events()).toEqual([expect.objectContaining({
+    operation: 'github-interface.update-branch-if-behind', severity: readOnly ? 'warning' : 'error', phase,
+    target: TARGET, correlationId: admission.nativeId, exitCode: 1, signal: null, stderr,
+    context: expect.objectContaining({ nativeId: admission.nativeId, retry, safeRetry: readOnly,
+      sideEffects: readOnly ? 'none' : 'uncertain' }),
+  })])
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ nativeId: admission.nativeId,
+    state: readOnly ? 'failed' : 'unknown', activity: readOnly ? 'settled' : 'unknown',
+    ...(readOnly ? { outcome: 'read_failed', completedAt: expect.any(String) } : {}),
+  }))
+  const previousRun = database.db.prepare('SELECT status, note FROM behavior_runs WHERE id = ?').get(admission.nativeId)
+  expect(previousRun).toMatchObject({ status: 'failed', note: expect.stringContaining(`phase=${phase}`) })
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(mocks.captureAdmission).toHaveBeenCalledTimes(1)
+
+  const original = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation((command: string, args: string[], options: RunFileOptions) => {
+    if (command === 'github-interface' && args[0] === '--update-branch-if-behind') {
+      expect(args).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA, '--token-user', 'review-bot']))
+      return Promise.resolve({ stdout: JSON.stringify({ action: 'update_branch_if_behind', repository: pr.repo,
+        pull_number: pr.number, head_sha: HEAD_SHA, outcome: 'updated' }), stderr: '' })
+    }
+    return original(command, args, options)
+  })
+  const key = `behavior_merge_prs_failure:${TARGET}`
+  database.setMeta(key, JSON.stringify({ ...JSON.parse(database.getMeta(key)!), nextRetryAtMs: 1 }))
+  await behaviors.runEnabledBehaviorsOnce()
+  const successor = mocks.captureAdmission.mock.calls[1]![0]
+  expect(successor.nativeId).not.toBe(admission.nativeId)
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ nativeId: successor.nativeId,
+    state: 'completed', activity: 'settled', outcome: 'updated' }))
+  expect(mocks.captureOutcome.mock.calls.filter(([value]) => value.nativeId === admission.nativeId)).toHaveLength(1)
+  expect(database.db.prepare('SELECT status, note FROM behavior_runs WHERE id = ?').get(admission.nativeId)).toEqual(previousRun)
+  expect(behaviors.getBehaviorFailureState('merge-prs', TARGET)).toBeNull()
+  expect(events()).toHaveLength(1)
+})
+
+it.each(['retry persistence', 'ledger bookkeeping', 'cancellation', 'disabled'])('retains a read-only branch-update Error after %s', async (blocker) => {
+  const stderr = branchUpdateDiagnostic('read_readiness')
+  const { database, behaviors } = await start('update-branch-if-behind', failureScript(stderr))
+  let stopping: Promise<void> | undefined
+  if (blocker === 'retry persistence') {
+    const setMeta = database.setMeta
+    vi.spyOn(database, 'setMeta').mockImplementation((key, value) => {
+      if (key === `behavior_merge_prs_failure:${TARGET}`) throw new Error('retry bookkeeping failed')
+      return setMeta(key, value)
+    })
+  } else if (blocker === 'ledger bookkeeping') {
+    mocks.captureOutcome.mockImplementationOnce(() => { throw new Error('ledger bookkeeping failed') })
+  } else {
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
+      try { return await original(command, args, options) }
+      catch (error) {
+        if (args[0] === '--update-branch-if-behind') {
+          if (blocker === 'cancellation') stopping = behaviors.stopBehaviorsRuntime()
+          else database.setMeta('behavior_merge_prs_enabled', '0')
+        }
+        throw error
+      }
+    })
+  }
+  await behaviors.runEnabledBehaviorsOnce()
+  await stopping
+  const recorded = events()
+  expect(recorded.filter((event) => event.operation === 'github-interface.update-branch-if-behind')).toEqual([
+    expect.objectContaining({ severity: 'error', phase: 'read_readiness', exitCode: 1, stderr,
+      context: expect.objectContaining({ safeRetry: false, retry: null, sideEffects: 'none' }) }),
+  ])
+  if (blocker.includes('bookkeeping') || blocker === 'retry persistence') {
+    expect(recorded.some((event) => event.message === (blocker === 'retry persistence' ? 'retry' : 'ledger') + ' bookkeeping failed')).toBe(true)
+  }
+  expect(behaviors.getBehaviorFailureState('merge-prs', TARGET)).toBeNull()
+})
+
+it.each(['uncertain', 'missing', 'malformed'])('requires valid terminal no-PUT proof for a read-stage Warning (%s)', async (proof) => {
+  const stderr = proof === 'malformed' ? 'caller_diagnostic: {' : branchUpdateDiagnostic('read_pull', proof)
+  const { behaviors } = await start('update-branch-if-behind', failureScript(stderr))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(events()).toEqual([expect.objectContaining({ severity: 'error', exitCode: 1, stderr,
+    context: expect.objectContaining({ safeRetry: false, sideEffects: 'uncertain' }) })])
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ state: 'unknown', activity: 'unknown' }))
+})
+
 it('keeps a killed branch-update process unknown despite read-stage output', async () => {
   const script = `process.stdout.write(JSON.stringify({ phase: 'read' })); setInterval(() => {}, 1000)`
   const { database, behaviors } = await start('update-branch-if-behind', script, true)
@@ -305,7 +406,7 @@ it('keeps a killed branch-update process unknown despite read-stage output', asy
   await expect(mocks.runFile.mock.results[commandIndex]!.value).rejects.toMatchObject({ stdout: JSON.stringify({ phase: 'read' }), stderr: '' })
   const admission = mocks.captureAdmission.mock.calls[0]![0]
   const retry = behaviors.getBehaviorFailureState('merge-prs', TARGET)!
-  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1 })
+  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: admission.nativeId })
   expect(Date.parse(retry.nextRetryAt) - Date.parse(retry.lastFailureAt)).toBe(60_000)
   expect(events()).toEqual([expect.objectContaining({
     operation: 'github-interface.update-branch-if-behind', behavior: 'merge-prs', severity: 'error',
@@ -563,4 +664,152 @@ it.each([
   expect(launches().filter((args) => args.includes('#17'))).toHaveLength(3)
   expect(launches().filter((args) => args.includes('#18'))).toHaveLength(3)
   expect(behaviors.getBehaviorFailureState('review-new-prs', checkTarget)).toBeNull()
+})
+
+it('defers a stalled review checkout with one Error and launches the same head on retry', async () => {
+  arrangeCli(false)
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const { database, behaviors } = await loadModules()
+  database.setMeta('me', 'poise-user')
+  database.setMeta('behavior_review_new_prs_keyver', '3')
+  database.setMeta('behavior_review_new_prs_enabled', '1')
+  database.recordSeen('review-new-prs', '__snapshot_v3__')
+  behaviors.startBehaviorsRuntime()
+  vi.stubEnv('CALLER_BIN_ROOT', fixture.tempRoot)
+  writeFileSync(join(fixture.tempRoot, 'github-interface'), `#!${process.execPath}
+process.stdout.write('private-output')
+process.stderr.write('delayed checkout\\nAuthorization: Bearer [REDACTED]\\n')
+setInterval(() => {}, 1000)
+`, { mode: 0o700 })
+  const original = mocks.runFile.getMockImplementation()!
+  let failing = true
+  mocks.runFile.mockImplementation((command: string, args: string[], options: RunFileOptions) => {
+    if (command === 'agent-interface' && args[0] === '--diagnostics') return Promise.resolve({
+      stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+    })
+    if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+      const error = Object.assign(new Error('Command failed (1): github-interface'),
+        { code: 1, killed: false, signal: null, stdout: '',
+          stderr: `error: checkout not found under /fake/dev: ${args[1]}/${args[2]}\n` })
+      return Promise.reject(error)
+    }
+    if (failing && command === 'github-interface' && args[0] === '--checkout-repo') {
+      expect(options.timeoutMs).toBe(30_000)
+      return mocks.realRunFile!(command, args, { ...options, timeoutMs: 500 })
+    }
+    if (command === 'github-interface' && args[0] === '--checkout-repo') {
+      mkdirSync(args[3]!, { recursive: true })
+      return Promise.resolve({ stdout: JSON.stringify({ action: 'checkout_repo', repository: pr.repo, path: args[3] }), stderr: '' })
+    }
+    if (command === 'git') return Promise.resolve({
+      stdout: args[0] === 'remote' ? `https://github.com/${pr.repo}.git` : args[0] === 'rev-parse' ? HEAD_SHA : '', stderr: '',
+    })
+    return original(command, args, options)
+  })
+  logging = await import('../server/logging')
+  vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+  logging.startLogging()
+  const checkoutPath = join(fixture.tempRoot, 'review-checkouts', HEAD_SHA, pr.repo.toLowerCase())
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await behaviors.runEnabledBehaviorsOnce()
+    const retry = behaviors.getBehaviorFailureState('review-new-prs', CHECK)!
+    const recorded = events()
+    expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: expect.any(String) })
+    expect(Date.parse(retry.nextRetryAt)).toBeLessThanOrEqual(Date.now())
+    expect(recorded).toHaveLength(attempt + 1)
+    expect(new Set(recorded.map((event) => event.id)).size).toBe(attempt + 1)
+    expect(new Set(recorded.map((event) => event.correlationId)).size).toBe(attempt + 1)
+    const latest = recorded.find((event) => event.correlationId === retry.correlationId)!
+    expect(latest).toMatchObject({ operation: 'github-interface.checkout-repo', behavior: 'review-new-prs',
+      phase: 'checkout', severity: 'error', repository: pr.repo, target: TARGET, account: 'review-bot',
+      exitCode: null, signal: 'SIGKILL', timeoutMs: 30_000, correlationId: retry.correlationId,
+      stderr: expect.stringContaining('delayed checkout'),
+      context: expect.objectContaining({ slot: 'primary', expectedHead: HEAD_SHA, killed: true,
+        executable: join(fixture.tempRoot, 'github-interface'), configuredCommand: 'github-interface',
+        retry: expect.objectContaining({ consecutiveFailures: 1 }) }) })
+    expect(Number(latest.context.elapsedMs)).toBeGreaterThanOrEqual(500)
+    for (const secret of ['private-output', '--token-user', '--path', 'checkout not found']) {
+      expect(JSON.stringify(recorded)).not.toContain(secret)
+    }
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(database.listBehaviorLaunchClaims('review-new-prs')).toEqual([])
+    expect(database.db.prepare("SELECT target FROM behavior_seen WHERE key = 'pr-operation'").all()).toEqual([])
+    expect(behaviors.getBehaviorCheckSlots().stats()).toMatchObject({ running: 0, behaviorRunning: 0 })
+    expect(existsSync(checkoutPath)).toBe(false)
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: retry.correlationId, outcome: 'preflight_failed', state: 'failed', activity: 'settled',
+    }))
+  }
+  failing = false
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+  expect(mocks.spawnDetached.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA, '--pwd', checkoutPath]))
+  expect(existsSync(checkoutPath)).toBe(true)
+  expect(behaviors.getBehaviorFailureState('review-new-prs', CHECK)).toBeNull()
+  expect(events()).toHaveLength(2)
+})
+
+it('keeps the checkout failure when claim release throws', async () => {
+  arrangeCli(false)
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const { database, behaviors } = await loadModules()
+  database.setMeta('me', 'poise-user')
+  database.setMeta('behavior_review_new_prs_keyver', '3')
+  database.setMeta('behavior_review_new_prs_enabled', '1')
+  database.recordSeen('review-new-prs', '__snapshot_v3__')
+  behaviors.startBehaviorsRuntime()
+  vi.stubEnv('CALLER_BIN_ROOT', fixture.tempRoot)
+  writeFileSync(join(fixture.tempRoot, 'github-interface'), `#!${process.execPath}\nprocess.stdout.write('private-output')\nprocess.stderr.write('original checkout failure\\n')\nprocess.exitCode = 1\n`, { mode: 0o700 })
+  const original = mocks.runFile.getMockImplementation()!
+  let checkoutFailed = false
+  mocks.runFile.mockImplementation((command: string, args: string[], options: RunFileOptions) => {
+    if (command === 'agent-interface' && args[0] === '--diagnostics') return Promise.resolve({
+      stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+    })
+    if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+      const error = Object.assign(new Error('Command failed (1): github-interface'),
+        { code: 1, killed: false, signal: null, stdout: '',
+          stderr: `error: checkout not found under /fake/dev: ${args[1]}/${args[2]}\n` })
+      return Promise.reject(error)
+    }
+    if (command === 'github-interface' && args[0] === '--checkout-repo') {
+      checkoutFailed = true
+      return mocks.realRunFile!(command, args, options)
+    }
+    if (command === 'git') return Promise.resolve({
+      stdout: args[0] === 'remote' ? `https://github.com/${pr.repo}.git` : args[0] === 'rev-parse' ? HEAD_SHA : '', stderr: '',
+    })
+    return original(command, args, options)
+  })
+  const realReleaseSeen = database.releaseSeenOwned.bind(database)
+  const realReleaseOperation = database.releasePrOperationOwned.bind(database)
+  let claimThrown = false, operationThrown = false
+  vi.spyOn(database, 'releaseSeenOwned').mockImplementation(((...args: Parameters<typeof database.releaseSeenOwned>) => {
+    if (checkoutFailed && !claimThrown) { claimThrown = true; throw new Error('claim release failed') }
+    return realReleaseSeen(...args)
+  }) as typeof database.releaseSeenOwned)
+  vi.spyOn(database, 'releasePrOperationOwned').mockImplementation(((...args: Parameters<typeof database.releasePrOperationOwned>) => {
+    if (checkoutFailed && !operationThrown) { operationThrown = true; throw new Error('operation release failed') }
+    return realReleaseOperation(...args)
+  }) as typeof database.releasePrOperationOwned)
+  logging = await import('../server/logging')
+  vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+  logging.startLogging()
+  await behaviors.runEnabledBehaviorsOnce()
+  const recorded = events()
+  const checkout = recorded.filter((event) => event.operation === 'github-interface.checkout-repo')
+  expect(checkout).toEqual([expect.objectContaining({ behavior: 'review-new-prs',
+    phase: 'checkout', severity: 'error', repository: pr.repo, target: TARGET, exitCode: 1,
+    stderr: expect.stringContaining('original checkout failure'),
+    context: expect.objectContaining({ slot: 'primary', expectedHead: HEAD_SHA }) })])
+  expect(JSON.stringify(checkout)).not.toContain('private-output')
+  expect(recorded.some((event) => event.message === 'claim release failed')).toBe(true)
+  expect(recorded.some((event) => event.message === 'operation release failed')).toBe(true)
+  const retry = behaviors.getBehaviorFailureState('review-new-prs', CHECK)!
+  expect(retry).toMatchObject({ kind: 'operation', consecutiveFailures: 1, correlationId: checkout[0]!.correlationId })
+  expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+    nativeId: retry.correlationId, outcome: 'preflight_failed', state: 'failed', activity: 'settled',
+  }))
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  expect(behaviors.getBehaviorCheckSlots().stats()).toMatchObject({ running: 0, behaviorRunning: 0 })
 })

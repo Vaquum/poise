@@ -24,7 +24,7 @@ export const OBSERVE: Registry = {
   'tk.legacy': { name: 'Kept by v1', kind: 'Display', what: 'Pull requests v1 still owned when v2 took over. v1 keeps them until they close; they are not tasks.' },
   'tk.row': { name: 'Task', kind: 'List item', what: 'One task: its issue and pull request, its phase rail, and its state with the reason.', does: 'Opens its timeline beside the list.', now: (el) => textOf(el).slice(0, 160) },
   'tk.age': { name: 'No verified advance', kind: 'Display', what: 'How long since the chain last verified progress on this task.', now: (el) => textOf(el) },
-  'tk.evidence': { name: 'Evidence', kind: 'Display', what: 'What the chain knows beyond the task’s state: its last verified advance, the gates on its head, what happens next, when its evidence is read again, and what covered a superseded task.', does: 'A recheck reads the evidence again. It never retries held work.', unavailable: 'The chain gives a last advance, gates and a next step only for the work in Needs attention.' },
+  'tk.evidence': { name: 'Evidence', kind: 'Display', what: 'What the chain knows beyond the task’s state: its last verified advance, the gates on its head, what happens next, when its evidence is read again, and what covered a superseded task.', does: 'A recheck reads the evidence again. Recovery follows the chain’s existing rules.', unavailable: 'The chain gives a last advance, gates and a next step only for the work in Needs attention.' },
   'tk.history': { name: 'History only', kind: 'Display', what: 'A merged or superseded task keeps its timeline; there is nothing left to hold or resume.' },
   'tk.board': { name: 'See it on Board', kind: 'Action', what: 'Opens Board, where the task is one card in its lane, with a route back here.' },
   'tk.from': { name: 'From here', kind: 'Display', what: 'The step a notice or a diagnostic pointed to, marked in the timeline.' },
@@ -78,7 +78,7 @@ export const OBSERVE: Registry = {
   'gh.state': {
     name: 'Status', kind: 'Display', what: 'Its state on GitHub. CI runs speak the state words; issues and pull requests keep GitHub’s Open, Merged and Closed.',
     now: (el) => textOf(el),
-    values: [['Open, Merged, Closed', 'Issues and pull requests, as GitHub says.'], ['Failed', 'CI that failed or timed out.'], ['Done', 'CI that passed, or ended neutral.'], ['Running, Waiting', 'CI in progress, or queued.'], ['Needs you', 'CI that waits for an action.'], ['Idle', 'CI that was cancelled, skipped or went stale.']],
+    values: [['Open, Merged, Closed', 'Issues and pull requests, as GitHub says.'], ['Failed', 'CI that failed or timed out.'], ['Done', 'CI that passed, or ended neutral.'], ['Running, Waiting', 'CI in progress, or queued.'], ['Blocked', 'CI that requires an action.'], ['Idle', 'CI that was cancelled, skipped or went stale.']],
   },
   'gh.updated': { name: 'Updated', kind: 'Display', what: 'How long ago it last changed. Rows repaint in place at the refresh rate from General; nothing moves while you read.', now: (el) => el.getAttribute('data-help') ?? textOf(el) },
   'gh.review': { name: 'Consensus review', kind: 'Action', what: 'Asks several models to review an open pull request together, and posts the result on it.', shows: 'Accepted, Executing, then Review posted, on the row. Afterwards it offers to run again.', unavailable: 'A merged or closed pull request has nothing to review.' },

@@ -5,19 +5,20 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { pipeline } from 'node:stream/promises'
+import { StringDecoder } from 'node:string_decoder'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { createGzip, gzip } from 'node:zlib'
+import { cleanText, environmentSecrets, lineRedactor, redact } from './redaction.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const LEASE_MS = 10_000
-const LIMIT_MS = 9 * 60_000
 const RECOVERY_MS = 30_000
 const GATEWAY_RESTART = 'the gateway restarted'
 // A suite that reached for Docker on a job, which has none: it starts again on a sandbox, which has.
@@ -28,7 +29,7 @@ const DEPENDENCY_BYTES = CHUNK_BYTES - 64 * 1024
 const zip = promisify(gzip)
 // The first bytes go at once: a proxy gives up on a download that stays silent for long.
 const FIRST_CHUNK_BYTES = 64 * 1024
-const FRAME = { heartbeat: 0, stdout: 1, stderr: 2, exit: 3, fail: 4, ready: 5 }
+const FRAME = { heartbeat: 0, stdout: 1, stderr: 2, exit: 3, fail: 4, ready: 5, evidence: 6 }
 // What a suite cannot run without although git ignores it.
 const DEPENDENCIES = new Set(['node_modules', '.venv', 'venv'])
 // Nothing a suite needs: credentials by name, and what only the provider CLIs and Poise read.
@@ -41,7 +42,7 @@ const LOCAL_ONLY = new Set(['_', 'OLDPWD', 'PWD', 'SHLVL', 'GOMAXPROCS', 'RIPGRE
 export function testEnvironment(env, hooks = HERE) {
   const result = {}
   for (const [name, value] of Object.entries(env)) {
-    if (!value || LOCAL_ONLY.has(name) || SECRET_NAME.test(name) || AGENT_NAME.test(name) || SECRET_VALUE.test(value)) continue
+    if (!value || name.startsWith('POISE_TEST_') || LOCAL_ONLY.has(name) || SECRET_NAME.test(name) || AGENT_NAME.test(name) || SECRET_VALUE.test(value)) continue
     result[name] = value
   }
   // A suite runs on the box as it was typed, so nothing there asks to be moved again.
@@ -195,21 +196,96 @@ function die(message, code = 125) {
   finish(code)
 }
 
+// Keep the first report, not a tail of pytest's potentially very long failure output.
+function callerPytestFailure() {
+  const secrets = environmentSecrets()
+  const streams = new Map()
+  let reports = false, firstReport = false, reportEnded = false, shortSummary = false
+  let test = '', detail = '', short = '', kind = ''
+  const bounded = (value, limit) => redact(value, secrets).slice(0, limit)
+  // Pytest prefixes every failure line with `E `, hiding a folded credential
+  // continuation from per-line redaction. Strip one prefix space so the shared
+  // line redactor still sees the continuation indent; other lines round-trip.
+  const detailRedactor = lineRedactor(secrets)
+  const detailLine = (value, limit) => {
+    const redacted = detailRedactor(value.replace(/^E\s/, ''))
+    return (redacted === '[redacted header continuation]' ? redacted : `E ${redacted}`).slice(0, limit)
+  }
+  const line = (value) => {
+    value = cleanText(value).trimEnd()
+    if (/^=+ (?:ERRORS|FAILURES) =+$/.test(value)) reports = true
+    if (/^=+ short test summary info =+$/.test(value)) shortSummary = true
+    if (reports && /^_+ .* _+$/.test(value)) {
+      if (firstReport) reportEnded = true
+      else {
+        firstReport = true
+        // Trailing comma: the persisted diagnostic is one line, where a
+        // credential word in the test name would otherwise read as a header
+        // field once a later colon follows.
+        test = bounded(value.replace(/^_+\s+|\s+_+$/g, ''), 600) + ','
+        kind = /^_+ ERROR\b/.test(value) ? 'ERROR' : 'FAILED'
+      }
+    }
+    if (firstReport && !reportEnded && /^E\s+/.test(value) && detail.length < 1200) {
+      detail += (detail ? '\n' : '') + detailLine(value, 1200 - detail.length)
+    }
+    if (shortSummary && !short && (!kind || value.startsWith(kind + ' '))) {
+      const summary = /^(FAILED|ERROR) (.+?)(?: - (.*))?$/.exec(value)
+      // Redact the node ID apart from its detail, on its own line: a credential
+      // word in the test name would otherwise swallow the identifier as a header
+      // field, here or in any later redaction pass over the assembled summary.
+      // The comma keeps it apart once the persisted diagnostic is one line.
+      if (summary) short = `${summary[1]} ${bounded(summary[2], 600)},${summary[3] === undefined ? '' : `\n${bounded(summary[3], 1000)}`}`.slice(0, 1000)
+    }
+  }
+  return {
+    write(type, payload) {
+      if (!streams.has(type)) streams.set(type, { decoder: new StringDecoder('utf8'), pending: '', oversized: false })
+      const stream = streams.get(type)
+      for (const part of stream.decoder.write(payload).split(/(?<=\n)/)) {
+        if (!stream.oversized) stream.pending += part
+        if (stream.pending.length > 64 * 1024) {
+          // Keep a bounded head: discarding a credential header would lose the
+          // folded-header state its continuation line needs.
+          stream.pending = stream.pending.slice(0, 64 * 1024)
+          stream.oversized = true
+        }
+        if (part.endsWith('\n')) {
+          line(stream.oversized ? stream.pending : stream.pending.slice(0, -1))
+          stream.pending = ''
+          stream.oversized = false
+        }
+      }
+    },
+    summary() {
+      for (const stream of streams.values()) line(stream.pending + stream.decoder.end())
+      return short || test ? [short || test, detail || 'assertion details unavailable'].join('\n') : null
+    },
+  }
+}
+
 async function main(args) {
   const also = []
   while (args[0] === '--also') also.push(args.splice(0, 2)[1])
   const command = args.slice(1)
-  const [relay, key] = readFileSync(join(HERE, 'relay'), 'utf8').split('\n')
+  const callerPytest = command.some((word) => ['pytest', 'py.test'].includes(basename(word)))
+    && ['caller/agent_interface/tests', 'caller/github_interface/tests', 'caller/github_datastore/tests'].every((path) => command.includes(path))
+  const [relay, key, configuredLimit = '540'] = readFileSync(join(HERE, 'relay'), 'utf8').trimEnd().split('\n')
+  if (!/^\d+$/.test(configuredLimit) || Number(configuredLimit) < 1 || Number(configuredLimit) > 3540) {
+    throw new Error('POISE_TEST_LIMIT_SECONDS must be a whole number from 1 to 3540')
+  }
   const headers = { authorization: `Bearer ${key}` }
   const cwd = process.cwd()
   // Names the checkout's history, so a repository whose suites use Docker goes to a sandbox at once.
   const repo = git(cwd, 'rev-list', '--max-parents=0', 'HEAD')?.toString().split('\n')[0] || undefined
-  const request = { argv: command, cwd, env: testEnvironment(process.env), repo }
+  const binding = process.env.POISE_TEST_BINDING ? JSON.parse(process.env.POISE_TEST_BINDING) : undefined
+  const request = { argv: command, cwd, env: testEnvironment(process.env), repo, ...(binding ? { binding } : {}) }
   const spec = JSON.stringify(request)
   let docker = false
   // One clock includes capture, provisioning, upload, recovery and the complete rerun.
   const shellLimit = Number(process.env.BASH_DEFAULT_TIMEOUT_MS)
-  const limit = shellLimit > 0 ? Math.min(LIMIT_MS, shellLimit) : LIMIT_MS
+  const configuredMs = Number(configuredLimit) * 1000
+  const limit = shellLimit > 0 ? Math.min(configuredMs, shellLimit) : configuredMs
   const lifetime = new AbortController()
   let current = null
   let ending = false
@@ -243,6 +319,8 @@ async function main(args) {
   const directory = mkdtempSync(join(tmpdir(), 'poise-test-input-'))
   const boundaries = dependencyBoundaries(selection)
   const archive = join(directory, boundaries ? 'tree.tar' : 'tree.tgz')
+  const specification = join(directory, 'spec.json')
+  writeFileSync(specification, spec, { mode: 0o600 })
   let dependencyRange
   process.once('exit', () => rmSync(directory, { recursive: true, force: true }))
   const capture = async () => {
@@ -258,7 +336,9 @@ async function main(args) {
     tar.stdin.end(selection.paths.map((path) => path.replace(/^\//, '')).join('\0'))
     const streams = boundaries ? [tar.stdout] : [tar.stdout, createGzip({ level: 1 })]
     const hash = createHash('sha256').update(spec)
-    streams.at(-1).on('data', (chunk) => hash.update(chunk))
+    // Hash the same uncompressed tar bytes on either upload route. The box
+    // independently recomputes this before it unpacks or executes anything.
+    tar.stdout.on('data', (chunk) => hash.update(chunk))
     try {
       const [, code] = await Promise.all([pipeline(...streams, createWriteStream(archive), { signal: lifetime.signal }), closed])
       // tar's exit 1 says a file changed as it was read. Both attempts still use these exact bytes.
@@ -325,7 +405,8 @@ async function main(args) {
   }
 
   const createRun = async (signal = lifetime.signal) => {
-    const created = await call('POST', '/runs', docker ? JSON.stringify({ ...request, docker }) : spec, signal)
+    const created = await call('POST', '/runs', JSON.stringify({ ...request, ...(docker ? { docker } : {}),
+      ...(binding ? { capture: { candidate, spec } } : {}) }), signal)
     const { id, dependencyCache } = await created.json()
     if (!/^[0-9a-f]{32}$/.test(id)) throw new Error('the test relay did not name the new run')
     return { id, dependencyCache: dependencyCache === true }
@@ -370,9 +451,10 @@ async function main(args) {
     throw new Error(`the test relay did not recover within ${RECOVERY_MS / 1000} s${lastError ? `: ${lastError.message}` : ''}`)
   }
 
+  let candidate
   try {
     say('this suite runs on a disposable test box; files it changes stay there. Capturing the checkout.')
-    const candidate = await capture()
+    candidate = await capture()
     const suite = command.slice(0, 5).map((word) => basename(word)).join(' ').slice(0, 200)
     say(`candidate ${candidate}, suite ${suite}, cwd ${cwd}`)
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -388,10 +470,22 @@ async function main(args) {
       let failure = null
       let upload = null
       let uploadError = null
+      const pytestFailure = callerPytest ? callerPytestFailure() : null
       const read = frameReader((type, payload) => {
+        if (type === FRAME.stdout || type === FRAME.stderr) pytestFailure?.write(type, payload)
         if (type === FRAME.stdout) process.stdout.write(payload)
         else if (type === FRAME.stderr) process.stderr.write(payload)
         else if (type === FRAME.exit) exitCode = Number(payload.toString())
+        else if (type === FRAME.evidence && binding && process.env.POISE_TEST_EVIDENCE_DIR && payload.length <= 48 * 1024) {
+          // Only the gateway can authenticate this receipt. Caller checks it
+          // independently and retains it before reclaiming this directory.
+          try {
+            writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, `${id}.json`), payload, { flag: 'wx', mode: 0o600 })
+          } catch (error) {
+            // A failed receipt must not replace the suite's genuine exit with a no-result handoff.
+            say(`assertion recovery evidence could not be retained: ${error.message}`)
+          }
+        }
         else if (type === FRAME.fail) failure = { code: payload[0], message: payload.subarray(1).toString() }
         else if (type === FRAME.ready && !upload) {
           say('the box is up. Sending the captured checkout.')
@@ -435,7 +529,24 @@ async function main(args) {
       }
       if (failure) die(failure.message, failure.code)
       else if (exitCode === null) die('the connection to the test relay ended before the suite did')
-      else finish(exitCode)
+      else {
+        const summary = exitCode !== 0 ? pytestFailure?.summary() : null
+        if (summary) say(`completed Caller pytest failure: captured candidate ${candidate}, producing run ${id}, exit ${exitCode}\n${summary}`)
+        // The suite has its result; its budget must not replace it during source capture.
+        clearTimeout(deadline)
+        if (exitCode > 0 && process.env.AGENT_INTERFACE_FAILED_SOURCE_CALL) {
+          // Read the archive that was actually sent, while it still exists. A later
+          // edit under the same HEAD must never replace this validation's source.
+          const retained = spawn('agent-interface', ['--capture-failed-source', archive, specification, candidate, id, String(exitCode)],
+            { stdio: 'ignore', signal: lifetime.signal })
+          const saved = await new Promise((done) => {
+            retained.once('error', () => done(false))
+            retained.once('close', (code) => done(code === 0))
+          })
+          if (!saved) say('failed source capture unavailable; remediation requires a fresh reproduction')
+        }
+        finish(exitCode)
+      }
       return
     }
   } catch (error) {

@@ -1,8 +1,10 @@
 import { defineConfig } from 'vitest/config'
+import FirstFailureReporter from './scripts/vitest-first-failure-reporter'
 
 export default defineConfig({
   test: {
     environment: 'node',
+    reporters: ['default', new FirstFailureReporter()],
     // Bound resource use on shared development hosts without relaxing test deadlines.
     maxWorkers: 2,
     // Tests that re-import the server pile up AsyncLocalStorage instances, and
