@@ -7,7 +7,7 @@ import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent }
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { behaviorChainAttention } from '../server/behavior-chain-summary'
-import { nativeActionReceipt } from '../server/behavior-chain-action'
+import { nativeActionReceipt, nativeRequestSha } from '../server/behavior-chain-action'
 import { completedReviewCall } from './review-response-fixture'
 import { parseAgentLogStdout, type LogEntry } from '../server/agent-log-parse'
 import { diagnosticPage, loggingRuntime, startLogging, stopLogging } from '../server/logging'
@@ -448,6 +448,113 @@ it.each(['recovery', 'base update', 'base update review', 'operator hold', 'unce
     expect(journal.read(chain.id)!.waiting).toBe('native repository readiness gates are not satisfied')
     expect(journal.read(chain.id)!.invocations[0]).toEqual(failedReceipt)
     expect(launch).toHaveBeenCalledTimes(1)
+  })
+
+it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed head', 'queue entry', 'unknown publication', 'missing proof'])(
+  'revalidates one held red candidate through the original Call across restart and base advance: %s', async scenario => {
+    const { db, journal } = setup()
+    const obs = observation()
+    const head = obs.pull!.head, base = 'b'.repeat(40), updated = 'c'.repeat(40)
+    const originalId = 'blocked-repair'
+    const repairCall = 'a'.repeat(32), refreshCall = 'b'.repeat(32)
+    Object.assign(obs.publication, { state: 'open', merged: false, merge_sha: null })
+    Object.assign(obs.pull!, { state: 'open', merged: false, mergeSha: null, checksState: 'FAILURE', failing: ['unit:failure'] })
+    let chain = seed(journal)
+    chain = record(journal, chain, { type: 'chain.observed', observation: structuredClone(obs) })
+    record(journal, chain, { type: 'invocation.admitted', invocation: { id: originalId, behavior: 'repair-pr', actor: chain.author,
+      model: reviewer.model, slot: reviewer.slot, basis: 'original failure', admittedAt: NOW - 86_400_000,
+      request: { command: 'agent-interface', argv: ['--expected-head', head], cwd: '/fixture',
+        context: { head, reviewRevision: obs.pull!.reviewRevision } } } })
+    const original: LogEntry = { ...completedReviewCall(chain.repository, 17, head, chain.author), id: repairCall,
+      behavior: 'repair_pr', source: 'poise:behavior-chain', correlation_id: originalId, status: 'failed', action: 'not_started',
+      outcome: 'preflight_failed', head_sha: null, review_id: null, error_code: 'atomic_work_blocked', error: 'CI failed',
+      completed_at: new Date(NOW - 3000).toISOString(), resources_settled_at: new Date(NOW - 2000).toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] },
+      artifact: { phase: scenario === 'unknown publication' ? 'publishing' : 'executing', ci_blocker: {
+        action: 'list_failing_ci', repository: chain.repository, pull_number: 17, head_sha: head, failing: [{
+          type: 'check_run', name: 'unit', state: 'completed', conclusion: 'failure', check_run_id: 41,
+          log_id: 41, url: 'https://github.com/acme/repo/actions/runs/40/job/41',
+        }],
+      } } }
+    const calls = [original]
+    const result = { action: 'update_branch_if_behind', repository: chain.repository, pull_number: 17, head_sha: head,
+      base_sha: base, outcome: 'updated' }
+    const lost = scenario === 'lost PUT response'
+    const perform = vi.fn<ChainRuntimeOperations['perform']>(async invocation => {
+      const call: LogEntry = { ...completedReviewCall(chain.repository, 17, head, chain.author), id: refreshCall, model: 'native-action',
+        behavior: 'native_action', source: 'poise:behavior-chain', correlation_id: invocation.id, status: lost ? 'failed' : 'completed',
+        action: lost ? null : 'native_action', outcome: lost ? null : 'native_action', review_id: null, head_sha: lost ? null : head,
+        response: lost ? null : JSON.stringify(result), error: lost ? 'PUT response lost' : '',
+        error_code: lost ? 'native_action_failed' : null, resources_settled_at: new Date().toISOString(),
+        resource_ownership: { version: 2, roots: [], errors: [], namespace: { state: 'settled', callId: refreshCall,
+          correlation: invocation.id, settled_at: Date.now() / 1000, controller: { version: 1, instance: 'd'.repeat(32) },
+          binding: { pid: 104, start: '12', namespace: 'pid:[91]', owner: { pid: 102, start: '10' },
+            holder: { pid: 103, start: '11' }, epoch: { boot: 'fixture', init_start: '1', namespace_dev: '2', namespace_ino: '3' } } } },
+        artifact: { request_sha: nativeRequestSha(invocation.request),
+          phase: lost ? 'performing_native_action' : 'received_native_action', ...(lost ? {} : { response_sha: 'd'.repeat(64) }) } }
+      calls.push(call)
+      if (lost) throw new Error('PUT response lost')
+      return { ...result, nativeCallId: refreshCall }
+    })
+    const readActionResult = vi.fn(async () => result)
+    const launch = vi.fn(async () => true)
+    const native = operations({ enabled: () => true, available: () => true, permitted: () => true, perform, readActionResult, launch,
+      observe: async () => ({ ...structuredClone(obs), checkedAt: Date.now() }),
+      readInvocations: async () => parseAgentLogStdout(JSON.stringify(calls), 'CI refresh regression'),
+      request: async (_chain, _observation, decision) => decision.behavior === 'refresh-pr-ci'
+        ? { command: 'github-interface', cwd: '/fixture', nativeResources: 2, argv: ['--update-branch-if-behind', '17',
+          '--expected-head', head, '--token-user', chain.author, '--shared-ci-recovery-json', JSON.stringify(obs.ciRefresh)] }
+        : { command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] } })
+    let runtime = new BehaviorChainRuntime(journal, native)
+    const tick = async () => { vi.setSystemTime(Date.now() + 120_001); await runtime.run(); return journal.read(chain.id)! }
+    chain = await tick()
+    const immutable = structuredClone(chain.invocations[0])
+    expect(chain.held).toBe('CI failed')
+    if (scenario !== 'missing proof') obs.ciRefresh = { head, base, report: 18, remediation: base, workflow: 2,
+      failedRun: 40, baselineRun: 42, passedRun: 43, checks: [41] }
+    if (scenario === 'operator hold') chain = record(journal, chain, { type: 'chain.held', reason: chain.held! })
+    if (scenario === 'changed head') { obs.pull!.head = updated; obs.publication.head_sha = updated }
+    if (scenario === 'queue entry') obs.pull!.queueEntry = 'queue-entry'
+    chain = await tick()
+    if (scenario !== 'accepted response' && !lost) {
+      expect(perform).not.toHaveBeenCalled()
+      expect(chain.held).toBe('CI failed')
+      expect(launch).not.toHaveBeenCalled()
+      return
+    }
+    expect(chain.held).toBe('CI failed')
+    expect(perform).toHaveBeenCalledTimes(1)
+    const admission = chain.invocations.at(-1)!
+    expect(admission.behavior).toBe('refresh-pr-ci')
+    journal.rebuild()
+    runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
+    obs.ciRefresh!.base = 'e'.repeat(40)
+    chain = await tick()
+    expect(chain.held).toBe('CI failed')
+    expect(chain.invocations[1].outcome).toBe(lost ? 'Error: PUT response lost' : 'updated')
+    expect(perform).toHaveBeenCalledTimes(1)
+    Object.assign(obs.pull!, { head: updated, checksState: 'PENDING', pending: true, failing: [] })
+    obs.publication.head_sha = updated
+    obs.ciBaseUpdate = { from: head, head: updated, base, tree: 'f'.repeat(40) }
+    expect((await tick()).held).toBe('CI failed')
+    Object.assign(obs.pull!, { checksState: 'SUCCESS', pending: false })
+    // Even successful unrelated checks cannot release the hold.
+    if (!lost) expect((await tick()).held).toBe('CI failed')
+    obs.ciRefreshPassed = updated
+    chain = await tick()
+    if (lost) {
+      expect(chain.held).toBe('CI failed')
+      expect(chain.invocations[1].outcome).toBe('update_observed')
+      chain = await tick()
+    }
+    expect(chain.held).toBeNull()
+    expect(chain.resumedAfterSequence).toBe(0)
+    expect(chain.invocations[0]).toEqual(immutable)
+    expect(chain.invocations[1]).toMatchObject({ callId: refreshCall, state: 'settled' })
+    expect(chain.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
+    expect(launch).toHaveBeenCalledTimes(1)
+    expect(perform).toHaveBeenCalledTimes(1)
+    expect(readActionResult).toHaveBeenCalledTimes(lost ? 0 : 1)
   })
 
 it('admits only a scoped exact-head conflict repair and never replenishes its retry budget across CI holds and rebuilds', async () => {

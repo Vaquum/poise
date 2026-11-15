@@ -685,7 +685,8 @@ it.each(['failure', 'pending', 'missing', 'success', 'queue-success', 'reused-qu
   })
 
 it.each(['verified', 'edited merge', 'missing proof', 'wrong ref', 'wrong head', 'wrong PR', 'wrong repository',
-  'wrong readiness PR', 'wrong readiness repository', 'wrong source', 'wrong parents', 'missing base', 'changed publication'])(
+  'wrong readiness PR', 'wrong readiness repository', 'wrong source', 'wrong parents', 'missing base', 'changed publication',
+  'fresh candidate CI', 'unrelated green CI'])(
   'binds CI hold base-update proof to the same repository, PR and head: %s', async mode => {
     const failed = 'd'.repeat(40), base = 'c'.repeat(40), tree = 'f'.repeat(40)
     const held = { ...chain, held: 'CI failed', ciHold: { invocationId: 'repair', callId: 'b'.repeat(32), head: failed } }
@@ -695,6 +696,17 @@ it.each(['verified', 'edited merge', 'missing proof', 'wrong ref', 'wrong head',
     const readiness = { repository: chain.repository, pull_number: 21, head_sha: HEAD, draft: false,
       checks_state: 'SUCCESS', reviewer_approved_current_head: false, unresolved_live_conversation_count: 0,
       unresolved_outdated_conversation_count: 0, green: false, blockers: ['reviewer_not_approved_current_head'] }
+    const refresh = ['fresh candidate CI', 'unrelated green CI'].includes(mode)
+    if (refresh) {
+      const proof = { head: failed, base, workflow: 1, failedRun: 30 }
+      held.invocations = [{ id: 'refresh', behavior: 'refresh-pr-ci', basis: 'held candidate', actor: 'author', model: null, slot: null,
+        state: 'uncertain', callId: null, outcome: null, evidence: null, admittedAt: Date.now(), admissionSequence: 1,
+        request: { command: 'github-interface', cwd: '/fixture', nativeResources: 2,
+          argv: ['--update-branch-if-behind', '21', '--shared-ci-recovery-json', JSON.stringify(proof)] } }]
+      ci.runs = [{ id: 41, workflow_id: mode === 'fresh candidate CI' ? 1 : 2, head_sha: HEAD,
+        event: 'pull_request', status: 'completed', conclusion: 'success' }]
+      ci.checks = [{ run_id: 41, check_run_id: 42, head_sha: HEAD, name: 'Verify (Node 22)', state: 'completed', conclusion: 'success' }]
+    }
     if (mode === 'edited merge') ci.base_update = null
     if (mode === 'missing proof') delete ci.base_update
     if (mode === 'wrong ref') ci.ref = base
@@ -723,16 +735,17 @@ it.each(['verified', 'edited merge', 'missing proof', 'wrong ref', 'wrong head',
       return { stdout: JSON.stringify(evidence[argv[0]]) }
     })
     const result = actionOperations().observe(held)
-    if (!['verified', 'edited merge'].includes(mode)) {
+    if (!refresh && !['verified', 'edited merge'].includes(mode)) {
       await expect(result).rejects.toThrow()
       return
     }
     const observation = await result
     expect(observation.pull).toMatchObject({ head: HEAD, checksState: 'SUCCESS', approved: false, ready: false })
-    expect(observation.ciBaseUpdate).toEqual(mode === 'verified' ? { ...update, head: HEAD } : undefined)
+    expect(observation.ciBaseUpdate).toEqual(mode === 'edited merge' ? undefined : { ...update, head: HEAD })
+    expect(observation.ciRefreshPassed).toBe(mode === 'fresh candidate CI' ? HEAD : undefined)
     expect(held.ciHold.head).toBe(failed)
     expect(reads.filter(argv => argv[0] === '--list-failing-ci')).toEqual([
-      ['--list-failing-ci', '21', '--base-update-from', failed, '--token-user', 'reviewer'],
+      ['--list-failing-ci', '21', '--base-update-from', failed, ...(refresh ? ['--include-runs'] : []), '--token-user', 'reviewer'],
     ])
   })
 

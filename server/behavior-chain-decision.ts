@@ -1,4 +1,4 @@
-import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
+import { chainBasis, ciRefreshBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation, type CiRefreshProof } from './behavior-chain-store'
 import { validReviewResponse, type ReviewResponse } from './review-response'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { matchingNativeActionReceipt } from './behavior-chain-action'
@@ -31,6 +31,8 @@ export interface ChainObservation extends Record<string, unknown> {
     recovery?: { merge: string, base: string, run: Record<string, unknown> } }
   prerequisites?: { wait: string | null, base: string | null, evidence: Record<string, unknown>[] }
   ciBaseUpdate?: { from: string, head: string, base: string, tree: string }
+  ciRefresh?: CiRefreshProof
+  ciRefreshPassed?: string
   fullSuite?: Record<string, unknown>
   remediation?: Record<string, unknown>
   pull: null | {
@@ -53,6 +55,27 @@ export type ChainDecision =
   | { kind: 'supersede', evidence: Record<string, unknown> }
   | { kind: 'invoke', behavior: ChainBehavior, basis: string, actor: string, reviewer: ChainReviewer | null, reason: string }
 export interface MergeReviewEvidence { before: ChainObservation | null, firstMerged: ChainObservation | null }
+
+export function heldCiRepair(chain: BehaviorChain) {
+  const hold = chain.ciHold, last = chain.invocations.at(-1)
+  if (!chain.held || !hold || chain.mergeSha || chain.supersession || !last) return null
+  const refresh = !hold.queue && last.behavior === 'refresh-pr-ci' && last.basis === ciRefreshBasis(hold) ? last : null
+  const original = refresh ? chain.invocations.find(invocation => invocation.id === hold.invocationId) : last
+  const evidence = original?.evidence, artifact = evidence?.artifact as Record<string, unknown> | undefined
+  if (original?.id !== hold.invocationId || original.state !== 'settled' || original.callId !== hold.callId
+    || evidence?.status !== 'failed' || evidence.error_code !== 'atomic_work_blocked' || evidence.action !== 'not_started'
+    || artifact?.phase !== 'executing' || artifact.plan_sha || evidence.publicationResume
+    || evidence.receipts != null || evidence.review_id != null || evidence.head_sha != null
+    || !resourceReleaseProven(evidence, true) || typeof evidence.completedAt !== 'number') return null
+  return { hold, original, refresh, evidence, artifact, completedAt: evidence.completedAt }
+}
+
+export function ciRefreshRequest(invocation: ChainInvocation): CiRefreshProof {
+  const argv = invocation.request.argv
+  const index = argv.indexOf('--shared-ci-recovery-json')
+  if (index < 0) throw new Error('CI refresh is missing its admitted recovery proof')
+  return JSON.parse(argv[index + 1]) as CiRefreshProof
+}
 
 function settled(chain: BehaviorChain, behavior: ChainBehavior, basis: string, slot: string | null): ChainInvocation[] {
   return chain.invocations.filter((invocation) => invocation.behavior === behavior && invocation.basis === basis
@@ -240,7 +263,7 @@ export function closedChainTarget(chain: BehaviorChain, observation: ChainObserv
   if (chain.mergeSha) return 'the pull request is confirmed merged'
   if (behavior === 'retire-pr') return null
   if (observation?.pull && (observation.pull.merged || observation.pull.state !== 'open')) return 'the pull request is closed'
-  if (observation && !observation.issue.open && ['review-issue', 'implement-issue', 'repair-pr'].includes(behavior)) return 'the seed issue is closed'
+  if (observation && !observation.issue.open && ['review-issue', 'implement-issue', 'repair-pr', 'refresh-pr-ci'].includes(behavior)) return 'the seed issue is closed'
   return null
 }
 
@@ -312,7 +335,21 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     return { kind: 'invoke', behavior: 'retire-pr', basis: chainBasis(['retire', coverage]), actor: chain.author,
       reviewer: null, reason: 'close the verified redundant repair after original invocation settlement' }
   }
-  if (chain.held) return { kind: 'wait', reason: chain.held }
+  if (chain.held) {
+    const held = heldCiRepair(chain), proof = observation.ciRefresh, publication = observation.publication
+    const queue = pull && lastChainQueueInvocation(chain)
+    if (held && !held.hold.queue && !held.refresh && proof && pull?.state === 'open' && !pull.draft && !pull.conflict
+      && pull.queueEntry === null && !pull.pending && pull.failing.length && observation.issue.open && !observation.existingPulls.length
+      && (!queue || queue.evidence?.head_sha !== pull.head || pull.queueRemoval && pull.queueRemoval.at >= queue.admittedAt)
+      && publication.state === 'open' && publication.pull_number === pull.number && publication.head_sha === pull.head
+      && pull.head === held.hold.head && proof.head === pull.head
+      && observation.checkedAt >= held.completedAt && observation.checkedAt >= Date.parse(String(held.evidence.resources_settled_at))
+      && ![held.artifact.publication_head, held.artifact.result, held.artifact.replies_started, held.evidence.publicationReceipt].some(value => value != null)) {
+      return { kind: 'invoke', behavior: 'refresh-pr-ci', actor: chain.author, reviewer: null, basis: ciRefreshBasis(held.hold),
+        reason: 'refresh the held PR after independently verified shared CI recovery' }
+    }
+    return { kind: 'wait', reason: chain.held }
+  }
   if (!observation.issue.open && !pull) return { kind: 'hold', reason: 'seed issue closed without a confirmed merged pull request' }
   if (pull && pull.state !== 'open') return { kind: 'hold', reason: 'pull request closed without a confirmed merge' }
   if (pull?.draft) return { kind: 'wait', reason: 'pull request is a draft' }

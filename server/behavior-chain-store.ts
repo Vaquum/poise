@@ -8,7 +8,7 @@ import { nativeResourcesPending, resourceReleaseProven } from './behavior-resour
 const CUTOVER_ID = '@behavior-admission'
 interface CutoverEvent { type: 'admission.changed', state: BehaviorCutoverState }
 
-export type ChainBehavior = 'review-issue' | 'implement-issue' | 'publish-issue' | 'review-pr' | 'repair-pr' | 'approve-pr' | 'resolve-threads' | 'merge-pr' | 'rerun-grey-ci' | 'retire-pr'
+export type ChainBehavior = 'review-issue' | 'implement-issue' | 'publish-issue' | 'review-pr' | 'repair-pr' | 'approve-pr' | 'resolve-threads' | 'merge-pr' | 'rerun-grey-ci' | 'retire-pr' | 'refresh-pr-ci'
 export interface PublicationPlanCondition {
   code: 'original_publication_plan_missing'
   callId: string
@@ -41,6 +41,10 @@ export interface QueueCiBlocker {
   removal: string, integration: string, base: string,
   failures: Array<{ name: string, check: number, job: number, run: number, workflow: number, attempt: number, url: string }>
 }
+export interface CiRefreshProof {
+  head: string, base: string, remediation: string, report: number, workflow: number,
+  failedRun: number, baselineRun: number, passedRun: number, checks: number[]
+}
 export interface BehaviorChain {
   id: string
   repository: string
@@ -69,6 +73,11 @@ export type ChainAdmission = Omit<ChainInvocation, 'state' | 'callId' | 'outcome
 export interface ChainRecoveryOrigin {
   origin: 'automatic' | 'operator' | 'unknown'
   intervention?: { callId: string, at: number, verifiedAt: number }
+}
+
+export function ciRefreshBasis(hold: NonNullable<BehaviorChain['ciHold']>): string {
+  // Advancing main does not change which failed Call owns this allowance.
+  return chainBasis(['refresh-pr-ci', hold.invocationId, hold.callId, hold.head])
 }
 export type ChainEvent =
   | { type: 'chain.admitted', repository: string, issue: number, branch: string, author: string, reviewer: string }
@@ -232,8 +241,17 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     next.supersession = event.evidence
     next.waiting = null
   } else if (event.type === 'invocation.admitted') {
-    if (next.held || next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
     const invocation = event.invocation
+    if (next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
+    if (invocation.behavior === 'refresh-pr-ci') {
+      const hold = next.ciHold, original = next.invocations.at(-1)
+      if (!next.held || !hold || hold.queue || original?.id !== hold.invocationId || original.callId !== hold.callId
+        || original.behavior !== 'repair-pr' || !resourceReleaseProven(original.evidence ?? {}, true)
+        || invocation.basis !== ciRefreshBasis(hold) || invocation.actor !== next.author || invocation.model !== null
+        || invocation.request.command !== 'github-interface' || invocation.request.nativeResources !== 2) {
+        throw new Error('CI refresh requires its original automatic hold and released repair Call')
+      }
+    } else if (next.held) throw new Error('behavior chain does not admit invocations')
     if (invocation.behavior === 'repair-pr' && next.repairRecovery) {
       const recovery = next.repairRecovery
       const prior = next.invocations.find(item => item.id === recovery.admission)
