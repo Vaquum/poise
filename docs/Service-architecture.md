@@ -302,6 +302,10 @@ client sent.
     bounded indexed reads. Cursors bind the grant and selector. Transcript
     projection follows the stored context reset boundary and reports when a
     previous checkpoint has expired.
+    An independent Manager consent adds the client identity to the signed
+    claim. Its typed actions use `POST /api/mcp/manager`, the native Manager
+    authorization and budget, and the existing durable command receipts with
+    delegated grant attribution.
     The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
     PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and

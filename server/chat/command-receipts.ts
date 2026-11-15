@@ -6,6 +6,7 @@ import { db } from '../db'
 import type { ServerFrame } from './protocol'
 
 type Ack = Extract<ServerFrame, { kind: 'ack' }>
+interface DelegatedAuthority { grantId: string; clientId: string; managerId: string; sessionId: string; sequence: number }
 interface Receipt { fingerprint: string, ack: string | null }
 interface Active { fingerprint: string, promise: Promise<Ack> }
 const active = new Map<string, Active>()
@@ -27,6 +28,7 @@ try {
   db.transaction(() => {
     const cols = db.prepare('PRAGMA table_info(chat_command_receipts)').all() as Array<{ name: string }>
     if (!cols.some((c) => c.name === 'operation')) db.exec('ALTER TABLE chat_command_receipts ADD COLUMN operation TEXT')
+    if (!cols.some((c) => c.name === 'delegation')) db.exec('ALTER TABLE chat_command_receipts ADD COLUMN delegation TEXT')
     db.exec('CREATE INDEX IF NOT EXISTS chat_command_receipts_time ON chat_command_receipts(instance, created_at)')
   }).immediate()
 } catch (error) {
@@ -50,10 +52,11 @@ function failure(id: string, code: string, error: string): Ack {
   return { kind: 'ack', id, ok: false, code, error }
 }
 
-const reserve = db.transaction((instance: string, id: string, fingerprint: string, createdAt: string, operation: string | null): { fresh: boolean, receipt: Receipt } => {
-  const result = db.prepare(`INSERT INTO chat_command_receipts (instance, request_id, fingerprint, ack, created_at, operation)
-    VALUES (?, ?, ?, NULL, ?, ?) ON CONFLICT(instance, request_id) DO NOTHING`)
-    .run(instance, id, fingerprint, createdAt, operation)
+const reserve = db.transaction((instance: string, id: string, fingerprint: string, createdAt: string, operation: string | null,
+  delegation: DelegatedAuthority | undefined): { fresh: boolean, receipt: Receipt } => {
+  const result = db.prepare(`INSERT INTO chat_command_receipts (instance, request_id, fingerprint, ack, created_at, operation, delegation)
+    VALUES (?, ?, ?, NULL, ?, ?, ?) ON CONFLICT(instance, request_id) DO NOTHING`)
+    .run(instance, id, fingerprint, createdAt, operation, delegation ? JSON.stringify(delegation) : null)
   const receipt = db.prepare('SELECT fingerprint, ack FROM chat_command_receipts WHERE instance = ? AND request_id = ?')
     .get(instance, id) as Receipt
   return { fresh: result.changes === 1, receipt }
@@ -67,7 +70,7 @@ export function executeCommandOnce(
   id: string,
   command: unknown,
   execute: () => Promise<Ack>,
-  options?: { now?: () => number, operation?: string },
+  options?: { now?: () => number, operation?: string, delegation?: DelegatedAuthority },
 ): Promise<Ack> {
   let fingerprint: string
   try { fingerprint = createHash('sha256').update(canonical(command)).digest('hex') }
@@ -80,7 +83,7 @@ export function executeCommandOnce(
   }
   if (active.size >= MAX_ACTIVE) return Promise.resolve(failure(id, 'overloaded', 'too many commands are in flight; nothing was executed'))
   let reserved: ReturnType<typeof reserve>
-  try { reserved = reserve.immediate(instance, id, fingerprint, new Date((options?.now ?? Date.now)()).toISOString(), options?.operation ?? null) }
+  try { reserved = reserve.immediate(instance, id, fingerprint, new Date((options?.now ?? Date.now)()).toISOString(), options?.operation ?? null, options?.delegation) }
   catch { return Promise.resolve(failure(id, 'receipt_unavailable', 'could not reserve the command safely; nothing was executed')) }
   if (reserved.receipt.fingerprint !== fingerprint) {
     return Promise.resolve(failure(id, 'request_id_conflict', 'this request ID was already used for a different command'))

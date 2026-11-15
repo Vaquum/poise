@@ -1,4 +1,5 @@
 export const MCP_READ_PATH = '/api/mcp/read'
+export const MCP_CONTROL_PATH = '/api/mcp/manager'
 export const MCP_SCOPE = 'poise:read'
 export const MCP_RESPONSE_BYTES = 128 * 1024
 const MCP_RECORD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
@@ -34,6 +35,18 @@ export const MCP_TOOLS = [
 ] as const
 
 export const MCP_WORK_TOOL_NAMES = ['poise_describe', 'poise_work'] as const
+export const MCP_MANAGER_TOOLS = [
+  { name: 'poise_action_preview', description: 'Preview a delegated Manager send, steer, stop or supervision. Shows the exact effect and current Chat sequence. Requires separately granted Manager controls.',
+    inputSchema: { type: 'object', required: ['operation', 'sessionId'],
+      properties: { operation: { enum: ['send', 'steer', 'stop', 'supervise'] }, sessionId: { type: 'string', pattern: MCP_RECORD_ID.source },
+        text: { type: 'string', minLength: 1, maxLength: 2000 }, intervalMinutes: { type: 'integer', minimum: 1, maximum: 1440 } },
+      additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: false } },
+  { name: 'poise_action_apply', description: 'Apply the exact confirmed Manager preview. Reuse its preview on retry to get the original outcome.',
+    inputSchema: { type: 'object', required: ['preview'],
+      properties: { preview: { type: 'string', minLength: 1, maxLength: 12000 } }, additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } },
+] as const
 export interface McpGrantScope {
   resource: string
   ownerId: number
@@ -42,6 +55,7 @@ export interface McpGrantScope {
   chatMetadata?: true
   chatList?: true
   chatTranscript?: true
+  managerClientId?: string
   repository?: string
 }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
@@ -53,6 +67,41 @@ export type McpRead = { name: 'poise_describe'; arguments: Record<string, never>
   | { name: 'poise_get'; arguments: McpGetArguments }
   | { name: 'poise_list'; arguments: McpChatListArguments }
   | { name: 'poise_changes'; arguments: McpChatChangesArguments }
+export type McpManagerAction = { operation: 'send' | 'steer'; sessionId: string; text: string }
+  | { operation: 'stop'; sessionId: string }
+  | { operation: 'supervise'; sessionId: string; text: string; intervalMinutes: number }
+export type McpManagerRequest = { name: 'poise_action_preview'; arguments: McpManagerAction }
+  | { name: 'poise_action_apply'; arguments: { preview: string } }
+export type McpRequest = McpRead | McpManagerRequest
+
+export const isMcpManagerTool = (name: unknown): name is McpManagerRequest['name'] =>
+  MCP_MANAGER_TOOLS.some(tool => name === tool.name)
+
+export function parseMcpManagerRequest(value: unknown): McpManagerRequest {
+  if (!value || typeof value !== 'object' || !('name' in value) || !isMcpManagerTool(value.name)
+    || !('arguments' in value) || !value.arguments || typeof value.arguments !== 'object' || Array.isArray(value.arguments)
+    || Object.keys(value).length !== 2) throw new Error('invalid Manager request')
+  const args = value.arguments as Record<string, unknown>
+  if (value.name === 'poise_action_apply') {
+    if (Object.keys(args).length !== 1 || typeof args.preview !== 'string' || !args.preview || args.preview.length > 12000) {
+      throw new Error('provide a valid Manager action preview')
+    }
+    return { name: value.name, arguments: { preview: args.preview } }
+  }
+  const { operation, sessionId, text, intervalMinutes } = args
+  if (!isMcpRecordId(sessionId)) throw new Error('provide an exact Chat session ID')
+  if (operation === 'stop' && Object.keys(args).length === 2) return { name: value.name, arguments: { operation, sessionId } }
+  if (typeof text === 'string' && text.trim() && text.length <= 2000 && Buffer.byteLength(JSON.stringify(text)) <= 7000) {
+    if ((operation === 'send' || operation === 'steer') && Object.keys(args).length === 3) {
+      return { name: value.name, arguments: { operation, sessionId, text: text.trim() } }
+    }
+    if (operation === 'supervise' && Object.keys(args).length === 4 && Number.isSafeInteger(intervalMinutes)
+      && Number(intervalMinutes) >= 1 && Number(intervalMinutes) <= 1440) {
+      return { name: value.name, arguments: { operation, sessionId, text: text.trim(), intervalMinutes: Number(intervalMinutes) } }
+    }
+  }
+  throw new Error('provide a supported Manager action and its exact text')
+}
 
 export const isMcpRecordId = (value: unknown): value is string => typeof value === 'string' && MCP_RECORD_ID.test(value)
 
@@ -62,11 +111,12 @@ export const isMcpRepository = (value: unknown): value is string => typeof value
 export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
   scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
-export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript'>): string[] {
+export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'managerClientId'>): string[] {
   const tools: string[] = [...MCP_WORK_TOOL_NAMES]
   if (scope.chatMetadata === true) tools.push('poise_get')
   if (scope.chatMetadata === true && scope.chatList === true) tools.push('poise_list')
   if (scope.chatTranscript === true) tools.push('poise_changes')
+  if (scope.managerClientId) tools.push(...MCP_MANAGER_TOOLS.map(tool => tool.name))
   return tools
 }
 

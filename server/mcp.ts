@@ -29,7 +29,7 @@ function readChatRecord(instance: string, grant: McpGrantScope, { kind, id }: Mc
 
 /** This scope terminates here, before ordinary workspace API dispatch. */
 export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, service: ServiceConfig | null,
-  authority: RequestAuthority, chatInstance?: string): Promise<void> {
+  authority: RequestAuthority, chatInstance?: string, managerRunning = false): Promise<void> {
   if (!service || authority.kind !== 'gateway' || authority.scope !== 'mcp' || !authority.mcp) throw new HttpError(403, 'an MCP read assertion is required')
   if (req.method !== 'POST' || req.url !== MCP_READ_PATH) throw new HttpError(405, `MCP reads require POST ${MCP_READ_PATH}`)
   const read = parseMcpRead(await readJson<unknown>(req, 16 * 1024))
@@ -49,7 +49,7 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
     page = read.name === 'poise_list' ? readMcpChatList(chatInstance, authority.mcp, read.arguments)
       : readMcpChatChanges(chatInstance, authority.mcp, read.arguments)
   }
-  const tools = mcpToolNames(chatInstance ? authority.mcp : {})
+  const tools = mcpToolNames({ ...(chatInstance ? authority.mcp : {}), managerClientId: managerRunning ? authority.mcp.managerClientId : undefined })
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },
     ...(read.name === 'poise_describe' ? { inventory: mcpInventory() } : {}),
     ...(work ? { work } : {}), ...(lookup ? { lookup } : {}), ...(page ? { page } : {}) })
