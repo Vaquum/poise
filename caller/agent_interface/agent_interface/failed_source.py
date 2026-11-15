@@ -329,7 +329,7 @@ def inspect(database: Path, call_id: str, candidate: str, run: str, diagnosis: s
         for storage_key, value in rows:
             report = json.loads(value)
             key = storage_key[len(prefix):]
-            if (hold is None or report.get("holdSequence") == hold) \
+            if (hold is None or report.get("holdSequence") == hold and report.get("adopted") is not True) \
                     and _report_matches(report, source, call_id, original["correlation_id"], key):
                 reports.append(key)
         if len(reports) != 1 or selected is not None and reports[0] != selected:

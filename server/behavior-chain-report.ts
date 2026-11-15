@@ -1560,7 +1560,7 @@ function originalTriageSource(db: Database, chain: BehaviorChain, observation: C
   const attempt = report.attempts[0]
   if (!qualified || !original || !prepared || !base || !/^[a-f0-9]{40}$/.test(base) || !observation.issue.eligible
     || chain.ciHold || chain.testHold || chain.repairRecovery || observation.workPublication || observation.prerequisites?.wait
-    || report.pull !== null || report.head !== null || report.attempts.length !== 1
+    || report.pull !== null || report.head !== null || report.adopted === true || report.attempts.length !== 1
     || report.holdSequence !== qualified.hold.sequence || report.heldAt !== qualified.hold.at
     || report.basis !== original.basis || report.slot !== original.slot || attempt?.invocation !== original.id
     || attempt.call !== qualified.call || attempt.completedAt !== original.evidence?.completedAt
@@ -1598,7 +1598,7 @@ function triageInputs(db: Database, source: BehaviorChain, observation: ChainObs
   const reported = String(original.original.evidence?.error ?? '')
   const capture = parseFailedSource(artifact.failed_source)
   const named = /\bCaptured candidate\b(.*)/i.exec(reported)?.[1]
-  const identity = named?.match(/^(?: digest)?:?\s+([a-f0-9]{64});\s+(?:original producing relay run:|producing run)\s+([a-f0-9]{32})\b/i)
+  const identity = named?.match(/^(?: digest)?:?\s+([a-f0-9]{64});\s+(?:original )?producing (?:relay )?run:?\s+([a-f0-9]{32})\b/i)
   const retained = capture?.status === 'available' && capture.base === original.prepared && capture.expires_at * 1000 > Date.now()
     && (named === undefined || capture.candidate === identity?.[1] && capture.run === identity[2]) ? capture : null
   return { source: source.id, report: chain.issue, reportKey: report.key, holdSequence: original.hold.sequence,
@@ -1650,8 +1650,7 @@ async function recoverImplementationTriage(db: Database, journal: BehaviorChainJ
   if (report.disposition && !report.disposition.triage) return null
   const target = journal.read(chainIdentity(source.repository, report.issueNumber!))
   if (!target || target.held || !target.observation) return pending('the report needs its settled current issue review')
-  // The ordinary report binder also owns scoped reports once their admission
-  // fence recognizes them. Generated and independently authored remedies differ.
+  // Use the ordinary admission binding for both original and scoped reports.
   if (chainBasis(implementationReport(db, target)) !== chainBasis(report)) return null
   if (report.recheck) return null
   const fresh = await verify(target)

@@ -1666,25 +1666,51 @@ it.each(['clean failure', 'candidate-only', 'missing', 'different failure'] as c
     if (mode === 'candidate-only') expect(probes).toEqual([subject(1).trim(), subject(2).trim()])
   }, 30_000)
 
-it.each(['distinct-fix', 'source-only', 'missing evidence', 'mismatched capture', 'stale report', 'stale base', 'stale during source preparation',
+it.each(['distinct-fix', 'source-only', 'scoped distinct-fix', 'scoped source-only', 'missing evidence', 'mismatched capture', 'stale report', 'stale base', 'stale during source preparation',
   'stale during report preparation', 'publication', 'operator hold', 'interrupted'] as const)(
   'diagnoses the current reviewed pre-PR hold through ordinary admission (%s)', async mode => {
     const root = mkdtempSync(join(tmpdir(), 'implementation-triage-')); roots.push(root)
     const path = join(root, 'journal.sqlite')
     let { db, journal } = setup(path)
-    const sourceOnly = mode === 'source-only' || mode === 'stale during source preparation'
+    const sourceOnly = mode === 'source-only' || mode === 'scoped source-only' || mode === 'stale during source preparation'
+    const scoped = mode === 'scoped distinct-fix' || mode === 'scoped source-only'
+    const reportNumber = scoped ? 100 : 99
+    const test = scoped ? 'reproduces the follow-up assertion'
+      : 'refreshes one held red candidate and reconciles its original Call across restart and another base advance: accepted response'
+    if (scoped) {
+      const previous = blockedImplementation(journal)
+      previous.call.error = ingressError('a'.repeat(64), 'b'.repeat(32))
+      previous.call.diagnostic = prePrDiagnostic()
+      await new BehaviorChainRuntime(journal, operations(db, journal, {
+        observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+        readInvocations: async () => ({ entries: [previous.call], quarantined: [] }),
+      })).run()
+      expect(posts()).toHaveLength(1)
+      remote[0].state = 'closed'
+      record(journal, journal.read(previous.chain.id)!, { type: 'chain.resumed' })
+    }
     const capture = { status: 'available', base: HEAD, candidate: 'd'.repeat(64), run: 'c'.repeat(32), bytes: 1024,
       sha256: '6'.repeat(64), expires_at: NOW / 1000 + 86400 }
     const { call } = blockedImplementation(journal)
-    call.error = INCIDENT_1855
+    call.error = scoped ? `atomic behavior blocked: tests/behavior-chain-reconciliation.test.ts > ${test} (tests/behavior-chain-reconciliation.test.ts:189): AssertionError: expected 'CI failed' to be null. Captured candidate ${capture.candidate}; producing relay run ${capture.run}` : INCIDENT_1855
+    if (scoped) call.diagnostic = prePrDiagnostic()
     call.artifact = { ...call.artifact!, prepared: { repository: 'acme/repo', issue_number: 7, branch: 'poise/issue-7',
       actor: 'author', checkout_head: HEAD, pull_number: null, head_sha: null },
       ...(sourceOnly ? { failed_source: capture }
         : mode === 'mismatched capture' ? { failed_source: { ...capture, run: '7'.repeat(32) } } : {}) }
-    fresh.prerequisites = { wait: null, base: HEAD, evidence: [] }
-    const fixture = await reviewedImplementationReport(db, journal, call)
+    fresh.prerequisites = prePrPrerequisites([])
+    const fixture = await reviewedImplementationReport(db, journal, call, reportNumber)
+    if (scoped) {
+      expect(posts()).toHaveLength(2)
+      const binding = implementationReportBinding(db, journal.read(`acme/repo#${reportNumber}`)!)!
+      expect(binding.key).toBe(chainBasis(['atomic_work_blocked', 'acme/repo#7', call.correlation_id, binding.holdSequence]))
+    }
     const invoke = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-interface' && args[0] === '--read-issue' && args[2] === '--delivery-base') {
+        expect(args.slice(1, 4)).toEqual([String(reportNumber), '--delivery-base', HEAD])
+        return { stdout: JSON.stringify({ repository: 'acme/repo', issue_number: reportNumber, verified: false }), stderr: '' }
+      }
       if (command === 'agent-interface') {
         expect(sourceOnly).toBe(true)
         expect(args).toEqual(['--read-failed-source', fixture.call.id, capture.candidate, capture.run, '--diagnosis', expect.stringMatching(/^[a-f0-9]{64}$/)])
@@ -1693,6 +1719,7 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'mismatched capture'
       return invoke(command, args, options)
     })
     const source = journal.read('acme/repo#7')!
+    const originals = source.invocations.filter(item => item.behavior === 'implement-issue').length
     const runTriage = async () => {
       const current = journal.read(source.id)!
       return recoverReportedRepair(db, journal, current, await fixture.overrides.observe(current), fixture.overrides.observe, () => true)
@@ -1713,7 +1740,7 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'mismatched capture'
       expect(mocks.diagnose).toHaveBeenCalledOnce()
       expect(mocks.diagnose).toHaveBeenCalledWith('acme/repo', 'author', HEAD, HEAD,
         { file: 'tests/behavior-chain-reconciliation.test.ts',
-          test: 'refreshes one held red candidate and reconciles its original Call across restart and another base advance: accepted response',
+          test,
           message: "expected 'CI failed' to be null" },
         sourceOnly ? { path: '/private/fixture-capture', call: fixture.call.id, capture } : null, expect.any(AbortSignal))
       if (mode === 'stale report') remote[0].body += '\nRevised scope'
@@ -1746,14 +1773,14 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'mismatched capture'
       })
     }
     await runtime().run()
-    const report = journal.read('acme/repo#99')!
+    const report = journal.read(`acme/repo#${reportNumber}`)!
     const current = journal.read(source.id)!
     const reportImplementations = report.invocations.filter(item => item.behavior === 'implement-issue')
     const sourceImplementations = current.invocations.filter(item => item.behavior === 'implement-issue')
-    if (mode === 'source-only') {
+    if (mode === 'source-only' || mode === 'scoped source-only') {
       expect(reportImplementations).toHaveLength(0)
-      expect(sourceImplementations).toHaveLength(2)
-      const retry = sourceImplementations[1]
+      expect(sourceImplementations).toHaveLength(originals + 1)
+      const retry = sourceImplementations.at(-1)!
       expect(current.testRecovery).toMatchObject({ base: HEAD, admission: retry.id,
         hold: { invocationId: fixture.call.correlation_id, callId: fixture.call.id } })
       expect(retry.request.implementationSource?.id).toBe(report.id)
@@ -1765,25 +1792,25 @@ it.each(['distinct-fix', 'source-only', 'missing evidence', 'mismatched capture'
         resources_settled_at: new Date(Date.now()).toISOString() }]).run()
       await runtime().run()
       expect(journal.read(source.id)?.held).toBe(fixture.call.error)
-      expect(journal.read(source.id)?.invocations.filter(item => item.behavior === 'implement-issue')).toHaveLength(2)
+      expect(journal.read(source.id)?.invocations.filter(item => item.behavior === 'implement-issue')).toHaveLength(originals + 1)
       expect(fixture.launch).toHaveBeenCalledOnce()
       expect(mocks.diagnose).toHaveBeenCalledOnce()
-    } else if (mode === 'distinct-fix') {
+    } else if (mode === 'distinct-fix' || mode === 'scoped distinct-fix') {
       expect(reportImplementations).toHaveLength(1)
       expect(reportImplementations[0].request.implementationSource?.id).toBe(source.id)
       expect(reportImplementations[0].request.argv.at(-1)).toContain('https://github.com/acme/repo/issues/7')
-      expect(sourceImplementations).toHaveLength(1)
+      expect(sourceImplementations).toHaveLength(originals)
       expect(current.held).toBe(source.held)
       expect(fixture.launch).toHaveBeenCalledOnce()
     } else if (mode === 'stale during source preparation' || mode === 'stale during report preparation') {
       expect(fixture.request).toHaveBeenCalledOnce()
       expect(fixture.launch).not.toHaveBeenCalled()
       expect(reportImplementations).toHaveLength(0)
-      expect(sourceImplementations).toHaveLength(1)
+      expect(sourceImplementations).toHaveLength(originals)
       expect(current.testRecovery?.admission).toBeUndefined()
     } else {
       expect(reportImplementations).toHaveLength(0)
-      expect(sourceImplementations).toHaveLength(1)
+      expect(sourceImplementations).toHaveLength(originals)
       expect(current.held).toBeTruthy()
       expect(implementationReportBinding(db, report)?.disposition).toBeNull()
       expect(mocks.diagnose).toHaveBeenCalledTimes(blocked ? 0 : mode === 'stale base' ? 2 : 1)
