@@ -1868,10 +1868,11 @@ on the held source through the existing report metadata and journal waits.
 This adds no retry or checkout-retention authority; see
 [report triage](Behavior-chain.md#reporting-verified-repair-exhaustion).
 The existing linked remediation also exposes bounded private source evidence
-from the original failed validation capture, retained through normal checkout
-cleanup under the workspace's incident-artifact lifecycle. Only its availability
-and capture identity enter receipts and reports; source bytes stay in the owning
-workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
+from failed validation, including interrupted runs with a recorded Vitest
+assertion diagnostic. Caller retains it through normal checkout cleanup under
+the workspace's incident-artifact lifecycle. Receipts and reports carry its
+availability and capture identity. The interrupted marker and source bytes stay
+in the owning workspace. [Caller's inspection contract](../caller/agent_interface/README.md#inspecting-failed-unpublished-source)
 defines binding, access, limits and expiry without granting recovery authority.
 Terminal repair reports require the matching automatic hold, settled original Call,
 positive release and unchanged open PR head and repair basis, without possible

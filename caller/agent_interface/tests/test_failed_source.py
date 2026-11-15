@@ -107,7 +107,8 @@ def linked_reader(monkeypatch, original, issue=99):
 
 
 @pytest.mark.parametrize("publish", [False, True])
-def test_original_failed_candidate_survives_cleanup_only_for_blocked_unpublished_call(workspace, monkeypatch, publish):
+@pytest.mark.parametrize("disposition", ["1", "interrupted"])
+def test_original_failed_candidate_survives_cleanup_only_for_blocked_unpublished_call(workspace, monkeypatch, publish, disposition):
     validation = {}
 
     def interface(*args, **kwargs):
@@ -128,13 +129,13 @@ def test_original_failed_candidate_survives_cleanup_only_for_blocked_unpublished
         result = subprocess.run(["node", "--test", "tests/candidate.test.cjs"],
                                 cwd=box / str(checkout).lstrip("/"), capture_output=True, text=True)
         assert result.returncode == 1 and "candidate-only regression" in result.stdout and "1 !== 2" in result.stdout
-        saved = subprocess.run(["agent-interface", "--capture-failed-source", str(archive), str(spec), candidate, RUN, "1"],
+        (checkout / "source.cjs").write_text("module.exports=2; // untested B\n")
+        (checkout / "tests/candidate.test.cjs").write_text("// later untested B\n")
+        saved = subprocess.run(["agent-interface", "--capture-failed-source", str(archive), str(spec), candidate, RUN, disposition],
                                env=env, capture_output=True, text=True, timeout=30)
         assert saved.returncode == 0, saved.stderr
         assert not saved.stdout, "source must not enter Caller stdout"
         validation.update(candidate=candidate, run=RUN, checkout=checkout)
-        (checkout / "source.cjs").write_text("module.exports=2; // untested B\n")
-        (checkout / "tests/candidate.test.cjs").write_text("// later untested B\n")
         (checkout.parent / "publication.json").write_text(json.dumps({
             "commitMessage": "fix: fixture", "title": "fix: fixture", "body": "Fixture correction", "replies": [],
             "blocked": None if publish else f"candidate-only regression: 1 !== 2; candidate {candidate}; run {RUN}"}))
@@ -163,7 +164,9 @@ def test_original_failed_candidate_survives_cleanup_only_for_blocked_unpublished
         assert not list((workspace / ".poise/incident-recovery").iterdir())
         return
     assert evidence["status"] == "available"
+    assert "validation" not in original["artifact"]["failed_source"]
     manifest = json.loads(Path(evidence["path"]).read_bytes())
+    assert manifest.get("validation") == ("interrupted" if disposition == "interrupted" else None)
     changes = {change["path"]: change for change in manifest["changes"]}
     assert set(changes) == {"source.cjs", "deleted.cjs", "tests/candidate.test.cjs"}
     assert base64.b64decode(changes["source.cjs"]["content"]) == b"module.exports=1;\n"
@@ -199,18 +202,21 @@ def test_unbound_or_oversized_capture_is_explicitly_unavailable(retained, monkey
         outside = work / "outside"
         outside.mkdir()
         (Path(os.environ["POISE_DB"]).parent / "incident-recovery").symlink_to(outside, target_is_directory=True)
-    metadata = failed_source.capture(api.DB, archive, spec, candidate, RUN, 1)
+    metadata = failed_source.capture(api.DB, archive, spec, candidate, RUN, None)
     assert metadata["status"] == "unavailable" and "reason" in metadata
     assert "content" not in json.dumps(metadata)
 
 
-@pytest.mark.parametrize("cause", ["candidate", "run", "expiry", "missing", "tampered", "foreign workspace", "unlinked remediation"])
+@pytest.mark.parametrize("cause", ["candidate", "run", "expiry", "missing", "tampered", "foreign workspace",
+                                   "unlinked remediation", "unreleased", "possible publication"])
 def test_inspection_refuses_unavailable_or_unauthorized_evidence(retained, monkeypatch, cause):
     call, work, archive, spec, candidate = retained
-    assert failed_source.capture(api.DB, archive, spec, candidate, RUN, 1)["status"] == "available"
+    assert failed_source.capture(api.DB, archive, spec, candidate, RUN, None)["status"] == "available"
     with api.db() as conn:
         conn.execute("update calls set status='failed', error_code='atomic_work_blocked',action='not_started',outcome='preflight_failed',resources_settled_at=? where id=?",
-                     (failed_source.time(), call))
+                     (None if cause == "unreleased" else failed_source.time(), call))
+        if cause == "possible publication":
+            conn.execute("update calls set artifact=json_set(artifact,'$.plan_sha',?) where id=?", ("d" * 64, call))
     original, = api.logs_selected({"latest": [], "ids": [call]})
     linked_reader(monkeypatch, original, issue=100 if cause == "unlinked remediation" else 99)
     run = RUN
