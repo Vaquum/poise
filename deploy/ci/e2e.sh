@@ -831,7 +831,7 @@ check_mcp() {
   done
   node "$root/scripts/package-poise-plugin.mjs" "https://$domain" "$work/poise-plugin"
   node "$here/mcp-client.mjs" "$apex/mcp" "$work/poise-plugin"
-  in_workspace python3 -c "import sqlite3; c=sqlite3.connect('/home/poise/mcp-fixture.sqlite'); c.execute(\"UPDATE sync_state SET updated_at='2000-01-01T00:00:00Z' WHERE scope='org' AND key='last_sync_at'\"); c.commit(); c.close()"
+  docker exec poise-ws-bob python3 -c "import sqlite3; c=sqlite3.connect('/home/poise/mcp-fixture.sqlite'); c.execute(\"UPDATE sync_state SET updated_at='2000-01-01T00:00:00Z' WHERE scope='org' AND key='last_sync_at'\"); c.commit(); c.close()"
   node "$here/mcp-client.mjs" "$apex/mcp" --stale
   pass "MCP OAuth and work trail through the installed gateway and workspaces"
 }

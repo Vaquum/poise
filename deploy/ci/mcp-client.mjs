@@ -81,23 +81,26 @@ async function acceptance(endpoint) {
     assert.deepEqual(description.capabilities.tools, ['poise_describe', 'poise_work'])
     assert.equal((await tool(bob.client, 'poise_describe')).workspace, 'bob')
     const selector = { repository: 'fixtures/work', label: 'poise', limit: 2 }
-    const { work: page } = await tool(alice.client, 'poise_work', selector)
+    // Bob's home is newly provisioned. Alice's restored live backup can
+    // correctly retain a prior ledger gap, which cannot establish absence.
+    const { work: page } = await tool(bob.client, 'poise_work', selector)
     assert.equal(page.coverage.issues.status, 'fresh')
-    assert.deepEqual(page.items.map(row => [row.issue, row.stage]), [[1, 'not_recorded'], [2, 'delayed']])
+    assert.deepEqual(page.items.map(row => [row.issue, row.stage]), [[1, 'not_recorded'], [2, 'delayed']],
+      JSON.stringify(page.items.map(row => ({ issue: row.issue, coverage: row.coverage, ledger: row.ledger.map(source => source.health) }))))
     assert.equal(page.items[0].author, 'third-party')
     assert.equal(page.items[0].chain, null)
     assert.deepEqual(page.items[0].receipts, [])
     assert.match(page.items[1].blocker, /capacity/)
     assert.ok(page.nextCursor)
     const continuation = { ...selector, cursor: page.nextCursor }
-    const { work: next } = await tool(alice.client, 'poise_work', continuation)
+    const { work: next } = await tool(bob.client, 'poise_work', continuation)
     assert.deepEqual(next.items.map(row => row.issue), [3, 4])
     assert.deepEqual(next.items.map(row => [row.github.mergeSha, row.reviewStatus]), [['b'.repeat(40), 'complete'], ['b'.repeat(40), 'pending']])
     assert.equal(next.items[1].stage, 'merged_review_pending')
-    const { work: missing } = await tool(alice.client, 'poise_work', { repository: 'fixtures/work', issue: 5 })
+    const { work: missing } = await tool(bob.client, 'poise_work', { repository: 'fixtures/work', issue: 5 })
     assert.equal(missing.items[0].coverage.receipts.status, 'partial')
     assert.equal(missing.items[0].receipts[0].coverage, 'not-recorded')
-    await assert.rejects(bob.client.callTool({ name: 'poise_work', arguments: continuation }))
+    await assert.rejects(alice.client.callTool({ name: 'poise_work', arguments: continuation }))
     console.log('MCP discovery, OAuth, initialize, both tools, two owners and native work-trail evidence passed')
   } finally { await Promise.all([alice.client.close(), bob.client.close()]) }
 }
@@ -106,7 +109,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const endpoint = process.argv[2]
   assert.ok(endpoint, 'Usage: node deploy/ci/mcp-client.mjs ENDPOINT')
   if (process.argv[3] === '--stale') {
-    const connection = await connectPoise(endpoint, 'alice')
+    const connection = await connectPoise(endpoint, 'bob')
     try {
       const { work } = await tool(connection.client, 'poise_work', { repository: 'fixtures/work', issue: 1 })
       assert.equal(work.coverage.issues.status, 'stale')
