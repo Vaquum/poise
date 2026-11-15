@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 from tempfile import TemporaryDirectory
+from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -532,14 +533,31 @@ def test_repair_deadline_continuation(workspace, monkeypatch, variant):
     monkeypatch.setattr(issue_review, "_issue", lambda *args: seed)
     monkeypatch.setattr(issue_review, "interface", interface)
     monkeypatch.setattr(atomic_work.checkout_lock, "Lease", REAL_LEASE)
-    monkeypatch.setattr(atomic_work.checkout_lock, "run_gated", REAL_RUN_GATED)
     monkeypatch.setattr(review_budget, "timeout", lambda *args, **kwargs: 1)
     edit = "" if variant == "no edits" else f"Path('source.cjs').write_text({corrected!r})"
     if variant == "oversized edit":
         edit = f"Path('source.cjs').write_bytes(b'x' * {failed_source.MAX_BYTES + 1})"
-    script = f"from pathlib import Path\nfrom time import sleep\n{edit}\nsleep(10)"
+    script = f"from pathlib import Path\nfrom threading import Event\n{edit}\nPath('../provider-ready').touch()\nEvent().wait()"
     monkeypatch.setattr(issue_review, "command", lambda *args: (_deadline_provider(script), "", None))
-    with pytest.raises(review_budget.ReviewLimitError):
+
+    def ready_deadline(lease, args, *, cwd, **kwargs):
+        ready = Path(cwd).parent / "provider-ready"
+        started = monotonic()
+
+        def gate_clock():
+            now = monotonic()
+            return now if ready.exists() or now - started >= 15 else started
+
+        # Give the stand-in time to write before expiring the real lease gate.
+        with monkeypatch.context() as gate:
+            gate.setattr(atomic_work.checkout_lock, "monotonic", gate_clock)
+            try:
+                return REAL_RUN_GATED(lease, args, cwd=cwd, **kwargs)
+            finally:
+                assert ready.is_file(), "the deadline fixture never reached its edit boundary"
+
+    with monkeypatch.context() as gate, pytest.raises(review_budget.ReviewLimitError):
+        gate.setattr(atomic_work.checkout_lock, "run_gated", ready_deadline)
         run_attempt("repair-original")
 
     original, = api.logs_selected({"latest": [], "ids": [], "correlations": ["repair-original"]})
@@ -603,6 +621,7 @@ Path('../publication.json').write_text({json.dumps(output)!r})
         return _deadline_provider(script), "", None
 
     monkeypatch.setattr(review_budget, "timeout", lambda *args, **kwargs: 30)
+    monkeypatch.setattr(atomic_work.checkout_lock, "run_gated", REAL_RUN_GATED)
     monkeypatch.setattr(issue_review, "command", successor_command)
     if publishes:
         run_attempt("repair-successor", original["id"])
