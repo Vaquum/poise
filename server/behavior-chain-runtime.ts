@@ -13,6 +13,7 @@ import { attributedNativeAction, matchingNativeActionReceipt, nativeActionReceip
 import { behaviorErrorMessage } from './behavior-diagnostics'
 import { classifyBehaviorDiagnostic } from '../src/behavior-failure-cause'
 import { CallerReceiptStoreError } from './service/caller-calls'
+import { resumeLink } from './review-response'
 import { diagnostic } from './logging'
 import { resumeReviewArgument, yieldedFinalization, yieldedReview } from './review-continuation'
 
@@ -1431,9 +1432,13 @@ export class BehaviorChainRuntime {
     }
     if (resourcesSettled && invocation.state === 'uncertain' && typeof nativeId === 'string' && observation.pull) {
       const expected = invocation.request.argv[invocation.request.argv.indexOf('--expected-head') + 1]
-      const review = observation.pull.reviewReceipts.find((receipt) => receipt.invocation === nativeId && receipt.head === expected)
-      const action = review?.state === 'APPROVED' ? 'approved' : review?.state === 'CHANGES_REQUESTED' ? 'requested_changes' : review?.state === 'COMMENTED' ? 'reviewed_clean' : null
       const artifact = invocation.evidence?.artifact as Record<string, unknown> | null
+      // A resumed finalizer publishes under its original marker; the
+      // response check below revalidates the resumed binding either way.
+      const resumedFrom = resumeLink(artifact)
+      const review = observation.pull.reviewReceipts.find((receipt) => (receipt.invocation === nativeId
+        || receipt.invocation === resumedFrom?.callId) && receipt.head === expected)
+      const action = review?.state === 'APPROVED' ? 'approved' : review?.state === 'CHANGES_REQUESTED' ? 'requested_changes' : review?.state === 'COMMENTED' ? 'reviewed_clean' : null
       const coverage = (artifact?.review_response as { coverage?: unknown } | null)?.coverage
       // A published partial keeps its incomplete disposition; the failed call outcome cannot speak for it.
       const partial = action === 'requested_changes' && coverage === 'incomplete'

@@ -55,6 +55,27 @@ it('fences a pending native review despite green CI and a separate approval, the
   expect(chainReviewClearance(chain, observation, NOW)).toBeNull()
 })
 
+it('clears a resumed finalizer whose marker and review ID span the original and resuming calls', () => {
+  const { chain, observation, invocation, pull, result } = fixture()
+  const original = 'a'.repeat(32), resumer = 'c'.repeat(32)
+  const response = { ...((invocation.evidence!.artifact as Record<string, unknown>).review_response as Record<string, unknown>),
+    invocation_id: original }
+  invocation.callId = original
+  invocation.evidence = { status: 'deferred', action: 'not_started', outcome: 'review_continuation_required' }
+  const resumed: ChainInvocation = { ...structuredClone(invocation), id: 'native-review-resumed', callId: resumer,
+    admittedAt: NOW - 1000, state: 'settled', outcome: 'clean',
+    evidence: { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 91, head_sha: HEAD,
+      completedAt: NOW, artifact: { review_response: response, review_resume: { root_call: original, generation: 2,
+        basis: 'b'.repeat(64), slot: 'primary', publication_call: original,
+        publisher_started_at: new Date(NOW - 2000).toISOString() } } } }
+  chain.invocations = [invocation, resumed]
+  observation.pull!.reviewReceipts = [{ id: 91, head: HEAD, state: 'COMMENTED', invocation: original, response, submittedAt: NOW }]
+  pull.reviews = [{ id: 91, head: HEAD, state: 'COMMENTED', actor: chain.reviewer, invocation: original, response,
+    submittedAt: new Date(NOW).toISOString() }]
+  expect(result()[0]).toMatchObject({ conclusion: 'success' })
+  expect(chainReviewClearance(chain, observation, NOW)).toBeNull()
+})
+
 it('checks every configured slot and rejects missing, stale, unavailable or dismissed native receipts', () => {
   const { observation, invocation, pull, result } = fixture()
   observation.prReviewers.push({ slot: 'secondary', model: 'other', recovery: 'other' })
