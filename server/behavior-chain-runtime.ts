@@ -3,7 +3,7 @@ import { DATASTORE_MAX_AGE_SECONDS, staleDatastoreFailure } from './datastore-he
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -44,6 +44,8 @@ export interface ChainRuntimeOperations {
   resumePublication(invocation: ChainInvocation, head: string, correlation: string): Promise<Record<string, unknown>>
   /** True only when Caller won the original correlation without a worker. */
   fenceClosedTarget(chain: BehaviorChain, invocation: ChainInvocation): Promise<boolean>
+  /** True when the original implementation is fenced for cooperative retirement. */
+  retireClosedImplementation?(chain: BehaviorChain, invocation: ChainInvocation, call: LogEntry): Promise<boolean>
   wake(): void
 }
 
@@ -75,6 +77,30 @@ function beforeNativeScope(call: LogEntry): boolean {
     && call.action === 'not_started' && call.outcome === 'preflight_failed' && call.head_sha === null
     && !call.artifact && !call.receipts && !call.review_id && !call.response && !call.runner && !call.resource_guard
     && ownership?.version === 1 && ownership.roots.length === 0 && ownership.errors.length === 0 && !ownership.process_pending
+}
+
+function implementBeforePublication(call: LogEntry): boolean {
+  const artifact = call.artifact as Record<string, unknown> | null
+  return call.behavior === 'implement_issue' && call.head_sha === null && call.review_id == null && call.receipts == null
+    && artifact !== null && typeof artifact === 'object'
+    && ['preparing', 'prepared', 'executing'].includes(String(artifact.phase))
+    && artifact.plan_sha == null && artifact.publication_head == null
+    && artifact.publication == null && artifact.result == null
+    && artifact.replies_started == null && artifact.resource_error == null
+}
+
+function retireEligible(call: LogEntry): boolean {
+  const retirement = (call.artifact as Record<string, unknown> | null)?.retirement as Record<string, unknown> | undefined
+  return call.status === 'running' && implementBeforePublication(call) && retirement?.cause !== 'target_closed'
+}
+
+function retiredImplementation(call: LogEntry): boolean {
+  const artifact = call.artifact as Record<string, unknown> | null
+  const retirement = artifact?.retirement as Record<string, unknown> | undefined
+  return call.status === 'superseded' && call.outcome === 'target_closed' && call.action === 'not_started'
+    && call.error_code === 'target_closed' && !call.error && call.head_sha === null && call.expected_head === null
+    && call.review_id == null && call.receipts == null && implementBeforePublication(call)
+    && retirement?.cause === 'target_closed'
 }
 
 function sameReceipt(prior: Record<string, unknown> | null, next: Record<string, unknown>): boolean {
@@ -595,13 +621,19 @@ export class BehaviorChainRuntime {
               }
               if (chain.mergeSha && owned && !released) continue
               if (owned && call && (call.status === 'running' || !nativeResourcesReleased(call))) {
-                // Running PR reviews still need bounded queue visibility. This
-                // observation cannot settle or replace their native invocation.
+                // Running PR reviews still need bounded queue visibility, and a
+                // running first implementation needs bounded seed-closure
+                // visibility. Neither observation can settle or replace its
+                // native invocation.
                 const prior = chain.observation as ChainObservation | null
-                if (owned.behavior !== 'review-pr' || call.status !== 'running'
-                  || prior?.pull?.state !== 'open' || prior.pull.merged
-                  || Number.isFinite(prior.checkedAt) && prior.checkedAt <= Date.now()
-                    && Date.now() - prior.checkedAt < CHAIN_OBSERVATION_MAX_AGE_MS) continue
+                const fresh = Number.isFinite(prior?.checkedAt) && (prior as ChainObservation).checkedAt <= Date.now()
+                  && Date.now() - (prior as ChainObservation).checkedAt < CHAIN_OBSERVATION_MAX_AGE_MS
+                if (owned.behavior === 'review-pr') {
+                  if (call.status !== 'running' || prior?.pull?.state !== 'open' || prior.pull.merged || fresh) continue
+                } else if (owned.behavior === 'implement-issue') {
+                  if (!retireEligible(call) || prior?.publication.pull_number !== null || fresh
+                    || !this.operations.retireClosedImplementation) continue
+                } else continue
               }
               phase = 'observation'
               let observation: ChainObservation
@@ -635,6 +667,19 @@ export class BehaviorChainRuntime {
               }
               chain = this.append(chain, { type: 'chain.observed', observation })
               if (!chain.mergeSha) chain = this.recordMerge(chain, observation, false)
+              if (owned?.behavior === 'implement-issue' && call?.status === 'running' && retireEligible(call)
+                && !observation.issue.open && observation.publication.pull_number === null
+                && observation.publication.head_sha === null && observation.publication.head_invocation === null
+                && this.operations.retireClosedImplementation) {
+                try {
+                  const current = this.current(chain)
+                  const original = current.invocations.find(candidate => candidate.id === owned.id)
+                  if (original) await this.operations.retireClosedImplementation(current, original, call)
+                } catch (error) {
+                  observationError = preferObservationError(observationError,
+                    new Error(`behavior retirement failed for ${chain.id}: ${behaviorErrorMessage(error)}`, { cause: error }))
+                }
+              }
               if (owned && call?.status === 'running') continue
               if (this.operations.recoverReport) {
                 const reason = await this.operations.recoverReport(chain, observation)
@@ -672,6 +717,8 @@ export class BehaviorChainRuntime {
               if (chain.held && missingReceiptHoldCanResume(chain, observation, Date.now())) {
                 chain = this.append(chain, { type: 'chain.resumed' })
               }
+              const approvalRecovery = exhaustedApprovalConversationHold(chain, observation, Date.now())
+              if (approvalRecovery) chain = this.append(chain, { type: 'chain.resumed', approvalRecovery, recovery: { origin: 'automatic' } })
               const decision = this.decision(chain, observation)
               if (decision.kind === 'invoke' && decision.behavior === 'implement-issue' && this.operations.implementationAdmission) {
                 const gate = await this.operations.implementationAdmission(chain, observation)
@@ -950,7 +997,8 @@ export class BehaviorChainRuntime {
     if (calls.length !== 1) return invocation.state === 'uncertain' ? chain : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
       reason: 'multiple native calls claim one admitted invocation' })
     const call = calls[0]
-    if (invocation.request.resourceLimits && call.outcome !== 'target_closed' && !beforeNativeScope(call)
+    const admissionFenced = call.outcome === 'target_closed' && call.artifact?.phase === 'admission_fenced'
+    if (invocation.request.resourceLimits && !admissionFenced && !beforeNativeScope(call)
       && chainBasis(call.resource_guard?.limits ?? null) !== chainBasis(invocation.request.resourceLimits)) {
       throw new Error('native resource ceilings differ from their immutable admission')
     }
@@ -1071,6 +1119,8 @@ export class BehaviorChainRuntime {
       && (call.receipts != null || call.review_id != null || call.head_sha != null)
       || prReview && (call.artifact?.phase === 'submitting_review' || call.artifact?.phase === 'review_submitted'
         || call.error_code === 'review_budget_exhausted' && call.artifact?.phase !== 'reviewing')
+      || invocation.behavior === 'approve-pr' && call.error_code === APPROVAL_CONVERSATION_REFUSAL && !approvalConversationRefusal(chain,
+        { ...invocation, state: 'settled', callId: call.id, evidence: receipt(call) })
     if (call.status === 'failed' && possibleWrite && ['implement-issue', 'repair-pr', 'review-issue', 'review-pr', 'approve-pr'].includes(invocation.behavior)) {
       if (invocation.state === 'uncertain' && invocation.evidence?.callId === call.id) {
         const evidence = { ...receipt(call), callId: call.id }
@@ -1082,6 +1132,14 @@ export class BehaviorChainRuntime {
       chain = this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id, evidence: { ...receipt(call), callId: call.id } })
       return this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
         reason: 'native publication may have happened; reconcile the original invocation against GitHub' })
+    }
+    if (invocation.behavior === 'implement-issue' && retiredImplementation(call)) {
+      // Verified no-write closure settles as deferred, consuming no failure
+      // attempt and producing no Error while keeping Caller history. Release
+      // was proven above; anything unreleased already went uncertain.
+      this.operations.received(invocation, call)
+      return this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
+        outcome: 'target_closed', evidence: { ...receipt(call), status: 'deferred', callId: call.id } })
     }
     this.operations.received(invocation, call)
     chain = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,

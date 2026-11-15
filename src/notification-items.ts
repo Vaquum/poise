@@ -137,7 +137,7 @@ function latest(entries: readonly DiagnosticEntry[]): string | null {
 /** The rail's list: notices first within each group, in the server's order,
  *  then the diagnostics no notice already shows. */
 export function notificationItems(notices: readonly Notice[], diagnostics: BehaviorDiagnostics | null, now: number, attention: readonly ChainAttentionRow[] = []): NotificationItem[] {
-  const groups = diagnostics ? behaviorDiagnosticGroups(diagnostics) : []
+  const groups = diagnostics ? behaviorDiagnosticGroups(diagnostics, now) : []
   const items: NotificationItem[] = notices.map((notice) => {
     const item: NotificationItem = {
       id: notice.id, ...NOTICE_LOOK[notice.kind], title: notice.title, body: notice.body,

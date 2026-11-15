@@ -510,6 +510,15 @@ independent approval gates govern readmission.
 
 The chain intentionally does not use the legacy approval-round escape that files remaining findings as a follow-up issue and approves. Unresolved blockers remain blockers.
 
+A typed approval refusal before publication, with the original Call and native
+resource release verified, waits on fresh GitHub conversation evidence without
+using an approval failure attempt. The existing readiness read checks for live
+threads from other reviewers. Incomplete evidence cannot confirm closure.
+New heads, review obligations and verified conflicts go through the ordinary
+decision path. The chain can also release an existing automatic hold from
+three verified refusals once fresh PR evidence is available. The original
+Calls and retry boundary are retained, and a person's Hold still applies.
+
 ## Authority and recovery
 
 `behavior_chain_events` is immutable. It owns admissions, phase progression, retry history and ownership. `behavior_chain_current` is a rebuildable index whose state is checked against the authoritative event hash. Admissions and projection updates commit together with SQLite FULL durability. Existing observational behavior ledgers do not authorize this executor.
@@ -610,8 +619,8 @@ with no Call becomes `uncertain`: a partial receipt-store recovery can lose the
 unique correlation that once protected it. It cannot be relaunched or given a
 synthetic no-effect fence, even while held or disabled. Unreadable receipt
 snapshots also journal this uncertainty before reconciliation resumes.
-An existing Call is never altered, and normal validated receipt reconciliation
-must prove release. [Receipt-store recovery](Operating.md#caller-receipt-store-recovery)
+The no-worker fence leaves an existing Call alone. Normal validated receipt
+reconciliation must prove release. [Receipt-store recovery](Operating.md#caller-receipt-store-recovery)
 defines preservation and activation requirements.
 The receipt reader accepts only the fence's exact no-provider, no-publication
 shape with its native resource-release timestamp. Other superseded outcomes
@@ -620,10 +629,14 @@ retain their original validation; malformed fence rows stay quarantined.
 Original artifact/receipt adoption continues while paused or held. Incomplete
 publication after closure is held once; complete original comments, reviews or
 replies can still settle through read-only observation. Native exit or
-quarantined uncertainty is retained. A running Call, or a terminal Call without
-resource-release proof, keeps its existing cleanup owner and reservation; no
-new stop or signal is sent. Closure first seen after that running worker ends
-is not a retroactive guarantee about its in-flight publication.
+quarantined uncertainty is retained. A running first implementation before
+publication planning gets a bounded recheck when the previous observation is
+stale. Verified seed closure fences the original Call before requesting
+cooperative termination. A seed found closed during read-only validation
+produces the same `target_closed` outcome. The invocation settles as deferred
+after verified no-write closure and original resource release, preserving
+history without an Error or a failed attempt. Other Calls and uncertain
+publication or cleanup retain their original ownership and reconciliation.
 
 The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
@@ -1014,7 +1027,19 @@ disposition returns to the ordinary quiescent cadence; operator holds retain it.
 
 These pre-PR implementation-hold reports require explicit triage before their
 own implementation can prepare or start. A posted issue review alone cannot
-authorize implementation. Through the existing guarded `/api/behavior-chains`
+authorize implementation. This includes follow-up reports keyed by their original
+invocation and hold sequence, even after a lost creation acknowledgement or restart.
+After a lost acknowledgement, admission binds the earliest issue by the original
+source author whose GitHub creation body begins with the exact marker. A later
+issue can quote the marker without taking the binding. Missing or incomplete
+creation evidence for a possible report keeps its admission waiting.
+An independently authored markerless remedy verified against the source's blocked-by
+relationship and original failing file and test case retains ordinary intake.
+That path is only for intents the reporter linked as remedies: an issue the
+reporter created stays gated even if its marker is later removed.
+Intents stored before the adoption record verify independence by the
+remedy predating the source hold.
+Through the existing guarded `/api/behavior-chains`
 control, the workspace owner records `source-only` or `distinct-fix`, with a
 diagnosis and next action. Read `GET /api/behavior-chains?id=OWNER/REPO%23N` for
 the report chain's current sequence and `implementationReport` binding, then

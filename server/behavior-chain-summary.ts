@@ -1,7 +1,7 @@
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
 import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
-import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, lastChainQueueInvocation, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
+import { APPROVAL_CONVERSATION_WAIT, approvalConversationRefusal, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, lastChainQueueInvocation, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
 import { nativeBehavior } from './behavior-chain-runtime'
 import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
@@ -617,6 +617,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       const mergeCompleted = !!pull && !!observation && !!mergeBasis
         && chain.invocations.some(invocation => invocation.behavior === 'merge-pr' && invocation.state === 'settled'
           && invocation.evidence?.status === 'completed' && invocation.basis === mergeBasis && invocation.slot === null)
+      const approvalWait = state === 'fresh' && waiting?.startsWith(APPROVAL_CONVERSATION_WAIT) && observation
+        ? decideBehaviorChain(chain, observation, now) : null
       let next = queueReviewConflict && pull
         ? `PR ${chain.repository}#${pull.number} head ${pull.head}, queue entry ${pull.queueEntry}: remove it from the merge queue and disable auto-merge if enabled; reconcile the required retained Poise review evidence before resuming. Resuming alone cannot stop GitHub merging.`
         : chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
@@ -628,6 +630,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
             : 'Resolve the durable hold, then explicitly resume the chain'
             : active ? 'Await the original invocation outcome'
               : state !== 'fresh' ? 'Await a fresh, complete chain observation'
+                : approvalWait?.kind === 'wait' && approvalWait.reason === waiting ? approvalWait.reason
                 : pull && pull.state !== 'open' ? 'Hold: pull request closed without a confirmed merge; a decision is required'
                 : pull?.draft ? 'Await the draft pull request becoming ready for review'
                   : observation && observation.existingPulls.length
@@ -701,10 +704,11 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       if (!chain.held && !chain.reviewPending && !active && last && waiting === `${last.behavior} is in native failure backoff`) {
         const attempts = chain.invocations.filter(invocation => invocation.behavior === last.behavior && invocation.basis === last.basis
           && invocation.slot === last.slot && invocation.state === 'settled' && invocation.evidence?.status !== 'deferred'
-          && invocation.admissionSequence > chain.resumedAfterSequence)
-        if (attempts.length > 0 && attempts.length < 3 && (last.evidence?.action === 'not_started' || last.evidence?.outcome === 'superseded')
-          && Number.isFinite(last.evidence?.completedAt)) {
-          retryAt = Number(last.evidence!.completedAt) + 60_000 * 2 ** (attempts.length - 1)
+          && invocation.admissionSequence > chain.resumedAfterSequence && !approvalConversationRefusal(chain, invocation))
+        const failed = attempts.at(-1)
+        if (failed && attempts.length < 3 && (failed.evidence?.action === 'not_started' || failed.evidence?.outcome === 'superseded')
+          && Number.isFinite(failed.evidence?.completedAt)) {
+          retryAt = Number(failed.evidence!.completedAt) + 60_000 * 2 ** (attempts.length - 1)
           next = 'Automatic retry eligible after backoff, subject to existing admission gates'
         }
       }

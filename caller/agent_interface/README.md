@@ -96,12 +96,23 @@ used. Externally managed Chat turns retain Poise's existing Stop route.
 Interruption reconciliation checks the original supervisor's process identity.
 Only a reader that can observe the current workspace supervisor can reconcile
 a previous workspace epoch. A reader in a private PID namespace cannot do so.
+Identified legacy Calls remain running while their supervisor is alive or its
+epoch is unobservable to that reader. Same-epoch supervisor loss retains the
+six-hour orphan grace because providers can outlive it. An authorized workspace
+observer can recognize a replacement from a prior boot or an older PID
+namespace init on the same boot. Missing or unverified identities retain the
+historical init/age/command rule only for an authorized workspace observer.
+Reaper decisions retain a bounded reason, observer scope and identity result
+in `diagnostic` (under `reaper` when an earlier diagnostic is present), without
+raw process or environment data.
 Existing resource and publication receipts still govern recovery.
 
 New native registrations use process identity version 2. An older Caller
 still running through a workspace update cannot reap these registrations.
 The current Caller continues to read version 1 identities and settle their
-original Calls.
+original Calls. Legacy protection covers updated observers reading those older
+registrations; rollout must exclude unpatched legacy reapers. A prior executable
+that ignores legacy identity can still interrupt them.
 
 Native per-Call resource receipts live in `resource_ownership`, outside the
 replaceable publication artifact. Directory registration precedes allocation;
@@ -226,6 +237,15 @@ and publication fields, and a valid resource-release timestamp. Caller tests
 feed real `--logs --select` bytes into Poise's decoder and journal runtime for
 all five behaviors; malformed variants remain quarantined. These contract
 checks create no GitHub artifacts and are not workflow acceptance runs.
+
+`--retire-closed-implementation CALL_ID` handles a running first implementation
+after Poise verifies seed closure. It pins the original supervisor and records
+closure under the same database write lock as publication planning, then sends
+cooperative SIGTERM. A stored plan or publication receipt prevents retirement.
+Validation of a first implementation can also report a confirmed closed seed
+before planning. The original Call retains the typed `superseded` /
+`not_started` / `target_closed` receipt and its own resource ownership. Poise
+settles the invocation only after the original cleanup proves release.
 
 # Recording a Chat turn
 
