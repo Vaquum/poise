@@ -706,15 +706,17 @@ the completion result, so a near-miss is visible before it fails.
 
 ### Explicit review continuation
 
-Managed structured PR reviews and uncapped approvals accept `--review-slot SLOT`
-to opt into durable analysis. Resume with the same review arguments, a new
+Managed structured PR reviews and approvals accept `--review-slot SLOT`
+to opt into durable analysis and finalization. Resume with the same review arguments, a new
 `--correlation-id`, and
 `--resume-review ROOT_CALL_ID:GENERATION` from the returned `continuation` object.
 Poise adds `--review-units-per-call 6` for automatic admission. This keeps a
 complete ordinary-sized packet on the single-pass path and yields a checkpoint
-after six completed units on a larger obligation. Claude and capped rounds
-retain their existing path. Managed legacy review Calls preserve their original
-source and use the same native release proof as chain Calls.
+after six completed units on a larger obligation. Claude retains its existing
+path. Capped rounds retain theirs for automatic admission; explicit continuation
+keeps their round and cap as part of the immutable review basis. Managed legacy
+review Calls preserve their original source and use the same native release
+proof as chain Calls.
 
 Caller binds progress to the repository, PR, exact head, base and merge base,
 complete material packet (including thread/repair-answer revisions and linked
@@ -765,9 +767,28 @@ Both are incomplete, with no review action. Genuine provider failures retain
 their existing error types.
 
 Only the claimant that finishes every source and integration unit can reserve
-finalization. The existing head-pinned submission also reserves the shared
-progress receipt atomically. A lost publication acknowledgement keeps that first
-publisher's Call ID and fence for reconciliation; another Call cannot publish.
+finalization. Its checkpoint retains the complete verdict, the original response
+identity and whether position remapping finished. After a proven pre-write
+deadline and positive resource settlement, the next claimant resumes that step
+without provider analysis. Already remapped LEFT locations are never remapped
+again. Changed review input, altered retained evidence, incomplete coverage and
+more than 100 inline findings remain held with all findings retained.
+
+The existing head-pinned submission reserves the shared progress receipt
+atomically. The response and GitHub marker keep the original finalizing Call's
+identity even when another Call executes the remaining step. Submission intent
+survives a restart around POST. A lost acknowledgement is reconciled through
+`--pull-action-state --queue-evidence`, requiring the original marker, response,
+head, context and verdict; missing or conflicting evidence permits no new POST.
+Capped follow-up creation likewise records intent before execution and retains
+its issue receipt. A lost issue acknowledgement requires the exact original
+body, author and invocation marker in live linked issues before approval can
+continue. Absence from a packet never authorizes another issue creation. An
+acknowledged follow-up followed by a pre-approval deadline resumes approval only.
+Finalization and reconciliation draw on the same cumulative time, execution and
+storage bounds, preserving the submission and verification reserves. Physical
+resource release leaves this publication obligation owned while other eligible
+work can use the released resources.
 Large evidence stays behind digest/length-checked artifact references rather
 than enlarging Call responses.
 

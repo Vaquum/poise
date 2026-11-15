@@ -1,5 +1,5 @@
 import { chainBasis, ciRefreshBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation, type CiRefreshProof } from './behavior-chain-store'
-import { validReviewResponse, type ReviewResponse } from './review-response'
+import { resumeLink, validReviewResponse, type ReviewResponse } from './review-response'
 import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { matchingNativeActionReceipt } from './behavior-chain-action'
@@ -247,7 +247,9 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
   const artifact = evidence?.artifact as Record<string, unknown> | null
   const response = artifact?.review_response
   const recoveryIndex = invocation.request.argv.indexOf('--recovery-model')
-  const review = pull?.reviewReceipts.find((item) => item.id === evidence?.review_id && item.invocation === invocation.callId
+  const resumedFrom = resumeLink(artifact)
+  const review = pull?.reviewReceipts.find((item) => item.id === evidence?.review_id
+    && (item.invocation === invocation.callId || (resumedFrom !== undefined && item.invocation === resumedFrom.callId))
     && item.head === pull.head && item.state === ({ reviewed_clean: 'COMMENTED', approved: 'APPROVED', requested_changes: 'CHANGES_REQUESTED' } as Record<string, string>)[String(evidence?.action)])
   if (!pull || !evidence || !review || !invocation.callId || !invocation.model || !pull.reviewContext
     || !validReviewResponse(response, { repository: chain.repository, number: pull.number, head: pull.head,
@@ -255,7 +257,7 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
       incompleteFindings: evidence.action === 'requested_changes' && evidence.outcome === 'incomplete',
       legacyNegative: evidence.action === 'requested_changes' && evidence.outcome === 'changes_requested',
       recoveryModel: recoveryIndex >= 0 ? invocation.request.argv[recoveryIndex + 1] : null,
-      startedAt: invocation.admittedAt, completedAt: Number(evidence.completedAt) }, now)
+      startedAt: invocation.admittedAt, completedAt: Number(evidence.completedAt), resumedFrom }, now)
     || chainBasis(response) !== chainBasis(review.response) || typeof review.submittedAt !== 'number' || !Number.isFinite(review.submittedAt)
     || response.completed_at > review.submittedAt + 999 || review.submittedAt > now) return null
   if (pull.merged && (typeof pull.mergedAt !== 'number' || !Number.isFinite(pull.mergedAt) || response.completed_at > pull.mergedAt || review.submittedAt > pull.mergedAt)) return null

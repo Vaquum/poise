@@ -91,6 +91,7 @@ def file_followup_issue(
     body: str,
     *,
     reserve: float = 0,
+    checkpoint=None,
 ) -> dict:
     """File the capped round's follow-up issue; fail loudly, never half-publish.
 
@@ -101,6 +102,8 @@ def file_followup_issue(
     retries, and the retry reuses the issue via its marker.
     """
     limit = review_budget.timeout(600, reserve=reserve)
+    if checkpoint is not None:
+        body = checkpoint.begin_followup(title, body, actor_name)
     progress.stage("filing_followup", "Filing the capped round's follow-up issue", timeout=limit)
     args = [
         os.getenv("GITHUB_INTERFACE_CLI", "github-interface"),
@@ -114,7 +117,9 @@ def file_followup_issue(
         actor_name,
     ]
     try:
-        done = subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=limit)
+        def execute(grant):
+            return subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=grant)
+        done = checkpoint.funded(execute, limit, reserve=reserve) if checkpoint is not None else execute(limit)
     except subprocess.TimeoutExpired as error:
         raise review_receipt.SubmissionError(
             "follow-up issue filing timed out; publication uncertain, reconcile before retry") from error
@@ -136,4 +141,4 @@ def file_followup_issue(
             or not isinstance(reply.get("issue"), dict) or not isinstance(reply["issue"].get("number"), int):
         raise review_receipt.SubmissionError(
             "follow-up issue filing returned no receipt; publication uncertain, reconcile before retry")
-    return reply["issue"]
+    return checkpoint.confirm_followup(reply["issue"]) if checkpoint is not None else reply["issue"]

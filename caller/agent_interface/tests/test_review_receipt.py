@@ -861,6 +861,14 @@ class TestDuplicatePrevention(TestCase):
             api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), facts([CLEAN]),
                                  receipt=receipt("reviewed_clean", 92), call_id="me")
 
+    def test_receipt_reconciled_to_a_resumed_call_is_not_a_sibling_conflict(self):
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("insert into calls (id, behavior, repo, pr_id, review_id, started_at) values ('sibling', 'pr_review', 'o/r', '1', '92', 0)")
+        with patch.object(api.review_continuation, "reconciled", return_value=True):
+            result = api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), facts([CLEAN]),
+                                          receipt=receipt("reviewed_clean", 92), call_id="me")
+        self.assertEqual(result["outcome"], "clean")
+
     def test_receipt_for_another_head_is_rejected(self):
         other = receipt("reviewed_clean", 92)
         other["head_sha"] = "b" * 40

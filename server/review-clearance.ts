@@ -7,6 +7,7 @@ import { getMeta, setMeta } from './db'
 import { behaviorChainForPull, behaviorChainJournal } from './behavior-chain-journal'
 import { chainBasis, type BehaviorChain } from './behavior-chain-store'
 import { chainReviewClearance, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { resumeLink } from './review-response'
 
 export const REVIEW_CLEARANCE = 'Poise review clearance'
 const REPOSITORY = 'autonomio/poise'
@@ -68,9 +69,12 @@ export function reviewClearanceResults(snapshot: ClearanceSnapshot, owners: Read
       const live: ChainObservation = { ...original, checkedAt: now, pull: { ...original.pull,
         reviewReceipts: pull.reviews.filter(review => review.actor.toLowerCase() === owner.chain.reviewer.toLowerCase())
           .map(review => ({ ...review, submittedAt: Date.parse(review.submittedAt) })) } }
+      // A resumed finalizer publishes under its original marker, so the
+      // marker and the review ID span two invocations of one obligation.
       const unretained = pull.reviews.some(review => review.head === pull.head && review.invocation
-        && !owner.chain.invocations.some(invocation => invocation.callId === review.invocation
-          && invocation.evidence?.review_id === review.id))
+        && !owner.chain.invocations.some(invocation => invocation.evidence?.review_id === review.id
+          && (invocation.callId === review.invocation
+            || resumeLink(invocation.evidence?.artifact as Record<string, unknown> | undefined)?.callId === review.invocation)))
       const reason = pull.draft ? 'draft' : unretained ? 'native submission is not yet retained'
         : chainReviewClearance(owner.chain, live, now)
       if (reason) blockers.push(`#${number}: ${reason}`)

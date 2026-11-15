@@ -1,20 +1,24 @@
 """Caller protocol proof; providers and GitHub writes are isolated stand-ins."""
 import json
+import io
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
+from uuid import uuid4
 
 import agent_interface as api
-from agent_interface import atoms, issue_review, review_budget, review_continuation as continuation, review_receipt, \
-    review_stages, structured_review
+from agent_interface import atoms, issue_review, pr_approve, review_budget, review_continuation as continuation, \
+    review_receipt, review_repository, review_stages, structured_review
 from agent_interface.model_catalog import CATALOG
+from github_interface.atoms.review_response import qualifying_response
 from review_submission_fixture import submission_args
 
 HEAD, BASE = "a" * 40, "b" * 40
@@ -29,6 +33,7 @@ def packet(count=1):
     return {"repository": "o/r", "pull_number": 12, "head_sha": HEAD,
             "pull": {"base": {"sha": BASE}, "title": "Continuation regression", "body": "Review context"},
             "merge_base_sha": BASE, "files": [{"filename": name} for name in names],
+            "linked_issues": [],
             "excluded_files": [{"path": "data.zip", "reason": "archive payload"}], "coverage": "complete",
             "diff": "\n".join(f"diff --git a/{name} b/{name}\n--- /dev/null\n+++ b/{name}\n"
                                "@@ -0,0 +1,2 @@\n+contract = 'value'\n+consumer(contract)" for name in names)}
@@ -81,12 +86,13 @@ class TestReviewContinuation(TestCase):
             body = review_receipt.begin_submission("Verified final verdict", HEAD)
         self.posts.append((submission_args(command), body))
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
-            {"action": "requested_changes" if "--request-changes" in command else "reviewed_clean",
+            {"action": "requested_changes" if "--request-changes" in command else "approved_pr" if "--approve-pr" in command else "reviewed_clean",
              "review_id": 91, "head_sha": HEAD}))
 
     @contextmanager
-    def call(self, node, resume=None, slot="sol", policy="policy", *, source="poise:behavior-chain", units_per_call=None):
-        call_id = api.track(MODEL.identity, "", "12", "o/r", "reviewer", "pr_review",
+    def call(self, node, resume=None, slot="sol", policy="policy", behavior="pr_review", *,
+               source="poise:behavior-chain", units_per_call=None):
+        call_id = api.track(MODEL.identity, "", "12", "o/r", "reviewer", behavior,
                             expected_head=HEAD, source=source, managed_review=units_per_call is not None)
         review_receipt.bind(api.DB, call_id)
         with review_budget.ReviewBudget(), review_receipt.invocation_environment(api.DB, call_id, True), \
@@ -99,12 +105,16 @@ class TestReviewContinuation(TestCase):
                 with sqlite3.connect(api.DB) as conn:
                     conn.execute("update calls set status='failed', resources_settled_at=1 where id=?", (call_id,))
 
-    def run_review(self, node, ask):
+    def run_review(self, node, ask, behavior="pr_review", **kwargs):
         raw = json.dumps(node)
         with (patch.dict(structured_review.ASK, {"codex": ask}) if ask is not None else nullcontext()):
-            return structured_review.run(self.directory.name, "system", "PR packet:\n" + raw, MODEL, "pr_review",
+            return structured_review.run(self.directory.name, "system", "PR packet:\n" + raw, MODEL, behavior,
                                         "https://github.com/o/r/pull/12", "reviewer", HEAD, 1413,
-                                        repository=self.repository, packet=raw)
+                                        repository=self.repository, packet=raw, **kwargs)
+
+    def artifact(self, call):
+        with sqlite3.connect(api.DB) as conn:
+            return json.loads(conn.execute("select artifact from calls where id=?", (call,)).fetchone()[0])
 
     def saved(self, root):
         with sqlite3.connect(api.DB) as conn:
@@ -390,11 +400,351 @@ class TestReviewContinuation(TestCase):
                     self.run_review(node, lambda *_args: verdict(_args[3]))
         original = self.saved(root)
         self.assertEqual(original["publisher"], root)
-        with self.call(node, self.resume(root)):
-            with self.assertRaisesRegex(continuation.Continuation, "reconcile that Call"):
-                self.run_review(node, lambda *_args: self.fail("uncertain publication must not launch a provider"))
-        self.assertEqual(self.saved(root), original)
+        response = self.artifact(root)["review_response"]
+        state = {"repository": "o/r", "pull_number": 12, "head_sha": HEAD, "review_context": response["context_sha"],
+                 "my_reviews": [{"id": 91, "state": "COMMENTED", "commit_id": HEAD,
+                    "submitted_at": api.utc_stamp(api.time()), "invocation_id": root, "review_response": response}]}
+
+        def reconcile(command, **_kwargs):
+            self.assertIn("--pull-action-state", command)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(state), stderr="")
+
+        original_state = json.loads(json.dumps(state))
+        for mismatch in ("sibling", "altered_response", "missing"):
+            state = json.loads(json.dumps(original_state))
+            if mismatch == "sibling":
+                state["my_reviews"][0]["invocation_id"] = "d" * 32
+            elif mismatch == "altered_response":
+                state["my_reviews"][0]["review_response"]["assessment"]["verdict"] = "Another Call's verdict"
+            else:
+                state["my_reviews"] = []
+            with self.subTest(mismatch=mismatch), self.call(node, self.resume(root)), \
+                    patch.object(structured_review.subprocess, "run", side_effect=reconcile):
+                with self.assertRaisesRegex(continuation.Continuation, "original review publication"):
+                    self.run_review(node, lambda *_: self.fail("unattributed review repeated analysis"))
+        state = original_state
+        with self.call(node, self.resume(root)), patch.object(structured_review.subprocess, "run", side_effect=reconcile):
+            output = self.run_review(node, lambda *_args: self.fail("uncertain publication must not launch a provider"))
+            self.assertIn('"review_id": 91', output)
+            self.assertEqual(review_receipt.get()["review_response"], response)
+        self.assertEqual(self.saved(root)["publisher"], original["publisher"])
         self.assertEqual(len(attempts), 1)
+
+    def test_large_completed_review_resumes_only_its_unfinished_remap_or_submission(self):
+        node = packet(176)
+        path = "src/f175.py"
+        since = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                 "@@ -10,3 +10,2 @@\n context\n-removed\n context2")
+        full = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                "@@ -4,3 +10,3 @@\n context\n-removed\n+added\n context2")
+        node.update(since_head_sha="c" * 40, p="p2")
+        node["diff"] = node["diff"].split(f"diff --git a/{path}", 1)[0] + since
+        finding = {"path": path, "line": 11, "side": "LEFT", "body": "[p1] Removed contract still has a consumer."}
+        original_validate = structured_review._validate_since_positions
+
+        for boundary in ("remap", "ready"):
+            with self.subTest(boundary=boundary):
+                calls = []
+
+                def ask(*args):
+                    prompt = args[3]
+                    calls.append(prompt)
+                    return verdict(prompt, [finding] if path in supplied(prompt)["diff"] else [])
+
+                def validate(*args):
+                    if boundary == "remap":
+                        raise review_budget.ReviewLimitError("pre-write remap deadline", "review_budget_exhausted")
+                    return original_validate(*args)
+
+                def before_submission(phase, *_args, **_kwargs):
+                    if phase == "submitting":
+                        raise review_budget.ReviewLimitError("pre-write submission deadline", "review_budget_exhausted")
+
+                with self.call(node, policy=boundary, slot=boundary) as root, \
+                        patch.object(structured_review, "fetch_packet", return_value=json.dumps({**node, "diff": full})), \
+                        patch.object(structured_review, "_validate_since_positions", side_effect=validate), \
+                        patch.object(structured_review.progress, "stage", side_effect=before_submission):
+                    with self.assertRaises(continuation.Continuation) as stopped:
+                        self.run_review(node, ask)
+                    self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
+                    self.assertEqual(self.saved(root)["finalization"]["step"], boundary)
+                    response = self.artifact(root)["review_response"]
+                self.assertEqual(len(calls), 23)
+                posts_before = len(self.posts)
+                with self.call(node, self.resume(root), policy=boundary, slot=boundary) as resumed, \
+                        patch.object(structured_review, "fetch_packet", return_value=json.dumps({**node, "diff": full})) as fetch:
+                    self.run_review(node, lambda *_: self.fail("finalization repeated provider analysis"))
+                    retained = self.artifact(resumed)["review_response"]
+                    self.assertEqual(retained, response)
+                    self.assertTrue(qualifying_response(retained, node["pull"], "o/r", 12, HEAD, "reviewer"))
+                    self.assertEqual(fetch.call_count, 1 if boundary == "remap" else 0)
+                self.assertEqual(len(self.posts), posts_before + 1)
+                command, body = self.posts[-1]
+                self.assertEqual(json.loads(command[command.index("--comments") + 1]), [{**finding, "line": 5}])
+                self.assertTrue(body.endswith(f"<!-- poise-invocation {root} -->"))
+                self.assertEqual(self.saved(root)["publisher"], root)
+                link = self.artifact(resumed)["review_resume"]
+                with sqlite3.connect(api.DB) as conn:
+                    publisher_started = conn.execute("select started_at from calls where id=?", (root,)).fetchone()[0]
+                self.assertEqual(link["publication_call"], root)
+                self.assertEqual(link["publisher_started_at"], api.utc_stamp(publisher_started))
+
+    def test_capped_followup_receipt_or_lost_ack_survives_a_deadline_before_approval(self):
+        finding = {"path": "src/f000.py", "line": 2, "side": "RIGHT", "body": "[p1] Optional caller uses the wrong contract."}
+        for lost_ack in (False, True):
+            node = packet()
+            created, approvals = [], []
+
+            def post(command, **kwargs):
+                if "--create-pr-linked-issue" in command:
+                    issue = {"number": 18, "html_url": "https://github.com/o/r/issues/18", "user": {"login": "reviewer"},
+                             "title": command[command.index("--title") + 1],
+                             "body": command[command.index("--body") + 1].strip() + "\n\nRelated PR: https://github.com/o/r/pull/12"}
+                    created.append(issue)
+                    if lost_ack:
+                        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                    return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                        {"action": "created_pr_linked_issue", "issue": issue}))
+                approvals.append(command)
+                return self.submit(command, **kwargs)
+
+            def deadline(phase, *_args, **_kwargs):
+                if phase == "submitting":
+                    raise review_budget.ReviewLimitError("pre-write approval deadline", "review_budget_exhausted")
+
+            policy = f"capped-{lost_ack}"
+            cap = {"behavior": "pr_approve", "capped": True, "review_round": 5, "review_cap": 5}
+            with self.subTest(lost_ack=lost_ack), self.call(node, policy=policy, slot=policy, behavior="pr_approve") as root, \
+                    patch.object(structured_review.subprocess, "run", side_effect=post), \
+                    patch.object(structured_review.progress, "stage", side_effect=deadline):
+                with self.assertRaises(review_receipt.SubmissionError if lost_ack else continuation.Continuation):
+                    self.run_review(node, lambda *args: verdict(args[3], [finding]), **cap)
+                self.assertEqual(self.artifact(root)["phase"], "filing_followup")
+            self.assertEqual(len(created), 1)
+            self.assertEqual(approvals, [])
+            if lost_ack:
+                with self.call(node, self.resume(root), policy=policy, slot=policy, behavior="pr_approve"), \
+                        patch.object(structured_review.subprocess, "run", side_effect=post):
+                    with self.assertRaisesRegex(continuation.Continuation, "original follow-up creation is uncertain"):
+                        self.run_review(node, lambda *_: self.fail("lost issue acknowledgement repeated analysis"), **cap)
+            node["linked_issues"] = created
+            with self.call(node, policy=policy, slot=policy, behavior="pr_approve"):
+                with self.assertRaisesRegex(continuation.Continuation, "saved review already exists"):
+                    self.run_review(node, lambda *_: self.fail("omitting resume replayed a follow-up effect"), **cap)
+            with self.call(node, self.resume(root), policy=policy, slot=policy, behavior="pr_approve"), \
+                    patch.object(structured_review.subprocess, "run", side_effect=post):
+                output = self.run_review(node, lambda *_: self.fail("completed capped review repeated analysis"), **cap)
+                self.assertIn('"review_id": 91', output)
+            self.assertEqual(len(created), 1)
+            self.assertEqual(len(approvals), 1)
+            self.assertIn("--approve-pr", approvals[0])
+            self.assertIn(f"<!-- poise-invocation {root} -->", created[0]["body"])
+            self.assertTrue(self.posts[-1][1].endswith(f"<!-- poise-invocation {root} -->"))
+
+    def test_capped_approval_entry_hydrates_manifest_coverage_before_deferring_findings(self):
+        node = packet()
+        node.update(coverage="incomplete", diff_deferred=True)
+        finding = {"path": "src/f000.py", "line": 2, "side": "RIGHT", "body": "[p1] Optional caller uses the wrong contract."}
+        repository = SimpleNamespace(prompt=lambda: "", inspect=self.inspect,
+            diff_packet=lambda value, _limit, **_kwargs: json.dumps({**json.loads(value), "coverage": "complete", "diff_deferred": False}))
+        creations = []
+
+        def post(command, **kwargs):
+            if "--create-pr-linked-issue" in command:
+                creations.append(command)
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({"action": "created_pr_linked_issue",
+                    "issue": {"number": 18, "html_url": "https://github.com/o/r/issues/18"}}))
+            return self.submit(command, **kwargs)
+
+        with self.call(node, behavior="pr_approve"), patch.object(atoms, "last_reviewed_head", return_value=None), \
+                patch.object(atoms, "packet", return_value=json.dumps(node)), \
+                patch.object(review_repository, "prepare", return_value=nullcontext(repository)), \
+                patch.dict(structured_review.ASK, {"codex": lambda *args: verdict(args[3], [finding])}), \
+                patch.object(structured_review.subprocess, "run", side_effect=post):
+            pr_approve.run(self.directory.name, "https://github.com/o/r/pull/12", "reviewer", HEAD,
+                           model=MODEL.identity, capped=True, review_round=5, review_cap=5)
+        self.assertEqual(len(creations), 1)
+        self.assertIn("--approve-pr", self.posts[0][0])
+
+    def test_completed_finalization_refuses_changed_basis_altered_result_and_unreleased_worker(self):
+        node = packet()
+
+        def deadline(phase, *_args, **_kwargs):
+            if phase == "submitting":
+                raise review_budget.ReviewLimitError("pre-write deadline", "review_budget_exhausted")
+
+        with self.call(node) as root, patch.object(structured_review.progress, "stage", side_effect=deadline):
+            with self.assertRaises(continuation.Continuation):
+                self.run_review(node, lambda *args: verdict(args[3]))
+        for field in ("head_sha", "title", "body", "coverage"):
+            changed = json.loads(json.dumps(node))
+            if field in {"title", "body"}:
+                changed["pull"][field] = "Changed context"
+            else:
+                changed[field] = "d" * 40 if field == "head_sha" else "incomplete"
+            with self.subTest(field=field), self.call(changed, self.resume(root)):
+                with self.assertRaisesRegex(continuation.Continuation, "material review basis changed"):
+                    self.run_review(changed, lambda *_: self.fail("changed basis launched analysis"))
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("update calls set resources_settled_at=null where id=?", (root,))
+        with self.call(node, self.resume(root)):
+            with self.assertRaisesRegex(continuation.Continuation, "has not released its resources"):
+                self.run_review(node, lambda *_: self.fail("unreleased worker launched analysis"))
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("update calls set resources_settled_at=1 where id=?", (root,))
+        reference = self.saved(root)["finalization"]["verdict"]
+        (api.RESPONSES / f"{reference['id']}.txt").write_text("{}")
+        with self.call(node, self.resume(root)):
+            with self.assertRaisesRegex(continuation.Continuation, "digest or length differs"):
+                self.run_review(node, lambda *_: self.fail("altered retained verdict launched analysis"))
+        self.assertEqual(self.posts, [])
+
+    def test_completed_finalization_cannot_spend_its_cumulative_verification_reserve(self):
+        node = packet()
+
+        def deadline(phase, *_args, **_kwargs):
+            if phase == "submitting":
+                raise review_budget.ReviewLimitError("pre-write deadline", "review_budget_exhausted")
+
+        with self.call(node) as root, patch.object(structured_review.progress, "stage", side_effect=deadline):
+            with self.assertRaises(continuation.Continuation):
+                self.run_review(node, lambda *args: verdict(args[3]))
+        artifact = self.artifact(root)
+        saved = artifact["review_progress"]
+        saved["spent_ms"] = saved["allowance_ms"] - structured_review.VERIFICATION_RESERVE_SECONDS * 1000
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), root))
+        with self.call(node, self.resume(root)):
+            with self.assertRaisesRegex(continuation.Continuation, "cumulative review time allowance exhausted"):
+                self.run_review(node, lambda *_: self.fail("exhausted finalization repeated analysis"))
+        self.assertEqual(self.saved(root)["phase"], "held")
+        self.assertEqual(self.posts, [])
+
+    def test_completed_101_finding_review_is_held_with_every_finding_retained(self):
+        node = packet(101)
+
+        def ask(*args):
+            source = supplied(args[3])
+            comments = [] if "required_cross_unit_evidence" in source else [
+                {"path": entry["filename"], "line": 2, "side": "RIGHT", "body": f"[p1] Broken consumer in {entry['filename']}"}
+                for entry in source["files"]]
+            return verdict(args[3], comments)
+
+        with self.call(node) as root:
+            with self.assertRaisesRegex(continuation.Continuation, "101 findings"):
+                self.run_review(node, ask)
+        self.assertEqual(self.saved(root)["phase"], "held")
+        reference = self.saved(root)["finalization"]["verdict"]
+        retained = json.loads((api.RESPONSES / f"{reference['id']}.txt").read_text())
+        self.assertEqual(len(retained["comments"]), 101)
+        with self.call(node, self.resume(root)):
+            with self.assertRaisesRegex(continuation.Continuation, "101 findings"):
+                self.run_review(node, lambda *_: self.fail("held verdict repeated analysis"))
+        self.assertEqual(self.posts, [])
+
+    def test_released_analysis_keeps_its_publication_owner_while_competing_finalizers_claim_once(self):
+        node = packet(9)
+
+        def deadline(phase, *_args, **_kwargs):
+            if phase == "submitting":
+                raise review_budget.ReviewLimitError("pre-write deadline", "review_budget_exhausted")
+
+        with self.call(node) as root, patch.object(structured_review.progress, "stage", side_effect=deadline):
+            with self.assertRaises(continuation.Continuation):
+                self.run_review(node, lambda *args: verdict(args[3]))
+        pending = self.saved(root)
+        self.assertEqual(pending["owner"], root)
+        self.assertTrue(pending["complete"])
+        # Released physical resources do not retire the publication obligation.
+        # Another eligible slot can reserve and release its own workspace.
+        with self.call(node, slot="unrelated"):
+            with api.resource_ownership.temporary_directory(prefix="unrelated-review-"):
+                self.assertEqual(self.saved(root), pending)
+        resume = self.resume(root)
+        ids = [api.track(MODEL.identity, "", "12", "o/r", "reviewer", "pr_review", expected_head=HEAD,
+                         source="poise:behavior-chain") for _ in range(2)]
+        for call_id in ids:
+            review_receipt.bind(api.DB, call_id)
+            with review_receipt.invocation_environment(api.DB, call_id, True), continuation.request("sol", resume):
+                review_receipt.prepare_response(json.dumps(node), MODEL.identity, policy="policy")
+        barrier = Barrier(2)
+
+        def race(call_id):
+            review_receipt.bind(api.DB, call_id)
+            with continuation.request("sol", resume):
+                barrier.wait(timeout=5)
+                try:
+                    self.run_review(node, lambda *_: self.fail("competing finalizer repeated analysis"))
+                    return "published"
+                except continuation.Continuation:
+                    return "held"
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            self.assertEqual(sorted(workers.map(race, ids)), ["held", "published"])
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.saved(root)["publisher"], root)
+        self.assertTrue(self.posts[0][1].endswith(f"<!-- poise-invocation {root} -->"))
+
+    def test_legacy_and_native_entry_points_reconcile_the_original_review_already_in_their_inventory(self):
+        for native in (False, True):
+            node = packet()
+            policy = f"entry-{native}"
+
+            def lost_ack(command, **kwargs):
+                review_receipt.begin_submission("Original verdict", HEAD)
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+            with self.subTest(native=native), self.call(node, policy=policy, slot=policy) as root, \
+                    patch.object(structured_review.subprocess, "run", side_effect=lost_ack):
+                with self.assertRaises(review_receipt.SubmissionError):
+                    self.run_review(node, lambda *args: verdict(args[3]))
+            response = self.artifact(root)["review_response"]
+            submitted = api.utc_stamp(api.time())
+            review_id = 91 + int(native)
+            inventory = {"id": review_id, "state": "COMMENTED", "commit": HEAD, "submitted_at": submitted}
+            facts = {"repository": "o/r", "pull_number": 12, "state": "OPEN", "draft": False, "head_sha": HEAD,
+                     "reviewer_reviews_since_items": [inventory], "review_context": response["context_sha"]}
+            state = {**facts, "my_reviews": [{"id": review_id, "state": "COMMENTED", "commit_id": HEAD,
+                      "submitted_at": submitted, "invocation_id": root, "review_response": response}]}
+
+            def read(command, **_kwargs):
+                self.assertIn("--pull-action-state", command)
+                return SimpleNamespace(returncode=0, stdout=json.dumps(state), stderr="")
+
+            def execute(*_args, **_kwargs):
+                review_receipt.prepare_response(json.dumps(node), MODEL.identity, policy=policy)
+                return self.run_review(node, lambda *_: self.fail("entry point repeated completed analysis"))
+
+            def boundary(call_id, _correlation):
+                # Kernel-boundary stand-in; routing, native receipts, generation
+                # fencing and actual registered-directory cleanup remain real.
+                with sqlite3.connect(api.DB) as conn:
+                    conn.execute("update calls set resource_ownership=? where id=?",
+                                 (api.resource_ownership.initial(), call_id))
+
+            correlation = uuid4().hex
+            with patch.object(api, "review_facts", return_value=facts), \
+                    patch.object(api.pr_review, "run", side_effect=execute), \
+                    patch.object(structured_review.subprocess, "run", side_effect=read), \
+                    patch.object(api, "_enter_native_call", side_effect=boundary), redirect_stdout(io.StringIO()):
+                if native:
+                    argv = ["agent-interface", "--pr-review", "https://github.com/o/r/pull/12", "--actor", "reviewer",
+                            "--expected-head", HEAD, "--source", "poise:behavior-chain", "--correlation-id", correlation,
+                            "--model", MODEL.identity, "--review-slot", policy, "--resume-review", self.resume(root),
+                            "--pwd", self.directory.name]
+                    with patch.object(sys, "argv", argv):
+                        api.main()
+                else:
+                    api.run_pr_review("https://github.com/o/r/pull/12", "reviewer", HEAD, "poise:behavior-chain", correlation,
+                                      pwd=self.directory.name, model=MODEL.identity, review_slot=policy, resume_review=self.resume(root))
+            with sqlite3.connect(api.DB) as conn:
+                row = conn.execute("select status,outcome,artifact,resources_settled_at from calls where correlation_id=?",
+                                   (correlation,)).fetchone()
+            self.assertEqual(row[:2], ("completed", "clean"))
+            self.assertEqual(json.loads(row[2])["review_response"], response)
+            if native:
+                self.assertIsNotNone(row[3])
+        self.assertEqual(self.posts, [])
 
     def test_missing_evidence_and_storage_exhaustion_never_clear_a_review(self):
         node = packet()
@@ -549,6 +899,25 @@ class TestReviewContinuation(TestCase):
             review_receipt.prepare_response(json.dumps(node), MODEL.identity, policy="policy")
             with self.assertRaisesRegex(RuntimeError, "complete, exclusively reserved"):
                 review_receipt.complete_response({**ASSESSMENT, "verified_fixes": [17]}, HEAD)
+
+    def test_reconciling_resume_after_packet_drift_keeps_link_and_checkpoint_on_the_original_basis(self):
+        node = packet()
+
+        def post_deadline(*_args, **_kwargs):
+            raise review_budget.ReviewLimitError("post-reservation deadline", "review_budget_exhausted")
+
+        with self.call(node) as root, patch.object(structured_review.subprocess, "run", side_effect=post_deadline):
+            with self.assertRaises(continuation.Continuation):
+                self.run_review(node, lambda *args: verdict(args[3]))
+        self.assertEqual(self.saved(root)["finalization"]["step"], "submitting")
+        changed = json.loads(json.dumps(node))
+        changed["reviews"] = [{"id": 1, "state": "commented", "body": "A new review landed during finalization"}]
+        with self.call(changed, self.resume(root)) as resumed:
+            continuation.Session(json.dumps(changed), MODEL.identity)
+            current = self.artifact(resumed)
+            self.assertEqual(current["review_resume"]["basis"], current["review_checkpoint"]["basis"])
+            self.assertEqual(current["review_resume"]["basis"], self.saved(root)["basis"])
+        self.assertEqual(self.posts, [])
 
     def test_omitting_resume_cannot_reset_the_saved_basis_budget(self):
         node = packet()

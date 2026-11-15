@@ -1,11 +1,14 @@
-"""Opt-in, receipt-owned continuation of read-only structured review analysis."""
+"""Opt-in, receipt-owned continuation of structured review and finalization."""
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import subprocess
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 from hashlib import sha256
 from time import monotonic, time
 from uuid import uuid4
@@ -61,8 +64,27 @@ def digest(value) -> str:
     return sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 
+def matches_followup(issue: dict, effect: dict) -> bool:
+    return (digest(issue.get("body")) == effect["body_sha"] and issue.get("title") == effect["title"]
+            and str((issue.get("user") or {}).get("login", "")).lower() == effect["actor"].lower()
+            and type(issue.get("number")) is int and issue["number"] > 0)
+
+
 def analysis_basis(packet: dict, policy: str) -> str:
     # Do not hash volatile GitHub counters/timestamps on the pull object.
+    requested, bound = _request.get(), review_receipt._call.get()
+    if requested and requested[1] and bound:
+        with caller_store.connect(bound[0]) as conn:
+            original = _artifact(conn, requested[1].split(":")[0])
+        finalization = original.get("review_progress", {}).get("finalization", {})
+        effect = finalization.get("followup")
+        if effect:
+            # Only our exact original issue may be removed from the live basis.
+            # A missing search result never proves its creation failed.
+            issues = packet.get("linked_issues", [])
+            matches = [issue for issue in issues if matches_followup(issue, effect)]
+            if len(matches) == 1:
+                packet = {**packet, "linked_issues": [issue for issue in issues if issue is not matches[0]]}
     pull = packet["pull"]
     material = {key: value for key, value in packet.items() if key != "pull"}
     return digest({"packet": material, "base": pull["base"]["sha"], "title": pull["title"],
@@ -96,10 +118,35 @@ def authority(conn, call_id: str, artifact: dict, *, publishing: bool = False) -
             or artifact["review_context"]["analysis_sha"] != link["analysis_sha"] \
             or digest(artifact.get("verification_candidates", {})) != link["verification_sha"]:
         raise RuntimeError("review continuation has no complete, exclusively reserved finalization")
+    finalization = saved.get("finalization", {})
+    if link.get("publication_call", call_id) != finalization.get("call", call_id):
+        raise RuntimeError("review continuation differs from its original publication identity")
+    response_sha = finalization.get("response_sha")
+    if response_sha and digest(artifact.get("review_response")) != response_sha:
+        raise RuntimeError("retained review response differs from its original finalization")
     if publishing:
-        saved.update(phase="publishing", publisher=call_id)
+        if finalization and finalization["step"] != "submitting":
+            raise RuntimeError("review finalization has not reserved its original submission")
+        if finalization.get("followup") and not finalization["followup"].get("issue"):
+            raise RuntimeError("original follow-up creation must be reconciled before review submission")
+        saved.update(phase="publishing", publisher=finalization.get("call", call_id))
         _write(conn, link["root_call"], original)
     return True
+
+
+def reconciled(call_id: str, receipt: dict) -> bool:
+    bound = review_receipt._call.get()
+    if not enabled() or bound is None or bound[1] != call_id:
+        return False
+    with caller_store.connect(bound[0]) as conn:
+        current = _artifact(conn, call_id)
+        link = current.get("review_resume")
+        if not link or current.get("review_reconciliation") != receipt:
+            return False
+        saved = _artifact(conn, link["root_call"])["review_progress"]
+        return (saved["owner"] == call_id and saved["generation"] == link["generation"]
+                and saved.get("publisher") == receipt["review_response"]["invocation_id"]
+                and digest(receipt["review_response"]) == saved["finalization"]["response_sha"])
 
 
 class Session:
@@ -113,6 +160,7 @@ class Session:
         slot, resume, self.units_per_call = requested
         self.root = resume.split(":")[0] if resume else self.call
         self.saved = {}
+        self.finalization = None
         expected = int(resume.split(":")[1]) if resume else 0
         self.generation = expected
         self.meter = monotonic()
@@ -127,8 +175,12 @@ class Session:
                             "behavior": row[1], "model": model, "slot": slot, "policy": review_budget.REVIEW_POLICY})
             if not resume:
                 existing = conn.execute("select id,artifact from calls where repo=? and pr_id=? and actor=? and behavior=? "
-                    "and json_extract(artifact,'$.review_progress.basis')=? limit 1",
-                    (json.loads(packet)["repository"], str(json.loads(packet)["pull_number"]), row[0], row[1], basis)).fetchone()
+                    "and (json_extract(artifact,'$.review_progress.basis')=? or "
+                    "(json_extract(artifact,'$.review_progress.finalization.slot')=? "
+                    "and json_extract(artifact,'$.review_context.head_sha')=? "
+                    "and json_extract(artifact,'$.review_context.context_sha')=?)) limit 1",
+                    (json.loads(packet)["repository"], str(json.loads(packet)["pull_number"]), row[0], row[1], basis,
+                     slot, current["review_context"]["head_sha"], current["review_context"]["context_sha"])).fetchone()
                 if existing:
                     self.root = existing[0]
                     self.saved = json.loads(existing[1])["review_progress"]
@@ -144,9 +196,11 @@ class Session:
                 original_source = conn.execute("select source from calls where id=?", (self.root,)).fetchone()[0]
                 if original_source != row[4]:
                     self.stop("review continuation belongs to a different launch source")
-                if saved["phase"] in {"finalizing", "publishing"}:
+                if saved["phase"] in {"finalizing", "publishing"} and not saved.get("finalization"):
                     self.stop(f"review finalization belongs to Call {saved.get('publisher') or saved['owner']}; reconcile that Call")
-                if saved["basis"] != basis:
+                self.finalization = saved.get("finalization")
+                reconciling = self.finalization and self.finalization["step"] == "submitting"
+                if saved["basis"] != basis and not reconciling:
                     self.stop("material review basis changed; saved analysis and repair verifications are invalid")
                 if saved["generation"] != expected:
                     self.stop("review continuation generation changed; refresh the saved receipt")
@@ -157,6 +211,18 @@ class Session:
                 if not previous or previous[0] == "running" or not resource_ownership.publication_released(
                         previous[1], previous[2], json.loads(previous[3] or "{}")):
                     self.stop("previous review claimant has not released its resources")
+                if self.finalization:
+                    publisher = _artifact(conn, self.finalization["call"])
+                    identity = conn.execute("select actor,behavior from calls where id=?", (self.finalization["call"],)).fetchone()
+                    if identity != row[:2] or self.finalization["slot"] != slot:
+                        self.stop("material review basis changed; original finalization identity differs")
+                    response = publisher.get("review_response")
+                    if not self.finalization.get("response_sha") or digest(response) != self.finalization["response_sha"]:
+                        self.stop("retained review response differs from its original finalization")
+                    context = current["review_context"]
+                    if any(response.get(key) != context.get(key) for key in
+                           ("repository", "pull_number", "head_sha", "context_sha", "model")):
+                        self.stop("material review basis changed; original finalization cannot publish")
                 used = review_budget.usage()
                 saved["spent_ms"] += math.ceil((used["used_seconds"] if used else 0) * 1000)
             else:
@@ -167,18 +233,44 @@ class Session:
                          "allowance_ms": OBLIGATION_TIME_MS,
                          "spent_ms": math.ceil((used["used_seconds"] if used else 0) * 1000),
                          "retained_bytes": 0, "attempts": 0, "complete": False}
-            saved.update(owner=self.call, last_call=self.call, generation=expected + 1, phase="analyzing")
+            saved.update(owner=self.call, last_call=self.call, generation=expected + 1,
+                         phase="publishing" if self.finalization and self.finalization["step"] == "submitting"
+                         else "finalizing" if self.finalization else "analyzing")
             self.saved = saved
             self.generation = saved["generation"]
             original["review_progress"] = saved
             _write(conn, self.root, original)
             current = _artifact(conn, self.call)
-            current["review_resume"] = {"root_call": self.root, "generation": self.generation, "basis": basis,
+            if self.finalization:
+                current["review_response"] = response
+                if self.finalization["step"] == "submitting":
+                    current["phase"] = "submitting_review"
+                elif self.finalization.get("followup"):
+                    current["phase"] = "filing_followup"
+            if self.finalization:
+                from . import utc_stamp
+                publisher_row = conn.execute("select started_at from calls where id=?", (self.finalization["call"],)).fetchone()
+                try:
+                    publisher_started_at = utc_stamp(publisher_row[0]) if publisher_row else None
+                except (TypeError, ValueError, OSError, OverflowError):
+                    publisher_started_at = None
+                if publisher_started_at is None:
+                    self.stop("original finalization lacks its publication start")
+                publication = {"publication_call": self.finalization["call"],
+                               "publisher_started_at": publisher_started_at}
+            else:
+                publication = {}
+            # The link names the basis the resumed computation ran against. A
+            # reconciling resume tolerates live packet drift, so the live basis
+            # would disagree with the checkpoint copied from saved progress.
+            current["review_resume"] = {"root_call": self.root, "generation": self.generation, "basis": saved["basis"],
                                        "slot": slot,
                                        "analysis_sha": current["review_context"]["analysis_sha"],
-                                       "verification_sha": digest(current.get("verification_candidates", {}))}
+                                       "verification_sha": digest(current.get("verification_candidates", {})),
+                                       **publication}
             self.retain_progress(conn, saved, current)
         self.meter = monotonic()
+        self.live_packet = packet
         self.packet = packet
         if saved.get("checkpoint"):
             self.state = self.read(saved["checkpoint"])
@@ -188,13 +280,137 @@ class Session:
             self.state = {"unit": 0, "results": [], "inspection": [], "pending": [],
                           "provisional": [], "verified": {}, "stalled": 0}
             self.manifest = None
+        if self.finalization:
+            if self.state["unit"] != len(self.manifest["units"]) + 1 \
+                    or len(self.state["results"]) != self.state["unit"]:
+                self.stop("retained finalization lacks complete source and integration evidence")
+            for reference in self.state["results"]:
+                self.result(reference)
+
+    def retain_finalization(self, verdict: dict, head: str, step: str) -> None:
+        review_receipt.retain_verdict(verdict, head)
+        reference = self.put(verdict)
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            original, saved = self.owned(conn)
+            current = _artifact(conn, self.call)
+            finalization = saved.get("finalization", {"call": self.call, "slot": _request.get()[0]})
+            finalization.update(verdict=reference, step=step, response_sha=digest(current["review_response"]))
+            saved["finalization"] = self.finalization = finalization
+            _write(conn, self.root, original)
+
+    def begin_review(self, action: str) -> None:
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            original, saved = self.owned(conn)
+            saved["finalization"].update(step="submitting", action=action)
+            self.finalization = saved["finalization"]
+            _write(conn, self.root, original)
+
+    def finalization_failure(self, error: BaseException) -> None:
+        diagnostic = getattr(error, "diagnostic", None) or {}
+        transient = getattr(error, "code", None) == "review_budget_exhausted" \
+            or diagnostic.get("outcome") == "timed_out"
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            original, saved = self.owned(conn)
+            saved["spent_ms"] += math.ceil((monotonic() - self.meter) * 1000)
+            resumable = transient and saved.get("finalization") is not None \
+                and saved["allowance_ms"] > saved["spent_ms"]
+            saved.update(phase="finalizing" if resumable else "held", reason=str(error))
+            _write(conn, self.root, original)
+        self.stop(str(error), resumable=resumable)
+
+    def remap(self, function) -> None:
+        def execute(grant):
+            with review_budget.ReviewBudget(grant, cap=grant):
+                function()
+        self.funded(execute, review_budget.timeout(600))
+
+    def followup_issue(self) -> dict | None:
+        effect = self.finalization.get("followup")
+        if not effect:
+            return None
+        if effect.get("issue"):
+            return effect["issue"]
+        matches = [issue for issue in json.loads(self.live_packet).get("linked_issues", []) if matches_followup(issue, effect)]
+        if len(matches) != 1:
+            self.stop("original follow-up creation is uncertain; reconcile that Call before another write")
+        return self.confirm_followup(matches[0])
+
+    def begin_followup(self, title: str, body: str, actor: str) -> str:
+        body = body.rstrip() + f"\n\n<!-- poise-invocation {self.finalization['call']} -->"
+        node = json.loads(self.packet)
+        original_body = body.strip() + f"\n\nRelated PR: https://github.com/{node['repository']}/pull/{node['pull_number']}"
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            original, saved = self.owned(conn)
+            if saved["finalization"].get("followup"):
+                self.stop("original follow-up creation already attempted; reconcile that Call")
+            saved["finalization"]["followup"] = {"title": title, "body_sha": digest(original_body), "actor": actor}
+            self.finalization = saved["finalization"]
+            _write(conn, self.root, original)
+            current = _artifact(conn, self.call)
+            current["phase"] = "filing_followup"
+            _write(conn, self.call, current)
+        return body
+
+    def confirm_followup(self, issue: dict) -> dict:
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            original, saved = self.owned(conn)
+            saved["finalization"]["followup"]["issue"] = {
+                "number": issue["number"], "html_url": issue.get("html_url") or issue.get("url")}
+            self.finalization = saved["finalization"]
+            _write(conn, self.root, original)
+        return issue
+
+    def reconcile_review(self, pwd: str, pr: str, actor: str) -> str:
+        from .atoms import pr_ref
+        response = self.read(self.finalization["verdict"])
+        with caller_store.connect(self.database) as conn:
+            retained = _artifact(conn, self.finalization["call"])["review_response"]
+        args = [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), "--pull-action-state", pr_ref(pr),
+                "--queue-evidence", "--token-user", actor]
+        done = self.funded(lambda grant: subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=grant),
+                           review_budget.timeout(60, reserve=review_budget.FINAL_CHECK_SECONDS),
+                           reserve=review_budget.FINAL_CHECK_SECONDS)
+        if done.returncode:
+            self.stop("cannot reconcile the original review publication: " + (done.stderr or done.stdout)[:500])
+        state = json.loads(done.stdout)
+        expected = {"request_changes": "CHANGES_REQUESTED", "reviewed_clean": "COMMENTED", "approve": "APPROVED"}[self.finalization["action"]]
+        matches = [item for item in state["my_reviews"] if item.get("invocation_id") == retained["invocation_id"]]
+        if state.get("repository") != retained["repository"] or state.get("pull_number") != retained["pull_number"] \
+                or state.get("head_sha") != retained["head_sha"] or state.get("review_context") != retained["context_sha"] \
+                or len(matches) != 1:
+            self.stop("original review publication is uncertain; reconcile that Call before another write")
+        item = matches[0]
+        submitted = datetime.fromisoformat(item["submitted_at"].replace("Z", "+00:00"))
+        if item.get("review_response") != retained or item.get("state") != expected \
+                or item.get("commit_id") != retained["head_sha"] or type(item.get("id")) is not int or item["id"] <= 0 \
+                or submitted.tzinfo is None or not retained["completed_at"] <= submitted.timestamp() * 1000 + 999 \
+                <= time() * 1000 + 999:
+            self.stop("original review publication differs from its retained verdict")
+        receipt = {"action": {"CHANGES_REQUESTED": "requested_changes", "COMMENTED": "reviewed_clean", "APPROVED": "approved_pr"}[expected],
+                   "review_id": item["id"], "head_sha": retained["head_sha"], "review_response": retained,
+                   "submitted_at": item["submitted_at"]}
+        review_receipt.record(json.dumps(receipt))
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            self.owned(conn)
+            current = _artifact(conn, self.call)
+            current["review_reconciliation"] = receipt
+            _write(conn, self.call, current)
+        return json.dumps(response, ensure_ascii=False) + "\n" + json.dumps(receipt)
 
     def stop(self, reason: str, *, resumable: bool = False) -> None:
         raise Continuation(reason, {"outcome": "continuation_required" if resumable else "held",
                                     "root_call": self.root, "generation": self.saved.get("generation", self.generation),
                                     "unit": getattr(self, "state", {}).get("unit"),
                                     "remaining_ms": max(0, self.saved.get("allowance_ms", 0) - self.saved.get("spent_ms", 0)),
-                                    "attempts": self.saved.get("attempts", 0)})
+                                    "attempts": self.saved.get("attempts", 0),
+                                    "publication_started": bool(self.finalization and
+                                        (self.finalization.get("followup") or self.finalization["step"] == "submitting"))})
 
     def owned(self, conn) -> tuple[dict, dict]:
         original = _artifact(conn, self.root)
@@ -202,7 +418,7 @@ class Session:
         self.saved = saved
         row = conn.execute("select status,error_code from calls where id=?", (self.call,)).fetchone()
         if saved["owner"] != self.call or saved["generation"] != self.generation \
-                or saved["phase"] != "analyzing" or not row or row[0] != "running" \
+                or saved["phase"] not in {"analyzing", "finalizing", "publishing"} or not row or row[0] != "running" \
                 or row[1] in {"stopping", "stopped"}:
             self.stop("stale review claimant cannot advance or finalize saved analysis")
         return original, saved
@@ -280,12 +496,13 @@ class Session:
             _write(conn, self.root, original)
         self.checkpoint(advanced=True)
 
-    def funded(self, function, seconds: float):
+    def funded(self, function, seconds: float, *, reserve: float = 0):
         with caller_store.connect(self.database) as conn:
             conn.execute("begin immediate")
             original, saved = self.owned(conn)
             saved["spent_ms"] += math.ceil((monotonic() - self.meter) * 1000)
-            remaining_ms = analysis_remaining_ms(saved)
+            remaining_ms = saved["allowance_ms"] - saved["spent_ms"] - math.ceil(reserve * 1000) \
+                if saved["complete"] else analysis_remaining_ms(saved)
             if remaining_ms <= 0:
                 self.stop("cumulative review time allowance exhausted")
             if saved["attempts"] >= 2 * (MAX_UNITS + 1) * 13:
@@ -456,6 +673,8 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
     from .atoms import AgentPreflightError, ReviewVerdictError
     session = Session(packet, model.identity)
     try:
+        if session.finalization:
+            return session.read(session.finalization["verdict"]), session.packet, session
         session.initialize(repository)
         units = session.manifest["units"]
         first_unit = session.state["unit"]
@@ -534,7 +753,8 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
             saved.update(phase="finalizing", complete=True)
             _write(conn, session.root, original)
             session.retain_progress(conn, saved, _artifact(conn, session.call))
-        return verdict, session.packet
+        session.meter = monotonic()
+        return verdict, session.packet, session
     except Continuation as error:
         if error.result["outcome"] == "held":
             with caller_store.connect(session.database) as conn:

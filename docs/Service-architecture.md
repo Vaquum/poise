@@ -1734,10 +1734,15 @@ Poise schedules [resumable structured reviews](Behavior-Contract.md#resumable-st
 through the existing legacy and chain admission paths. Caller owns each exact
 review basis and reserves one finalization after full source and integration
 coverage. The original receipt proves worker release before re-admission and
-preserves the publisher's Call after a lost acknowledgement. Existing PR status
-and chain summary reads expose the compact checkpoint and cumulative spend.
-This uses the existing native cleanup capability, release barrier and review
-receipt interfaces.
+preserves the publisher's Call after a lost acknowledgement. A complete verdict
+resumes only its unfinished remapping or publication step after resource
+settlement, without further provider analysis. Review and capped follow-up
+attempts retain their original identity and require reconciliation of uncertain
+effects before any further write. Existing PR status and chain summary reads
+expose the compact checkpoint and cumulative spend. This uses the existing
+native cleanup capability, release barrier and review receipt interfaces. See
+[Caller's protocol](../caller/agent_interface/README.md#explicit-review-continuation)
+for bounds, invalidation, holds and isolated proof.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
