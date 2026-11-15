@@ -12,6 +12,7 @@ from typing import Callable
 from . import atoms, checkout_lock, failed_source, issue_review, native_namespace, progress, review_budget, resource_ownership
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope, escaped_failure
+from .review_watch import ReviewWatch
 
 UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended; report a blocker instead of inventing a human answer. Caller owns publication."
 
@@ -418,7 +419,10 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             progress.stage("waiting_provider", "Waiting for atomic behavior provider", timeout=seconds)
             started = monotonic()
             try:
-                done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
+                watch = ReviewWatch(str(checkout), f"https://github.com/{repo}/pull/{pull}", actor, expected_head) \
+                    if pull is not None and os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") == call_id else None
+                done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env,
+                                              provider=model.provider, **({"head_watch": watch} if watch else {}))
             except subprocess.TimeoutExpired as error:
                 if pull is None:
                     try:

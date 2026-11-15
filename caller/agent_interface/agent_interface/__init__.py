@@ -1686,8 +1686,10 @@ def persist_action_plan(call_id: str, plan: dict) -> str:
         raise ValueError("native publication plan exceeds its durable byte bound")
     with db() as conn:
         conn.execute("begin immediate")
-        row = conn.execute("select action_plan, status, json_extract(artifact,'$.retirement.cause') as retirement "
+        row = conn.execute("select action_plan, status, json_extract(artifact,'$.retirement.cause') as retirement,outcome,head_sha "
                            "from calls where id=?", (call_id,)).fetchone()
+        if row is not None and row["outcome"] == "superseded":
+            raise ReviewSuperseded(row["head_sha"])
         if row is not None and row["retirement"] == "target_closed":
             raise ClosedImplementationRetired("work publication fenced by verified target closure")
         if row is None or row["status"] != "running" or (row["action_plan"] is not None and row["action_plan"] != encoded):
@@ -1935,7 +1937,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
             with review_receipt.managed_resources(run_dir):
                 try:
                     result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
-                except ClosedImplementationRetired:
+                except (ClosedImplementationRetired, ReviewSuperseded):
                     raise
                 except Exception as error:
                     if getattr(error, "diagnostic", None) is None:
@@ -1977,9 +1979,14 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                 resource_ownership.failure(DB, id_, "resources_unknown", run_dir)
             record({**artifact, "phase": "resources_unknown"})
         with db() as conn:
-            row = conn.execute("select error_code,artifact,action_plan from calls where id=?", (id_,)).fetchone()
+            row = conn.execute("select error_code,artifact,action_plan,outcome,head_sha from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
         stored = json.loads(row["artifact"] or "{}") if row and row["artifact"] else {}
+        if isinstance(error, ReviewSuperseded) and source == "poise:behavior-chain" and pull is not None \
+                and row is not None and row["outcome"] == "superseded" and row["head_sha"] == error.head_sha and not row["error_code"]:
+            finish(id_, "superseded", outcome="superseded", head_sha=error.head_sha, action=None)
+            print(json.dumps({"id": id_, "behavior": behavior, "outcome": "superseded", "head_sha": error.head_sha}))
+            return
         retired = (
             source == "poise:behavior-chain" and pull is None and behavior == "implement_issue"
             and row is not None and row["action_plan"] is None and failure is None

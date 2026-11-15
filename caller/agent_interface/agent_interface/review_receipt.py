@@ -239,6 +239,33 @@ def checkpoint_verified_resolution(response: dict, review_id: int | None, thread
                      (json.dumps(progress), call_id))
 
 
+def supersede_repair(expected_head: str, head: str) -> bool:
+    """Fence the original repair before its publication transaction can win."""
+    database, call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_DB"), os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database and not call_id:
+        return False
+    if not database or not call_id or not re.fullmatch(r"[0-9a-f]{32}", call_id) \
+            or not re.fullmatch(r"[0-9a-f]{40}", expected_head) or not re.fullmatch(r"[0-9a-f]{40}", head) or head == expected_head:
+        raise ValueError("repair supersession requires its original Call and distinct verified heads")
+    with caller_store.connect(database, timeout=30) as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select artifact,outcome,head_sha,action,review_id,receipts from calls where id=? and status='running' "
+                           "and source='poise:behavior-chain' and behavior='repair_pr' and expected_head=? "
+                           "and coalesce(error_code,'') not in ('stopping','stopped')", (call_id, expected_head)).fetchone()
+        artifact = json.loads(row[0] or "{}") if row else {}
+        if not row or artifact.get("phase") not in {"preparing", "prepared", "executing", "preparing_publication"} \
+                or any(artifact.get(key) is not None for key in
+                       ("publication_head", "replies_started", "publication", "result", "resource_error")) \
+                or any(value is not None for value in row[3:]):
+            return False
+        if row[1] == "superseded" and row[2] == head:
+            return True
+        if row[1] is not None or row[2] is not None:
+            return False
+        conn.execute("update calls set outcome='superseded',head_sha=? where id=?", (head, call_id))
+    return True
+
+
 def work_publication(head: str, *, start_replies: bool = False) -> None:
     """Record write intent before push, then reserve planned replies before POST.
 
@@ -253,10 +280,12 @@ def work_publication(head: str, *, start_replies: bool = False) -> None:
         raise RuntimeError("managed work publication lacks its native receipt binding")
     with caller_store.connect(database, timeout=30) as conn:
         conn.execute("begin immediate")
-        row = conn.execute("select artifact,status,resources_settled_at,resource_ownership from calls where id=? and source='poise:behavior-chain' "
+        row = conn.execute("select artifact,status,resources_settled_at,resource_ownership,outcome from calls where id=? and source='poise:behavior-chain' "
                            "and behavior in ('implement_issue','repair_pr') and action_plan is not null "
                            "and coalesce(error_code,'') not in ('stopping','stopped')", (call_id,)).fetchone()
         artifact = json.loads(row[0]) if row and row[0] else {}
+        if row and row[4] == "superseded":
+            raise RuntimeError("work publication fenced by verified repair head change")
         if isinstance(artifact.get("retirement"), dict) and artifact["retirement"].get("cause") == "target_closed":
             raise RuntimeError("work publication fenced by verified target closure")
         if not row or artifact.get("phase") not in {"preparing_publication", "publishing"} or not artifact.get("plan_sha"):

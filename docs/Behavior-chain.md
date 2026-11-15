@@ -638,6 +638,17 @@ after verified no-write closure and original resource release, preserving
 history without an Error or a failed attempt. Other Calls and uncertain
 publication or cleanup retain their original ownership and reconciliation.
 
+A native repair also observes the live PR head within its original gated
+provider lifecycle. Only a verified different head and a Caller fence that wins
+the publication transaction can stop that provider early. The original Call
+records supersession with both revisions and retains its resources until positive
+settlement. The chain then considers the current head through its normal gates,
+without a chain supersession or a person's Stop/Resume hold. Publication that
+wins the race retains ownership and normal reconciliation. Bounded chain
+observations show the changed head waiting on the original Call, with the old
+and new revisions in the existing work status. Unavailable or unchanged head
+evidence never cancels a healthy repair or extends its deadline.
+
 The publication primitive validates the checkout and model-written metadata in
 read-only mode before Caller records its write intent. Invalid commit subjects,
 PR titles, issue-closing references or reply targets fail as unstarted work,

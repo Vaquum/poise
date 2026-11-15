@@ -247,6 +247,16 @@ before planning. The original Call retains the typed `superseded` /
 `not_started` / `target_closed` receipt and its own resource ownership. Poise
 settles the invocation only after the original cleanup proves release.
 
+Native repairs reuse the bounded `--head-sha` observation during the original
+gated provider run. A verified different head fences that Call under the same
+database write lock as `work_publication()` entering `publishing`, before
+cooperatively stopping its worker. The original result is `status/outcome =
+superseded`, `action = null`, with the old `expected_head` and verified new
+`head_sha`. Its lease and chain slot remain owned until original process and
+disk settlement are proven. If publication wins the transaction, the repair
+continues through normal settlement. Missing, malformed or unchanged head
+evidence leaves the original deadline and worker intact.
+
 # Recording a Chat turn
 
 Poise's Chat runs the agents itself; Caller only keeps the row so Swarm lists
