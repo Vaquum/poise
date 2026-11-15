@@ -246,6 +246,14 @@ test('a card is added at the top of its lane, edited in place, and deleted after
 
 test('card repository search saves chosen options and preserves an unlisted link', async ({ page }) => {
   await board(page, { records: RECORDS })
+  // The GitHub repositories are fixtures, so persist the card's actual write
+  // payload in the same fixture rather than asking the real account validator.
+  const stored = { id: 1, text: '', repo: null as string | null, lane: 'idea', position: 0, created_at: iso(0), updated_at: iso(0) }
+  await page.route(/\/api\/current(?:\?|\/|$)/, async (route) => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { cards: stored.text ? [stored] : [] } })
+    Object.assign(stored, route.request().postDataJSON())
+    return route.fulfill({ json: stored })
+  })
   const idea = page.locator('.lane[data-lane="idea"]')
   await idea.getByRole('button', { name: 'Add' }).click()
   await idea.getByRole('textbox', { name: 'Card text' }).fill('A searchable repository')
@@ -352,6 +360,37 @@ test('issue repository search requires a choice and stays disabled when editing'
   await card(page, 'Opened today').getByRole('button', { name: 'Edit issue' }).click()
   await expect(page.getByRole('combobox', { name: 'Repository', exact: true })).toBeDisabled()
   await expect(page.getByRole('combobox', { name: 'Repository', exact: true })).toHaveValue('acme/site')
+})
+
+test('a failed card save leaves the newer repository writer active and keeps the card draft', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  let finish: (() => void) | undefined
+  await page.route('**/api/current', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    await new Promise<void>((resolve) => { finish = resolve })
+    await route.fulfill({ status: 503, json: { error: 'Card save unavailable' } })
+  })
+  const idea = page.getByRole('region', { name: 'Idea' })
+  const newCard = idea.getByRole('button', { name: 'Add', exact: true }).first()
+  await newCard.click()
+  await idea.getByRole('textbox', { name: 'Card text' }).fill('Keep my card draft')
+  await idea.getByRole('combobox').fill('api')
+  await idea.locator('[data-writer]').getByRole('button', { name: 'Add', exact: true }).click()
+  await expect.poll(() => !!finish).toBe(true)
+
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.getByLabel('Issue title').fill('Keep this issue open')
+  finish!()
+  await expect(page.getByText('The card was not saved: Card save unavailable')).toBeVisible()
+  await expect(page.getByRole('combobox')).toHaveCount(1)
+  const repository = page.getByRole('combobox', { name: 'Repository', exact: true })
+  await repository.fill('api')
+  await expect(page.getByRole('option')).toHaveText(['acme/api'])
+  await expect(page.getByLabel('Issue title')).toHaveValue('Keep this issue open')
+
+  await newCard.click()
+  await expect(idea.getByRole('textbox', { name: 'Card text' })).toHaveValue('Keep my card draft')
+  await expect(idea.getByRole('combobox')).toHaveValue('api')
 })
 
 test('choosing a live item opens it beside the board, and a card’s chat opens in the side pane', async ({ page }) => {

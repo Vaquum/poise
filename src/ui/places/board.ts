@@ -265,7 +265,8 @@ export const mount: MountPlace = (ctx) => {
     if (!repoPick) return []
     const { key, value, query } = repoPick
     const available = value && !repos.includes(value) ? [value, ...repos] : repos
-    return (key === 'issue' ? available : ['', ...available]).filter((r) => (r || 'No repository').toLowerCase().includes(query.toLowerCase()))
+    const matching = available.filter((r) => r.toLowerCase().includes(query.toLowerCase()))
+    return key !== 'issue' && !query ? ['', ...matching] : matching
   }
   function repoHTML(key: string, selected: string | null, disabled = false): string {
     const field = `${key.split('.')[0]}-repo`
@@ -278,7 +279,7 @@ export const mount: MountPlace = (ctx) => {
     if (disabled) p.open = false
     const choices = repoChoices()
     const label = key === 'issue' ? 'Repository' : key.startsWith('edit.') ? 'Linked repository' : 'Link a repository'
-    return `<div class="board-repo"><input type="hidden" data-w="${field}" data-repo-value value="${esc(p.value)}"><input data-w="repo-query" data-repo-query role="combobox" aria-label="${label}" aria-autocomplete="list" aria-expanded="${p.open}" aria-controls="board-repo-list"${p.open && choices[p.active] !== undefined ? ` aria-activedescendant="board-repo-${p.active}"` : ''} autocomplete="off" placeholder="${key === 'issue' ? 'Search repositories…' : 'No repository'}" value="${esc(p.query)}" data-ref="composer.repo"${disabled ? ' disabled' : ''}><div class="board-repo-list" id="board-repo-list" role="listbox" aria-label="Repositories"${p.open ? '' : ' hidden'}>${choices.length ? choices.map((r, i) => `<button type="button" role="option" tabindex="-1" id="board-repo-${i}" data-repo-option="${esc(r)}" aria-selected="${r === p.value}" data-active="${i === p.active}">${esc(r || 'No repository')}</button>`).join('') : '<p class="t-gloss" role="status">No repositories match.</p>'}</div></div>`
+    return `<div class="board-repo"><input type="hidden" data-w="${field}" data-repo-value value="${esc(p.value)}"><input type="search" data-w="repo-query" data-repo-query role="combobox" aria-label="${label}" aria-autocomplete="list" aria-expanded="${p.open}" aria-controls="board-repo-list"${p.open && choices[p.active] !== undefined ? ` aria-activedescendant="board-repo-${p.active}"` : ''} autocomplete="off" placeholder="${key === 'issue' ? 'Search repositories…' : 'No repository'}" value="${esc(p.query)}" data-ref="composer.repo"${disabled ? ' disabled' : ''}><div class="board-repo-list" id="board-repo-list" role="listbox" aria-label="Repositories"${p.open ? '' : ' hidden'}>${choices.length ? choices.map((r, i) => `<button type="button" role="option" tabindex="-1" id="board-repo-${i}" data-repo-option="${esc(r)}" aria-selected="${r === p.value}" data-active="${i === p.active}">${esc(r || 'No repository')}</button>`).join('') : '<p class="t-gloss" role="status">No repositories match.</p>'}</div></div>`
   }
   function dismissRepos(): void {
     if (!repoPick) return
@@ -619,11 +620,13 @@ export const mount: MountPlace = (ctx) => {
   })
 
   async function addCard(lane: MineLane): Promise<void> {
-    const w = $(`[data-writer="add.${lane}"]`, lanesEl)
+    const key = `add.${lane}`
+    const w = $(`[data-writer="${key}"]`, lanesEl)
     const text = ($('[data-w="add-text"]', w).value as string).trim(), repo = ($('[data-w="add-repo"]', w).value as string) || null
-    if (!text) { closeWriter(`add.${lane}`, writerFocus(`add.${lane}`)); return }
-    W.delete(`add.${lane}`)
-    drafts.delete(`add.${lane}`)
+    if (!text) { closeWriter(key, writerFocus(key)); return }
+    const query = repoPick?.query ?? repo ?? ''
+    W.delete(key)
+    drafts.delete(key)
     try {
       const created = await createCard({ text, lane, repo })
       // + Add puts the card at the top of its lane, under the composer.
@@ -634,9 +637,10 @@ export const mount: MountPlace = (ctx) => {
       $(`.card[data-id="${placed.id}"]`, lanesEl)?.focus()
       if (!matches(text, repo) || !inOrg(repo)) toast('Card added. Your filter hides it; clear the filter to see it.')
     } catch (error) {
-      W.set(`add.${lane}`, {})
-      drafts.set(`add.${lane}`, { 'add-text': text, 'add-repo': repo ?? '' })
-      render(false)
+      if (!W.has(key)) {
+        drafts.set(key, { 'add-text': text, 'add-repo': repo ?? '', 'repo-query': query })
+        if (!W.size) openWriter(key)
+      }
       toast(`The card was not saved: ${(error as Error).message}`, 'failed')
     }
   }
@@ -994,11 +998,9 @@ export const mount: MountPlace = (ctx) => {
     const t = e.target as HTMLInputElement
     if (t.matches('[data-repo-query]') && repoPick?.query === repoPick?.value) t.select()
   }, root)
-  on('focusout', (e) => {
-    if ((e.target as Element).matches('[data-repo-query]')) dismissRepos()
-  }, root)
   on('click', (e) => {
     const t = e.target as Element
+    // Closing the inline list on pointer focusout can move the next button before its click.
     if (!t.closest('.board-repo')) dismissRepos()
     if (!root.contains(t)) return
     const option = t.closest<HTMLElement>('[data-repo-option]')
@@ -1119,6 +1121,7 @@ export const mount: MountPlace = (ctx) => {
     const w = t.closest<HTMLElement>('[data-writer]')
     if (w && repoPick?.open && e.key === 'Escape') { e.preventDefault(); dismissRepos(); return }
     if (t.matches('[data-repo-query]') && repoPick && !(t as HTMLInputElement).disabled) {
+      if (e.key === 'Tab') dismissRepos()
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault()
         const choices = repoChoices()
@@ -1208,7 +1211,7 @@ export const mount: MountPlace = (ctx) => {
     const out: string[] = []
     for (const key of W.keys()) {
       const box = $(`[data-writer="${CSS.escape(key)}"]`, lanesEl)
-      const typed = box ? $$('[data-w]', box).some((f: HTMLInputElement) => f.tagName !== 'SELECT' && f.value.trim()) : false
+      const typed = box ? $$('[data-w]:not([data-repo-value], [data-repo-query])', box).some((f: HTMLInputElement) => f.value.trim()) : false
       if (typed) out.push(key === 'issue' ? 'An issue being written on Board' : 'A card being written on Board')
     }
     if ([...LIFE.values()].some(([stage]) => stage === 'Accepted' || stage === 'Executing')) out.push('A Board action on its way')
