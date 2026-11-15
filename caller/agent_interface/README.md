@@ -238,6 +238,15 @@ feed real `--logs --select` bytes into Poise's decoder and journal runtime for
 all five behaviors; malformed variants remain quarantined. These contract
 checks create no GitHub artifacts and are not workflow acceptance runs.
 
+`--retire-closed-implementation CALL_ID` handles a running first implementation
+after Poise verifies seed closure. It pins the original supervisor and records
+closure under the same database write lock as publication planning, then sends
+cooperative SIGTERM. A stored plan or publication receipt prevents retirement.
+Validation of a first implementation can also report a confirmed closed seed
+before planning. The original Call retains the typed `superseded` /
+`not_started` / `target_closed` receipt and its own resource ownership. Poise
+settles the invocation only after the original cleanup proves release.
+
 # Recording a Chat turn
 
 Poise's Chat runs the agents itself; Caller only keeps the row so Swarm lists

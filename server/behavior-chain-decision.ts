@@ -1,8 +1,8 @@
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
+import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 import { validReviewResponse, type ReviewResponse } from './review-response'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { matchingNativeActionReceipt } from './behavior-chain-action'
-import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 
 export const CHAIN_OBSERVATION_MAX_AGE_MS = 120_000
 // The readiness blockers an open conversation can explain. Any other also fails

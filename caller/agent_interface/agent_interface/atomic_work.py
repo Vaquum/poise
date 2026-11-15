@@ -590,7 +590,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                                 "--title", publication["title"], "--body", publication["body"], "--replies-json", json.dumps(replies)]
             progress.stage("validating_publication", "Validating the candidate through github-interface")
             validated = issue_review.interface(*publication_args, "--mode", "validate", seconds=120)
-            if validated.get("outcome") == "superseded":
+            if validated.get("outcome") in {"superseded", "target_closed"}:
                 return validated
             if validated.get("outcome") != "validated":
                 raise AtomicWorkFailed("publication validation returned no confirmation; no publication attempted")

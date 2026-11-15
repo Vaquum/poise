@@ -2,6 +2,7 @@ import { expect, test, type Locator, type Page, type Route, type WebSocketRoute 
 import type { AnalyticsHealth } from '../../src/analytics-health-types'
 import { BEHAVIOR_KEYS } from '../../src/behavior-types'
 import { BEHAVIOR_METRICS_COVERAGE_ERROR } from '../../src/behavior-metrics'
+import type { BehaviorDiagnostics } from '../../src/behaviors'
 
 // Overview in the new interface (#556, PRD Support → Tests): Answer here with
 // a request answered elsewhere while held or focused, several requests at
@@ -46,6 +47,7 @@ interface Workspace {
   chainActions?: unknown[]
   /** Behaviors' agent log error, a diagnostic with no time of its own. */
   agentLogsError?: string | null
+  diagnostics?: Partial<BehaviorDiagnostics>
   /** Review publications and each document's threads; a reply appends to its thread. */
   publications?: unknown[]
   threads?: Record<string, { id: string, messages: { author: string, body: string, createdAt: string }[] }[]>
@@ -141,7 +143,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     }
     if (path === '/api/answers/dismissals') return json(route, { dismissals: workspace.dismissals ?? [] })
     if (path === '/api/behaviors' && workspace.behaviorsFail) return json(route, { error: 'behaviors are unavailable' }, 503)
-    if (path === '/api/behaviors') return json(route, { ...workspace.behaviorStates, diagnostics: { status: 'ok', agentLogsError: workspace.agentLogsError ?? null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
+    if (path === '/api/behaviors') return json(route, { ...workspace.behaviorStates, diagnostics: { status: 'ok', agentLogsError: workspace.agentLogsError ?? null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [], ...workspace.diagnostics } })
     if (path === '/api/settings' && method === 'GET') await workspace.settingsLate
     if (path === '/api/settings' && method === 'GET') return json(route, { org: '', organizations: (workspace.orgs ?? ['acme']).map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })), me: 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
     if (path === '/api/analytics') return json(route, { window: { since: url.searchParams.get('since'), until: url.searchParams.get('until') }, agentAccount: 'bot', ...day, ...(url.searchParams.get('dailyBounds') ? { daily: Array.from({ length: 7 }, () => day) } : {}), errors: [] })
@@ -320,6 +322,44 @@ test('the level decides what shows and what the bell counts, and is remembered',
   await expect(answers(page).getByRole('radio', { name: 'Only you' })).toHaveAttribute('aria-checked', 'true')
   await expect(page.locator('[data-bell]')).toHaveText('2')
 })
+
+for (const blocked of [false, true]) {
+  test(`reviewer backoff stays unverified while Overview and the bell count ${blocked ? 'exhausted work and a stalled sweep' : 'no faults'}, on and away from Overview`, async ({ page }) => {
+    const timeout = 'grok-4.7-xhigh cannot review: it timed out before a verdict. Poise retries automatically.'
+    const failure: BehaviorDiagnostics['failures'][number] = { org: 'acme', behavior: 'review-new-prs',
+      target: 'reviewer:grok-4.7-xhigh', kind: 'operation', consecutiveFailures: 3, failingSince: ago(900),
+      lastFailureAt: ago(850), nextRetryAt: ago(845), error: timeout, callId: 'original-call', evidence: EVIDENCE }
+    const workspace: Workspace = { notices: [], requests: [], decisions: [], revision: 1, orgs: ['acme', 'other'],
+      // Unrelated reviews continue; no successor proves this model recovered.
+      behaviorStates: { 'review-new-prs': { enabled: true, lastTriggered: { at: ago(1), target: 'other/site#12' }, lastSucceeded: { at: ago(2) } } },
+      diagnostics: { status: blocked ? 'degraded' : 'ok', runtimeError: blocked ? 'The behavior scheduler is no longer responding.' : null,
+        failures: [failure, { ...failure, behavior: 'approve-prs', nextRetryAt: ago(-2) },
+          { ...failure, org: 'other', failingSince: ago(30), lastFailureAt: ago(1), nextRetryAt: ago(-1) }],
+        deadLetters: blocked ? [{ id: 'exhausted', behavior: 'review-new-prs', target: 'acme/site#3', createdAt: ago(1),
+          error: 'Automatic retries stopped after two review timeouts', diagnostic: { severity: 'warning', code: 'review_budget_exhausted' } }] : [] } }
+    await open(page, workspace)
+    const count = blocked ? '2' : '0'
+    await expect(page.locator('[data-bell]')).toHaveText(count)
+    await expect(answers(page).locator('[data-notice]')).toHaveCount(blocked ? 2 : 0)
+    if (blocked) await expect(answers(page)).toContainText('Automatic retries stopped after two review timeouts')
+    await answers(page).getByRole('radio', { name: 'Everything', exact: true }).click()
+    if (blocked) await unfoldAuto(page)
+    const due = answers(page).locator('[data-notice]').filter({ hasText: 'Recorded backoff elapsed; recovery unverified.' })
+    const live = answers(page).locator('[data-notice]').filter({ hasText: 'Recorded backoff is active; recovery unverified.' })
+    await expect(due).toHaveCount(1)
+    await expect(live).toHaveCount(1)
+    await press(due, 'Show more')
+    await expect(due).toContainText(timeout)
+    await expect(due.getByRole('link', { name: 'Open its diagnostic' })).toHaveAttribute('href', expect.stringContaining(`event=${EVIDENCE.eventId}`))
+    await expect(page.locator('[data-bell]')).toHaveText(count)
+
+    const awayRead = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/behavior-ledger/pr-status')
+    await page.getByRole('navigation', { name: 'Poise' }).getByRole('link', { name: 'Observe', exact: true }).click()
+    await awayRead
+    await expect(page.locator('[data-bell]')).toHaveText(count)
+    if (blocked) await expect(page.locator('[data-bell]')).toHaveAttribute('data-tone', 'failed')
+  })
+}
 
 test('only one worker question asks the owner after the Manager escalates it', async ({ page }) => {
   const worker = { ...question('q1', 'w1', { question: 'Which release?', options: ['Stable', 'Beta'], freeText: false }), ownerAction: false }

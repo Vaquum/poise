@@ -399,6 +399,9 @@ async def _issue_work(client: GitHubClient, payload: dict) -> dict:
         # head, which Caller needs to decode and settle this no-write receipt.
         return {**result, "outcome": "superseded", "head_sha": merged_head, "merged": True}
     issue = await client.get(f"/repos/{target}/issues/{issue_number}")
+    if mode == "validate" and pull is None and remote_head is None \
+            and issue.get("state") == "closed" and "pull_request" not in issue:
+        return {**result, "outcome": "target_closed"}
     if issue.get("state") != "open" or "pull_request" in issue:
         raise ValueError("behavior chain seed is no longer an open issue")
     if pull is not None and (pull.get("state") != "open" or pull.get("merged_at") or pull.get("merged")):

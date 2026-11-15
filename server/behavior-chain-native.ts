@@ -581,6 +581,17 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         || proof.source !== 'poise:behavior-chain' || proof.correlation_id !== invocation.id || proof.expected_head !== expected) throw new Error('native closed-target fence conflicts with its original admission')
       return proof.outcome === 'fenced'
     },
+    async retireClosedImplementation(chain, invocation, call) {
+      if (invocation.behavior !== 'implement-issue' || invocation.request.command !== 'agent-interface' || !invocation.model
+        || call.correlation_id !== invocation.id || call.behavior !== 'implement_issue' || call.repo !== chain.repository
+        || call.actor !== invocation.actor || call.source !== 'poise:behavior-chain') throw new Error('closed-target retirement requires the original running implementation')
+      requireCallerReceipts()
+      const { stdout } = await runFile('agent-interface', ['--retire-closed-implementation', call.id],
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 16 * 1024 })
+      const proof = object(JSON.parse(stdout), 'native closed-target retirement')
+      if (proof.id !== call.id || !['retiring', 'refused'].includes(String(proof.outcome))) throw new Error('native closed-target retirement conflicts with its original Call')
+      return proof.outcome === 'retiring'
+    },
     async perform(invocation, chain) {
       requireCallerReceipts()
       let stdout: string

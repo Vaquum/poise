@@ -78,6 +78,14 @@ evidence overrides Caller no-action text; a matching correlation must identify
 exactly one Caller row. Stronger current incident evidence also overrides a
 cached automatic failure summary.
 
+A timeout on a `reviewer:` operation describes that model's recorded backoff,
+not a stalled sweep. A due deadline says **Recorded backoff elapsed; recovery
+unverified**; a future deadline remains active backoff and can reserve a probe
+without a new failure. Each record is classified before grouping organizations
+and behaviors. Its age alone does not establish a Fault or PR eligibility:
+sibling review behaviors, target holds and exhausted attempts remain independent.
+Original failure clocks, counts, Call evidence and scheduler decisions are retained.
+
 If the browser cannot read `/api/behaviors`, it reports one request diagnostic
 and retains its last known snapshot. It does not infer agent-log, datastore or
 identity failures from that request. A generic browser fetch exception retains
