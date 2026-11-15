@@ -616,15 +616,18 @@ function implementationReport(db: Database, chain: BehaviorChain): RepairReport 
       // pre-record generated report must still run its predatesHold gate
       // instead of collapsing to ordinary intake when another source adopts
       // its stripped issue. The earliest pre-record decides: it predates
-      // only when every pre-record does.
+      // only when every pre-record does. All-explicit adoptions return
+      // their earliest so admission runs its orphan gate instead of
+      // collapsing when a lost-ack could own the issue.
       const generated = reports.filter(report => report.adopted === false)
       if (generated.length === 1) return generated[0]
       if (!generated.length) {
         const legacy = reports.filter(report => report.adopted === undefined)
           .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
             || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
-        if (!legacy.length) return null
-        return legacy[0]
+        if (legacy.length) return legacy[0]
+        return [...reports].sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
+          || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))[0]
       }
     }
     throw new Error('Blocked report has conflicting source intents')
@@ -954,7 +957,7 @@ export async function implementationReportAdmission(db: Database, journal: Behav
             && deps.prerequisites.some(entry => typeof entry?.repo === 'string'
               && entry.repo.toLowerCase() === chain.repository.toLowerCase() && entry.number === chain.issue)
             && journal.read(source.id)?.sequence === source.sequence
-          // A lost-ack scoped intent with null issueNumber is invisible to
+          // A lost-ack intent with null issueNumber is invisible to
           // implementationReport. If its marker was stripped before
           // reconciliation and a second hold adopted the stripped issue,
           // exempting here would bypass the original report's disposition.
@@ -965,8 +968,6 @@ export async function implementationReportAdmission(db: Database, journal: Behav
             const file = failure.file, test = failure.test
             orphaned = unconfirmedImplementationReports(db, chain.repository).some(candidate => {
               if (candidate.pull !== null || candidate.adopted === true) return false
-              if (candidate.key === chainBasis([IMPLEMENTATION_CAUSE, candidate.source])
-                || candidate.key === chainBasis([IMPLEMENTATION_BUDGET_CAUSE, candidate.source])) return false
               if (predatesHold(issue.created_at, candidate.heldAt)) return false
               const origin = journal.read(candidate.source)
               const original = origin?.invocations.find(item => item.id === candidate.attempts[0]?.invocation)

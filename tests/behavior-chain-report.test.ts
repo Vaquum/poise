@@ -2140,7 +2140,8 @@ it('keeps a shared blocked-by remedy ordinary when two source holds adopt it', a
   expect(admitted).toMatchObject({ behavior: 'implement-issue', state: 'started' })
   expect(admitted.request.implementationSource).toBeUndefined()
   expect(() => implementationReportBinding(db, journal.read('acme/repo#98')!)).not.toThrow()
-  expect(implementationReportBinding(db, journal.read('acme/repo#98')!)).toBeNull()
+  expect(implementationReportBinding(db, journal.read('acme/repo#98')!)).toMatchObject({ key: scoped.key, source: chain.id,
+    holdSequence: scoped.holdSequence, invocation: next.call.correlation_id, call: next.call.id })
   expect(journal.read(chain.id)).toMatchObject({ held: next.call.error })
   expect(posts()).toHaveLength(1)
 })
@@ -2441,6 +2442,116 @@ it('keeps a lost-ack scoped report gated when its stripped issue is adopted', as
   expect(report.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
   expect(journal.read(chain.id)).toMatchObject({ held: third.call.error })
   expect(posts()).toHaveLength(2)
+})
+
+it('keeps a lost-ack scoped report gated when two sources adopt its stripped issue', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedImplementation(journal)
+  call.error = ingressError('a'.repeat(64), 'b'.repeat(32)); call.diagnostic = prePrDiagnostic()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  const originalKey = chainBasis(['atomic_work_blocked', chain.id])
+  remote[0].state = 'closed'
+  record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  const next = blockedImplementation(journal)
+  next.call.error = memoryError('c'.repeat(64), 'd'.repeat(32)); next.call.diagnostic = prePrDiagnostic()
+  fresh.prerequisites = prePrPrerequisites([])
+  loseCreation = true
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [next.call], quarantined: [] }) })).run()
+  loseCreation = false
+  const intents = reports(db).map(row => JSON.parse(row.value))
+  expect(intents).toHaveLength(2)
+  const scoped = intents.find(intent => intent.key !== originalKey)!
+  expect(scoped).toMatchObject({ source: chain.id, pull: null, issueNumber: null, adopted: false })
+  expect(posts()).toHaveLength(2)
+  remote[1].body = remote[1].body.replace(`<!-- poise-repair-exhaustion:${scoped.key} -->`, '')
+  expect(remote[1].body).not.toContain('poise-repair-exhaustion')
+  record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  const third = blockedImplementation(journal)
+  third.call.error = memoryError('e'.repeat(64), 'f'.repeat(32)).replace('STACK_TRACE_ERROR', 'OTHER_ERROR')
+  third.call.diagnostic = prePrDiagnostic()
+  fresh.prerequisites = prePrPrerequisites([100])
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [third.call], quarantined: [] }) })).run()
+  const adopted = reports(db).map(row => JSON.parse(row.value))
+  expect(adopted).toHaveLength(3)
+  const linked = adopted.find(intent => intent.key !== originalKey && intent.key !== scoped.key)!
+  expect(linked).toMatchObject({ source: chain.id, pull: null, issueNumber: 100, adopted: true })
+  // A second source adopts the same stripped issue. Two adopted intents must
+  // not collapse to ordinary intake while the lost-ack orphan could own it.
+  const secondKey = chainBasis(['atomic_work_blocked', 'acme/repo#8', 'second-implementation', 5])
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('behavior_chain_repair_report:' + secondKey, JSON.stringify({
+    key: secondKey, source: 'acme/repo#8', pull: null, holdSequence: 5, heldAt: Date.now(), head: null,
+    basis: 'b'.repeat(64), slot: 'primary',
+    attempts: [{ invocation: 'second-implementation', call: 'c'.repeat(32), completedAt: Date.now() }],
+    issueNumber: 100, adopted: true }))
+  expect(reports(db)).toHaveLength(4)
+  vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  const fixture = await reviewedImplementationReport(db, journal, third.call, 100)
+  const report = journal.read('acme/repo#100')!
+  expect(() => implementationReportBinding(db, report)).not.toThrow()
+  expect(implementationReportBinding(db, report)).toMatchObject({ key: linked.key, source: chain.id,
+    holdSequence: linked.holdSequence, invocation: third.call.correlation_id, call: third.call.id })
+  const admission = await implementationReportAdmission(db, journal, report,
+    await fixture.overrides.observe(report), fixture.overrides.observe)
+  expect(admission.reason).toContain('awaits a current explicit')
+  expect(fixture.request).not.toHaveBeenCalled()
+  expect(fixture.launch).not.toHaveBeenCalled()
+  expect(report.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
+  expect(journal.read(chain.id)).toMatchObject({ held: third.call.error })
+  expect(posts()).toHaveLength(2)
+})
+
+it('keeps a source-only lost-ack report gated when its stripped issue is adopted', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = blockedImplementation(journal)
+  call.error = memoryError('c'.repeat(64), 'd'.repeat(32)); call.diagnostic = prePrDiagnostic()
+  fresh.prerequisites = prePrPrerequisites([])
+  loseCreation = true
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  loseCreation = false
+  const originalKey = chainBasis(['atomic_work_blocked', chain.id])
+  const intents = reports(db).map(row => JSON.parse(row.value))
+  expect(intents).toHaveLength(1)
+  expect(intents[0]).toMatchObject({ key: originalKey, source: chain.id, pull: null, issueNumber: null,
+    attempts: [{ invocation: call.correlation_id, call: call.id }] })
+  expect(intents[0].adopted).toBeUndefined()
+  expect(posts()).toHaveLength(1)
+  remote[0].body = remote[0].body.replace(`<!-- poise-repair-exhaustion:${originalKey} -->`, '')
+  expect(remote[0].body).not.toContain('poise-repair-exhaustion')
+  expect(remote[0].body).toContain(MEMORY_FILE)
+  expect(remote[0].body).toContain('keeps memory warnings correlatable')
+  record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  const next = blockedImplementation(journal)
+  next.call.error = memoryError('e'.repeat(64), 'f'.repeat(32)).replace('STACK_TRACE_ERROR', 'OTHER_ERROR')
+  next.call.diagnostic = prePrDiagnostic()
+  fresh.prerequisites = prePrPrerequisites([99])
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => ({ ...fresh, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [next.call], quarantined: [] }) })).run()
+  const adopted = reports(db).map(row => JSON.parse(row.value))
+  expect(adopted).toHaveLength(2)
+  expect(adopted.find(intent => intent.key === originalKey)).toMatchObject({ issueNumber: null })
+  const linked = adopted.find(intent => intent.key !== originalKey)!
+  expect(linked).toMatchObject({ source: chain.id, pull: null, issueNumber: 99, adopted: true,
+    attempts: [{ invocation: next.call.correlation_id, call: next.call.id }] })
+  expect(posts()).toHaveLength(1)
+  vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  const fixture = await reviewedImplementationReport(db, journal, next.call, 99)
+  const report = journal.read('acme/repo#99')!
+  expect(() => implementationReportBinding(db, report)).not.toThrow()
+  expect(implementationReportBinding(db, report)).toMatchObject({ key: linked.key, source: chain.id,
+    holdSequence: linked.holdSequence, invocation: next.call.correlation_id, call: next.call.id })
+  const admission = await implementationReportAdmission(db, journal, report,
+    await fixture.overrides.observe(report), fixture.overrides.observe)
+  expect(admission.reason).toContain('awaits a current explicit')
+  expect(fixture.request).not.toHaveBeenCalled()
+  expect(fixture.launch).not.toHaveBeenCalled()
+  expect(report.invocations.some(item => item.behavior === 'implement-issue')).toBe(false)
+  expect(journal.read(chain.id)).toMatchObject({ held: next.call.error })
+  expect(posts()).toHaveLength(1)
 })
 
 it('deduplicates a same pre-PR failure after Resume without creation', async () => {
