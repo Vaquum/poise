@@ -1,5 +1,6 @@
 export const MCP_READ_PATH = '/api/mcp/read'
 export const MCP_CONTROL_PATH = '/api/mcp/manager'
+export const MCP_OWNER_PATH = '/api/mcp/owner'
 export const MCP_SCOPE = 'poise:read'
 export const MCP_RESPONSE_BYTES = 128 * 1024
 const MCP_RECORD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
@@ -34,8 +35,19 @@ export const MCP_MANAGER_TOOLS = [
       properties: { preview: { type: 'string', minLength: 1, maxLength: 12000 } }, additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } },
 ] as const
+export const MCP_OWNER_TOOLS = [
+  { name: 'poise_chain_preview', description: 'Preview an owner-delegated hold or resume for one existing Behavior chain.',
+    inputSchema: { type: 'object', required: ['operation', 'repository', 'issue'], properties: {
+      operation: { enum: ['hold', 'resume'] }, repository: { type: 'string', maxLength: 140 },
+      issue: { type: 'integer', minimum: 1 },
+    }, additionalProperties: false }, annotations: { readOnlyHint: true, openWorldHint: false } },
+  { name: 'poise_chain_apply', description: 'Apply an exact owner-delegated chain preview. Reuse the preview to recover the original receipt.',
+    inputSchema: { type: 'object', required: ['preview'], properties: { preview: { type: 'string', minLength: 1, maxLength: 2048 } },
+      additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } },
+] as const
 export interface McpGrantScope {
-  resource: string; ownerId: number; handle: string; grantId: string; chatMetadata?: true; repository?: string; managerClientId?: string
+  resource: string; ownerId: number; handle: string; grantId: string; chatMetadata?: true; repository?: string
+  managerClientId?: string; ownerClientId?: string
 }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
 export interface McpGetArguments { kind: 'chat' | 'timer'; id: string }
@@ -47,10 +59,32 @@ export type McpManagerAction = { operation: 'send' | 'steer'; sessionId: string;
   | { operation: 'supervise'; sessionId: string; text: string; intervalMinutes: number }
 export type McpManagerRequest = { name: 'poise_action_preview'; arguments: McpManagerAction }
   | { name: 'poise_action_apply'; arguments: { preview: string } }
-export type McpRequest = McpRead | McpManagerRequest
+export interface McpOwnerAction { operation: 'hold' | 'resume'; repository: string; issue: number }
+export type McpOwnerRequest = { name: 'poise_chain_preview'; arguments: McpOwnerAction }
+  | { name: 'poise_chain_apply'; arguments: { preview: string } }
+export type McpRequest = McpRead | McpManagerRequest | McpOwnerRequest
 
 export const isMcpManagerTool = (name: unknown): name is McpManagerRequest['name'] =>
   MCP_MANAGER_TOOLS.some(tool => name === tool.name)
+export const isMcpOwnerTool = (name: unknown): name is McpOwnerRequest['name'] =>
+  MCP_OWNER_TOOLS.some(tool => name === tool.name)
+
+export function parseMcpOwnerRequest(value: unknown): McpOwnerRequest {
+  if (!value || typeof value !== 'object' || !('name' in value) || !isMcpOwnerTool(value.name)
+    || !('arguments' in value) || !value.arguments || typeof value.arguments !== 'object' || Array.isArray(value.arguments)
+    || Object.keys(value).length !== 2) throw new Error('invalid owner control request')
+  const args = value.arguments as Record<string, unknown>
+  if (value.name === 'poise_chain_apply' && Object.keys(args).length === 1
+    && typeof args.preview === 'string' && args.preview && args.preview.length <= 2048) {
+    return { name: value.name, arguments: { preview: args.preview } }
+  }
+  const { operation, repository, issue } = args
+  if (value.name === 'poise_chain_preview' && Object.keys(args).length === 3 && (operation === 'hold' || operation === 'resume')
+    && isMcpRepository(repository) && Number.isSafeInteger(issue) && Number(issue) >= 1) {
+    return { name: value.name, arguments: { operation, repository, issue: Number(issue) } }
+  }
+  throw new Error('provide a supported owner action and an exact repository and issue')
+}
 
 export function parseMcpManagerRequest(value: unknown): McpManagerRequest {
   if (!value || typeof value !== 'object' || !('name' in value) || !isMcpManagerTool(value.name)

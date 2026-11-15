@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { MCP_MANAGER_TOOLS, MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_TOOLS, MCP_WORK_TOOL_NAMES, mcpRepositoryAllowed, parseMcpRead, type McpGetArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
+import { MCP_MANAGER_TOOLS, MCP_OWNER_TOOLS, MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_TOOLS, MCP_WORK_TOOL_NAMES, mcpRepositoryAllowed, parseMcpRead, type McpGetArguments, type McpGrantScope } from '../gateway/src/mcp-contract'
 import { getSession, sessionInstance } from './chat/storage'
 import { timerById, timerSummaries } from './chat/control-store'
 import { HttpError, readJson, type RequestAuthority } from './http'
@@ -40,7 +40,8 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
     lookup = { observedAt: new Date().toISOString(), record: readChatRecord(chatInstance, authority.mcp, read.arguments) }
   }
   const tools = [...(authority.mcp.chatMetadata && chatInstance ? MCP_TOOLS.map(tool => tool.name) : MCP_WORK_TOOL_NAMES),
-    ...(authority.mcp.managerClientId && managerRunning ? MCP_MANAGER_TOOLS.map(tool => tool.name) : [])]
+    ...(authority.mcp.managerClientId && managerRunning ? MCP_MANAGER_TOOLS.map(tool => tool.name) : []),
+    ...(authority.mcp.ownerClientId ? MCP_OWNER_TOOLS.map(tool => tool.name) : [])]
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },
     ...(read.name === 'poise_describe' ? { inventory: mcpInventory() } : {}),
     ...(work ? { work } : {}), ...(lookup ? { lookup } : {}) })

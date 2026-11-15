@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { brotliCompressSync, constants as zlibConstants, gzipSync } from 'node:zlib'
-import { MCP_CONTROL_PATH, MCP_READ_PATH, type McpGrantScope } from '../gateway/src/mcp-contract'
+import { MCP_CONTROL_PATH, MCP_OWNER_PATH, MCP_READ_PATH, type McpGrantScope } from '../gateway/src/mcp-contract'
 import type { ServiceConfig } from './service/config'
 import { IDENTITY_HEADER, scopeAllowsPath, verifyIdentityAssertion, type AssertionScope } from './service/identity'
 import { retainRequestIdentity } from './service/request-identity'
@@ -137,7 +137,7 @@ export function enforceApiRequest(
   }
   if (policy.service) {
     const path = (req.url || '/').split('?')[0]
-    if (path === MCP_READ_PATH || path === MCP_CONTROL_PATH) return enforceGatewayRequest(req, policy.service, true)
+    if (path === MCP_READ_PATH || path === MCP_CONTROL_PATH || path === MCP_OWNER_PATH) return enforceGatewayRequest(req, policy.service, true)
     if (!isLoopbackPeer(req)) return enforceGatewayRequest(req, policy.service, true)
     delete req.headers[IDENTITY_HEADER]
   }

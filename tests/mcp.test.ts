@@ -18,12 +18,13 @@ import { send, startHarness, type Harness } from '../gateway/tests/harness'
 import { enforceApiRequest, httpStatus } from '../server/http'
 import { handleMcpRead } from '../server/mcp'
 import { handleMcpControl } from '../server/mcp-manager'
+import { handleMcpOwner } from '../server/mcp-owner'
 import { readServiceConfig } from '../server/service/config'
 import { BehaviorChainJournal, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import { nativeActionReceipt, nativeActionSettlement } from '../server/behavior-chain-action'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
-import { db, setMeta } from '../server/db'
+import { db, getMeta, setMeta } from '../server/db'
 import * as ledger from '../server/behavior-ledger'
 import * as processes from '../server/process'
 import type { readMcpWork } from '../server/mcp-work'
@@ -75,6 +76,7 @@ beforeEach(async () => {
       workspaceReads++
       beforeRead?.()
       if (req.url === '/api/mcp/manager') await handleMcpControl(req, res, authority, bob ? null : control)
+      else if (req.url === '/api/mcp/owner') await handleMcpOwner(req, res, authority)
       else await handleMcpRead(req, res, service, authority, bob ? 'bob-chat' : 'alice-chat', !bob && control?.status().running)
     } catch (error) { res.statusCode = httpStatus(error, 400); res.end(JSON.stringify({ error: String(error) })) }
   })
@@ -112,7 +114,7 @@ const fetcher: typeof fetch = async (input, init) => {
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
 async function connect(login: string, serverEndpoint = endpoint,
-  options: { chatMetadata?: boolean; repository?: string; managerControls?: boolean } = {}) {
+  options: { chatMetadata?: boolean; repository?: string; managerControls?: boolean; ownerControls?: boolean } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -144,6 +146,7 @@ async function connect(login: string, serverEndpoint = endpoint,
     cookie: signedIn.apexCookie, origin: new URL(endpoint).origin, 'content-type': 'application/x-www-form-urlencoded',
   }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
     ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.managerControls ? { managerControls: '1' } : {}),
+    ...(options.ownerControls ? { ownerControls: '1' } : {}),
     ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
@@ -380,6 +383,49 @@ it('requires delegated Manager authority and revalidates and receipts an exact a
     db.prepare('DELETE FROM chat_control_watches WHERE instance = ? AND owner = ?').run('alice-chat', manager)
     for (const id of [manager, worker, foreignWorker]) deleteSession(id)
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+it('keeps owner chain consent separate and preserves the original hold and resume receipts', async () => {
+  const repository = 'Fixture/Owner'
+  const originalOrg = getMeta('org')
+  setMeta('org', 'Fixture')
+  const journal = new BehaviorChainJournal(db)
+  const id = 'fixture/owner#1'
+  const chain = journal.append(id, randomUUID(), 0, { type: 'chain.admitted', repository, issue: 1, branch: 'poise/issue-1',
+    author: 'Alice', reviewer: 'review-bot' })
+  const manager = await connect('Alice', endpoint, { managerControls: true })
+  const owner = await connect('Alice', endpoint, { ownerControls: true, repository })
+  const another = await connect('Alice', endpoint, { ownerControls: true, repository })
+  const preview = { name: 'poise_chain_preview', arguments: { repository, issue: 1, operation: 'hold' } }
+  const apply = (value: string) => ({ name: 'poise_chain_apply', arguments: { preview: value } })
+  async function invoke(client: Client, request: typeof preview | ReturnType<typeof apply>) {
+    const result = await client.callTool(request)
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).action as { preview: string; requestId: string }
+  }
+  try {
+    expect((await manager.client.callTool(preview)).isError).toBe(true)
+    expect((await owner.client.callTool({ ...preview, arguments: { ...preview.arguments, repository: 'Fixture/Other' } })).isError).toBe(true)
+    const stale = await invoke(owner.client, preview)
+    expect(stale).toMatchObject({ status: 'preview', sequence: chain.sequence, humanDecisionRequired: false })
+    expect(journal.read(id)?.held).toBeNull()
+    journal.append(id, randomUUID(), chain.sequence, { type: 'chain.waiting', reason: 'Fixture change after preview' })
+    expect(await invoke(owner.client, apply(stale.preview))).toMatchObject({ status: 'refused' })
+    const fresh = await invoke(owner.client, preview)
+    expect(await invoke(another.client, apply(fresh.preview))).toMatchObject({ status: 'refused' })
+    const held = await invoke(owner.client, apply(fresh.preview))
+    expect(held).toMatchObject({ status: 'applied', receipt: { event: 'chain.held' } })
+    const resumed = await invoke(owner.client, { ...preview, arguments: { ...preview.arguments, operation: 'resume' } })
+    expect(await invoke(owner.client, apply(resumed.preview))).toMatchObject({ status: 'applied', receipt: { event: 'chain.resumed' } })
+    expect(await invoke(owner.client, apply(fresh.preview))).toEqual(held)
+    expect(journal.read(id)?.held).toBeNull()
+    const grant = gateway.context.mcp.grants.find((await owner.provider.tokens())!.access_token, 'access')!
+    expect(journal.eventReceipt(id, held.requestId)?.event).toMatchObject({ delegation: { grantId: grant.grantId, clientId: grant.clientId, ownerId: 1001 } })
+    expect(JSON.stringify(held)).not.toContain(grant.grantId)
+  } finally {
+    setMeta('org', originalOrg ?? '')
+    await Promise.all([manager.client.close(), owner.client.close(), another.client.close()])
   }
 })
 

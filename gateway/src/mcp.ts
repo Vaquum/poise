@@ -4,8 +4,9 @@ import { pagePrincipal, postPrincipal } from './auth.js'
 import { signAssertion } from './assertion.js'
 import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
-import { MCP_CONTROL_PATH, MCP_MANAGER_TOOLS, MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES,
-  isMcpManagerTool, isMcpRecordId, isMcpRepository, mcpRepositoryAllowed, parseMcpManagerRequest, parseMcpRead, type McpGrantScope, type McpRequest } from './mcp-contract.js'
+import { MCP_CONTROL_PATH, MCP_MANAGER_TOOLS, MCP_OWNER_PATH, MCP_OWNER_TOOLS, MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_NAMES,
+  isMcpManagerTool, isMcpOwnerTool, isMcpRecordId, isMcpRepository, mcpRepositoryAllowed, parseMcpManagerRequest, parseMcpOwnerRequest,
+  parseMcpRead, type McpGrantScope, type McpRequest } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
 import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
 import { html, page } from './pages.js'
@@ -97,6 +98,7 @@ export class McpGateway {
         <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata</label>
         <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
         <label><input type="checkbox" name="managerControls" value="1"> Delegate Manager send, steer, stop and workspace-wide supervision</label>
+        <label><input type="checkbox" name="ownerControls" value="1"> Delegate Behavior chain hold and resume</label>
         <button name="decision" value="approve">Allow read access and selected permissions</button><button name="decision" value="deny">Deny</button></form></div>`), authorizeHeaders)
     }
     if (url.pathname === '/mcp/authorize' && req.method === 'POST') {
@@ -117,6 +119,7 @@ export class McpGateway {
           scope: { resource: this.resource, handle: principal.user.handle, ownerId: principal.user.githubId,
             ...(form.get('chatMetadata') === '1' ? { chatMetadata: true } : {}),
             ...(form.get('managerControls') === '1' ? { managerClientId: auth.client } : {}),
+            ...(form.get('ownerControls') === '1' ? { ownerClientId: auth.client } : {}),
             ...(repository ? { repository } : {}) } })
         target.searchParams.set('code', code)
       }
@@ -191,7 +194,7 @@ export class McpGateway {
       ? (rpc.params as { protocolVersion: string }).protocolVersion : VERSIONS[0], capabilities: { tools: {}, resources: {} },
       serverInfo: { name: 'poise', version: '1.0.0' }, instructions: INSTRUCTIONS })
     if (rpc.method === 'ping') return result({})
-    if (rpc.method === 'tools/list') return result({ tools: [...MCP_TOOLS, ...MCP_MANAGER_TOOLS].filter(tool => grant.tools.includes(tool.name)) })
+    if (rpc.method === 'tools/list') return result({ tools: [...MCP_TOOLS, ...MCP_MANAGER_TOOLS, ...MCP_OWNER_TOOLS].filter(tool => grant.tools.includes(tool.name)) })
     if (rpc.method === 'resources/list') return result({ resources: grant.tools.includes('poise_describe')
       ? [{ uri: WORKSPACE_RESOURCE, name: 'Poise workspace inventory', mimeType: 'application/json' }] : [] })
     if (rpc.method === 'resources/templates/list') return result({ resourceTemplates: [] })
@@ -205,12 +208,13 @@ export class McpGateway {
       const params = rpc.params as Record<string, unknown> | undefined
       const request = params && { name: params.name, arguments: params.arguments }
       read = resource ? { name: 'poise_describe', arguments: {} }
-        : isMcpManagerTool(params?.name) ? parseMcpManagerRequest(request) : parseMcpRead(request)
+        : isMcpManagerTool(params?.name) ? parseMcpManagerRequest(request)
+          : isMcpOwnerTool(params?.name) ? parseMcpOwnerRequest(request) : parseMcpRead(request)
     } catch (error) { return result({ isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : 'invalid tool request' }] }) }
     if (!grant.tools.includes(read.name)) {
       return result({ isError: true, content: [{ type: 'text', text: 'tool not authorized by this grant; reconnect to grant consent' }] })
     }
-    if (read.name === 'poise_work' && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
+    if ((read.name === 'poise_work' || read.name === 'poise_chain_preview') && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
       return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     }
     const minute = Math.floor(ctx.deps.now() / 60_000)
@@ -236,18 +240,21 @@ export class McpGateway {
     if (!this.grants.find(token, 'access')) throw new HttpError(401, 'invalid_token')
     this.owner(grant)
     const manager = read.name === 'poise_action_preview' || read.name === 'poise_action_apply'
+    const ownerControl = read.name === 'poise_chain_preview' || read.name === 'poise_chain_apply'
+    const apply = read.name === 'poise_action_apply' || read.name === 'poise_chain_apply'
     const uncertain = { workspace: owner.handle, action: { status: 'uncertain',
       error: 'Poise could not confirm the action receipt. Retry the same preview to recover the outcome.' } }
     const target = ctx.deps.upstream(owner.handle), payload = JSON.stringify(read)
     const scope: McpGrantScope = { resource: grant.resource, ownerId: grant.ownerId, handle: grant.handle, grantId: grant.grantId,
       ...(grant.chatMetadata && grant.tools.includes('poise_get') ? { chatMetadata: true } : {}),
       ...(grant.managerClientId === grant.clientId && grant.tools.includes('poise_action_apply') ? { managerClientId: grant.clientId } : {}),
+      ...(grant.ownerClientId === grant.clientId && grant.tools.includes('poise_chain_apply') ? { ownerClientId: grant.clientId } : {}),
       ...(grant.repository === undefined ? {} : { repository: grant.repository }) }
     const identity = signAssertion(ctx.deps.keys.privateKey, { handle: owner.handle, login: owner.login, scope: 'mcp', mcp: scope }, ctx.deps.now())
     let text: string
     try {
       text = await new Promise<string>((resolve, reject) => {
-        const upstream = http.request({ ...target, method: 'POST', path: manager ? MCP_CONTROL_PATH : MCP_READ_PATH, agent: ctx.agent, headers: {
+        const upstream = http.request({ ...target, method: 'POST', path: manager ? MCP_CONTROL_PATH : ownerControl ? MCP_OWNER_PATH : MCP_READ_PATH, agent: ctx.agent, headers: {
           host: new URL(ctx.workspaceOrigin(owner.handle)).host, 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-poise-identity': identity,
         } }, response => {
           const chunks: Buffer[] = []; let bytes = 0
@@ -259,23 +266,23 @@ export class McpGateway {
         upstream.on('close', () => clearTimeout(deadline)); upstream.on('error', reject); upstream.end(payload)
       })
     } catch (error) {
-      if (read.name === 'poise_action_apply') return uncertain
+      if (apply) return uncertain
       if (error instanceof HttpError) throw error
       throw new HttpError(503, 'workspace_read_unavailable')
     }
     let value: unknown
     try { value = JSON.parse(text) }
     catch {
-      if (read.name === 'poise_action_apply') return uncertain
+      if (apply) return uncertain
       throw new HttpError(502, 'invalid_workspace_response')
     }
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      if (read.name === 'poise_action_apply') return uncertain
+      if (apply) return uncertain
       throw new HttpError(502, 'invalid_workspace_response')
     }
     const body = value as Record<string, unknown>
     if (body.workspace !== owner.handle) {
-      if (read.name === 'poise_action_apply') return uncertain
+      if (apply) return uncertain
       throw new HttpError(502, 'wrong_workspace_response')
     }
     if (manager) {
@@ -296,10 +303,29 @@ export class McpGateway {
       }
       return { workspace: owner.handle, action: { ...action, link: ctx.workspaceOrigin(owner.handle) + '/?view=chat&chat=' + basis.sessionId } }
     }
+    if (ownerControl) {
+      const action = body.action as Record<string, unknown> | undefined
+      if (action?.status === 'refused' && typeof action.error === 'string') {
+        return { workspace: owner.handle, action: { status: 'refused', error: action.error } }
+      }
+      const target = action?.action as Record<string, unknown> | undefined
+      if (!action || !target || !scope.ownerClientId || action.clientId !== scope.ownerClientId || !isMcpRecordId(action.requestId)
+        || !isMcpRepository(target.repository) || !mcpRepositoryAllowed(scope, target.repository)
+        || !Number.isSafeInteger(target.issue) || Number(target.issue) < 1
+        || action.chainId !== target.repository.toLowerCase() + '#' + String(target.issue)
+        || (read.name === 'poise_chain_preview' ? action.status !== 'preview' || JSON.stringify(target) !== JSON.stringify(read.arguments)
+          || typeof action.preview !== 'string' : !['applied', 'uncertain'].includes(String(action.status)))) {
+        if (apply) return uncertain
+        throw new HttpError(502, 'invalid_workspace_owner_scope')
+      }
+      return { workspace: owner.handle, action: { ...action, link: ctx.workspaceOrigin(owner.handle)
+        + '/?view=observe&part=tasks&chain=' + encodeURIComponent(String(action.chainId)) } }
+    }
     // GitHub logins are case-preserved but case-insensitive; the container keeps the case from its creation.
     const tools = body.capabilities && typeof body.capabilities === 'object' && 'tools' in body.capabilities ? body.capabilities.tools : null
     const permitted = [...MCP_WORK_TOOL_NAMES, ...(scope.chatMetadata ? ['poise_get'] : []),
-      ...(scope.managerClientId ? MCP_MANAGER_TOOLS.map(tool => tool.name) : [])]
+      ...(scope.managerClientId ? MCP_MANAGER_TOOLS.map(tool => tool.name) : []),
+      ...(scope.ownerClientId ? MCP_OWNER_TOOLS.map(tool => tool.name) : [])]
     if (typeof body.owner !== 'string' || body.owner.toLowerCase() !== owner.login.toLowerCase() || !Array.isArray(tools)
       || !MCP_WORK_TOOL_NAMES.every(tool => tools.includes(tool)) || tools.some(tool => !permitted.includes(tool))) {
       throw new HttpError(502, 'invalid_workspace_capabilities')
