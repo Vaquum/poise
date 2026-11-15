@@ -438,13 +438,13 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                                              "review_inspection_timeout" if phase == "inspection" else "review_budget_exhausted",
                                              diagnostic)
 
-    def wait_allowance(cap=None):
+    def wait_allowance(cap=None, *, include_checkpoint=True):
         try:
             overall = review_budget.timeout(timeout_s, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
         except review_budget.ReviewLimitError as error:
             raise timed_out("overall", 0) from error
         limits = [(overall, "overall")]
-        if checkpoint is not None:
+        if include_checkpoint and checkpoint is not None:
             limits.append((checkpoint.remaining(), "cumulative"))
         if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS or correction_attempted:
             # The shared analysis deadline only hands off when the provider
@@ -461,8 +461,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
         return timeout, phase
 
     while round_number <= MAX_INSPECTION_ROUNDS:
-        timeout, phase = wait_allowance()
         if groups_remaining is not None and repository is not None and not initializing and group_deadline is None:
+            # Divide the current Call window. The saved review's remaining
+            # balance caps the resulting grant without shortening it twice.
+            timeout, _ = wait_allowance(include_checkpoint=False)
             share = timeout / groups_remaining
             # Cap each later group's estimated reserve at half the equal share,
             # leaving borrowing room even after an expensive early prefix.
@@ -471,7 +473,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                 allowance = max(share, timeout - min(expected_group_seconds, share / 2) * (groups_remaining - 1))
             group_deadline = monotonic() + allowance
             inspection_cutoff = monotonic() + share / 2
-            timeout, phase = wait_allowance()
+        timeout, phase = wait_allowance()
         if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
             # Loop-driven growth, not #186's initial-packet overflow: keep
             # it out of the packet block so the head is not pinned.

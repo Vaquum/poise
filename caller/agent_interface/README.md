@@ -680,11 +680,13 @@ authority. A required final integration unit receives every unit's assessment,
 findings and boundary evidence, and can inspect cross-file contracts before
 returning the single verdict.
 
-Calls retain the existing time, prompt and inspection-round bounds. The original
-1,413-second ceiling, including the two 60-second finalization reserves, is not
-renewed by resume. Execution allowance is charged before launch; an interrupted
-execution keeps its reserved charge. The protocol admits at most 6,682 executions
-and 32,000,000 cumulative retained bytes, charged before allocation. Two attempts
+Each Call retains its existing 1,413-second ceiling and its prompt and
+inspection-round bounds. A review obligation has a separate cumulative ceiling
+of 2,826 seconds across Calls, including the two 60-second finalization reserves.
+Each resume draws on the same saved balance. Execution allowance is charged
+before launch; an interrupted execution keeps its reserved charge. The protocol
+admits at most 6,682 executions and 32,000,000 cumulative retained bytes, charged
+before allocation. Two attempts
 at the same immutable unit without new validated evidence reach a target hold;
 heartbeats, provider prose and identical inspection results do not reset it.
 `review_continuation_required` returns an actionable `continuation_required`

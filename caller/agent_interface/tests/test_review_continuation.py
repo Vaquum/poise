@@ -115,6 +115,45 @@ class TestReviewContinuation(TestCase):
     def test_twenty_two_groups_resume_a_later_deadline_and_publish_one_verified_verdict(self):
         self.later_deadline(176, 22)
 
+    def test_twenty_two_groups_can_spend_more_than_one_call_and_publish_once(self):
+        node = packet(176)
+        completed = []
+        unit_seconds = 68
+
+        def ask(*args):
+            prompt, timeout = args[3], args[-1]
+            self.clock.now += min(timeout, unit_seconds)
+            if timeout < unit_seconds:
+                raise subprocess.TimeoutExpired("isolated provider", timeout)
+            value = supplied(prompt)
+            if "required_cross_unit_evidence" in value:
+                self.assertEqual(len(value["required_cross_unit_evidence"]), 22)
+                completed.append("integration")
+            else:
+                completed.append(value["files"][0]["filename"])
+            return verdict(prompt)
+
+        with self.call(node) as root:
+            with self.assertRaises(continuation.Continuation) as stopped:
+                self.run_review(node, ask)
+            self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
+            self.assertEqual(self.saved(root)["unit"], len(completed))
+            self.assertTrue(0 < len(completed) < 22)
+            self.assertLessEqual(self.clock.now, review_budget.REVIEW_TIMEOUT_SECONDS - continuation.FINALIZATION_RESERVE_SECONDS)
+            self.assertEqual(self.posts, [])
+
+        with self.call(node, self.resume(root)) as publisher:
+            output = self.run_review(node, ask)
+            with sqlite3.connect(api.DB) as conn:
+                receipt = json.loads(conn.execute("select artifact from calls where id=?", (publisher,)).fetchone()[0])
+        self.assertEqual(completed, [f"src/f{i:03d}.py" for i in range(0, 176, 8)] + ["integration"])
+        self.assertGreater(len(completed) * unit_seconds, review_budget.REVIEW_TIMEOUT_SECONDS)
+        self.assertGreaterEqual(self.saved(root)["spent_ms"], len(completed) * unit_seconds * 1000)
+        self.assertEqual(self.saved(root)["publisher"], publisher)
+        self.assertEqual(receipt["review_response"]["coverage"], "complete")
+        self.assertIn('"review_id": 91', output)
+        self.assertEqual(len(self.posts), 1)
+
     def test_isomora_821_resumes_group_four_of_ten(self):
         self.later_deadline(74, 10)
 
@@ -210,7 +249,7 @@ class TestReviewContinuation(TestCase):
         node.update(verification_candidates=[17], review_threads=[{"root_comment_id": 17, "id": "thread",
                     "repair_answer": {"revision": "answer-v1", "body": "Fixed the caller"}}])
         with self.call(node) as root:
-            session = continuation.Session(json.dumps(node), MODEL.identity, 1413)
+            session = continuation.Session(json.dumps(node), MODEL.identity)
             session.initialize(self.repository)
             session.state["verified"] = session.verified([17])
             session.checkpoint()
@@ -222,13 +261,13 @@ class TestReviewContinuation(TestCase):
                 changed["review_threads"][0]["repair_answer"].update(revision="answer-v2", body="Different repair")
             with self.subTest(policy=policy, slot=slot), self.call(changed, self.resume(root), slot, policy):
                 with self.assertRaisesRegex(continuation.Continuation, "material review basis changed"):
-                    continuation.Session(json.dumps(changed), MODEL.identity, 1413)
+                    continuation.Session(json.dumps(changed), MODEL.identity)
         self.assertEqual(self.posts, [])
 
     def test_two_distinct_claimants_cannot_spend_or_overwrite_the_same_generation(self):
         node = packet()
         with self.call(node) as root:
-            first = continuation.Session(json.dumps(node), MODEL.identity, 1413)
+            first = continuation.Session(json.dumps(node), MODEL.identity)
             first.initialize(self.repository)
             first.checkpoint()  # Simulate commit followed by loss of acknowledgement.
         resume = self.resume(root)
@@ -288,11 +327,11 @@ class TestReviewContinuation(TestCase):
         self.assertEqual(self.saved(root), original)
         self.assertEqual(len(attempts), 1)
 
-    def test_missing_evidence_and_cumulative_budget_exhaustion_never_clear_a_review(self):
+    def test_missing_evidence_and_storage_exhaustion_never_clear_a_review(self):
         node = packet()
-        for kind in ("missing", "malformed", "budget", "storage"):
+        for kind in ("missing", "malformed", "storage"):
             with self.subTest(kind=kind), self.call(node, policy=kind) as root:
-                session = continuation.Session(json.dumps(node), MODEL.identity, 1413)
+                session = continuation.Session(json.dumps(node), MODEL.identity)
                 session.initialize(self.repository)
                 if kind in {"missing", "malformed"}:
                     reference = session.manifest["units"][0]
@@ -303,17 +342,47 @@ class TestReviewContinuation(TestCase):
                         target.write_text("{}")
                     with self.assertRaisesRegex(continuation.Continuation, "evidence"):
                         session.read(reference)
-                elif kind == "budget":
-                    with self.assertRaises(RuntimeError):
-                        session.funded(lambda _grant: (_ for _ in ()).throw(RuntimeError("worker interrupted")), 1293)
-                    with self.assertRaisesRegex(continuation.Continuation, "cumulative review time"):
-                        session.funded(lambda _grant: self.fail("exhausted allowance launched work"), 1)
                 else:
                     with patch.object(continuation, "MAX_STORAGE_BYTES", self.saved(root)["retained_bytes"]):
                         with self.assertRaisesRegex(continuation.Continuation, "storage allowance"):
                             session.put("another allocation")
                 with self.assertRaises(RuntimeError):
                     review_receipt.complete_response(ASSESSMENT, HEAD)
+        self.assertEqual(self.posts, [])
+
+    def test_cumulative_time_exhaustion_retains_interrupted_charges_across_calls(self):
+        node = packet(176)
+        call_seconds = review_budget.REVIEW_TIMEOUT_SECONDS - continuation.FINALIZATION_RESERVE_SECONDS
+
+        def interrupted(_grant):
+            raise RuntimeError("worker interrupted")
+
+        def timed_out(*args):
+            timeout = args[-1]
+            self.assertEqual(timeout, continuation.FINALIZATION_RESERVE_SECONDS)
+            self.clock.now += timeout
+            raise subprocess.TimeoutExpired("isolated provider", timeout)
+
+        with self.call(node) as root:
+            session = continuation.Session(json.dumps(node), MODEL.identity)
+            session.initialize(self.repository)
+            with self.assertRaisesRegex(RuntimeError, "worker interrupted"):
+                session.funded(interrupted, call_seconds)
+
+        with self.call(node, self.resume(root)):
+            session = continuation.Session(json.dumps(node), MODEL.identity)
+            with self.assertRaisesRegex(RuntimeError, "worker interrupted"):
+                session.funded(interrupted, call_seconds)
+
+        with self.call(node, self.resume(root)):
+            with self.assertRaisesRegex(continuation.Continuation, "cumulative review time allowance exhausted") as stopped:
+                self.run_review(node, timed_out)
+            self.assertEqual(stopped.exception.result["outcome"], "held")
+            self.assertEqual(self.saved(root)["spent_ms"], 2 * call_seconds * 1000 + 120_000)
+
+        with self.call(node, self.resume(root)):
+            with self.assertRaisesRegex(continuation.Continuation, "cumulative review time allowance exhausted"):
+                self.run_review(node, lambda *_args: self.fail("exhausted allowance launched work"))
         self.assertEqual(self.posts, [])
 
     def test_identical_inspection_and_ordinary_output_do_not_reset_stall_bound(self):
@@ -334,7 +403,7 @@ class TestReviewContinuation(TestCase):
         self.assertIn("no validated advancement in two attempts", stopped.exception.result["reason"])
         self.assertEqual(self.posts, [])
 
-    def test_isomora_841_two_later_deadlines_resume_validated_pages_within_original_allowance(self):
+    def test_isomora_841_two_later_deadlines_resume_validated_pages_within_cumulative_allowance(self):
         node = packet(37)
         failures, turns, credited = 0, 0, []
         read = {"operation": "read", "path": "src/f016.py", "query": "", "start_line": 1}
@@ -384,8 +453,8 @@ class TestReviewContinuation(TestCase):
         self.assertEqual([request["start_line"] for request in self.inspections], [1, 2, 3])
         self.assertEqual(credited.count("src/f000.py"), 1)
         self.assertEqual(credited.count("src/f008.py"), 1)
-        self.assertEqual(self.saved(root)["allowance_ms"], 1_413_000)
-        self.assertLess(self.saved(root)["spent_ms"], 1_293_000)
+        self.assertEqual(self.saved(root)["allowance_ms"], continuation.OBLIGATION_TIME_MS)
+        self.assertLess(self.saved(root)["spent_ms"], continuation.OBLIGATION_TIME_MS - 120_000)
         self.assertEqual(len(self.posts), 1)
 
     def test_verification_keeps_its_original_revision_and_cannot_attach_to_a_refreshed_answer(self):
@@ -415,14 +484,14 @@ class TestReviewContinuation(TestCase):
     def test_omitting_resume_cannot_reset_the_saved_basis_budget(self):
         node = packet()
         with self.call(node) as root:
-            session = continuation.Session(json.dumps(node), MODEL.identity, 1413)
+            session = continuation.Session(json.dumps(node), MODEL.identity)
             session.initialize(self.repository)
             with self.assertRaises(continuation.Continuation):
                 session.pause("Call boundary")
         before = self.saved(root)
         with self.call(node):
             with self.assertRaisesRegex(continuation.Continuation, "saved review already exists"):
-                continuation.Session(json.dumps(node), MODEL.identity, 1413)
+                continuation.Session(json.dumps(node), MODEL.identity)
         self.assertEqual(self.saved(root), before)
 
     def test_manifest_unit_bound_is_checked_before_rendering_or_launching_work(self):

@@ -1644,8 +1644,9 @@ cleanup alone cannot release an unknown publication effect.
 Caller also exposes an explicitly requested structured review continuation via
 `--review-slot` and `--resume-review`. Its typed incomplete result names the
 original Call and checkpoint generation. The existing receipt and response store
-own the exclusive claim, evidence and cumulative allowance; partial analysis
-grants no review authority. Complete source and cross-unit coverage reserve one
+own the exclusive claim, evidence and cumulative allowance across independently
+bounded Calls; partial analysis grants no review authority. Complete source and
+cross-unit coverage reserve one
 head-pinned finalization, preserving the first publisher's Call ID on a lost
 acknowledgement. Poise does not automatically admit these continuations. See
 [Caller's protocol](../caller/agent_interface/README.md#explicit-review-continuation)

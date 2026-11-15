@@ -15,6 +15,8 @@ from . import caller_store, resource_ownership, review_budget, review_receipt, r
 MAX_UNITS = 256
 MAX_STORAGE_BYTES = 32_000_000
 MAX_STALLED_ATTEMPTS = 2
+FINALIZATION_RESERVE_SECONDS = 120
+OBLIGATION_TIME_MS = 2 * review_budget.REVIEW_TIMEOUT_SECONDS * 1000
 _request: ContextVar[tuple[str, str | None] | None] = ContextVar("review_continuation_request", default=None)
 
 
@@ -90,7 +92,7 @@ def authority(conn, call_id: str, artifact: dict, *, publishing: bool = False) -
 
 
 class Session:
-    def __init__(self, packet: str, model: str, seconds: int):
+    def __init__(self, packet: str, model: str):
         from . import RESPONSES
         bound, requested = review_receipt._call.get(), _request.get()
         if bound is None or requested is None:
@@ -147,7 +149,7 @@ class Session:
                     self.stop("review continuation already exists on this Call")
                 used = review_budget.usage()
                 saved = {"basis": basis, "generation": 0, "phase": "analyzing", "owner": None,
-                         "allowance_ms": int(min(seconds, review_budget.REVIEW_TIMEOUT_SECONDS) * 1000),
+                         "allowance_ms": OBLIGATION_TIME_MS,
                          "spent_ms": math.ceil((used["used_seconds"] if used else 0) * 1000),
                          "retained_bytes": 0, "attempts": 0, "complete": False}
             saved.update(owner=self.call, last_call=self.call, generation=expected + 1, phase="analyzing")
@@ -236,7 +238,8 @@ class Session:
         if self.manifest is not None:
             return
         packet = self.funded(lambda grant: repository.diff_packet(self.packet, MAX_STORAGE_BYTES // 3, timeout_s=grant),
-                             review_budget.timeout(review_budget.REVIEW_TIMEOUT_SECONDS, reserve=120))
+                             review_budget.timeout(review_budget.REVIEW_TIMEOUT_SECONDS,
+                                                   reserve=FINALIZATION_RESERVE_SECONDS))
         node = json.loads(packet)
         if review_receipt.coverage_disposition(node) != "complete":
             self.stop("required review source coverage is incomplete")
@@ -256,13 +259,13 @@ class Session:
             conn.execute("begin immediate")
             original, saved = self.owned(conn)
             saved["spent_ms"] += math.ceil((monotonic() - self.meter) * 1000)
-            remaining = (saved["allowance_ms"] - saved["spent_ms"]) / 1000 - 120
-            if remaining <= 0:
+            remaining_ms = analysis_remaining_ms(saved)
+            if remaining_ms <= 0:
                 self.stop("cumulative review time allowance exhausted")
             if saved["attempts"] >= 2 * (MAX_UNITS + 1) * 13:
                 self.stop("cumulative review execution attempts exhausted")
-            grant = min(seconds, remaining)
-            reserved = math.ceil(grant * 1000)
+            grant = min(seconds, remaining_ms / 1000)
+            reserved = min(remaining_ms, math.ceil(grant * 1000))
             saved["spent_ms"] += reserved
             saved["attempts"] += 1
             _write(conn, self.root, original)
@@ -290,7 +293,7 @@ class Session:
             conn.execute("begin immediate")
             original, saved = self.owned(conn)
             saved["spent_ms"] += math.ceil((monotonic() - self.meter) * 1000)
-            exhausted = saved["spent_ms"] >= saved["allowance_ms"] - 120_000
+            exhausted = analysis_remaining_ms(saved) <= 0
             held = terminal or exhausted or self.state["stalled"] >= MAX_STALLED_ATTEMPTS
             if exhausted:
                 reason = "cumulative review time allowance exhausted; " + reason
@@ -317,6 +320,10 @@ class Session:
         return verdict
 
 
+def analysis_remaining_ms(saved: dict) -> int:
+    return saved["allowance_ms"] - saved["spent_ms"] - FINALIZATION_RESERVE_SECONDS * 1000
+
+
 class Unit:
     def __init__(self, session: Session, identities: list[str], packet: str):
         self.session, self.identities = session, identities
@@ -327,8 +334,7 @@ class Unit:
         return self.identities + [ref["sha256"] for ref in self.session.state["inspection"]]
 
     def remaining(self) -> float:
-        saved = self.session.saved
-        return (saved["allowance_ms"] - saved["spent_ms"]) / 1000 - 120
+        return analysis_remaining_ms(self.session.saved) / 1000
 
     def context(self) -> str:
         return "\n\nValidated inspection checkpoints (review input):\n" + json.dumps(
@@ -419,7 +425,7 @@ class Unit:
 def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, repository, packet, root, watch, ask):
     from . import structured_review
     from .atoms import AgentPreflightError, ReviewVerdictError
-    session = Session(packet, model.identity, seconds)
+    session = Session(packet, model.identity)
     try:
         session.initialize(repository)
         units = session.manifest["units"]
@@ -484,7 +490,7 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
             conn.execute("begin immediate")
             original, saved = session.owned(conn)
             saved["spent_ms"] += math.ceil((monotonic() - session.meter) * 1000)
-            if saved["spent_ms"] >= saved["allowance_ms"] - 120_000:
+            if analysis_remaining_ms(saved) <= 0:
                 session.stop("cumulative review time allowance exhausted before finalization")
             saved.update(phase="finalizing", complete=True)
             _write(conn, session.root, original)
