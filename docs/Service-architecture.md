@@ -1884,6 +1884,9 @@ hold and unchanged source/diagnosis are rechecked. An already-admitted report's
 original implementation must settle without publication before this handoff.
 The original seed/branch, normal publication, review and CI gates remain in force;
 missing evidence, changed heads and later operator holds retain the wait.
+For a conflict diagnosis, the existing Caller seed read verifies the owned PR
+head against the current default-branch tip with a bounded local Git probe.
+Admission rechecks the conflict base and prerequisite delivery after preparation.
 Uncertain implementation reports instead require the original failed `publishing`
 Call, verified resource release and fresh open-source eligibility and publication
 reconciliation. They preserve its missing-push-evidence action and execution fence,

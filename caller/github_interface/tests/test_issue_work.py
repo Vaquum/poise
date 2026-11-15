@@ -47,6 +47,26 @@ class IssueOwnership(IsolatedAsyncioTestCase):
         self.client.get.return_value = {"full_name": "example/repo", "default_branch": "main"}
         self.client.graphql.return_value = self.graph
 
+    async def test_conflict_proof_pins_the_owned_head_and_current_base(self):
+        old_base, base, head = "a" * 40, "c" * 40, "d" * 40
+        owned = {"number": 8, "state": "open", "merged": False, "user": {"login": "author"},
+                 "body": "<!-- poise-chain example/repo#7 -->",
+                 "head": {"sha": head, "ref": self.payload["branch"], "repo": {"full_name": "example/repo"}},
+                 "base": {"sha": old_base, "ref": "main", "repo": {"full_name": "example/repo"}}}
+        self.client.paginate.return_value = [owned]
+        self.graph["repository"]["ref"] = {"target": {"oid": head}}
+
+        for actual_base, conflict, expected in [(base, True, base), (base, False, None), (old_base, True, None)]:
+            with self.subTest(actual_base=actual_base, conflict=conflict):
+                self.client.get.side_effect = [{"full_name": "example/repo", "default_branch": "main"},
+                                               {"object": {"sha": actual_base}}]
+                with patch("github_interface.behaviors.issue_work._integration_conflicts", return_value=conflict) as inspect:
+                    result = await run(self.client, {**self.payload, "verify_conflict": True})
+                inspect.assert_awaited_once_with(self.client, "example/repo", base, head)
+                self.assertEqual(result.get("conflict_base"), expected)
+        self.client.post.assert_not_awaited()
+        self.client.patch.assert_not_awaited()
+
     async def test_stacked_owner_appearing_after_intake_is_found_on_a_later_page_before_prepare(self):
         with patch('github_interface.client.get_token', return_value="test-token"):
             client = GitHubClient("author")

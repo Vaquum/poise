@@ -19,7 +19,7 @@ export interface ChainRuntimeOperations {
   accounts(): { author: string, reviewer: string }
   discover(): Promise<ChainSeed[]>
   ownsRepository(repository: string): boolean
-  observe(chain: BehaviorChain): Promise<ChainObservation>
+  observe(chain: BehaviorChain, verifyConflict?: boolean): Promise<ChainObservation>
   /** Also reports terminal uncertain publications and merges without a chain hold. */
   reportHold?(chain: BehaviorChain): Promise<string | null>
   implementationAdmission?(chain: BehaviorChain, observation: ChainObservation): Promise<{
