@@ -288,6 +288,10 @@ client sent.
     projections and retained ledger pages. Continuations bind the owner grant,
     resource, repository, label and limit. The gateway rechecks result scope;
     source freshness and missing receipts remain independent evidence.
+    The description and `poise://workspace/inventory` resource share a signed
+    workspace read for the running release and canonical navigation and capability
+    inventory. The gateway projects the fields, intersects tools with the live
+    grant and generates links within the authorized workspace.
     The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
     PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and

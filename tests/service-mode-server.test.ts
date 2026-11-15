@@ -266,7 +266,8 @@ describe('Poise in service mode', () => {
     const read = { name: 'poise_describe', arguments: {} }
     const description = await send('POST', '/api/mcp/read', fromGateway('mcp', { mcp }), read)
     expect(description.status).toBe(200)
-    expect(description.json).toEqual({ workspace: 'octocat', owner: OWNER, capabilities: { tools: ['poise_describe', 'poise_work'] } })
+    expect(description.json).toMatchObject({ workspace: 'octocat', owner: OWNER, capabilities: { tools: ['poise_describe', 'poise_work'] },
+      inventory: { surfaces: expect.arrayContaining([expect.objectContaining({ id: 'board', tool: 'poise_work' })]) } })
     for (const scope of ['browser', 'link', 'admin']) {
       expect((await send('POST', '/api/mcp/read', fromGateway(scope), read)).status).toBe(403)
     }

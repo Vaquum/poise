@@ -6,11 +6,13 @@ set `POISE_MCP_ENABLED=1` in the gateway environment (`deploy/.env` with the
 deployment bundle); unset it to remove the transport, discovery and grant pages.
 No default or deployed configuration is changed by this capability.
 
-`poise_describe`, with no arguments, returns
-`{ workspace, owner, capabilities: { tools: ["poise_describe", "poise_work"] } }`
-for the authorized workspace. `poise_work` reads its issue work trail. Neither
-tool grants Manager controls or reads chats, documents, credentials or raw
-process state.
+`poise_describe`, with no arguments, returns the authorized workspace, effective
+tools, grant expiry, running release and a machine-readable inventory. Each entry
+names its data kind, source, permission, retention, current MCP availability and
+Poise link. The catalog follows Poise's existing places, Observe parts, Settings
+sections and capability names. The MCP resource `poise://workspace/inventory`
+returns the same projection and runbooks. `poise_work` reads the workspace's
+issue work trail.
 
 ## Read work
 

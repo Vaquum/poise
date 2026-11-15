@@ -26,6 +26,8 @@ import { db, setMeta } from '../server/db'
 import * as ledger from '../server/behavior-ledger'
 import * as processes from '../server/process'
 import type { readMcpWork } from '../server/mcp-work'
+import { PARTS, PLACES, SECTIONS } from '../src/ui/address'
+import { listCapabilities } from '../server/capabilities'
 
 const endpoint = 'https://poise.test/mcp'
 let h: Harness
@@ -165,8 +167,8 @@ it('connects a fresh MCP client after anonymous registrations fill the pending p
     const bob = await connect('bob')
     try {
       expect((await bob.client.listTools()).tools.map(tool => tool.name)).toEqual(['poise_describe', 'poise_work'])
-      expect(await describe(bob.client)).toEqual({ workspace: 'bob', owner: 'bob', capabilities: { tools: ['poise_describe', 'poise_work'] } })
-      expect(await describe(alice.client)).toEqual({ workspace: 'alice', owner: 'Alice', capabilities: { tools: ['poise_describe', 'poise_work'] } })
+      expect(await describe(bob.client)).toMatchObject({ workspace: 'bob', owner: 'bob', capabilities: { tools: ['poise_describe', 'poise_work'] } })
+      expect(await describe(alice.client)).toMatchObject({ workspace: 'alice', owner: 'Alice', capabilities: { tools: ['poise_describe', 'poise_work'] } })
       expect(gateway.context.mcp.grants.redirects((await alice.provider.clientInformation())!.client_id)).toEqual(['http://127.0.0.1:19876/callback'])
       expect(workspaceReads).toBe(2)
       const unsupported = await bob.client.callTool({ name: 'poise_write', arguments: { repository: 'private/work', issue: 1 } })
@@ -249,8 +251,38 @@ it('accepts the same immutable owner after a case-only GitHub login change', asy
   const connection = await connect('Alice')
   try {
     h.store.saveSignIn({ handle: 'alice', login: 'ALICE', githubId: 1001, accessOrg: null })
-    expect(await describe(connection.client)).toEqual({ workspace: 'alice', owner: 'ALICE', capabilities: { tools: ['poise_describe', 'poise_work'] } })
+    expect(await describe(connection.client)).toMatchObject({ workspace: 'alice', owner: 'ALICE', capabilities: { tools: ['poise_describe', 'poise_work'] } })
   } finally { await connection.client.close() }
+})
+
+it('reports the running workspace inventory through describe and the matching MCP resource', async () => {
+  const { client } = await connect('Alice')
+  try {
+    const result = await describe(client) as { inventory: { surfaces: Array<{ id: string; href: string }> } }
+    const expected = [...PLACES, ...PARTS.map(id => `observe/${id}`), ...SECTIONS.map(id => `settings/${id}`),
+      ...listCapabilities().map(id => `capability/${id}`)]
+    expect(result.inventory.surfaces.map(surface => surface.id)).toEqual(expected)
+    expect(result.inventory.surfaces.every(surface => new URL(surface.href).origin === 'https://alice.poise.test')).toBe(true)
+    expect(result).toMatchObject({ access: { resource: endpoint, scope: 'poise:read' }, instructions: expect.any(String),
+      runbooks: expect.arrayContaining([expect.objectContaining({ name: 'Poise MCP' })]) })
+    expect(result.inventory).toMatchObject({ coverage: 'complete', observedAt: expect.any(String),
+      release: { repo: 'autonomio/poise' } })
+    expect(result.inventory.surfaces).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'board', status: 'available', tool: 'poise_work', source: expect.any(String),
+        retention: expect.any(String), permission: expect.any(String) }),
+      expect.objectContaining({ id: 'settings/admin', status: 'unavailable', tool: null, permission: 'Instance admin' }),
+      expect.objectContaining({ id: 'chat', status: 'unavailable', tool: null, reason: expect.any(String) }),
+    ]))
+    const uri = 'poise://workspace/inventory'
+    expect((await client.listResources()).resources).toEqual([{ uri, name: 'Poise workspace inventory', mimeType: 'application/json' }])
+    const resource = await client.readResource({ uri })
+    const [content] = resource.contents
+    expect(content).toMatchObject({ uri, mimeType: 'application/json' })
+    if (!content || !('text' in content)) throw new Error('Inventory resource must return JSON text')
+    expect(JSON.parse(content.text)).toMatchObject({ workspace: 'alice',
+      inventory: { surfaces: result.inventory.surfaces }, access: { resource: endpoint } })
+    await expect(client.readResource({ uri: 'poise://workspace/bob' })).rejects.toThrow('resource not found')
+  } finally { await client.close() }
 })
 
 it('traces bounded label pages and exact issues through a packaged SDK connection on a disposable service', async () => {

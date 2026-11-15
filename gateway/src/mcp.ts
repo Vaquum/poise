@@ -6,6 +6,7 @@ import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
 import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
+import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
 import { html, page } from './pages.js'
 import { hashSecret, newSecret, type User } from './store.js'
 
@@ -176,15 +177,22 @@ export class McpGateway {
     }
     const result = (body: unknown) => sendJson(res, 200, { jsonrpc: '2.0', id, result: body })
     if (rpc.method === 'initialize') return result({ protocolVersion: VERSIONS.includes(String((rpc.params as { protocolVersion?: unknown } | undefined)?.protocolVersion))
-      ? (rpc.params as { protocolVersion: string }).protocolVersion : VERSIONS[0], capabilities: { tools: {} },
+      ? (rpc.params as { protocolVersion: string }).protocolVersion : VERSIONS[0], capabilities: { tools: {}, resources: {} },
       serverInfo: { name: 'poise', version: '1.0.0' }, instructions: INSTRUCTIONS })
     if (rpc.method === 'ping') return result({})
     if (rpc.method === 'tools/list') return result({ tools: MCP_TOOLS.filter(tool => grant.tools.includes(tool.name)) })
-    if (rpc.method !== 'tools/call') return sendJson(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: 'unsupported method' } })
+    if (rpc.method === 'resources/list') return result({ resources: grant.tools.includes('poise_describe')
+      ? [{ uri: WORKSPACE_RESOURCE, name: 'Poise workspace inventory', mimeType: 'application/json' }] : [] })
+    if (rpc.method === 'resources/templates/list') return result({ resourceTemplates: [] })
+    const resource = rpc.method === 'resources/read'
+    if (resource && ((rpc.params as { uri?: unknown } | undefined)?.uri !== WORKSPACE_RESOURCE || !grant.tools.includes('poise_describe'))) {
+      return sendJson(res, 200, { jsonrpc: '2.0', id, error: { code: -32002, message: 'resource not found' } })
+    }
+    if (!resource && rpc.method !== 'tools/call') return sendJson(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: 'unsupported method' } })
     let read: McpRead
     try {
       const params = rpc.params as Record<string, unknown> | undefined
-      read = parseMcpRead(params && { name: params.name, arguments: params.arguments })
+      read = resource ? { name: 'poise_describe', arguments: {} } : parseMcpRead(params && { name: params.name, arguments: params.arguments })
     } catch (error) { return result({ isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : 'invalid tool request' }] }) }
     if (!grant.tools.includes(read.name)) {
       return result({ isError: true, content: [{ type: 'text', text: 'tool not authorized by this grant; reconnect to grant consent' }] })
@@ -200,6 +208,7 @@ export class McpGateway {
       // Revocation/access changes during an upstream read must also withhold its result.
       if (!this.grants.find(token!, 'access')) throw new HttpError(401, 'invalid_token')
       this.owner(grant)
+      if (resource) return result({ contents: [{ uri: WORKSPACE_RESOURCE, mimeType: 'application/json', text: JSON.stringify(body) }] })
       return result({ content: [{ type: 'text', text: JSON.stringify(body) }] })
     } finally { rate.active-- }
   }
@@ -238,7 +247,13 @@ export class McpGateway {
       || !('tools' in body.capabilities) || !Array.isArray(body.capabilities.tools)
       || JSON.stringify(body.capabilities.tools) !== JSON.stringify(MCP_TOOLS.map(tool => tool.name))) throw new HttpError(502, 'invalid_workspace_capabilities')
     const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: MCP_TOOLS.map(tool => tool.name) } }
-    if (read.name === 'poise_describe') return described
+    if (read.name === 'poise_describe') {
+      const tools = described.capabilities.tools.filter(tool => grant.tools.includes(tool))
+      return { ...described, capabilities: { tools },
+        access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString() },
+        inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), tools),
+        runbooks: RUNBOOKS, instructions: INSTRUCTIONS }
+    }
     const work = body.work as Record<string, unknown> | undefined
     if (!work || work.repository !== read.arguments.repository || !Array.isArray(work.items) || work.items.length > (read.arguments.issue ? 1 : read.arguments.limit!)
       || work.items.some(item => !item || typeof item !== 'object' || typeof item.repository !== 'string'

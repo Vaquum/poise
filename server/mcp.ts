@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_TOOLS, parseMcpRead } from '../gateway/src/mcp-contract'
 import { HttpError, readJson, type RequestAuthority } from './http'
+import { mcpInventory } from './mcp-inventory'
 import { readMcpWork } from './mcp-work'
 import type { ServiceConfig } from './service/config'
 
@@ -11,7 +12,7 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
   const read = parseMcpRead(await readJson<unknown>(req, 16 * 1024))
   const work = read.name === 'poise_work' ? await readMcpWork(read.arguments, service, authority.mcp) : undefined
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools: MCP_TOOLS.map(tool => tool.name) },
-    ...(work ? { work } : {}) })
+    ...(work ? { work } : { inventory: mcpInventory() }) })
   if (Buffer.byteLength(text) > MCP_RESPONSE_BYTES) throw new HttpError(503, 'work response exceeds its bound; request a smaller page')
   res.statusCode = 200
   res.setHeader('Content-Type', 'application/json')
