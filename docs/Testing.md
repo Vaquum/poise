@@ -193,7 +193,12 @@ bytes after a cache hit followed by a relay restart.
 It replaces the relay mid-suite and verifies one recovery with identical captured
 input despite unchanged-HEAD edits, genuine failures (including exit 125),
 cancellation, repeated restarts and an unrecovered relay. Recovery and the full
-rerun share the original command budget. A journal/decision fixture continues
+rerun share the original command budget. It exhausts Render's three checkout-part
+upload attempts, checks recovery with the original bytes after a checkout edit,
+and verifies persistent 502s and mixed upload/restart failures share that one
+recovery. Cancellation and the original deadline still stop recovery; Render
+command output followed by EOF without an exit event remains incomplete.
+A journal/decision fixture continues
 from the fresh complete result through exact-head review, CI, readiness and merge
 observations without Resume; it performs no live GitHub actions and retains the
 interrupted attempt as missing a result.

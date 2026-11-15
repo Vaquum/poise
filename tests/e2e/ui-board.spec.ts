@@ -244,6 +244,208 @@ test('a card is added at the top of its lane, edited in place, and deleted after
   await expect(card(page, 'A thought, edited')).toHaveCount(0)
 })
 
+test('card repository search saves chosen options and preserves an unlisted link', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  // The GitHub repositories are fixtures, so persist the card's actual write
+  // payload in the same fixture rather than asking the real account validator.
+  const stored = { id: 1, text: '', repo: null as string | null, lane: 'idea', position: 0, created_at: iso(0), updated_at: iso(0) }
+  await page.route(/\/api\/current(?:\?|\/|$)/, async (route) => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { cards: stored.text ? [stored] : [] } })
+    Object.assign(stored, route.request().postDataJSON())
+    return route.fulfill({ json: stored })
+  })
+  const idea = page.locator('.lane[data-lane="idea"]')
+  await idea.getByRole('button', { name: 'Add' }).click()
+  await idea.getByRole('textbox', { name: 'Card text' }).fill('A searchable repository')
+  const repo = page.getByRole('combobox')
+  await repo.fill('sIt')
+  await expect(page.getByRole('option')).toHaveText(['acme/site'])
+  await repo.fill('')
+  await expect(page.getByRole('option')).toHaveText(['No repository', 'acme/site', 'acme/api'])
+  await page.getByRole('option', { name: 'acme/site', exact: true }).click()
+  await repo.fill('unmatched-repository')
+  await expect(page.getByRole('listbox')).toHaveText('No repositories match.')
+  await repo.press('Enter')
+  await expect(repo).toHaveValue('unmatched-repository')
+  await idea.getByRole('button', { name: 'Add', exact: true }).last().click()
+  const added = card(page, 'A searchable repository')
+  await expect(added.locator('.repo')).toHaveText('acme/site')
+
+  await added.locator('.card-text').click()
+  await repo.fill('ApI')
+  await repo.press('ArrowDown')
+  await repo.press('Enter')
+  await expect(repo).toHaveValue('acme/api')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(added.locator('.repo')).toHaveText('acme/api')
+
+  await page.route('**/api/repos**', (route) => route.fulfill({ json: { repos: ['acme/site'] } }))
+  await page.reload()
+  await added.locator('.card-text').click()
+  await expect(repo).toHaveValue('acme/api')
+  await repo.fill('')
+  await expect(page.getByRole('option')).toHaveText(['No repository', 'acme/api', 'acme/site'])
+  await page.getByRole('option', { name: 'No repository', exact: true }).click()
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(added.locator('.repo')).toHaveCount(0)
+})
+
+test('issue repository filtering keeps the draft and labels until a different option is chosen', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  const labelReads: string[] = []
+  const opened: object[] = []
+  await page.route('**/api/gh', async (route) => {
+    const body = route.request().postDataJSON() as { operation: string, repository_full_name: string }
+    if (body.operation === 'list_repo_labels') labelReads.push(body.repository_full_name)
+    if (body.operation !== 'open_issue') return route.fallback()
+    opened.push(body)
+    return route.fulfill({ json: { record: record('issue', 45, 'A searched issue', { repo: body.repository_full_name }), labels_dropped: [] } })
+  })
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.getByLabel('Issue title').fill('A searched issue')
+  await page.getByLabel('Issue body').fill('Keep this draft')
+  await page.getByRole('button', { name: 'Labels', exact: true }).click()
+  await page.getByRole('checkbox', { name: 'bug' }).check()
+  const repo = page.getByRole('combobox', { name: 'Repository', exact: true })
+  await repo.fill('ApI')
+  await expect(page.getByRole('option')).toHaveText(['acme/api'])
+  await expect(page.getByRole('button', { name: 'Labels, 1 chosen' })).toBeVisible()
+  expect(labelReads).toEqual(['acme/site'])
+
+  // A layout change redraws the writer; query, committed choice and draft survive.
+  await view(page, 'List').click()
+  await expect(repo).toHaveValue('ApI')
+  await expect(page.getByLabel('Issue title')).toHaveValue('A searched issue')
+  await expect(page.getByLabel('Issue body')).toHaveValue('Keep this draft')
+  await repo.press('ArrowDown')
+  await repo.press('Escape')
+  await expect(page.getByRole('listbox')).toBeHidden()
+  await expect(repo).toHaveValue('ApI')
+  await expect(page.getByRole('button', { name: 'Labels, 1 chosen' })).toBeVisible()
+  await expect(page.locator('[data-w="issue-repo"]')).toHaveValue('acme/site')
+
+  await repo.fill('site')
+  await repo.press('Enter')
+  await expect(page.getByRole('checkbox', { name: 'bug' })).toBeChecked()
+  expect(labelReads).toEqual(['acme/site'])
+  await repo.fill('ApI')
+  await repo.press('ArrowDown')
+  await repo.press('Enter')
+  await expect(page.getByRole('checkbox', { name: 'bug' })).not.toBeChecked()
+  await expect(page.locator('[data-writer="issue"]')).toContainText('Cleared 1 label chosen for the previous repository.')
+  expect(labelReads).toEqual(['acme/site', 'acme/api'])
+  await page.getByRole('checkbox', { name: 'bug' }).check()
+  await repo.fill('no-match')
+  await page.getByRole('button', { name: 'Open issue', exact: true }).click()
+  await expect(card(page, 'A searched issue')).toBeVisible()
+  expect(opened).toEqual([{ operation: 'open_issue', repository_full_name: 'acme/api', title: 'A searched issue', body: 'Keep this draft', labels: ['bug'] }])
+})
+
+test('issue repository search requires a choice and stays disabled when editing', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  await page.route('**/api/repos**', (route) => route.fulfill({ json: { repos: [] } }))
+  await page.reload()
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.getByLabel('Issue title').fill('Needs a repository')
+  await page.getByRole('combobox').fill('not/a-repository')
+  await page.getByRole('button', { name: 'Open issue', exact: true }).click()
+  await expect(page.getByRole('alert')).toHaveText('Choose a repository.')
+  await page.locator('[data-writer="issue"]').getByRole('button', { name: 'Cancel' }).click()
+
+  await page.route('**/api/gh', async (route) => {
+    if (route.request().postDataJSON().operation !== 'read_issue') return route.fallback()
+    return route.fulfill({ json: { issue: { number: 42, title: 'Opened today', body: 'Existing body' } } })
+  })
+  await card(page, 'Opened today').getByRole('button', { name: 'Edit issue' }).focus()
+  await card(page, 'Opened today').getByRole('button', { name: 'Edit issue' }).click()
+  await expect(page.getByRole('combobox', { name: 'Repository', exact: true })).toBeDisabled()
+  await expect(page.getByRole('combobox', { name: 'Repository', exact: true })).toHaveValue('acme/site')
+})
+
+test('a failed card save leaves the newer repository writer active and keeps the card draft', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  let finish: (() => void) | undefined
+  await page.route('**/api/current', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    await new Promise<void>((resolve) => { finish = resolve })
+    await route.fulfill({ status: 503, json: { error: 'Card save unavailable' } })
+  })
+  const idea = page.getByRole('region', { name: 'Idea' })
+  const newCard = idea.getByRole('button', { name: 'Add', exact: true }).first()
+  await newCard.click()
+  await idea.getByRole('textbox', { name: 'Card text' }).fill('Keep my card draft')
+  await idea.getByRole('combobox').fill('api')
+  await idea.locator('[data-writer]').getByRole('button', { name: 'Add', exact: true }).click()
+  await expect.poll(() => !!finish).toBe(true)
+
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.getByLabel('Issue title').fill('Keep this issue open')
+  finish!()
+  await expect(page.getByText('The card was not saved: Card save unavailable')).toBeVisible()
+  await expect(page.getByRole('combobox')).toHaveCount(1)
+  const repository = page.getByRole('combobox', { name: 'Repository', exact: true })
+  await repository.fill('api')
+  await expect(page.getByRole('option')).toHaveText(['acme/api'])
+  await expect(page.getByLabel('Issue title')).toHaveValue('Keep this issue open')
+
+  await newCard.click()
+  await expect(idea.getByRole('textbox', { name: 'Card text' })).toHaveValue('Keep my card draft')
+  await expect(idea.getByRole('combobox')).toHaveValue('api')
+})
+
+test('a failed card edit leaves the busy issue submission active and keeps the edit draft', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  const stored = { id: 7, text: 'Keep my edited card', repo: 'acme/site', lane: 'idea', position: 0, created_at: iso(0), updated_at: iso(0) }
+  let finishEdit: (() => void) | undefined
+  await page.route(/\/api\/current(?:\?|\/|$)/, async (route) => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { cards: [stored] } })
+    if (route.request().method() === 'PATCH') {
+      await new Promise<void>((resolve) => { finishEdit = resolve })
+      return route.fulfill({ status: 503, json: { error: 'Card save unavailable' } })
+    }
+    return route.fallback()
+  })
+  let finishIssue: (() => void) | undefined
+  await page.route('**/api/gh', async (route) => {
+    if (route.request().postDataJSON().operation !== 'open_issue') return route.fallback()
+    await new Promise<void>((resolve) => { finishIssue = resolve })
+    return route.fulfill({ status: 503, json: { error: 'GitHub unavailable' } })
+  })
+  await page.reload()
+  const edited = card(page, 'Keep my edited card')
+  await expect(edited).toBeVisible()
+
+  await edited.locator('.card-text').click()
+  await page.getByRole('textbox', { name: 'Card text' }).fill('Keep my edited draft')
+  await page.getByRole('combobox', { name: 'Linked repository' }).fill('api')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect.poll(() => !!finishEdit).toBe(true)
+
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.getByLabel('Issue title').fill('Keep this issue open')
+  await page.getByRole('button', { name: 'Open issue', exact: true }).click()
+  await expect.poll(() => !!finishIssue).toBe(true)
+  await expect(page.getByRole('combobox', { name: 'Repository', exact: true })).toBeDisabled()
+
+  finishEdit!()
+  await expect(page.getByText('The card was not saved: Card save unavailable')).toBeVisible()
+  await expect(page.getByRole('combobox')).toHaveCount(1)
+  await expect(page.getByLabel('Issue title')).toHaveValue('Keep this issue open')
+
+  finishIssue!()
+  await expect(page.locator('[data-writer="issue"]').getByRole('alert')).toHaveText('The issue was not opened: GitHub unavailable')
+  await expect(page.getByRole('combobox')).toHaveCount(1)
+  const repository = page.getByRole('combobox', { name: 'Repository', exact: true })
+  await repository.fill('api')
+  await expect(page.getByRole('option')).toHaveText(['acme/api'])
+  await expect(page.getByLabel('Issue title')).toHaveValue('Keep this issue open')
+
+  await page.locator('[data-writer="issue"]').getByRole('button', { name: 'Cancel' }).click()
+  await edited.locator('.card-text').click()
+  await expect(page.getByRole('textbox', { name: 'Card text' })).toHaveValue('Keep my edited draft')
+  await expect(page.getByRole('combobox', { name: 'Linked repository' })).toHaveValue('api')
+})
+
 test('choosing a live item opens it beside the board, and a card’s chat opens in the side pane', async ({ page }) => {
   await board(page, { records: RECORDS })
   await card(page, 'A pull request').locator('.card-meta').click()
@@ -297,6 +499,7 @@ test('opening an issue keeps its writer open and guarded until GitHub answers', 
   await page.getByLabel('Issue title').fill('A new issue')
   await page.getByRole('button', { name: 'Open issue' }).click()
   await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
+  await expect(page.getByRole('combobox', { name: 'Repository', exact: true })).toBeDisabled()
   // It says where it is, where it was asked, and its unavailable buttons look it.
   await expect(page.locator('[data-writer="issue"] [data-ref="life"]')).toContainText('Executing · opening on GitHub')
   await expect(page.getByRole('button', { name: 'Open issue' })).toHaveCSS('opacity', '0.45')

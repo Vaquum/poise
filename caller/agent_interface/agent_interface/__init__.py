@@ -461,6 +461,57 @@ def fence_closed_behavior(model: str, actor: str, repository: str, number: int,
     return {"id": id_, "correlation_id": correlation_id, "outcome": "fenced", **identity}
 
 
+RETIRE_BEFORE_PUBLICATION_PHASES = {"preparing", "prepared", "executing"}
+
+
+class ClosedImplementationRetired(RuntimeError):
+    """The original Call was fenced before it could retain a publication plan."""
+
+
+def retire_closed_implementation(call_id: str) -> dict:
+    """Fence a running first implementation against publication, then signal it.
+
+    Only a running implement_issue before its publication boundary can retire:
+    preparing/prepared/executing with no plan, head, publication or result and
+    no recorded resource error. Anything else is refused without changing the
+    row, so an already-publishing Call keeps its existing reconciliation. The
+    fence shares work_publication's transaction: whichever commits first wins.
+    Signalling is cooperative SIGTERM only; the original cleanup path settles
+    the typed receipt and its own resource release."""
+    if not re.fullmatch(r"[0-9a-f]{32}", call_id):
+        raise ValueError("retirement requires the original native call id")
+    with db() as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select status,behavior,source,error_code,artifact,pid,process_identity,action_plan,head_sha "
+                           "from calls where id=?", (call_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown call id")
+        if row["status"] != "running" or row["behavior"] != "implement_issue" \
+                or row["source"] != "poise:behavior-chain":
+            return {"id": call_id, "outcome": "refused", "reason": "not a running first implementation"}
+        if (row["error_code"] or "") in {"stopping", "stopped"}:
+            return {"id": call_id, "outcome": "refused", "reason": "already stopping"}
+        artifact = json.loads(row["artifact"] or "{}")
+        if isinstance(artifact.get("retirement"), dict) and artifact["retirement"].get("cause") == "target_closed":
+            return {"id": call_id, "outcome": "retiring", "reason": "already requested"}
+        if row["action_plan"] is not None or row["head_sha"] is not None \
+                or artifact.get("phase") not in RETIRE_BEFORE_PUBLICATION_PHASES \
+                or artifact.get("plan_sha") or artifact.get("publication_head") \
+                or artifact.get("publication") or artifact.get("result") or artifact.get("resource_error") \
+                or artifact.get("replies_started") is not None:
+            return {"id": call_id, "outcome": "refused", "reason": "already beyond the publication boundary"}
+        if not row["pid"]:
+            raise RuntimeError("retirement requires the original supervisor PID")
+        with process_identity.pinned(row["process_identity"], int(row["pid"])) as process:
+            if process is None:
+                return {"id": call_id, "outcome": "refused", "reason": "original supervisor exited"}
+            artifact["retirement"] = {"cause": "target_closed", "requested_at": time()}
+            conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), call_id))
+            conn.commit()
+            process.signal(signal.SIGTERM)
+    return {"id": call_id, "outcome": "retiring"}
+
+
 # ── --record-turn ──────────────────────────────────────────────────────
 # A Chat turn runs in Poise's own runtime; Caller keeps the calls row so Swarm
 # lists it with its model, elapsed time and outcome. The row is marked with a
@@ -748,7 +799,7 @@ def init_started_at() -> float | None:
 
 
 def reap_interrupted() -> int:
-    """Historical non-native calls retain their age-based status reaping.
+    """Legacy calls retain their orphan grace behind identity/scope guards.
     Native supervisor loss uses its recorded kernel identity, never wall-clock
     epoch order. Only a reader that can observe the current workspace
     supervisor can reconcile an earlier epoch. Interrupted status grants
@@ -765,42 +816,69 @@ def reap_interrupted() -> int:
     ended = []
     workspace_observer = None
     for row in rows:
-        if row["source"] == "poise:behavior-chain":
-            try:
-                observed = process_identity.state(row["process_identity"], int(row["pid"]), True)
-            except (RuntimeError, TypeError, ValueError):
+        native = row["source"] == "poise:behavior-chain"
+        try:
+            observed = process_identity.state(row["process_identity"], int(row["pid"]), True)
+        except (RuntimeError, TypeError, ValueError):
+            if native:
                 continue
-            if observed == "unobservable":
-                if workspace_observer is None:
-                    workspace_observer = caller_store.observes_workspace_supervisor()
-                if workspace_observer:
-                    observed = "different"
-            if observed in {"gone", "different"}:
-                ended.append(row["id"])
+            observed = "unverified" if row["process_identity"] else "missing"
+        observer = "same_epoch"
+        if observed in {"unobservable", "unverified", "missing"}:
+            if workspace_observer is None:
+                workspace_observer = caller_store.observes_workspace_supervisor()
+            if not workspace_observer:
+                continue
+            observer = "workspace"
+        if observed == "alive":
             continue
-        started = float(row["started_at"] or 0)
-        if init is None or started >= init:
-            if row["source"] != "poise:behavior-chain" and now - started < ORPHAN_AFTER_SECONDS:
-                continue
-            try:
-                pid = int(row["pid"])
-            except (TypeError, ValueError):
-                continue
-            command = process_command(pid)
-            if command is not None and STOP_COMMAND_MARK in command:
-                continue
-        ended.append(row["id"])
+        reason = "workspace_replaced" if observed == "unobservable" else "supervisor_lost"
+        if not native:
+            if observed == "unobservable":
+                # A parent sees a live child namespace as unobservable too.
+                # Only an earlier kernel epoch proves replacement here.
+                try:
+                    registered = process_identity.decode(row["process_identity"], int(row["pid"]))["epoch"]
+                    workspace = process_identity.epoch()
+                    boot = registered["boot"]
+                    if not isinstance(boot, str) or not boot:
+                        continue
+                    if boot == workspace["boot"] and int(registered["init_start"]) >= int(workspace["init_start"]):
+                        continue
+                except (OSError, RuntimeError, KeyError, TypeError, ValueError, IndexError):
+                    continue
+            started = float(row["started_at"] or 0)
+            reason = "workspace_replaced" if observed == "unobservable" else "legacy_before_init"
+            # Same-epoch supervisor loss does not prove its providers ended.
+            # A verified replacement does; older rows need the authorized
+            # workspace observer before retaining their historical init rule.
+            if observed != "unobservable" and (observed in {"gone", "different"} or init is None or started >= init):
+                if now - started < ORPHAN_AFTER_SECONDS:
+                    continue
+                try:
+                    pid = int(row["pid"])
+                except (TypeError, ValueError):
+                    continue
+                command = process_command(pid)
+                if command is not None and STOP_COMMAND_MARK in command:
+                    continue
+                reason = "legacy_orphan"
+        evidence = diagnostic_envelope(operation="call.reap", phase="reconciliation", outcome="interrupted",
+                                       message=f"{reason}; observer={observer}; identity={observed}", call_id=row["id"])
+        ended.append((row["id"], json.dumps(evidence)))
     count = 0
     with db() as conn:
-        for id_ in ended:
+        for id_, evidence in ended:
             # Whether it is being stopped is read by the update itself: stop_call
             # may have marked it, and ended its worker, since the select above.
             count += conn.execute(
                 "update calls set status='failed', ended_at=?, "
                 "error=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error when error_code='stopping' then 'Stopped by user' else ? end, "
                 "error_code=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error_code when error_code='stopping' then 'stopped' else 'interrupted' end, "
+                "diagnostic=case when diagnostic is null then ? "
+                "when json_valid(diagnostic) then json_set(diagnostic,'$.reaper',json(?)) else diagnostic end, "
                 "progress=coalesce(?, progress) where id=? and status='running'",
-                (now, INTERRUPTED_ERROR, progress.terminal("failed"), id_),
+                (now, INTERRUPTED_ERROR, evidence, evidence, progress.terminal("failed"), id_),
             ).rowcount
             mark_managed_no_write(conn, id_)
     return count
@@ -1608,7 +1686,10 @@ def persist_action_plan(call_id: str, plan: dict) -> str:
         raise ValueError("native publication plan exceeds its durable byte bound")
     with db() as conn:
         conn.execute("begin immediate")
-        row = conn.execute("select action_plan, status from calls where id=?", (call_id,)).fetchone()
+        row = conn.execute("select action_plan, status, json_extract(artifact,'$.retirement.cause') as retirement "
+                           "from calls where id=?", (call_id,)).fetchone()
+        if row is not None and row["retirement"] == "target_closed":
+            raise ClosedImplementationRetired("work publication fenced by verified target closure")
         if row is None or row["status"] != "running" or (row["action_plan"] is not None and row["action_plan"] != encoded):
             raise ValueError("native publication plan conflicts with its original durable record")
         if conn.execute("update calls set action_plan=? where id=? and status='running'", (encoded, call_id)).rowcount != 1:
@@ -1854,6 +1935,8 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
             with review_receipt.managed_resources(run_dir):
                 try:
                     result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
+                except ClosedImplementationRetired:
+                    raise
                 except Exception as error:
                     if getattr(error, "diagnostic", None) is None:
                         failure = atomic_work.failure_diagnostic(error)
@@ -1868,9 +1951,15 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                     failure = retain_native_failure(id_, error, diagnostic=failure)
                     raise
             outcome = result.get("outcome")
-            if outcome not in {"published", "no_changes", "superseded", "prerequisite_wait"}:
+            if outcome not in {"published", "no_changes", "superseded", "target_closed", "prerequisite_wait"}:
                 raise RuntimeError("atomic behavior returned no publication outcome")
-            if outcome == "prerequisite_wait":
+            if outcome == "target_closed":
+                if pull is not None or behavior != "implement_issue":
+                    raise RuntimeError("target closure retirement requires the original first implementation")
+                record({**artifact, "retirement": {"cause": "target_closed", "detected_at": time()}})
+                finish(id_, "superseded", response=json.dumps(result), outcome="target_closed",
+                       head_sha=None, action="not_started", error_code="target_closed")
+            elif outcome == "prerequisite_wait":
                 if pull is not None or artifact.get("phase") != "prerequisite_wait" \
                         or artifact.get("publication_head") is not None or artifact.get("replies_started") is not None \
                         or artifact.get("result") is not None or result.get("head_sha") is not None:
@@ -1888,8 +1977,27 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                 resource_ownership.failure(DB, id_, "resources_unknown", run_dir)
             record({**artifact, "phase": "resources_unknown"})
         with db() as conn:
-            row = conn.execute("select error_code from calls where id=?", (id_,)).fetchone()
+            row = conn.execute("select error_code,artifact,action_plan from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
+        stored = json.loads(row["artifact"] or "{}") if row and row["artifact"] else {}
+        retired = (
+            source == "poise:behavior-chain" and pull is None and behavior == "implement_issue"
+            and row is not None and row["action_plan"] is None and failure is None
+            and (isinstance(error, ClosedImplementationRetired)
+                 or isinstance(error, SystemExit) and error.code == 128 + signal.SIGTERM)
+            and not stopped and stored.get("phase") in RETIRE_BEFORE_PUBLICATION_PHASES
+            and isinstance(stored.get("retirement"), dict) and stored["retirement"].get("cause") == "target_closed"
+            and not stored.get("plan_sha") and not stored.get("publication_head")
+            and not stored.get("publication") and not stored.get("result")
+            and not stored.get("resource_error") and stored.get("replies_started") is None
+        )
+        if retired:
+            finish(id_, "superseded", outcome="target_closed", head_sha=None,
+                   action="not_started", error_code="target_closed")
+            print(json.dumps({"id": id_, "behavior": behavior, "actor": actor, "source": source,
+                              "correlation_id": correlation_id, "model": spec.identity,
+                              "outcome": "target_closed"}))
+            return
         no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline", "prerequisite_wait"}
         finish(id_, "failed", error="Stopped by user" if stopped else failure_message or str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
@@ -3265,6 +3373,12 @@ def _main():
         if not re.fullmatch(r"[0-9a-f]{32}", call_id):
             raise ValueError("stop requires a full call id")
         print(json.dumps(stop_call(call_id)))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--retire-closed-implementation":
+        call_id = sys.argv[2]
+        if not re.fullmatch(r"[0-9a-f]{32}", call_id):
+            raise ValueError("retirement requires a full call id")
+        print(json.dumps(retire_closed_implementation(call_id)))
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--read-reasoning":
         call_id = sys.argv[2]

@@ -49,7 +49,11 @@ _READINESS_QUERY = """
           }
           reviewThreads(first: 100) {
             pageInfo { hasNextPage }
-            nodes { isResolved isOutdated }
+            nodes {
+              isResolved
+              isOutdated
+              comments(first: 1) { nodes { author { login } } }
+            }
           }
           commits(last: 1) {
             nodes {
