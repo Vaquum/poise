@@ -11,7 +11,7 @@ export interface McpGrant extends McpGrantScope { clientId: string; createdAt: n
 interface StoredGrant extends McpGrant { accessHash: string; accessExpires: number; refreshHash: string }
 // Grants issued before poise_work existed carry no tools; they consented to workspace identity only.
 const LEGACY_TOOLS = ['poise_describe']
-function grantedTools(value: unknown, scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'managerClientId'>): string[] {
+function grantedTools(value: unknown, scope: McpGrantScope): string[] {
   return Array.isArray(value) && value.length > 0 && value.every(tool => typeof tool === 'string')
     ? mcpToolNames(scope).filter(tool => value.includes(tool)) : [...LEGACY_TOOLS]
 }

@@ -305,6 +305,11 @@ client sent.
     An exact work request can opt into Caller’s live pull evidence. It keeps
     the live head and merge decision separate from the workspace’s recorded
     observation and original review receipts.
+    Separate signed grants cover Chat artifacts, workspace operations and
+    workspace content. A restricted repository grant cannot read workspace-wide
+    snapshots. Logging and Link reads stay in the gateway. Instance Logging
+    requires explicit administrator consent and a live administrator check
+    before the read and response.
     An independent Manager consent adds the client identity to the signed
     claim. Its typed actions use `POST /api/mcp/manager`, the native Manager
     authorization and budget, and the existing durable command receipts with
