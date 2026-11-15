@@ -144,6 +144,41 @@ export async function reconcileRepairReport(repository: string, marker: string, 
   }
 }
 
+/** Issues updated since `since`, oldest first. The orphan probe orders rival
+ * claimants by creation. A direct listing, never search: search absence
+ * never proves an earlier POST had no effect. */
+export async function listOwnerIssuesSince(repository: string, creator: string, since: string) {
+  requireConfiguredRepository(repository)
+  const me = getMeta('me')
+  if (!me) throw new Error('Repair reporting requires the configured GitHub account')
+  const token = await resolveMeToken(me)
+  const env = { GH_HOST: 'github.com', GH_TOKEN: token, GITHUB_TOKEN: undefined,
+    GH_ENTERPRISE_TOKEN: undefined, GITHUB_ENTERPRISE_TOKEN: undefined }
+  try {
+    const { stdout } = await runFile(GH, ['api',
+      `repos/${repository}/issues?creator=${creator}&since=${since}&state=all&sort=created&direction=asc&per_page=100`], {
+      env, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024,
+    })
+    const items: unknown = JSON.parse(stdout)
+    if (!Array.isArray(items)) throw new Error('Repair report owner listing is invalid')
+    if (items.length >= 100) throw new Error('Repair report owner listing is incomplete')
+    return items.filter(item => !!item && typeof item === 'object' && !Array.isArray(item) && !('pull_request' in item))
+      .map(item => {
+        const row = item as Record<string, unknown>
+        const user = row.user as Record<string, unknown> | undefined
+        if (!Number.isSafeInteger(row.number) || Number(row.number) < 1 || typeof user?.login !== 'string'
+          || typeof row.created_at !== 'string' || typeof row.body !== 'string') {
+          throw new Error('Repair report owner listing is invalid')
+        }
+        return { number: Number(row.number), author: user.login as string, created_at: row.created_at as string, body: row.body as string }
+      })
+  } catch (error) {
+    const failure = error as { stderr?: unknown, message?: string }
+    const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)
+    throw new Error(`Repair report owner listing failed: ${message.split(token).join('***')}`)
+  }
+}
+
 // github-interface resolves the repo from cwd's last two path parts when
 // no git remote is found. We make a no-op directory under tmpdir for each
 // repo and use that as cwd — `mkdir -p` is cheap and idempotent.

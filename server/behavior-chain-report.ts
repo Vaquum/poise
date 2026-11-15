@@ -8,7 +8,7 @@ import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { runDatastoreHealth, validatedHealth } from './datastore-health'
-import { getHeadSha, handleGhBody, reconcileRepairReport } from './gh'
+import { getHeadSha, handleGhBody, listOwnerIssuesSince, reconcileRepairReport } from './gh'
 import { HttpError } from './http'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
@@ -931,15 +931,16 @@ export async function implementationReportAdmission(db: Database, journal: Behav
     }
     if (!report) {
       // A stripped or mutated marker defeats exact reconciliation. If any
-      // unconfirmed pre-PR intent could have filed this issue, bind the
-      // earliest and require its disposition instead of ordinary intake.
-      // Every body signal is quotable and removable singly: the published
-      // source/hold/basis line alone must not consume the intent, while a
-      // basis removal must still gate. Binding therefore requires the
-      // original failing file/test plus the basis or the original
-      // invocation/Call IDs, alongside tolerant source and hold signals and
-      // the orphan's own source-owner authorship. Unknown authorship fails
-      // closed. Never bind an orphan to its own source.
+      // unconfirmed pre-PR intent could have filed this issue, bind it and
+      // require its disposition instead of ordinary intake. Body signals are
+      // quotable and removable, so a body match alone cannot consume the
+      // intent: a quoting ordinary issue copies every published signal while
+      // a rewrite removes them, including the failing file and test case.
+      // The reporter files the genuine report right after its hold through
+      // the orphan's own source-owner account, so a match binds only when no
+      // earlier owner-authored post-hold issue matches the same orphan: a
+      // quoter necessarily postdates the publication it copies. Unknown
+      // authorship fails closed. Never bind an orphan to its own source.
       const orphans = unconfirmedImplementationReports(db, chain.repository)
         .filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
         .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
@@ -951,29 +952,44 @@ export async function implementationReportAdmission(db: Database, journal: Behav
             const body = probe.body
             const author = typeof (probe as { author?: unknown }).author === 'string'
               ? ((probe as { author: string }).author.toLowerCase()) : null
-            const match = orphans.find(candidate => {
+            const created = typeof probe.created_at === 'string' ? Date.parse(probe.created_at) : NaN
+            const bodyMatches = (candidate: RepairReport, text: string) =>
+              text.includes(candidate.source)
+              && (candidate.holdSequence === null || new RegExp(`\\b${candidate.holdSequence}\\b`).test(text))
+              && (text.includes(candidate.basis)
+                || (candidate.attempts.length > 0 && candidate.attempts.every(attempt =>
+                  text.includes(attempt.invocation) && text.includes(attempt.call))))
+            const matches = (candidate: RepairReport) => {
               if (author !== null) {
                 const owner = journal.read(candidate.source)?.author
                 if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
               }
-              if (!body.includes(candidate.source)) return false
-              if (candidate.holdSequence !== null
-                && !new RegExp(`\\b${candidate.holdSequence}\\b`).test(body)) return false
-              if (predatesHold(probe.created_at, candidate.heldAt)) return false
-              const reason = candidate.holdSequence === null ? null : (db.prepare(`SELECT json_extract(payload, '$.reason') AS reason
-                FROM behavior_chain_events WHERE chain_id = ? AND sequence = ? AND json_extract(payload, '$.type') = 'chain.held'`)
-                .get(candidate.source, candidate.holdSequence) as { reason: unknown } | undefined)?.reason ?? null
-              const failure = typeof reason === 'string' ? prePrFileAndTest(reason) : null
-              if (!failure) return body.includes(candidate.basis)
-              if (!body.includes(failure.file) || !body.includes(failure.test)) return false
-              return body.includes(candidate.basis)
-                || (candidate.attempts.length > 0 && candidate.attempts.every(attempt =>
-                  body.includes(attempt.invocation) && body.includes(attempt.call)))
-            })
-            if (match) {
-              match.issueNumber = chain.issue
-              db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(match), PREFIX + match.key)
-              report = match
+              return bodyMatches(candidate, body) && !predatesHold(probe.created_at, candidate.heldAt)
+            }
+            for (const candidate of orphans.filter(matches)) {
+              const owner = journal.read(candidate.source)?.author
+              const creator = typeof owner === 'string' ? owner : author
+              // A hold is durable for these intents; without one there is no
+              // creation order to check, so the body match binds directly.
+              if (typeof candidate.heldAt !== 'number' || creator === null) {
+                candidate.issueNumber = chain.issue
+                db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(candidate), PREFIX + candidate.key)
+                report = candidate
+                break
+              }
+              if (!Number.isFinite(created)) return { reason: `${implWait}: verification unavailable: probed issue creation time is unavailable` }
+              const rivals = await listOwnerIssuesSince(chain.repository, creator, new Date(candidate.heldAt - 60_000).toISOString())
+              const earlier = rivals.some(rival => rival.number !== chain.issue
+                && rival.author.toLowerCase() === creator.toLowerCase()
+                && bodyMatches(candidate, rival.body) && !predatesHold(rival.created_at, candidate.heldAt)
+                && (Date.parse(rival.created_at) < created
+                  || (Date.parse(rival.created_at) === created && rival.number < chain.issue)))
+              if (!earlier) {
+                candidate.issueNumber = chain.issue
+                db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(candidate), PREFIX + candidate.key)
+                report = candidate
+                break
+              }
             }
           }
         } catch (error) {
