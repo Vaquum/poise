@@ -447,6 +447,12 @@ conn.close()
   waitedMerge = append(waitedMerge, { type: 'chain.observed', observation: waitedObservation })
   append(waitedMerge, { type: 'chain.merged', mergeSha: 'b'.repeat(40), evidence: { repository: 'Acme/Repo', pull_number: 21,
     merged: true, merge_sha: 'b'.repeat(40), review_complete: true } })
+  let heldWithActive = admit(12)
+  heldWithActive = append(heldWithActive, { type: 'invocation.admitted', invocation: { id: 'original-active', behavior: 'implement-issue',
+    basis: 'issue', actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 1000,
+    request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
+  heldWithActive = append(heldWithActive, { type: 'invocation.started', invocationId: 'original-active' })
+  append(heldWithActive, { type: 'chain.held', reason: 'Pause new admission while the original worker finishes' })
   await ledger.startBehaviorLedger({ path: join(root, 'ledger.sqlite') })
   ledger.behaviorLedgerHeartbeat()
   const packagePoisePlugin = (apex: string, destination: string) => promisify(execFile)(process.execPath,
@@ -514,6 +520,7 @@ conn.close()
       [3, 'complete', 'complete', 'b'.repeat(40)], [4, 'merged_review_pending', 'pending', 'b'.repeat(40)],
     ])
     expect(second.items[1].github?.mergeSha).toBe('b'.repeat(40))
+    expect(second.items[1].github).toMatchObject({ approved: null, changesRequested: null, unresolvedThreads: null })
     expect(second.items[1].links).toMatchObject({ issue: 'https://github.com/Acme/Repo/issues/4', pr: 'https://github.com/Acme/Repo/pull/14',
       ci: `https://github.com/Acme/Repo/pull/14/checks?sha=${'a'.repeat(40)}`, merge: `https://github.com/Acme/Repo/commit/${'b'.repeat(40)}` })
     expect(run.mock.calls).toHaveLength(2)
@@ -554,6 +561,8 @@ conn.close()
     const waited = await work({ repository: 'acme/repo', issue: 11 })
     expect(waited.items[0]).toMatchObject({ stage: 'complete', reviewStatus: 'complete' })
     expect(waited.items[0].blocker).toBeNull()
+    expect((await work({ repository: 'acme/repo', issue: 12 })).items[0]).toMatchObject({ stage: 'held',
+      next: { actor: 'author', action: 'await-original-receipt' } })
     run.mockClear()
     const dash = await work({ repository: 'acme/repo', label: '-blocked', limit: 2 })
     expect(dash.coverage.issues.status).toBe('fresh')

@@ -86,6 +86,7 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
     ? coverage('unavailable', null, 'No valid chain observation recorded')
     : coverage(now - checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS ? 'stale' : 'fresh', new Date(checkedAt).toISOString())
   const pullNumber = summary?.pullNumber ?? null
+  const openPull = observation?.pull?.state === 'open' && !observation.pull.merged ? observation.pull : null
   const targets = [...new Set([issue.number, ...(pullNumber ? [pullNumber] : [])])]
   // Ledger reads stay sequential: a full page fans out to two targets per
   // issue against the worker's bounded read slots, so parallel reads
@@ -169,8 +170,8 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
     receipts, omittedInvocations, ledger,
     github: observation?.pull ? { observedAt: observationCoverage.observedAt, head, merged: observation.pull.merged,
       mergeSha: observation.pull.mergeSha, checks: { pending: observation.pull.pending, failing: observation.pull.failing.slice(0, 10) },
-      queueEntry: observation.pull.queueEntry, approved: observation.pull.approved, changesRequested: observation.pull.changesRequested,
-      unresolvedThreads: observation.pull.unresolved, conflicts: observation.pull.conflict, behind: observation.pull.behind } : null,
+      queueEntry: observation.pull.queueEntry, approved: openPull?.approved ?? null, changesRequested: openPull?.changesRequested ?? null,
+      unresolvedThreads: openPull?.unresolved ?? null, conflicts: openPull?.conflict ?? null, behind: openPull?.behind ?? null } : null,
     links: { issue: `${github}/issues/${issue.number}`,
       chain: chain ? `${origin}/api/behavior-chains?id=${encodeURIComponent(chain.id)}` : null,
       calls: calls.map(id => ({ id, url: `${origin}/api/agent-response/${id}` })), pr: pullUrl,
@@ -186,8 +187,8 @@ function nextWorkAction(stage: string, blocker: string | null, chain: BehaviorCh
   observation: ChainObservation | null, source: Coverage, now: number, eligible: boolean | null) {
   if (stage === 'complete' || stage === 'superseded' || stage === 'merged_review_not_recorded') return null
   if (stage === 'unknown') return { actor: 'workspace-owner', action: 'inspect-evidence', reason: blocker ?? 'Coverage is incomplete' }
-  if (stage === 'held') return { actor: 'workspace-owner', action: 'inspect-hold', reason: blocker }
   if (active) return { actor: active.actor, action: 'await-original-receipt', reason: blocker }
+  if (stage === 'held') return { actor: 'workspace-owner', action: 'inspect-hold', reason: blocker }
   if (stage === 'merged_review_pending') return { actor: 'workspace-owner', action: 'inspect-original-review', reason: blocker }
   if (stage === 'delayed') return { actor: 'poise', action: 'recheck-admission', reason: blocker }
   if (observation?.pull?.queueEntry && source.status === 'fresh') return { actor: 'github', action: 'observe-queue', reason: blocker }
