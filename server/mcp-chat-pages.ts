@@ -33,17 +33,22 @@ function textPreview(text: string) {
 function eventDetail(event: ChatEvent) {
   switch (event.type) {
     case 'turn.started':
-      return { turnId: event.turnId, callId: event.callId ?? null, ...textPreview(event.prompt.text) }
+      return { turnId: event.turnId, callId: event.callId ?? null, ...textPreview(event.prompt.text),
+        attachmentIds: (event.prompt.attachments ?? []).filter(item => isMcpRecordId(item.id)).map(item => item.id) }
     case 'text.delta':
       return { turnId: event.turnId, messageId: event.messageId, ...textPreview(event.delta) }
     case 'steer.sent':
-      return { turnId: event.turnId, ...textPreview(event.text) }
+      return { turnId: event.turnId, ...textPreview(event.text),
+        attachmentIds: (event.attachments ?? []).filter(item => isMcpRecordId(item.id)).map(item => item.id) }
     case 'turn.finished':
       return { turnId: event.turnId, stopReason: event.stopReason, durationMs: event.durationMs ?? null }
     case 'timer.changed':
       return { timerId: event.timer.id, state: event.timer.state, change: event.change }
     case 'status.changed':
       return { status: event.status }
+    case 'plan.updated':
+      return { turnId: event.turnId, entries: event.entries.slice(0, 10).map(({ content, status, priority }) =>
+        ({ content: content.slice(0, 150), status, priority })), truncated: event.entries.length > 10 || event.entries.some(row => row.content.length > 150) }
     case 'diff':
       return { turnId: event.turnId, diffId: event.diffId, metadataOnly: true }
     default:

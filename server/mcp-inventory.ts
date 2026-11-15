@@ -76,7 +76,7 @@ const capabilityLinks: Record<Capability, string> = {
   'settings-conflict': placeHref('settings'),
 }
 
-export function mcpInventory() {
+export function mcpInventory(artifacts = false) {
   const entry = (id: string, query: string, surface: Surface) => ({ id, href: `/${query}`, ...surface })
   return {
     observedAt: new Date().toISOString(),
@@ -90,6 +90,9 @@ export function mcpInventory() {
         tool: 'poise_list', reason: 'Indexed pages by repository and update time' }),
       entry('chat/transcript', placeHref('chat'), { kind: 'chat-event', source: 'Retained Chat journal', retention: 'Events since the last context reset',
         permission: 'Chat transcript consent', tool: 'poise_changes', reason: 'Resumable transcript pages by stored sequence' }),
+      entry('chat/artifacts', placeHref('chat'), { kind: 'chat-artifact', source: 'Recorded Chat attachments and diffs',
+        retention: 'Retained upload records and journal events', permission: 'Separate Chat artifact consent',
+        ...(artifacts ? { tool: 'poise_get' } : {}), reason: artifacts ? 'Exact artifact ID under the owning Chat' : 'Requires separate Chat artifact consent' }),
     ],
   }
 }

@@ -98,6 +98,18 @@ metadata report partial coverage. A reset reports expired coverage for an
 older checkpoint and returns the retained boundary. `watermark` is the last
 sequence consumed. Pass `nextCursor` to continue or check for new events.
 
+For exact Chat metadata, `poise_get` includes current worker and creator
+identities, work bindings and pending owner requests where the grant permits
+them. Each collection returns up to ten records and reports truncation. Plan
+updates appear in the retained Chat event stream.
+
+With separate artifact consent, call `poise_get` with `kind: "chat-attachment"`
+or `kind: "chat-diff"`, the artifact `id`, and the owning `chatId`. Attachment
+metadata includes original size and upload time. Text up to 16 KiB is served
+only when its saved content hash still matches. A diff uses the retained event
+and returns up to 6,144 characters on each side for a previewable checkout file.
+Missing or limited content carries an explicit coverage result.
+
 ## Private plugin
 
 Render a private package for an installation's HTTPS apex into a new directory:

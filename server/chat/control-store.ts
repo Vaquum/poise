@@ -11,10 +11,12 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS chat_control_children (
     child TEXT PRIMARY KEY, manager TEXT NOT NULL, instance TEXT NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS chat_control_parent ON chat_control_children(instance, manager, child);
   CREATE TABLE IF NOT EXISTS chat_work_bindings (
     instance TEXT NOT NULL, target TEXT NOT NULL, session TEXT NOT NULL,
     created_at INTEGER NOT NULL, PRIMARY KEY(instance, target)
   );
+  CREATE INDEX IF NOT EXISTS chat_work_bindings_session ON chat_work_bindings(instance, session, target);
   CREATE TABLE IF NOT EXISTS chat_work_binding_releases (
     instance TEXT NOT NULL, target TEXT NOT NULL, session TEXT NOT NULL,
     released_at INTEGER NOT NULL, PRIMARY KEY(instance, target, session)
@@ -116,6 +118,13 @@ export function workTarget(value: string): WorkTarget {
 export interface Binding { target: string, session: string, created_at: number }
 export function bindings(instance: string): Binding[] {
   return db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? ORDER BY target').all(instance) as Binding[]
+}
+
+export function chatBindings(instance: string, session: string, repository: string | null, limit: number): Binding[] {
+  const prefix = repository ? 'https://github.com/' + repository.toLowerCase() + '/' : null
+  return cachedStatement(db, 'SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND session = ?'
+    + ' AND (? IS NULL OR lower(substr(target, 1, length(?))) = ?) ORDER BY target LIMIT ?')
+    .all(instance, session, prefix, prefix, prefix, limit) as Binding[]
 }
 
 export function openWorkBindings(instance: string): Array<{ target: string, session: string, role: string | null }> {
@@ -232,6 +241,12 @@ export function addChild(instance: string, manager: string, child: string): void
 }
 export function children(instance: string): Array<{ child: string, manager: string }> {
   return db.prepare('SELECT child, manager FROM chat_control_children WHERE instance = ?').all(instance) as Array<{ child: string, manager: string }>
+}
+
+export function chatChildren(instance: string, manager: string, repository: string | null, limit: number): string[] {
+  return (cachedStatement(db, 'SELECT child FROM chat_control_children c JOIN chat_sessions s ON s.id = c.child AND s.instance = c.instance'
+    + ' WHERE c.instance = ? AND c.manager = ? AND (? IS NULL OR s.repo = ? COLLATE NOCASE) ORDER BY child LIMIT ?')
+    .all(instance, manager, repository, repository, limit) as Array<{ child: string }>).map(row => row.child)
 }
 
 export interface InternalMessage {

@@ -14,9 +14,10 @@ export const MCP_TOOLS = [
       cursor: { type: 'string', maxLength: 2048 },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
-  { name: 'poise_get', description: 'Read a Chat session or a live Chat timer by its Poise record ID. Requires the owner’s Chat metadata grant.',
+  { name: 'poise_get', description: 'Read an exact Chat, live timer, retained attachment or diff by its Poise record ID. Artifacts require separate content consent.',
     inputSchema: { type: 'object', required: ['kind', 'id'], properties: {
-      kind: { enum: ['chat', 'timer'] }, id: { type: 'string', pattern: MCP_RECORD_ID.source },
+      kind: { enum: ['chat', 'timer', 'chat-attachment', 'chat-diff'] }, id: { type: 'string', pattern: MCP_RECORD_ID.source },
+      chatId: { type: 'string', pattern: MCP_RECORD_ID.source, description: 'Required for a Chat attachment or diff' },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_list', description: 'List a bounded page of current or archived Chat session records by repository and UTC update window.',
@@ -42,10 +43,13 @@ export interface McpGrantScope {
   chatMetadata?: true
   chatList?: true
   chatTranscript?: true
+  chatArtifacts?: true
   repository?: string
 }
 export interface McpWorkArguments { repository: string; issue?: number; label?: string; limit?: number; cursor?: string }
-export interface McpGetArguments { kind: 'chat' | 'timer'; id: string }
+export interface McpChatMetadataArguments { kind: 'chat' | 'timer'; id: string }
+export interface McpChatArtifactArguments { kind: 'chat-attachment' | 'chat-diff'; id: string; chatId: string }
+export type McpGetArguments = McpChatMetadataArguments | McpChatArtifactArguments
 export interface McpChatListArguments { kind: 'chat'; repository: string | null; since: string | null; until: string | null; limit: number; cursor?: string }
 export interface McpChatChangesArguments { kind: 'chat'; id: string; limit: number; afterSequence?: number; cursor?: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
@@ -62,9 +66,9 @@ export const isMcpRepository = (value: unknown): value is string => typeof value
 export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
   scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
-export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript'>): string[] {
+export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'chatArtifacts'>): string[] {
   const tools: string[] = [...MCP_WORK_TOOL_NAMES]
-  if (scope.chatMetadata === true) tools.push('poise_get')
+  if (scope.chatMetadata === true || scope.chatArtifacts === true) tools.push('poise_get')
   if (scope.chatMetadata === true && scope.chatList === true) tools.push('poise_list')
   if (scope.chatTranscript === true) tools.push('poise_changes')
   return tools
@@ -88,9 +92,14 @@ export function parseMcpRead(value: unknown): McpRead {
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('invalid tool arguments')
   if (row.name === 'poise_describe' && !Object.keys(args).length) return { name: row.name, arguments: {} }
   if (row.name === 'poise_get') {
-    const { kind, id } = args as Record<string, unknown>
-    if (Object.keys(args).length !== 2 || (kind !== 'chat' && kind !== 'timer') || !isMcpRecordId(id)) throw new Error('provide a Chat or timer record ID')
-    return { name: row.name, arguments: { kind, id } }
+    const { kind, id, chatId } = args as Record<string, unknown>
+    if (isMcpRecordId(id)) {
+      if ((kind === 'chat' || kind === 'timer') && Object.keys(args).length === 2) return { name: row.name, arguments: { kind, id } }
+      if ((kind === 'chat-attachment' || kind === 'chat-diff') && Object.keys(args).length === 3 && isMcpRecordId(chatId)) {
+        return { name: row.name, arguments: { kind, id, chatId } }
+      }
+    }
+    throw new Error('provide an exact Chat or timer ID, or a Chat artifact ID with its owning Chat')
   }
   if (row.name === 'poise_list' || row.name === 'poise_changes') {
     const page = args as Record<string, unknown>
