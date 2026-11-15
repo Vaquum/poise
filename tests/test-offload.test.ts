@@ -1020,7 +1020,8 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
       })
 
       const baseline = await run(1)
-      const clean = await (await verify(readFileSync(join(evidence, baseline.id + '.json'), 'utf8'))).json()
+      const baselineReceipt = readFileSync(join(evidence, baseline.id + '.json'), 'utf8')
+      const clean = await (await verify(baselineReceipt)).json()
       expect(clean).toMatchObject({ clean: true, base, binding, run: baseline.id, exit: 1 })
 
       // These would run in an ordinary suite. Neither can supply collector input.
@@ -1043,13 +1044,17 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
         execFileSync('sh', [join(SOURCE, 'install.sh')], { env: {
           PATH: process.env.PATH, HOME: home, POISE_TEST_RELAY_URL: relayUrl, POISE_TEST_RELAY_KEY: KEY,
         } })
-        const script = 'import asyncio, json, sys\nfrom github_interface.test_dependency import _relay_receipt\n'
-          + 'print(json.dumps(asyncio.run(_relay_receipt(json.loads(sys.argv[1])))))'
+        const value = { base, capture: binding, run: original.id, baselineRun: baseline.id,
+          remediation: 'https://github.com/example/repo/issues/1',
+          relay: { original: JSON.parse(receipt), baseline: JSON.parse(baselineReceipt) } }
+        const script = 'import asyncio, json, sys\nfrom github_interface.test_dependency import _relay_proof\n'
+          + 'print(json.dumps(asyncio.run(_relay_proof("example/repo", json.loads(sys.argv[1])))))'
         const result = await new Promise<string>((done, fail) => {
-          execFile(python, ['-c', script, receipt], { env: { ...process.env, HOME: home } },
+          execFile(python, ['-c', script, JSON.stringify(value)], { env: { ...process.env, HOME: home }, timeout: 30_000 },
             (error, stdout) => error ? fail(error) : done(stdout))
         })
-        expect(JSON.parse(result)).toEqual(proof)
+        expect(JSON.parse(result)).toMatchObject({ base, candidate: proof.candidate, baselineCapture: clean.candidate,
+          failures: proof.failures, run: original.id, baselineRun: baseline.id })
       }
       expect((await verify(receipt, workspaceKey(privateKey, 'bob'))).status).toBe(403)
       const changed = JSON.parse(receipt) as { payload: string, signature: string }
