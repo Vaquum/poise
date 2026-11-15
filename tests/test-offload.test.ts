@@ -970,8 +970,9 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
     execFileSync('git', ['-C', repo, 'replace', 'HEAD', substitute])
     expect(sourceCapture(repo)).toMatchObject({ clean: false })
     const object = execFileSync('git', ['-C', repo, 'cat-file', 'commit', substitute])
-    writeFileSync(join(repo, '.git/objects', head.slice(0, 2), head.slice(2)),
-      deflateSync(Buffer.concat([Buffer.from('commit ' + object.length + '\0'), object])))
+    const objectFile = join(repo, '.git/objects', head.slice(0, 2), head.slice(2))
+    rmSync(objectFile)
+    writeFileSync(objectFile, deflateSync(Buffer.concat([Buffer.from('commit ' + object.length + '\0'), object])))
     expect(() => sourceCapture(repo)).toThrow('git object does not match the prepared base')
   }, 30_000)
 
