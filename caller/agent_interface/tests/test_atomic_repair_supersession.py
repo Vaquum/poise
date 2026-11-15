@@ -31,6 +31,21 @@ def database(tmp_path, monkeypatch):
 @pytest.mark.parametrize("evidence", ["analysis", "planning", "unchanged", "missing", "wrong-target", "unsettled"])
 def test_original_repair_supersession(database, monkeypatch, evidence):
     pending = []
+    _real_cwd_pids = issue_review._cwd_pids
+
+    def _diag_cwd_pids(root, *, require_complete=False):
+        result = _real_cwd_pids(root, require_complete=require_complete)
+        print(f"CIDIAG evidence={evidence} cwd_pids={result} root={root}", flush=True)
+        if result:
+            for pid in result:
+                try:
+                    cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")[:200]
+                    print(f"CIDIAG pid={pid} cwd={os.readlink(f'/proc/{pid}/cwd')} cmd={cmd!r}", flush=True)
+                except Exception as error:
+                    print(f"CIDIAG pid={pid} unreadable {error!r}", flush=True)
+        return result
+
+    monkeypatch.setattr(issue_review, "_cwd_pids", _diag_cwd_pids)
     cleanup = resource_ownership.cleanup_remaining
 
     def cleanup_remaining(path, call_id, **kwargs):
