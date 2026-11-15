@@ -545,6 +545,71 @@ describe('Poise in service mode', () => {
     expect(after.json.error).toContain('not a github PR url')
   })
 
+  it('reports release admission and organization sweeps independently of timer ticks', async () => {
+    const background = await import('../server/release-background')
+    const runtime = await import('../server/behaviors')
+    const { BehaviorChainRuntime } = await import('../server/behavior-chain-runtime')
+    const { db, getMeta, setMeta } = await import('../server/db')
+    const settings = getMeta('behavior_chain_settings')
+    const sweep = vi.spyOn(BehaviorChainRuntime.prototype, 'run').mockResolvedValue()
+    const health = () => send('GET', '/api/health', fromGateway())
+    const tick = () => vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_TICK_MS)
+    await runtime.stopBehaviorsRuntime()
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    vi.setSystemTime(Math.floor(Date.now() / runtime.BEHAVIOR_TICK_MS) * runtime.BEHAVIOR_TICK_MS)
+    try {
+      db.prepare("INSERT INTO organizations(login, managed, status, stage) VALUES ('health-test', 0, 'ready', 'ready')").run()
+      setMeta('behavior_chain_settings', JSON.stringify({ enabled: false, seedMode: 'label', label: 'poise' }))
+      runtime.startBehaviorsRuntime()
+
+      const initial = await health()
+      expect(initial.json.scheduler).toMatchObject({
+        status: 'ok', releaseAdmission: { paused: false, reason: null }, organizationSweeps: [],
+      })
+      await runtime.runEnabledBehaviorsOnce()
+      expect(sweep).toHaveBeenCalledOnce()
+      const before = (await health()).json.scheduler
+      expect(before.organizationSweeps).toEqual([{ organization: 'health-test', lastSweepAt: Date.now(), error: null }])
+
+      expect(await send('POST', '/api/service/drain', fromGateway('admin'))).toMatchObject({ status: 200 })
+      background.markReleaseSwitch(true)
+      await tick()
+      const drained = await health()
+      expect(drained).toMatchObject({ status: initial.status, json: { status: initial.json.status, scheduler: {
+        status: 'ok', releaseAdmission: { paused: true, reason: 'drain' },
+        lastTickAt: new Date().toISOString(), lastTickCompletedAt: new Date().toISOString(),
+        organizationSweeps: before.organizationSweeps,
+      } } })
+      expect(drained.json.scheduler.lastTickAt).not.toBe(before.lastTickAt)
+      expect(sweep).toHaveBeenCalledOnce()
+
+      expect(await send('POST', '/api/service/resume', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: false } })
+      await tick()
+      expect(await health()).toMatchObject({ status: initial.status, json: { scheduler: {
+        releaseAdmission: { paused: true, reason: 'switch_pending' }, organizationSweeps: before.organizationSweeps,
+      } } })
+      expect(sweep).toHaveBeenCalledOnce()
+
+      background.markReleaseSwitch(false)
+      await runtime.runEnabledBehaviorsOnce()
+      expect(sweep).toHaveBeenCalledTimes(2)
+      expect(await health()).toMatchObject({ status: initial.status, json: { scheduler: {
+        releaseAdmission: { paused: false, reason: null },
+        organizationSweeps: [{ organization: 'health-test', lastSweepAt: Date.now(), error: null }],
+      } } })
+    } finally {
+      background.markReleaseSwitch(false)
+      await send('POST', '/api/service/resume', fromGateway('admin'))
+      await runtime.stopBehaviorsRuntime()
+      vi.useRealTimers()
+      sweep.mockRestore()
+      db.prepare("DELETE FROM organizations WHERE login = 'health-test'").run()
+      if (settings === null) db.prepare("DELETE FROM meta WHERE key = 'behavior_chain_settings'").run()
+      else setMeta('behavior_chain_settings', settings)
+      runtime.startBehaviorsRuntime()
+    }
+  })
+
   it('counts a launch admitted before the drain until its handler finishes', async () => {
     ;(await import('../server/db')).setMeta('me', 'octocat')
     await writeFile(join(bin, 'github-interface'), `#!/bin/sh\nprintf '%s' '${JSON.stringify({ action: 'head_sha', repository: 'acme/app', pull_number: 1, head_sha: 'a'.repeat(40), author: 'octocat' })}'\n`)
