@@ -7,6 +7,7 @@ import { scopePrefix, SEVERITIES, type LogEvent } from './contract.js'
 
 import type { LogAccess, LogFilter, Coverage, LogPolicy, LoggingPage } from './query-contract.js'
 import { observedCoverage } from './query-contract.js'
+import { handoffCandidate, type HandoffCandidate } from './query-handoff.js'
 export type { LogAccess, LogFilter, Coverage, LogPolicy } from './query-contract.js'
 export function projectCoverage(value: Coverage, access: LogAccess): Coverage {
   return access.operator || value.workspace === access.workspace ? value : {
@@ -21,7 +22,7 @@ export const MAX_COVERAGE_RECORD_BYTES = 64 * 1024
 const COVERAGE_PAGE_RESERVE_BYTES = 2 * MAX_COVERAGE_SOURCES * MAX_COVERAGE_RECORD_BYTES
 interface EventRow { id: string; sort_time: string; payload: string }
 interface ExpiredRow { id: string; workspace: string | null; visibility: string; expired_at: string }
-interface Cursor { kind: 'page' | 'watermark' | 'delivery'; high: number; time?: string; id?: string; filter: string }
+interface Cursor { kind: 'page' | 'watermark' | 'delivery'; high: number; time?: string; id?: string; filter: string; classification?: string }
 
 export class DiagnosticCursorError extends Error {}
 
@@ -36,13 +37,17 @@ export class DiagnosticConflictError extends Error {
 export class DiagnosticStore {
   private readonly db: Database.Database
   private readonly indexes = new Set<string>()
+  private readonly warnings: Set<string>
   /** Tombstones added since the cap was last held: the cap is read again once a
    *  64th of it has built up, and on the first prune of this store. */
   private tombstonesSinceCap = Number.POSITIVE_INFINITY
-  constructor(readonly path: string, readonly policy: LogPolicy = DEFAULT_LOG_POLICY, readonly now = Date.now, readonly readOnly = false) {
+  constructor(readonly path: string, readonly policy: LogPolicy = DEFAULT_LOG_POLICY, readonly now = Date.now, readonly readOnly = false,
+    private readonly classification?: { high: number; warnings: string[] }) {
     if (!Object.values(policy).every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error('Logging retention and storage limits must be positive integers')
     if (!readOnly && path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.db = new Database(path, { readonly: readOnly, fileMustExist: readOnly })
+    this.warnings = new Set(classification?.warnings)
+    this.db.function('logging_severity', { deterministic: true }, (id, severity) => severity === 'error' && this.warnings.has(String(id)) ? 'warning' : severity)
     try {
       this.db.pragma('busy_timeout = 25')
       if (readOnly) {
@@ -233,13 +238,40 @@ export class DiagnosticStore {
     return this.db.transaction(() => this.querySnapshot(access, filter))()
   }
 
+  handoffs(access: LogAccess, eventId?: string): { high: number; candidates: HandoffCandidate[] } {
+    return this.db.transaction(() => {
+      const high = this.high()
+      const rows = this.db.prepare(`SELECT payload FROM log_events WHERE workspace=? AND visibility='workspace'
+        AND source='caller' AND severity='error' AND component IN ('pr_review','pr_approve') AND seq<=? AND ingested_at>=?
+        ${eventId ? 'AND id=?' : ''}`).iterate(access.workspace, high, new Date(this.now() - this.policy.retentionMs).toISOString(),
+        ...(eventId ? [eventId] : [])) as IterableIterator<{ payload: string }>
+      const candidates: HandoffCandidate[] = []
+      for (const row of rows) {
+        const candidate = handoffCandidate(JSON.parse(row.payload) as LogEvent)
+        if (candidate) candidates.push(candidate)
+      }
+      return { high, candidates }
+    })()
+  }
+
+  private high(): number {
+    return (this.db.prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='log_events'),0) AS high").get() as { high: number }).high
+  }
+
+  private classificationHash(high: number): string {
+    const changed = this.warnings.size ? this.db.prepare('SELECT id FROM log_events WHERE seq<=? AND logging_severity(id,severity)<>severity ORDER BY id')
+      .all(high) as Array<{ id: string }> : []
+    return changed.length ? createHash('sha256').update(JSON.stringify(changed)).digest('hex') : ''
+  }
+
   private querySnapshot(access: LogAccess, filter: LogFilter): LoggingPage {
     const levels = filter.severities ?? [...SEVERITIES]
     if (!Array.isArray(levels) || !levels.every((level) => SEVERITIES.includes(level))) throw new Error('Select only Critical, Error and Warning')
     const limit = filter.limit ?? 50
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('Logging page size must be between 1 and 100')
     if (filter.workspace && !access.operator && filter.workspace !== access.workspace) throw new Error('Logging workspace scope is forbidden')
-    const clauses = ['ingested_at >= ?', levels.length ? `severity IN (${levels.map(() => '?').join(',')})` : '0']
+    const severity = this.warnings.size ? 'logging_severity(id,severity)' : 'severity'
+    const clauses = ['ingested_at >= ?', levels.length ? `${severity} IN (${levels.map(() => '?').join(',')})` : '0']
     const values: Array<string | number | null> = [new Date(this.now() - this.policy.retentionMs).toISOString(), ...levels]
     clauses.push(access.operator ? "(visibility IN ('operator','infrastructure') OR (workspace=? AND visibility='workspace'))"
       : "workspace=? AND visibility IN ('workspace','infrastructure')")
@@ -264,12 +296,17 @@ export class DiagnosticStore {
       if (filter.search.length > 256) throw new Error('Logging search exceeds 256 characters')
       clauses.push("search LIKE ? ESCAPE '\\'"); values.push('%' + filter.search.toLowerCase().replace(/[\\%_]/g, '\\$&') + '%')
     }
-    const filterHash = createHash('sha256').update(JSON.stringify([access, clauses, values.slice(1)])).digest('hex')
+    const filterHash = createHash('sha256').update(JSON.stringify([access,
+      clauses.map(clause => clause.replace('logging_severity(id,severity)', 'severity')), values.slice(1)])).digest('hex')
     const after = filter.after ? this.openToken(filter.after, 'watermark', filterHash) : null
     if (after) { clauses.push('seq>?'); values.push(after.high) }
     const fingerprint = createHash('sha256').update(JSON.stringify([filterHash, after?.high ?? null])).digest('hex')
     const cursor = filter.cursor ? this.openToken(filter.cursor, 'page', fingerprint) : null
-    const high = cursor?.high ?? (this.db.prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='log_events'),0) AS high").get() as { high: number }).high
+    const high = cursor?.high ?? this.classification?.high ?? this.high()
+    for (const token of [cursor, after]) if (token && (token.classification ?? '') !== this.classificationHash(token.high)) {
+      throw new DiagnosticCursorError('Logging severity evidence changed. Refresh to start a new snapshot.')
+    }
+    const snapshot = this.classificationHash(high)
     clauses.push('seq<=?'); values.push(high)
     const where = clauses.join(' AND ')
     const broad = !filter.from && !filter.to && Object.keys(columns).every((key) => key === 'workspace' || filter[key as keyof typeof columns] === undefined)
@@ -297,12 +334,12 @@ export class DiagnosticStore {
         occurrences = (countIncident.get(event.incidentId, retentionAfter) as { count: number }).count
         occurrenceCounts.set(event.incidentId, occurrences)
       }
-      return { ...event, occurrences }
+      return { ...event, severity: event.severity === 'error' && this.warnings.has(event.id) ? 'warning' as const : event.severity, occurrences }
     })
     const last = page.at(-1)
     return { version: 1, events, total, countKind: 'events', nextCursor: positions.length > limit && last
-      ? this.sealToken({ kind: 'page', high, time: last.sort_time, id: last.id, filter: fingerprint }) : null,
-    watermark: this.sealToken({ kind: 'watermark', high, filter: filterHash }),
+      ? this.sealToken({ kind: 'page', high, time: last.sort_time, id: last.id, filter: fingerprint, classification: snapshot }) : null,
+    watermark: this.sealToken({ kind: 'watermark', high, filter: filterHash, classification: snapshot }),
     coverage: this.readCoverage(access), bounds: this.bounds(access), policy: this.policy }
   }
 
@@ -402,7 +439,8 @@ export class DiagnosticStore {
     if (row) {
       const event = JSON.parse(row.payload) as LogEvent
       const age = this.now() - Date.parse(event.ingestedAt)
-      return age <= this.policy.retentionMs ? { status: 'found', event } : { status: age <= this.policy.retentionMs * 2 ? 'expired' : 'unavailable' }
+      return age <= this.policy.retentionMs ? { status: 'found', event: { ...event,
+        severity: event.severity === 'error' && this.warnings.has(event.id) ? 'warning' : event.severity } } : { status: age <= this.policy.retentionMs * 2 ? 'expired' : 'unavailable' }
     }
     const cutoff = new Date(this.now() - this.policy.retentionMs).toISOString()
     const expired = (access.operator

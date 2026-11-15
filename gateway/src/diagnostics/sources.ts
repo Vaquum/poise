@@ -64,7 +64,12 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
     timeoutMs: number(context.timeout_seconds) === null ? null : Number(context.timeout_seconds) * 1000,
     errno: number(context.errno) ?? text(context.errno), resources: object(diagnostic?.filesystem) ?? {},
     context: { model: text(row.model), errorCode: text(row.error_code), outcome: text(row.outcome), action: text(row.action),
-      ...(handoff ? { submission: 'none' } : approvalWait ? { submission: 'blocked' } : {}),
+      ...(handoff && (context.call_id == null || context.call_id === row.id)
+        && (context.correlation_id == null || context.correlation_id === row.correlation_id)
+        && (context.expected_head == null || context.expected_head === row.expected_head)
+        && (row.action == null || row.action === 'not_started')
+        && (row.outcome == null || row.outcome === 'preflight_failed') ? { submission: 'none' }
+        : approvalWait ? { submission: 'blocked' } : {}),
       expectedHead: text(row.expected_head), observedHead: text(row.head_sha), executable: text(context.executable),
       resolvedExecutable: text(context.resolved_executable), cwd: text(context.cwd), elapsedMs: number(context.elapsed_ms),
       startedAt: text(row.started_at_precise) ?? text(row.started_at), source: text(row.source),

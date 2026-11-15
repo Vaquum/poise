@@ -6,6 +6,7 @@ import { decideBehaviorChain } from '../server/behavior-chain-decision'
 import { normalize } from '../gateway/src/diagnostics/contract'
 import { DiagnosticStore } from '../gateway/src/diagnostics/store'
 import { loggingWorkFixture } from './fixtures/logging-work-impact'
+import { reviewHandoffFixture } from './fixtures/logging-review-handoff'
 import { parseProcessDiagnostic } from '../server/process-diagnostic'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { loggingSeverity } from '../src/logging'
@@ -203,6 +204,33 @@ it('keeps a current backoff retry time when progress advances past its wait note
   expect(behaviorChainWorkImpact(journal, call, correlation)).toMatchObject({ impact: 'recovered', recovered: true,
     callerBehavior: 'repair_pr', retryAt: at + 63_000,
     nextAction: 'Automatic retry eligible after backoff, subject to existing admission gates' })
+})
+
+it.each(['review-pr', 'approve-pr'] as const)('keeps a verified %s handoff recovered after the PR head moves on', behavior => {
+  const journal = new BehaviorChainJournal(db)
+  const fixture = reviewHandoffFixture(journal, behavior)
+  const { append, successor, observation, at: started, candidate } = fixture
+  append({ type: 'invocation.admitted', invocation: successor }, started + 6000)
+  const callId = successor.id.slice(0, 31) + 'f'
+  const response = { repository: 'acme/repo', pull_number: observation.pull!.number, head_sha: observation.pull!.head,
+    context_sha: observation.pull!.reviewContext, invocation_id: callId, reviewer: successor.actor,
+    model: successor.model, completed_at: started + 8000, coverage: 'complete',
+    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+      reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
+  const action = behavior === 'approve-pr' ? 'approved' : 'reviewed_clean'
+  append({ type: 'invocation.settled', invocationId: successor.id, callId, outcome: action,
+    evidence: { status: 'completed', action, head_sha: response.head_sha, review_id: 91,
+      artifact: { review_response: response }, completedAt: started + 8000 } }, started + 8000)
+  const receipts = [{ id: 91, head: response.head_sha,
+    invocation: callId, state: behavior === 'approve-pr' ? 'APPROVED' : 'COMMENTED', response, submittedAt: started + 8000 }]
+  append({ type: 'chain.observed', observation: { ...observation, checkedAt: started + 9000,
+    pull: { ...observation.pull!, reviewIds: [91], reviewReceipts: receipts } } }, started + 9000)
+  expect(behaviorChainWorkImpact(journal, candidate.callId, candidate.correlationId)).toMatchObject({ impact: 'recovered', recovered: true })
+  // The PR moves on: new head, new review context. The historical recovery stands.
+  append({ type: 'chain.observed', observation: { ...observation, checkedAt: started + 12000,
+    pull: { ...observation.pull!, head: 'c'.repeat(40), reviewContext: 'd'.repeat(64),
+      reviewIds: [91], reviewReceipts: receipts } } }, started + 12000)
+  expect(behaviorChainWorkImpact(journal, candidate.callId, candidate.correlationId)).toMatchObject({ impact: 'recovered', recovered: true })
 })
 
 function handoffFixture() {

@@ -275,6 +275,52 @@ function foldProgress(fold: ProgressFold, rows: Iterable<ProgressRow>, id: strin
   Object.assign(fold, { last, chain, at, sequence, previous, failureSequence, waitingSequence, waitingHead })
 }
 
+/** Native review admissions pin the head in argv, not request.context. */
+export function reviewAdmissionHead(invocation: ChainInvocation): string | null {
+  const argv = invocation.request.argv
+  if (argv.filter(arg => arg === '--expected-head').length !== 1) return null
+  const head = argv[argv.indexOf('--expected-head') + 1]
+  if (!head || !/^[a-f0-9]{40}$/i.test(head) || invocation.request.context?.head && invocation.request.context.head !== head
+    || invocation.evidence?.expected_head != null && invocation.evidence.expected_head !== head
+    || invocation.evidence?.head_sha != null && invocation.evidence.head_sha !== head) return null
+  return head
+}
+
+export function reviewHandoffSuccessor(chain: BehaviorChain, invocation: ChainInvocation) {
+  const diagnostic = invocation.evidence?.diagnostic as ProcessDiagnostic | null | undefined
+  const head = reviewAdmissionHead(invocation)
+  const completedAt = invocation.evidence?.completedAt
+  const command = invocation.behavior === 'review-pr' ? '--pr-review' : '--pr-approve'
+  if (!['review-pr', 'approve-pr'].includes(invocation.behavior) || invocation.request.command !== 'agent-interface'
+    || invocation.request.argv[0] !== command || !invocation.request.argv[1] || !head
+    || invocation.state !== 'settled' || invocation.evidence?.status !== 'failed'
+    || invocation.evidence.error_code !== 'review_budget_exhausted' || invocation.evidence.review_id != null
+    || invocation.evidence.head_sha != null || invocation.evidence.review_comments != null || invocation.evidence.receipts != null
+    || invocation.evidence.action != null && invocation.evidence.action !== 'not_started'
+    || invocation.evidence.outcome != null && invocation.evidence.outcome !== 'preflight_failed'
+    || diagnostic?.version !== 1 || diagnostic.source !== 'caller' || diagnostic.operation !== 'provider.review'
+    || diagnostic.phase !== 'analysis' || diagnostic.outcome !== 'handoff' || diagnostic.context.submission !== 'none'
+    || diagnostic.context.call_id !== invocation.callId || diagnostic.context.correlation_id !== invocation.id
+    || diagnostic.context.expected_head !== head || typeof completedAt !== 'number' || !Number.isFinite(completedAt)) return undefined
+  // The reducer admits another invocation only after the original settles.
+  return chain.invocations.filter(item => item.admissionSequence > invocation.admissionSequence && item.admittedAt >= completedAt
+    && item.behavior === invocation.behavior && item.basis === invocation.basis && item.slot === invocation.slot
+    && item.actor === invocation.actor && item.request.command === invocation.request.command
+    && item.request.argv[0] === command && item.request.argv[1] === invocation.request.argv[1]
+    && reviewAdmissionHead(item) === head).at(-1)
+}
+
+// A settled successor's verdict is verified against the head and context it
+// reviewed, not the latest observation: later pushes must not reclassify a
+// recovered historical handoff. Receipt, basis and time checks stay.
+export function scopedSuccessorObservation(successor: ChainInvocation, observation: ChainObservation | null): ChainObservation | null {
+  if (!observation?.pull) return null
+  const retained = (successor.evidence?.artifact as Record<string, unknown> | null)?.review_response as {
+    head_sha?: unknown, context_sha?: unknown } | null
+  if (typeof retained?.head_sha !== 'string' || typeof retained?.context_sha !== 'string') return null
+  return { ...observation, pull: { ...observation.pull, head: retained.head_sha, reviewContext: retained.context_sha } }
+}
+
 /** PR review/approval heads travel as `--expected-head` argv; other behaviors
  * carry them in request context. */
 function invocationHead(invocation: ChainInvocation): string | null {
@@ -333,8 +379,10 @@ function invocationWorkImpact(journal: BehaviorChainJournal, match: ReturnType<B
         && invocationHead(item) === head && item.request.argv[1] === invocation.request.argv[1]).at(-1)
     }
     const observation = chain.observation as ChainObservation | null
+    const scoped = successor && successor.state === 'settled' && successor.evidence?.status === 'completed'
+      ? scopedSuccessorObservation(successor, observation) : null
     recovered = !!successor && successor.state === 'settled' && successor.evidence?.status === 'completed'
-      && !!observation && !!chainReviewResponse(chain, successor, observation, observation.checkedAt)
+      && !!scoped && !!chainReviewResponse(chain, successor, scoped, observation!.checkedAt)
   }
   let retryAt: number | null = null
   // A backoff outlives observation-only progress past its wait note (CI

@@ -122,7 +122,9 @@ failed recovery, a current hold, uncertain publication or unavailable evidence
 keeps Error. The active blocker and next action remain visible. The retained
 source event stays Error: severity filters, counts and exports continue to use
 that immutable source severity. Refresh replaces the displayed work assessment;
-historical rows without typed no-submission proof remain unproven.
+historical rows without typed no-submission proof remain unproven. A confirmed
+historical handoff stays recovered after the PR head moves on: the successor
+verdict is verified against the head and context it reviewed.
 For a verified merge with a pending native review obligation, the next action is
 to reconcile original pre-merge review evidence, including when a durable hold
 is retained. Resume cannot start a new review after merge.

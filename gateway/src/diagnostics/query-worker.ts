@@ -108,8 +108,9 @@ function exportEvents(db: DiagnosticStore, request: LoggingRead): LoggingReply {
 
 export function executeLoggingRead(request: LoggingRead): LoggingReply {
   if (request.operation === 'health') return health(request)
-  const db = new DiagnosticStore(request.path, request.policy, () => request.now, true)
+  const db = new DiagnosticStore(request.path, request.policy, () => request.now, true, request.classification)
   try {
+    if (request.operation === 'handoffs') return json(200, db.handoffs(request.access, request.eventId))
     if (request.operation === 'evidence') return json(200, joinEvidence(db, request.access, request.selectors ?? []))
     if (request.operation === 'event') {
       const found = db.lookup(request.access, request.eventId!)
