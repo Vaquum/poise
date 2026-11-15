@@ -5,7 +5,7 @@ import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
 import type { DetachedProcessExit, DetachedSpawnOptions } from '../server/process'
 import { CheckSemaphore } from '../server/check-semaphore'
 import checkoutSuperseded from './fixtures/review-checkout-superseded.json'
-import { agentLog, arrangeCli, fixture, HEAD_SHA, NEXT_HEAD_SHA, launchApprovalBeforeCrash, launchReviewBeforeCrash, loadModules, mocks, pr, resetLogCache, restartModules } from './behaviors-runtime-fixture'
+import { agentLog, arrangeCli, fixture, HEAD_SHA, NEXT_HEAD_SHA, launchApprovalBeforeCrash, launchReviewBeforeCrash, loadModules, mocks, pr, recordCompletedInitialReview, resetLogCache, restartModules } from './behaviors-runtime-fixture'
 
 async function reviewWorker(behavior: 'review-new-prs' | 'approve-prs' = 'review-new-prs') {
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
@@ -47,10 +47,12 @@ async function reviewWorker(behavior: 'review-new-prs' | 'approve-prs' = 'review
 }
 
 describe('managed legacy review continuation', () => {
-  it.each(['review-new-prs', 'approve-prs'] as const)('keeps %s capacity across exit and restart, then honors the ordinary waiter', async behavior => {
+  it.each([
+    ['review-new-prs', 'gpt-6-astra-ultra'], ['approve-prs', 'gpt-6-astra-ultra'],
+    ['review-new-prs', 'opus-5-xhigh'], ['approve-prs', 'opus-5-xhigh'],
+  ] as const)('keeps %s (%s) capacity across exit and restart, then honors the ordinary waiter', async (behavior, model) => {
     vi.stubEnv('POISE_NATIVE_CONTROL', 'fixture')
     try {
-      const model = 'gpt-6-astra-ultra'
       arrangeCli(behavior === 'approve-prs')
       mocks.spawnDetached.mockResolvedValue(undefined)
       let { database, behaviors } = await loadModules()
@@ -58,10 +60,16 @@ describe('managed legacy review continuation', () => {
       database.setMeta('models', JSON.stringify({ slots: { primary: model }, places: { pr_review: { slot: 'primary' }, pr_approve: { slot: 'primary' } } }))
       database.setMeta(`behavior_${behavior.replace(/-/g, '_')}_enabled`, '1')
       database.setMeta('behavior_review_new_prs_keyver', '3')
+      if (behavior === 'approve-prs') {
+        behaviors.setReviewCap(2)
+        recordCompletedInitialReview(database, { outcome: 'changes_requested', headSha: 'b'.repeat(40) })
+      }
       database.recordSeen('review-new-prs', '__snapshot_v3__')
       behaviors.setBehaviorCheckSlots(new CheckSemaphore(() => 1))
       await behaviors.runEnabledBehaviorsOnce()
       expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+      expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--model', model, '--review-units-per-call', '6']))
+      if (behavior === 'approve-prs') expect(mocks.spawnDetached.mock.calls[0][1]).toContain('--review-cap-reached')
       const first = database.listBehaviorLaunchClaims(behavior)[0]
       const link = { root_call: 'a'.repeat(32), generation: 13, basis: '7'.repeat(64), slot: first.launchReviewSlot }
       expect(first.launchReviewSlot).toBeTruthy()

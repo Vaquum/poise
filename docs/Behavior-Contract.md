@@ -199,12 +199,14 @@ failure rules are in [Caller PR review models](../caller/agent_interface/README.
 
 ### Resumable structured reviews
 
-Poise dispatches large structured PR reviews and uncapped approvals in Calls
+Poise dispatches large PR reviews and approvals in Calls
 that complete up to six source or integration units. A complete packet within
 one ordinary file group uses the existing single-pass review. Continuation
 requires a workspace whose Caller advertises `reviewContinuation: 1` through
-its native cleanup capability. Claude and capped approval rounds retain their
-existing path.
+its native cleanup capability. Configured Claude reviewers use this same contract,
+including capped approval rounds. Partial analysis has governed read access only;
+Caller applies the cap after all findings, including late breaking findings, are
+retained. Ordinary small Claude reviews keep their governed path and recovery.
 
 Each Call keeps its actor, behavior, slot, exact head and original launch
 correlation. A checkpoint releases its admission only after Caller verifies

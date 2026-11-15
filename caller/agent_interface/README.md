@@ -706,14 +706,19 @@ the completion result, so a near-miss is visible before it fails.
 
 ### Explicit review continuation
 
-Managed structured PR reviews and uncapped approvals accept `--review-slot SLOT`
+Managed PR reviews and approvals accept `--review-slot SLOT`
 to opt into durable analysis. Resume with the same review arguments, a new
 `--correlation-id`, and
 `--resume-review ROOT_CALL_ID:GENERATION` from the returned `continuation` object.
 Poise adds `--review-units-per-call 6` for automatic admission. This keeps a
 complete ordinary-sized packet on the single-pass path and yields a checkpoint
-after six completed units on a larger obligation. Claude and capped rounds
-retain their existing path. Managed legacy review Calls preserve their original
+after six completed units on a larger obligation. Claude uses the same units,
+inspection checkpoints and final integration pass with its configured identity.
+Bounded Claude analysis permits only governed read commands; terminal reviews
+and capped follow-up issues are controller-owned after complete coverage. An
+output/context limit yields the saved checkpoint without switching providers.
+Small Claude reviews retain their ordinary governed tools and recovery behavior.
+Managed legacy review Calls preserve their original
 source and use the same native release proof as chain Calls.
 
 Caller binds progress to the repository, PR, exact head, base and merge base,
