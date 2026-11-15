@@ -933,11 +933,13 @@ export async function implementationReportAdmission(db: Database, journal: Behav
       // A stripped or mutated marker defeats exact reconciliation. If any
       // unconfirmed pre-PR intent could have filed this issue, bind the
       // earliest and require its disposition instead of ordinary intake.
-      // Generated reports anchor their source hold in the body and are
-      // authored by the orphan's own source owner at creation; the
-      // invocation and Call IDs are published and therefore quotable, so
-      // they cannot anchor the match. An ordinary post-hold issue lacks
-      // the source anchor and must not consume the intent. Unknown
+      // Generated reports carry their source, hold sequence and unguessable
+      // basis in the body and are authored by the orphan's own source owner
+      // at creation; the invocation and Call IDs are published and therefore
+      // quotable, so they cannot anchor the match. The source/hold anchor
+      // alone is both copyable and fragile, so binding requires the basis
+      // alongside tolerant source and hold signals. An ordinary post-hold
+      // issue lacks the basis and must not consume the intent. Unknown
       // authorship fails closed. Never bind an orphan to its own source.
       const orphans = unconfirmedImplementationReports(db, chain.repository)
         .filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
@@ -955,10 +957,9 @@ export async function implementationReportAdmission(db: Database, journal: Behav
                 const owner = journal.read(candidate.source)?.author
                 if (typeof owner === 'string' && owner.toLowerCase() !== author) return false
               }
-              const anchored = candidate.holdSequence === null
-                ? body.includes(`Source: ${candidate.source};`)
-                : body.includes(`Source: ${candidate.source}; hold event ${candidate.holdSequence};`)
-              if (!anchored) return false
+              if (!body.includes(candidate.source) || !body.includes(candidate.basis)) return false
+              if (candidate.holdSequence !== null
+                && !new RegExp(`\\b${candidate.holdSequence}\\b`).test(body)) return false
               return !predatesHold(probe.created_at, candidate.heldAt)
             })
             if (match) {
