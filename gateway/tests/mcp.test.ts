@@ -2,12 +2,12 @@ import { createHash } from 'node:crypto'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { McpGrants } from '../src/mcp-grants.js'
-import { MCP_TOOLS } from '../src/mcp-contract.js'
+import { MCP_TOOLS, MCP_WORK_TOOL_NAMES } from '../src/mcp-contract.js'
 import { workspaceInventory } from '../src/mcp-inventory.js'
 import { loadConfig } from '../src/config.js'
 import { APEX, startHarness, type Harness } from './harness.js'
 
-const workTools = MCP_TOOLS.filter(tool => tool.name !== 'poise_get')
+const workTools = MCP_TOOLS.filter(tool => MCP_WORK_TOOL_NAMES.some(name => name === tool.name))
 let h: Harness
 beforeEach(async () => { h = await startHarness({ env: { POISE_MCP_ENABLED: '1' } }) })
 afterEach(async () => { await h.close() })

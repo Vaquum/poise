@@ -628,6 +628,59 @@ process.exit(1)
 })
 
 describe('maintenance schedule', () => {
+  it('retains one release reservation through a shared pass and its report write', async () => {
+    const { releaseBackgroundBusy } = await import('../server/release-background')
+    let startTrim!: () => void
+    const trimming = new Promise<void>(resolve => { startTrim = resolve })
+    let finishTrim!: () => void
+    const held = new Promise<void>(resolve => { finishTrim = resolve })
+    const run = maintenance.runStorageMaintenanceOnce({ chatRoot, stateRoot, home, trim: async () => {
+      startTrim()
+      await held
+      return 123
+    } })
+    try {
+      await trimming
+      expect(maintenance.runStorageMaintenanceOnce()).toBe(run)
+      expect(releaseBackgroundBusy()).toBe(1)
+      expect(maintenance.lastMaintenanceRun()).toBeNull()
+    } finally {
+      finishTrim()
+      await run
+    }
+    expect(maintenance.lastMaintenanceRun()).toEqual(await run)
+    expect(releaseBackgroundBusy()).toBe(0)
+  })
+
+  it('defers a scheduled full pass during a pending switch and runs it after restart', async () => {
+    const background = await import('../server/release-background')
+    const report = await maintenance.runStorageMaintenance({ dryRun: true, chatRoot, stateRoot, home })
+    // Put pressure maintenance in cooldown regardless of the host's free space.
+    await maintenance.checkWorkspacePressure(home, async () => ({ blocks: 100, bsize: 1024, bavail: 1 }), async () => report)
+    const processes = await import('../server/process')
+    const runFile = processes.runFile
+    vi.spyOn(processes, 'runFile').mockImplementation((command, args, options) => command === 'fstrim'
+      ? Promise.resolve({ stdout: '', stderr: '' }) : runFile(command, args, options))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    try {
+      background.markReleaseSwitch(true)
+      maintenance.startStorageMaintenanceRuntime()
+      await vi.advanceTimersByTimeAsync(maintenance.MAINTENANCE_START_DELAY_MS)
+      await maintenance.stopStorageMaintenanceRuntime()
+      expect(maintenance.lastMaintenanceRun()).toBeNull()
+
+      background.markReleaseSwitch(false)
+      maintenance.startStorageMaintenanceRuntime()
+      await vi.advanceTimersByTimeAsync(maintenance.MAINTENANCE_START_DELAY_MS)
+      await maintenance.stopStorageMaintenanceRuntime()
+      expect(maintenance.lastMaintenanceRun()).toMatchObject({ pressureRun: false })
+    } finally {
+      background.markReleaseSwitch(false)
+      await maintenance.stopStorageMaintenanceRuntime()
+      vi.useRealTimers()
+    }
+  })
+
   it('starts the first pass 6 hours after the last finished run, never within minutes of a start', () => {
     const now = Date.parse('2026-11-13T02:00:00Z')
     const at = (hoursAgo: number) => ({ finishedAt: new Date(now - hoursAgo * 3_600_000).toISOString() })

@@ -100,8 +100,10 @@ export const DRAIN_TURN_STOPPED =
   `Poise stopped this turn after it held an update for ${DRAIN_TURN_DEADLINE_MS / 60_000} minutes; ` +
   'the agent keeps its context, so send a new prompt to continue.'
 
-// Browser routes that start a Caller call or the model check.
-const LAUNCH_ROUTES = new Set(['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/models/refresh'])
+// Browser routes that start work which must settle before a release.
+const LAUNCH_ROUTES = new Set([
+  '/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/models/refresh', '/api/storage/maintenance',
+])
 
 export interface DrainTimer {
   setTimeout(callback: () => void, delayMs: number): unknown
