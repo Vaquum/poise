@@ -875,12 +875,14 @@ describe('Poise in service mode', () => {
     const records = process.env.AGENT_INTERFACE_DATA_DIR!
     await mkdir(records, { recursive: true })
     const receipts = new Database(join(records, 'calls.sqlite3'))
-    receipts.exec('CREATE TABLE calls (id TEXT, status TEXT, pid INTEGER, runner TEXT, source TEXT, resources_settled_at REAL, resource_cleanup TEXT, artifact TEXT)')
+    receipts.exec(`CREATE TABLE calls (id TEXT, status TEXT, pid INTEGER, runner TEXT, source TEXT,
+      resources_settled_at REAL, resource_cleanup TEXT, artifact TEXT, correlation_id TEXT, resource_ownership TEXT)`)
     const originalArtifact = JSON.stringify({ outcome: 'completed', head_sha: 'b'.repeat(40) })
-    receipts.prepare('INSERT INTO calls VALUES (?, ?, NULL, NULL, ?, NULL, ?, ?)')
+    receipts.prepare('INSERT INTO calls VALUES (?, ?, NULL, NULL, ?, NULL, ?, ?, NULL, NULL)')
       .run('a'.repeat(32), 'completed', 'poise:behavior-chain', JSON.stringify({ token: 'original-claim' }), originalArtifact)
     const heldReceipt = { id: 'a'.repeat(32), status: 'completed', pid: null, runner: null, source: 'poise:behavior-chain',
-      resources_settled_at: null, resource_cleanup: JSON.stringify({ token: 'original-claim' }), artifact: originalArtifact }
+      resources_settled_at: null, resource_cleanup: JSON.stringify({ token: 'original-claim' }), artifact: originalArtifact,
+      correlation_id: null, resource_ownership: null }
     const resource = join(records, 'native-resources', 'a'.repeat(32))
     await mkdir(resource, { recursive: true })
     await writeFile(join(resource, 'owned'), 'original cleanup work')
@@ -899,8 +901,8 @@ describe('Poise in service mode', () => {
     const service = new ServiceControl(getChatRuntime(), { releasesDir: releases, release: { name: 'old', base: 'same-base' },
       drainTimeoutSeconds: 1800, canRestart: () => true, restart: () => { shutdown(75); return true } })
     try {
-      service.drain()
       try {
+        expect(service.drain()).toMatchObject({ draining: true, unsettledNativeCalls: 1, idle: false })
         maintenance.startStorageMaintenanceRuntime()
         await vi.waitFor(() => expect(existsSync(join(root, 'cleanup-started'))).toBe(true))
       } finally { service.resume() }
