@@ -136,7 +136,7 @@ export async function reconcileRepairReport(repository: string, marker: string, 
       applied = labels(await request(['api', `repos/${repository}/issues/${issue.number}/labels`, '--method', 'POST', '-f', 'labels[]=poise']))
     }
     return { number: Number(issue.number), url: String(issue.html_url), state: String(issue.state), labels: applied,
-      title: issue.title, body: issue.body, created_at: issue.created_at, author: author.login }
+      title: issue.title, body: issue.body, created_at: issue.created_at, updated_at: issue.updated_at, author: author.login }
   } catch (error) {
     const failure = error as { stderr?: unknown, message?: string }
     const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)
@@ -163,14 +163,18 @@ export async function listOwnerIssuesSince(repository: string, creator: string, 
     if (!Array.isArray(items)) throw new Error('Repair report owner listing is invalid')
     if (items.length >= 100) throw new Error('Repair report owner listing is incomplete')
     return items.filter(item => !!item && typeof item === 'object' && !Array.isArray(item) && !('pull_request' in item))
+      // A missing body cannot match orphan signals, so unrelated null-body
+      // issues are skipped rather than aborting the listing.
+      .filter(item => typeof (item as Record<string, unknown>).body === 'string')
       .map(item => {
         const row = item as Record<string, unknown>
         const user = row.user as Record<string, unknown> | undefined
         if (!Number.isSafeInteger(row.number) || Number(row.number) < 1 || typeof user?.login !== 'string'
-          || typeof row.created_at !== 'string' || typeof row.body !== 'string') {
+          || typeof row.created_at !== 'string' || typeof row.updated_at !== 'string' || typeof row.body !== 'string') {
           throw new Error('Repair report owner listing is invalid')
         }
-        return { number: Number(row.number), author: user.login as string, created_at: row.created_at as string, body: row.body as string }
+        return { number: Number(row.number), author: user.login as string, created_at: row.created_at as string,
+          updated_at: row.updated_at as string, body: row.body as string }
       })
   } catch (error) {
     const failure = error as { stderr?: unknown, message?: string }

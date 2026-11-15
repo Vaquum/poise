@@ -938,9 +938,15 @@ export async function implementationReportAdmission(db: Database, journal: Behav
       // a rewrite removes them, including the failing file and test case.
       // The reporter files the genuine report right after its hold through
       // the orphan's own source-owner account, so a match binds only when no
-      // earlier owner-authored post-hold issue matches the same orphan: a
-      // quoter necessarily postdates the publication it copies. Unknown
-      // authorship fails closed. Never bind an orphan to its own source.
+      // earlier owner-authored post-hold issue matches the same orphan. A
+      // quoter created after the publication is excluded by creation order;
+      // an ordinary issue created before it can still quote through a later
+      // edit, so edit times break that tie: a rival created before the
+      // probed issue but edited after its creation may quote it and is
+      // ignored, while a probed issue created before a matching rival but
+      // edited after that rival's creation may quote the rival and is not
+      // bound. Unknown authorship or timestamps fail closed. Never bind an
+      // orphan to its own source.
       const orphans = unconfirmedImplementationReports(db, chain.repository)
         .filter(candidate => candidate.pull === null && candidate.adopted !== true && candidate.source !== chain.id)
         .sort((a, b) => (a.heldAt ?? -1) - (b.heldAt ?? -1) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0)
@@ -953,6 +959,8 @@ export async function implementationReportAdmission(db: Database, journal: Behav
             const author = typeof (probe as { author?: unknown }).author === 'string'
               ? ((probe as { author: string }).author.toLowerCase()) : null
             const created = typeof probe.created_at === 'string' ? Date.parse(probe.created_at) : NaN
+            const updated = typeof (probe as { updated_at?: unknown }).updated_at === 'string'
+              ? Date.parse((probe as { updated_at: string }).updated_at) : NaN
             const bodyMatches = (candidate: RepairReport, text: string) =>
               text.includes(candidate.source)
               && (candidate.holdSequence === null || new RegExp(`\\b${candidate.holdSequence}\\b`).test(text))
@@ -978,13 +986,20 @@ export async function implementationReportAdmission(db: Database, journal: Behav
                 break
               }
               if (!Number.isFinite(created)) return { reason: `${implWait}: verification unavailable: probed issue creation time is unavailable` }
+              if (!Number.isFinite(updated)) return { reason: `${implWait}: verification unavailable: probed issue update time is unavailable` }
               const rivals = await listOwnerIssuesSince(chain.repository, creator, new Date(candidate.heldAt - 60_000).toISOString())
-              const earlier = rivals.some(rival => rival.number !== chain.issue
-                && rival.author.toLowerCase() === creator.toLowerCase()
+              const rivalCreated = (rival: { created_at: string }) => Date.parse(rival.created_at)
+              const rivalUpdated = (rival: { updated_at: string }) => Date.parse(rival.updated_at)
+              const rivalMatches = (rival: { number: number, author: string, created_at: string, body: string }) =>
+                rival.number !== chain.issue && rival.author.toLowerCase() === creator.toLowerCase()
                 && bodyMatches(candidate, rival.body) && !predatesHold(rival.created_at, candidate.heldAt)
-                && (Date.parse(rival.created_at) < created
-                  || (Date.parse(rival.created_at) === created && rival.number < chain.issue)))
-              if (!earlier) {
+              const earlier = rivals.some(rival => rivalMatches(rival)
+                && !(rivalCreated(rival) < created && rivalUpdated(rival) > created)
+                && (rivalCreated(rival) < created
+                  || (rivalCreated(rival) === created && rival.number < chain.issue)))
+              const quotes = rivals.some(rival => rivalMatches(rival)
+                && created < rivalCreated(rival) && updated > rivalCreated(rival))
+              if (!earlier && !quotes) {
                 candidate.issueNumber = chain.issue
                 db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(candidate), PREFIX + candidate.key)
                 report = candidate
@@ -1840,7 +1855,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(author.toLowerCase())
           && !REPORT_MARKER.test(body) && body.includes(failure.file) && body.includes(failure.test)
           && !body.includes(implementation!.invocation.id) && !body.includes(implementation!.call)
-        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string, created_at: unknown, author: string }> = []
+        const candidates: Array<{ number: number, url: string, state: string, labels: string[], title: unknown, body: string, created_at: unknown, updated_at: unknown, author: string }> = []
         for (const entry of blockedBy) {
           const number = Number((entry as { number: number }).number)
           try {
