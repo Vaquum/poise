@@ -147,6 +147,11 @@ export function nativeResourcesPending(invocation: Record<string, unknown>): boo
   // has no Call to reconcile; readability alone clears this hold.
   if (invocation.state === 'settled' && invocation.outcome === 'receipt_unavailable'
     && evidence.action === 'not_started' && !evidence.nativeCallId && !evidence.resource_ownership) return false
+  // The journal accepts this settlement only from the admitted, unstarted
+  // state. No physical Call was created, so only the reservation needs release.
+  if (invocation.state === 'settled' && invocation.behavior === 'refresh-pr-ci' && invocation.outcome === 'launch_deferred'
+    && invocation.callId === null && evidence.status === 'deferred' && evidence.action === 'not_started'
+    && evidence.outcome === 'launch_deferred' && !evidence.nativeCallId && !evidence.resource_ownership) return false
   const request = object(invocation.request) ? invocation.request : {}
   if (invocation.model === null && request.nativeResources !== 2 && !evidence.nativeCallId && !evidence.resource_ownership) return false
   if (request.nativeResources === 2 || evidence.nativeCallId || object(evidence.resource_ownership) && evidence.resource_ownership.version === 2) {

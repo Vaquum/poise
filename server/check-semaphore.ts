@@ -77,11 +77,15 @@ export class CheckSemaphore {
     return background - (background >= 2 ? BEHAVIOR_RESERVE : 0)
   }
 
+  private remaining(lane: CheckLane, cap: number): number {
+    let slots = cap - this.holdings
+    if (lane !== 'person') slots = Math.min(slots, this.backgroundLimit(cap) - this.backgroundHoldings - this.behaviorHoldings)
+    if (lane === 'background') slots = Math.min(slots, this.chatTurnLimit(cap) - this.backgroundHoldings)
+    return Math.max(0, slots)
+  }
+
   private fits(lane: CheckLane, cap: number): boolean {
-    if (this.holdings >= cap) return false
-    if (lane === 'person') return true
-    if (this.backgroundHoldings + this.behaviorHoldings >= this.backgroundLimit(cap)) return false
-    return lane === 'behavior' || this.backgroundHoldings < this.chatTurnLimit(cap)
+    return this.remaining(lane, cap) > 0
   }
 
   private take(lane: CheckLane): () => void {
@@ -118,8 +122,12 @@ export class CheckSemaphore {
 
   /** True when the lane could take a slot now, after earlier waiters. */
   available(lane: CheckLane): boolean {
+    return this.availableSlots(lane) > 0
+  }
+
+  availableSlots(lane: CheckLane): number {
     this.grant()
-    return this.fits(lane, this.liveCap())
+    return this.remaining(lane, this.liveCap())
   }
 
   /** Take a slot or return null; earlier waiters are granted first. */

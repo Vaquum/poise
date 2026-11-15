@@ -238,13 +238,13 @@ export const PHASES = ['Intake', 'Issue review', 'Implementation', 'PR review', 
 
 const PHASE_OF: Record<string, number> = {
   'review-issue': 1, 'implement-issue': 2, 'publish-issue': 2, 'review-pr': 3,
-  'repair-pr': 4, 'rerun-grey-ci': 4, 'retire-pr': 4, 'approve-pr': 5, 'resolve-threads': 5, 'merge-pr': 6,
+  'repair-pr': 4, 'rerun-grey-ci': 4, 'refresh-pr-ci': 4, 'retire-pr': 4, 'approve-pr': 5, 'resolve-threads': 5, 'merge-pr': 6,
 }
 
 /** A chain step in words, as Settings → Behaviors names the behavior. */
 export const STEP_WORDS: Record<string, string> = {
   'review-issue': 'Issue review', 'implement-issue': 'Implementation', 'publish-issue': 'Publication', 'review-pr': 'PR review',
-  'repair-pr': 'Repair', 'rerun-grey-ci': 'Rerun grey CI', 'retire-pr': 'Retiring the pull request', 'approve-pr': 'Approval',
+  'repair-pr': 'Repair', 'rerun-grey-ci': 'Rerun grey CI', 'refresh-pr-ci': 'Refresh PR CI', 'retire-pr': 'Retiring the pull request', 'approve-pr': 'Approval',
   'resolve-threads': 'Resolving conversations', 'merge-pr': 'Merge if ready',
 }
 export const stepWord = (behavior: string): string => STEP_WORDS[behavior] ?? behavior

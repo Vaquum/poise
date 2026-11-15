@@ -3,7 +3,9 @@ import { DATASTORE_MAX_AGE_SECONDS, staleDatastoreFailure } from './datastore-he
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS,
+  chainReviewResponse, ciRefreshRequest, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold,
+  heldCiRepair, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -12,18 +14,20 @@ import { behaviorErrorMessage } from './behavior-diagnostics'
 import { classifyBehaviorDiagnostic } from '../src/behavior-failure-cause'
 import { CallerReceiptStoreError } from './service/caller-calls'
 import { diagnostic } from './logging'
+import { resumeReviewArgument, yieldedReview } from './review-continuation'
 
 export interface ChainSeed { repository: string, number: number }
 export interface ChainRuntimeOperations {
   enabled(): boolean
   accounts(): { author: string, reviewer: string }
   discover(): Promise<ChainSeed[]>
+  closedSeedHints?(after: ChainSeed | null): Promise<Array<ChainSeed & { updatedAt: number }>>
   ownsRepository(repository: string): boolean
   observe(chain: BehaviorChain, verifyConflict?: boolean): Promise<ChainObservation>
   /** Also reports terminal uncertain publications and merges without a chain hold. */
   reportHold?(chain: BehaviorChain): Promise<string | null>
   implementationAdmission?(chain: BehaviorChain, observation: ChainObservation): Promise<{
-    reason: string | null, source?: { id: string, sequence: number }
+    reason: string | null, source?: { id: string, sequence: number }, note?: string
   }>
   recoverReport?(chain: BehaviorChain, observation: ChainObservation): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
@@ -31,6 +35,7 @@ export interface ChainRuntimeOperations {
   authenticationRejected?(call: LogEntry): void
   authRecovered?(invocation: ChainInvocation): boolean | ChainRecoveryOrigin
   available(): boolean
+  availableSlots?(): number
   capacity(): number
   /** Override for the synchronous admission-boundary probe; production and
    *  local validation measure the actual host. Tests stub this. */
@@ -51,7 +56,8 @@ export interface ChainRuntimeOperations {
 export function nativeBehavior(behavior: ChainInvocation['behavior']): string | null {
   return ({ 'review-issue': 'issue_review', 'review-pr': 'pr_review', 'approve-pr': 'pr_approve',
     'implement-issue': 'implement_issue', 'repair-pr': 'repair_pr', 'merge-pr': 'native_action',
-    'resolve-threads': 'native_action', 'rerun-grey-ci': 'native_action', 'publish-issue': 'native_action', 'retire-pr': 'native_action' } as Partial<Record<ChainInvocation['behavior'], string>>)[behavior] ?? null
+    'resolve-threads': 'native_action', 'rerun-grey-ci': 'native_action', 'publish-issue': 'native_action', 'retire-pr': 'native_action',
+    'refresh-pr-ci': 'native_action' } as Partial<Record<ChainInvocation['behavior'], string>>)[behavior] ?? null
 }
 
 function receipt(call: LogEntry): Record<string, unknown> {
@@ -130,17 +136,17 @@ function ciOnlyHold(invocation: ChainInvocation, call: LogEntry): BehaviorChain[
 }
 
 function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, now: number, operations: ChainRuntimeOperations): boolean {
-  const hold = chain.ciHold, pull = observation.pull, original = chain.invocations.at(-1)
-  const evidence = original?.evidence, artifact = evidence?.artifact as Record<string, unknown> | undefined
-  if (!(!!chain.held && !!hold && !chain.mergeSha && original?.id === hold.invocationId && original.state === 'settled'
-    && original.callId === hold.callId && evidence?.status === 'failed' && evidence.error_code === 'atomic_work_blocked'
-    && evidence.action === 'not_started' && artifact?.phase === 'executing' && !artifact.plan_sha && !evidence.publicationResume
-    && evidence.receipts == null && evidence.review_id == null && evidence.head_sha == null
-    && resourceReleaseProven(evidence, true) && typeof evidence.completedAt === 'number'
-    && Number.isFinite(observation.checkedAt) && observation.checkedAt >= evidence.completedAt
-    && observation.checkedAt >= Date.parse(String(evidence.resources_settled_at))
+  const held = heldCiRepair(chain), pull = observation.pull
+  if (!(held && Number.isFinite(observation.checkedAt) && observation.checkedAt >= held.completedAt
+    && observation.checkedAt >= Date.parse(String(held.evidence.resources_settled_at))
     && observation.checkedAt <= now && now - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
     && !!pull && pull.state === 'open' && !pull.merged)) return false
+  const { hold, original, refresh } = held
+  if (refresh && refresh.evidence?.action !== 'not_started') {
+    return refresh.state === 'settled' && ['updated', 'update_observed'].includes(refresh.outcome ?? '')
+      && resourceReleaseProven(refresh.evidence ?? {}, true) && observation.ciRefreshPassed === pull.head
+      && observedCiRefresh(refresh, observation)
+  }
   if (pull.head === hold.head && pull.conflict) {
     // Release only for the ordinary scoped repair, including its retry bound.
     // The failed CI receipt remains evidence; admission does not resolve it.
@@ -161,6 +167,20 @@ function ciHoldCanResume(chain: BehaviorChain, observation: ChainObservation, no
       && observation.ciRecovery.removal === hold.queue.removal && observation.ciRecovery.integration === hold.queue.integration
       && pull.queueRemoval?.id === hold.queue.removal && pull.queueRemoval.reason === 'failed_checks'
       && chainBasis(queueCiBlocker(original)) === chainBasis(hold.queue))
+}
+
+function observedCiRefresh(refresh: ChainInvocation, observation: ChainObservation): boolean {
+  const proof = ciRefreshRequest(refresh)
+  const pull = observation.pull, update = observation.ciBaseUpdate, publication = observation.publication
+  const completed = refresh.evidence?.completedAt
+  return typeof completed === 'number' && observation.checkedAt >= completed
+    && observation.checkedAt >= Date.parse(String(refresh.evidence?.resources_settled_at))
+    && observation.checkedAt <= Date.now() && Date.now() - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
+    && !!pull && pull.number === Number(refresh.request.argv[1]) && pull.state === 'open' && !pull.draft && !pull.merged
+    && pull.queueEntry === null && publication.pull_number === pull.number && publication.head_sha === pull.head
+    && publication.state === 'open' && !observation.existingPulls.length
+    && !!update && update.from === proof.head && update.base === proof.base && update.head === pull.head
+    && pull.checksState === 'SUCCESS' && !pull.pending && !pull.failing.length
 }
 
 function missingReceiptHoldCanResume(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
@@ -209,8 +229,13 @@ function recoveredImplementation(chain: BehaviorChain, observation: ChainObserva
     || observation.checkedAt < Date.parse(String(evidence.resources_settled_at))
     || !Number.isFinite(observation.checkedAt) || observation.checkedAt > now || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS
     || recovery?.invocationId !== original.id || recovery.verified !== true || recovery.recovered !== true
-    || !recovery.recovery || !/^[a-f0-9]{40}$/.test(recovery.recovery.merge) || !/^[a-f0-9]{40}$/.test(recovery.recovery.base)
-    || observation.prerequisites?.base !== recovery.recovery.base
+    || !recovery.recovery || !/^[a-f0-9]{40}$/.test(recovery.recovery.base)
+    || observation.prerequisites?.base !== recovery.recovery.base) return null
+  if (chain.testRecovery?.triage) {
+    return recovery.recheck === chain.testRecovery.recheck && recovery.recovery.triage === chain.testRecovery.triage
+      && recovery.recovery.base === chain.testRecovery.base ? chain.testRecovery : null
+  }
+  if (!recovery.recovery.merge || !/^[a-f0-9]{40}$/.test(recovery.recovery.merge)
     || chain.testRecovery && chain.testRecovery.merge !== recovery.recovery.merge) return null
   return { hold, merge: recovery.recovery.merge, base: recovery.recovery.base }
 }
@@ -273,6 +298,8 @@ function capacityWait(reason: string): boolean {
     || reason.startsWith('shared native resource budget is exhausted: ') || reason.startsWith('insufficient behavior resource headroom: ')
 }
 
+const REVIEW_CAPACITY_WAIT = 'waiting for the shared native behavior capacity'
+
 function admissionDecision(chain: BehaviorChain, observation: ChainObservation, now: number): Extract<ChainDecision, { kind: 'invoke' }> | null {
   let decision: ChainDecision
   try {
@@ -315,6 +342,7 @@ export class BehaviorChainRuntime {
   private reconciliationCursor = ''
   private reconciliationFirst = false
   private authenticationCursor = ''
+  private closedSeedCursor: ChainSeed | null = null
 
   constructor(readonly journal: BehaviorChainJournal, private readonly operations: ChainRuntimeOperations) {}
 
@@ -328,6 +356,47 @@ export class BehaviorChainRuntime {
     return current
   }
 
+  private recordMerge(chain: BehaviorChain, observation: ChainObservation, reviewComplete: boolean): BehaviorChain {
+    const pull = observation.pull
+    if (!pull?.merged || !pull.mergeSha) return chain
+    return this.append(chain, { type: 'chain.merged', mergeSha: pull.mergeSha, evidence: { repository: chain.repository,
+      pull_number: pull.number, merged: true, merge_sha: pull.mergeSha, review_complete: reviewComplete } })
+  }
+
+  private decision(chain: BehaviorChain, observation: ChainObservation): ChainDecision {
+    const mergeEvidence = observation.pull?.merged ? {
+      before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
+      firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
+    } : undefined
+    return decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
+  }
+
+  private async recheckClosedSeed(began: number): Promise<void> {
+    if (!this.operations.closedSeedHints) return
+    const hints = await this.operations.closedSeedHints(this.closedSeedCursor)
+    if (!hints.length) this.closedSeedCursor = null
+    for (const hint of hints) {
+      const now = Date.now()
+      if (now - began > 45_000) break
+      this.closedSeedCursor = hint
+      if (!this.operations.ownsRepository(hint.repository) || hint.updatedAt > now) continue
+      let chain = this.journal.deferredSeedClosure(chainIdentity(hint.repository, hint.number), hint.updatedAt, now)
+      if (!chain) continue
+      // Use the usual observation, with no admission, reporting or recovery.
+      // An authoritative reopen also consumes the hint.
+      const observation = await this.operations.observe(chain)
+      try {
+        chain = this.append(chain, { type: 'chain.observed', observation })
+        if (observation.pull?.merged && observation.pull.mergeSha) {
+          chain = this.recordMerge(chain, observation, false)
+          if (this.decision(chain, observation).kind === 'complete') this.recordMerge(chain, observation, true)
+        }
+      }
+      catch (error) { if (!(error instanceof BehaviorChainRevisionConflict)) throw error }
+      break
+    }
+  }
+
   /** The first capacity refusal for this uninterrupted behavior/basis/slot.
    * Observations retain waiting, so the reason alone cannot date the episode. */
   private capacityWaitSequence(chain: BehaviorChain): number | null {
@@ -335,13 +404,18 @@ export class BehaviorChainRuntime {
     const basis = observation && admissionDecisionBasis(chain, observation, observation.checkedAt)
     if (!basis) return null
     let first: number | null = null, matching = false, after = 0
+    let lastObservation: ChainObservation | null = null
     while (true) {
       const events = this.journal.history(chain.id, after)
       for (const row of events) {
         const event = JSON.parse(row.payload) as ChainEvent
         if (event.type === 'chain.observed') {
-          matching = admissionDecisionBasis(chain, event.observation as ChainObservation, row.at) === basis
+          lastObservation = event.observation as ChainObservation
+          matching = admissionDecisionBasis(chain, lastObservation, row.at) === basis
           if (!matching) first = null
+        } else if (event.type === 'invocation.settled' && event.outcome === 'review_continuation_required') {
+          matching = !!lastObservation && admissionDecisionBasis(chain, lastObservation, row.at) === basis
+          first = matching ? row.sequence : null
         } else if (event.type === 'chain.waiting' && capacityWait(event.reason) && matching) {
           first ??= row.sequence
         } else {
@@ -358,6 +432,30 @@ export class BehaviorChainRuntime {
     if (chain.waiting !== reason || this.capacityWaitSequence(chain) === null) {
       this.append(chain, { type: 'chain.waiting', reason })
     }
+  }
+
+  /** An organization's runtime cannot prepare another organization's review.
+   * Honor its durable turn and let the existing workspace wake offer it. */
+  private earlierReviewWaitsElsewhere(chain: BehaviorChain, decision: Extract<ChainDecision, { kind: 'invoke' }>,
+    resources: BehaviorResourceAdmission | null, headroom: BehaviorResourceHeadroom | undefined): boolean {
+    if (!decision.reviewer) return false
+    const turn = (chain.waiting && capacityWait(chain.waiting) ? this.capacityWaitSequence(chain) : null) ?? Infinity
+    const now = Date.now()
+    const earlierCount = this.journal.capacityWaiters().filter(waiter => {
+      const observation = waiter.observation as ChainObservation | null
+      if (this.operations.ownsRepository(waiter.repository) || !observation || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return false
+      const earlier = admissionDecision(waiter, observation, now)
+      if (!earlier?.reviewer || !decision.checkpoint && !earlier.checkpoint) return false
+      return (this.capacityWaitSequence(waiter) ?? Infinity) < turn
+    }).length
+    if (!earlierCount) return false
+    const free = Math.min(this.operations.availableSlots?.() ?? 1, this.operations.capacity() - this.journal.liveModelInvocationCount())
+    if (earlierCount >= free) return true
+    if (!resources) return false
+    const needed = { memoryBytes: resources.reservation.memoryBytes * (earlierCount + 1),
+      diskBytes: resources.reservation.diskBytes * (earlierCount + 1) }
+    return !!budgetShortfall(resources.budget, this.journal.reservedResources(), needed)
+      || !!headroom && !!headroomShortfall(headroom, needed)
   }
 
   /** Resume retains waiting in hashed reducer state; a still-blocking reason
@@ -387,11 +485,11 @@ export class BehaviorChainRuntime {
     return budgetShortfall(resources.budget, reserved, resources.reservation)
   }
 
-  private allowed(chain: BehaviorChain, invocation: ChainInvocation): boolean {
+  private allowed(chain: BehaviorChain, invocation: ChainInvocation, source = invocation.request.implementationSource): boolean {
     const current = this.current(chain)
     const accounts = this.operations.accounts()
     return current.invocations.some(candidate => candidate.id === invocation.id && candidate.state !== 'settled')
-      && (!invocation.request.implementationSource || this.journal.read(invocation.request.implementationSource.id)?.sequence === invocation.request.implementationSource.sequence)
+      && (!source || this.journal.read(source.id)?.sequence === source.sequence)
       && !closedChainTarget(current, current.observation as ChainObservation | null, invocation.behavior)
       && !current.held && this.operations.enabled() && accounts.author.toLowerCase() === current.author.toLowerCase() && accounts.reviewer.toLowerCase() === current.reviewer.toLowerCase()
       && this.operations.permitted(current, { kind: 'invoke', behavior: invocation.behavior, actor: invocation.actor,
@@ -492,6 +590,14 @@ export class BehaviorChainRuntime {
       this.reconciliationFirst = !first
       for (const deferred of [first, !first]) {
         if (Date.now() - began > 45_000) break
+        if (deferred && this.operations.closedSeedHints) {
+          try { await this.recheckClosedSeed(began) }
+          catch (error) {
+            if (!staleDatastoreFailure(error)) observationError = preferObservationError(observationError,
+              new Error(`closed seed recheck failed: ${behaviorErrorMessage(error)}`, { cause: error }))
+          }
+          if (Date.now() - began > 45_000) break
+        }
         const cursorKey = deferred ? 'reconciliationCursor' : 'cursor'
         let page = this.journal.reconcilable(this[cursorKey], Date.now(), deferred)
         if (!page.length && this[cursorKey]) {
@@ -617,10 +723,7 @@ export class BehaviorChainRuntime {
                 }
               }
               chain = this.append(chain, { type: 'chain.observed', observation })
-              if (observation.pull?.merged && observation.pull.mergeSha && !chain.mergeSha) {
-                chain = this.append(chain, { type: 'chain.merged', mergeSha: observation.pull.mergeSha, evidence: { repository: chain.repository,
-                  pull_number: observation.pull.number, merged: true, merge_sha: observation.pull.mergeSha, review_complete: false } })
-              }
+              if (!chain.mergeSha) chain = this.recordMerge(chain, observation, false)
               if (owned?.behavior === 'implement-issue' && call?.status === 'running' && retireEligible(call)
                 && !observation.issue.open && observation.publication.pull_number === null
                 && observation.publication.head_sha === null && observation.publication.head_invocation === null
@@ -683,11 +786,7 @@ export class BehaviorChainRuntime {
               }
               const approvalRecovery = exhaustedApprovalConversationHold(chain, observation, Date.now())
               if (approvalRecovery) chain = this.append(chain, { type: 'chain.resumed', approvalRecovery, recovery: { origin: 'automatic' } })
-              const mergeEvidence = observation.pull?.merged ? {
-                before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
-                firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
-              } : undefined
-              const decision = decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
+              const decision = this.decision(chain, observation)
               if (decision.kind === 'invoke' && decision.behavior === 'implement-issue' && this.operations.implementationAdmission) {
                 const gate = await this.operations.implementationAdmission(chain, observation)
                 if (gate.reason) {
@@ -700,8 +799,7 @@ export class BehaviorChainRuntime {
                 chain = this.append(chain, { type: 'chain.resumed' })
               }
               if (decision.kind === 'complete') {
-                this.append(chain, { type: 'chain.merged', mergeSha: decision.mergeSha, evidence: { repository: chain.repository,
-                  pull_number: observation.pull!.number, merged: true, merge_sha: decision.mergeSha, review_complete: true } })
+                this.recordMerge(chain, observation, true)
               } else if (decision.kind === 'supersede') {
                 this.append(chain, { type: 'chain.superseded', evidence: decision.evidence })
               } else if (decision.kind === 'hold') {
@@ -740,6 +838,7 @@ export class BehaviorChainRuntime {
                 // count check, so blocked work holds no native agent session and
                 // consumes no provider probe. Unset budgets skip every probe.
                 const resources = readBehaviorResourceAdmission()
+                let headroom: BehaviorResourceHeadroom | undefined
                 if (resources) {
                   const exhausted = this.resourceWaitReason(resources)
                   if (exhausted) {
@@ -748,7 +847,8 @@ export class BehaviorChainRuntime {
                     continue
                   }
                   try {
-                    const cramped = headroomShortfall((this.operations.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)
+                    headroom = (this.operations.measureHeadroom ?? measureBehaviorHeadroom)()
+                    const cramped = headroomShortfall(headroom, resources.reservation)
                     if (cramped) {
                       this.waitForCapacity(chain, cramped)
                       continue
@@ -758,6 +858,10 @@ export class BehaviorChainRuntime {
                     if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
                     continue
                   }
+                }
+                if (this.earlierReviewWaitsElsewhere(chain, decision, resources, headroom)) {
+                  this.waitForCapacity(chain, REVIEW_CAPACITY_WAIT)
+                  continue
                 }
                 const accounts = this.operations.accounts()
                 if (accounts.author.toLowerCase() !== chain.author.toLowerCase() || accounts.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()) {
@@ -789,7 +893,9 @@ export class BehaviorChainRuntime {
                   continue
                 }
                 if (!request) {
-                  const reason = `${decision.behavior} is waiting for native provider backoff`
+                  const reason = decision.checkpoint
+                    ? `Review Call ${decision.checkpoint.root_call} needs its original reviewer ${decision.reviewer?.model} and a Caller with review continuation support`
+                    : `${decision.behavior} is waiting for native provider backoff`
                   if (this.renewsWait(chain, reason)) {
                     this.append(chain, { type: 'chain.waiting', reason })
                   }
@@ -862,7 +968,18 @@ export class BehaviorChainRuntime {
                   continue
                 }
                 if (gate?.source) request = { ...request, implementationSource: gate.source }
+                if (gate?.note) {
+                  const argv = [...request.argv]
+                  const note = argv.indexOf('--note')
+                  if (note < 0) argv.push('--note', gate.note)
+                  else argv[note + 1] = [argv[note + 1], gate.note].filter(Boolean).join('\n\n')
+                  request = { ...request, argv }
+                }
                 if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
+                if (this.earlierReviewWaitsElsewhere(chain, decision, resources, headroom)) {
+                  this.waitForCapacity(chain, REVIEW_CAPACITY_WAIT)
+                  continue
+                }
                 const admitted = this.journal.admitInvocation(chain, randomUUID(), { id, behavior: decision.behavior, basis: decision.basis,
                   actor: decision.actor, model: request.command === 'agent-interface' ? request.argv[request.argv.indexOf('--model') + 1] : null, slot: decision.reviewer?.slot ?? null,
                   ...(resources ? { reservation: resources.reservation } : {}),
@@ -1086,6 +1203,24 @@ export class BehaviorChainRuntime {
       return this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
         outcome: 'prerequisite_wait', evidence: { ...receipt(call), status: 'deferred', action: 'not_started', outcome: 'prerequisite_wait' } })
     }
+    if (prReview && invocation.request.argv.includes('--review-slot')) {
+      const checkpoint = yieldedReview(call)
+      if (checkpoint) {
+        const resume = invocation.request.argv.indexOf('--resume-review')
+        const input = resume < 0 ? null : invocation.request.argv[resume + 1]
+        const link = call.artifact?.review_resume as { slot?: string } | undefined
+        const slot = invocation.request.argv[invocation.request.argv.indexOf('--review-slot') + 1]
+        if (call.model !== invocation.model || link?.slot !== slot || (input === null ? checkpoint.root_call !== call.id
+          : !input?.startsWith(`${checkpoint.root_call}:`) || Number(input.split(':')[1]) >= checkpoint.generation)) {
+          throw new Error(`native review checkpoint conflicts with admission ${invocation.id}: ${resumeReviewArgument(checkpoint)}`)
+        }
+        chain = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
+          outcome: 'review_continuation_required', evidence: { ...receipt(call), status: 'deferred' } })
+        chain = this.append(chain, { type: 'chain.waiting', reason: REVIEW_CAPACITY_WAIT })
+        this.operations.wake()
+        return chain
+      }
+    }
     const possibleWrite = call.action !== 'not_started' || (invocation.behavior === 'review-issue' || prReview)
       && (call.receipts != null || call.review_id != null || call.head_sha != null)
       || prReview && (call.artifact?.phase === 'submitting_review' || call.artifact?.phase === 'review_submitted'
@@ -1151,11 +1286,11 @@ export class BehaviorChainRuntime {
     return this.append(chain, { type: 'chain.resumed', recovery: typeof recovery === 'object' ? recovery : { origin: 'unknown' } })
   }
 
-  private async start(chain: BehaviorChain, invocation: ChainInvocation): Promise<void> {
+  private async start(chain: BehaviorChain, invocation: ChainInvocation, source = invocation.request.implementationSource): Promise<void> {
     chain = this.append(chain, { type: 'invocation.started', invocationId: invocation.id })
     if (invocation.request.command === 'agent-interface') {
       try {
-        const started = await this.operations.launch(this.nativeInvocation(chain, invocation), (result) => this.exited(chain, invocation, result), () => this.allowed(chain, invocation))
+        const started = await this.operations.launch(this.nativeInvocation(chain, invocation), (result) => this.exited(chain, invocation, result), () => this.allowed(chain, invocation, source))
         if (!started) this.append(this.current(chain), { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
           evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
       } catch (error) {
@@ -1339,6 +1474,38 @@ export class BehaviorChainRuntime {
       return
     }
     if (invocation.request.command === 'github-interface') {
+      if (invocation.behavior === 'refresh-pr-ci') {
+        const refreshCall = invocation.evidence?.nativeCallId
+        const artifact = invocation.evidence?.artifact as Record<string, unknown> | undefined
+        if (invocation.state === 'admitted') {
+          if (snapshot.entries.some(call => call.correlation_id === invocation.id) || snapshot.quarantined.length) return
+          const held = heldCiRepair(chain)
+          // The original request re-verifies its pinned base inside Caller.
+          // A crash before start can only resume that admission or settle it without a write.
+          const current = decideBehaviorChain({ ...chain, invocations: chain.invocations.slice(0, -1) },
+            { ...observation, ciRefresh: ciRefreshRequest(invocation) }, Date.now())
+          if (held?.refresh?.id !== invocation.id || current.kind !== 'invoke' || current.behavior !== invocation.behavior
+              || current.basis !== invocation.basis) {
+            this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
+              evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
+            this.operations.wake()
+            return
+          }
+          const accounts = this.operations.accounts()
+          if (accounts.author.toLowerCase() === chain.author.toLowerCase() && accounts.reviewer.toLowerCase() === chain.reviewer.toLowerCase()
+            && this.operations.enabled() && this.operations.permitted(chain, current)) await this.start(chain, invocation)
+        } else if (invocation.state === 'uncertain' && resourcesSettled && typeof refreshCall === 'string'
+          && invocation.evidence?.action === null && invocation.evidence?.status === 'failed'
+          && artifact?.phase === 'performing_native_action' && artifact.request_sha === nativeRequestSha(invocation.request)
+          && observedCiRefresh(invocation, observation)) {
+          // Keep the original possible-write Call and its error. The clean
+          // head proves the observed effect, without inventing a PUT response.
+          this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: refreshCall, outcome: 'update_observed',
+            evidence: { ...invocation.evidence, ciBaseUpdate: observation.ciBaseUpdate } })
+          this.operations.wake()
+        }
+        return
+      }
       if (this.recoverNativeAction(chain, invocation)) return
       let evidence: Record<string, unknown> | null = null
       if (invocation.behavior === 'rerun-grey-ci' && observation.greyRecovery?.invocationId === invocation.id
@@ -1371,6 +1538,7 @@ export class BehaviorChainRuntime {
         reason: 'native process exited without a durable Call receipt; its exit evidence must be reconciled before another effect' })
       return
     }
+    let source = invocation.request.implementationSource
     if (invocation.state === 'admitted' && invocation.behavior === 'implement-issue' && this.operations.implementationAdmission) {
       const gate = await this.operations.implementationAdmission(chain, observation)
       if (gate.reason) {
@@ -1385,13 +1553,14 @@ export class BehaviorChainRuntime {
       }
       // An admission that predates source binding cannot carry its launch
       // precondition; retire it so a fresh admission binds the current source.
-      if (gate.source && !invocation.request.implementationSource) {
+      if (gate.source && gate.source.id !== source?.id) {
         this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
           evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
         this.operations.wake()
         return
       }
+      if (chain.testRecovery?.triage) source = gate.source
     }
-    if (invocation.state === 'admitted') await this.start(chain, invocation)
+    if (invocation.state === 'admitted') await this.start(chain, invocation, source)
   }
 }

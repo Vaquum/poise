@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
@@ -11,6 +12,11 @@ import { parseViewArgs } from './datastore-views'
 // (server/datastore-views.ts mirrors what the CLI answers).
 
 const READ_TIMEOUT_MS = 30_000
+
+/** The path selected by GitHub Datastore when the organization omits --db. */
+export function organizationDatastorePath(org: { datastorePath?: string }): string {
+  return org.datastorePath ?? join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'github-datastore', 'github_datastore.sqlite')
+}
 
 interface Answer { rows: Record<string, unknown>[], content: string | null }
 interface Pending { resolve: (answer: Answer) => void, reject: (error: Error) => void, timer: NodeJS.Timeout }

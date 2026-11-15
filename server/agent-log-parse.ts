@@ -8,6 +8,7 @@ import { parseProgress, type ModelProgress } from '../src/agent-progress'
 import { parseProcessDiagnostic, type ProcessDiagnostic } from './process-diagnostic'
 import { parseResourceOwnership, resourceReleaseContradicted, type ResourceOwnershipReceipt } from './behavior-resource-receipt'
 import { parseExecutionResourceGuard } from './behavior-resources'
+import { parseReviewCheckpoint, reviewContinuationCode, reviewContinuationNoWrite } from './review-continuation'
 
 export interface LogEntry {
   id: string
@@ -292,6 +293,13 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
   const managedReview = behavior === 'pr_review' || behavior === 'pr_approve' || (source === 'poise:behavior-chain' && issueReview)
   if (artifact !== null && ((!atomicWork && !managedReview && !nativeAction) || typeof artifact !== 'object' || Array.isArray(artifact)
     || Buffer.byteLength(JSON.stringify(artifact)) > 128 * 1024)) throw new Error(`agent-interface log row ${index} has an invalid atomic artifact`)
+  const reviewArtifact = artifact as Record<string, unknown> | null
+  const checkpoint = parseReviewCheckpoint(reviewArtifact)
+  const reviewContinuation = reviewContinuationCode(errorCode) && reviewContinuationNoWrite({ behavior, status, action, outcome,
+    head_sha: headSha, review_id: row.review_id, review_comments: row.review_comments, receipts: row.receipts, artifact: reviewArtifact })
+  if (reviewContinuationCode(errorCode) && (!reviewContinuation || errorCode === 'review_continuation_required' && !checkpoint)) {
+    throw new Error(`agent-interface log row ${index} lacks its authoritative review continuation evidence`)
+  }
   const incompleteReview = (behavior === 'pr_review' || behavior === 'pr_approve') && headSha === expectedHead
     && (status === 'failed' && action === null && errorCode === 'review_incomplete'
       || status === 'completed' && action === 'requested_changes'
@@ -359,7 +367,7 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     || (startedAtPrecise !== null && !Number.isFinite(Date.parse(startedAtPrecise)))
     || (completedAt !== null && !Number.isFinite(Date.parse(completedAt)))
     || !['clean', 'changes_requested', 'approved', 'incomplete', 'superseded', 'preflight_failed', 'commented', 'published', 'no_changes', 'prerequisite_wait', 'target_closed', 'native_action', null].includes(outcome)
-    || (outcome === 'incomplete' && !incompleteReview)
+    || (outcome === 'incomplete' && !incompleteReview && !reviewContinuation)
     || (outcome === 'target_closed' && !closedFence && !retiredFence)
     || (headSha !== null && !/^[0-9a-f]{40}$/.test(headSha))
     || (expectedHead !== null && !/^[0-9a-f]{40}$/.test(expectedHead))
@@ -369,7 +377,7 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     || ((action === 'published' || action === 'no_changes' || outcome === 'published' || outcome === 'no_changes') && !atomicWork)
     || (outcome === 'prerequisite_wait' && (behavior !== 'implement_issue' || action !== 'not_started' || status !== 'completed'))
     || ((action === 'commented' || outcome === 'commented') && !issueReview)
-    || ((action === 'not_started' || outcome === 'preflight_failed') && !preflightFailed && !closedFence && !retiredFence && outcome !== 'prerequisite_wait')
+    || ((action === 'not_started' || outcome === 'preflight_failed') && !preflightFailed && !closedFence && !retiredFence && !reviewContinuation && outcome !== 'prerequisite_wait')
     || (source !== null && !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(source))
     || (correlationId !== null && !LOG_CORRELATION_ID.test(correlationId))) {
     throw new Error(`agent-interface log row ${index} violates the schema`)

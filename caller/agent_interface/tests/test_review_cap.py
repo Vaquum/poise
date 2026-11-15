@@ -12,6 +12,7 @@ from agent_interface import review_cap as followup
 from agent_interface import review_budget, review_receipt
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
+from review_submission_fixture import submission_args
 
 ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 HEAD = "c" * 40
@@ -222,7 +223,7 @@ class TestStructuredCappedConversion(TestCase):
     def _run(self, verdict, github, packet=PACKET, **kwargs):
         def process(args, **kwargs):
             if args[0] == "github-interface":
-                return github(args)
+                return github(submission_args(args))
             Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -270,7 +271,7 @@ class TestStructuredCappedConversion(TestCase):
                     with self.subTest(review_round=review_round, packet=packet, comments=comments):
                         def github(args):
                             self.assertEqual(args[1], "--request-changes")
-                            self.assertEqual(json.loads(args[args.index("--comments-json") + 1]), comments)
+                            self.assertEqual(json.loads(args[args.index("--comments") + 1]), comments)
                             self.assertEqual(args[args.index("--expected-head") + 1], HEAD)
                             self.assertEqual(args[args.index("--token-user") + 1], "bit-mis")
                             return SimpleNamespace(returncode=0, stdout=json.dumps(
@@ -293,7 +294,7 @@ class TestStructuredCappedConversion(TestCase):
 
                     def github(args):
                         self.assertEqual(args[1], "--request-changes")
-                        self.assertEqual(json.loads(args[args.index("--comments-json") + 1]), [original])
+                        self.assertEqual(json.loads(args[args.index("--comments") + 1]), [original])
                         return SimpleNamespace(returncode=0, stdout=json.dumps(
                             {"action": "requested_changes", "review_id": 92, "head_sha": HEAD}), stderr="")
 

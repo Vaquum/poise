@@ -278,19 +278,21 @@ class InterruptedCallsCase(TestCase):
         identity = agent_interface.process_identity
         outer = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
         inner = {**outer, "init_start": "20", "namespace_ino": 3}
-        with patch.object(identity, "epoch", return_value=outer), patch.object(identity, "_start", return_value="42"):
-            call = agent_interface.track("fixture-model", "native observer", repo="acme/app",
-                                         behavior="pr_review", source="poise:behavior-chain")
-            self.assertEqual(agent_interface.reap_interrupted(), 0)
-        with patch.object(identity, "epoch", return_value=inner), patch.object(identity, "_start") as start, \
-                patch.object(agent_interface.caller_store, "observes_workspace_supervisor", return_value=False):
-            entries = agent_interface.logs(status="running")
-            start.assert_not_called()
-        self.assertIn(call, {entry["id"] for entry in entries})
-        self.assertEqual(self.row(call)["status"], "running")
-        with patch.object(identity, "epoch", return_value=outer), patch.object(identity, "_start", side_effect=FileNotFoundError):
-            self.assertEqual(agent_interface.reap_interrupted(), 1)
-        self.assertEqual(self.row(call)["error_code"], "interrupted")
+        for source, managed_review in (("poise:behavior-chain", False), ("poise:review-new-prs", True)):
+            with self.subTest(source=source):
+                with patch.object(identity, "epoch", return_value=outer), patch.object(identity, "_start", return_value="42"):
+                    call = agent_interface.track("fixture-model", "native observer", repo="acme/app",
+                                                 behavior="pr_review", source=source, managed_review=managed_review)
+                    self.assertEqual(agent_interface.reap_interrupted(), 0)
+                with patch.object(identity, "epoch", return_value=inner), patch.object(identity, "_start") as start, \
+                        patch.object(agent_interface.caller_store, "observes_workspace_supervisor", return_value=False):
+                    entries = agent_interface.logs(status="running")
+                    start.assert_not_called()
+                self.assertIn(call, {entry["id"] for entry in entries})
+                self.assertEqual(self.row(call)["status"], "running")
+                with patch.object(identity, "epoch", return_value=outer), patch.object(identity, "_start", side_effect=FileNotFoundError):
+                    self.assertEqual(agent_interface.reap_interrupted(), 1)
+                self.assertEqual(self.row(call)["error_code"], "interrupted")
 
     def test_an_old_reader_cannot_reap_a_native_registration_from_a_new_release(self):
         identity = agent_interface.process_identity

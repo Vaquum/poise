@@ -9,10 +9,16 @@ const number = (value: unknown) => typeof value === 'number' && Number.isFinite(
 
 /** Prompts, output and arguments are never read from the Caller row. */
 export function callerDiagnostic(value: unknown, workspace: string): DiagnosticInput | null {
-  const row = object(value)
+  let row = object(value)
   if (!row || !text(row.id) || !/^[a-f0-9]{32}$/.test(String(row.id))) return null
   if (row.outcome === 'superseded' || issueReviewSuperseded(row) || ['stopped', 'stopping'].includes(String(row.error_code))) return null
   const raw = object(row.diagnostic)
+  if (row.status === 'failed' && row.error_code === 'review_continuation_required' && row.outcome === 'incomplete'
+    && row.action === 'not_started' && row.head_sha == null && ['pr_review', 'pr_approve'].includes(String(row.behavior))
+    && row.evidence_unavailable == null && row.resource_error == null && row.ownership_error == null) {
+    if (row.diagnostic == null) return null
+    if (raw?.version === 1 && raw.severity === 'warning') row = { ...row, status: 'completed', error: '', error_code: null }
+  }
   const rawContext = object(raw?.context) ?? raw
   // A planned handoff is terminal evidence, not a prior preparation warning.
   // Its source stays Error until the separate work read confirms a successor.

@@ -196,6 +196,45 @@ Codex input overflow is staged within the existing total review budget, with
 every fragment acknowledged in one native conversation before a single final
 verdict can be submitted. Ordinary messages are unchanged. The bounds and
 failure rules are in [Caller PR review models](../caller/agent_interface/README.md#pr-review-models).
+
+### Resumable structured reviews
+
+Poise dispatches large structured PR reviews and uncapped approvals in Calls
+that complete up to six source or integration units. A complete packet within
+one ordinary file group uses the existing single-pass review. Continuation
+requires a workspace whose Caller advertises `reviewContinuation: 1` through
+its native cleanup capability. Claude and capped approval rounds retain their
+existing path.
+
+Each Call keeps its actor, behavior, slot, exact head and original launch
+correlation. A checkpoint releases its admission only after Caller verifies
+the original worker and its resources settled. The next Call joins the existing
+capacity order behind eligible work that was already waiting. Native chains
+use the workspace reservation and waiter order across organizations.
+
+The [Caller contract](../caller/agent_interface/README.md#explicit-review-continuation)
+defines the exact analysis basis, cumulative allowance and single publisher.
+The final pass rereads the material packet before reserving submission. A
+changed head or review context invalidates the saved analysis. A checkpoint
+yield leaves the provider and failure counters unchanged. An exhausted
+obligation reports its cause and original Call in the existing work status.
+Status retains completed and required units, attempts, cumulative time and
+the timestamp of the last verified progress. A checkpoint grants no verdict
+or queue authority. A possibly submitted review retains its original write
+fence until reconciled through the existing receipt path.
+
+The fixed acceptance case used 176 files across 22 source groups plus the
+integration pass. With live `gpt-6.1-sol-max` and `muse-spark-1.3-contributor-max`,
+each finished in four Calls with one attributable fixture submission. Elapsed
+time was 567 seconds for Sol and 698 seconds for Muse. With both large reviews
+running, a two-file review took 43.60 seconds on Sol versus 31.17 seconds alone,
+and 40.90 seconds on Muse versus 41.31 seconds alone. The concurrent run's
+sampled process-tree RSS peaked at 716 MiB and scratch disk at 1.40 GiB.
+This was one macOS run using the production model catalog and isolated source
+and GitHub fixtures. These measurements apply to the fixed case.
+
+### Review failures
+
 A structured provider exit or error terminal keeps `not_started` /
 `preflight_failed` with a typed `review_provider_exit` / `review_provider_error`
 cause (a Codex credential rejection is typed `authentication_failed`) and no
@@ -412,8 +451,10 @@ itself releases the admission.
 Operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
-Queue-enabled branches are excluded from automatic base updates: GitHub tests
-the queued integration against current main. With Merge Pull Requests enabled,
+The Merge Pull Requests behavior excludes queue-enabled branches from its
+behind-branch updates. GitHub tests the queued integration against current main.
+The [behavior chain](Behavior-chain.md#bounded-reconciliation) can refresh a held
+PR after verifying recovery from a shared CI failure. With Merge Pull Requests enabled,
 ready eligible PRs enter that queue automatically; no per-PR merge or confirmation
 click is needed. Chat Auto-merge instructions, the default Manager charter and
 work-monitor notices follow the repository's live merge policy instead of

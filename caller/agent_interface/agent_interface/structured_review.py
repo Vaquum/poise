@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from contextlib import ExitStack
 from hashlib import sha256
 import os
 import re
@@ -719,65 +720,69 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     flag = {"request_changes": "--request-changes", "reviewed_clean": "--reviewed-clean",
             "approve": "--approve-pr"}[verdict["action"]]
     args = [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), flag, ref]
-    if verdict["action"] == "request_changes":
-        args.extend(["--comments-json", json.dumps(verdict["comments"])])
     review_receipt.complete_response(verdict["assessment"], head)
-    args.extend(["--assessment-json", json.dumps(verdict["assessment"], ensure_ascii=False)])
-    try:
-        limit = review_budget.timeout(600, reserve=VERIFICATION_RESERVE_SECONDS)
-        progress.stage("submitting", "Submitting GitHub review", timeout=limit)
-        done = subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=limit)
-    except subprocess.TimeoutExpired as error:
-        # The POST may have gone out before the timeout killed the child.
-        raise review_receipt.SubmissionError(
-            "review submission timed out; publication uncertain, reconcile before retry") from error
-    except (review_budget.ReviewLimitError, OSError) as error:
-        cause = bounded_cause(str(error))
-        raise review_budget.ReviewLimitError(
-            f"Completed review could not start submission: {cause}; complete findings retained on the original Call; "
-            "no review submitted", "review_contract_violation",
-            diagnostic_envelope(operation="provider.review", phase="submitting", outcome="resource_failure",
-                                stderr=cause, provider=model.provider, submission="none")) from error
-    if done.returncode:
-        transient = review_receipt.record_failure(done.stderr or done.stdout)
-        if transient is not None:
-            raise review_receipt.SubmissionError(transient)
-        output = (done.stderr or done.stdout).strip()
-        superseded = _refused_head(output)
-        if superseded is not None:
-            # The pre-POST head check refused: proved no review, so the run
-            # is superseded, not a contract violation.
-            raise ReviewSuperseded(superseded)
-        cause = bounded_cause(output or f"github-interface exited {done.returncode}")
-        if review_receipt.blocked_refusal(output) is not None:
-            # The pre-POST guard refused: other reviewers' conversations are
-            # still open, so the approval waits on them. The guard stays
-            # strict — nothing is approved — but a blocked approval is not a
-            # failed verdict publication.
+    with ExitStack() as files:
+        try:
+            if verdict["action"] == "request_changes":
+                directory = files.enter_context(resource_ownership.temporary_directory(prefix="agent-interface-findings-"))
+                comments = Path(directory) / "comments.json"
+                comments.write_text(json.dumps(verdict["comments"]), encoding="ascii")
+                args.extend(["--comments", str(comments)])
+            args.extend(["--assessment-json", json.dumps(verdict["assessment"], ensure_ascii=False)])
+            limit = review_budget.timeout(600, reserve=VERIFICATION_RESERVE_SECONDS)
+            progress.stage("submitting", "Submitting GitHub review", timeout=limit)
+            done = subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=limit)
+        except subprocess.TimeoutExpired as error:
+            # The POST may have gone out before the timeout killed the child.
+            raise review_receipt.SubmissionError(
+                "review submission timed out; publication uncertain, reconcile before retry") from error
+        except (review_budget.ReviewLimitError, OSError) as error:
+            cause = bounded_cause(str(error))
             raise review_budget.ReviewLimitError(
-                f"approval blocked by unresolved review conversations: {cause}",
-                "approval_blocked_unresolved_conversations",
-                diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
-                                    stderr=cause, provider=model.provider, submission="blocked"))
-        raise review_budget.ReviewLimitError(
-            f"review submission rejected: {cause}", "review_contract_violation",
-            diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
-                                stderr=cause, provider=model.provider, submission="rejected"))
-    receipt = review_receipt.record(done.stdout)
-    if receipt is None:
-        # A repeat-only refusal restated already-published bodies in every
-        # finding and delivered nothing. Typed so recovery can tell it
-        # from other duplicate refusals without reading prose.
-        details = review_receipt.parse_no_review(done.stdout)
-        if details is not None:
-            cause = bounded_cause(json.dumps(details["skipped"]) or "no review submitted")
+                f"Completed review could not start submission: {cause}; complete findings retained on the original Call; "
+                "no review submitted", "review_contract_violation",
+                diagnostic_envelope(operation="provider.review", phase="submitting", outcome="resource_failure",
+                                    stderr=cause, provider=model.provider, submission="none")) from error
+        if done.returncode:
+            transient = review_receipt.record_failure(done.stderr or done.stdout)
+            if transient is not None:
+                raise review_receipt.SubmissionError(transient)
+            output = (done.stderr or done.stdout).strip()
+            superseded = _refused_head(output)
+            if superseded is not None:
+                # The pre-POST head check refused: proved no review, so the run
+                # is superseded, not a contract violation.
+                raise ReviewSuperseded(superseded)
+            cause = bounded_cause(output or f"github-interface exited {done.returncode}")
+            if review_receipt.blocked_refusal(output) is not None:
+                # The pre-POST guard refused: other reviewers' conversations are
+                # still open, so the approval waits on them. The guard stays
+                # strict — nothing is approved — but a blocked approval is not a
+                # failed verdict publication.
+                raise review_budget.ReviewLimitError(
+                    f"approval blocked by unresolved review conversations: {cause}",
+                    "approval_blocked_unresolved_conversations",
+                    diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
+                                        stderr=cause, provider=model.provider, submission="blocked"))
             raise review_budget.ReviewLimitError(
-                f"review submission was a no-op: {cause}", "review_contract_violation",
+                f"review submission rejected: {cause}", "review_contract_violation",
                 diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
-                                    stderr=cause, provider=model.provider, submission="noop",
-                                    refusal="repeat_only" if details["repeat_only"] else "duplicate"))
-        raise review_receipt.SubmissionError(
-            "review submission returned no receipt; publication uncertain, reconcile before retry")
+                                    stderr=cause, provider=model.provider, submission="rejected"))
+        receipt = review_receipt.record(done.stdout)
+        if receipt is None:
+            # A repeat-only refusal restated already-published bodies in every
+            # finding and delivered nothing. Typed so recovery can tell it
+            # from other duplicate refusals without reading prose.
+            details = review_receipt.parse_no_review(done.stdout)
+            if details is not None:
+                cause = bounded_cause(json.dumps(details["skipped"]) or "no review submitted")
+                raise review_budget.ReviewLimitError(
+                    f"review submission was a no-op: {cause}", "review_contract_violation",
+                    diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
+                                        stderr=cause, provider=model.provider, submission="noop",
+                                        refusal="repeat_only" if details["repeat_only"] else "duplicate"))
+            raise review_receipt.SubmissionError(
+                "review submission returned no receipt; publication uncertain, reconcile before retry")
     # The outer governed behavior reads authoritative review facts afterward:
     # a receipted review reconciles as completed even when the head moved
     # after the POST, because GitHub pins the stale verdict instead of

@@ -29,6 +29,7 @@ vi.mock('../server/behavior-ledger', () => ({
 // refusal and namespace delivery have separate boundary/kernel checks.
 vi.mock('../server/native-cleanup-support', () => ({
   nativeCleanupSupport: () => ({ status: 'supported', error: null }),
+  nativeReviewContinuationSupported: () => !!process.env.POISE_NATIVE_CONTROL,
   requireNativeCleanup: async () => {},
   invalidateNativeCleanup: vi.fn(),
 }))

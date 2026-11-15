@@ -917,19 +917,41 @@ redacted summary of the first failure or setup error, its test and the original
 candidate digest and run ID. Atomic workers put that summary first in `blocked`,
 so the original Call's retained `diagnostic.stderr` survives console truncation.
 Later runs keep their own identities and cannot replace that completed failure.
-For new atomic Calls, completed direct Vitest assertion failures would retain
-bounded gateway-authenticated evidence before the relay deletes their run, but
-recovery is currently held for #1619: candidate-controlled reports cannot
-authorize it. Missing, interrupted, oversized, unaccounted or relay results cannot
-authorize the existing [pre-PR recovery](Behavior-chain.md#bounded-reconciliation)
-path; historical worker logs remain diagnostic evidence only.
+For atomic Calls, the standalone text assertion command can retain bounded
+gateway-authenticated evidence for the existing [pre-PR recovery](Behavior-chain.md#bounded-reconciliation).
+Run it from the checkout root with the prepared HEAD unchanged.
+
+```sh
+/usr/local/bin/node /opt/poise-assertions/node_modules/vitest/vitest.mjs run tests/example.test.mjs
+```
+
+The sandbox's installed Vitest runs one synchronous string comparison. The
+selected `.test.mjs` file under `tests/` must use this form with a simple test
+title, a regular captured repository text file and a JSON string literal.
+
+```js
+import { expect, test } from 'vitest'
+import { readFileSync } from 'node:fs'
+test("ships the expected text", () => expect(readFileSync("fixture.txt", "utf8")).toBe("expected\n"))
+```
+
+The collector derives the case from the captured data and uses its own
+configuration and dependencies. The matching clean replay uses the same command
+on the exact prepared base. The standalone command requires the atomic Call's
+capture and an eligible file. Ordinary suites and historical output remain
+diagnostic. An interrupted, oversized or incomplete result cannot authorize
+recovery.
 Poise's configured Vitest reporters also emit the first failed test's file, full
 name and assertion/error stack as soon as that test finishes, alongside the
 normal reporter. This failure-only stderr record is redacted in full before
 being limited to 8,192 characters (plus its final newline). Passing tests add no
 output. A later interruption still leaves the suite incomplete and any observed
 failure blocked under the evidence rules below.
-An explicit gateway-restart failure is the one exception: the active command
+An explicit gateway-restart failure or code-125 relay fail frame starting
+`sending the checkout to the box failed: ` permits bounded recovery. The latter
+confirms that the relay exhausted its three part-upload attempts and retired
+the run before any suite command started, including on a final checkout part.
+The active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated
 run handshake and retries the whole suite once. The authenticated
@@ -946,7 +968,10 @@ A shorter inherited `BASH_DEFAULT_TIMEOUT_MS` still caps the command budget.
 Cancellation retires the active upload and lease and prevents recovery from
 starting a new suite. Only the fresh suite's complete exit is returned; a genuine
 suite exit (including 125), a broken stream or another relay cause never retries.
-A second restart or an unrecovered relay retains the no-result contract above.
+Upload failures and gateway restarts share this single recovery allowance.
+A second interruption or an unrecovered relay retains the no-result contract above.
+Output followed by EOF without an exit event on Render's command stream remains
+incomplete and does not authorize recovery.
 Poise derives the agent shell default from the installed budget plus 60 seconds
 for reporting and cleanup (600000 ms at the default budget). The shell maximum
 stays 3600000 ms. The client allows up to one second for its cleanup DELETE;

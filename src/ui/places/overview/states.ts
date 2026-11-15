@@ -70,6 +70,7 @@ const BEHAVIOR_PHASE: Record<string, typeof PHASES[number]> = {
   'review-pr': 'PR review',
   'repair-pr': 'Repair',
   'rerun-grey-ci': 'Repair',
+  'refresh-pr-ci': 'Repair',
   'approve-pr': 'Approval',
   'resolve-threads': 'Approval',
   'merge-pr': 'Merge',

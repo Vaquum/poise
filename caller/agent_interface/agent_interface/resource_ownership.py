@@ -19,6 +19,11 @@ from uuid import uuid4
 
 MAX_RECEIPT_BYTES = 512 * 1024
 MAX_ERROR_CHARACTERS = 512
+LEGACY_REVIEW_SOURCES = {"pr_review": "poise:review-new-prs", "pr_approve": "poise:approve-prs"}
+MANAGED_CALLS = "(source='poise:behavior-chain' or (resource_ownership is not null and " \
+    "((source='poise:review-new-prs' and behavior='pr_review') or (source='poise:approve-prs' and behavior='pr_approve'))))"
+PENDING_CALLS = "((source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)) " \
+    "or (source in ('poise:review-new-prs','poise:approve-prs') and resource_cleanup is not null))"
 
 
 def initial(call_id: str | None = None, correlation: str | None = None) -> str:
@@ -43,7 +48,7 @@ def _database(path: Path):
 
 
 def read(conn: sqlite3.Connection, call_id: str) -> dict:
-    row = conn.execute("select resource_ownership from calls where id=? and source='poise:behavior-chain'", (call_id,)).fetchone()
+    row = conn.execute(f"select resource_ownership from calls where id=? and {MANAGED_CALLS}", (call_id,)).fetchone()
     value = json.loads(row[0]) if row and row[0] else None
     if not isinstance(value, dict) or value.get("version") not in (1, 2) \
             or not isinstance(value.get("roots"), list) or not isinstance(value.get("errors"), list):
@@ -195,10 +200,10 @@ def binding() -> tuple[Path, str] | None:
     if not database or not call_id:
         raise RuntimeError("native resource ownership lacks its Call binding")
     with _database(Path(database)) as conn:
-        row = conn.execute("select source from calls where id=?", (call_id,)).fetchone()
+        row = conn.execute(f"select {MANAGED_CALLS} from calls where id=?", (call_id,)).fetchone()
     if row is None:
         raise RuntimeError("resource ownership binding does not identify a Call")
-    if row[0] != "poise:behavior-chain":
+    if not row[0]:
         return None
     return Path(database), call_id
 

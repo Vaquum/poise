@@ -495,6 +495,7 @@ async function main(args) {
       let diagnosticTail = ''
       let runnerNoResult = false
       const pytestFailure = callerPytest ? callerPytestFailure() : null
+      let evidence = null
       const read = frameReader((type, payload) => {
         if (type === FRAME.stdout || type === FRAME.stderr) pytestFailure?.write(type, payload)
         if (type === FRAME.stderr && retainFailedSource) {
@@ -512,14 +513,7 @@ async function main(args) {
           clearTimeout(deadline)
         }
         else if (type === FRAME.evidence && binding && process.env.POISE_TEST_EVIDENCE_DIR && payload.length <= 48 * 1024) {
-          // Only the gateway can authenticate this receipt. Caller checks it
-          // independently and retains it before reclaiming this directory.
-          try {
-            writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, `${id}.json`), payload, { flag: 'wx', mode: 0o600 })
-          } catch (error) {
-            // A failed receipt must not replace the suite's genuine exit with a no-result handoff.
-            say(`assertion recovery evidence could not be retained: ${error.message}`)
-          }
+          evidence = payload
         }
         else if (type === FRAME.fail) failure = { code: payload[0], message: payload.subarray(1).toString() }
         else if (type === FRAME.ready && !upload) {
@@ -556,7 +550,8 @@ async function main(args) {
         attempt -= 1
         continue
       }
-      if (failure?.code === 125 && failure.message === GATEWAY_RESTART) {
+      if (failure?.code === 125 && (failure.message === GATEWAY_RESTART
+        || failure.message.startsWith('sending the checkout to the box failed: '))) {
         say(`interrupted validation: candidate ${candidate}, suite ${suite}, run ${id}: no test result: ${failure.message}`)
         if (attempt === 0) {
           say('waiting up to 30 s for the authenticated relay handshake, then retrying this captured suite once within the remaining time budget')
@@ -567,6 +562,14 @@ async function main(args) {
       else if (exitCode === null) await stop(125, 'the connection to the test relay ended before the suite did')
       else if (exitCode === 125 && runnerNoResult) await stop(exitCode, undefined, true)
       else {
+        // Receipt delivery can precede exit. Retain it only with the suite result.
+        if (exitCode === 1 && evidence) {
+          try {
+            writeFileSync(join(process.env.POISE_TEST_EVIDENCE_DIR, id + '.json'), evidence, { flag: 'wx', mode: 0o600 })
+          } catch (error) {
+            say('assertion recovery evidence could not be retained: ' + error.message)
+          }
+        }
         if (exitCode !== 0) {
           const summary = pytestFailure?.summary()
           if (summary) say(`completed Caller pytest failure: captured candidate ${candidate}, producing run ${id}, exit ${exitCode}\n${summary}`)

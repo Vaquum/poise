@@ -32,7 +32,7 @@ def _claim(database: Path, call_id: str) -> tuple[str | None, str | None]:
         conn.row_factory = sqlite3.Row
         conn.execute("begin immediate")
         row = conn.execute("select pid,process_identity,resources_settled_at,resource_cleanup from calls where id=? "
-                           "and source='poise:behavior-chain'", (call_id,)).fetchone()
+                           f"and {ownership.MANAGED_CALLS}", (call_id,)).fetchone()
         if row is None:
             raise RuntimeError("native cleanup Call is unavailable")
         # The candidate list can predate another worker's settlement or retry.
@@ -162,7 +162,7 @@ def recover(database: Path, *, limit: int = MAX_CALLS, seconds: int = PASS_SECON
     deadline = monotonic() + seconds
     report = {"version": 1, "examined": 0, "released": [], "held": []}
     with ownership._database(database) as conn:
-        rows = conn.execute("select id from calls where source='poise:behavior-chain' "
+        rows = conn.execute(f"select id from calls where {ownership.MANAGED_CALLS} "
                             "and json_valid(resource_ownership) and json_extract(resource_ownership,'$.version')=2 "
                             "and (resources_settled_at is null or resource_cleanup is not null) "
                             "and coalesce(json_extract(resource_cleanup,'$.next_attempt_at'),0) <= ? "

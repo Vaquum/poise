@@ -1,4 +1,5 @@
 """One implementation or repair invocation, with no persistent model session."""
+from hashlib import sha256
 import json
 import os
 import re
@@ -283,9 +284,33 @@ def _ci_only_blocker(ci: object, queue: dict, head: str, actor: str) -> object:
     return blocker
 
 
+def _repair_deadline_identity(prepared: dict, packet: dict, checkout: Path, number: int, pull: int,
+                              expected_head: str | None, basis: str) -> tuple[dict | None, dict | None]:
+    base = prepared.get("base_sha")
+    review_base = ((packet.get("pull") or {}).get("base") or {}).get("sha")
+    reviews = [packet.get(key) for key in ("review_threads", "change_request_reviews", "author_pr_comments")]
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_head or "") or not isinstance(base, str) \
+            or not re.fullmatch(r"[0-9a-f]{40}", base) or not re.fullmatch(r"[0-9a-f]{64}", basis) \
+            or prepared.get("head_sha") != expected_head or prepared.get("checkout_head") != expected_head \
+            or prepared.get("path") != str(checkout) or prepared.get("issue_number") != number or prepared.get("pull_number") != pull \
+            or packet.get("head_sha") != expected_head or review_base != base or packet.get("pull_number") != pull \
+            or packet.get("repository") != prepared.get("repository") or not all(isinstance(items, list) for items in reviews):
+        return None, None
+    try:
+        baseline = failed_source.repair_snapshot(checkout, expected_head)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None, None
+    identity = {"issue": number, "basis": basis, "integration_base": base,
+                "review_sha": sha256(json.dumps(reviews, sort_keys=True).encode()).hexdigest(),
+                "prepared_sha": sha256(json.dumps(baseline, sort_keys=True).encode()).hexdigest()}
+    return identity, baseline
+
+
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
         call_id: str, record: Callable[[dict], None], pull: int | None = None,
-        expected_head: str | None = None, note: str = "", merge_base: bool = False, expected_issue_revision: str | None = None) -> dict:
+        expected_head: str | None = None, note: str = "", merge_base: bool = False,
+        expected_issue_revision: str | None = None, *, repair_basis: str | None = None,
+        repair_predecessor: str | None = None) -> dict:
     progress.stage("preparing_workspace", "Preparing the atomic workspace")
     work.mkdir(parents=True, exist_ok=True)
     checkout = work / "repo"
@@ -309,22 +334,6 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         return prepared
     test_capture = {"call": call_id, "nonce": secrets.token_hex(32), "repository": repo, "base": prepared["checkout_head"]}
     record({"phase": "prepared", "prepared": prepared, "test_capture": test_capture, "seed_revision": seed_revision})
-    restored = None
-    if pull is None:
-        try:
-            bound = resource_ownership.binding()
-        except Exception:
-            bound = None
-        if bound is not None and bound[1] == call_id:
-            try:
-                result = failed_source.restore_deadline(bound[0], call_id, checkout, prepared["checkout_head"], seed_revision)
-            except Exception as error:
-                raise AtomicWorkFailed(f"deadline restore verification failed; no publication attempted: {error}") from error
-            if result.get("status") == "restored":
-                restored = result
-                record({"phase": "prepared", "prepared": prepared, "seed_revision": seed_revision,
-                        "deadline_restored": {"predecessor": result["predecessor"], "base": result["base"],
-                                              "seed": result["seed"], "count": len(result["paths"])}})
     test_evidence = work / "test-evidence"
     test_evidence.mkdir(mode=0o700)
     evidence = {}
@@ -337,6 +346,28 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         required_reply_ids = {thread["root_comment_id"] for thread in evidence["review_packet"]["review_threads"] if not thread["is_resolved"]}
         evidence["queue"] = issue_review.interface("--pull-action-state", str(pull), "--repository", repo,
                                                    "--token-user", actor, "--queue-evidence")
+    try:
+        bound = resource_ownership.binding() if pull is None or repair_basis else None
+    except Exception:
+        bound = None
+    if bound is not None and bound[1] != call_id:
+        bound = None
+    repair, baseline = None, None
+    if bound is not None and pull is not None and repair_basis:
+        repair, baseline = _repair_deadline_identity(prepared, evidence["review_packet"], checkout,
+                                                     number, pull, expected_head, repair_basis)
+    restored = None
+    if bound is not None and (pull is None or repair is not None and repair_predecessor):
+        try:
+            result = failed_source.restore_deadline(bound[0], call_id, checkout, prepared["checkout_head"], seed_revision,
+                                                   repair=repair, original_call=repair_predecessor)
+        except Exception as error:
+            raise AtomicWorkFailed("deadline restore verification failed; no publication attempted") from error
+        if result["status"] == "restored":
+            restored = result
+            record({"phase": "prepared", "deadline_restored": {
+                "predecessor": result["predecessor"], "base": result["base"], "seed": result["seed"],
+                "count": len(result["paths"]), "sha256": result["sha256"]}})
     seconds = review_budget.timeout(issue_review.TIMEOUT_SECONDS, reserve=issue_review.POST_RESERVE_SECONDS)
     instruction = (
         f"Read AGENTS.md and its routed repository instructions first. You are the {'PR repair' if pull else 'issue implementation'} behavior "
@@ -389,8 +420,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "testDependency: {base: prepared.checkout_head, run: original producing CI run ID, baselineRun: a distinct CI run ID "
         "on that exact base, remediation: existing repository GitHub issue URL}. Caller independently reads the complete "
         "assertion artifacts and requires every original failure/cause on the exact base. Keep blocked as the concrete string. "
-        "Relay assertion proof is currently held for #1619: candidate-controlled reports cannot authorize recovery. "
-        "Do not use source 'relay'; worker text and historical relay output cannot substitute. "
+        "The standalone relay text assertion command is /usr/local/bin/node "
+        "/opt/poise-assertions/node_modules/vitest/vitest.mjs run tests/FILE.test.mjs. "
+        "For a block caused solely by a completed assertion in that mode, "
+        "Supply testDependency with source 'relay', base: prepared.checkout_head, run: the original run ID, baselineRun: "
+        "the independent clean exact-base run ID for the same command, and remediation: the existing repository issue URL. "
+        "Caller requires both authenticated receipts and every original failure and cause. Worker text, ordinary suite output and interrupted runs provide only diagnosis. "
         "Do not use the CI dependency for candidate-specific failures or other blockers. "
         'If a repair is blocked solely by failed CI on the supplied PR head or a verified merge-group-only failure, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
         "Use this ci_only receipt even when PR-head checks are green and optional baseline proof is unavailable. "
@@ -424,44 +459,34 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                 done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env,
                                               provider=model.provider, **({"head_watch": watch} if watch else {}))
             except subprocess.TimeoutExpired as error:
-                if pull is None:
+                elapsed_ms = round((monotonic() - started) * 1000)
+                if bound is not None and (pull is None or repair is not None):
+                    base = prepared["checkout_head"]
+                    proven = not lease.retained
+                    if proven:
+                        try:
+                            issue_review.stop_leftovers(work)
+                            proven = issue_review._cwd_pids(work, require_complete=True) == []
+                            scope = native_namespace.active()
+                            if proven and scope is not None:
+                                scope.require_idle()
+                        except Exception:
+                            proven = False
                     try:
-                        bound = resource_ownership.binding()
-                    except Exception:
-                        bound = None
-                    if bound is not None and bound[1] == call_id:
-                        base = prepared.get("checkout_head")
-                        proven = not lease.retained
                         if proven:
-                            try:
-                                issue_review.stop_leftovers(work)
-                                proven = issue_review._cwd_pids(work, require_complete=True) == []
-                            except Exception:
-                                proven = False
-                        if proven:
-                            try:
-                                scope = native_namespace.active()
-                                if scope is not None:
-                                    scope.require_idle()
-                            except Exception:
-                                proven = False
-                        if proven:
-                            try:
-                                failed_source.capture_deadline(bound[0], call_id, checkout, base, seed_revision)
-                            except Exception:
-                                pass
+                            failed_source.capture_deadline(bound[0], call_id, checkout, base, seed_revision,
+                                                           repair=repair, baseline=baseline)
                         else:
-                            try:
-                                record({"phase": "executing", "prepared": prepared,
-                                        "deadline_source": {"status": "unavailable", "base": base,
-                                                            "seed": seed_revision, "reason": failed_source.DEADLINE_REASON}})
-                            except Exception:
-                                pass
+                            record({"phase": "executing", "deadline_source": {"status": "unavailable", "base": base,
+                                                                            "seed": seed_revision, "reason": failed_source.DEADLINE_REASON}})
+                    except Exception:
+                        # Optional capture cannot replace the typed timeout receipt.
+                        pass
                 raise review_budget.ReviewLimitError(
                     "Atomic behavior provider exhausted its execution budget; no publication attempted",
                     "atomic_work_execution_budget_exhausted",
                     diagnostic_envelope(operation="provider.atomic_work", phase="provider_execution", outcome="timed_out",
-                                        executable=model.provider, elapsed_ms=round((monotonic() - started) * 1000),
+                                        executable=model.provider, elapsed_ms=elapsed_ms,
                                         timeout_seconds=seconds, repository=repo, pr=pull, expected_head=expected_head,
                                         behavior="repair_pr" if pull is not None else "implement_issue",
                                         message=f"Seed issue {repo}#{number}", submission="none")) from error

@@ -1,15 +1,15 @@
 // @vitest-environment node
 // Agents' test suites run on disposable test boxes: these run the real hooks, runner, relay and box
 // script, with only Render itself replaced. docs/Operating.md, "Agents' test suites".
-import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process'
-import { createHash, generateKeyPairSync } from 'node:crypto'
+import { execFile, execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process'
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { runInNewContext } from 'node:vm'
-import { gunzipSync, gzipSync } from 'node:zlib'
+import { deflateSync, gunzipSync, gzipSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
@@ -490,7 +490,7 @@ describe('Poise', () => {
 })
 
 describe('a suite on a test box', () => {
-  interface Box { id: string; plan: string; group: string; snapshotName: string | null; timeoutSeconds: number; idleTimeoutSeconds: number; createdAt: string; status: string; child: ChildProcess | null; dir: string }
+  interface Box { id: string; plan: string; group: string; snapshotName: string | null; timeoutSeconds: number; idleTimeoutSeconds: number; createdAt: string; status: string; child: ChildProcess | null; dir: string; container?: string }
   interface Snapshot { id: string; name: string; status: string; expiresAt: string; sandboxGroupId: string }
   interface Job { id: string; service: string; startCommand: string; planId: string; status: string; child: ChildProcess | null }
   let render: Server
@@ -509,7 +509,9 @@ describe('a suite on a test box', () => {
   let listLagMs: number
   let runBoxes: boolean
   let runJobs: boolean
-  let refuseTreeUploads: boolean
+  let refuseTreeUploads: number
+  let treeUploads: { boxId: string; path: string; body: Buffer }[]
+  let omitCommandExit: boolean
   let warnings: Record<string, unknown>[]
   let events: Record<string, unknown>[]
   let runners: { child: ChildProcess; done: Promise<unknown> }[]
@@ -520,6 +522,8 @@ describe('a suite on a test box', () => {
   let hooks: string
   let unpacked: string
   let uploads: { path: string; bytes: number }[]
+  let assertionBoxImage: string | undefined
+  let delayAssertionExit: boolean
 
   async function listen(server: Server, port = 0): Promise<number> {
     await new Promise<void>((done) => { server.listen(port, '127.0.0.1', done) })
@@ -557,13 +561,21 @@ describe('a suite on a test box', () => {
     const [, script, spec, tree] = command.split(' ')
     const inBox = (path: string) => join(box.dir, path)
     if (!runBoxes) return
-    const child = spawn(process.execPath, [inBox(script), inBox(spec), inBox(tree), unpacked], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const options = { stdio: ['ignore', 'pipe', 'pipe'] } satisfies SpawnOptions
+    const child = assertionBoxImage
+      ? spawn('docker', ['run', '--rm', '--name', box.container = 'poise-' + basename(box.dir),
+        ...(process.platform === 'linux' ? ['--network', 'host'] : []),
+        '-v', inBox('/tmp') + ':/uploads', assertionBoxImage, 'sh', '-c',
+        'chmod 1777 / /opt && exec node /uploads/poise-box.cjs /uploads/poise-spec.json /uploads/poise-tree'], options)
+      : spawn(process.execPath, [inBox(script), inBox(spec), inBox(tree), unpacked], options)
     box.child = child
     child.stdout?.on('data', (chunk) => { event('output', { data: chunk.toString(), stream: 'stdout' }) })
     child.stderr?.on('data', (chunk) => { event('output', { data: chunk.toString(), stream: 'stderr' }) })
     child.on('close', (code) => {
-      if (box.status === 'running') event('exit', { exit_code: code })
-      res.end()
+      if (!delayAssertionExit) {
+        if (box.status === 'running' && !omitCommandExit) event('exit', { exit_code: code })
+        res.end()
+      }
     })
   }
 
@@ -586,11 +598,17 @@ describe('a suite on a test box', () => {
         mkdirSync(dirname(file), { recursive: true })
         const chunks: Buffer[] = []
         for await (const chunk of req) chunks.push(chunk as Buffer)
-        if (refuseTreeUploads && url.searchParams.get('path')?.startsWith('/tmp/poise-tree/')) {
-          res.writeHead(503).end('upload refused')
-          return
+        const body = Buffer.concat(chunks)
+        const uploadedPath = url.searchParams.get('path') ?? ''
+        if (uploadedPath.startsWith('/tmp/poise-tree/')) {
+          treeUploads.push({ boxId: box!.id, path: uploadedPath, body })
+          if (refuseTreeUploads > 0) {
+            refuseTreeUploads -= 1
+            res.writeHead(502).end('upload refused')
+            return
+          }
         }
-        writeFileSync(file, Buffer.concat(chunks))
+        writeFileSync(file, body)
         res.writeHead(200).end()
         return
       }
@@ -715,7 +733,11 @@ describe('a suite on a test box', () => {
     runners = []
     runBoxes = true
     runJobs = true
-    refuseTreeUploads = false
+    refuseTreeUploads = 0
+    treeUploads = []
+    omitCommandExit = false
+    assertionBoxImage = undefined
+    delayAssertionExit = false
     render = startRender()
     relayServer = undefined as unknown as Server
   })
@@ -723,12 +745,16 @@ describe('a suite on a test box', () => {
   afterEach(async () => {
     for (const runner of runners) if (runner.child.exitCode === null) runner.child.kill('SIGTERM')
     await Promise.all(runners.map((runner) => runner.done))
-    for (const box of boxes.values()) box.child?.kill('SIGKILL')
+    for (const box of boxes.values()) {
+      box.child?.kill('SIGKILL')
+      if (box.container) spawnSync('docker', ['rm', '-f', box.container], { stdio: 'ignore', timeout: 5_000 })
+    }
     for (const job of jobs.values()) job.child?.kill('SIGKILL')
     relay?.stop()
     for (const server of [relayServer, render]) {
-      server?.closeAllConnections()
-      await new Promise((done) => { server?.close(done) })
+      if (!server) continue
+      server.closeAllConnections()
+      await new Promise((done) => { server.close(done) })
     }
   })
 
@@ -931,36 +957,14 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
     expect(run.assertions).toBeNull()
   })
 
-  it('holds relay inventories without trusting candidate-controlled reports', async () => {
-    await startAll()
-    const { assertionResult, sourceCapture } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as {
-      assertionResult: (reporter: { report: string, completion: string }, capture: { top: string }) => unknown,
+  it('compares source to the original tree even when uploaded git metadata hides a change', () => {
+    const { sourceCapture } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as {
       sourceCapture: (cwd: string) => { clean: boolean, source: string },
     }
-    const directory = temp()
-    const reporter = { report: join(directory, 'report.json'), completion: join(directory, 'complete.json') }
-    const failure = { fullName: 'original failure', status: 'failed', failureMessages: ['expected []'] }
-    const report = { success: false, numFailedTests: 1, numTotalTests: 1,
-      testResults: [{ name: join(directory, 'tests/a.test.ts'), status: 'failed', message: '', assertionResults: [failure] }] }
-    const complete = { errors: 0, reason: 'failed', setupFailed: false }
-    const parse = (value = report, completion = complete) => {
-      writeFileSync(reporter.report, JSON.stringify(value))
-      writeFileSync(reporter.completion, JSON.stringify(completion))
-      return assertionResult(reporter, { top: directory })
-    }
-    // Held for #1619: even a well-formed inventory is candidate-controlled, so none is trusted.
-    expect(parse()).toBeNull()
-    expect(parse(report, { ...complete, errors: 1 })).toBeNull()
-    expect(parse(report, { ...complete, setupFailed: true })).toBeNull()
-    expect(parse(report, { ...complete, reason: 'interrupted' })).toBeNull()
-    expect(parse({ ...report, numFailedTests: 2 })).toBeNull()
-    expect(parse({ ...report, testResults: [{ ...report.testResults[0], message: 'beforeAll failed' }] })).toBeNull()
-    expect(parse({ ...report, numFailedTests: 101, numTotalTests: 101,
-      testResults: [{ ...report.testResults[0], assertionResults: Array.from({ length: 101 }, () => failure) }] })).toBeNull()
-    rmSync(reporter.completion)
-    expect(assertionResult(reporter, { top: directory })).toBeNull()
     const repo = committed()
+    rmSync(join(repo, '.env'))
     execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
     const clean = sourceCapture(repo)
     expect(clean.clean).toBe(true)
     // Same HEAD and an index flag cannot pass off the dirty candidate as base.
@@ -968,7 +972,134 @@ it.each([1, 2])('shared fixed title', value => { expect(value).toBe(0) });`)
     writeFileSync(join(repo, 'tracked.txt'), 'dirty candidate')
     expect(sourceCapture(repo)).toMatchObject({ clean: false })
     expect(sourceCapture(repo).source).not.toBe(clean.source)
-  })
+    execFileSync('git', ['-C', repo, 'update-index', '--no-assume-unchanged', 'tracked.txt'])
+    execFileSync('git', ['-C', repo, 'add', 'tracked.txt'])
+    const tree = execFileSync('git', ['-C', repo, 'write-tree'], { encoding: 'utf8' }).trim()
+    const substitute = execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com',
+      'commit-tree', tree, '-m', 'substituted tree'], { encoding: 'utf8' }).trim()
+    execFileSync('git', ['-C', repo, 'replace', 'HEAD', substitute])
+    expect(sourceCapture(repo)).toMatchObject({ clean: false })
+    const object = execFileSync('git', ['-C', repo, 'cat-file', 'commit', substitute])
+    const objectFile = join(repo, '.git/objects', head.slice(0, 2), head.slice(2))
+    rmSync(objectFile)
+    writeFileSync(objectFile, deflateSync(Buffer.concat([Buffer.from('commit ' + object.length + '\0'), object])))
+    expect(() => sourceCapture(repo)).toThrow('git object does not match the prepared base')
+  }, 30_000)
+
+  it.skipIf(process.env.GITHUB_ACTIONS !== 'true' && process.env.POISE_GATEWAY_DOCKER_TESTS !== '1')(
+    'attests a completed standalone assertion under the real suite UID and refuses substituted and interrupted evidence', async () => {
+      const install = readFileSync('gateway/src/test-box-setup.sh', 'utf8').split('\n').find(line => line.startsWith('npm ci --prefix /opt/poise-assertions'))
+      expect(install).toBeDefined()
+      const iid = join(temp(), 'image')
+      const image = spawnSync('docker', ['build', '--progress=plain', '--iidfile', iid, '-f', '-', 'gateway'], { encoding: 'utf8', input: [
+        'FROM node:22-bookworm',
+        'RUN groupadd --gid 10001 poise && useradd --uid 10001 --gid 10001 --create-home poise && chmod 1777 / /opt',
+        'COPY package.json package-lock.json /opt/poise-assertions/',
+        'RUN ' + install,
+      ].join('\n') + '\n', timeout: 90_000 })
+      expect(image.status, image.stderr).toBe(0)
+      assertionBoxImage = readFileSync(iid, 'utf8').trim()
+      let now = Date.now()
+      await startAll({
+        baseService: 'crn-test', limitSeconds: 20, now: () => now,
+        origin: () => process.platform === 'linux' ? relayOrigin : relayOrigin.replace('127.0.0.1', 'host.docker.internal'),
+      })
+      const repo = repository()
+      const file = 'tests/text.test.mjs'
+      const source = "import { expect, test } from 'vitest'\nimport { readFileSync } from 'node:fs'\n"
+        + 'test("ships the fixed text", () => expect(readFileSync("tracked.txt", "utf8")).toBe("fixed\\n"))\n'
+      mkdirSync(join(repo, 'tests'))
+      writeFileSync(join(repo, file), source)
+      writeFileSync(join(repo, '.gitignore'), '.env\nnode_modules/\n')
+      execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'])
+      execFileSync('git', ['-C', repo, 'add', '.'])
+      execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'shared failure'])
+      const base = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+      const binding = { call: 'a'.repeat(32), nonce: 'b'.repeat(64), repository: 'example/repo', base }
+      const evidence = temp()
+      // On macOS, simulate the Linux capture without AppleDouble tar entries.
+      const env = { POISE_TEST_BINDING: JSON.stringify(binding), POISE_TEST_EVIDENCE_DIR: evidence, COPYFILE_DISABLE: '1' }
+      const argv = ['/usr/local/bin/node', '/opt/poise-assertions/node_modules/vitest/vitest.mjs', 'run', file]
+      const run = async (code: number) => {
+        const result = await suite(repo, argv, env).done
+        expect(result.code, result.stderr + '\n' + result.stdout).toBe(code)
+        return { ...result, id: /suite .+, run ([a-f0-9]{32})/.exec(result.stderr)?.[1] ?? '' }
+      }
+      const verify = (receipt: string, key = KEY) => fetch(relayUrl + '/evidence/verify', {
+        method: 'POST', headers: { authorization: 'Bearer ' + key }, body: receipt,
+      })
+
+      const baseline = await run(1)
+      const baselineReceipt = readFileSync(join(evidence, baseline.id + '.json'), 'utf8')
+      const clean = await (await verify(baselineReceipt)).json()
+      expect(clean).toMatchObject({ clean: true, base, binding, run: baseline.id, exit: 1 })
+
+      // These would run in an ordinary suite. Neither can supply collector input.
+      writeFileSync(join(repo, 'vitest.config.mjs'), 'throw new Error("candidate config ran")')
+      mkdirSync(join(repo, 'node_modules/vitest'), { recursive: true })
+      writeFileSync(join(repo, 'node_modules/vitest/vitest.mjs'), 'throw new Error("candidate Vitest ran")')
+      const original = await run(1)
+      const receipt = readFileSync(join(evidence, original.id + '.json'), 'utf8')
+      const proof = await (await verify(receipt)).json()
+      expect(proof).toMatchObject({ clean: false, base, binding, run: original.id, exit: 1, command: argv,
+        failures: [{ file, test: 'ships the fixed text', cause: expect.stringContaining('AssertionError:') }],
+        totals: [{ file, test: 'ships the fixed text', total: 1 }] })
+      expect(proof.failures).toEqual(clean.failures)
+      expect(proof.candidate).not.toBe(clean.candidate)
+      expect(proof.source).not.toBe(clean.source)
+      expect(jobs.size).toBe(0)
+      const python = resolve('caller/.venv/bin/python')
+      if (existsSync(python)) {
+        const home = temp()
+        execFileSync('sh', [join(SOURCE, 'install.sh')], { env: {
+          PATH: process.env.PATH, HOME: home, POISE_TEST_RELAY_URL: relayUrl, POISE_TEST_RELAY_KEY: KEY,
+        } })
+        const value = { base, capture: binding, run: original.id, baselineRun: baseline.id,
+          remediation: 'https://github.com/example/repo/issues/1',
+          relay: { original: JSON.parse(receipt), baseline: JSON.parse(baselineReceipt) } }
+        const script = 'import asyncio, json, sys\nfrom github_interface.test_dependency import _relay_proof\n'
+          + 'print(json.dumps(asyncio.run(_relay_proof("example/repo", json.loads(sys.argv[1])))))'
+        const result = await new Promise<string>((done, fail) => {
+          execFile(python, ['-c', script, JSON.stringify(value)], { env: { ...process.env, HOME: home }, timeout: 30_000 },
+            (error, stdout) => error ? fail(error) : done(stdout))
+        })
+        expect(JSON.parse(result)).toMatchObject({ base, candidate: proof.candidate, baselineCapture: clean.candidate,
+          failures: proof.failures, run: original.id, baselineRun: baseline.id })
+      }
+      expect((await verify(receipt, workspaceKey(privateKey, 'bob'))).status).toBe(403)
+      const changed = JSON.parse(receipt) as { payload: string, signature: string }
+      changed.payload = changed.payload.replace(original.id, baseline.id)
+      expect((await verify(JSON.stringify(changed))).status).toBe(422)
+
+      writeFileSync(join(repo, 'tracked.txt'), 'different candidate failure\n')
+      const different = await run(1)
+      expect(await (await verify(readFileSync(join(evidence, different.id + '.json'), 'utf8'))).json())
+        .toMatchObject({ failures: [{ causeDigest: expect.not.stringMatching(proof.failures[0].causeDigest) }] })
+      writeFileSync(join(repo, 'tracked.txt'), 'fixed\n')
+      const passing = await run(0)
+      expect(existsSync(join(evidence, passing.id + '.json'))).toBe(false)
+
+      // Use the exact same argv. File, config and dependency substitutions
+      // must never run inside the collector, even if they would exit 1.
+      writeFileSync(join(repo, file), source + 'console.error("forged inventory ran"); '
+        + 'readFileSync("/tmp/poise-spec.json"); process.exit(1)\n')
+      const forged = await run(125)
+      expect(forged.stderr).not.toContain('forged inventory ran')
+      expect(existsSync(join(evidence, forged.id + '.json'))).toBe(false)
+
+      writeFileSync(join(repo, file), source)
+      writeFileSync(join(repo, 'tracked.txt'), 'checked out\n')
+      delayAssertionExit = true
+      const interrupted = suite(repo, argv, env)
+      await until(() => [...relay.runs.values()].some(item => item.assertions !== null), 'collector submission before provider exit', 45_000)
+      const active = [...relay.runs.values()].find(item => item.assertions !== null)!
+      expect((await fetch(relayUrl + '/runs/' + active.id + '/assertions', {
+        method: 'POST', headers: { authorization: 'Bearer ' + active.token }, body: JSON.stringify(active.assertions),
+      })).status).toBe(409)
+      now += 20_001
+      expect(await interrupted.done).toMatchObject({ code: 124, stderr: expect.stringContaining('no test result') })
+      expect(existsSync(join(evidence, active.id + '.json'))).toBe(false)
+    }, 180_000)
 
   it('starts a suite on a job of the base service, which costs less, and gives the agent its output and exit code', async () => {
     await startAll({ baseService: 'crn-test' })
@@ -1818,6 +1949,84 @@ ${interruption === 'capture failed' ? 'process.exit(1)' : 'fs.copyFileSync(archi
     }
   })
 
+  it.each([[0, 0], [128 * 1024, 7], [0, 125]])('recovers exhausted checkout uploads with the original capture (extra bytes: %i, suite exit: %i)', async (bytes, status) => {
+    refuseTreeUploads = 3
+    await startAll({ maxRuns: 1 })
+    const repo = repository()
+    writeFileSync(join(repo, 'tracked.txt'), 'captured input')
+    if (bytes) writeFileSync(join(repo, 'large.bin'), randomBytes(bytes))
+    const run = suite(repo, [process.execPath, '-e', `console.log(require('fs').readFileSync(process.argv[1], 'utf8')); process.exit(${status})`, join(unpacked, repo, 'tracked.txt')])
+    await until(() => treeUploads.length > 0, 'the first captured part to reach Render')
+    writeFileSync(join(repo, 'tracked.txt'), 'edited after capture')
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(status)
+    expect(stdout).toBe('captured input\n')
+    const [failed, recovered] = suiteBoxes()
+    expect(suiteBoxes()).toHaveLength(2)
+    const refused = treeUploads.filter(({ boxId }) => boxId === failed.id)
+    expect(refused).toHaveLength(3)
+    expect(refused[1]).toEqual(refused[0])
+    expect(refused[2]).toEqual(refused[0])
+    if (bytes) expect(refused[0].body.length).toBe(64 * 1024)
+    else expect(refused[0].body.length).toBeLessThan(64 * 1024) // This part accompanies ?end=1.
+    const sent = treeUploads.filter(({ boxId }) => boxId === recovered.id)
+    expect(sent[0]).toEqual({ ...refused[0], boxId: recovered.id })
+    expect(failed.child).toBeNull()
+    expect(existsSync(join(failed.dir, 'tmp/poise-spec.json'))).toBe(false)
+    expect(relay.runs.size).toBe(0)
+    expect(terminated).toContain(failed.id)
+    const candidate = createHash('sha256').update(readFileSync(join(recovered.dir, 'tmp/poise-spec.json')))
+      .update(gunzipSync(Buffer.concat(sent.map(({ body }) => body)))).digest('hex')
+    const originalId = /, run ([a-f0-9]{32})/.exec(stderr)![1]
+    expect(stderr).toContain(`interrupted validation: candidate ${candidate}, suite `)
+    expect(stderr).toContain(`run ${originalId}: no test result: sending the checkout to the box failed: `)
+    expect(stderr).toContain(`relay recovered; rerunning candidate ${candidate} as run `)
+    expect(stderr).not.toContain('Skip local tests')
+    expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: originalId,
+      error: expect.stringContaining('with HTTP 502: upload refused') }))
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([expect.objectContaining({ exit: status })])
+  })
+
+  it.each(['upload', 'restart'])('shares one recovery allowance when the first failure is %s and the next is the other cause', async (first) => {
+    refuseTreeUploads = first === 'upload' ? 3 : 0
+    await startAll()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    if (first === 'restart') refuseTreeUploads = 3
+    relay.stop()
+    await startAll2()
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(stdout).toBe('started\n')
+    expect(stderr.match(/interrupted validation:/g)).toHaveLength(2)
+    expect(stderr).toContain('no test result: sending the checkout to the box failed: ')
+    expect(stderr).toContain('no test result: the gateway restarted')
+    expect(stderr.match(/retrying this captured suite once/g)).toHaveLength(1)
+    expect(stderr).toContain('Skip local tests for this work')
+    expect(suiteBoxes()).toHaveLength(2)
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([])
+  })
+
+  it.each([true, false])('retains cancellation and the original deadline after upload failure (cancel: %s)', async (cancel) => {
+    refuseTreeUploads = 3
+    await startAll()
+    const started = Date.now()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'], { BASH_DEFAULT_TIMEOUT_MS: '2500' })
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    if (cancel) run.child.kill('SIGTERM')
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(cancel ? 143 : 124)
+    expect(stdout).toBe('started\n')
+    expect(stderr).toContain('interrupted validation')
+    if (cancel) expect(stderr).not.toContain('Skip local tests')
+    else expect(stderr).toContain('no test result: the test offload exhausted its total time budget')
+    expect(Date.now() - started).toBeLessThan(5000)
+    expect(suiteBoxes()).toHaveLength(2)
+    expect(suiteBoxes()[0].child).toBeNull()
+    await until(() => relay.runs.size === 0 && suiteBoxes().every(({ id }) => terminated.includes(id)), 'both upload attempts to retire')
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([])
+  })
+
   it.each([7, 124, 125])('returns a genuine suite exit %s without retrying, even if its output names a gateway restart', async (status) => {
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.error('the gateway restarted'); process.exit(${status})`]).done
@@ -1936,8 +2145,9 @@ setInterval(() => {}, 1000)`)
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
   })
 
-  it.each([0, 4_000])('keeps the full rerun within the remaining command budget (setup delayed %i ms)', async (setupDelay) => {
+  it.each([[0, 'restart'], [4_000, 'restart'], [0, 'upload']] as const)('keeps the full rerun within the remaining command budget (setup delayed %i ms, %s)', async (setupDelay, interruption) => {
     setupMs = setupDelay
+    refuseTreeUploads = interruption === 'upload' ? 3 : 0
     await startAll()
     const control = temp()
     const clock = join(control, 'clock.cjs')
@@ -1972,21 +2182,26 @@ setInterval(() => {}, 1000)`)
       BASH_DEFAULT_TIMEOUT_MS: '3500', NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require "${clock}"`].filter(Boolean).join(' '),
     })
     let output = ''
+    let errors = ''
     run.child.stdout?.on('data', (chunk) => { output += chunk })
+    run.child.stderr?.on('data', (chunk) => { errors += chunk })
     const advance = async (at: number) => {
       writeFileSync(time, String(at))
       await until(() => existsSync(observed) && readFileSync(observed, 'utf8') === String(at), 'the runner clock to advance', 5_000)
     }
-    await until(() => output === 'started\n', 'the first suite to start')
-    const original = [...relay.runs.keys()][0]
+    await until(() => interruption === 'upload' ? errors.includes('interrupted validation') : output === 'started\n', 'the first run to be interrupted or start')
+    const original = events.find(({ event }) => event === 'test_relay.run.created')!.id
     expect(original).toMatch(/^[a-f0-9]{32}$/)
     await advance(1_000)
-    relay.stop()
-    await startAll2()
+    if (interruption === 'restart') {
+      relay.stop()
+      await startAll2()
+    }
     await until(() => relay.runs.size === 1, 'the replacement run to be admitted')
     const replacement = [...relay.runs.keys()][0]
     expect(replacement).not.toBe(original)
-    await until(() => output === 'started\nstarted\n', 'the replacement suite to start')
+    const expectedOutput = interruption === 'upload' ? 'started\n' : 'started\nstarted\n'
+    await until(() => output === expectedOutput, 'the replacement suite to start')
     await advance(3_499)
     expect(run.child.exitCode).toBeNull()
     expect(relay.runs.has(replacement)).toBe(true)
@@ -1994,7 +2209,7 @@ setInterval(() => {}, 1000)`)
     await until(() => run.child.exitCode !== null, 'the original deadline to stop the replacement suite', 5_000)
     const { code, stdout, stderr } = await run.done
     expect(code).toBe(124)
-    expect(stdout).toBe('started\nstarted\n')
+    expect(stdout).toBe(expectedOutput)
     expect(stderr).toContain('no test result: the test offload exhausted its total time budget')
     expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
     await until(() => !relay.runs.has(replacement), 'the timed-out replacement run to be retired')
@@ -2335,34 +2550,52 @@ ${stderr}`
     expect(lines.map((line) => JSON.parse(line)).filter(({ event }) => event === 'test_relay.request.failed')).toEqual([])
   }, 20_000)
 
-  it('fails loud when the box dies without a word', async () => {
+  it.each([false, true])('fails loud when the Render command stream ends without an exit event (otherwise successful: %s)', async (successful) => {
+    omitCommandExit = successful
     await startAll()
-    const { child, done } = suite(repository(), [process.execPath, '-e', 'console.log("up"); setInterval(() => {}, 1000)'])
-    child.stdout?.once('data', () => {
+    const { child, done } = suite(repository(), [process.execPath, '-e', successful ? 'console.log("up")' : 'console.log("up"); setInterval(() => {}, 1000)'])
+    if (!successful) child.stdout?.once('data', () => {
       const box = runBox()
       box.status = 'errored'
       box.child?.kill('SIGKILL')
     })
-    const { code, stderr } = await done
+    const { code, stdout, stderr } = await done
     expect(code).toBe(125)
+    expect(stdout).toBe('up\n')
     expect(stderr).toContain('no test result')
     expect(stderr).toContain('says nothing about your code')
+    expect(stderr).toContain('Skip local tests for this work')
+    expect(stderr).not.toContain('retrying this captured suite')
+    expect(suiteBoxes()).toHaveLength(1)
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([])
     const admission = /, run ([a-f0-9]{32})/.exec(stderr)
     expect(admission).not.toBeNull()
     expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![1],
       error: expect.stringContaining('the stream from the box ended before the command did') }))
   })
 
-  it('warns when the checkout upload fails', async () => {
-    refuseTreeUploads = true
+  it('stops after one recovery when checkout uploads persistently return 502', async () => {
+    refuseTreeUploads = Infinity
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done
     expect(code).toBe(125)
     expect(stderr).toContain('no test result: sending the checkout to the box failed:')
+    expect(stderr.match(/interrupted validation:/g)).toHaveLength(2)
+    expect(stderr.match(/retrying this captured suite once/g)).toHaveLength(1)
+    expect(stderr).toContain('Skip local tests for this work')
+    expect(treeUploads).toHaveLength(6)
+    expect(suiteBoxes()).toHaveLength(2)
+    for (const { id, child } of suiteBoxes()) {
+      expect(treeUploads.filter(({ boxId }) => boxId === id)).toHaveLength(3)
+      expect(child).toBeNull()
+      expect(terminated).toContain(id)
+    }
+    expect(relay.runs.size).toBe(0)
+    expect(events.filter(({ event }) => event === 'test_relay.run.finished')).toEqual([])
     const admission = /, run ([a-f0-9]{32})/.exec(stderr)
     expect(admission).not.toBeNull()
     expect(warnings).toContainEqual(expect.objectContaining({ event: 'test_relay.run.failed', id: admission![1],
-      error: expect.stringContaining('with HTTP 503: upload refused') }))
+      error: expect.stringContaining('with HTTP 502: upload refused') }))
   })
 
   it('keeps a healthy run whose box took long to get, however far Render\'s list lags', async () => {

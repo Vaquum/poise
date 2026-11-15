@@ -1,4 +1,4 @@
-"""Private inspection evidence from a failed validation's original archive."""
+"""Private source evidence from failed validation and provider deadlines."""
 from __future__ import annotations
 
 import base64
@@ -14,6 +14,7 @@ import stat
 import subprocess
 import tarfile
 from time import time
+from typing import Iterator
 
 from . import caller_store, resource_ownership
 
@@ -43,13 +44,13 @@ def _directory() -> int:
     return fd
 
 
-def _call(database: Path, call_id: str) -> dict:
+def _call(database: Path, call_id: str, behavior: str = "implement_issue") -> dict:
     if not re.fullmatch(r"[0-9a-f]{32}", call_id):
         raise ValueError("invalid source Call")
     with closing(caller_store.connect(database)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("select * from calls where id=?", (call_id,)).fetchone()
-    if row is None or row["source"] != "poise:behavior-chain" or row["behavior"] != "implement_issue":
+    if row is None or row["source"] != "poise:behavior-chain" or row["behavior"] != behavior:
         raise ValueError("source Call is unavailable in this workspace")
     return dict(row)
 
@@ -225,30 +226,114 @@ def discard_unless_failed(database: Path, call_id: str) -> None:
         conn.execute("update calls set artifact=json_remove(artifact,'$.failed_source') where id=?", (call_id,))
 
 
-def inspect(database: Path, call_id: str, candidate: str, run: str) -> dict:
-    """Return a private file location, never source bytes, to the linked remediation Call."""
+def _report_matches(report: dict, source: str, call: str, invocation: str, key: str) -> bool:
+    parts = ["atomic_work_blocked", source]
+    keys = [hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()]
+    hold = report.get("holdSequence")
+    if type(hold) is int and hold > 0:
+        keys.append(hashlib.sha256(json.dumps([*parts, invocation, hold], separators=(",", ":")).encode()).hexdigest())
+    attempts = report.get("attempts", [])
+    return report.get("key") == key and key in keys and report.get("source") == source \
+        and report.get("pull") is None and len(attempts) == 1 \
+        and attempts[0].get("call") == call and attempts[0].get("invocation") == invocation
+
+
+def _diagnosis_report(conn: sqlite3.Connection, diagnosis: str, original: dict, metadata: dict) -> tuple[int, str, int]:
+    if not re.fullmatch(r"[0-9a-f]{64}", diagnosis) or original["error_code"] != "atomic_work_blocked":
+        raise ValueError("unbound failed source diagnosis")
+    row = conn.execute("select json_extract(value,'$.inputs'), json_extract(value,'$.deadline') from meta "
+                       "where key=? and json_type(value,'$.outcome')='null'", ("behavior_chain_implementation_triage:" + diagnosis,)).fetchone()
+    if not row or not row[0] or type(row[1]) is not int or row[1] <= time() * 1000 \
+            or hashlib.sha256(row[0].encode()).hexdigest() != diagnosis:
+        raise ValueError("diagnosis is unavailable or no longer running")
+    intent = json.loads(row[0])
+    source = f"{original['repo'].lower()}#{original['pr_id']}"
+    if intent.get("source") != source or intent.get("capture") != metadata \
+            or intent.get("prepared") != metadata["base"] or intent.get("actor") != original["actor"] \
+            or intent.get("call") != original["id"] or intent.get("invocation") != original["correlation_id"]:
+        raise ValueError("diagnosis belongs to different source evidence")
+    accounts = dict(conn.execute("select key, value from meta where key in ('me', 'agentAccount')"))
+    if accounts.get("me", "").lower() != intent["actor"].lower() \
+            or accounts.get("agentAccount", "").lower() != intent["reviewer"].lower():
+        raise ValueError("diagnosis owner changed")
+    number, key = intent["report"], intent["reportKey"]
+    target = f"{original['repo'].lower()}#{number}"
+    states = {ident: json.loads(state) for ident, state in conn.execute(
+        "select chain_id, state from behavior_chain_current where chain_id in (?,?)", (source, target))}
+    source_state, report_state = states[source], states[target]
+    if any(state.get("author") != intent["actor"] or state.get("reviewer") != intent["reviewer"]
+           or state.get("mergeSha") or state.get("supersession") for state in (source_state, report_state)):
+        raise ValueError("diagnosis chain ownership changed")
+    for state, revision in ((source_state, intent["sourceRevision"]), (report_state, intent["revision"])):
+        observation = state["observation"]
+        issue, publication = observation["issue"], observation["publication"]
+        if not issue["open"] or not issue["eligible"] or issue["revision"] != revision or observation["pull"] is not None \
+                or observation["existingPulls"] or observation.get("workPublication") or publication["merged"] is not False \
+                or any(publication[name] is not None for name in ("pull_number", "head_sha", "head_invocation", "state", "merge_sha")):
+            raise ValueError("diagnosis chain no longer verifies no publication")
+    latest = source_state["invocations"][-1]
+    hold = conn.execute("select sequence from behavior_chain_events where chain_id=? "
+                        "and json_extract(payload,'$.type')='chain.held' order by sequence desc limit 1", (source,)).fetchone()
+    if not hold or hold[0] != intent["holdSequence"] or source_state["resumedAfterSequence"] >= hold[0] \
+            or not source_state.get("held") or source_state["held"] != latest["evidence"]["error"] \
+            or latest["id"] != intent["invocation"] or latest["callId"] != original["id"] \
+            or any(item["state"] != "settled" for item in source_state["invocations"]):
+        raise ValueError("diagnosis source hold changed")
+    report_observation = report_state["observation"]
+    issue = report_observation["issue"]
+    pending = any(item["state"] != "settled" or (item["behavior"] in ("implement-issue", "publish-issue")
+                  and (item.get("outcome") != "launch_deferred" or item.get("callId") or item["evidence"].get("action") != "not_started"))
+                  for item in report_state["invocations"])
+    reviews = [item for item in report_state["invocations"] if item["id"] == intent["review"]]
+    if report_state.get("held") or pending or not issue["open"] or issue["revision"] != intent["revision"] \
+            or intent["commentId"] not in issue["commentIds"] or not reviews:
+        raise ValueError("diagnosis no longer owns its reviewed report")
+    review = reviews[0]
+    evidence = review["evidence"]
+    if review["callId"] != intent["reviewCall"] or review["behavior"] != "review-issue" or review["actor"] != intent["reviewer"] \
+            or evidence["status"] != "completed" or evidence["action"] != "commented" or evidence["issue_revision"] != intent["revision"] \
+            or not any(receipt["comment_id"] == intent["commentId"] and receipt["issue"].lower() == target
+                       and receipt["author"].lower() == intent["reviewer"].lower() for receipt in evidence["receipts"]):
+        raise ValueError("diagnosis no longer owns its review Call")
+    return number, key, hold[0]
+
+
+def inspect(database: Path, call_id: str, candidate: str, run: str, diagnosis: str | None = None) -> dict:
+    """Return a private file location to the bound report implementation or diagnosis."""
     unavailable = {"status": "unavailable", "reason": "source evidence is absent, expired, mismatched or not authorized; reproduce afresh"}
     fd = None
     try:
         original = _call(database, call_id)
-        reader = _call(database, os.environ.get("AGENT_INTERFACE_FAILED_SOURCE_CALL", ""))
         artifact = json.loads(original["artifact"] or "{}")
         metadata = artifact.get("failed_source", {})
         if not _failed_unpublished(original, artifact) or not resource_ownership.publication_released(
                 original["resources_settled_at"], original["resource_ownership"], artifact) \
-                or reader["status"] != "running" or reader["repo"] != original["repo"] or reader["actor"] != original["actor"] \
                 or metadata.get("status") != "available" or metadata.get("candidate") != candidate or metadata.get("run") != run \
                 or not re.fullmatch(r"[0-9a-f]{32}", run) or not re.fullmatch(r"[0-9a-f]{64}", candidate) \
                 or metadata.get("expires_at", 0) <= time():
             return unavailable
         source = f"{original['repo'].lower()}#{original['pr_id']}"
-        key = hashlib.sha256(json.dumps(["atomic_work_blocked", source], separators=(",", ":")).encode()).hexdigest()
         with closing(sqlite3.connect(f"{_poise_database().as_uri()}?mode=ro", uri=True, timeout=1)) as conn:
-            report = conn.execute("select value from meta where key=?", ("behavior_chain_repair_report:" + key,)).fetchone()
-        report = json.loads(report[0]) if report else {}
-        if report.get("source") != source or report.get("pull") is not None or report.get("issueNumber") != int(reader["pr_id"]) \
-                or not any(attempt.get("call") == call_id and attempt.get("invocation") == original["correlation_id"]
-                           for attempt in report.get("attempts", [])):
+            conn.execute("begin")
+            hold = None
+            if diagnosis is None:
+                reader = _call(database, os.environ.get("AGENT_INTERFACE_FAILED_SOURCE_CALL", ""))
+                if reader["status"] != "running" or reader["repo"] != original["repo"] or reader["actor"] != original["actor"]:
+                    return unavailable
+                number, selected = int(reader["pr_id"]), None
+            else:
+                number, selected, hold = _diagnosis_report(conn, diagnosis, original, metadata)
+            prefix = "behavior_chain_repair_report:"
+            rows = conn.execute("select key, value from meta where key glob ? and json_extract(value,'$.source')=? "
+                                "and json_extract(value,'$.issueNumber')=?", (prefix + "*", source, number)).fetchall()
+        reports = []
+        for storage_key, value in rows:
+            report = json.loads(value)
+            key = storage_key[len(prefix):]
+            if (hold is None or report.get("holdSequence") == hold and report.get("adopted") is not True) \
+                    and _report_matches(report, source, call_id, original["correlation_id"], key):
+                reports.append(key)
+        if len(reports) != 1 or selected is not None and reports[0] != selected:
             return unavailable
         fd = _directory()
         name = f"failed-source-{call_id}-{run}.json"
@@ -270,7 +355,7 @@ def inspect(database: Path, call_id: str, candidate: str, run: str) -> dict:
             os.close(fd)
 
 
-def _checkout_changes(checkout: Path, base: str) -> list[dict]:
+def _checkout_tree(checkout: Path, base: str) -> dict[str, tuple[str, str]]:
     if _git(checkout, "rev-parse", "HEAD").decode().strip() != base:
         raise ValueError("capture base mismatch")
     tracked = {}
@@ -282,10 +367,15 @@ def _checkout_changes(checkout: Path, base: str) -> list[dict]:
         if kind != "blob":
             raise ValueError("nested repository capture is unavailable")
         tracked[name.decode()] = (mode, digest)
+    return tracked
+
+
+def _checkout_files(checkout: Path, tracked: dict[str, tuple[str, str]], *,
+                    contents: bool) -> Iterator[tuple[str, str, str, int, bytes]]:
     algorithm = _git(checkout, "rev-parse", "--show-object-format").decode().strip()
-    seen, changes = set(), []
-    size = 0
-    for chunk in _git(checkout, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split(b"\0"):
+    # An unresolved merge has multiple index entries for the same worktree file.
+    names = _git(checkout, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split(b"\0")
+    for chunk in dict.fromkeys(names):
         if not chunk:
             continue
         name = chunk.decode()
@@ -300,9 +390,6 @@ def _checkout_changes(checkout: Path, base: str) -> list[dict]:
             node = full.lstat()
         except FileNotFoundError:
             continue
-        if name in seen:
-            raise ValueError("duplicate captured source")
-        seen.add(name)
         parent_parts = path.parent.parts
         for depth in range(1, len(parent_parts) + 1):
             if not stat.S_ISDIR((checkout / "/".join(parent_parts[:depth])).lstat().st_mode):
@@ -318,14 +405,31 @@ def _checkout_changes(checkout: Path, base: str) -> list[dict]:
             with full.open("rb") as source:
                 while chunk := source.read(64 * 1024):
                     hasher.update(chunk)
-                    if node.st_size <= MAX_BYTES:
+                    if contents and node.st_size <= MAX_BYTES:
                         parts.append(chunk)
             data, digest = b"".join(parts), hasher.hexdigest()
         else:
             raise ValueError("captured source is not a file or symlink")
+        yield name, mode, digest, node.st_size, data
+
+
+def repair_snapshot(checkout: Path, head: str) -> dict[str, tuple[str, str]]:
+    """Read the actual prepared files, including staged base changes and conflict markers."""
+    tracked = _checkout_tree(checkout, head)
+    return {name: (mode, digest) for name, mode, digest, _, _ in _checkout_files(checkout, tracked, contents=False)}
+
+
+def _checkout_changes(checkout: Path, base: str, baseline: dict[str, tuple[str, str]] | None) -> list[dict]:
+    tracked = _checkout_tree(checkout, base) if baseline is None else baseline
+    if baseline is not None and _git(checkout, "rev-parse", "HEAD").decode().strip() != base:
+        raise ValueError("capture base mismatch")
+    seen, changes = set(), []
+    size = 0
+    for name, mode, digest, file_size, data in _checkout_files(checkout, tracked, contents=True):
+        seen.add(name)
         if tracked.get(name) == (mode, digest):
             continue
-        if node.st_size > MAX_BYTES:
+        if file_size > MAX_BYTES:
             raise ValueError("source evidence exceeds its byte limit")
         size += len(data)
         if size > MAX_BYTES:
@@ -335,9 +439,10 @@ def _checkout_changes(checkout: Path, base: str) -> list[dict]:
     return sorted(changes, key=lambda change: change["path"])
 
 
-def capture_deadline(database: Path, call_id: str, checkout: Path, base: str, seed: str) -> dict:
-    """Retain bounded first-implementation edits after a proven provider deadline."""
-    row = _call(database, call_id)
+def capture_deadline(database: Path, call_id: str, checkout: Path, base: str, seed: str, *,
+                     repair: dict | None = None, baseline: dict[str, tuple[str, str]] | None = None) -> dict:
+    """Retain bounded source edits after a proven provider deadline."""
+    row = _call(database, call_id, "implement_issue" if repair is None else "repair_pr")
     artifact = json.loads(row["artifact"] or "{}")
     if row["status"] != "running" or not _unpublished(row, artifact):
         raise ValueError("deadline capture lacks its original unpublished Call")
@@ -361,14 +466,20 @@ def capture_deadline(database: Path, call_id: str, checkout: Path, base: str, se
                 raise ValueError("capture checkout mismatch")
         if root.resolve() != root or checkout.resolve() != checkout:
             raise ValueError("capture checkout mismatch")
-        repo, issue, actor = row["repo"], int(row["pr_id"]), row["actor"]
+        repo, actor = row["repo"], row["actor"]
+        issue = int(row["pr_id"]) if repair is None else repair["issue"]
         if prepared.get("repository") != repo or prepared.get("issue_number") != issue or prepared.get("actor") != actor:
             raise ValueError("capture checkout mismatch")
-        changes = _checkout_changes(checkout, base)
+        if repair is not None and (baseline is None or row["expected_head"] != base or prepared.get("head_sha") != base
+                                   or prepared.get("base_sha") != repair["integration_base"]
+                                   or prepared.get("pull_number") != int(row["pr_id"])):
+            raise ValueError("capture repair mismatch")
+        changes = _checkout_changes(checkout, base, baseline)
         if not changes:
             raise ValueError("no edits to retain")
+        identity = {"repair": repair} if repair is not None else {}
         payload = json.dumps({"call": call_id, "repo": repo, "issue": issue, "actor": actor,
-                              "base": base, "seed": seed, "changes": changes}, separators=(",", ":")).encode()
+                              "base": base, "seed": seed, **identity, "changes": changes}, separators=(",", ":")).encode()
         if len(payload) > MAX_BYTES:
             raise ValueError("source evidence exceeds its byte limit")
         fd = _directory()
@@ -377,7 +488,7 @@ def capture_deadline(database: Path, call_id: str, checkout: Path, base: str, se
             target.write(payload)
             target.flush()
             os.fsync(target.fileno())
-        metadata = {"status": "available", "base": base, "seed": seed,
+        metadata = {"status": "available", "base": base, "seed": seed, **identity,
                     "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
                     "expires_at": int(time()) + RETENTION_SECONDS}
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
@@ -402,11 +513,12 @@ def capture_deadline(database: Path, call_id: str, checkout: Path, base: str, se
     return metadata
 
 
-def discard_deadline_unless_failed(database: Path, call_id: str) -> None:
-    row = _call(database, call_id)
+def discard_deadline_unless_failed(database: Path, call_id: str, behavior: str = "implement_issue") -> None:
+    row = _call(database, call_id, behavior)
     artifact = json.loads(row["artifact"] or "{}")
     metadata = artifact.get("deadline_source")
-    if not isinstance(metadata, dict) or _failed_unpublished(row, artifact):
+    if not isinstance(metadata, dict) or (_failed_unpublished(row, artifact)
+                                          and row["error_code"] == "atomic_work_execution_budget_exhausted"):
         return
     if metadata.get("status") == "available":
         fd = _directory()
@@ -529,33 +641,44 @@ def _restore_entries(changes: object, checkout: Path) -> list[tuple[str, str | N
     return entries
 
 
-def restore_deadline(database: Path, successor_call: str, checkout: Path, base: str, seed: str) -> dict:
-    """Restore the immediate predecessor's deadline edits onto a matching clean checkout."""
+def restore_deadline(database: Path, successor_call: str, checkout: Path, base: str, seed: str, *,
+                     repair: dict | None = None, original_call: str | None = None) -> dict:
+    """Restore the predecessor's deadline edits onto the matching preparation."""
     unavailable = {"status": "unavailable", "reason": DEADLINE_UNAVAILABLE_REASON}
     if not Path(database).is_file():
         return unavailable
     fd = None
     validated = False
     try:
-        successor = _call(database, successor_call)
-        with closing(caller_store.connect(database)) as conn:
-            conn.row_factory = sqlite3.Row
-            found = conn.execute("select * from calls where repo=? and pr_id=? and behavior='implement_issue' "
-                                 "and source='poise:behavior-chain' and id!=? "
-                                 "order by started_at desc, rowid desc limit 1",
-                                 (successor["repo"], successor["pr_id"], successor_call)).fetchone()
-        if found is None:
-            return unavailable
-        predecessor = dict(found)
+        if repair is None:
+            successor = _call(database, successor_call)
+            with closing(caller_store.connect(database)) as conn:
+                conn.row_factory = sqlite3.Row
+                found = conn.execute("select * from calls where repo=? and pr_id=? and behavior='implement_issue' "
+                                     "and source='poise:behavior-chain' and id!=? "
+                                     "order by started_at desc, rowid desc limit 1",
+                                     (successor["repo"], successor["pr_id"], successor_call)).fetchone()
+            if found is None:
+                return unavailable
+            predecessor = dict(found)
+        else:
+            if not original_call or original_call == successor_call:
+                return unavailable
+            successor = _call(database, successor_call, "repair_pr")
+            predecessor = _call(database, original_call, "repair_pr")
+            if successor["expected_head"] != base or predecessor["expected_head"] != base:
+                return unavailable
         pred_artifact = json.loads(predecessor["artifact"] or "{}")
         metadata = pred_artifact.get("deadline_source", {})
-        if not _failed_unpublished(predecessor, pred_artifact) or not resource_ownership.publication_released(
+        if not _failed_unpublished(predecessor, pred_artifact) or predecessor["review_id"] is not None \
+                or predecessor["error_code"] != "atomic_work_execution_budget_exhausted" or not resource_ownership.publication_released(
                 predecessor["resources_settled_at"], predecessor["resource_ownership"], pred_artifact):
             return unavailable
         if successor["status"] != "running" or successor["repo"] != predecessor["repo"] \
                 or successor["actor"] != predecessor["actor"] or successor["pr_id"] != predecessor["pr_id"]:
             return unavailable
         if metadata.get("status") != "available" or metadata.get("base") != base or metadata.get("seed") != seed \
+                or metadata.get("repair") != repair \
                 or not re.fullmatch(r"[0-9a-f]{40}", base) or not re.fullmatch(r"[0-9a-f]{64}", seed) \
                 or metadata.get("expires_at", 0) <= time():
             return unavailable
@@ -572,8 +695,9 @@ def restore_deadline(database: Path, successor_call: str, checkout: Path, base: 
         evidence = json.loads(payload)
         if hashlib.sha256(payload).hexdigest() != metadata.get("sha256") \
                 or any(evidence.get(key) != value for key, value in {
-                    "call": predecessor["id"], "repo": predecessor["repo"], "issue": int(predecessor["pr_id"]),
-                    "actor": predecessor["actor"], "base": base, "seed": seed}.items()):
+                    "call": predecessor["id"], "repo": predecessor["repo"],
+                    "issue": int(predecessor["pr_id"]) if repair is None else repair["issue"],
+                    "actor": predecessor["actor"], "base": base, "seed": seed, "repair": repair}.items()):
             return unavailable
         entries = _restore_entries(evidence.get("changes"), checkout)
         for path, _, _ in entries:
