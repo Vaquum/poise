@@ -12,6 +12,7 @@ interface Surface {
   tool?: 'poise_work' | 'poise_get' | 'poise_list' | 'poise_changes'
   requiresWorkspace?: true
   requiresChat?: true
+  requiresOperator?: true
   reason: string
 }
 
@@ -41,7 +42,9 @@ const parts = {
   tasks: work,
   behaviors: workspace('behaviors'),
   github: { ...work, reason: 'Issue mirror and recorded PR observations' },
-  logging: browser('logging', 'Gateway Logging and workspace diagnostic evidence', 'Source retention and coverage windows', 'Logging reads are pending'),
+  logging: { kind: 'logging', source: 'Gateway Logging', retention: 'Configured retention and recorded source gaps',
+    permission: 'Workspace settings and operational data consent', tool: 'poise_list', requiresWorkspace: true,
+    reason: 'Bounded workspace diagnostics with exact events and changes' },
 } satisfies Record<Part, Surface>
 
 const settings = {
@@ -52,8 +55,8 @@ const settings = {
   publishing: browser('publishing', 'Editor publication bindings', 'Current bindings and retained reviews', 'Publishing reads are pending'),
   behaviors: workspace('behaviors'),
   snippets: workspace('snippets'),
-  admin: { ...browser('infrastructure', 'Gateway operator diagnostics', 'Current health and retained diagnostic windows',
-    'Operator-only surface'), permission: 'Instance admin' },
+  admin: { kind: 'instance-logging', source: 'Gateway operator diagnostics', retention: 'Current health and retained diagnostic windows',
+    permission: 'Instance admin', tool: 'poise_list', requiresOperator: true, reason: 'Separately consented instance Logging' },
   style: browser('style', 'Local browser preferences', 'Current browser preferences', 'Browser-local interface settings'),
   manager: { ...chat, kind: 'manager-timer', reason: 'Exact live Manager wake timer' },
 } satisfies Record<Section, Surface>
@@ -102,6 +105,9 @@ export function mcpInventory() {
       entry('workspace/caller', placeHref('observe', { part: 'tasks' }), { ...workspace('behaviors'), kind: 'call',
         source: 'Caller retained Call log and Behavior chain journal', retention: 'Retained Call and invocation records',
         reason: 'Exact full Call or invocation ID with settlement and quarantine coverage' }),
+      entry('settings/link-devices', placeHref('settings', { settings: 'link' }), {
+        ...workspace('accounts'), kind: 'gateway', source: 'Gateway Poise Link device inventory',
+        retention: 'Current and retained pairings', reason: 'Exact link-devices snapshot' }),
     ],
   }
 }

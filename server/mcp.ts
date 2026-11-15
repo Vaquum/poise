@@ -46,13 +46,14 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
     } else if (read.arguments.kind === 'call' || read.arguments.kind === 'invocation') {
       if (!mcpWorkspaceAllowed(authority.mcp)) throw new HttpError(403, 'workspace data consent is required')
       lookup = await readCallerRecord(read.arguments.kind, read.arguments.id)
-    } else {
+    } else if (read.arguments.kind === 'chat' || read.arguments.kind === 'timer') {
       if (!authority.mcp.chatMetadata) throw new HttpError(403, 'Chat metadata consent is required')
       if (!chatInstance) throw new HttpError(503, 'Chat metadata is unavailable until the workspace starts')
       lookup = { observedAt: new Date().toISOString(), record: readChatRecord(chatInstance, authority.mcp, read.arguments) }
-    }
+    } else throw new HttpError(403, 'the selected read belongs to the gateway')
   }
   if (read.name === 'poise_list' || read.name === 'poise_changes') {
+    if (read.arguments.kind !== 'chat') throw new HttpError(403, 'the selected read belongs to the gateway')
     if (read.name === 'poise_list' ? !authority.mcp.chatList || !authority.mcp.chatMetadata : !authority.mcp.chatTranscript) {
       throw new HttpError(403, 'the selected Chat data consent is required')
     }

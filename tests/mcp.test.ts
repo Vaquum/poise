@@ -381,7 +381,7 @@ it('reports the running workspace inventory through describe and the matching MC
     const result = await describe(client) as { inventory: { surfaces: Array<{ id: string; href: string }> } }
     const expected = [...PLACES, ...PARTS.map(id => `observe/${id}`), ...SECTIONS.map(id => `settings/${id}`),
       ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript',
-      ...MCP_WORKSPACE_VIEWS.map(id => 'workspace/' + id), 'workspace/caller']
+      ...MCP_WORKSPACE_VIEWS.map(id => 'workspace/' + id), 'workspace/caller', 'settings/link-devices']
     expect(result.inventory.surfaces.map(surface => surface.id)).toEqual(expected)
     expect(result.inventory.surfaces.every(surface => new URL(surface.href).origin === 'https://alice.poise.test')).toBe(true)
     expect(result).toMatchObject({ access: { resource: endpoint, scope: 'poise:read' }, instructions: expect.any(String),

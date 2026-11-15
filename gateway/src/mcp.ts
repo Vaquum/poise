@@ -8,6 +8,7 @@ import { MCP_READ_PATH, MCP_RESPONSE_BYTES, MCP_SCOPE, MCP_TOOLS, MCP_WORK_TOOL_
   mcpRepositoryAllowed, mcpToolNames, mcpWorkspaceAllowed, parseMcpRead, type McpGrantScope, type McpRead } from './mcp-contract.js'
 import { McpGrants, type McpGrant } from './mcp-grants.js'
 import { RUNBOOKS, WORKSPACE_RESOURCE, workspaceInventory } from './mcp-inventory.js'
+import { gatewayMcpRead, instanceLoggingRead, readGatewayMcp } from './mcp-gateway-views.js'
 import { html, page } from './pages.js'
 import { hashSecret, newSecret, type User } from './store.js'
 
@@ -97,6 +98,7 @@ export class McpGateway {
         <label><input type="checkbox" name="chatMetadata" value="1"> Allow Chat session and live timer metadata, including listings</label>
         <label><input type="checkbox" name="chatTranscript" value="1"> Allow Chat transcript and retained turn events</label>
         <label><input type="checkbox" name="workspaceData" value="1"> Allow workspace settings and operational data (workspace-wide grants)</label>
+        ${principal.isAdmin ? html`<label><input type="checkbox" name="operatorLogs" value="1"> Allow instance Logging as an administrator</label>` : ''}
         <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
         <button name="decision" value="approve">Allow read access</button><button name="decision" value="deny">Deny</button></form></div>`), authorizeHeaders)
     }
@@ -119,6 +121,7 @@ export class McpGateway {
             ...(form.get('chatMetadata') === '1' ? { chatMetadata: true, chatList: true } : {}),
             ...(form.get('chatTranscript') === '1' ? { chatTranscript: true } : {}),
             ...(!repository && form.get('workspaceData') === '1' ? { workspaceData: true } : {}),
+            ...(!repository && principal.isAdmin && form.get('operatorLogs') === '1' ? { operatorLogs: true } : {}),
             ...(repository ? { repository } : {}) } })
         target.searchParams.set('code', code)
       }
@@ -213,11 +216,12 @@ export class McpGateway {
     if (read.name === 'poise_work' && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
       return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     }
-    if (read.name === 'poise_get' && ((read.arguments.kind === 'chat' || read.arguments.kind === 'timer')
+    const direct = gatewayMcpRead(read)
+    if (read.name === 'poise_get' && !direct && ((read.arguments.kind === 'chat' || read.arguments.kind === 'timer')
       ? !grant.chatMetadata : !mcpWorkspaceAllowed(grant))) {
       return result({ isError: true, content: [{ type: 'text', text: 'this data is outside the owner’s selected consent' }] })
     }
-    if (read.name === 'poise_list') {
+    if (read.name === 'poise_list' && read.arguments.kind === 'chat') {
       const repository = read.arguments.repository ?? grant.repository ?? null
       if (!mcpRepositoryAllowed(grant, repository)) {
         return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
@@ -231,10 +235,12 @@ export class McpGateway {
     if (rate.active >= 2 || rate.count >= 60) throw new HttpError(429, 'too_many_requests')
     rate.active++; rate.count++; this.reads.set(grant.grantId, rate)
     try {
-      const body = await this.dispatch(owner, grant, read)
+      const body = direct ? await readGatewayMcp(ctx, owner, grant, direct) : await this.dispatch(owner, grant, read)
       // Revocation/access changes during an upstream read must also withhold its result.
       if (!this.grants.find(token!, 'access')) throw new HttpError(401, 'invalid_token')
       this.owner(grant)
+      if (direct && instanceLoggingRead(direct) && !ctx.isAdmin(owner.handle)) throw new HttpError(403, 'operator_access_removed')
+      if (Buffer.byteLength(JSON.stringify(body)) > MCP_RESPONSE_BYTES) throw new HttpError(503, 'mcp_response_exceeds_bound')
       if (resource) return result({ contents: [{ uri: WORKSPACE_RESOURCE, mimeType: 'application/json', text: JSON.stringify(body) }] })
       return result({ content: [{ type: 'text', text: JSON.stringify(body) }] })
     } finally { rate.active-- }
@@ -282,11 +288,15 @@ export class McpGateway {
       || tools.some(tool => typeof tool !== 'string' || !allowedTools.includes(tool))) {
       throw new HttpError(502, 'invalid_workspace_capabilities')
     }
-    const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: grant.tools.filter(tool => tools.includes(tool)) } }
+    const operatorLogs = grant.operatorLogs === true && grant.repository === undefined && ctx.isAdmin(owner.handle)
+    const directTools = operatorLogs ? ['poise_get', 'poise_list', 'poise_changes'] : []
+    const described = { workspace: owner.handle, owner: owner.login,
+      capabilities: { tools: grant.tools.filter(tool => tools.includes(tool) || directTools.includes(tool)) } }
     if (read.name === 'poise_describe') return { ...described,
       access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString(),
-        repository: grant.repository ?? null, workspaceData: mcpWorkspaceAllowed(grant) },
-      inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools, scope),
+        repository: grant.repository ?? null, workspaceData: mcpWorkspaceAllowed(grant), operatorLogs },
+      inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools,
+        { ...scope, ...(operatorLogs ? { operatorLogs: true } : {}) }),
       runbooks: RUNBOOKS, instructions: INSTRUCTIONS }
     if (read.name === 'poise_get') {
       if (read.arguments.kind !== 'chat' && read.arguments.kind !== 'timer') {
@@ -318,6 +328,7 @@ export class McpGateway {
         link: record === null ? null : `${ctx.workspaceOrigin(owner.handle)}/?view=chat&chat=${chatId}` } }
     }
     if (read.name === 'poise_list' || read.name === 'poise_changes') {
+      if (read.arguments.kind !== 'chat') throw new HttpError(502, 'invalid_gateway_read_dispatch')
       const page = body.page as Record<string, unknown> | undefined
       if (!page || typeof page.observedAt !== 'string' || !Number.isFinite(Date.parse(page.observedAt))
         || !Array.isArray(page.items) || page.items.length > read.arguments.limit

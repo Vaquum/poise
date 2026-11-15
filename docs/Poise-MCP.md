@@ -115,6 +115,24 @@ payloads, extension arguments and memory text stay in their owning surfaces.
 Snapshot timestamps report when the read was assembled. Underlying observations
 keep their own times, and bounded summaries report omitted records.
 
+## Read Logging and linked devices
+
+Use `poise_list` with `kind: "logging"` for bounded retained workspace events.
+The optional `repository`, `since` and `until` select a repository and UTC
+window. Counts refer to retained events. Each page includes retention bounds,
+source coverage and a continuation. Open a specific event with
+`poise_get`, `kind: "logging"` and the exact event ID.
+
+Read new observations with `poise_changes`, the same selector and the
+previous `watermark` as `afterWatermark`. Finish all continuation pages of a
+batch before advancing to its new watermark. The cursor and watermark are
+bound to the grant. An instance administrator can separately consent to
+`kind: "instance-logging"`, with access rechecked before every read.
+
+Use `poise_get` with `kind: "gateway"` for `logging-health`,
+`instance-logging-health` or `link-devices`. Device status carries pairing and
+connection metadata. It carries no device credentials.
+
 ## Private plugin
 
 Render a private package for an installation's HTTPS apex into a new directory:
