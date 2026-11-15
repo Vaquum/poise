@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { LogEntry } from '../server/agent-log-parse'
 import { nativeActionReceipt, nativeRequestSha } from '../server/behavior-chain-action'
-import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
+import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
 import { behaviorChainSummary } from '../server/behavior-chain-summary'
@@ -165,7 +165,7 @@ it('waits for an active original and its native release before closing, then wai
   calls.push(call)
   const runtime = new BehaviorChainRuntime(journal, operations)
   await runtime.run()
-  expect(operations.observe).not.toHaveBeenCalled()
+  expect(operations.observe).toHaveBeenCalledTimes(1)
   Object.assign(call, { status: 'completed', action: 'published', outcome: 'published', completed_at: new Date().toISOString() })
   await runtime.run()
   expect(operations.perform).not.toHaveBeenCalled()
@@ -181,6 +181,47 @@ it('waits for an active original and its native release before closing, then wai
   close.resources_settled_at = new Date().toISOString()
   await runtime.run()
   expect(journal.read(chain.id)?.supersession).toEqual(obs.fullSuite)
+})
+
+it.each(['executing', 'publishing'])('shows a changed head waiting on the original %s repair without admitting work', async phase => {
+  const { journal, chain, obs, operations, calls } = setup()
+  const changed = 'e'.repeat(40)
+  obs.issue.open = true
+  obs.pull!.head = changed
+  obs.publication.head_sha = changed
+  const call = completedReviewCall(chain.repository, 946, HEAD, chain.author)
+  Object.assign(call, { correlation_id: 'original', source: 'poise:behavior-chain', behavior: 'repair_pr', status: 'running',
+    completed_at: null, head_sha: null, expected_head: HEAD, action: null, outcome: null, review_id: null, receipts: null,
+    artifact: phase === 'publishing' ? { phase, publication_head: 'f'.repeat(40), plan_sha: 'd'.repeat(64) } : { phase },
+    resources_settled_at: null, resource_ownership: { version: 1, roots: [], errors: [] } })
+  calls.push(call)
+  let current = journal.append(chain.id, 'original', chain.sequence, { type: 'invocation.admitted', invocation: {
+    id: 'original', behavior: 'repair-pr', actor: chain.author, model: call.model, slot: 'primary', basis: 'old-head',
+    admittedAt: Date.now(), request: { command: 'agent-interface', cwd: '/isolated', argv: ['--atomic-work', 'example/repo#943'],
+      context: { head: HEAD, reviewRevision: 'review' } } } })
+  journal.append(chain.id, 'started', current.sequence, { type: 'invocation.started', invocationId: 'original' })
+  const before = structuredClone(call)
+  const runtime = new BehaviorChainRuntime(journal, operations)
+  await runtime.run()
+  current = journal.read(chain.id)!
+  expect(current.invocations).toHaveLength(1)
+  expect(current.invocations[0].state).toBe('started')
+  expect(behaviorChainSummary(current, journal).waiting).toBe(`original repair Call ${call.id} is still running for ${HEAD}`)
+  expect(call).toEqual(before)
+  expect(operations.launch).not.toHaveBeenCalled()
+  expect(operations.perform).not.toHaveBeenCalled()
+  await runtime.run()
+  expect(operations.observe).toHaveBeenCalledTimes(1)
+  expect(journal.liveModelInvocationCount()).toBe(1)
+  // A head that returns before the repair retires must not leave a stale replacement SHA behind.
+  obs.pull!.head = HEAD
+  obs.publication.head_sha = HEAD
+  vi.useFakeTimers()
+  vi.advanceTimersByTime(CHAIN_OBSERVATION_MAX_AGE_MS + 1000)
+  await runtime.run()
+  expect(behaviorChainSummary(journal.read(chain.id)!, journal).waiting)
+    .toBe(`original repair Call ${call.id} is still running for ${HEAD}`)
+  expect(operations.observe).toHaveBeenCalledTimes(2)
 })
 
 it.each([false, true])('retains a lost close response as uncertain across closed observations, sweeps and rebuild (remediation=%s)', async remediation => {

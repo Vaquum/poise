@@ -676,8 +676,8 @@ export class BehaviorChainRuntime {
               }
               if (chain.mergeSha && owned && !released) continue
               if (owned && call && (call.status === 'running' || !nativeResourcesReleased(call))) {
-                // Running PR reviews still need bounded queue visibility, and a
-                // running first implementation needs bounded seed-closure
+                // Running PR reviews and repairs need bounded head/queue visibility,
+                // and a first implementation needs bounded seed-closure
                 // visibility. Neither observation can settle or replace its
                 // native invocation.
                 const prior = chain.observation as ChainObservation | null
@@ -685,6 +685,8 @@ export class BehaviorChainRuntime {
                   && Date.now() - (prior as ChainObservation).checkedAt < CHAIN_OBSERVATION_MAX_AGE_MS
                 if (owned.behavior === 'review-pr') {
                   if (call.status !== 'running' || prior?.pull?.state !== 'open' || prior.pull.merged || fresh) continue
+                } else if (owned.behavior === 'repair-pr') {
+                  if (call.status !== 'running' || fresh) continue
                 } else if (owned.behavior === 'implement-issue') {
                   if (!retireEligible(call) || prior?.publication.pull_number !== null || fresh
                     || !this.operations.retireClosedImplementation) continue
@@ -735,7 +737,17 @@ export class BehaviorChainRuntime {
                     new Error(`behavior retirement failed for ${chain.id}: ${behaviorErrorMessage(error)}`, { cause: error }))
                 }
               }
-              if (owned && call?.status === 'running') continue
+              if (owned && call?.status === 'running') {
+                if (owned.behavior === 'repair-pr' && observation.pull?.head !== call.expected_head
+                  && observation.pull?.number === Number(call.pr_id) && /^[0-9a-f]{40}$/.test(observation.pull.head)
+                  && observation.publication.head_sha === observation.pull.head
+                  && observation.publication.pull_number === observation.pull.number
+                  && observation.checkedAt <= Date.now() && Date.now() - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS) {
+                  const reason = `original repair Call ${call.id} is still running for ${call.expected_head}`
+                  if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+                }
+                continue
+              }
               if (this.operations.recoverReport) {
                 const reason = await this.operations.recoverReport(chain, observation)
                 chain = this.current(chain)
@@ -1115,7 +1127,9 @@ export class BehaviorChainRuntime {
       const cause = failure ? `; ${failure.cause}${failure.path ? ` at ${failure.path}` : ''}`
         : !call.resource_ownership ? '; durable resource ownership is unavailable'
           : root ? `; ${root.state} directory at ${root.path} lacks a reclamation receipt` : ''
-      const reason = `native invocation ended without proof that its worker resources were released${cause}`
+      const replacement = invocation.behavior === 'repair-pr' && call.status === 'superseded' && call.head_sha !== call.expected_head
+        ? `PR head ${call.head_sha} is waiting on original repair Call ${call.id} for ${call.expected_head}; ` : ''
+      const reason = `${replacement}native invocation ended without proof that its worker resources were released${cause}`
       return invocation.state === 'uncertain' && invocation.outcome === reason ? chain
         : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id, reason })
     }

@@ -1741,6 +1741,15 @@ An in-flight managed issue review whose final live seed read observes closure
 settles superseded without a PR head or publication plan. The reader accepts this
 unattempted receipt while retaining its original resource-release requirement;
 [Issue review](Issue-review.md) defines the publication race and reconciliation.
+Native repairs reuse Caller's bounded live-head read within the original gated
+provider run. Verified head drift fences the original Call against publication
+before cooperative interruption; a winning publication transaction retains normal
+ownership and settlement. The existing superseded receipt carries the old and
+new heads, and positive original resource release precedes replacement admission.
+Bounded chain observations show the changed head waiting on its original Call in
+existing work status. No new receipt fields, journal events or cancellation
+command are added; [Behavior chain](Behavior-chain.md#authority-and-recovery)
+defines the normal gates and unchanged-head behavior.
 Managed native admissions recheck the bounded receipt reader at their final
 launch, action and publication boundaries. Its independent diagnostics retain
 the first typed SQLite cause and affected workspace; confirmed integrity failure
