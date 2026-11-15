@@ -12,6 +12,7 @@ interface Surface {
   tool?: 'poise_work' | 'poise_get' | 'poise_list' | 'poise_changes'
   requiresWorkspace?: true
   requiresChat?: true
+  requiresChatList?: true
   requiresChatTranscript?: true
   requiresChatArtifacts?: true
   requiresOperator?: true
@@ -105,7 +106,7 @@ export function mcpInventory() {
       ...SECTIONS.map(id => entry(`settings/${id}`, placeHref('settings', { settings: id }), settings[id])),
       ...listCapabilities().map(id => entry(`capability/${id}`, capabilityLinks[id], capabilities[id])),
       entry('chat/sessions', placeHref('chat'), { ...chat, retention: 'Current and archived sessions',
-        tool: 'poise_list', reason: 'Indexed pages by repository and update time' }),
+        tool: 'poise_list', requiresChatList: true, reason: 'Indexed pages by repository and update time' }),
       entry('chat/transcript', placeHref('chat'), { kind: 'chat-event', source: 'Retained Chat journal', retention: 'Events since the last context reset',
         permission: 'Chat transcript consent', tool: 'poise_changes', requiresChatTranscript: true, reason: 'Resumable transcript pages by stored sequence' }),
       entry('chat/artifacts', placeHref('chat'), { kind: 'chat-artifact', source: 'Recorded Chat attachments and diffs',
