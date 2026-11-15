@@ -1155,7 +1155,9 @@ fs.writeFileSync(path.join(process.env.FIXTURE_RETENTION, 'identity'), JSON.stri
     writeFileSync(join(bin, 'agent-interface'), '#!/bin/sh\nprintf "%s" "$6" > "$FIXTURE_RETENTION"\n', { mode: 0o700 })
     const detail = (assertion ? '[poise] first test failure: fixture.test.js > expected value\nAssertionError: expected 1 to equal 2\n' : '')
       + (noResult ? '[poise] no test result: the box stopped. This says nothing about your code.\n' : '')
-    const result = await suite(committed(), [process.execPath, '-e', `process.stderr.write(${JSON.stringify(detail)}); process.exitCode = 125`], {
+    const repo = committed()
+    writeFileSync(join(repo, 'runner-fixture.cjs'), `process.stderr.write(${JSON.stringify(detail)}); process.exitCode = 125`)
+    const result = await suite(repo, [process.execPath, 'runner-fixture.cjs'], {
       PATH: `${bin}:${process.env.PATH}`, FIXTURE_RETENTION: retained, AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
     }).done
     expect(result.code).toBe(125)
@@ -1888,13 +1890,14 @@ ${interruption === 'capture failed' ? 'process.exit(1)' : 'fs.copyFileSync(archi
     const bin = temp()
     const retained = join(bin, 'retained')
     writeFileSync(join(bin, 'agent-interface'), '#!/bin/sh\nprintf "%s %s" "$5" "$6" > "$FIXTURE_RETENTION"\n', { mode: 0o700 })
-    const script = `
+    const repo = repository()
+    writeFileSync(join(repo, 'replay-fixture.cjs'), `
 const fs = require('node:fs')
-if (!fs.existsSync(process.argv[1])) process.stderr.write('[poise] first test failure: fixture.test.js > expected value\\nAssertionError: expected 1 to equal 2\\n')
+if (!fs.existsSync(process.argv[2])) process.stderr.write('[poise] first test failure: fixture.test.js > expected value\\nAssertionError: expected 1 to equal 2\\n')
 console.log('started')
-setInterval(() => {}, 1000)`
+setInterval(() => {}, 1000)`)
     const secondAttempt = join(bin, 'second-attempt')
-    const run = suite(repository(), [process.execPath, '-e', script, secondAttempt], {
+    const run = suite(repo, [process.execPath, 'replay-fixture.cjs', secondAttempt], {
       PATH: `${bin}:${process.env.PATH}`, FIXTURE_RETENTION: retained, AGENT_INTERFACE_FAILED_SOURCE_CALL: 'a'.repeat(32),
     })
     let evidence = ''
