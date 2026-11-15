@@ -136,6 +136,7 @@ POISE_INSECURE_HTTP=1
 POISE_GITHUB_URL=$github
 POISE_GITHUB_API_URL=$github
 POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP=1
+POISE_MCP_ENABLED=1
 POISE_REPAIR_EXHAUSTION_REPOSITORIES=acme/repair-test
 EOF
   "$deploy/install.sh" | tee "$work/install.log"
@@ -817,6 +818,24 @@ NODE
   pass "install.sh switches back to the bundled Caddy"
 }
 
+check_mcp() {
+  local handle
+  npm ci --prefix "$root"
+  wait_for_poise "$bob" bob
+  "$root/gateway/node_modules/.bin/esbuild" "$here/mcp-seed.ts" --bundle --platform=node --format=esm --packages=external --outfile="$work/mcp-seed.mjs"
+  for handle in alice bob; do
+    docker cp "$here/mcp-seed.py" "poise-ws-$handle:/tmp/mcp-seed.py"
+    docker cp "$work/mcp-seed.mjs" "poise-ws-$handle:/opt/poise/mcp-seed.mjs"
+    docker exec "poise-ws-$handle" python3 /tmp/mcp-seed.py
+    docker exec "poise-ws-$handle" node /opt/poise/mcp-seed.mjs
+  done
+  node "$root/scripts/package-poise-plugin.mjs" "https://$domain" "$work/poise-plugin"
+  node "$here/mcp-client.mjs" "$apex/mcp" "$work/poise-plugin"
+  docker exec poise-ws-bob python3 -c "import sqlite3; c=sqlite3.connect('/home/poise/mcp-fixture.sqlite'); c.execute(\"UPDATE sync_state SET updated_at='2000-01-01T00:00:00Z' WHERE scope='org' AND key='last_sync_at'\"); c.commit(); c.close()"
+  node "$here/mcp-client.mjs" "$apex/mcp" --stale
+  pass "MCP OAuth and work trail through the installed gateway and workspaces"
+}
+
 run() {
   install
   sign_in_alice
@@ -831,6 +850,7 @@ run() {
   revoke_link
   backup_and_restore
   check_persisted_public_pages
+  check_mcp
   check_gateway_recreated
   check_persisted_public_pages
   check_upgrade

@@ -148,6 +148,11 @@ New workspace containers receive `POISE_WORKSPACE_OWNER_ID` from the gateway.
 Older containers without it retain normal behavior but refuse MCP assertions;
 they need a normal container replacement before connecting.
 
+The Deployment CI journey opens the installed gateway's MCP endpoint with a
+real SDK client and follows records across two isolated workspaces. The
+deployment uses fixture GitHub identities, a generated plugin package and
+native datastore and journal records.
+
 `tests/mcp.test.ts` exercises a real SDK client through disposable gateway and
 workspace HTTP fixtures with the production assertion guard and read handler.
 It uses the packaged endpoint, real datastore selectors, isolated chain journal
