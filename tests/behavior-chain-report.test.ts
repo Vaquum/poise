@@ -3178,6 +3178,7 @@ it.each([
     + ` Copied Source: ${chain.id}; hold event ${scoped.holdSequence}; basis ${scoped.basis};`
     + ` Quoting file ${MEMORY_FILE} test keeps memory warnings correlatable without logging command bodies.`
   if (copiedMarker) {
+    quoting.created_at = lost.created_at
     quoting.originalBody = `<!-- poise-repair-exhaustion:${scoped.key} -->\n\n${quoting.body}`
     quoting.updated_at = new Date(NOW + 75_000).toISOString()
     lost.body = 'The report body was rewritten after the quote.'

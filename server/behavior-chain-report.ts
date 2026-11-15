@@ -1026,6 +1026,9 @@ export async function implementationReportAdmission(db: Database, journal: Behav
         if (!issue) return { reason: `${wait}: report or linked remedy identity is unverified` }
         if (!REPORT_MARKER.test(issue.body)) {
           if (!source) return { reason: `${wait}: original source hold or Call changed` }
+          // A later adoption can link the issue from an unconfirmed report.
+          const canExempt = report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt)
+          const orphan = canExempt && await findUnconfirmedPrePrReport(journal, chain, unconfirmedImplementationReports(db, chain.repository))
           const fresh = await observe(source)
           const deps = fresh.prerequisites?.evidence?.[0] as { repo?: unknown, number?: unknown,
             found?: unknown, complete?: unknown, prerequisites?: Array<{ repo?: unknown, number?: unknown }> } | undefined
@@ -1036,10 +1039,7 @@ export async function implementationReportAdmission(db: Database, journal: Behav
               && entry.repo.toLowerCase() === chain.repository.toLowerCase() && entry.number === chain.issue)
             && journal.read(source.id)?.sequence === source.sequence
           if (!verified) return { reason: `${wait}: linked remedy source evidence changed` }
-          // A later adoption can link the issue from an unconfirmed report.
-          // Check its creation evidence before allowing the remedy exemption.
-          if ((report.adopted !== undefined || predatesHold(issue.created_at, report.heldAt))
-            && !await findUnconfirmedPrePrReport(journal, chain, unconfirmedImplementationReports(db, chain.repository))) return { reason: null }
+          if (canExempt && !orphan) return { reason: null }
         }
       } catch (error) {
         return { reason: `${wait}: verification unavailable: ${behaviorErrorMessage(error instanceof Error ? error.message : String(error), 500)}` }

@@ -220,7 +220,7 @@ export async function listIssueCreationBodies(repository: string, author: string
   const data = await readIssueCreationEvidence(repository, `query($owner: String!, $repo: String!, $author: String!, $since: DateTime) {
     repository(owner: $owner, name: $repo) {
       nameWithOwner
-      issues(first: 100, filterBy: { createdBy: $author, since: $since }, orderBy: { field: CREATED_AT, direction: ASC }) {
+      issues(first: 100, states: [OPEN, CLOSED], filterBy: { createdBy: $author, since: $since }, orderBy: { field: CREATED_AT, direction: ASC }) {
         pageInfo { hasNextPage }
         nodes { ${ISSUE_CREATION_FIELDS} }
       }
