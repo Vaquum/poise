@@ -264,7 +264,8 @@ export class McpGateway {
     }
     const described = { workspace: owner.handle, owner: owner.login, capabilities: { tools: grant.tools.filter(tool => tools.includes(tool)) } }
     if (read.name === 'poise_describe') return { ...described,
-      access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString() },
+      access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString(),
+        repository: grant.repository ?? null },
       inventory: workspaceInventory(body.inventory, ctx.workspaceOrigin(owner.handle), described.capabilities.tools),
       runbooks: RUNBOOKS, instructions: INSTRUCTIONS }
     if (read.name === 'poise_get') {
@@ -272,6 +273,7 @@ export class McpGateway {
       const record = lookup?.record
       if (!lookup || typeof lookup.observedAt !== 'string' || !Number.isFinite(Date.parse(lookup.observedAt)) || (record !== null && (!record
         || record.kind !== read.arguments.kind || record.id !== read.arguments.id
+        || !mcpRepositoryAllowed(grant, typeof record.repository === 'string' ? record.repository : null)
         || (record.kind === 'timer' && !isMcpRecordId(record.chatId))
         || (record.kind === 'chat' && (!Array.isArray(record.timerIds) || !record.timerIds.every(isMcpRecordId)))))) {
         throw new HttpError(502, 'invalid_workspace_record_scope')

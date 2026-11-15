@@ -222,6 +222,8 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
   const workGrant = await connect('Alice')
   const alice = await connect('Alice', endpoint, { chatMetadata: true })
   const bob = await connect('bob', endpoint, { chatMetadata: true })
+  const matching = await connect('Alice', endpoint, { chatMetadata: true, repository: 'acme/repo' })
+  const outside = await connect('Alice', endpoint, { chatMetadata: true, repository: 'acme/other' })
   const args = { kind: 'chat', id }
   const request = { name: 'poise_get', arguments: args }
   async function lookup(client: Client, kind: 'chat' | 'timer', id: string) {
@@ -252,10 +254,16 @@ it('requires explicit Chat metadata consent and follows a Chat to its live timer
     expect(JSON.stringify(timerLookup)).not.toContain('Private timer instruction')
     expect(await lookup(bob.client, 'chat', id)).toMatchObject({ record: null, link: null })
     expect(await lookup(bob.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
+    expect(await lookup(matching.client, 'chat', id)).toMatchObject({ record: { id } })
+    expect(await lookup(matching.client, 'timer', timer.id)).toMatchObject({ record: { repository: 'Acme/Repo' } })
+    expect(await lookup(outside.client, 'chat', id)).toMatchObject({ record: null, link: null })
+    expect(await lookup(outside.client, 'timer', timer.id)).toMatchObject({ record: null, link: null })
   } finally {
     await workGrant.client.close()
     await alice.client.close()
     await bob.client.close()
+    await matching.client.close()
+    await outside.client.close()
     db.prepare('DELETE FROM chat_control_timers WHERE id = ?').run(timer.id)
     deleteSession(id)
   }
@@ -350,6 +358,7 @@ it('keeps a consented repository restriction at the gateway and signed workspace
     const work = await client.callTool(request)
     expect(work).toMatchObject({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     expect(workspaceReads).toBe(0)
+    expect(await describe(client)).toMatchObject({ access: { repository: 'Acme/Repo' } })
     const renewed = await fetcher(new URL('/mcp/token', endpoint), { method: 'POST', headers: {
       'content-type': 'application/x-www-form-urlencoded',
     }, body: new URLSearchParams({ grant_type: 'refresh_token', client_id: grant.clientId,
