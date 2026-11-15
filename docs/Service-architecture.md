@@ -866,8 +866,8 @@ assertion may only resume, and anything else is refused with 403):
   successful reconciliation sweep for every followed account after resume.
   This prevents overlapping new Calls from starving replacement while completed
   original receipts settle without repeating their publication. The admission
-  fence expires eight minutes after its last replacement request if the gateway
-  stops retrying; the owner's ordinary resume clears it too. When pending
+  fence expires thirty minutes after its last replacement request if the gateway
+  stops retrying, covering serial passes; the owner's ordinary resume clears it too. When pending
   cleanup blocks replacement and no Caller is live, it releases the drain
   immediately. Existing maintenance retries cleanup independently. While
   waiting for live work, the gateway logs `workspace.drain.waiting` at each renew

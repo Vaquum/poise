@@ -929,6 +929,9 @@ export class Orchestrator {
             }
             retainedCleanup = fresh.retainedCleanup
           }
+          // A slow install must not push the stop against the workspace's fixed pause ceiling.
+          // Past the attempt budget, defer to the next pass when the install is already done.
+          if (running && this.deps.now() >= deadline) return 'abort-unknown'
           this.ready.delete(handle)
           let stoppedAt = 0
           if (running) {

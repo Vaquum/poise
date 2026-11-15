@@ -718,6 +718,27 @@ describe('image upgrades', () => {
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
+  it('defers replacement past a slow install to the next pass instead of stopping near the pause ceiling', async () => {
+    await start({ replacementDrainMs: 50 })
+    h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'target-release', 'poise.base': 'new-base' })
+    const original = h.docker.containers.get('poise-ws-alice')!.id
+    // Idle workspace drains at once; a slow first install pushes the recheck past the attempt budget.
+    let slowed = false
+    h.docker.onTask = () => {
+      if (!slowed) { slowed = true; h.advance(1000) }
+    }
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')!.id).toBe(original)
+    expect(h.workspace.health.draining).toBe(false)
+    expect(dockerCalls(h).filter(call => call.endsWith('/stop'))).toHaveLength(0)
+    expect(h.logs.find(entry => entry.event === 'workspace.upgrade.aborted')).toMatchObject({ handle: 'alice' })
+    // The install is already done; the retry replaces promptly.
+    h.docker.onTask = undefined
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')!.id).not.toBe(original)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
   it.each(['lost', 'unapplied'] as const)('observes recovery after a %s resume before starting another replacement drain', async mode => {
     await start({ replacementDrainMs: 30, serviceTimeoutMs: 10 })
     const original = h.docker.containers.get('poise-ws-alice')!.id

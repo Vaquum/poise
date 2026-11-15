@@ -405,6 +405,30 @@ describe('service drain', () => {
     expect(service.draining).toBe(false)
   })
 
+  it('disarms the ordinary Chat-turn deadline when replacement starts during an ordinary drain', () => {
+    const runtime = fakeRuntime(), timer = new FakeTimer()
+    const service = new control.ServiceControl(runtime as unknown as ChatRuntime,
+      { drainTimeoutSeconds: 1800, timer, log: vi.fn(), now: () => 1_800_000_000_000 })
+    try {
+      service.drain()
+      expect(service.draining).toBe(true)
+      service.drain('new-image')
+      expect(service.draining).toBe(true)
+      // Only the replacement admission fence remains at the 30-minute delay; the ordinary deadline is gone.
+      // Pre-fix this fires the stale deadline and stops a live turn during cooperative replacement.
+      timer.fireDelay(control.REPLACEMENT_ADMISSION_MS)
+      expect(runtime.stopTurnsForDrain).not.toHaveBeenCalled()
+      expect(service.health().replacement).toBeNull()
+      expect(service.draining).toBe(false)
+    } finally { service.reset() }
+  })
+
+  it('holds replacement admission across serial passes of busy outdated workspaces', () => {
+    // Five 120-second attempts plus the five-minute retry interval must fit within the fence,
+    // or the first workspace's fence expires before its retry and new long Calls starve replacement.
+    expect(control.REPLACEMENT_ADMISSION_MS).toBeGreaterThan(5 * REPLACEMENT_DRAIN_MS + 5 * 60_000)
+  })
+
   it('stops Chat turns that hold the drain past the turn deadline, once per drain', () => {
     const { runtime, timer, log, service } = serviceOf()
     service.drain()

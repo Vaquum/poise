@@ -91,8 +91,8 @@ export const DRAIN_GRACE_SECONDS = 300
 
 /** Includes gateway rechecks and lost resume responses; renewals cannot extend this pause. */
 export const REPLACEMENT_PAUSE_MS = 180_000
-/** Covers the existing five-minute retry interval, but expires if the gateway disappears. */
-export const REPLACEMENT_ADMISSION_MS = 8 * 60_000
+/** Covers serial replacement passes and the five-minute retry interval, but expires if the gateway disappears. */
+export const REPLACEMENT_ADMISSION_MS = 30 * 60_000
 
 /** How long one Chat turn may hold a refusing drain: past this the drain
  *  stops it through the person's Stop path, with a transcript notice naming
@@ -547,6 +547,11 @@ export class ServiceControl {
       if (!replacement || replacement.length > 200) throw new HttpError(400, 'replacement must name the target release or image')
       freshReplacement = this.replacement !== replacement
       this.replacement = replacement
+      // Replacement lets Chat turns finish cooperatively; a fresh target disarms an ordinary drain's deadline.
+      if (freshReplacement && this.turnDeadline !== null) {
+        this.timer.clearTimeout(this.turnDeadline)
+        this.turnDeadline = null
+      }
       markReplacementPending(true)
       this.runtime.setSwitchPending(this.switchTo ?? replacement)
       if (this.replacementLapse !== null) this.timer.clearTimeout(this.replacementLapse)

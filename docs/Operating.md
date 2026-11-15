@@ -1139,9 +1139,9 @@ restores background work within three minutes even if the gateway disappears
 or loses resume responses. Between the existing five-minute retries, new agent
 launches yield and Chat prompts wait while original Calls finish; datastore
 refresh and journal settlement recover. A new drain requires observed successful
-sync and reconciliation after resume. Replacement admission expires eight
-minutes after the last request if retries stop. The owner's resume also releases
-it. These bounds require replacement-aware workspace code; older releases keep
+sync and reconciliation after resume. Replacement admission expires thirty
+minutes after the last request if retries stop, covering serial passes. The owner's
+resume also releases it. These bounds require replacement-aware workspace code; older releases keep
 their configured drain lapse. In an ordinary
 drain, one Chat turn holds the drain at most 30 minutes: past that the workspace stops it
 with a notice in its transcript, naming the update, and the agent keeps its
