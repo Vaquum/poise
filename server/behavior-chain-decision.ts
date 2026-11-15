@@ -44,7 +44,7 @@ export interface ChainObservation extends Record<string, unknown> {
   remediation?: Record<string, unknown>
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,
-    queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null },
+    queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null, reviewClearanceOnly?: boolean },
     queueEntryDetails?: { id: string, state: string, base: string | null, head: string | null } | null,
     changesRequested: boolean, unresolved: number, unresolvedOutdated?: number, approved: boolean, ready: boolean,
     approvalBlocked?: boolean,
@@ -260,6 +260,44 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
     || response.completed_at > review.submittedAt + 999 || review.submittedAt > now) return null
   if (pull.merged && (typeof pull.mergedAt !== 'number' || !Number.isFinite(pull.mergedAt) || response.completed_at > pull.mergedAt || review.submittedAt > pull.mergedAt)) return null
   return response
+}
+
+/** Review evidence only: repository readiness includes this required check. */
+export function chainReviewClearance(chain: BehaviorChain, observation: ChainObservation, now: number): string | null {
+  const pull = observation.pull
+  if (!pull || !pull.reviewContext || observation.publication.pull_number !== pull.number
+    || observation.publication.head_sha !== pull.head || !observation.prReviewers.length) return 'native ownership or review panel is incomplete'
+  const basis = chainBasis(['pr', pull.head, pull.reviewContext])
+  for (const reviewer of observation.prReviewers) {
+    const review = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'review-pr'
+      && invocation.slot === reviewer.slot && invocation.basis === basis)
+    if (!review || review.state !== 'settled' || review.evidence?.status !== 'completed'
+      || review.actor !== chain.reviewer || review.model !== reviewer.model
+      || !chainReviewResponse(chain, review, observation, now)) return `review slot ${reviewer.slot} lacks its current-head/context receipt`
+  }
+  const current = chain.invocations.filter(invocation => ['review-pr', 'approve-pr'].includes(invocation.behavior)
+    && (invocation.basis === basis || invocation.request.argv[invocation.request.argv.indexOf('--expected-head') + 1] === pull.head))
+  if (current.some(invocation => invocation.state !== 'settled')) return 'a native review is still running'
+  if (current.some(invocation => {
+    const response = (invocation.evidence?.artifact as { review_response?: { context_sha?: string } } | undefined)?.review_response
+    return invocation.evidence?.review_id != null && (!response?.context_sha || response.context_sha === pull.reviewContext)
+      && !chainReviewResponse(chain, invocation, observation, now)
+  })) return 'a current native submission lacks its retained review receipt'
+  const negative = current.filter(invocation => invocation.evidence?.action === 'requested_changes'
+    && chainReviewResponse(chain, invocation, observation, now))
+  if (!negative.length) return null
+  // An ordinary GitHub approval cannot discharge a native change request.
+  // Preserve the existing same-head repair followed by independent verification.
+  const approval = [...current].reverse().find(invocation => invocation.behavior === 'approve-pr'
+    && invocation.evidence?.status === 'completed' && invocation.evidence.action === 'approved'
+    && invocation.actor === chain.reviewer && chainReviewResponse(chain, invocation, observation, now)
+    && negative.every(request => Number(request.evidence?.completedAt) < invocation.admittedAt))
+  const repair = approval && chain.invocations.some(invocation => invocation.behavior === 'repair-pr'
+    && invocation.state === 'settled' && invocation.evidence?.status === 'completed'
+    && invocation.request.context?.head === pull.head
+    && negative.every(request => Number(request.evidence?.completedAt) < invocation.admittedAt)
+    && Number(invocation.evidence.completedAt) <= approval.admittedAt)
+  return repair ? null : 'native changes requested; a retained independent repair verification is required'
 }
 
 function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, actor: string,
@@ -498,11 +536,11 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     if (!['failed_checks', 'merge_conflict'].includes(removal.reason || '')) return { kind: 'hold', reason: `queue removal requires a decision: ${removal.reason || 'unknown reason'} (${removal.id})` }
     const repair = [...chain.invocations].reverse().find((invocation) => invocation.behavior === 'repair-pr' && succeeded(invocation)
       && invocation.request.context?.head === pull.head && invocation.request.context.queueRemoval === removal.id) ?? queueRecovery
-    if (!repair || ((pull.changesRequested || pull.failing.length || pull.conflict || pull.behind)
-      && repair.request.context?.reviewRevision !== pull.reviewRevision)) return propose(chain, 'repair-pr',
+    if (!removal.reviewClearanceOnly && (!repair || ((pull.changesRequested || pull.failing.length || pull.conflict || pull.behind)
+      && repair.request.context?.reviewRevision !== pull.reviewRevision))) return propose(chain, 'repair-pr',
       chainBasis(['queue', pull.head, removal.id, pull.reviewRevision]), chain.author, observation.repairer,
       `diagnose and repair GitHub queue rejection ${removal.id}: ${removal.reason}; PR-head green checks do not prove integration success`, now)
-    queueVerification ??= chainBasis(['queue-verification', pull.head, removal.id, repair.id])
+    if (!removal.reviewClearanceOnly) queueVerification ??= chainBasis(['queue-verification', pull.head, removal.id, repair!.id])
   }
   const repairBasis = chainBasis(['repair', pull.head, pull.failing, pull.conflict, pull.behind, pull.changesRequested, pull.unresolved, pull.reviewRevision, observation.issue.revision])
   const grey = pull.greyRuns[0]

@@ -17,6 +17,7 @@ import { isExpectedFailure, runFile, spawnDetached } from './process'
 import { runDatastoreHealth, validatedHealth } from './datastore-health'
 import { requireCallerReceipts } from './service/caller-calls'
 import { reviewContinuationArgs } from './review-continuation'
+import { reviewClearanceOnly } from './review-clearance'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
@@ -426,6 +427,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         queueEntry: typeof state.queue_entry_id === 'string' ? state.queue_entry_id : null,
         queueEntryDetails,
         queueRemoval: removal ? { id: String(removal.id), reason: typeof removal.reason === 'string' ? removal.reason : null,
+          ...(reviewClearanceOnly(removal) ? { reviewClearanceOnly: true } : {}),
           at: Date.parse(String(removal.createdAt)), actor: removal.actor ? String(object(removal.actor, 'queue actor').login) : null } : null,
         changesRequested: latest?.state === 'CHANGES_REQUESTED' && latest.commit_id === head,
         unresolved: Number(readiness.unresolved_live_conversation_count), unresolvedOutdated: Number(readiness.unresolved_outdated_conversation_count),

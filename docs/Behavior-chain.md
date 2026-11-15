@@ -8,6 +8,10 @@ head or context requires the existing fresh-review cycle. Approval metadata and
 another process using the same account cannot supply that invocation's response.
 Merge and queue admission revalidate the retained response against the current
 PR and its published review while preserving the normal CI and thread gates.
+For `autonomio/poise`, the dedicated App's
+[Poise review clearance](Review-clearance.md) check also exposes the complete
+native review obligation at GitHub's PR-head and merge-group boundary. Its
+activation and audit are separate administrator rollout steps.
 A confirmed external merge is recorded separately: without qualifying pre-merge
 review evidence its review obligation remains open through journal recovery.
 A closed seed without a bound PR also discovers exactly one merged GitHub closing
