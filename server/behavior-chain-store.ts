@@ -132,6 +132,22 @@ const AUTHENTICATION_HOLD_SQL = "merged = 0 AND json_extract(state, '$.held') LI
 
 const ACTIVE_WORK_SQL = `CASE WHEN (json_extract(state, '$.mergeSha') IS NULL AND json_extract(state, '$.supersession') IS NULL AND json_extract(state, '$.held') IS NULL)
   OR (${LIVE_MODEL_SQL}) THEN 1 ELSE 0 END`
+const SETTLED_CLOSURE_SQL = `json_type(state, '$.observation.existingPulls') = 'array'
+  AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.observation.existingPulls') p
+    WHERE json_extract(state, '$.observation.externalMerge.merge_sha') IS NULL
+      OR lower(p.value) IS NOT lower('https://github.com/' || json_extract(state, '$.repository') || '/pull/' || json_extract(state, '$.observation.externalMerge.pull_number')))
+  AND resource_pending = 0 AND json_extract(state, '$.reviewPending') IS NOT 1
+  AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i WHERE json_extract(i.value, '$.state') IS NOT 'settled')
+  AND json_extract(state, '$.observation.publication.merged') IS 0
+  AND ((json_type(state, '$.observation.pull') = 'null'
+    AND json_type(state, '$.observation.publication.pull_number') = 'null'
+    AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
+    AND json_type(state, '$.observation.publication.state') = 'null')
+  OR (json_extract(state, '$.observation.pull.state') = 'closed'
+    AND json_extract(state, '$.observation.publication.state') = 'closed'
+    AND json_extract(state, '$.observation.pull.number') = json_extract(state, '$.observation.publication.pull_number')
+    AND json_extract(state, '$.observation.pull.merged') IS 0
+    AND json_extract(state, '$.observation.pull.mergeSha') IS NULL))`
 const RECHECK_AT_SQL = `CASE
   WHEN json_extract(state, '$.supersession') IS NOT NULL THEN NULL
   WHEN json_extract(state, '$.mergeSha') IS NOT NULL AND json_extract(state, '$.reviewPending') IS NOT 1 THEN NULL
@@ -546,6 +562,16 @@ export class BehaviorChainJournal {
     return row.at
   }
 
+  /** Mirror hints only bring forward an otherwise deferred, settled seed. */
+  deferredSeedClosure(id: string, updatedAt: number, now: number): BehaviorChain | null {
+    const matches = cachedStatement(this.db, `SELECT 1 FROM behavior_chain_current WHERE chain_id = ? AND merged = 0
+      AND json_extract(state, '$.held') IS NOT NULL
+      AND json_type(state, '$.observation.issue.open') = 'true'
+      AND coalesce(json_extract(state, '$.observation.issue.updatedAt'), json_extract(state, '$.observation.checkedAt')) < ?
+      AND (${SETTLED_CLOSURE_SQL}) AND (${RECHECK_AT_SQL}) > ?`).get(id, updatedAt, now)
+    return matches ? this.read(id) : null
+  }
+
   /** Original recorded context/panel, never today's settings or a later
    * observation of an already-merged target. Old history stays immutable. */
   preMergeObservation(id: string, mergedAt: number): Record<string, unknown> | null {
@@ -656,22 +682,7 @@ export class BehaviorChainJournal {
       : cachedStatement(this.db, `SELECT chain_id FROM behavior_chain_current WHERE merged = ?
         ${merged ? '' : `AND json_extract(state, '$.supersession') IS NULL AND NOT coalesce((
           json_type(state, '$.observation.issue.open') = 'false'
-          AND json_type(state, '$.observation.existingPulls') = 'array'
-          AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.observation.existingPulls') p
-            WHERE json_extract(state, '$.observation.externalMerge.merge_sha') IS NULL
-              OR lower(p.value) IS NOT lower('https://github.com/' || json_extract(state, '$.repository') || '/pull/' || json_extract(state, '$.observation.externalMerge.pull_number')))
-          AND resource_pending = 0 AND json_extract(state, '$.reviewPending') IS NOT 1
-          AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i WHERE json_extract(i.value, '$.state') IS NOT 'settled')
-          AND json_extract(state, '$.observation.publication.merged') IS 0
-          AND ((json_type(state, '$.observation.pull') = 'null'
-            AND json_type(state, '$.observation.publication.pull_number') = 'null'
-            AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
-            AND json_type(state, '$.observation.publication.state') = 'null')
-          OR (json_extract(state, '$.observation.pull.state') = 'closed'
-            AND json_extract(state, '$.observation.publication.state') = 'closed'
-            AND json_extract(state, '$.observation.pull.number') = json_extract(state, '$.observation.publication.pull_number')
-            AND json_extract(state, '$.observation.pull.merged') IS 0
-            AND json_extract(state, '$.observation.pull.mergeSha') IS NULL))
+          AND (${SETTLED_CLOSURE_SQL})
         ), 0)`}
         AND chain_id > ? ORDER BY chain_id LIMIT ?`).all(merged ? 1 : 0, after, limit)) as Array<{ chain_id: string }>
     return rows.map((row) => this.read(row.chain_id)!)

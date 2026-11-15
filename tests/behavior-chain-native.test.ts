@@ -14,9 +14,14 @@ import type { ChainObservation } from '../server/behavior-chain-decision'
 import { completedReviewCall } from './review-response-fixture'
 import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn(), health: vi.fn(async () => {}) }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), health: vi.fn(), readDatastoreView: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn() }))
-vi.mock('../server/datastore-health', () => ({ runDatastoreHealth: mocks.health }))
+vi.mock('../server/datastore-health', async importOriginal => ({
+  ...await importOriginal<typeof import('../server/datastore-health')>(), runDatastoreHealth: mocks.health,
+}))
+vi.mock('../server/datastore-reader', async importOriginal => ({
+  ...await importOriginal<typeof import('../server/datastore-reader')>(), readDatastoreView: mocks.readDatastoreView,
+}))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/interface' }))
 vi.mock('../server/settings', () => ({ getSettings: () => ({ me: 'author', agentAccount: 'reviewer' }),
   getBehaviorChainSettings: () => ({ enabled: true, seedMode: 'all', label: 'poise' }),
@@ -118,6 +123,24 @@ function actionOperations(overrides: Partial<NativeChainHooks> = {}) {
     reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {}, ...overrides,
   })
 }
+
+it.each([false, true])('returns default-database closure hints only with healthy mirror evidence: %s', async healthy => {
+  vi.stubEnv('XDG_DATA_HOME', '/fixture/data')
+  const database = '/fixture/data/github-datastore/github_datastore.sqlite'
+  const updatedAt = new Date().toISOString()
+  mocks.readDatastoreView.mockResolvedValueOnce([
+    { repo: 'example/repo', number: 7, status: 'closed', updated_at: updatedAt },
+    { repo: 'unfollowed/repo', number: 8, status: 'closed', updated_at: updatedAt },
+  ])
+  mocks.health.mockResolvedValueOnce({ stdout: JSON.stringify({ action: 'health', database, healthy,
+    status: healthy ? 'healthy' : 'stale', max_age_seconds: 120, age_seconds: healthy ? 1 : 180, last_success_at: updatedAt }) })
+  const after = { repository: 'example/repo', number: 6 }
+  expect(await actionOperations().closedSeedHints!(after))
+    .toEqual(healthy ? [{ repository: 'example/repo', number: 7, updatedAt: Date.parse(updatedAt) }] : [])
+  expect(mocks.readDatastoreView).toHaveBeenLastCalledWith(database, expect.arrayContaining([
+    '--status', 'closed', '--limit', '100', '--after-repo', after.repository, '--after-number', '6',
+  ]))
+})
 
 function mergeInvocation(): ChainInvocation {
   return { id: 'original-merge', behavior: 'merge-pr', basis: 'merge', actor: 'reviewer', model: null, slot: null,
