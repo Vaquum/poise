@@ -15,6 +15,7 @@
 //
 // Reference: caller/github_datastore/CONSUMER_CONTRACT.md.
 
+import { createHash } from 'node:crypto'
 import { mkdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -1121,6 +1122,87 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
   return result
 }
 
+function parseIssue(stdout: string, repository: string, number: number) {
+  const value: unknown = JSON.parse(stdout)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('GitHub returned an invalid issue')
+  const row = value as Record<string, unknown>
+  if ('pull_request' in row) throw new HttpError(400, 'The target is a pull request')
+  if (row.number !== number || typeof row.title !== 'string' || !row.title
+    || row.body !== null && typeof row.body !== 'string' || !['open', 'closed'].includes(String(row.state))
+    || typeof row.html_url !== 'string' || row.html_url.toLowerCase() !== `https://github.com/${repository}/issues/${number}`.toLowerCase()
+    || typeof row.created_at !== 'string' || !Number.isFinite(Date.parse(row.created_at))
+    || typeof row.updated_at !== 'string' || !Number.isFinite(Date.parse(row.updated_at))) {
+    throw new Error('GitHub returned an invalid or mismatched issue')
+  }
+  return { number, title: row.title, body: row.body ?? '', state: String(row.state),
+    url: row.html_url, created_at: row.created_at, updated_at: row.updated_at }
+}
+
+function issueIntakeLabel(state: string): string {
+  const { seedMode, label } = getBehaviorChainSettings()
+  if (seedMode !== 'label') throw new HttpError(409, 'The behavior chain takes every open issue, so there is no label to add')
+  if (state !== 'open') throw new HttpError(409, 'The issue is closed')
+  return label
+}
+
+const githubAccountEnv = (token: string) => ({ GH_HOST: 'github.com', GH_TOKEN: token, GITHUB_TOKEN: undefined,
+  GH_ENTERPRISE_TOKEN: undefined, GITHUB_ENTERPRISE_TOKEN: undefined })
+
+async function addIssueLabel(endpoint: string, label: string, token: string, timeoutMs: number) {
+  const applied: unknown = JSON.parse((await runFile(GH, ['api', `${endpoint}/labels`, '--method', 'POST', '-f', `${ISSUE_LABEL_PREFIX}${label}`], {
+    env: githubAccountEnv(token), timeoutMs, maxOutputBytes: 4 * 1024 * 1024,
+  })).stdout)
+  if (!Array.isArray(applied) || !applied.some((entry) => typeof entry?.name === 'string' && entry.name.toLowerCase() === label.toLowerCase())) {
+    throw new Error(`GitHub did not confirm the ${label} label`)
+  }
+}
+
+export interface IssueLabelBasis { issueId: number; updatedAt: string; revision: string; label: string }
+export async function readIssueLabel(repository: string, issue: number, owner: string,
+  apply?: { expected: IssueLabelBasis; beforeWrite: () => void }) {
+  requireConfiguredRepository(repository)
+  const assertOwner = () => {
+    const account = getMeta('me')
+    if (!account || account.toLowerCase() !== owner.toLowerCase()) {
+      throw new HttpError(403, 'GitHub actions require the signed workspace owner as the configured account')
+    }
+    return account
+  }
+  const account = assertOwner()
+  const endpoint = `repos/${repository}/issues/${issue}`
+  let basis: IssueLabelBasis
+  let title: string
+  let token: string
+  try {
+    token = await resolveMeToken(account)
+    const { stdout } = await runFile(GH, ['api', endpoint, '--method', 'GET'], {
+      env: githubAccountEnv(token), timeoutMs: 8000, maxOutputBytes: 4 * 1024 * 1024,
+    })
+    const record = parseIssue(stdout, repository, issue)
+    const label = issueIntakeLabel(record.state)
+    const raw = JSON.parse(stdout) as { id?: unknown; labels?: Array<{ name?: unknown }> }
+    if (typeof raw.id !== 'number' || !Number.isSafeInteger(raw.id) || raw.id < 1
+      || !Array.isArray(raw.labels) || !raw.labels.every(item => typeof item?.name === 'string')) throw new Error('The issue identity or labels are unavailable')
+    const labels = raw.labels.map(item => String(item.name).toLowerCase()).sort()
+    if (labels.includes(label.toLowerCase())) throw new HttpError(409, 'This issue already has the configured intake label')
+    basis = { issueId: raw.id, updatedAt: record.updated_at,
+      revision: createHash('sha256').update(JSON.stringify([record.title, record.body, labels])).digest('hex'), label }
+    title = record.title.slice(0, 300)
+  } catch (error) {
+    if (error instanceof HttpError) throw error
+    throw new HttpError(502, 'GitHub could not verify the issue basis')
+  }
+  if (apply) {
+    assertOwner()
+    requireConfiguredRepository(repository)
+    if (JSON.stringify(apply.expected) !== JSON.stringify(basis)) throw new HttpError(409, 'The GitHub issue or intake policy changed after preview')
+    apply.beforeWrite()
+    // A failed or malformed write response may still mean GitHub applied it.
+    await addIssueLabel(endpoint, basis.label, token, 8000)
+  }
+  return { basis, title, actor: account }
+}
+
 async function handleGhOperation(body: any, op: unknown, me: string): Promise<{ status: number, body: unknown }> {
 
   if (op === 'actions') return listActionRuns(body)
@@ -1202,36 +1284,14 @@ async function handleGhOperation(body: any, op: unknown, me: string): Promise<{ 
       const env = { GH_HOST: 'github.com', GH_TOKEN: token, GITHUB_TOKEN: undefined,
         GH_ENTERPRISE_TOKEN: undefined, GITHUB_ENTERPRISE_TOKEN: undefined }
       const endpoint = `repos/${repoFull}/issues/${issueNumber}`
-      const parse = (stdout: string) => {
-        const value: unknown = JSON.parse(stdout)
-        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('GitHub returned an invalid issue')
-        const row = value as Record<string, unknown>
-        if ('pull_request' in row) throw new HttpError(400, 'The target is a pull request, not an issue')
-        if (row.number !== issueNumber || typeof row.title !== 'string' || !row.title
-          || row.body !== null && typeof row.body !== 'string' || !['open', 'closed'].includes(String(row.state))
-          || typeof row.html_url !== 'string' || row.html_url.toLowerCase() !== `https://github.com/${repoFull}/issues/${issueNumber}`.toLowerCase()
-          || typeof row.created_at !== 'string' || !Number.isFinite(Date.parse(row.created_at))
-          || typeof row.updated_at !== 'string' || !Number.isFinite(Date.parse(row.updated_at))) {
-          throw new Error('GitHub returned an invalid or mismatched issue')
-        }
-        return { number: issueNumber, title: row.title, body: row.body ?? '', state: String(row.state),
-          url: row.html_url, created_at: row.created_at, updated_at: row.updated_at }
-      }
+      const parse = (stdout: string) => parseIssue(stdout, repoFull, issueNumber)
       const current = parse((await runFile(GH, ['api', endpoint, '--method', 'GET'], {
         env, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024,
       })).stdout)
       if (op === 'read_issue') return { status: 200, body: { issue: current } }
       if (op === 'assign_issue') {
-        // The label comes from the chain's settings, never from the browser.
-        const { seedMode, label } = getBehaviorChainSettings()
-        if (seedMode !== 'label') return { status: 409, body: { error: 'The behavior chain takes every open issue, so there is no label to add' } }
-        if (current.state !== 'open') return { status: 409, body: { error: 'The issue is closed' } }
-        const applied: unknown = JSON.parse((await runFile(GH, ['api', `${endpoint}/labels`, '--method', 'POST', '-f', `${ISSUE_LABEL_PREFIX}${label}`], {
-          env, timeoutMs: 60_000, maxOutputBytes: 4 * 1024 * 1024,
-        })).stdout)
-        if (!Array.isArray(applied) || !applied.some((entry) => typeof entry?.name === 'string' && entry.name.toLowerCase() === label.toLowerCase())) {
-          throw new Error(`GitHub did not confirm the ${label} label`)
-        }
+        const label = issueIntakeLabel(current.state)
+        await addIssueLabel(endpoint, label, token, 60_000)
         return { status: 200, body: { label } }
       }
       const title = body.title.trim(), issueBody = body.body

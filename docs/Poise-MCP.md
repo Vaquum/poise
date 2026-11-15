@@ -203,6 +203,25 @@ grant, client and target. Messages report queue admission, and stops report
 whether execution settled. A send or steering action cannot approve a native
 permission request or supply the person's answer.
 
+## Delegate chain holds and resumes
+
+The owner can separately delegate the existing chain Hold and Resume controls.
+Call `poise_chain_preview` with `operation`, `repository` and `issue`. The
+preview names the exact chain, current journal sequence, client and effect.
+Pass its opaque `preview` to `poise_chain_apply`. The apply checks the current
+sequence and write scope before appending the event.
+
+The journal retains the delegate, grant, request ID and applied event
+sequence. Repeating a valid applied preview recovers this exact receipt.
+Normal admission, capacity, GitHub and review gates still decide whether
+a resumed chain can start work.
+
+A label preview verifies the live open GitHub issue, its identity and
+revision, the configured intake label and the workspace owner's GitHub account.
+Apply rechecks that basis before adding the label. Poise records attribution
+before sending the write. A missing GitHub acknowledgement returns uncertainty
+and a repeated preview cannot send the write again.
+
 ## Private plugin
 
 Render a private package for an installation's HTTPS apex into a new directory:

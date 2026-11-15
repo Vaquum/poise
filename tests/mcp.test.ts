@@ -18,12 +18,13 @@ import { send, startHarness, type Harness } from '../gateway/tests/harness'
 import { enforceApiRequest, httpStatus } from '../server/http'
 import { handleMcpRead } from '../server/mcp'
 import { handleMcpControl } from '../server/mcp-manager'
+import { handleMcpOwner } from '../server/mcp-owner'
 import { readServiceConfig } from '../server/service/config'
 import { BehaviorChainJournal, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import { nativeActionReceipt, nativeActionSettlement } from '../server/behavior-chain-action'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
-import { db, setMeta } from '../server/db'
+import { db, getMeta, setMeta } from '../server/db'
 import * as ledger from '../server/behavior-ledger'
 import * as agent from '../server/agent'
 import * as analytics from '../server/analytics'
@@ -83,6 +84,7 @@ beforeEach(async () => {
       workspaceReads++
       beforeRead?.()
       if (req.url === '/api/mcp/manager') await handleMcpControl(req, res, authority, bob ? null : control)
+      else if (req.url === '/api/mcp/owner') await handleMcpOwner(req, res, authority, 'Alice')
       else await handleMcpRead(req, res, service, authority, bob ? 'bob-chat' : 'alice-chat', !bob && control?.status().running)
     } catch (error) { res.statusCode = httpStatus(error, 400); res.end(JSON.stringify({ error: String(error) })) }
   })
@@ -120,7 +122,7 @@ const fetcher: typeof fetch = async (input, init) => {
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
 async function connect(login: string, serverEndpoint = endpoint,
-  options: { chatMetadata?: boolean; chatTranscript?: boolean; chatArtifacts?: boolean; workspaceData?: boolean; contentData?: boolean; repository?: string; managerControls?: boolean } = {}) {
+  options: { chatMetadata?: boolean; chatTranscript?: boolean; chatArtifacts?: boolean; workspaceData?: boolean; contentData?: boolean; repository?: string; managerControls?: boolean; ownerControls?: boolean } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -156,6 +158,7 @@ async function connect(login: string, serverEndpoint = endpoint,
     ...(options.contentData ? { contentData: '1' } : {}),
     ...(options.chatArtifacts ? { chatArtifacts: '1' } : {}),
     ...(options.managerControls ? { managerControls: '1' } : {}),
+    ...(options.ownerControls ? { ownerControls: '1' } : {}),
     ...(options.repository === undefined ? {} : { repository: options.repository }) }) })
   expect(approved.status).toBe(303)
   const callback = new URL(approved.headers.get('location')!)
@@ -502,6 +505,111 @@ it('requires delegated Manager authority and revalidates and receipts an exact a
     db.prepare('DELETE FROM chat_control_watches WHERE instance = ? AND owner = ?').run('alice-chat', manager)
     for (const id of [manager, worker, foreignWorker]) deleteSession(id)
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+it('keeps owner chain consent separate and preserves the original hold and resume receipts', async () => {
+  const repository = 'Fixture/Owner'
+  const originalOrg = getMeta('org')
+  setMeta('org', 'Fixture')
+  const journal = new BehaviorChainJournal(db)
+  const id = 'fixture/owner#1'
+  const chain = journal.append(id, randomUUID(), 0, { type: 'chain.admitted', repository, issue: 1, branch: 'poise/issue-1',
+    author: 'Alice', reviewer: 'review-bot' })
+  const manager = await connect('Alice', endpoint, { managerControls: true })
+  const owner = await connect('Alice', endpoint, { ownerControls: true, repository })
+  const another = await connect('Alice', endpoint, { ownerControls: true, repository })
+  const preview = { name: 'poise_chain_preview', arguments: { repository, issue: 1, operation: 'hold' } }
+  const apply = (value: string) => ({ name: 'poise_chain_apply', arguments: { preview: value } })
+  async function invoke(client: Client, request: typeof preview | ReturnType<typeof apply>) {
+    const result = await client.callTool(request)
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).action as { preview: string; requestId: string }
+  }
+  try {
+    expect((await manager.client.callTool(preview)).isError).toBe(true)
+    expect((await owner.client.callTool({ ...preview, arguments: { ...preview.arguments, repository: 'Fixture/Other' } })).isError).toBe(true)
+    const stale = await invoke(owner.client, preview)
+    expect(stale).toMatchObject({ status: 'preview', sequence: chain.sequence, humanDecisionRequired: false })
+    expect(journal.read(id)?.held).toBeNull()
+    journal.append(id, randomUUID(), chain.sequence, { type: 'chain.waiting', reason: 'Fixture change after preview' })
+    expect(await invoke(owner.client, apply(stale.preview))).toMatchObject({ status: 'refused' })
+    const fresh = await invoke(owner.client, preview)
+    expect(await invoke(another.client, apply(fresh.preview))).toMatchObject({ status: 'refused' })
+    const held = await invoke(owner.client, apply(fresh.preview))
+    expect(held).toMatchObject({ status: 'applied', receipt: { event: 'chain.held' } })
+    const resumed = await invoke(owner.client, { ...preview, arguments: { ...preview.arguments, operation: 'resume' } })
+    expect(await invoke(owner.client, apply(resumed.preview))).toMatchObject({ status: 'applied', receipt: { event: 'chain.resumed' } })
+    expect(await invoke(owner.client, apply(fresh.preview))).toEqual(held)
+    expect(journal.read(id)?.held).toBeNull()
+    const grant = gateway.context.mcp.grants.find((await owner.provider.tokens())!.access_token, 'access')!
+    expect(journal.eventReceipt(id, held.requestId)?.event).toMatchObject({ delegation: { grantId: grant.grantId, clientId: grant.clientId, ownerId: 1001 } })
+    expect(JSON.stringify(held)).not.toContain(grant.grantId)
+  } finally {
+    setMeta('org', originalOrg ?? '')
+    await Promise.all([manager.client.close(), owner.client.close(), another.client.close()])
+  }
+})
+
+it('labels only a verified issue on its exact preview basis and preserves uncertain write receipts', async () => {
+  const originalOrg = getMeta('org'), originalMe = getMeta('me')
+  const repository = 'Fixture/Owner'
+  setMeta('org', 'Fixture')
+  setMeta('me', 'Alice')
+  const owner = await connect('Alice', endpoint, { ownerControls: true, repository })
+  const stranger = await connect('Alice', endpoint, { ownerControls: true, repository })
+  const run = vi.spyOn(processes, 'runFile')
+  const issue = { number: 7, id: 705, title: 'Verified issue', body: null, labels: [], state: 'open',
+    html_url: 'https://github.com/Fixture/Owner/issues/7', created_at: '2026-11-01T00:00:00Z', updated_at: '2026-11-02T00:00:00Z' }
+  let lost = false, writes = 0
+  run.mockImplementation(async (_command, args) => {
+    if (args[0] === 'auth') {
+      expect(args).toEqual(['auth', 'token', '--hostname', 'github.com', '--user', 'Alice'])
+      return { stdout: 'fixture-owner-token\n', stderr: '' }
+    }
+    if (args.includes('POST')) {
+      expect(args).toEqual(['api', 'repos/Fixture/Owner/issues/7/labels', '--method', 'POST', '-f', 'labels[]=poise'])
+      writes++
+      if (lost) throw new Error('response lost')
+      return { stdout: JSON.stringify([{ name: 'poise' }]), stderr: '' }
+    }
+    return { stdout: JSON.stringify(issue), stderr: '' }
+  })
+  async function control(name: string, arguments_: Record<string, unknown>, client = owner.client) {
+    const result = await client.callTool({ name, arguments: arguments_ })
+    expect(result.isError).not.toBe(true)
+    return JSON.parse((result.content as { text: string }[])[0].text).action as { preview: string; requestId: string }
+  }
+  const preview = () => control('poise_chain_preview', { operation: 'label', repository, issue: 7 })
+  const apply = (value: string, client?: Client) => control('poise_chain_apply', { preview: value }, client)
+  try {
+    const stale = await preview()
+    expect(stale).toMatchObject({ status: 'preview', actor: 'Alice', issueBasis: { issueId: 705, label: 'poise', updatedAt: issue.updated_at },
+      link: issue.html_url })
+    expect(writes).toBe(0)
+    issue.title = 'Edited while preview was open'
+    expect(await apply(stale.preview)).toMatchObject({ status: 'refused' })
+    expect(writes).toBe(0)
+    const fresh = await preview()
+    expect(await apply(fresh.preview, stranger.client)).toMatchObject({ status: 'refused' })
+    const done = await apply(fresh.preview)
+    expect(done).toMatchObject({ status: 'applied', receipt: { issueId: 705, label: 'poise', actor: 'Alice' } })
+    expect(await apply(fresh.preview)).toEqual(done)
+    expect(writes).toBe(1)
+    const persisted = db.prepare('SELECT delegation FROM chat_command_receipts WHERE instance = ? AND request_id = ?')
+      .get('mcp-issue:alice', done.requestId) as { delegation: string }
+    const grant = gateway.context.mcp.grants.find((await owner.provider.tokens())!.access_token, 'access')!
+    expect(JSON.parse(persisted.delegation)).toMatchObject({ grantId: grant.grantId, clientId: grant.clientId, ownerId: 1001, issue: 7 })
+    lost = true
+    const uncertain = await preview()
+    expect(await apply(uncertain.preview)).toMatchObject({ status: 'uncertain' })
+    expect(await apply(uncertain.preview)).toMatchObject({ status: 'uncertain' })
+    expect(writes).toBe(2)
+  } finally {
+    run.mockRestore()
+    setMeta('org', originalOrg ?? '')
+    setMeta('me', originalMe ?? '')
+    await Promise.all([owner.client.close(), stranger.client.close()])
   }
 })
 

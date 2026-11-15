@@ -81,13 +81,16 @@ export function ciRefreshBasis(hold: NonNullable<BehaviorChain['ciHold']>): stri
   // Advancing main does not change which failed Call owns this allowance.
   return chainBasis(['refresh-pr-ci', hold.invocationId, hold.callId, hold.head])
 }
+interface DelegatedChainAuthority { grantId: string; clientId: string; expectedSequence: number; ownerId: number }
 export type ChainEvent =
   | { type: 'chain.admitted', repository: string, issue: number, branch: string, author: string, reviewer: string }
   | { type: 'chain.observed', observation: Record<string, unknown> }
-  | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'], testHold?: Omit<NonNullable<BehaviorChain['testHold']>, 'sequence'> }
+  | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'], testHold?: Omit<NonNullable<BehaviorChain['testHold']>, 'sequence'>,
+    delegation?: DelegatedChainAuthority }
   | { type: 'chain.waiting', reason: string }
   | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], testRecovery?: BehaviorChain['testRecovery'],
-    repairRecovery?: BehaviorChain['repairRecovery'], approvalRecovery?: string, recovery?: ChainRecoveryOrigin }
+    repairRecovery?: BehaviorChain['repairRecovery'], approvalRecovery?: string, recovery?: ChainRecoveryOrigin,
+    delegation?: DelegatedChainAuthority }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
@@ -510,6 +513,12 @@ export class BehaviorChainJournal {
           next.invocations.some(invocation => nativeResourcesPending({ ...invocation })) ? 1 : 0)
       return next
     }).immediate()
+  }
+
+  eventReceipt(id: string, eventId: string): { sequence: number; at: number; event: ChainEvent } | null {
+    const row = cachedStatement(this.db, 'SELECT sequence, at, payload FROM behavior_chain_events WHERE chain_id = ? AND event_id = ?')
+      .get(id, eventId) as { sequence: number; at: number; payload: string } | undefined
+    return row ? { sequence: row.sequence, at: row.at, event: JSON.parse(row.payload) as ChainEvent } : null
   }
 
   active(after = '', limit = 100): BehaviorChain[] {

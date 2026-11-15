@@ -106,7 +106,7 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
         : readMcpChatChanges(chatInstance, authority.mcp, read.arguments)
     } else throw new HttpError(403, 'the selected read belongs to the gateway')
   }
-  const tools = mcpToolNames({ ...(chatInstance ? authority.mcp : { workspaceData: authority.mcp.workspaceData, contentData: authority.mcp.contentData }), managerClientId: managerRunning ? authority.mcp.managerClientId : undefined })
+  const tools = mcpToolNames({ ...(chatInstance ? authority.mcp : { workspaceData: authority.mcp.workspaceData, contentData: authority.mcp.contentData }), managerClientId: managerRunning ? authority.mcp.managerClientId : undefined, ownerClientId: authority.mcp.ownerClientId })
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },
     ...(read.name === 'poise_describe' ? { inventory: mcpInventory() } : {}),
     ...(work ? { work } : {}), ...(lookup ? { lookup } : {}), ...(page ? { page } : {}) })

@@ -6,7 +6,10 @@ import { db } from '../db'
 import type { ServerFrame } from './protocol'
 
 type Ack = Extract<ServerFrame, { kind: 'ack' }>
-interface DelegatedAuthority { grantId: string; clientId: string; managerId: string; sessionId: string; sequence: number }
+type DelegatedAuthority = { grantId: string; clientId: string } & (
+  { managerId: string; sessionId: string; sequence: number }
+  | { ownerId: number; repository: string; issue: number; updatedAt: string }
+)
 interface Receipt { fingerprint: string, ack: string | null }
 interface Active { fingerprint: string, promise: Promise<Ack> }
 const active = new Map<string, Active>()
