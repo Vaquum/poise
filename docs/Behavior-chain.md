@@ -790,6 +790,18 @@ the specific cause as its invocation outcome in History. Preparation timeouts
 remain distinct. Retry still requires positive resource release and the existing
 same-basis backoff; three failures hold the chain across restart until **Resume**.
 
+A repair that changes source before the deadline can retain its edits in
+Caller's private, size-limited deadline artifact after the original provider
+has stopped. Capture compares with the prepared checkout, including files
+staged by base integration and unresolved conflict markers. The existing retry
+can restore the artifact from its preceding settled Call in the same attempt
+window. It requires positive resource release and no publication effect, the
+same actor, seed revision, PR head, integration base and repair basis, and a
+matching fresh review packet and preparation. Missing or invalid source evidence
+leaves the next eligible repair fresh. Restored edits are unvalidated and the
+successor still supplies its own review replies and passes the normal validation
+and publication gates.
+
 Repair prompts receive `change_request_reviews` from the native
 `github-interface --pr-review` packet, even with no inline roots. The read selects each
 author's latest effective review (`APPROVED`, `CHANGES_REQUESTED`, `DISMISSED`),

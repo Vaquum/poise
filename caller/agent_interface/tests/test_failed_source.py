@@ -11,13 +11,14 @@ import subprocess
 import sys
 import tarfile
 from tempfile import TemporaryDirectory
+from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 import agent_interface as api
-from agent_interface import atomic_work, failed_source, issue_review
+from agent_interface import atomic_work, failed_source, issue_review, resource_ownership
 from agent_interface import review_budget
 
 RUN = "b" * 32
@@ -524,6 +525,194 @@ def test_deadline_unreleased_cleanup_refuses_restore(workspace, monkeypatch):
 
     successor, _, _ = _run_deadline_successor(workspace, monkeypatch, "2026-01-01T00:00:00+00:00", False, mutate=mutate)
     assert "deadline_restored" not in successor["artifact"]
+
+
+@pytest.mark.parametrize("variant", [
+    "same", "conflict", "head", "base", "basis", "review", "seed", "actor", "no edits",
+    "oversized edit", "corrupt", "oversized artifact", "unreleased", "possible write", "missing reply",
+])
+def test_repair_deadline_continuation(workspace, monkeypatch, variant):
+    source = workspace / "source"
+    ancestor = prepared(source)["checkout_head"]
+    git(source, "switch", "-c", "integration")
+    (source / "integrated.cjs").write_text("module.exports='integration';\n")
+    if variant == "conflict":
+        (source / "source.cjs").write_text("module.exports='base';\n")
+    git(source, "add", ".")
+    git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "integrate base")
+    base = git(source, "rev-parse", "HEAD")
+    git(source, "switch", "-c", "repair", ancestor)
+    (source / "pr.cjs").write_text("module.exports='pr';\n")
+    if variant == "conflict":
+        (source / "source.cjs").write_text("module.exports='branch';\n")
+    git(source, "add", ".")
+    git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "PR changes")
+    head = git(source, "rev-parse", "HEAD")
+    seed = {"state": "open", "title": "Repair seed"}
+    basis, actor = "b" * 64, "author"
+    body = "Original finding"
+    reply = {"commentId": 123, "body": "The corrected source now returns the expected value."}
+    modes, checkouts = [], []
+    corrected = "module.exports=42;\n"
+    initial = ""
+
+    def interface(command, *args, **kwargs):
+        if command == "--pr-review":
+            return {"repository": "example/repo", "head_sha": head, "pull_number": 21,
+                    "pull": {"base": {"sha": base}}, "change_request_reviews": [], "author_pr_comments": [],
+                    "review_threads": [{"root_comment_id": 123, "is_resolved": False, "bodies": [body]}]}
+        if command != "--issue-work":
+            assert command in {"--list-failing-ci", "--pull-action-state"}
+            return {}
+        mode = args[args.index("--mode") + 1]
+        modes.append(mode)
+        checkout = Path(args[args.index("--path") + 1])
+        if mode == "prepare":
+            nonlocal initial
+            assert "--merge-base" in args and args[args.index("--expected-head") + 1] == head
+            git(source, "clone", "-q", "--branch", "repair", str(source), str(checkout))
+            merged = subprocess.run(["git", "-C", str(checkout), "-c", "user.name=fixture",
+                                     "-c", "user.email=fixture@example.test", "merge", "--no-commit", "--no-ff", base],
+                                    capture_output=True)
+            assert merged.returncode == (1 if variant == "conflict" else 0), merged.stderr
+            assert git(checkout, "rev-parse", "HEAD") == head
+            initial = (checkout / "source.cjs").read_text()
+            checkouts.append(checkout)
+            return {"outcome": "prepared", "checkout_head": head, "head_sha": head, "base_sha": base,
+                    "path": str(checkout), "repository": "example/repo", "issue_number": 7,
+                    "pull_number": 21, "actor": actor}
+        assert (checkout / "source.cjs").read_text() == corrected
+        assert git(checkout, "diff", "--name-only", "--diff-filter=U") == ""
+        assert json.loads(args[args.index("--replies-json") + 1]) == [reply]
+        return {"outcome": "validated" if mode == "validate" else "published", "head_sha": "d" * 40}
+
+    track = api.track
+
+    def track_with_fixture_resources(*args, **kwargs):
+        with monkeypatch.context() as binding:
+            binding.setattr(api, "_native_cli", False)
+            return track(*args, **kwargs)
+
+    def run_attempt(correlation, predecessor=None):
+        argv = ["agent-interface", "--atomic-work", "example/repo#7", "--actor", actor, "--source", "poise:behavior-chain",
+                "--correlation-id", correlation, "--model", "fixture", "--branch", "repair", "--pull-number", "21",
+                "--expected-head", head, "--expected-issue-revision", issue_review.revision(seed),
+                "--merge-base", "--repair-basis", basis]
+        if predecessor:
+            argv.extend(["--repair-predecessor", predecessor])
+        monkeypatch.setattr(sys, "argv", argv)
+        api.main()
+
+    monkeypatch.setattr(api, "track", track_with_fixture_resources)
+    monkeypatch.setattr(issue_review, "packet", lambda *args: {"issue": seed})
+    monkeypatch.setattr(issue_review, "_issue", lambda *args: seed)
+    monkeypatch.setattr(issue_review, "interface", interface)
+    monkeypatch.setattr(atomic_work.checkout_lock, "Lease", REAL_LEASE)
+    monkeypatch.setattr(review_budget, "timeout", lambda *args, **kwargs: 1)
+    edit = "" if variant == "no edits" else f"Path('source.cjs').write_text({corrected!r})"
+    if variant == "oversized edit":
+        edit = f"Path('source.cjs').write_bytes(b'x' * {failed_source.MAX_BYTES + 1})"
+    script = f"from pathlib import Path\nfrom threading import Event\n{edit}\nPath('../provider-ready').touch()\nEvent().wait()"
+    monkeypatch.setattr(issue_review, "command", lambda *args: (_deadline_provider(script), "", None))
+
+    def ready_deadline(lease, args, *, cwd, **kwargs):
+        ready = Path(cwd).parent / "provider-ready"
+        started = monotonic()
+
+        def gate_clock():
+            now = monotonic()
+            return now if ready.exists() or now - started >= 15 else started
+
+        # Give the stand-in time to write before expiring the real lease gate.
+        with monkeypatch.context() as gate:
+            gate.setattr(atomic_work.checkout_lock, "monotonic", gate_clock)
+            try:
+                return REAL_RUN_GATED(lease, args, cwd=cwd, **kwargs)
+            finally:
+                assert ready.is_file(), "the deadline fixture never reached its edit boundary"
+
+    with monkeypatch.context() as gate, pytest.raises(review_budget.ReviewLimitError):
+        gate.setattr(atomic_work.checkout_lock, "run_gated", ready_deadline)
+        run_attempt("repair-original")
+
+    original, = api.logs_selected({"latest": [], "ids": [], "correlations": ["repair-original"]})
+    assert (original["error_code"], original["action"], original["outcome"]) == (
+        "atomic_work_execution_budget_exhausted", "not_started", "preflight_failed")
+    assert modes == ["prepare"] and not checkouts[0].parent.exists()
+    assert resource_ownership.released(original["resource_ownership"]) and original["resources_settled_at"]
+    assert "plan_sha" not in original["artifact"] and original["receipts"] is None
+    metadata = original["artifact"]["deadline_source"]
+    capture = Path(os.environ["POISE_DB"]).parent / "incident-recovery" / f"deadline-source-{original['id']}.json"
+    if variant in {"no edits", "oversized edit"}:
+        assert metadata["status"] == "unavailable" and not capture.exists()
+    else:
+        assert metadata["status"] == "available" and metadata["repair"]["integration_base"] == base
+        payload = capture.read_bytes()
+        assert metadata["sha256"] == hashlib.sha256(payload).hexdigest()
+        change, = json.loads(payload)["changes"]
+        assert change["path"] == "source.cjs" and base64.b64decode(change["content"]).decode() == corrected
+
+    if variant in {"head", "base"}:
+        git(source, "switch", "repair" if variant == "head" else "integration")
+        git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "--allow-empty", "-qm", "advance")
+        if variant == "head":
+            head = git(source, "rev-parse", "HEAD")
+        else:
+            base = git(source, "rev-parse", "HEAD")
+    elif variant == "basis":
+        basis = "c" * 64
+    elif variant == "review":
+        body = "Finding edited while the PR head stays fixed"
+    elif variant == "seed":
+        seed = {**seed, "title": "Updated seed"}
+    elif variant == "actor":
+        actor = "another-author"
+    elif variant == "corrupt":
+        capture.write_bytes(payload.replace(b"source.cjs", b"forged.cjs"))
+    elif variant == "oversized artifact":
+        capture.write_bytes(b"x" * (failed_source.MAX_BYTES + 1))
+    elif variant in {"unreleased", "possible write"}:
+        with api.db() as conn:
+            if variant == "unreleased":
+                conn.execute("update calls set resources_settled_at=null where id=?", (original["id"],))
+            else:
+                conn.execute("update calls set action_plan='uncertain' where id=?", (original["id"],))
+
+    expects_restore = variant in {"same", "conflict", "missing reply"}
+    publishes = variant in {"same", "conflict"}
+    output = {"commitMessage": "fix: repair", "title": "fix: repair", "body": "Validate restored source",
+              "replies": [reply] if publishes else [], "blocked": None if expects_restore else "fresh repair needed"}
+
+    def successor_command(_model, instruction, _checkout, _work, _seconds, _unattended):
+        assert ("unvalidated file(s)" in instruction) is expects_restore
+        expected = corrected if expects_restore else initial
+        script = f"""from pathlib import Path
+import subprocess
+assert Path('source.cjs').read_text() == {expected!r}
+assert Path('integrated.cjs').is_file()
+subprocess.run(['git', 'add', 'source.cjs'], check=True)
+Path('../publication.json').write_text({json.dumps(output)!r})
+"""
+        return _deadline_provider(script), "", None
+
+    monkeypatch.setattr(review_budget, "timeout", lambda *args, **kwargs: 30)
+    monkeypatch.setattr(atomic_work.checkout_lock, "run_gated", REAL_RUN_GATED)
+    monkeypatch.setattr(issue_review, "command", successor_command)
+    if publishes:
+        run_attempt("repair-successor", original["id"])
+    elif expects_restore:
+        with pytest.raises(atomic_work.AtomicWorkFailed, match="did not answer every unresolved review finding"):
+            run_attempt("repair-successor", original["id"])
+    else:
+        with pytest.raises(atomic_work.AtomicWorkBlocked, match="fresh repair needed"):
+            run_attempt("repair-successor", original["id"])
+    successor, = api.logs_selected({"latest": [], "ids": [], "correlations": ["repair-successor"]})
+    assert modes == ["prepare", "prepare"] + (["validate", "publish"] if publishes else [])
+    if expects_restore:
+        assert successor["artifact"]["deadline_restored"]["predecessor"] == original["id"]
+        assert successor["artifact"]["deadline_restored"]["sha256"] == metadata["sha256"]
+    else:
+        assert "deadline_restored" not in successor["artifact"]
 
 
 def test_deadline_large_unchanged_file_does_not_veto_capture(workspace, monkeypatch):
