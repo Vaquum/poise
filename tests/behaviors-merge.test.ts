@@ -411,6 +411,11 @@ describe('Merge Pull Requests', () => {
     expect(mergeCalls()).toEqual([])
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ behavior: 'merge-prs', error: expect.stringContaining('stale') })])
   })
+  it('avoids admitting a stale item snapshot and still merges its healthy neighbour', async () => {
+    enable(); pulls.push(pull(REPO, 8, { sync_error: 'GitHub did not return the PR graph' }))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls().map(([, args]) => args[1])).toEqual(['#7'])
+  })
   it('records per-target errors and applies retry backoff', async () => {
     enable(); error = new Error('GitHub unavailable')
     await runtime.runEnabledBehaviorsOnce()

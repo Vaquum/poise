@@ -119,11 +119,28 @@ describe('datastore views read in-process', () => {
     } finally { mapped.close() }
   })
 
-  it('fails where Caller fails: incomplete label evidence', async () => {
+  it('keeps issues with usable labels next to an old snapshot with missing evidence', async () => {
     const unlabelled = join(directory, 'unlabelled.sqlite')
     const [answer] = caller(unlabelled, [LABEL_READ], true)
-    expect(answer.error).toContain('issue label evidence is incomplete')
-    await expect(readDatastoreView(unlabelled, LABEL_READ)!).rejects.toThrow('issue label evidence is incomplete')
+    expect(answer.rows?.length).toBeGreaterThan(0)
+    expectSameRows(await readDatastoreView(unlabelled, LABEL_READ)!, answer.rows!)
+  })
+
+  it('projects a sync error only on its item and invalidates the content mark', async () => {
+    const partial = join(directory, 'partial.sqlite')
+    const [answer] = caller(partial, [READS[0]])
+    const target = answer.rows![0]
+    const before = await readDatastoreContent(partial)!
+    const writer = new Database(partial)
+    try {
+      writer.prepare("INSERT INTO sync_state VALUES ('item-sync-errors', ?, ?, ?)")
+        .run(String(target.payload_ref), JSON.stringify({ reason: 'missing PR graph' }), new Date().toISOString())
+      const rows = await readDatastoreView(partial, READS[0])!
+      expect(rows.filter(row => row.sync_error !== undefined)).toEqual([
+        expect.objectContaining({ payload_ref: target.payload_ref, sync_error: 'missing PR graph' }),
+      ])
+      expect(await readDatastoreContent(partial)!).not.toBe(before)
+    } finally { writer.close() }
   })
 
   it('reads a datastore that was replaced, not the file it replaced', async () => {

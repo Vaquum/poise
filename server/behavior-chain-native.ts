@@ -158,12 +158,13 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         return rows.map((raw) => {
           const row = object(raw, 'issue intake')
           if (typeof row.repo !== 'string' || !ownsRepository(row.repo) || row.status !== 'open') throw new Error('issue intake escaped its followed organization')
-          return { repository: row.repo, number: positive(row.number, 'issue intake') }
+          return { repository: row.repo, number: positive(row.number, 'issue intake'), stale: row.sync_error !== undefined }
         })
       }))
       const tail = pages[1].at(-1)
       discoveryCursor = pages[1].length === 100 && tail ? { repo: tail.repository, number: tail.number } : { repo: '', number: 0 }
-      const seeds = [...new Map(pages.flat().map((seed) => [`${seed.repository}#${seed.number}`, seed])).values()]
+      const seeds = [...new Map(pages.flat().filter(seed => !seed.stale)
+        .map((seed) => [`${seed.repository}#${seed.number}`, seed])).values()]
       const existing = await hooks.existing(seeds)
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
@@ -177,7 +178,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       if (validatedHealth(stdout, { ...org, datastorePath })?.status !== 'healthy') return []
       return rows.flatMap(row => {
         const updatedAt = typeof row.updated_at === 'string' ? Date.parse(row.updated_at) : NaN
-        return typeof row.repo === 'string' && ownsRepository(row.repo) && row.status === 'closed' && Number.isFinite(updatedAt)
+        return row.sync_error === undefined && typeof row.repo === 'string' && ownsRepository(row.repo) && row.status === 'closed' && Number.isFinite(updatedAt)
           ? [{ repository: row.repo, number: positive(row.number, 'closed issue hint'), updatedAt }] : []
       })
     },

@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 FULL_BUILD_COMPLETE_KEY = "full_build_complete"
 FULL_BUILD_MARKERS_INITIALIZED_KEY = "full_build_markers_v1_initialized"
 FULL_BUILD_RETRY_KEY = "full_build_retry_required"
+ITEM_SYNC_ERRORS = "item-sync-errors"
 INITIALIZATION_KEY = "initialization_v1"
 RECONCILE_PROGRESS_KEY = "reconcile_progress_v1"
 
@@ -334,6 +335,8 @@ def changed_items_for_repos(
 
 
 def build_user(username: str, db_path: str | Path) -> None:
+    if not username.strip():
+        raise ValueError("username is required")
     conn = connect(db_path)
     try:
         init_db(conn)
@@ -353,6 +356,10 @@ def build_user(username: str, db_path: str | Path) -> None:
             assert_no_duplicate_items(conn)
     finally:
         conn.close()
+
+
+class ReconciliationDeadline(Exception):
+    pass
 
 
 def sync_once(
@@ -450,9 +457,21 @@ def sync_once(
             and not full_build_retry_required(conn, int(repo["id"]))
         ]
         changed = changed_items_for_repos(reader, conn, incremental_repos, since)
+        pending: dict[int, dict[int, dict[str, Any]]] = {}
+        for row in conn.execute("SELECT key, value FROM sync_state WHERE scope = ?", (ITEM_SYNC_ERRORS,)):
+            try:
+                saved = json.loads(row["value"])
+                item = saved["item"]
+                item_id = int(row["key"])
+                if int(item["id"]) != item_id or type(item["number"]) is not int or item["item_kind"] not in ("pr", "issue"):
+                    raise ValueError("saved retry has an invalid item identity")
+                pending.setdefault(int(saved["repo_id"]), {})[item_id] = item
+            except (ValueError, TypeError, KeyError) as error:
+                logger.warning("Could not read sync retry for item %s: %s", row["key"], error)
 
         for repo in repos:
             repo_id = int(repo["id"])
+            retries = pending.get(repo_id, {})
             prior_repo = known_repos.get(repo_id)
             retry_full_build = full_build_retry_required(conn, repo_id)
             requires_initial_full = (
@@ -466,24 +485,31 @@ def sync_once(
                     with conn:
                         clear_full_build_marker(conn, repo_id)
                 all_issues = list_repo_items(reader, repo)
-                issues = (
+                refresh = (
                     all_issues
                     if reconcile or retry_full_build
                     else items_requiring_full_refresh(
                         conn, repo_id, repo["full_name"], all_issues
                     )
                 )
+                issues = {int(issue["id"]): issue for issue in refresh}
+                versions_in_repo = {int(issue["id"]): issue for issue in all_issues}
+                for item_id in retries:
+                    if item_id in versions_in_repo:
+                        issues[item_id] = versions_in_repo[item_id]
                 with conn:
                     prune_items_for_repo(
                         conn, repo_id, [int(issue["id"]) for issue in all_issues]
                     )
+                    for missing_id in retries.keys() - versions_in_repo.keys():
+                        conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (ITEM_SYNC_ERRORS, str(missing_id)))
                 # Each expansion and its source version survive a killed CLI.
                 # A new enumeration still discovers transfers, removals and edits.
                 checkpoint_scope = f"full-refresh:{repo_id}"
                 versions = {
                     int(issue["id"]): json.dumps([
                         repo["full_name"], issue["number"], issue["item_kind"], issue["updated_at"],
-                    ]) for issue in issues
+                    ]) for issue in issues.values()
                 }
                 stored_versions = {
                     int(row["item_id"]): json.dumps([
@@ -493,22 +519,34 @@ def sync_once(
                         (repo_id,),
                     )
                 }
-                issues = [issue for issue in issues if stored_versions.get(int(issue["id"])) != versions[int(issue["id"])] or
-                          get_state(conn, checkpoint_scope, str(issue["id"])) != versions[int(issue["id"])]]
+                items = [issue for item_id, issue in issues.items() if item_id in retries or stored_versions.get(item_id) != versions[item_id] or
+                         get_state(conn, checkpoint_scope, str(item_id)) != versions[item_id]]
             else:
-                issues = changed[repo["full_name"]]
-            outstanding = len(issues)
-            failed_item = False
+                by_number = {item["number"]: item for item in retries.values()}
+                by_number.update({item["number"]: item for item in changed[repo["full_name"]]})
+                items = list(by_number.values())
+            outstanding = len(items)
+            by_number = {item["number"]: item for item in items}
+
+            def checked_attempt() -> None:
+                nonlocal outstanding
+                outstanding -= 1
+                if reconcile_sleep:
+                    time.sleep(reconcile_sleep)
+                if deadline is not None and outstanding and time.monotonic() >= deadline:
+                    raise ReconciliationDeadline()
 
             def retain_item_failure(number: int | str, error: Exception) -> None:
-                nonlocal failed_item, outstanding
-                failed_item = True
-                outstanding -= 1
                 logger.warning("Could not sync %s#%s; keeping the last snapshot: %s", repo["full_name"], number, error)
-                with conn:
-                    mark_full_build_retry(conn, repo_id)
+                item = by_number.get(number)
+                if item is not None:
+                    with conn:
+                        set_state(conn, ITEM_SYNC_ERRORS, str(item["id"]), json.dumps({
+                            "repo_id": repo_id, "item": item, "reason": str(error)[:500],
+                        }))
+                checked_attempt()
 
-            expansions = iter_expanded(reader, repo, issues, workers, on_item_error=retain_item_failure)
+            expansions = iter_expanded(reader, repo, items, workers, on_item_error=retain_item_failure)
             try:
                 for expanded in expansions:
                     try:
@@ -518,18 +556,19 @@ def sync_once(
                         number = issue.get("number", "unknown") if isinstance(issue, dict) else "unknown"
                         retain_item_failure(number, error)
                         continue
-                    if full_enumeration:
+                    if full_enumeration or item_id in retries:
                         with conn:
-                            set_state(conn, checkpoint_scope, str(item_id), versions[item_id])
-                    outstanding -= 1
-                    if reconcile_sleep:
-                        time.sleep(reconcile_sleep)
-                    if deadline is not None and outstanding and time.monotonic() >= deadline:
-                        return False
+                            if full_enumeration:
+                                set_state(conn, checkpoint_scope, str(item_id), versions[item_id])
+                            if item_id in retries:
+                                conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (ITEM_SYNC_ERRORS, str(item_id)))
+                    checked_attempt()
+            except ReconciliationDeadline:
+                return False
             finally:
                 # Closing explicitly propagates errors from workers still in flight.
                 expansions.close()
-            if full_enumeration and not failed_item:
+            if full_enumeration:
                 with conn:
                     mark_full_build_completed(conn, repo_id)
                     conn.execute("DELETE FROM sync_state WHERE scope = ?", (checkpoint_scope,))
@@ -541,8 +580,6 @@ def sync_once(
 
         with conn:
             if reconcile:
-                if progress["remaining"]:
-                    return False
                 set_state(conn, "org", "last_reconcile_at", progress["started_at"])
                 conn.execute("DELETE FROM sync_state WHERE scope = 'org' AND key = ?", (RECONCILE_PROGRESS_KEY,))
             else:
@@ -765,12 +802,12 @@ def iter_expanded(
             continue
         pool = ThreadPoolExecutor(max_workers=workers)
         futures, processed = {}, set()
+        rate_error = None
         try:
             futures = {
                 pool.submit(expand, issue): issue["number"]
                 for issue in batch
             }
-            rate_error = None
             for future in as_completed(futures):
                 processed.add(future)
                 try:
@@ -795,6 +832,8 @@ def iter_expanded(
                 raise rate_error
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
+            if rate_error is not None:
+                raise rate_error
             # A consumer ending at a deadline can still encounter a quota
             # failure from a worker it did not get to consume.
             for future in futures:

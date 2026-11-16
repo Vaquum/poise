@@ -35,9 +35,9 @@ class ItemGraphError(GitHubApiError):
 
 
 class GitHubRateLimitError(GitHubApiError):
-    def __init__(self, message: str, reset_at: int) -> None:
+    def __init__(self, message: str, reset_at: int | None) -> None:
         self.reset_at = reset_at
-        super().__init__(f"{message} GITHUB_RATE_LIMIT_RESET={reset_at}")
+        super().__init__(message if reset_at is None else f"{message} GITHUB_RATE_LIMIT_RESET={reset_at}")
 
 
 ENUMERATION_DRIFT_MAX_ATTEMPTS = 3
@@ -107,7 +107,7 @@ def raise_rate_limit(headers: Mapping[str, str], diagnostic: str) -> None:
         return
     reset = headers.get("x-ratelimit-reset", "")
     if not reset.isdecimal() or int(reset) <= 0:
-        raise GitHubApiError(f"{diagnostic}; GraphQL rate limit response has no valid reset time")
+        raise GitHubRateLimitError(f"{diagnostic}; GraphQL rate limit response has no valid reset time", None)
     raise GitHubRateLimitError(diagnostic, int(reset))
 
 
@@ -509,7 +509,8 @@ class GitHubClient:
             raise GitHubRequestError("GH_TOKEN is not set: github-datastore reads GitHub only as the account whose token it is given")
         fields = {key: value for key, value in (variables or {}).items() if value is not None}
         for attempt in range(1, self.attempts + 1):
-            if self._rate_limit_error is not None and time.time() < self._rate_limit_error.reset_at:
+            if self._rate_limit_error is not None and (self._rate_limit_error.reset_at is None
+                                                       or time.time() < self._rate_limit_error.reset_at):
                 raise self._rate_limit_error
             if self._http is None:
                 headers, body, failure, retryable = self._cli_request(query, fields, environment)
