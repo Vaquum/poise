@@ -6,6 +6,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, type ChainEvent } from '../server/behavior-chain-store'
 import { chainMergeReviewDecision, chainReviewClearance, chainReviewResponse, decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { behaviorChainSummary } from '../server/behavior-chain-summary'
 import { completedReviewCall } from './review-response-fixture'
 
 const databases: Database.Database[] = []
@@ -87,6 +88,9 @@ it('reopens a journal written by the pre-coverage reducer and recovers its actua
     journal.rebuild()
     expect(db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence LIMIT ?').all(fixture.rows.length)).toEqual(fixture.rows)
     expect(journal.read(id)?.reviewPending).toBe(false)
+    const recovered = journal.read(id)!
+    expect(() => behaviorChainSummary(recovered, journal)).not.toThrow()
+    expect(behaviorChainSummary(recovered, journal)).toMatchObject({ reviewStatus: 'complete', mergedReviewWarning: null })
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 

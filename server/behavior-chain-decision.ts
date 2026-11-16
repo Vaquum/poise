@@ -302,7 +302,9 @@ export function chainMergeReviewDecision(chain: BehaviorChain, observation: Chai
   return mergeReviewDecision(chain, observation, now, 2)
 }
 
-function retainedMergeReview(chain: BehaviorChain, observation: ChainObservation, before: ChainObservation,
+/** The original native admission re-established under its own contract. Read
+ * projections use the same predicate so retained favorable evidence counts. */
+export function retainedMergeReview(chain: BehaviorChain, observation: ChainObservation, before: ChainObservation,
   admission: ChainInvocation): boolean {
   const pull = observation.pull!, argv = admission.request.argv
   const argument = (flag: string) => argv.filter(value => value === flag).length === 1 ? argv[argv.indexOf(flag) + 1] : undefined
