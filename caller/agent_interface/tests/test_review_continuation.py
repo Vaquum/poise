@@ -669,17 +669,21 @@ class TestReviewContinuation(TestCase):
                 review_receipt.prepare_response(json.dumps(node), MODEL.identity, policy="policy")
         barrier = Barrier(2)
 
+        def ask(*_args):
+            self.fail("competing finalizer repeated analysis")
+
         def race(call_id):
             review_receipt.bind(api.DB, call_id)
             with continuation.request("sol", resume):
                 barrier.wait(timeout=5)
                 try:
-                    self.run_review(node, lambda *_: self.fail("competing finalizer repeated analysis"))
+                    self.run_review(node, None)
                     return "published"
                 except continuation.Continuation:
                     return "held"
 
-        with ThreadPoolExecutor(max_workers=2) as workers:
+        # Keep the provider override in place until both workers exit.
+        with patch.dict(structured_review.ASK, {"codex": ask}), ThreadPoolExecutor(max_workers=2) as workers:
             self.assertEqual(sorted(workers.map(race, ids)), ["held", "published"])
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(self.saved(root)["publisher"], root)
