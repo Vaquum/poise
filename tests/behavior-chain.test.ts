@@ -667,10 +667,12 @@ describe('native admission and recovery', () => {
       expect(received).toHaveBeenCalledTimes(1)
       expect(launch).not.toHaveBeenCalled()
       obs.pull!.queueEntry = null
+      obs.pull!.conflict = true
       obs.pull!.queueRemoval = { id: 'old-removal', reason: 'failed_checks', at: NOW, actor: null }
       expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'queue entry disappeared; awaiting GitHub removal evidence' })
       obs.pull!.queueRemoval = { id: 'new-removal', reason: 'manual', at: NOW, actor: 'maintainer' }
       expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'hold', reason: expect.stringContaining('manual') })
+      obs.pull!.conflict = false
 
       clock.mockReturnValue(NOW + 60_000)
       if (kind === 'push_rejected') {

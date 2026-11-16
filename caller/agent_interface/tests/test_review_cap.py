@@ -187,6 +187,22 @@ class TestStructuredCappedConversion(TestCase):
                 "https://github.com/o/r/pull/12", "bit-mis", HEAD, 60, **params)
         return result, [args for args in calls if args[0] == "github-interface"]
 
+    def test_capped_reaffirmation_preserves_a_breaking_legacy_thread(self):
+        original = {**FINDING, "body": "Every save loses the existing document."}
+        node = {**json.loads(PACKET), "review_threads": [{**original, "bodies": [original["body"]],
+                "is_resolved": False, "is_outdated": True}]}
+
+        def github(args):
+            self.assertEqual(args[1], "--request-changes")
+            self.assertEqual(json.loads(args[args.index("--comments") + 1]), [original])
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                {"action": "requested_changes", "review_id": 92, "head_sha": HEAD}), stderr="")
+
+        for body in (original["body"], "[p0] " + original["body"]):
+            with self.subTest(body=body):
+                self._run({"assessment": ASSESSMENT, "action": "request_changes",
+                           "comments": [{**original, "body": body, "line": 999}]}, github, packet=json.dumps(node))
+
     def test_capped_change_request_files_an_issue_then_approves(self):
         seen = []
 

@@ -424,6 +424,28 @@ describe('reviewer account trips', () => {
     expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
   })
 
+  it('falls through with one alert for the provider named by native CLI preparation', async () => {
+    const { db, runtime } = await startPrReviews({
+      primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    fixture.agentLogs = [failedLog(db, `${pr.repo}#${pr.number}`, 'opus-5-xhigh', {
+      action: 'not_started', outcome: 'preflight_failed', error_code: 'launch_preflight_failed',
+      error: 'Claude CLI has no verified launcher',
+      diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.cli_update',
+        phase: 'launcher_verification', outcome: 'unavailable', provider: 'claude', submission: 'none', stderr: 'launcher is missing' },
+    })]
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(db.listBehaviorDeadLetters()).toEqual([])
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
+    const { openAlerts } = await import('../server/alerts/store')
+    expect(openAlerts({ kind: 'provider_unavailable' })).toEqual([
+      expect.objectContaining({ dedupeKey: 'provider-unavailable:claude' }),
+    ])
+  })
+
   it('leaves the PR eligible when recovery rejects credentials', async () => {
     const { db, runtime } = await startPrReviews({
       primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',

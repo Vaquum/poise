@@ -14,7 +14,8 @@ from .process_diagnostic import diagnostic_envelope
 FINAL_FINDINGS_POLICY = (
     "Only breaking changes introduced by this PR block it. Prefix each confirmed breaking finding with [p0]. "
     "Return all other confirmed findings with [p1], [p2] or [p3] even below the normal severity threshold; "
-    "Caller files those in a linked ticket. "
+    "Classify reaffirmed threads too: use the current severity prefix and copy the original finding text after it. "
+    "Caller preserves existing thread wording and files nonbreaking findings in a linked ticket. "
     "When there are only nonbreaking findings, return them for the ticket so Caller can move the PR to approval."
 )
 
@@ -58,8 +59,9 @@ def issue_reference(issue: dict) -> str:
     return "the existing follow-up issue"
 
 
-def render_title(repo: str, pr_number: str, review_round: int) -> str:
-    return f"Review follow-up for {repo}#{pr_number} (round {review_round})"
+def render_title(repo: str, pr_number: str, review_round: int | None) -> str:
+    stage = f"round {review_round}" if review_round is not None else "final inspection"
+    return f"Review follow-up for {repo}#{pr_number} ({stage})"
 
 
 def render_body(
@@ -67,14 +69,15 @@ def render_body(
     pr_number: str,
     head: str,
     base: str,
-    review_round: int,
-    review_cap: int,
+    review_round: int | None,
+    review_cap: int | None,
     comments: list[dict],
 ) -> str:
+    stage = f"review round {review_round} of {review_cap}" if review_round is not None else "the final repository inspection"
     lines = [
         marker(pr_number, head),
         "",
-        f"Nonbreaking findings from review round {review_round} of {review_cap} were deferred here.",
+        f"Nonbreaking findings from {stage} were deferred here.",
         "",
         f"## Findings (on `{head[:7]}`)",
         "",

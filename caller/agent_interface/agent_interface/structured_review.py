@@ -205,7 +205,7 @@ def events(stdout: str) -> list[dict]:
 
 
 def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
-                          review_round: int, review_cap: int,
+                          review_round: int | None, review_cap: int | None,
                           comments: list, pwd: str, *, checkpoint=None) -> str:
     try:
         node = json.loads(packet)
@@ -266,6 +266,13 @@ def _stage_texts(text: str, packet: str) -> Iterator[str]:
         yield text.replace(packet, stage, 1)
 
 
+_PRIORITY_PREFIX = re.compile(r"^\s*\[p([0-3])\]\s*", re.IGNORECASE)
+
+
+def _finding_text(body: str) -> str:
+    return " ".join(_PRIORITY_PREFIX.sub("", body).casefold().split())
+
+
 def _reaffirming_thread(comment: dict, threads: list[dict], *, in_since_diff: bool) -> dict | None:
     """The unresolved thread this comment reaffirms, if any.
 
@@ -276,18 +283,45 @@ def _reaffirming_thread(comment: dict, threads: list[dict], *, in_since_diff: bo
     collides with an unrelated thread's base line, and remapping must
     win so the finding is not discarded as a duplicate.
     """
-    body = " ".join(comment["body"].lower().split())
+    body = _finding_text(comment["body"])
     for thread in threads:
         if thread.get("is_resolved") or thread.get("path") != comment["path"]:
             continue
         if thread.get("is_outdated"):
-            if any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
+            if any(body == _finding_text(text) for text in thread.get("bodies", [])):
                 return thread
         elif thread.get("line") == comment["line"] and thread.get("side") == comment["side"]:
             if not in_since_diff or \
-                    any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
+                    any(body == _finding_text(text) for text in thread.get("bodies", [])):
                 return thread
     return None
+
+
+def _final_findings(packet: str, comments: list[dict]) -> tuple[list[dict], list[dict]]:
+    threads = json.loads(packet).get("review_threads", [])
+    findings: dict[tuple, tuple[int | None, dict]] = {}
+    for comment in comments:
+        text = _finding_text(comment["body"])
+        key = (comment["path"], comment["line"], comment["side"], text)
+        mark = _PRIORITY_PREFIX.match(comment["body"])
+        rank = int(mark[1]) if mark else None
+        previous = findings.get(key)
+        if previous is None or rank is not None and (previous[0] is None or rank < previous[0]):
+            findings[key] = (rank, comment)
+    breaking, deferred = [], []
+    for rank, comment in findings.values():
+        thread = _reaffirming_thread(comment, threads, in_since_diff=True)
+        original = next((body for body in (thread or {}).get("bodies", [])
+                         if _finding_text(body) == _finding_text(comment["body"])), None)
+        if original is not None and rank is None:
+            mark = _PRIORITY_PREFIX.match(original)
+            # A reaffirmed legacy blocker cannot be cleared without reclassification.
+            rank = int(mark[1]) if mark else 0
+        if rank == 0:
+            breaking.append({**comment, "body": original} if original is not None else comment)
+        else:
+            deferred.append(comment)
+    return breaking, deferred
 
 
 def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str,
@@ -732,12 +766,9 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     checkpoint.remap(lambda: _validate_since_positions(pwd, pr, actor_name, head, packet, verdict))
                     checkpoint.retain_finalization(verdict, head, "ready")
                 raw = json.dumps(verdict, ensure_ascii=False)
-                final_round = (capped or inspection_finished) and review_round is not None and review_cap is not None
+                final_round = capped or inspection_finished
                 if final_round and verdict["action"] == "request_changes":
-                    breaking, deferred = [], []
-                    for comment in verdict["comments"]:
-                        target = breaking if re.match(r"\s*\[p0\]", comment["body"], re.IGNORECASE) else deferred
-                        target.append(comment)
+                    breaking, deferred = _final_findings(packet, verdict["comments"])
                     if deferred:
                         reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
                                                           deferred, pwd, checkpoint=checkpoint)

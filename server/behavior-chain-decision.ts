@@ -729,8 +729,6 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     && chain.invocations.some((invocation) => invocation.behavior === 'approve-pr' && invocation.callId === review.invocation))
   if (dismissed) return { kind: 'hold', reason: `approval ${dismissed.id} was dismissed on the current head; a decision is required` }
   const repairBasis = chainBasis(['repair', pull.head, pull.failing, pull.conflict, pull.behind, pull.changesRequested, pull.unresolved, pull.reviewRevision, observation.issue.revision])
-  if (pull.conflict) return propose(chain, 'repair-pr', repairBasis, chain.author, observation.repairer,
-    'repair the confirmed branch conflict before reviewing the current head', now)
   const queue = chainQueueSettlement(chain, pull)
   if (queue && !queue.removal) return { kind: 'wait', reason: 'queue entry disappeared; awaiting GitHub removal evidence' }
   if (queue?.removal && !['failed_checks', 'merge_conflict', 'merged'].includes(queue.removal.reason || '')) {
@@ -759,6 +757,8 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       `diagnose and repair GitHub queue rejection ${removal.id}: ${removal.reason}; PR-head green checks do not prove integration success`, now)
     if (!removal.reviewClearanceOnly) queueVerification ??= chainBasis(['queue-verification', pull.head, removal.id, repair!.id])
   }
+  if (pull.conflict) return propose(chain, 'repair-pr', repairBasis, chain.author, observation.repairer,
+    'repair the confirmed branch conflict before reviewing the current head', now)
   const review = nextPrReview(chain, observation, pull, now)
   if (review) return review
   if (finalReviewFinished(chain, observation, now)

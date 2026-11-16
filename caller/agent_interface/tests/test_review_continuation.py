@@ -381,7 +381,7 @@ class TestReviewContinuation(TestCase):
             artifact = json.loads(conn.execute("select artifact from calls where id=?", (root,)).fetchone()[0])
         self.assertEqual(artifact["review_response"]["coverage"], "incomplete")
 
-    def test_inspection_cap_keeps_findings_and_warns_about_unread_pages(self):
+    def test_inspection_cap_defers_nonbreaking_findings_without_pr_round_flags(self):
         node = packet(37)
         read = {"operation": "read", "path": "src/f016.py", "query": "", "start_line": 1}
         finding = {"path": "src/f016.py", "line": 2, "side": "RIGHT", "body": "[p1] Consumer uses the wrong contract."}
@@ -407,12 +407,14 @@ class TestReviewContinuation(TestCase):
                     return verdict(prompt, [finding], request)
             return verdict(prompt)
 
-        with self.call(node) as root:
+        with self.call(node) as root, \
+                patch.object(structured_review, "_file_capped_followup", return_value="issue #18") as ticket:
             self.run_review(node, ask)
         self.assertEqual(calls, [1, 2, 3, 4])
         self.assertEqual([request["start_line"] for request in self.inspections], [1, 2, 3])
         command = self.posts[0][0]
-        self.assertEqual(json.loads(command[command.index("--comments") + 1]), [finding])
+        self.assertIn("--reviewed-clean", command)
+        self.assertEqual(ticket.call_args.args[4:7], (None, None, [finding]))
         assessment = json.loads(command[command.index("--assessment-json") + 1])
         self.assertIn("src/f016.py from line 4 was not read", assessment["limitations"])
         self.assertIn("reached its round limit", assessment["limitations"])
