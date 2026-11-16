@@ -12,6 +12,7 @@ import { completedReviewCall } from './review-response-fixture'
 import { parseAgentLogStdout, type LogEntry } from '../server/agent-log-parse'
 import { diagnosticPage, loggingRuntime, startLogging, stopLogging } from '../server/logging'
 import * as processes from '../server/process'
+import { parseProcessDiagnostic } from '../server/process-diagnostic'
 
 const NOW = 1_800_000_000_000
 const MERGE = 'c'.repeat(40)
@@ -57,6 +58,157 @@ function operations(overrides: Partial<ChainRuntimeOperations> = {}): ChainRunti
     received: () => {}, available: () => false, capacity: () => 3, permitted: () => false, request: forbidden,
     launch: forbidden, perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {}, ...overrides }
 }
+
+function persistedEnqueueRefusal(journal: BehaviorChainJournal, review = 'complete') {
+  vi.setSystemTime(NOW - 70_000)
+  let chain = seed(journal)
+  vi.setSystemTime(NOW - 60_000)
+  const before = observation()
+  Object.assign(before.publication, { state: 'open', merged: false, merge_sha: null })
+  Object.assign(before.pull!, { state: 'open', merged: false, mergeSha: null, mergedAt: null })
+  const reviewed = completedReviewCall(chain.repository, 17, before.pull!.head, chain.reviewer)
+  if (review !== 'missing review') {
+    chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-review', behavior: 'review-pr',
+      actor: chain.reviewer, model: reviewed.model, slot: reviewer.slot, basis: chainBasis(['pr', before.pull!.head, before.pull!.reviewContext]),
+      admittedAt: Date.parse(reviewed.started_at), request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
+    chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'original-review', callId: reviewed.id, outcome: 'clean',
+      evidence: { status: 'completed', action: 'reviewed_clean', review_id: reviewed.review_id, head_sha: reviewed.head_sha,
+        artifact: reviewed.artifact, completedAt: Date.parse(reviewed.completed_at!), resources_settled_at: reviewed.completed_at,
+        resource_ownership: { version: 1, roots: [], errors: [] } } })
+  }
+  before.pull!.reviewIds = [reviewed.review_id!]
+  before.pull!.reviewReceipts = [{ id: reviewed.review_id!, head: before.pull!.head, state: 'COMMENTED', invocation: reviewed.id,
+    response: reviewed.artifact!.review_response, submittedAt: Date.parse(reviewed.completed_at!) }]
+  if (review === 'missing context') delete before.pull!.reviewContext
+  chain = record(journal, chain, { type: 'chain.observed', observation: before })
+  vi.setSystemTime(NOW - 40_000)
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-merge', behavior: 'merge-pr',
+    actor: chain.reviewer, model: null, slot: null, basis: 'original-admission', admittedAt: Date.now(),
+    reservation: { memoryBytes: 8, diskBytes: 16 }, request: { command: 'github-interface', cwd: '/fixture', nativeResources: 2,
+      argv: ['--merge-if-ready', '17', '--author', chain.author, '--expected-head', before.pull!.head,
+        '--token-user', chain.reviewer, '--review-response-json', JSON.stringify(reviewed.artifact!.review_response)] } } })
+  const invocation = chain.invocations.at(-1)!, id = '9b83b2cb9a994b5aa59b6946c2efea5c'
+  const call: LogEntry = { id, correlation_id: invocation.id, source: 'poise:behavior-chain', behavior: 'native_action',
+    model: 'native-action', actor: invocation.actor, repo: chain.repository, pr_id: '17', session_id: null, prompt: '', time_elapsed: '2s',
+    started_at: new Date(NOW - 39_000).toISOString(), completed_at: new Date(NOW - 37_000).toISOString(),
+    status: 'failed', action: null, outcome: null, head_sha: null, expected_head: before.pull!.head, response: null,
+    error_code: 'native_action_failed', error: 'native action returned no valid structured response',
+    artifact: { phase: 'performing_native_action', request_sha: nativeRequestSha(invocation.request) },
+    resources_settled_at: new Date(NOW - 36_000).toISOString(),
+    resource_ownership: { version: 2, roots: [], errors: [], namespace: { state: 'settled', callId: id,
+      correlation: invocation.id, settled_at: (NOW - 36_000) / 1000, controller: { version: 1, instance: 'd'.repeat(32) },
+      binding: { pid: 104, start: '12', namespace: 'pid:[91]', owner: { pid: 102, start: '10' },
+        holder: { pid: 103, start: '11' }, epoch: { boot: 'fixture', init_start: '1', namespace_dev: '2', namespace_ino: '3' } } } },
+    diagnostic: parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error', operation: 'merge_if_ready',
+      phase: 'native_action', outcome: 'unknown', submission: 'uncertain', refusal: null, call_id: id,
+      stderr_truncated: false, stderr: "[{'type': 'UNPROCESSABLE', 'path': ['enqueuePullRequest'], 'locations': [{'line': 3, 'column': 7}], 'message': 'Pull request is already in the queue'}]" }) }
+  chain = record(journal, chain, { type: 'invocation.reconciled', invocationId: invocation.id, evidence: {
+    status: call.status, action: null, outcome: null, nativeCallId: id, diagnostic: call.diagnostic, artifact: call.artifact,
+    resources_settled_at: call.resources_settled_at, resource_ownership: call.resource_ownership,
+    error: call.error, error_code: call.error_code, completedAt: Date.parse(call.completed_at!) } })
+  chain = record(journal, chain, { type: 'invocation.uncertain', invocationId: invocation.id, reason: 'original effect remains uncertain' })
+  vi.setSystemTime(NOW)
+  const merged = observation()
+  merged.pull!.reviewIds = before.pull!.reviewIds
+  merged.pull!.reviewReceipts = before.pull!.reviewReceipts
+  merged.pull!.reviewContext = before.pull!.reviewContext
+  chain = record(journal, chain, { type: 'chain.observed', observation: merged })
+  chain = record(journal, chain, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: chain.repository,
+    pull_number: 17, merged: true, merge_sha: MERGE, review_complete: false } })
+  return { chain, call, merged }
+}
+
+it.each(['complete', 'missing review', 'missing context'])('reconciles one historical enqueue refusal on an already-merged chain: %s', async review => {
+  const root = mkdtempSync(join(tmpdir(), 'poise-merged-refusal-')); roots.push(root)
+  const path = join(root, 'journal.sqlite'), { db, journal } = setup(path)
+  const { chain, call, merged } = persistedEnqueueRefusal(journal, review)
+  const original = journal.history(chain.id)
+  expect(chain.invocations.at(-1)).toMatchObject({ state: 'uncertain', evidence: { action: null,
+    diagnostic: { context: { submission: 'uncertain' } } } })
+  expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+  db.close(); databases.splice(databases.indexOf(db), 1)
+  const reopened = new Database(path); databases.push(reopened)
+  const recovered = new BehaviorChainJournal(reopened)
+  recovered.rebuild()
+  expect(recovered.reconcilable('', NOW, true).map(item => item.id)).toContain(chain.id)
+  const observe = vi.fn(async () => merged)
+  const ops = operations({ enabled: () => true, available: () => true, permitted: () => true, observe,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })
+  const writes = [vi.spyOn(ops, 'request'), vi.spyOn(ops, 'launch'), vi.spyOn(ops, 'perform'),
+    vi.spyOn(ops, 'resumePublication'), vi.spyOn(ops, 'fenceClosedTarget'), vi.spyOn(ops, 'readActionResult')]
+  const runtime = new BehaviorChainRuntime(recovered, ops)
+  await runtime.run()
+  const settled = recovered.read(chain.id)!
+  expect(settled).toMatchObject({ mergeSha: MERGE, reviewPending: review !== 'complete' })
+  expect(settled.invocations.at(-1)).toMatchObject({ id: 'original-merge', state: 'settled', callId: call.id, outcome: 'preflight_failed',
+    evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed', nativeCallId: call.id,
+      diagnostic: call.diagnostic, resources_settled_at: call.resources_settled_at, resource_ownership: call.resource_ownership } })
+  expect(settled.invocations.at(-1)!.evidence).not.toHaveProperty('nativeActionReceipt')
+  expect(recovered.history(chain.id).slice(0, original.length)).toEqual(original)
+  await runtime.run()
+  recovered.rebuild()
+  await new BehaviorChainRuntime(recovered, ops).run()
+  expect(recovered.read(chain.id)).toEqual(settled)
+  expect(recovered.history(chain.id).filter(event => {
+    const payload = JSON.parse(event.payload)
+    return payload.type === 'invocation.settled' && payload.invocationId === 'original-merge'
+  })).toHaveLength(1)
+  expect(observe).toHaveBeenCalledTimes(1)
+  for (const write of writes) expect(write).not.toHaveBeenCalled()
+})
+
+it.each(['missing Call', 'duplicate Call', 'quarantined Call', 'missing diagnostic', 'truncated diagnostic', 'unknown truncation',
+  'generic resolver error', 'wrong error type', 'wrong mutation', 'different refusal', 'partial error', 'additional error',
+  'wrong diagnostic Call', 'conflicting diagnostic head', 'missing request digest', 'unreleased resources', 'contradictory resources',
+  'response digest', 'unexpected response', 'changed Call request', 'changed Call head', 'changed Call identity', 'changed Call actor',
+  'release after merge', 'completion before admission', 'missing merge time', 'changed head', 'changed publication', 'merge conflict', 'not owned'])(
+  'retains merged enqueue uncertainty with %s', async mode => {
+    const { journal } = setup()
+    const { chain, call, merged } = persistedEnqueueRefusal(journal)
+    if (mode === 'missing diagnostic') call.diagnostic = null
+    if (mode === 'truncated diagnostic') call.diagnostic!.stderr_truncated = true
+    if (mode === 'unknown truncation') call.diagnostic!.stderr_truncated = null
+    if (mode === 'generic resolver error') call.diagnostic!.stderr = "[{'message': 'Internal resolver error', 'path': ['enqueuePullRequest']}]"
+    for (const [scenario, from, to] of [
+      ['wrong error type', 'UNPROCESSABLE', 'INTERNAL'], ['wrong mutation', 'enqueuePullRequest', 'enablePullRequestAutoMerge'],
+      ['different refusal', 'Pull request is already in the queue', 'Pull request cannot be enqueued'],
+    ]) if (mode === scenario) call.diagnostic!.stderr = call.diagnostic!.stderr!.replace(from, to)
+    if (mode === 'partial error') call.diagnostic!.stderr = call.diagnostic!.stderr!.slice(0, -1)
+    if (mode === 'additional error') call.diagnostic!.stderr = call.diagnostic!.stderr!.slice(0, -1) + ", {'message': 'Internal resolver error'}]"
+    if (mode === 'wrong diagnostic Call') call.diagnostic!.context.call_id = 'e'.repeat(32)
+    if (mode === 'conflicting diagnostic head') call.diagnostic!.context.expected_head = 'e'.repeat(40)
+    if (mode === 'missing request digest') delete call.artifact!.request_sha
+    if (mode === 'unreleased resources') call.resources_settled_at = null
+    if (mode === 'contradictory resources') call.resource_ownership!.process_pending = true
+    if (mode === 'response digest') call.artifact!.response_sha = 'e'.repeat(64)
+    if (mode === 'unexpected response') call.response = call.id.slice(0, 8)
+    if (mode === 'changed Call request') call.artifact!.request_sha = 'e'.repeat(64)
+    if (mode === 'changed Call head') call.expected_head = 'e'.repeat(40)
+    if (mode === 'changed Call identity') call.id = 'e'.repeat(32)
+    if (mode === 'changed Call actor') call.actor = 'another-actor'
+    if (mode === 'release after merge') call.resources_settled_at = new Date(NOW).toISOString()
+    if (mode === 'completion before admission') call.completed_at = new Date(NOW - 41_000).toISOString()
+    if (mode === 'missing merge time') delete merged.pull!.mergedAt
+    if (mode === 'changed head') merged.pull!.head = merged.publication.head_sha = 'e'.repeat(40)
+    if (mode === 'changed publication') merged.publication.pull_number = 18
+    if (mode === 'merge conflict') merged.pull!.mergeSha = 'e'.repeat(40)
+    if (['missing merge time', 'changed head', 'changed publication', 'merge conflict'].includes(mode)) {
+      record(journal, chain, { type: 'chain.observed', observation: merged })
+    }
+    const perform = vi.fn(async () => ({}))
+    const runtime = new BehaviorChainRuntime(journal, operations({ ownsRepository: () => mode !== 'not owned', perform,
+      readInvocations: async () => ({ entries: mode === 'missing Call' ? [] : mode === 'duplicate Call' ? [call, call] : [call],
+        quarantined: mode === 'quarantined Call' ? [{ correlationId: call.correlation_id!, index: 0, error: 'unreadable Call',
+          id: null, repo: null, prId: null, behavior: null, sessionId: null }] : [] }) }))
+    for (let tick = 0; tick < 2; tick++) {
+      if (['changed Call request', 'changed Call head', 'changed Call identity', 'changed Call actor'].includes(mode)) {
+        await expect(runtime.run()).rejects.toThrow('conflicts with')
+      } else await runtime.run()
+    }
+    expect(journal.read(chain.id)).toMatchObject({ mergeSha: MERGE, reviewPending: true })
+    expect(journal.read(chain.id)!.invocations.at(-1)!.state).toBe('uncertain')
+    expect(perform).not.toHaveBeenCalled()
+  })
 
 it.each(['closed', 'reopened'])('rechecks a fresh mirror closure once when GitHub says %s', async state => {
   const { journal } = setup()
