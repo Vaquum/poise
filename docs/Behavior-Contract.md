@@ -267,46 +267,27 @@ After account recovery, a successful explicit replay on the same head, model,
 and reviewer reconciles the held no-action attempt. Its GitHub review receipt
 must be present in live evidence before it becomes durable approval evidence.
 
-Approve Pull Requests carries a review-round cap: off unless set, otherwise an
-integer from 2 to 10. A round is a completed change-request round on the pull
-request: the initial review counts once however wide its panel, and every
-approve-prs follow-up counts, including follow-ups on an unchanged head that
-author replies re-armed. Failed, held, quarantined and manual runs add none,
-as do superseded runs that posted nothing. A review that posted on its
-expected head counts even when the pull request's head moved before the run
-finished verifying it; Caller reports the posted verdict, not a supersede,
-and a superseded run that nevertheless carries a review id is quarantined
-for a person instead of being silently released. The count is read from the
-durable launch ledger at preparation time, so it survives restarts. From the capped round on
-(round ≥ cap, never = cap alone, so a push after a capped approval cannot
-reopen the loop), the run retains the ordinary atomic change request with all
-blocking findings if any verified `p0` remains (`p0` breaks a common path).
-Missing or unrecognized severity also stays blocking. Only when every finding
-body explicitly starts with `[p1]` or `[p2]` (case-insensitive) does the run file
-the findings as one follow-up issue in the pull request's repository and approve.
-New findings carry a severity prefix; reaffirmed threads keep their original
-bodies. A capped round with no findings is a plain approval with no issue.
-The issue carries a marker for its pull request and head
-(`<!-- poise:review-cap #N@sha -->`), one section per finding with its
-severity, path, line and side, a permalink
-pinned to the reviewed head (to its base for removed-side findings), and a
-link back to the pull request; a retry or replay
-reuses the marked issue and never files a second one for the same head.
-An explicit approval replay runs under the same effective cap: at or past
-the capped round it applies the same breaking-finding check before filing
-(or reusing) a follow-up issue and approving. An existing marked issue never
-bypasses that check.
-The capped approval reconciles as the ordinary head-pinned approved outcome.
-When the issue cannot be created, nothing is approved and the run fails loudly
-with a contract violation; an uncertain filing is reconciled from live
-evidence before anything retries. With Merge Pull Requests on, a pull request
-can merge with deferred p1/p2 findings and the follow-up issue is their only
-remaining record. Structured providers convert only explicitly nonbreaking
-change requests into issue-plus-approval in the harness; Claude receives the
-same severity policy and can request changes or file the issue then approve.
-Claude submits nothing when filing fails. A human's change request still blocks
-as before, and the row's Skip list and pause/disable guards apply to capped
-runs like any other launch.
+Poise allows three PR review rounds by default. The existing PR review rounds
+setting accepts 2–10 and applies to chain and standalone reviews. A completed
+initial review panel counts once on each reviewed head; an approval pass that
+requests changes counts as another round. Provider retries and saved analysis
+slices keep the same round. Each reviewer sees its round and the limit.
+
+Caller allows three optional repository inspection rounds within a review,
+including resumed analysis. At the start of the last inspection round and of
+the last PR review round, the reviewer is told to return verified breaking
+findings as `p0` and put every other finding in a linked follow-up issue. If
+nothing breaking remains, the review moves to approval. Approval and merge
+still use GitHub's current-head evidence, and partial source is recorded as
+such. The exact head and finding coordinates are carried in the follow-up
+issue. A rejected issue write is visible and an uncertain write is reconciled
+before retrying.
+
+A published PR can be reviewed while its tests are red. The repair work and
+GitHub's merge checks continue independently. A provider failure with proof
+that it posted nothing leaves the PR eligible for the next runnable provider.
+The failed provider gets one Needs You item per incident.
+
 `resolve-unblocking` uses the upstream strong
 resolution primitive, which revalidates the complete gate before every thread
 mutation. Before Caller starts, an admitted resolution persists its target,

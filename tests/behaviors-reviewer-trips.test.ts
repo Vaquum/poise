@@ -388,14 +388,14 @@ describe('reviewer account trips', () => {
     expect(db.getMeta(failureKey)).toBe('')
   })
 
-  it('trips the recovery model on its 402 and holds the target', async () => {
+  it('tries another recovery after a 402 and leaves the PR eligible', async () => {
     const { db, runtime } = await startPrReviews({
       primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
     })
     await runtime.runEnabledBehaviorsOnce()
     expect(modelOf(mocks.spawnDetached.mock.calls[0])).toBe('opus-5-xhigh')
 
-    // Caller names the healthy primary in `model` and the refused recovery
+    // Caller names the original reviewer in `model` and the refused recovery
     // in `recovery_model`.
     const key = `${pr.repo}#${pr.number}`
     fixture.agentLogs = [failedLog(db, key, 'opus-5-xhigh', {
@@ -407,24 +407,24 @@ describe('reviewer account trips', () => {
     await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
 
-    expect(db.listBehaviorDeadLetters()).toEqual([expect.objectContaining({ target: key })])
+    expect(db.listBehaviorDeadLetters()).toEqual([])
     const failures = runtime.getBehaviorsRuntimeHealth().failures
-    expect(failures).toEqual([
+    expect(failures).toEqual(expect.arrayContaining([
       expect.objectContaining({
         target: 'reviewer:grok-4.6-xhigh',
         error: expect.stringContaining('grok-4.6-xhigh cannot review'),
       }),
+    ]))
+    const { openAlerts } = await import('../server/alerts/store')
+    expect(openAlerts({ kind: 'provider_unavailable' })).toEqual([
+      expect.objectContaining({ dedupeKey: 'provider-unavailable:grok' }),
     ])
-    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
-
-    // The healthy primary keeps reviewing; only the recovery is gated.
-    fixture.listedPrs = [pr, { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18' }]
-    await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
-    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('opus-5-xhigh')
+    expect(mocks.spawnDetached.mock.calls[1][1]).toContain(`#${pr.number}`)
+    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
   })
 
-  it('holds the target when the recovery route rejects credentials', async () => {
+  it('leaves the PR eligible when recovery rejects credentials', async () => {
     const { db, runtime } = await startPrReviews({
       primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
     })
@@ -443,8 +443,13 @@ describe('reviewer account trips', () => {
     await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
 
-    expect(db.listBehaviorDeadLetters()).toEqual([expect.objectContaining({ target: key })])
-    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+    expect(db.listBehaviorDeadLetters()).toEqual([])
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
+    const { openAlerts } = await import('../server/alerts/store')
+    expect(openAlerts({ kind: 'provider_unavailable' })).toEqual([
+      expect.objectContaining({ dedupeKey: 'provider-unavailable:grok' }),
+    ])
   })
 
   it('clears only the recovery trip when a verdict comes from the recovery', async () => {

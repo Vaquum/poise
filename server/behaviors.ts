@@ -15,7 +15,7 @@ import { resourceReleaseProven } from './behavior-resource-receipt'
 import { invalidateNativeCleanup, nativeCleanupSupport, nativeReviewContinuationSupported, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
 import { reviewClearanceConfigured, runReviewClearance } from './review-clearance'
-import { reviewContinuationArgs, reviewContinuationCode, reviewContinuationNoWrite, yieldedFinalization, yieldedReview, type ReviewCheckpoint } from './review-continuation'
+import { DEFAULT_PR_REVIEW_CAP, reviewRoundArgs, reviewContinuationArgs, reviewContinuationCode, reviewContinuationNoWrite, yieldedFinalization, yieldedReview, type ReviewCheckpoint } from './review-continuation'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
@@ -47,7 +47,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { ISSUE_REVIEW_BEHAVIOR, fetchAgentLogSnapshot, quarantinedLogMayMatch, type LogEntry } from './agent'
 import { claudeAuth, ClaudeAuthReadinessError } from './claude-auth'
 import { REVIEW_POLICY, needsClaude, randomDrawStillValid, reviewChoice, reviewPanel, type ReviewPanel, type ReviewPlace } from './review-model'
-import { type Catalog, type ReviewerSlot, MODEL_SLOTS, REVIEWER_SLOTS, isPlaceModel, loadCatalog, loadedCatalog, recoveryModel, resolveSlots, resolvePlace, seededRandom } from './models'
+import { type Catalog, type ReviewerSlot, MODEL_SLOTS, REVIEWER_SLOTS, isPlaceModel, loadCatalog, loadedCatalog, resolveSlots, resolvePlace, seededRandom } from './models'
 import {
   db,
   claimPrOperationOwned,
@@ -114,7 +114,7 @@ import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, 
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, organizationAccounts, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { readDatastoreView } from './datastore-reader'
-import { behaviorHeld, providerSignInRejected, providerSignInVerified } from './alerts/producers'
+import { behaviorHeld, providerFailure, providerRecovered, providerSignInRejected, providerSignInVerified } from './alerts/producers'
 import { retireClearedBehaviorAlerts } from './alerts/notices'
 import { consumeProviderRecovery, providerRecoveryAvailable, providerSignInFailure, recordProviderRecovery } from './accounts/logins'
 import { getWorkerCapacity, type WorkerCapacity } from './worker-capacity'
@@ -829,12 +829,7 @@ export function setReviewers(count: ReviewerCount, key: PanelBehavior = 'review-
   setMeta(reviewersKey(key), String(count))
 }
 
-// The review-round cap for Approve Pull Requests: once a pull request has
-// completed this many change-request rounds, the next round files its
-// findings as one follow-up issue and approves instead of requesting changes
-// again. Off (null) unless set. 2 is the floor so the cap can only fire
-// inside a follow-up round — round 1 is the initial review, which approves
-// nothing and runs as a panel the cap must never split.
+// The existing PR review round setting. Null selects the workspace default.
 export const REVIEW_CAP_MIN = 2
 export const REVIEW_CAP_MAX = 10
 const REVIEW_CAP_KEY = `${META_PREFIX}approve_prs_review_cap`
@@ -975,7 +970,9 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
     || /rate[\s_-]*limit/i.test(error))) return 'rate_limit'
   // A provider CLI that died outright trips like one that errored: before a
   // verdict, the next slot is strictly more useful than the same dead run.
-  if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit') return 'provider'
+  if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit'
+    || call.error_code === 'launch_preflight_failed' && call.diagnostic?.operation === 'provider.cli_update'
+    || call.error_code === 'atomic_work_failed' && call.diagnostic?.operation === 'provider.atomic_work') return 'provider'
   if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)
     && !isPreparationBudgetExhaustion(call) && !isFileGroupBudgetExhaustion(call)) return 'budget'
   return null
@@ -985,25 +982,18 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
 // `model` and the failed recovery in `recovery_model`, so the trip follows
 // the model that actually refused the work.
 function tripIdentity(call: LogEntry): string | null {
+  if (call.diagnostic?.operation === 'provider.cli_update' && call.diagnostic.context.provider) {
+    return [call.model, call.recovery_model].find(identity => loadedCatalog()?.models.some(model =>
+      model.identity === identity && model.provider === call.diagnostic?.context.provider)) ?? call.model ?? null
+  }
   if (call.error_code === 'review_recovery_failed') return call.recovery_model || null
   if (call.error_code === 'authentication_failed' && call.recovery_model) return call.recovery_model
   return call.model || null
 }
 
-// Only a run that provably posted nothing trips: anything submitted proves
-// the account worked, and holds exactly as before.
+// A submitted review remains attached to its original Call.
 function postedNothing(call: LogEntry): boolean {
   return !call.head_sha && call.review_id == null && call.receipts == null
-}
-
-// A recovery report holds its target even as it trips the recovery model:
-// the primary hit its output limit and needs the recovery to proceed, so
-// releasing would relaunch it every tick. A credential rejection on the
-// recovery route keeps its authentication_failed code so the sign-in
-// condition can fire; it must hold like the wrapped recovery failure.
-function tripHoldsTarget(call: LogEntry): boolean {
-  return call.error_code === 'review_recovery_failed'
-    || (call.error_code === 'authentication_failed' && !!call.recovery_model)
 }
 
 const REVIEWER_TRIP_TARGET_PREFIX = 'reviewer:'
@@ -1040,6 +1030,8 @@ function tripReviewer(behavior: TripBehavior, identity: string, kind: ReviewerTr
         : kind === 'provider'
           ? `${identity} cannot review: its provider failed before the verdict. Poise retries automatically.`
           : `${identity} cannot review: it timed out before a verdict. Poise retries automatically.`
+  const provider = loadedCatalog()?.models.find(model => model.identity === identity)?.provider
+  if (kind !== 'budget' && (kind !== 'signin' || provider !== 'codex' && provider !== 'claude')) providerFailure(provider ?? identity, message)
   recordBehaviorFailure(behavior, 'operation', message, reviewerTripTarget(identity),
     { callId, ...(kind === 'signin' ? { errorCode: 'authentication_failed' } : {}) })
 }
@@ -1087,6 +1079,7 @@ function clearReviewerTrip(identity: string): void {
 
 function reviewerSucceeded(call: LogEntry): void {
   const identity = call.recovery_model || call.model
+  providerRecovered(loadedCatalog()?.models.find(model => model.identity === identity)?.provider ?? identity)
   const catalog = loadedCatalog()
   if (catalog?.models.find(model => model.identity === identity)?.provider === 'codex') {
     const failure = providerSignInFailure('codex')
@@ -1113,9 +1106,7 @@ function reviewerSucceeded(call: LogEntry): void {
   clearReviewerTrip(identity)
 }
 
-// Trips the reviewer for a provider failure before a verdict, without
-// releasing the target. The retained stop keeps this PR/head held while the
-// fresh trip keeps the existing timeout backoff for other PRs.
+// Only move to a different provider when Caller proved no review was posted.
 function tripReviewerForCall(behavior: TripBehavior, call: LogEntry): boolean {
   observeProviderRejection(call)
   const kind = reviewerTripKind(call)
@@ -1126,6 +1117,9 @@ function tripReviewerForCall(behavior: TripBehavior, call: LogEntry): boolean {
   // instead of risking a duplicate verdict.
   if (call.review_comments != null || /could not prove a safe recovery/.test(call.error || '')) return false
   tripReviewer(behavior, identity, kind, call.id)
+  if (call.recovery_model === identity && call.model && call.model !== identity) {
+    tripReviewer(behavior, call.model, 'budget', call.id)
+  }
   return true
 }
 
@@ -1134,7 +1128,6 @@ function tripReviewerForCall(behavior: TripBehavior, call: LogEntry): boolean {
 // true when the claim was released and reconciliation moves on.
 function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, call: LogEntry): boolean {
   if (!tripReviewerForCall(behavior, call)) return false
-  if (tripHoldsTarget(call)) return false
   releaseOwnedClaim(behavior, claim.target, claim.claimId)
   return true
 }
@@ -1145,9 +1138,9 @@ function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, 
 async function launchReviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review', seedKey?: string): Promise<ReviewPanel> {
   const full = await reviewPanel(REVIEWER_SLOTS.length, place, seedKey === undefined ? Math.random : seededRandom(seedKey))
   const targets = full.reviewers.slice(0, count)
-  const models = full.reviewers.filter(({ model }) => !reviewerTripped(model)).slice(0, count)
+  const models = full.reviewers.filter(({ model }) => reviewModelAvailable(full.catalog, model)).slice(0, count)
   const reviewers = targets.slice(0, models.length).map((target, index) => ({
-    slot: target.slot, model: models[index].model, recovery: models[index].recovery,
+    slot: target.slot, model: models[index].model, recovery: liveReviewRecovery(full.catalog, place, models[index].model, models[index].recovery),
   }))
   return { ...full, reviewers }
 }
@@ -1208,34 +1201,23 @@ async function retireStaleReviewerTrips(): Promise<void> {
 // from its draw onward, so a tripped draw moves to an untried model. When no
 // slot runs there at all, the catalog seed still approves. A peek: the probe
 // claim happens beside the spawn, like a panel.
+function reviewModelAvailable(catalog: Catalog, identity: string): boolean {
+  return !reviewerTripped(identity) && (!needsClaude(catalog, identity) || claudeAuth.snapshot().status === 'authenticated')
+}
+
+function liveReviewRecovery(catalog: Catalog, place: ReviewPlace, model: string, preferred: string): string {
+  const slots = resolveSlots(catalog, getModelSettings().slots)
+  return [preferred, ...MODEL_SLOTS.map(slot => slots[slot])].find(identity => identity !== model
+    && isPlaceModel(catalog, place, identity) && reviewModelAvailable(catalog, identity)) ?? model
+}
+
 async function approvalSlot(): Promise<{ slot: ReviewerSlot, model: string, recovery: string, catalog: Catalog } | null> {
   const choice = await reviewChoice('pr_approve')
   const slots = resolveSlots(choice.catalog, getModelSettings().slots)
-  const stored = getModelSettings().places?.['pr_approve']?.slot ?? 'primary'
-  const runnable = (stored === 'random' ? [...MODEL_SLOTS] : MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(choice.slot)))
-    .filter((slot) => isPlaceModel(choice.catalog, 'pr_approve', slots[slot]))
-  if (runnable.length === 0) {
-    return { slot: choice.slot, model: choice.model, recovery: recoveryModel(choice.catalog, 'pr_approve', slots, choice.slot), catalog: choice.catalog }
-  }
-  if (stored === 'random' && !reviewerTripped(choice.model) && runnable.includes(choice.slot)) {
-    return { slot: choice.slot, model: choice.model, recovery: choice.recovery, catalog: choice.catalog }
-  }
-  const untripped = runnable.filter((slot) => !reviewerTripped(slots[slot]))
-  if (untripped.length === 0) return null
-  if (stored === 'random') {
-    const slot = untripped[Math.floor(Math.random() * untripped.length) % untripped.length]
-    const remaining = untripped.filter((candidate) => candidate !== slot)
-    const recovery = remaining.length > 0
-      ? slots[remaining[Math.floor(Math.random() * remaining.length) % remaining.length]]
-      : recoveryModel(choice.catalog, 'pr_approve', slots, slot)
-    return { slot, model: slots[slot], recovery, catalog: choice.catalog }
-  }
-  for (const slot of runnable) {
-    const model = slots[slot]
-    if (reviewerTripped(model)) continue
-    return { slot, model, recovery: recoveryModel(choice.catalog, 'pr_approve', slots, slot), catalog: choice.catalog }
-  }
-  return null
+  const candidates = [choice, ...MODEL_SLOTS.map(slot => ({ slot, model: slots[slot] }))]
+  const selected = candidates.find(({ model }) => isPlaceModel(choice.catalog, 'pr_approve', model) && reviewModelAvailable(choice.catalog, model))
+  if (!selected) return null
+  return { ...selected, catalog: choice.catalog, recovery: liveReviewRecovery(choice.catalog, 'pr_approve', selected.model, choice.recovery) }
 }
 
 // ── Per-behavior memory (scratchpad) ────────────────────────────────────
@@ -3479,6 +3461,7 @@ async function prepareReviewTarget(
       }
       const expectedHead = await withNoticeDiagnosticIdentity({ ...identity, progress: { slot, primitive: 'head-sha', expectedHead: null } },
         () => currentHeadSha(pr.repo, pr.number, actor, false))
+      if (countReviewRounds(pr.repo, pr.number, expectedHead) >= (getReviewCap() ?? DEFAULT_PR_REVIEW_CAP)) return null
       if (!isEnabled('review-new-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('review-new-prs', pr, actor)) return null
       let changes: ChangesAddressedResult | null = null
       if (reviewer) {
@@ -3517,6 +3500,12 @@ async function prepareReviewTarget(
 // behavior lock: the atomic claim plus launch intent is the ownership.
 async function spawnReviewLaunch(prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting, pwd: string): Promise<void> {
   const { pr, target: claimTarget } = prepared
+  const cap = getReviewCap() ?? DEFAULT_PR_REVIEW_CAP
+  const completed = countReviewRounds(pr.repo, pr.number, prepared.expectedHead)
+  if (completed >= cap) {
+    releaseOwnedClaim('review-new-prs', claimTarget, claimId)
+    return
+  }
   const args = [
     '--pr-review',
     `#${prepared.num}`,
@@ -3537,6 +3526,7 @@ async function spawnReviewLaunch(prepared: PreparedReviewTarget, claimId: string
     '--p',
     setting,
     ...noteArgs('review-new-prs'),
+    ...reviewRoundArgs(completed, cap),
     ...(prepared.reviewSlot ? reviewContinuationArgs(prepared.reviewSlot, prepared.checkpoint) : []),
   ]
   await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: prepared.actor }, async () => {
@@ -5184,12 +5174,7 @@ async function fireApprove(
     throw new Error(`approval PR operation ownership was lost for ${pr.repo}#${pr.number}`)
   }
   const source = 'poise:approve-prs'
-  // The review-round cap: from the capped round on, this run files its
-  // findings as one follow-up issue and approves instead of requesting
-  // changes again. The round is pinned here, at preparation time.
-  const reviewCap = getReviewCap()
-  const reviewRound = reviewCap === null ? null : reviewRoundNumber(pr.repo, pr.number)
-  const reviewCapReached = reviewCap !== null && reviewRound !== null && reviewRound >= reviewCap
+  const round = reviewRoundArgs(countReviewRounds(pr.repo, pr.number), getReviewCap() ?? DEFAULT_PR_REVIEW_CAP)
   const reviewSlot = legacyReviewSlot(catalog, model, slot, claimTarget)
   const args = [
     '--pr-approve',
@@ -5209,9 +5194,7 @@ async function fireApprove(
     '--pwd',
     pwd,
     ...noteArgs('approve-prs'),
-    ...(reviewCapReached
-      ? ['--review-cap-reached', '--review-round', String(reviewRound), '--review-cap', String(reviewCap)]
-      : []),
+    ...round,
   ]
   // The model read above awaits: a pause landing in that window must
   // still hold this launch, so this is the last check before it.
@@ -8286,7 +8269,7 @@ export class ReplayRefusedError extends HttpError {
   }
 }
 
-export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCapReached?: { reviewRound: number, reviewCap: number } } | void> {
+export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCap?: number } | void> {
   const owner = repo.split('/')[0].toLowerCase()
   const org = readyOrganizations().find((candidate) => candidate.login.toLowerCase() === owner)
   if (!org) throw new ReplayRefusedError(`${repo} does not belong to a ready GitHub account`)
@@ -8314,14 +8297,7 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
   })
   if (refusal) throw new ReplayRefusedError(refusal)
   if (author && actor && accounts) {
-    // The replayed approval round is pinned here, like a scheduled launch
-    // pins its round at preparation time.
-    const reviewCap = behavior === 'pr_approve' ? getReviewCap() : null
-    const reviewRound = reviewCap === null ? null : reviewRoundNumber(repo, number)
-    const reviewCapReached = reviewCap !== null && reviewRound !== null && reviewRound >= reviewCap
-      ? { reviewRound, reviewCap }
-      : undefined
-    return { author, actor, accounts, reviewEnvironment, ...(reviewCapReached ? { reviewCapReached } : {}) }
+    return { author, actor, accounts, reviewEnvironment, reviewCap: getReviewCap() ?? DEFAULT_PR_REVIEW_CAP }
   }
 }
 
@@ -8666,11 +8642,16 @@ async function runBehaviorChains(): Promise<void> {
       if (issues.reviewers.length !== getReviewers(ISSUES_KEY) || prs.reviewers.length !== getReviewers('review-new-prs')) throw new Error('behavior chain reviewer count exceeds configured model slots')
       const model = (place: 'issue_implement' | 'pr_repair') => { const resolved = resolvePlace(catalog, place, getModelSettings(), seededRandom(`${chainKey}:${place}`)); return { ...resolved, recovery: resolved.model } }
       return { issueReviewers: issues.reviewers, prReviewers: prs.reviewers, implementer: model('issue_implement'), repairer: model('pr_repair'),
-        approver: { slot: approval.slot, model: approval.model, recovery: approval.recovery } }
+        approver: { slot: approval.slot, model: approval.model, recovery: approval.recovery }, reviewCap: getReviewCap() ?? DEFAULT_PR_REVIEW_CAP }
     }
     const operations = nativeChainOperations(org, {
       roster,
       async resolve(decision, chainKey, chain, observation) {
+        if (decision.checkpoint && decision.reviewer) {
+          const catalog = await loadCatalog()
+          return reviewModelAvailable(catalog, decision.reviewer.model) && claimReviewerTripProbe(decision.reviewer.model)
+            ? decision.reviewer : null
+        }
         if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
           const place = decision.behavior === 'review-issue' ? 'issue_review' : 'pr_review'
           const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), place, `${chainKey}:${place}:panel`)
@@ -8681,7 +8662,7 @@ async function runBehaviorChains(): Promise<void> {
         if (decision.behavior === 'approve-pr') {
           const approval = await approvalSlot()
           if (!approval || !claimReviewerTripProbe(approval.model)) return null
-          return approval
+          return { ...approval, slot: decision.reviewer?.slot ?? approval.slot }
         }
         const models = await roster(chainKey)
         const selected = decision.behavior === 'repair-pr' ? models.repairer : models.implementer
@@ -8711,7 +8692,7 @@ async function runBehaviorChains(): Promise<void> {
             && resourceReleaseProven(evidence, true)
         })
         const candidates = [selected.model, ...ordered.map((slot) => slots[slot])]
-          .filter(identity => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
+          .filter(identity => isPlaceModel(catalog, place, identity) && reviewModelAvailable(catalog, identity))
         // Spend the existing final attempt on an alternate without changing its retry slot or basis.
         const model = (exhausted ? candidates.find(identity => identity !== selected.model) : null) ?? candidates[0]
         if (!model || !claimReviewerTripProbe(model)) return null
@@ -8770,12 +8751,8 @@ async function runBehaviorChains(): Promise<void> {
         observeProviderRejection(call)
         if (call.error_code === 'native_cleanup_failed') invalidateNativeCleanup(call.error || 'Native cleanup verification failed')
         if (invocation.model === null) return
-        const identity = call.recovery_model || call.model
         if (call.status === 'completed') reviewerSucceeded(call)
-        else {
-          const kind = reviewerTripKind(call)
-          if (kind) tripReviewer(invocation.behavior === 'review-pr' || invocation.behavior === 'approve-pr' ? 'review-new-prs' : ISSUES_KEY, identity, kind, call.id)
-        }
+        else tripReviewerForCall(invocation.behavior === 'review-pr' || invocation.behavior === 'approve-pr' ? 'review-new-prs' : ISSUES_KEY, call)
       },
       authRecovered(invocation) {
         const failure = providerSignInFailure('codex')

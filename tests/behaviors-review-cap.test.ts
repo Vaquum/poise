@@ -107,10 +107,10 @@ describe('review-round cap', () => {
     expect(db.countReviewRounds(pr.repo, pr.number)).toBe(3)
   })
 
-  it('ignores clean, failed and quarantined runs', async () => {
+  it('counts clean reviews and skips failed and quarantined runs', async () => {
     const { database: db } = await loadModules()
     recordCompletedInitialReview(db, { outcome: 'clean', headSha: HEAD_SHA })
-    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(0)
+    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(1)
     // A change request that never completed (its claim is still held) adds no round.
     const target = `${pr.repo}#${pr.number}@req=2026-07-10T10:00:00Z/r=1/head=${NEXT_HEAD_SHA}`
     const claimId = db.claimSeenOwned('approve-prs', target)
@@ -120,7 +120,7 @@ describe('review-round cap', () => {
       requestedAt: new Date().toISOString(), expectedHead: NEXT_HEAD_SHA, actor: 'review-bot',
       source: 'poise:approve-prs', correlationId: claimId,
     })
-    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(0)
+    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(1)
   })
 
   it('passes no cap flag while the cap is off', async () => {
@@ -230,7 +230,7 @@ describe('review-round cap', () => {
     })
 
     await expect(runtime.admitReplay('pr_approve', pr.repo, pr.number)).resolves.toMatchObject({
-      author: pr.author, reviewCapReached: { reviewRound: 5, reviewCap: 5 },
+      author: pr.author, reviewCap: 5,
     })
   })
 
@@ -328,7 +328,7 @@ describe('review-round cap', () => {
 
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
-      '--review-cap-reached', '--review-round', '3', '--review-cap', '2',
+      '--review-cap-reached', '--review-round', '2', '--review-cap', '2',
     ]))
   })
 })

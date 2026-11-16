@@ -77,7 +77,7 @@ export type Role = (chat: string) => 'manager' | 'worker' | null | undefined
 
 // ---------- The notices feed, Behaviors' diagnostics and chain attention ----------
 const KIND_WORDS: Record<NoticeKind, string> = {
-  chat_waiting: 'Waiting', sign_in_needed: 'Sign-in needed', behavior_held: 'Behavior held', datastore_sync_failing: 'GitHub data',
+  chat_waiting: 'Waiting', sign_in_needed: 'Sign-in needed', provider_unavailable: 'Model unavailable', behavior_held: 'Behavior held', datastore_sync_failing: 'GitHub data',
   pr_ready: 'Ready to merge', review_requested: 'Review requested', pr_conflict: 'Merge conflict', chat_turn_finished: 'Turn finished',
   github_quota_warning: 'GitHub API', github_quota_exhausted: 'GitHub API', storage_low: 'Storage', ledger_queue_stalled: 'Ledger',
   ledger_capture_loss: 'Ledger', worker_idle: 'Idle slots', read_failed: 'Read failed', action_failed: 'Action failed',

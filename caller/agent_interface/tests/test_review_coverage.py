@@ -128,7 +128,7 @@ class TestReviewCoverage(TestCase):
     def run_review(self, behavior, findings=(), **options):
         verdict = {"action": "request_changes" if findings else "reviewed_clean" if behavior == "pr_review" else "approve",
                    "comments": list(findings), "assessment": ASSESSMENT,
-                   **({"requests": []} if behavior == "pr_review" else {})}
+                   **({"requests": []} if behavior == "pr_review" or "review_round" in options else {})}
         with patch.dict(structured_review.ASK, {"codex": lambda *_args: json.dumps(verdict)}), redirect_stdout(io.StringIO()):
             api.run_governed_behavior(pr_review if behavior == "pr_review" else pr_approve, behavior,
                 "https://github.com/o/r/pull/12", "reviewer", self.head, "poise:test", f"coverage-{behavior}-{self.head}",

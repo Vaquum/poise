@@ -342,10 +342,20 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'wait', reason: 'native merge queue owns entry repaired-queue-entry' })
   })
 
-  it('repairs a completed exact-head CI failure before spending review slots, then requires fresh reviews on the repaired head', () => {
+  it('reviews a PR with failing CI, then repairs CI and reviews the repaired head', () => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
     let current = reviewed(journal, chain, obs)
     Object.assign(obs.pull!, { failing: ['unit:failure'], reviewIds: [], reviewReceipts: [] })
+    const review = decideBehaviorChain(current, obs, NOW)
+    expect(review).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+    current = finish(journal, current, 'review-red-ci', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 28, head_sha: HEAD })
+    obs.pull!.reviewIds.push(28)
+    obs.pull!.reviewReceipts.push({ id: 28, head: HEAD, state: 'COMMENTED', invocation: chainBasis('review-red-ci').slice(0, 32),
+      submittedAt: NOW, response: reviewResponse(chainBasis('review-red-ci').slice(0, 32), HEAD) })
+    obs.reviewCap = 1
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+    obs.reviewCap = 3
     const repair = decideBehaviorChain(current, obs, NOW)
     expect(repair).toMatchObject({ kind: 'invoke', behavior: 'repair-pr', actor: 'author', reviewer: REVIEWER,
       basis: chainBasis(['repair', HEAD, ['unit:failure'], false, false, false, 0, obs.pull!.reviewRevision, obs.issue.revision]) })
@@ -600,6 +610,7 @@ describe('native admission and recovery', () => {
       const { journal, chain } = setup()
       const obs = observation(); pull(obs)
       obs.pull!.queueEntry = 'external-entry'
+      obs.prReviewers = [] // This fixture isolates queue-removal repair after review.
       let current = reviewed(journal, chain, obs)
       const repair = invocation('original-repair', 'repair-pr', chainBasis(['repair', HEAD]))
       const callId = 'c'.repeat(32)

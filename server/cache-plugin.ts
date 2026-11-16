@@ -1459,7 +1459,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (url === '/api/pr-review' && req.method === 'POST') {
           try {
             const body = await readJson<any>(req)
-            const result = await triggerPrReview(String(body.url || ''))
+            const result = await triggerPrReview(String(body.url || ''), getReviewCap() ?? undefined)
             return json(res, 200, result)
           } catch (err: any) {
             const stderr = err?.stderr?.toString?.() || ''

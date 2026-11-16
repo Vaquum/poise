@@ -20,7 +20,8 @@ import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
-import { releaseIssueReviewRevision, requestIssueReviewRevision } from './db'
+import { countReviewRounds, releaseIssueReviewRevision, requestIssueReviewRevision } from './db'
+import { DEFAULT_PR_REVIEW_CAP, reviewRoundArgs } from './review-continuation'
 import { getHeadSha, getPrAuthor } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
@@ -842,6 +843,7 @@ export async function stopAgentJob(callId: string): Promise<StopResult> {
 // fires upstream, then settles to completed/failed).
 export async function triggerPrReview(
   prUrl: string,
+  reviewCap = DEFAULT_PR_REVIEW_CAP,
 ): Promise<{ ok: true, source: string, correlationId: string }> {
   const m = String(prUrl || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url')
@@ -856,6 +858,8 @@ export async function triggerPrReview(
   if (claude) await claudeAuth.requireReady()
   const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
   const expectedHead = await getHeadSha(repoFullName, Number(num), { actor })
+  const completed = countReviewRounds(repoFullName, Number(num), expectedHead)
+  if (completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
   const pwd = await resolveReviewCheckout(owner, repo, Number(num), actor, expectedHead)
   const source = 'poise:manual-review'
   const correlationId = randomUUID()
@@ -890,6 +894,7 @@ export async function triggerPrReview(
     correlationId,
     '--pwd',
     pwd,
+    ...reviewRoundArgs(completed, reviewCap),
   ], {
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
@@ -905,7 +910,7 @@ export async function triggerPrReview(
 // admitReplay): it reads the target fresh and throws when the scheduler would
 // not act on it. Passed in rather than imported, so this bridge to Caller does
 // not depend on the behavior runtime.
-export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCapReached?: { reviewRound: number, reviewCap: number } } | void>
+export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCap?: number } | void>
 
 // Replay an existing agent-interface job — used by the Swarm view's
 // Replay column. The frontend sends the row's `behavior` + `repo` +
@@ -960,16 +965,13 @@ export async function replayAgentJob(input: {
   const drawValid = stored === 'random' ? await randomDrawStillValid(place, model) : selectedModel === model
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   if (!drawValid) throw new Error('Review model changed; retry the request')
+  const reviewCap = admission.reviewCap ?? DEFAULT_PR_REVIEW_CAP
+  const completed = countReviewRounds(repo, Number(prId), behavior === 'pr_review' ? expectedHead : null)
+  const capFlags = reviewRoundArgs(completed, reviewCap)
+  if (behavior === 'pr_review' && completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
     repository: repo, number: Number(prId), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
-  // An approval replay runs under the same effective cap as a scheduled
-  // approve-prs launch: at or past the capped round it files (or reuses)
-  // the follow-up issue and approves instead of requesting changes again.
-  const capFlags = behavior === 'pr_approve' && admission.reviewCapReached
-    ? ['--review-cap-reached', '--review-round', String(admission.reviewCapReached.reviewRound),
-      '--review-cap', String(admission.reviewCapReached.reviewCap)]
-    : []
   try { await spawnDetached(CLI, [
     flag,
     `#${prId}`,

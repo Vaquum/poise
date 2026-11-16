@@ -401,18 +401,20 @@ class TestReviewContinuation(TestCase):
                 pending = json.loads(prompt.split("Optional unfinished inspection requests: ", 1)[1].splitlines()[0])
                 request = pending or [read]
                 calls.append(request[0]["start_line"])
+                if request[0]["start_line"] == 3:
+                    self.assertIn("This is the last inspection round. No further inspection rounds will follow.", prompt)
                 if "Repository inspection is finished" not in prompt:
                     return verdict(prompt, [finding], request)
             return verdict(prompt)
 
         with self.call(node) as root:
             self.run_review(node, ask)
-        self.assertEqual(calls, list(range(1, 14)))
-        self.assertEqual([request["start_line"] for request in self.inspections], list(range(1, 13)))
+        self.assertEqual(calls, [1, 2, 3, 4])
+        self.assertEqual([request["start_line"] for request in self.inspections], [1, 2, 3])
         command = self.posts[0][0]
         self.assertEqual(json.loads(command[command.index("--comments") + 1]), [finding])
         assessment = json.loads(command[command.index("--assessment-json") + 1])
-        self.assertIn("src/f016.py from line 13 was not read", assessment["limitations"])
+        self.assertIn("src/f016.py from line 4 was not read", assessment["limitations"])
         self.assertIn("reached its round limit", assessment["limitations"])
 
     def test_changed_answer_revision_same_head_and_changed_policy_invalidate_progress(self):
@@ -632,6 +634,24 @@ class TestReviewContinuation(TestCase):
             self.assertIn("--approve-pr", approvals[0])
             self.assertIn(f"<!-- poise-invocation {root} -->", created[0]["body"])
             self.assertTrue(self.posts[-1][1].endswith(f"<!-- poise-invocation {root} -->"))
+
+    def test_final_pr_round_files_nonbreaking_findings_even_when_a_break_remains(self):
+        node = packet()
+        next_step = {"path": "src/f000.py", "line": 2, "side": "RIGHT", "body": "[p1] Optional consumer ignores a status."}
+        blocking = {"path": "src/f000.py", "line": 2, "side": "RIGHT", "body": "[p0] Existing callers now crash."}
+        for index, findings in enumerate(([next_step], [next_step, blocking])):
+            with self.subTest(findings=findings), self.call(node, slot=f"review-{index}") as original, \
+                    patch.object(structured_review, "_file_capped_followup", return_value="issue #18") as file_ticket:
+                self.run_review(node, lambda *args: verdict(args[3], findings),
+                                capped=True, review_round=3, review_cap=3)
+            self.assertEqual(file_ticket.call_args.args[6], [next_step])
+            command = self.posts[-1][0]
+            if blocking in findings:
+                self.assertIn("--request-changes", command)
+                self.assertEqual(json.loads(command[command.index("--comments") + 1]), [blocking])
+            else:
+                self.assertIn("--reviewed-clean", command)
+            self.assertIsNotNone(self.artifact(original))
 
     def test_capped_approval_entry_hydrates_manifest_coverage_before_deferring_findings(self):
         node = packet()

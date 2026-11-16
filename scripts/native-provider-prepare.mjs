@@ -18,14 +18,15 @@ for (const provider of providers) {
   const result = results[provider]
   if (result.status === 'unavailable') warnings.push(`${provider}: ${result.error}`)
   if (provider === 'codex' && !process.env.CODEX_CLI) {
-    if (!result.launchPath) failure = `Codex CLI has no verified launcher: ${result.error || 'version check failed'}`
-    else env.CODEX_CLI = result.launchPath
+    if (result.launchPath) env.CODEX_CLI = result.launchPath
+    else if (provider === providers[0]) failure = `Codex CLI has no verified launcher: ${result.error || 'version check failed'}`
   }
 }
 // Updater errors are already redacted by the existing updater. Keep warnings
 // in Caller's existing diagnostic stream even when a retained launcher works.
 const diagnostic = warnings.length || failure ? { version: 1, source: 'caller', severity: failure ? 'error' : 'warning',
   operation: 'provider.cli_update', phase: 'launcher_verification', outcome: 'unavailable',
-  message: (failure || warnings.join('; ')).slice(0, 4096), stderr: warnings.join('\n').slice(0, 8192), stderr_truncated: warnings.join('\n').length > 8192 } : null
+  message: (failure || warnings.join('; ')).slice(0, 4096), stderr: warnings.join('\n').slice(0, 8192), stderr_truncated: warnings.join('\n').length > 8192,
+  ...(failure ? { context: { provider: 'codex', submission: 'none' } } : {}) } : null
 process.stdout.write(JSON.stringify({ version: 1, env, diagnostic }) + '\n')
 if (failure) process.exitCode = 1

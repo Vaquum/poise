@@ -1163,7 +1163,7 @@ export function listCompletedBehaviorActions(): CompletedBehaviorAction[] {
   `).all() as CompletedBehaviorAction[])
 }
 
-// How many change-request rounds a pull request has completed: the initial
+// How many review rounds a pull request has completed: the initial
 // review counts once however wide its panel, and every approve-prs follow-up
 // counts — including follow-ups on an unchanged head, which author replies
 // re-arm without a new commit. Only launches that reconciled cleanly count:
@@ -1171,25 +1171,26 @@ export function listCompletedBehaviorActions(): CompletedBehaviorAction[] {
 // reviews nor superseded runs that posted nothing. A superseded run that
 // posted is quarantined for a person instead of being silently released. The
 // review-round cap reads this at launch time.
-export function countReviewRounds(repo: string, pr: number): number {
+export function countReviewRounds(repo: string, pr: number, currentPanelHead: string | null = null): number {
   const row = cachedStatement(db, `
     SELECT
-      COUNT(DISTINCT CASE WHEN key = 'review-new-prs' THEN launch_head_sha END)
+      COUNT(DISTINCT CASE WHEN key = 'review-new-prs' AND launch_head_sha IS NOT ? THEN launch_head_sha END)
       + COUNT(CASE WHEN key = 'approve-prs' THEN 1 END) AS n
     FROM behavior_seen
     WHERE claim_id = '' AND launch_error IS NULL AND launch_quarantine IS NULL
       AND launch_repo = ? AND launch_pr = ?
-      AND launch_action = 'requested_changes' AND launch_outcome = 'changes_requested'
       AND (
         (key = 'review-new-prs' AND launch_behavior = 'pr_review'
-          AND launch_source IN ('poise:review-new-prs', 'poise:replay'))
+          AND launch_source IN ('poise:review-new-prs', 'poise:replay')
+          AND (launch_action, launch_outcome) IN (VALUES ('reviewed_clean', 'clean'), ('requested_changes', 'changes_requested')))
         OR (key = 'approve-prs' AND launch_behavior = 'pr_approve'
-          AND launch_source IN ('poise:approve-prs', 'poise:replay'))
+          AND launch_source IN ('poise:approve-prs', 'poise:replay')
+          AND launch_action = 'requested_changes' AND launch_outcome = 'changes_requested')
       )
       AND launch_requested_at IS NOT NULL
       AND launch_call_id IS NOT NULL AND launch_call_id <> ''
       AND launch_completed_at IS NOT NULL AND launch_expected_head = launch_head_sha
-  `).get(repo, pr) as { n: number }
+  `).get(currentPanelHead, repo, pr) as { n: number }
   return row.n
 }
 

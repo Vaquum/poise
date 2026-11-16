@@ -1,13 +1,12 @@
 import json
 import os
-import shlex
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
 import agent_interface
-from agent_interface import atoms, bash_guard, claude_acl, pr_approve, structured_review
+from agent_interface import atoms, pr_approve, review_repository, structured_review
 from agent_interface import review_cap as followup
 from agent_interface import review_budget, review_receipt
 from agent_interface.model_catalog import CATALOG
@@ -55,17 +54,20 @@ def issue_reply(number=8):
 
 
 class TestCappedApprovalTools(TestCase):
-    def test_claude_cannot_defer_findings_or_approve_when_required_source_is_omitted(self):
-        packet = json.dumps({**json.loads(PACKET), "coverage": "incomplete",
-                             "omitted_files": [{"path": "src/z.py", "reason": "capacity"}]})
-        with patch.object(atoms, "packet", return_value=packet), \
+    def test_claude_gets_the_final_round_policy_and_only_read_tools(self):
+        with patch.object(atoms, "packet", return_value=PACKET), \
                 patch.object(atoms, "last_reviewed_head", return_value=None), \
+                patch.object(review_repository, "prepare") as prepare, \
                 patch.object(atoms, "run_agent", return_value="submitted") as run:
+            prepare.return_value.__enter__.return_value.prompt.return_value = ""
             pr_approve.run("/repo", "https://github.com/o/r/pull/12", "bit-mis", HEAD,
                            model="opus-5-high", capped=True, review_round=5, review_cap=5)
-        self.assertFalse(run.call_args.kwargs["capped"])
-        self.assertEqual(run.call_args.args[3], pr_approve.allowed("12", "bit-mis", HEAD))
-        self.assertNotIn("file the findings as ONE follow-up issue", run.call_args.args[2])
+        text, tools = run.call_args.args[2:4]
+        self.assertIn("PR review round 5 of 5", text)
+        self.assertIn("This is the final PR review round", text)
+        self.assertIn("Only breaking changes", text)
+        self.assertIn("linked ticket", text)
+        self.assertEqual(tools, [review_repository.INSPECTION_RULE])
 
     def test_uncapped_tools_are_unchanged(self):
         self.assertEqual(
@@ -74,67 +76,9 @@ class TestCappedApprovalTools(TestCase):
              f"--assessment-json * --expected-head {HEAD} --token-user bit-mis)",
              f"Bash(github-interface --approve-pr '#12' --assessment-json * --expected-head {HEAD} --token-user bit-mis)"])
 
-    def test_capped_tools_allow_change_requests_and_followup_approvals(self):
-        tools = pr_approve.allowed("#12", "bit-mis", HEAD, capped=True)
-        self.assertEqual(tools[0], pr_approve.allowed("#12", "bit-mis", HEAD)[0])
-        self.assertIn("--create-pr-linked-issue '#12' --title * --body * --token-user bit-mis", tools[1])
-        self.assertEqual(tools[2], pr_approve.allowed("#12", "bit-mis", HEAD)[1])
-
     def test_capped_run_needs_round_and_cap_numbers(self):
         with self.assertRaises(ValueError):
             pr_approve.run("/repo", "https://github.com/o/r/pull/12", "bit-mis", HEAD, capped=True)
-
-    def test_capped_prompt_names_the_round_issue_and_approval(self):
-        self.assertIn("round 5 of a 5-round cap", pr_approve.capped_policy(5, 5))
-        self.assertIn('--assessment-json with a JSON object', pr_approve.capped_policy(5, 5))
-        self.assertIn('limitations (including unverified tests, 4-4000 characters)', pr_approve.capped_policy(5, 5))
-        rules = pr_approve.capped_rules("o/r", "#12", HEAD, 5, 5, "bit-mis")
-        text = "\n".join(rules)
-        self.assertIn(followup.marker("12", HEAD), text)
-        self.assertIn("--create-pr-linked-issue '#12' --title", text)
-        self.assertIn("BEFORE approving", text)
-        self.assertIn("submit NOTHING", text)
-        # The prompt formats its severity placeholder without other braces leaking in.
-        atoms.prompt("policy", ("p0: x.",), rules, "{}", [], "", "p2")
-
-    def test_claude_gets_the_exception_policy_and_permitted_publication_paths(self):
-        cases = [([BREAKING_FINDING], ["--request-changes"]),
-                 ([BREAKING_FINDING, FINDING], ["--request-changes"]),
-                 ([FINDING, REMOVED_FINDING], ["--create-pr-linked-issue", "--approve-pr"])]
-        for review_round in (5, 6):
-            for comments, flags in cases:
-                with self.subTest(review_round=review_round, comments=comments):
-                    source = PACKET if flags[0] == "--create-pr-linked-issue" else packet_with_issue(followup.marker("12", HEAD))
-                    packet = json.dumps({**json.loads(source),
-                                         "review_threads": [{**comment, "bodies": [comment["body"]],
-                                                             "is_resolved": False} for comment in comments]})
-                    with patch.object(atoms, "packet", return_value=packet), \
-                            patch.object(atoms, "last_reviewed_head", return_value=None), \
-                            patch.object(atoms, "run_agent", return_value="submitted") as run:
-                        pr_approve.run("/repo", "https://github.com/o/r/pull/12", "bit-mis", HEAD,
-                                       model="opus-5-high", capped=True, review_round=review_round, review_cap=5)
-                    text, tools = run.call_args.args[2:4]
-                    self.assertIn(f"round {review_round} of a 5-round cap", text)
-                    self.assertIn("if any verified p0 (breaks a common path) remains, request changes", text)
-                    self.assertIn("with ALL blocking inline findings, including p1/p2 findings", text)
-                    self.assertIn("Missing or unrecognized severity also stays blocking", text)
-                    self.assertIn("Only when every finding body explicitly starts with [p1] or [p2]", text)
-                    self.assertIn("preserve original bodies when reaffirming existing threads", text)
-                    self.assertIn("even if a marked follow-up issue exists", text)
-                    self.assertIn(packet, text)
-                    with patch.dict(os.environ, {"AGENT_INTERFACE_BASH_ALLOW": json.dumps(claude_acl.bash_patterns(tools))}):
-                        for flag in flags:
-                            command = ["github-interface", flag, "#12"]
-                            if flag == "--create-pr-linked-issue":
-                                command += ["--title", "follow-up", "--body", json.dumps(comments), "--token-user", "bit-mis"]
-                            else:
-                                if flag == "--request-changes":
-                                    command += ["--comments-json", json.dumps(comments)]
-                                command += ["--assessment-json", json.dumps(ASSESSMENT), "--expected-head", HEAD,
-                                            "--token-user", "bit-mis"]
-                            self.assertTrue(bash_guard.allowed(shlex.join(command)))
-                            if "--expected-head" in command:
-                                self.assertFalse(bash_guard.allowed(shlex.join(command).replace(HEAD, "d" * 40)))
 
 
 class TestCappedApprovalCli(TestCase):
@@ -155,7 +99,7 @@ class TestCappedApprovalCli(TestCase):
         cases = [
             base + ["--review-cap-reached", "--review-round", "5"],
             base + ["--review-cap-reached"],
-            base + ["--review-round", "5", "--review-cap", "5"],
+            base + ["--review-cap", "5"],
             base + ["--review-cap-reached", "--review-round", "banana", "--review-cap", "5"],
             base + ["--review-cap-reached", "--review-round", "0", "--review-cap", "5"],
         ]
@@ -184,7 +128,7 @@ class TestFollowupIssue(TestCase):
         body = followup.render_body("o/r", "12", HEAD, BASE, 5, 5, [FINDING])
         self.assertTrue(body.startswith(followup.marker("12", HEAD)))
         self.assertIn("round 5", body)
-        self.assertIn("cap of 5 rounds", body)
+        self.assertIn("round 5 of 5", body)
         self.assertIn(f"https://github.com/o/r/blob/{HEAD}/src/main.py#L4", body)
         self.assertIn("(RIGHT,", body)
         self.assertIn(FINDING["body"], body)
@@ -257,49 +201,29 @@ class TestStructuredCappedConversion(TestCase):
                                            "comments": [FINDING, REMOVED_FINDING]}, github, review_round=review_round)
                 self.assertEqual(seen, ["--create-pr-linked-issue", "--approve-pr"])
                 self.assertIn("issue #8 (https://github.com/o/r/issues/8)", result)
-                self.assertIn(f"round {review_round} of 5", result)
                 self.assertIn('"review_id": 91', result)
                 self.assertEqual(calls[-1][calls[-1].index("--expected-head") + 1], HEAD)
 
-    def test_capped_blockers_retain_the_entire_change_request_even_with_a_followup(self):
-        findings = [[BREAKING_FINDING], [BREAKING_FINDING, FINDING]]
-        findings += [[{**FINDING, "body": body}] for body in (
-            "Still loses data.", "[p9] Unknown severity.", "This mentions [p1] without classifying the finding.")]
-        for review_round in (5, 6):
-            for packet in (PACKET, packet_with_issue(followup.marker("12", HEAD))):
-                for comments in findings:
-                    with self.subTest(review_round=review_round, packet=packet, comments=comments):
-                        def github(args):
-                            self.assertEqual(args[1], "--request-changes")
-                            self.assertEqual(json.loads(args[args.index("--comments") + 1]), comments)
-                            self.assertEqual(args[args.index("--expected-head") + 1], HEAD)
-                            self.assertEqual(args[args.index("--token-user") + 1], "bit-mis")
-                            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                                {"action": "requested_changes", "review_id": 92, "head_sha": HEAD}), stderr="")
+    def test_capped_request_publishes_only_the_breaking_finding(self):
+        for packet in (PACKET, packet_with_issue(followup.marker("12", HEAD))):
+            seen = []
+            def github(args):
+                seen.append(args[1])
+                if args[1] == "--create-pr-linked-issue":
+                    self.assertIn(FINDING["body"], args[args.index("--body") + 1])
+                    self.assertNotIn(BREAKING_FINDING["body"], args[args.index("--body") + 1])
+                    return issue_reply()
+                self.assertEqual(args[1], "--request-changes")
+                self.assertEqual(json.loads(args[args.index("--comments") + 1]), [BREAKING_FINDING])
+                self.assertEqual(args[args.index("--expected-head") + 1], HEAD)
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": "requested_changes", "review_id": 92, "head_sha": HEAD}), stderr="")
 
-                        result, calls = self._run({"assessment": ASSESSMENT, "action": "request_changes",
-                                                   "comments": comments}, github, packet=packet, review_round=review_round)
-                        self.assertEqual(len(calls), 1)
-                        self.assertNotIn("findings filed", result)
-
-    def test_capped_reaffirmation_preserves_original_unlabelled_bodies(self):
-        original = {**FINDING, "body": "Still loses the existing document."}
-        for review_round in (5, 6):
-            for outdated in (False, True):
-                with self.subTest(review_round=review_round, outdated=outdated):
-                    node = json.loads(PACKET)
-                    node["review_threads"] = [{**original, "bodies": [original["body"]],
-                                               "is_resolved": False, "is_outdated": outdated}]
-                    comment = {**original, "line": 999} if outdated else original
-
-                    def github(args):
-                        self.assertEqual(args[1], "--request-changes")
-                        self.assertEqual(json.loads(args[args.index("--comments") + 1]), [original])
-                        return SimpleNamespace(returncode=0, stdout=json.dumps(
-                            {"action": "requested_changes", "review_id": 92, "head_sha": HEAD}), stderr="")
-
-                    self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [comment]},
-                              github, packet=json.dumps(node), review_round=review_round)
+            self._run({"assessment": ASSESSMENT, "action": "request_changes",
+                       "comments": [BREAKING_FINDING, FINDING]}, github, packet=packet)
+            has_issue = packet != PACKET
+            self.assertEqual(seen, ["--request-changes"] if has_issue else
+                             ["--create-pr-linked-issue", "--request-changes"])
 
     def test_capped_issue_carries_marker_findings_and_actor(self):
         bodies = {}

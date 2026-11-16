@@ -460,7 +460,7 @@ one existing `github-interface` terminal command with the original PR, actor, an
 expected head. For PR review these providers can first return `action: "inspect"`
 with provisional `comments` and a `requests` array; Caller reads the requested
 source and supplies the result in their next turn. Terminal verdicts require
-`requests: []`. Caller allows at most 12 inspection rounds within the existing
+`requests: []`. Caller allows at most three inspection rounds within the existing
 total review deadline and 3 MB prompt limit. When optional inspection reaches
 either limit, the reviewer returns a verdict using the source already supplied.
 After a successful provider call, an invalid response gets one correction attempt
@@ -608,27 +608,16 @@ A reasoning-file write failure leaves heartbeats and terminal outcomes working.
 Progress warns about the unavailable text, and its text counter advances only
 after an atomic file save, so clients can fetch new text when storage recovers.
 
-### Capped review rounds
+### PR review rounds
 
-`--pr-approve ... --review-cap-reached --review-round N --review-cap N` runs
-the capped round. On and after the cap, any verified `p0` (breaks a common path)
-keeps the whole atomic change request blocking, including mixed p0/p1/p2
-findings. Missing or unrecognized severity also stays blocking. Only when all
-finding bodies explicitly start with `[p1]` or `[p2]` (case-insensitive) does it
-file one follow-up issue via `github-interface --create-pr-linked-issue` and
-approve; a round with no findings approves without filing. New findings carry
-a severity prefix; reaffirmed threads keep their original bodies.
-The issue body starts with a marker for its pull request and
-head (`<!-- poise:review-cap #N@sha -->`), then one finding per section, each
-pinned to the reviewed head — or to its base for removed-side findings.
-A rejected filing approves nothing and raises a contract violation;
-an uncertain filing (timeout, transient GitHub error, exit 0 without a
-receipt) raises a submission error for Poise to reconcile, and the retry
-reuses the marked issue instead of filing again. An existing marked issue
-never bypasses the breaking-finding check. Structured providers review as usual
-and the harness converts only explicitly nonbreaking change requests;
-Claude receives the same severity policy and can request changes or file the
-issue then approve. It must submit nothing when filing fails.
+Both `--pr-review` and `--pr-approve` accept `--review-round N --review-cap N`
+for the current PR round and its limit. Managed reviews use the structured
+verdict for every provider. In the final PR round or when optional repository
+inspection reaches its final round, Caller requests changes only for verified
+`p0` findings. It files the rest through
+`github-interface --create-pr-linked-issue`. A review without breaking
+findings then advances to approval. See the
+[behavior contract](../../docs/Behavior-Contract.md) for the workspace policy.
 
 ### Staged and follow-up reviews
 

@@ -43,6 +43,7 @@ export const shownAt = (group: Group, level: number): boolean => groupRank(group
 const NOTICE_GROUPS: Record<NoticeKind, Group | null> = {
   chat_waiting: null,
   sign_in_needed: 'needs-you',
+  provider_unavailable: 'needs-you',
   review_requested: 'needs-you',
   storage_low: 'fault',
   action_needed: 'fault',

@@ -16,7 +16,7 @@ export function behaviorChainSettings() {
     <label class="tp-label"><input type="checkbox" data-chain-enabled disabled> Run the issue-to-merge chain</label>
     <label class="tp-label" for="chain-seed-mode">Seed issues</label><select id="chain-seed-mode" class="st-select"><option value="label">Issues with the selected label</option><option value="all">All issues in followed organizations</option></select>
     <label class="tp-label" for="chain-seed-label">Issue label</label><input id="chain-seed-label" class="st-input" maxlength="50" spellcheck="false" autocomplete="off">
-    <p class="st-help">This intake controls v2. Repository/author triggers and the approval-round cap in the Behaviors table apply to legacy work. Existing reviewer counts, phase switches, pauses, notes and PR exclusions still apply to v2.</p>
+    <p class="st-help">This intake controls v2. Repository and author triggers in the Behaviors table apply to legacy work. Existing reviewer counts, phase switches, pauses, notes and PR exclusions still apply to v2.</p>
     <button type="button" class="st-clear" data-chain-save disabled>Save chain settings</button> <button type="button" class="st-clear" data-chain-reload>Reload saved settings</button> <button type="button" class="st-clear" data-chain-refresh>Refresh availability</button>
     <p role="status" data-chain-status></p>`
   const enabled = element.querySelector<HTMLInputElement>('[data-chain-enabled]')!

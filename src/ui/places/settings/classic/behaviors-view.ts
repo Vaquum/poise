@@ -363,7 +363,7 @@ function triggersPresentation(key: BehaviorKey) {
         : (skipped.length ? `Skip ${skipped.length}` : 'All repos'),
       title: unknown
         ? 'The setting could not be read from the server.'
-        : [ceiling ? `Priority ${ceiling}` : '', cap ? `Review cap: round ${cap} files its findings as one follow-up issue and approves` : '', skipped.length ? `Skipped: ${skipped.join(', ')}` : 'Acts in every repository']
+        : [ceiling ? `Priority ${ceiling}` : '', cap ? `PR review rounds: ${cap}` : '', skipped.length ? `Skipped: ${skipped.join(', ')}` : 'Acts in every repository']
           .filter(Boolean).join(' · '),
       open,
     }
@@ -539,7 +539,7 @@ function buildTriggersPanel(): HTMLElement {
   panel.id = 'behavior-triggers-panel'
   panel.setAttribute('role', 'dialog')
   const ceilings = SETTING_OPTIONS.map((option) => `<option value="${option.value}">${escapeHtml(option.label)}</option>`).join('')
-  const caps = ['<option value="">Off</option>']
+  const caps = ['<option value="">Default (3)</option>']
     .concat(Array.from({ length: 9 }, (_, index) => {
       const rounds = index + 2
       return `<option value="${rounds}">${rounds} rounds</option>`
@@ -554,8 +554,8 @@ function buildTriggersPanel(): HTMLElement {
       <input id="bt-days" class="st-input bt-days-input" type="number" min="1" step="1" required data-help="Elapsed 24-hour days since opening. Existing old pull requests qualify on the first run." />
     </div>
     <div class="bt-section bt-review-cap" hidden>
-      <label class="bt-label" for="bt-review-cap">Review cap (legacy only)</label>
-      <select id="bt-review-cap" class="behavior-setting bt-review-cap-select" data-help="From this round on, Approve files the round's findings as one follow-up issue and approves instead of requesting changes. Off disables the cap.">${caps}</select>
+      <label class="bt-label" for="bt-review-cap">PR review rounds</label>
+      <select id="bt-review-cap" class="behavior-setting bt-review-cap-select" data-help="The last round files nonbreaking findings as a follow-up issue. Breaking changes still block approval.">${caps}</select>
     </div>
     <div class="bt-section">
       <label class="bt-label bt-repos-label" for="bt-filter">Repositories</label>
