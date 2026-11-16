@@ -474,12 +474,15 @@ def staged_packet(paths):
 
 
 class TestStagedReview(TestCase):
-    def test_finishing_every_retained_stage_cannot_clear_capacity_omissions(self):
+    def test_finishing_every_retained_stage_publishes_only_a_note_for_capacity_omissions(self):
         node = json.loads(staged_packet([f"src/f{i:02d}.py" for i in range(9)]))
         node.update(coverage="incomplete", omitted_files=[{"path": "src/z.py", "reason": "capacity"}])
-        with self.assertRaises(review_budget.ReviewLimitError) as failure:
-            self._run(json.dumps(node), [{"action": "reviewed_clean", "comments": [], "assessment": ASSESSMENT}] * 2)
-        self.assertEqual(failure.exception.code, "review_incomplete")
+        _, calls = self._run(json.dumps(node), [{"action": "reviewed_clean", "comments": [], "assessment": ASSESSMENT}] * 2)
+        command = calls[-1][0]
+        self.assertEqual(command[1], "--reviewed-clean")
+        self.assertIn("--partial-note", command)
+        assessment = json.loads(command[command.index("--assessment-json") + 1])
+        self.assertIn("PR diff for src/z.py omitted. capacity", assessment["limitations"])
 
     def test_completion_race_retains_closure_before_another_group_turn_or_submission(self):
         real_popen = subprocess.Popen
