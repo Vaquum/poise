@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from github_datastore.cli import main
 from github_datastore.db import connect, get_state, init_db, set_state, upsert_repo
+from github_datastore.github_api import GitHubRateLimitError, ItemGraphError
 from github_datastore.store import INITIALIZATION_KEY, init_org, iter_expanded, store_expanded, sync_once
 from tests.test_store import BatchReader, base_expanded, repo_row
 
@@ -457,6 +458,45 @@ class InitializationTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_sync_keeps_the_last_bad_item_snapshot_and_advances_healthy_items(self) -> None:
+        first = expansion(self.repo, 100, 1)
+        second = expansion(self.repo, 101, 2)
+        reader = self.reader([first, second])
+        with patch("github_datastore.store.utc_now", return_value=START):
+            self.initialize(reader)
+        updated = "2026-09-01T12:00:00Z"
+        reader.catchup_items[self.repo["full_name"]] = [
+            expansion(self.repo, 100, 1, updated), expansion(self.repo, 101, 2, updated),
+        ]
+        original = reader.expand_issue_or_pr
+
+        def expand(repo, item):
+            if item["number"] == 1:
+                raise ItemGraphError("issue labels missing")
+            return original(repo, item)
+
+        def timestamps():
+            conn = connect(self.path)
+            try:
+                return [row[0] for row in conn.execute("SELECT updated_at FROM items ORDER BY number")]
+            finally:
+                conn.close()
+
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader), \
+                patch("github_datastore.store.utc_now", return_value=updated), \
+                patch.object(reader, "expand_issue_or_pr", side_effect=expand), \
+                self.assertLogs("github_datastore.store", level="WARNING") as warning:
+            self.assertTrue(sync_once(self.path, workers=2))
+        self.assertIn("Vaquum/Test#1", warning.output[0])
+        self.assertIn("issue labels missing", warning.output[0])
+        self.assertEqual(timestamps(), [first["issue"]["updated_at"], updated])
+        self.assertEqual(self.state("last_sync_at"), updated)
+
+        reader.catchup_items.clear()
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader):
+            self.assertTrue(sync_once(self.path, workers=2))
+        self.assertEqual(timestamps(), [updated, updated])
+
     def test_quota_failure_cancels_queued_expansions(self) -> None:
         release = threading.Event()
         shutdown = threading.Event()
@@ -472,7 +512,7 @@ class InitializationTest(unittest.TestCase):
             def expand_issue_or_pr(self, repo: dict, issue: dict) -> dict:
                 calls.append(issue["number"])
                 if issue["number"] == 1:
-                    raise RuntimeError("quota exceeded")
+                    raise GitHubRateLimitError("quota exceeded", 2_000_000_000)
                 if not release.wait(5):
                     raise AssertionError("test did not release running expansion")
                 return {}

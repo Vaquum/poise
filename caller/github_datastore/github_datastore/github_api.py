@@ -20,6 +20,20 @@ class GitHubApiError(RuntimeError):
     pass
 
 
+class GitHubRequestError(GitHubApiError):
+    pass
+
+
+class GitHubGraphQLError(GitHubRequestError):
+    def __init__(self, message: str, data: Any, errors: Any) -> None:
+        super().__init__(message)
+        self.data, self.errors = data, errors
+
+
+class ItemGraphError(GitHubApiError):
+    """A failed graph for one identified issue or pull request."""
+
+
 class GitHubRateLimitError(GitHubApiError):
     def __init__(self, message: str, reset_at: int) -> None:
         self.reset_at = reset_at
@@ -492,7 +506,7 @@ class GitHubClient:
         # only as the account whose token it is given, never gh's active one.
         token = self._token if self._token is not None else environment.get("GH_TOKEN", "").strip()
         if not token:
-            raise GitHubApiError("GH_TOKEN is not set: github-datastore reads GitHub only as the account whose token it is given")
+            raise GitHubRequestError("GH_TOKEN is not set: github-datastore reads GitHub only as the account whose token it is given")
         fields = {key: value for key, value in (variables or {}).items() if value is not None}
         for attempt in range(1, self.attempts + 1):
             if self._rate_limit_error is not None and time.time() < self._rate_limit_error.reset_at:
@@ -513,15 +527,15 @@ class GitHubClient:
                     if payload.get("errors"):
                         diagnostic = f"GraphQL errors: {json.dumps(payload['errors'])}"
                         self._raise_rate_limit(headers, diagnostic)
-                        raise GitHubApiError(diagnostic)
+                        raise GitHubGraphQLError(diagnostic, payload.get("data"), payload["errors"])
                     return payload["data"]
             last_error = failure
             self._raise_rate_limit(headers, f"GraphQL request failed: {last_error}")
             if not retryable or attempt == self.attempts:
-                raise GitHubApiError(f"GraphQL request failed: {last_error}")
+                raise GitHubRequestError(f"GraphQL request failed: {last_error}")
             time.sleep(self.retry_sleep_seconds)
 
-        raise GitHubApiError(f"GraphQL request failed: {last_error}")
+        raise GitHubRequestError(f"GraphQL request failed: {last_error}")
 
     def _cli_request(
         self, query: str, fields: dict[str, Any], environment: dict[str, str],
@@ -1014,7 +1028,7 @@ class GitHubOrgReader:
 
     def fetch_initial_item_graphs(
         self, repo: dict[str, Any], items: list[dict[str, Any]]
-    ) -> dict[int, dict[str, Any]]:
+    ) -> dict[int, dict[str, Any] | ItemGraphError]:
         if not 1 <= len(items) <= ITEM_GRAPH_BATCH_SIZE:
             raise ValueError(f"item graph batch must contain 1..{ITEM_GRAPH_BATCH_SIZE} items")
         numbers = [int(item["number"]) for item in items]
@@ -1042,23 +1056,41 @@ class GitHubOrgReader:
             "query(" + ", ".join(declarations) + ") {"
             " repository(owner: $owner, name: $name) { " + " ".join(selections) + " } }"
         )
-        data = self.client.graphql(query, variables)
-        nodes = data.get("repository")
         expected_aliases = {f"item_{index}" for index in range(len(items))}
-        if not isinstance(nodes, dict) or set(nodes) != expected_aliases:
+        failures: dict[str, str] = {}
+        try:
+            data = self.client.graphql(query, variables)
+        except GitHubGraphQLError as error:
+            if not isinstance(error.data, dict) or not isinstance(error.errors, list):
+                raise
+            for entry in error.errors:
+                path = entry.get("path") if isinstance(entry, dict) else None
+                if (not isinstance(path, list) or len(path) < 2 or path[0] != "repository"
+                        or not isinstance(path[1], str) or path[1] not in expected_aliases):
+                    raise
+                failures.setdefault(path[1], str(entry.get("message") or "GitHub returned a graph error"))
+            data = error.data
+        nodes = data.get("repository")
+        if not isinstance(nodes, dict):
             raise GitHubApiError(f"incomplete item graph batch for {owner}/{name}")
-        result = {}
+        result: dict[int, dict[str, Any] | ItemGraphError] = {}
         for index, item in enumerate(items):
-            node = nodes[f"item_{index}"]
+            alias = f"item_{index}"
+            node = nodes.get(alias)
+            number = numbers[index]
+            if alias in failures:
+                result[number] = ItemGraphError(f"{owner}/{name}#{number}: {failures[alias]}")
+                continue
             expected_type = "PullRequest" if item["item_kind"] == "pr" else "Issue"
-            if (
-                not isinstance(node, dict)
-                or node.get("__typename") != expected_type
-                or node.get("number") != numbers[index]
-                or int(required_id(node, item["item_kind"])) != int(item["id"])
-            ):
-                raise GitHubApiError(f"item graph identity mismatch for {owner}/{name}#{numbers[index]}")
-            result[numbers[index]] = {key: value for key, value in node.items() if key != "__typename"}
+            try:
+                if (not isinstance(node, dict) or node.get("__typename") != expected_type
+                        or type(node.get("number")) is not int or node["number"] != number
+                        or int(required_id(node, item["item_kind"])) != int(item["id"])):
+                    raise ItemGraphError("missing graph or identity mismatch")
+            except (GitHubApiError, ValueError, TypeError) as error:
+                result[number] = ItemGraphError(f"{owner}/{name}#{number}: {error}")
+                continue
+            result[number] = {key: value for key, value in node.items() if key != "__typename"}
         return result
 
     def expand_item_graph(
@@ -1066,9 +1098,14 @@ class GitHubOrgReader:
     ) -> dict[str, Any]:
         owner, name = split_full_name(str(repo["full_name"]))
         number = int(item["number"])
-        if item["item_kind"] == "pr":
-            return self._expand_pull_graph(repo, owner, name, number, node)
-        return self._expand_issue_graph(repo, owner, name, number, node)
+        try:
+            if item["item_kind"] == "pr":
+                return self._expand_pull_graph(repo, owner, name, number, node)
+            return self._expand_issue_graph(repo, owner, name, number, node)
+        except (GitHubRateLimitError, GitHubRequestError):
+            raise
+        except (GitHubApiError, KeyError, TypeError, ValueError, AttributeError) as error:
+            raise ItemGraphError(f"{owner}/{name}#{number}: {type(error).__name__}: {error}") from error
 
     def _list_issue_nodes(
         self,

@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from . import views
 from .db import (
@@ -33,8 +33,10 @@ from .db import (
 from .extract import extract_associations
 from .github_api import (
     ITEM_GRAPH_BATCH_SIZE,
+    GitHubApiError,
     GitHubOrgReader,
     GitHubRateLimitError,
+    ItemGraphError,
     PullReconciliation,
     datastore_github_client,
     parse_graphql_datetime,
@@ -341,8 +343,12 @@ def build_user(username: str, db_path: str | Path) -> None:
         with conn:
             add_user(conn, username)
             for row in rows:
-                expanded = json.loads(row["expanded_json"])
-                associations = extract_associations(expanded, username)
+                try:
+                    expanded = json.loads(row["expanded_json"])
+                    associations = extract_associations(expanded, username)
+                except (ValueError, TypeError, KeyError, AttributeError) as error:
+                    logger.warning("Could not index %s associations for item %s: %s", username, row["item_id"], error)
+                    continue
                 replace_associations(conn, int(row["item_id"]), username, associations)
             assert_no_duplicate_items(conn)
     finally:
@@ -492,10 +498,26 @@ def sync_once(
             else:
                 issues = changed[repo["full_name"]]
             outstanding = len(issues)
-            expansions = iter_expanded(reader, repo, issues, workers)
+            failed_item = False
+
+            def retain_item_failure(number: int | str, error: Exception) -> None:
+                nonlocal failed_item, outstanding
+                failed_item = True
+                outstanding -= 1
+                logger.warning("Could not sync %s#%s; keeping the last snapshot: %s", repo["full_name"], number, error)
+                with conn:
+                    mark_full_build_retry(conn, repo_id)
+
+            expansions = iter_expanded(reader, repo, issues, workers, on_item_error=retain_item_failure)
             try:
                 for expanded in expansions:
-                    item_id = store_expanded(conn, expanded, users)
+                    try:
+                        item_id = store_expanded(conn, expanded, users)
+                    except (GitHubApiError, ValueError, TypeError, KeyError, AttributeError, sqlite3.IntegrityError) as error:
+                        issue = expanded.get("issue") if isinstance(expanded, dict) else None
+                        number = issue.get("number", "unknown") if isinstance(issue, dict) else "unknown"
+                        retain_item_failure(number, error)
+                        continue
                     if full_enumeration:
                         with conn:
                             set_state(conn, checkpoint_scope, str(item_id), versions[item_id])
@@ -507,7 +529,7 @@ def sync_once(
             finally:
                 # Closing explicitly propagates errors from workers still in flight.
                 expansions.close()
-            if full_enumeration:
+            if full_enumeration and not failed_item:
                 with conn:
                     mark_full_build_completed(conn, repo_id)
                     conn.execute("DELETE FROM sync_state WHERE scope = ?", (checkpoint_scope,))
@@ -519,6 +541,8 @@ def sync_once(
 
         with conn:
             if reconcile:
+                if progress["remaining"]:
+                    return False
                 set_state(conn, "org", "last_reconcile_at", progress["started_at"])
                 conn.execute("DELETE FROM sync_state WHERE scope = 'org' AND key = ?", (RECONCILE_PROGRESS_KEY,))
             else:
@@ -565,12 +589,18 @@ def items_requiring_full_refresh(
         stored_at = parse_graphql_datetime(
             row["updated_at"], f"stored item {item_id} for {repo_full_name}"
         )
+        issue_labels = True
+        if row["item_type"] == "issue":
+            try:
+                issue_labels = isinstance(json.loads(row["expanded_json"])["issue"].get("labels"), list)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                issue_labels = False
         if (
             current_at != stored_at
             or int(row["number"]) != int(item["number"])
             or str(row["item_type"]) != item["item_kind"]
             or str(row["repo_full_name"]) != repo_full_name
-            or (row["item_type"] == "issue" and not isinstance(json.loads(row["expanded_json"])["issue"].get("labels"), list))
+            or not issue_labels
         ):
             refresh.append(item)
     return refresh
@@ -695,36 +725,85 @@ def store_expanded(
 
 
 def iter_expanded(
-    reader: GitHubOrgReader, repo: dict[str, Any], issues: list[dict[str, Any]], workers: int
+    reader: GitHubOrgReader, repo: dict[str, Any], issues: list[dict[str, Any]], workers: int,
+    *, on_item_error: Callable[[int, ItemGraphError], None] | None = None,
 ) -> Iterator[dict[str, Any]]:
+    first_error: Exception | None = None
+
+    def failed(number: int, error: Exception) -> None:
+        nonlocal first_error
+        if isinstance(error, ItemGraphError) and on_item_error is not None:
+            on_item_error(number, error)
+        else:
+            logger.warning("Could not expand %s#%s: %s", repo["full_name"], number, error)
+            if first_error is None:
+                first_error = error
+
     for offset in range(0, len(issues), ITEM_GRAPH_BATCH_SIZE):
         batch = issues[offset:offset + ITEM_GRAPH_BATCH_SIZE]
         graphs = reader.fetch_initial_item_graphs(repo, batch)
+
+        def expand(issue: dict[str, Any]) -> dict[str, Any]:
+            number = issue["number"]
+            graph = graphs.get(number)
+            if isinstance(graph, ItemGraphError):
+                raise graph
+            if graph is None:
+                raise ItemGraphError("GitHub omitted this item's graph")
+            return reader.expand_item_graph(repo, issue, graph)
+
         if workers == 1 or len(batch) == 1:
             for issue in batch:
-                yield reader.expand_item_graph(repo, issue, graphs[issue["number"]])
+                try:
+                    expanded = expand(issue)
+                except GitHubRateLimitError:
+                    raise
+                except Exception as error:
+                    failed(issue["number"], error)
+                    continue
+                yield expanded
             continue
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures, processed = {}, set()
+        try:
             futures = {
-                pool.submit(reader.expand_item_graph, repo, issue, graphs[issue["number"]]): issue["number"]
+                pool.submit(expand, issue): issue["number"]
                 for issue in batch
             }
-            try:
-                for future in as_completed(futures):
-                    yield future.result()
-            finally:
-                # Do not fetch the next batch after a quota or consumer error;
-                # cancel queued pagination and wait for already-running calls.
-                for future in futures:
-                    future.cancel()
-                pool.shutdown(wait=True, cancel_futures=True)
-                errors = [error for future in futures if not future.cancelled()
-                          and (error := future.exception()) is not None]
-                for error in errors:
+            rate_error = None
+            for future in as_completed(futures):
+                processed.add(future)
+                try:
+                    expanded = future.result()
+                except GitHubRateLimitError as error:
+                    rate_error = error
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                except Exception as error:
+                    failed(futures[future], error)
+                    continue
+                yield expanded
+            if rate_error is not None:
+                for future in as_completed([f for f in futures if f not in processed and not f.cancelled()]):
+                    processed.add(future)
+                    try:
+                        expanded = future.result()
+                    except Exception as error:
+                        failed(futures[future], error)
+                        continue
+                    yield expanded
+                raise rate_error
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            # A consumer ending at a deadline can still encounter a quota
+            # failure from a worker it did not get to consume.
+            for future in futures:
+                if future not in processed and not future.cancelled():
+                    error = future.exception()
                     if isinstance(error, GitHubRateLimitError):
                         raise error
-                if errors:
-                    raise errors[0]
+    if first_error is not None:
+        raise first_error
 
 
 def validate_repo_filter(
