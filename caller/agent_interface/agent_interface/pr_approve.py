@@ -72,7 +72,7 @@ def run(
     if capped and (review_round is None or review_cap is None):
         raise ValueError("a capped approval round needs its round and cap numbers")
     spec = atoms.CATALOG.review_model("pr_approve", model)
-    bounded = review_continuation.enabled() or review_round is not None
+    bounded = review_continuation.enabled() or (review_round is not None and spec.provider == "claude")
     governed = spec.provider == "claude" and not bounded
     tools = allowed(pr, actor, expected_head) if governed else []
     # A follow-up round reviews the diff since the last reviewed head, not
@@ -97,9 +97,9 @@ def run(
         if spec.provider == "claude":
             tools = [review_repository.INSPECTION_RULE]
         policy += " " + review_repository.REQUEST_POLICY
-        round_note = followup.round_policy(review_round, review_cap, capped)
-        if round_note:
-            policy += " " + round_note
+    round_note = followup.round_policy(review_round, review_cap, capped)
+    if round_note:
+        policy += " " + round_note
     text = atoms.prompt(
         policy,
         SEVERITY,

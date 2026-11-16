@@ -225,7 +225,7 @@ def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
             "a capped approval round needs a readable PR packet", "review_contract_violation")
     existing = checkpoint.followup_issue() if checkpoint is not None else None
     if existing is None:
-        existing = followup.find_capped_issue(packet, str(number), head)
+        existing = followup.find_capped_issue(packet, str(number), head, comments)
     if existing is not None:
         return followup.issue_reference(existing)
     issue = followup.file_followup_issue(
@@ -644,7 +644,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     try:
         total = review_stages.stage_count(packet) if packet and not review_continuation.enabled() else 1
         staged = total > 1
-        candidates = set(json.loads(packet).get("verification_candidates", [])) if packet and not capped else set()
+        candidates = set(json.loads(packet).get("verification_candidates", [])) if packet else set()
         verified: set[int] = set()
         with resource_ownership.temporary_directory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
@@ -732,7 +732,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     checkpoint.remap(lambda: _validate_since_positions(pwd, pr, actor_name, head, packet, verdict))
                     checkpoint.retain_finalization(verdict, head, "ready")
                 raw = json.dumps(verdict, ensure_ascii=False)
-                final_round = coverage == "complete" and (capped or inspection_finished) and review_round is not None and review_cap is not None
+                final_round = (capped or inspection_finished) and review_round is not None and review_cap is not None
                 if final_round and verdict["action"] == "request_changes":
                     breaking, deferred = [], []
                     for comment in verdict["comments"]:
@@ -742,7 +742,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                         reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
                                                           deferred, pwd, checkpoint=checkpoint)
                         capped_note = f"\nNonbreaking findings filed as {reference}."
-                    action = "request_changes" if breaking else "reviewed_clean" if behavior == "pr_review" else "approve"
+                    action = ("request_changes" if breaking else "approve" if behavior == "pr_approve" and coverage == "complete"
+                              else "reviewed_clean")
                     verdict = {**verdict, "action": action, "comments": breaking}
             except (review_budget.ReviewLimitError, AgentPreflightError, OSError, ValueError) as error:
                 if isinstance(error, review_continuation.Continuation):

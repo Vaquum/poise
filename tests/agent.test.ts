@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
   diagnostic: vi.fn(),
   diagnosticFailure: vi.fn(),
+  prepareClis: vi.fn<(_catalog: import('../server/models').Catalog, identities: string[], forReview?: boolean) => Promise<NodeJS.ProcessEnv>>(),
   runFile: vi.fn(),
   workerBuild: vi.fn<(outfile: string) => void>(),
   models: {} as import('../server/models').ModelSettings,
@@ -40,12 +41,18 @@ vi.mock('../server/logging', () => ({
   diagnosticFailure: mocks.diagnosticFailure,
 }))
 
+vi.mock('../server/provider-clis', async importOriginal => ({
+  ...await importOriginal<typeof import('../server/provider-clis')>(), prepareModelClis: mocks.prepareClis,
+}))
+
 vi.mock('../server/process', () => ({
+  CLAUDE_SUBSCRIPTION_CLI: '/fixture/claude',
   claudeSubscriptionEnvironment: vi.fn(),
   runFile: mocks.runFile,
   spawnDetached: vi.fn(),
 }))
-vi.mock('../server/claude-auth', () => ({
+vi.mock('../server/claude-auth', async importOriginal => ({
+  ...await importOriginal<typeof import('../server/claude-auth')>(),
   claudeAuth: {
     observeProcessFailure: vi.fn(),
     requireReady: vi.fn(),
@@ -886,6 +893,7 @@ describe('agent log snapshot sharing', () => {
 describe('manual review model selection', () => {
   beforeEach(async () => {
     mocks.models = {}
+    mocks.prepareClis.mockReset().mockResolvedValue({})
     mocks.runFile.mockReset().mockResolvedValue({ stdout: CATALOG_STDOUT, stderr: '' })
     const { invalidateCatalog } = await import('../server/models')
     invalidateCatalog()
@@ -900,6 +908,19 @@ describe('manual review model selection', () => {
     vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
     const { claudeAuth } = await import('../server/claude-auth')
     vi.mocked(claudeAuth.requireReady).mockReset().mockResolvedValue(undefined)
+  })
+
+  it('tries the next reviewer when preparation fails and gives it the same round', async () => {
+    const { ProviderCliUnavailable } = await import('../server/provider-clis')
+    mocks.prepareClis.mockRejectedValueOnce(new ProviderCliUnavailable('claude', 'launcher is missing'))
+    const { triggerPrReview } = await import('../server/agent')
+    const { spawnDetached } = await import('../server/process')
+    await triggerPrReview('https://github.com/owner/repo/pull/12')
+    expect(mocks.prepareClis).toHaveBeenCalledTimes(2)
+    expect(spawnDetached).toHaveBeenCalledOnce()
+    expect(vi.mocked(spawnDetached).mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--model', 'gpt-6-astra-ultra', '--review-round', '1', '--review-cap', '3',
+    ]))
   })
 
   it('launches the catalog default with its recovery model when nothing is chosen', async () => {

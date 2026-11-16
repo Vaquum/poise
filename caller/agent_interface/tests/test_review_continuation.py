@@ -417,6 +417,34 @@ class TestReviewContinuation(TestCase):
         self.assertIn("src/f016.py from line 4 was not read", assessment["limitations"])
         self.assertIn("reached its round limit", assessment["limitations"])
 
+    def test_inspection_rounds_are_shared_across_groups_and_resumed_calls(self):
+        node = packet(9)
+        final_rounds = []
+
+        def ask(_root, _model, _system, prompt, *_args):
+            value = supplied(prompt)
+            if "Repository inspection is finished" in prompt:
+                self.assertEqual(len(self.inspections), 3)
+                return verdict(prompt)
+            count = len(self.inspections)
+            if count == 1 and value["files"][0]["filename"] == "src/f000.py":
+                return verdict(prompt)
+            if count == 2:
+                final_rounds.append(prompt)
+            read = {"operation": "read", "path": value["files"][0]["filename"], "query": "", "start_line": count + 1}
+            return verdict(prompt, [], [read])
+
+        with self.call(node, units_per_call=1) as root, self.assertRaises(continuation.Continuation):
+            self.run_review(node, ask)
+        self.assertEqual(len(self.inspections), 1)
+        with self.call(node, self.resume(root), units_per_call=6), \
+                patch.object(atoms, "packet", return_value=json.dumps(node)):
+            self.run_review(node, ask)
+        self.assertEqual(len(final_rounds), 1)
+        self.assertIn("Inspection round 3 of 3", final_rounds[0])
+        self.assertIn("No further inspection rounds will follow", final_rounds[0])
+        self.assertEqual(len(self.posts), 1)
+
     def test_changed_answer_revision_same_head_and_changed_policy_invalidate_progress(self):
         node = packet()
         node.update(verification_candidates=[17], review_threads=[{"root_comment_id": 17, "id": "thread",

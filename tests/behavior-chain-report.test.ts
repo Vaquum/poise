@@ -375,8 +375,14 @@ async function exhaustedReviews(journal: BehaviorChainJournal,
         resources_settled_at: new Date(NOW - 100_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
   }
   const decision = decideBehaviorChain(chain, fresh, NOW)
-  if (decision.kind !== 'hold') throw new Error('Fixture must exhaust its PR review attempts')
-  return record(journal, chain, { type: 'chain.held', reason: decision.reason })
+  if (decision.kind === 'hold') return record(journal, chain, { type: 'chain.held', reason: decision.reason })
+  // Exercise reporting on holds retained from before provider fall-through.
+  if (!failures.some(failure => ['review_provider_exit', 'authentication_failed'].includes(failure.error_code ?? ''))) {
+    throw new Error('Fixture must exhaust its PR review attempts')
+  }
+  expect(decision).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+  return record(journal, chain, { type: 'chain.held',
+    reason: `review-pr failed before publication three times: ${failures.at(-1)!.error}` })
 }
 async function exhaustedApprovals(journal: BehaviorChainJournal,
   failures: Array<Pick<LogEntry, 'error' | 'error_code' | 'diagnostic'> & { callId?: string }> = REVIEW_ERRORS.map(error => ({ error, error_code: 'review_budget_exhausted' }))) {
@@ -4466,7 +4472,7 @@ it('reports a terminal repair separately from a closed implementation report, in
       completedAt: Date.now(), resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
   fresh = observation()
   fresh.publication.head_invocation = publicationCall
-  fresh.prReviewers = [reviewer]
+  fresh.prReviewers = [] // This fixture starts from an already-reviewed queue entry.
   Object.assign(fresh.pull!, { changesRequested: false, unresolved: 0, approved: true, ready: true, checksState: 'SUCCESS' })
   current = record(journal, current, { type: 'chain.observed', observation: fresh })
   remote[0].state = 'closed'

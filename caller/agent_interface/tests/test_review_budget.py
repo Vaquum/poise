@@ -800,8 +800,10 @@ class TestRecovery(TestCase):
 
         self.mod.run.reset_mock()
         self.mod.run.side_effect = pr_approve.run if remapping or followup else pr_review.run
+        # Exercise timing independently of the optional inspection round cap.
         with patch.object(budget, 'monotonic', lambda: clock.now), \
                 patch.object(structured_review, 'monotonic', lambda: clock.now), \
+                patch.object(structured_review, 'MAX_INSPECTION_ROUNDS', 4 * total), \
                 patch.object(structured_review, 'ReviewWatch', return_value=nullcontext(SimpleNamespace(run=provider, check_closed=lambda: None))), \
                 patch.object(structured_review, 'codex_environment', return_value={}), \
                 (patch.dict(structured_review.PROVIDER_ANALYSIS_SECONDS, {'codex': 800})

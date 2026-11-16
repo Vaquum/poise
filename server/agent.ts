@@ -1,4 +1,4 @@
-import { prepareModelClis } from './provider-clis'
+import { prepareModelClis, ProviderCliUnavailable } from './provider-clis'
 import { captureBehaviorAdmission, captureBehaviorOutcome, observeAgentSnapshot } from './behavior-ledger'
 // Bridge to the local `agent-interface` CLI for Swarm's data source.
 //
@@ -23,9 +23,10 @@ import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { countReviewRounds, releaseIssueReviewRevision, requestIssueReviewRevision } from './db'
 import { DEFAULT_PR_REVIEW_CAP, reviewRoundArgs } from './review-continuation'
 import { getHeadSha, getPrAuthor } from './gh'
-import { claudeAuth } from './claude-auth'
+import { claudeAuth, ClaudeAuthReadinessError } from './claude-auth'
 import { HttpError } from './http'
-import { needsClaude, randomDrawStillValid, reviewChoice } from './review-model'
+import { needsClaude, randomDrawStillValid, reviewChoice, type ReviewChoice } from './review-model'
+import { isPlaceModel, MODEL_SLOTS, resolveSlots } from './models'
 import { claudeSubscriptionEnvironment, isExpectedFailure, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic, diagnosticFailure } from './logging'
@@ -836,6 +837,30 @@ export async function stopAgentJob(callId: string): Promise<StopResult> {
   return { id: value.id, stopped: value.stopped, status: value.status, error_code: typeof value.error_code === 'string' ? value.error_code : null }
 }
 
+async function preparePrReviewer(place: 'pr_review' | 'pr_approve', choice: ReviewChoice) {
+  const { catalog } = choice
+  const slots = resolveSlots(catalog, getModelSettings().slots)
+  const candidates = [...new Set([choice.model, choice.recovery, ...MODEL_SLOTS.map(slot => slots[slot])])]
+    .filter(model => isPlaceModel(catalog, place, model))
+  const unavailable = new Set<string>()
+  for (const model of candidates) {
+    if (unavailable.has(model)) continue
+    const recovery = candidates.find(identity => identity !== model && !unavailable.has(identity)) ?? model
+    const claude = needsClaude(catalog, model)
+    try {
+      if (claude) await claudeAuth.requireReady()
+      const modelCliEnv = await prepareModelClis(catalog, [model, recovery], true)
+      return { model, recovery, claude, modelCliEnv }
+    } catch (error) {
+      if (!(error instanceof ProviderCliUnavailable || error instanceof ClaudeAuthReadinessError)) throw error
+      const provider = catalog.models.find(entry => entry.identity === model)?.provider
+      for (const entry of catalog.models) if (entry.provider === provider) unavailable.add(entry.identity)
+      if (!candidates.some(identity => !unavailable.has(identity))) throw error
+    }
+  }
+  throw new Error('No configured PR reviewer is available')
+}
+
 // Kick off `agent-interface --pr-review #<num> --pwd <local-checkout>`.
 // The underlying claude run takes minutes; we spawn detached and return
 // immediately. The user watches progress in the Swarm view (the agent
@@ -853,10 +878,9 @@ export async function triggerPrReview(
   const author = await getPrAuthor(repoFullName, Number(num), accounts.agent)
     .catch(() => getPrAuthor(repoFullName, Number(num), accounts.me))
   const actor = prReviewer(author, true)
-  const { model, recovery, slot, catalog } = await reviewChoice('pr_review')
-  const claude = needsClaude(catalog, model)
-  if (claude) await claudeAuth.requireReady()
-  const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
+  const choice = await reviewChoice('pr_review')
+  const { model, recovery, claude, modelCliEnv } = await preparePrReviewer('pr_review', choice)
+  const { slot } = choice
   const expectedHead = await getHeadSha(repoFullName, Number(num), { actor })
   const completed = countReviewRounds(repoFullName, Number(num), expectedHead)
   if (completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
@@ -871,7 +895,7 @@ export async function triggerPrReview(
   // runnable slots instead of identity with a fresh draw.
   const stored = getModelSettings().places?.['pr_review']?.slot ?? 'primary'
   const selectedModel = stored === 'random' ? null : (await reviewChoice('pr_review')).model
-  const drawValid = stored === 'random' ? await randomDrawStillValid('pr_review', model) : selectedModel === model
+  const drawValid = stored === 'random' ? await randomDrawStillValid('pr_review', choice.model) : selectedModel === choice.model
   if (!prAccountsMatch(accounts) || prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
   if (!drawValid) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
@@ -946,11 +970,10 @@ export async function replayAgentJob(input: {
   const actor = admission.actor
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
-  const { model, recovery, slot, catalog } = await reviewChoice(place)
-  const claude = needsClaude(catalog, model)
-  if (claude) await claudeAuth.requireReady()
+  const choice = await reviewChoice(place)
+  const { model, recovery, claude, modelCliEnv } = await preparePrReviewer(place, choice)
+  const { slot } = choice
   const [owner, repoName] = repo.split('/', 2)
-  const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
   const expectedHead = await getHeadSha(repo, Number(prId), { actor })
   const pwd = await resolveReviewCheckout(owner, repoName, Number(prId), actor, expectedHead)
   const source = 'poise:replay'
@@ -962,7 +985,7 @@ export async function replayAgentJob(input: {
   // runnable slots instead of identity with a fresh draw.
   const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
   const selectedModel = stored === 'random' ? null : (await reviewChoice(place)).model
-  const drawValid = stored === 'random' ? await randomDrawStillValid(place, model) : selectedModel === model
+  const drawValid = stored === 'random' ? await randomDrawStillValid(place, choice.model) : selectedModel === choice.model
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   if (!drawValid) throw new Error('Review model changed; retry the request')
   const reviewCap = admission.reviewCap ?? DEFAULT_PR_REVIEW_CAP

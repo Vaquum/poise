@@ -205,7 +205,7 @@ class TestStructuredCappedConversion(TestCase):
                 self.assertEqual(calls[-1][calls[-1].index("--expected-head") + 1], HEAD)
 
     def test_capped_request_publishes_only_the_breaking_finding(self):
-        for packet in (PACKET, packet_with_issue(followup.marker("12", HEAD))):
+        for packet in (PACKET, packet_with_issue(followup.render_body("o/r", "12", HEAD, BASE, 5, 5, [FINDING]))):
             seen = []
             def github(args):
                 seen.append(args[1])
@@ -285,7 +285,7 @@ class TestStructuredCappedConversion(TestCase):
             seen.append(args[1])
             return approval_reply()
 
-        packet = packet_with_issue(f"findings\n\n{followup.marker('12', HEAD)}\n")
+        packet = packet_with_issue(followup.render_body("o/r", "12", HEAD, BASE, 5, 5, [FINDING]))
         for review_round in (5, 6):
             with self.subTest(review_round=review_round):
                 seen.clear()

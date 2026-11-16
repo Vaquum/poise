@@ -350,7 +350,8 @@ function prOperationEvaluationLeaseMs(): number {
     : PR_OPERATION_EVALUATION_LEASE_MS
 }
 
-async function prepareBehaviorModelClis(catalog: Catalog, identities: string[], claimId?: string): Promise<NodeJS.ProcessEnv> {
+async function prepareBehaviorModelClis(catalog: Catalog, identities: string[], claimId?: string,
+  review?: TripBehavior): Promise<NodeJS.ProcessEnv | null> {
   const signal = behaviorSignal()
   const deadline = signal && behaviorOperationDeadline.get(signal)
   const prepare = async () => {
@@ -359,7 +360,14 @@ async function prepareBehaviorModelClis(catalog: Catalog, identities: string[], 
     if (claimId && !renewPrOperationOwned(claimId, prOperationEvaluationLeaseMs())) {
       throw new Error('PR operation ownership was lost before provider preparation')
     }
-    const env = await waitForBehavior(prepareModelClis(catalog, identities))
+    let env
+    try {
+      env = await waitForBehavior(prepareModelClis(catalog, identities, !!review))
+    } catch (error) {
+      if (!review || !(error instanceof Error) || error.name !== 'ProviderCliUnavailable') throw error
+      tripReviewer(review, identities[0], 'provider', undefined, error.message)
+      return null
+    }
     if (claimId && !renewPrOperationOwned(claimId, prOperationEvaluationLeaseMs())) {
       throw new Error('PR operation ownership was lost during provider preparation')
     }
@@ -1006,6 +1014,11 @@ type TripBehavior = PanelBehavior | 'approve-prs'
 const TRIP_BEHAVIORS: readonly TripBehavior[] = [...PANEL_BEHAVIORS, 'approve-prs']
 
 function observeProviderRejection(call: LogEntry): void {
+  const preparation = call.diagnostic
+  if (preparation?.operation === 'provider.cli_update' && typeof preparation.context.provider === 'string') {
+    const provider = preparation.context.provider
+    providerFailure(provider, preparation.stderr || `${provider} CLI has no verified launcher`)
+  }
   if (call.status !== 'failed' || reviewAccountFailure(call) !== 'signin' || call.diagnostic?.operation !== 'provider.review') return
   const identity = tripIdentity(call)
   if (!identity) return
@@ -1019,9 +1032,9 @@ function observeProviderRejection(call: LogEntry): void {
     phase: `${call.behavior} / ${call.diagnostic.phase}`, work: `${call.repo}#${call.pr_id}`, cause: call.error })
 }
 
-function tripReviewer(behavior: TripBehavior, identity: string, kind: ReviewerTripKind, callId: string): void {
-  if (kind === 'signin' && readBehaviorFailure(behavior, reviewerTripTarget(identity))?.callId === callId) return
-  const message = kind === 'balance'
+function tripReviewer(behavior: TripBehavior, identity: string, kind: ReviewerTripKind, callId?: string, detail?: string): void {
+  if (kind === 'signin' && callId && readBehaviorFailure(behavior, reviewerTripTarget(identity))?.callId === callId) return
+  const message = detail ?? (kind === 'balance'
     ? `${identity} cannot review: its account is out of balance (402). Top up its credit; Poise retries automatically.`
     : kind === 'signin'
       ? `${identity} cannot review: it is not signed in. Sign it in from Settings → Accounts; Poise retries automatically.`
@@ -1029,7 +1042,7 @@ function tripReviewer(behavior: TripBehavior, identity: string, kind: ReviewerTr
         ? `${identity} cannot review: its provider is rate-limiting it (429). Poise retries automatically.`
         : kind === 'provider'
           ? `${identity} cannot review: its provider failed before the verdict. Poise retries automatically.`
-          : `${identity} cannot review: it timed out before a verdict. Poise retries automatically.`
+          : `${identity} cannot review: it timed out before a verdict. Poise retries automatically.`)
   const provider = loadedCatalog()?.models.find(model => model.identity === identity)?.provider
   if (kind !== 'budget' && (kind !== 'signin' || provider !== 'codex' && provider !== 'claude')) providerFailure(provider ?? identity, message)
   recordBehaviorFailure(behavior, 'operation', message, reviewerTripTarget(identity),
@@ -1118,7 +1131,7 @@ function tripReviewerForCall(behavior: TripBehavior, call: LogEntry): boolean {
   if (call.review_comments != null || /could not prove a safe recovery/.test(call.error || '')) return false
   tripReviewer(behavior, identity, kind, call.id)
   if (call.recovery_model === identity && call.model && call.model !== identity) {
-    tripReviewer(behavior, call.model, 'budget', call.id)
+    tripReviewer(behavior, call.model, 'budget', call.id, `${call.model} already attempted this review. Poise tries another model.`)
   }
   return true
 }
@@ -1138,7 +1151,8 @@ function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, 
 async function launchReviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review', seedKey?: string): Promise<ReviewPanel> {
   const full = await reviewPanel(REVIEWER_SLOTS.length, place, seedKey === undefined ? Math.random : seededRandom(seedKey))
   const targets = full.reviewers.slice(0, count)
-  const models = full.reviewers.filter(({ model }) => reviewModelAvailable(full.catalog, model)).slice(0, count)
+  const models = full.reviewers.filter(({ model }) => place === 'issue_review'
+    ? !reviewerTripped(model) : reviewModelAvailable(full.catalog, model)).slice(0, count)
   const reviewers = targets.slice(0, models.length).map((target, index) => ({
     slot: target.slot, model: models[index].model, recovery: liveReviewRecovery(full.catalog, place, models[index].model, models[index].recovery),
   }))
@@ -3448,7 +3462,9 @@ async function prepareReviewTarget(
       const actor = reviewer
       const reviewSlot = legacyReviewSlot(catalog, model, slot, target)
       if (claude) await waitForBehavior(claudeAuth.requireReady())
-      const modelCliEnv = reviewSlot ? nativeReviewEnvironment() : await prepareBehaviorModelClis(catalog, [model, recovery], operationId)
+      const modelCliEnv = reviewSlot ? nativeReviewEnvironment()
+        : await prepareBehaviorModelClis(catalog, [model, recovery], operationId, 'review-new-prs')
+      if (!modelCliEnv) return null
       // mkdir the cwd hack dir — agent-interface needs it to exist for
       // --pwd resolution behavior identical to triggerPrReview in agent.ts.
       await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
@@ -5117,7 +5133,8 @@ async function fireApprove(
   if (admittedReviewer && (actor.toLowerCase() !== admittedReviewer.toLowerCase()
     || await dismissedApprovalHeld(pr, expectedHead, model))) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady())
-  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], claimId)
+  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], claimId, 'approve-prs')
+  if (!modelCliEnv) return false
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
   if (!isEnabled('approve-prs')) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady())
@@ -7730,7 +7747,8 @@ async function fireIssueReview(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady())
-  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery])
+  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], undefined, ISSUES_KEY)
+  if (!modelCliEnv) return false
   // The CLI check and the model read can each take a while; turning the
   // behavior off, deselecting the repository, untrusting the author or
   // changing the panel meanwhile must stop this launch, so these are the last
@@ -9063,7 +9081,7 @@ export async function runEnabledBehaviorsOnce(
       operations.push(runBehaviorCycle('approve-prs', async () => {
         return await withBehaviorProcessLock('approve-prs', async () => {
           await reconcileBehaviorLaunchClaims('approve-prs')
-          if (await reviewHeldByClaudeAuth('pr_approve')) return false
+          if (claudeAuth.snapshot().status !== 'authenticated' && !await approvalSlot()) return false
           await tickApprovePrs()
           return listBehaviorLaunchClaims('approve-prs').length === 0
         })
@@ -9536,27 +9554,6 @@ export function getScratchpadMap(): Record<BehaviorKey, string> {
   const out: Record<BehaviorKey, string> = {} as any
   for (const k of BEHAVIOR_KEYS) out[k] = getScratchpad(k)
   return out
-}
-
-// A review tick is held only while its resolved model needs the Claude.ai
-// sign-in and that sign-in is not there; a fallback on another provider runs.
-async function reviewHeldByClaudeAuth(place: ReviewPlace): Promise<boolean> {
-  try {
-    if (claudeAuth.snapshot().status === 'authenticated') return false
-    // A Random draw varies per read, so hold only while every runnable slot
-    // needs the sign-in; otherwise a fresh draw can proceed without it.
-    if ((getModelSettings().places?.[place]?.slot ?? 'primary') === 'random') {
-      const catalog = await loadCatalog()
-      const slots = resolveSlots(catalog, getModelSettings().slots)
-      const runnable = MODEL_SLOTS.filter((slot) => isPlaceModel(catalog, place, slots[slot]))
-      return runnable.length > 0 && runnable.every((slot) => needsClaude(catalog, slots[slot]))
-    }
-    const { model, catalog } = await reviewChoice(place)
-    return needsClaude(catalog, model)
-  } catch {
-    // An unavailable catalog is reported by the tick itself.
-    return false
-  }
 }
 
 function availableReviewSlots(panel: Awaited<ReturnType<typeof reviewPanel>>): ReviewerSlot[] {

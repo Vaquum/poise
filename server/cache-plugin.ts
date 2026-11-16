@@ -1089,7 +1089,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               enabled: enabled['approve-prs'],
               setting: null,
               reviewers: null,
-              // The review-round cap: null is off, otherwise 2-10 rounds.
+              // Null selects the default of three PR review rounds.
               reviewCap: getReviewCap(),
               skipRepos: getRepositorySkips('approve-prs'),
               scratchpad: scratch['approve-prs'],

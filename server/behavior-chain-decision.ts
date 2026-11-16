@@ -1,4 +1,4 @@
-import { canCloseMergedReviewHold, chainBasis, ciRefreshBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation, type CiRefreshProof, type MergeReviewDecision } from './behavior-chain-store'
+import { canCloseMergedReviewHold, chainBasis, ciRefreshBasis, reviewCanPassRepairHold, type BehaviorChain, type ChainBehavior, type ChainInvocation, type CiRefreshProof, type MergeReviewDecision } from './behavior-chain-store'
 import { resumeLink, validReviewResponse, type ReviewResponse } from './review-response'
 import { DEFAULT_PR_REVIEW_CAP, parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
@@ -68,10 +68,11 @@ export type ChainDecision =
 export interface MergeReviewEvidence { before: ChainObservation | null, firstMerged: ChainObservation | null, admission?: ChainInvocation }
 
 export function heldCiRepair(chain: BehaviorChain) {
-  const hold = chain.ciHold, last = chain.invocations.at(-1)
-  if (!chain.held || !hold || chain.mergeSha || chain.supersession || !last) return null
-  const refresh = !hold.queue && last.behavior === 'refresh-pr-ci' && last.basis === ciRefreshBasis(hold) ? last : null
-  const original = refresh ? chain.invocations.find(invocation => invocation.id === hold.invocationId) : last
+  const hold = chain.ciHold
+  if (!chain.held || !hold || chain.mergeSha || chain.supersession) return null
+  const original = chain.invocations.find(invocation => invocation.id === hold.invocationId)
+  const refresh = hold.queue ? null : [...chain.invocations].reverse().find(invocation =>
+    invocation.behavior === 'refresh-pr-ci' && invocation.basis === ciRefreshBasis(hold)) ?? null
   const evidence = original?.evidence, artifact = evidence?.artifact as Record<string, unknown> | undefined
   if (original?.id !== hold.invocationId || original.state !== 'settled' || original.callId !== hold.callId
     || evidence?.status !== 'failed' || evidence.error_code !== 'atomic_work_blocked' || evidence.action !== 'not_started'
@@ -400,7 +401,9 @@ function providerFailedBeforeWrite(invocation: ChainInvocation): boolean {
   if (evidence?.status !== 'failed' || evidence.action !== 'not_started' || evidence.review_id != null
     || evidence.receipts != null || evidence.head_sha || !resourceReleaseProven(evidence, true)) return false
   const diagnostic = evidence.diagnostic as ProcessDiagnostic | undefined
-  return ['authentication_failed', 'review_provider_error', 'review_provider_exit'].includes(String(evidence.error_code))
+  if (diagnostic?.context?.submission !== 'none') return false
+  return diagnostic.operation === 'provider.review'
+    && ['authentication_failed', 'review_provider_error', 'review_provider_exit', 'review_recovery_failed'].includes(String(evidence.error_code))
     || evidence.error_code === 'launch_preflight_failed' && diagnostic?.operation === 'provider.cli_update'
     || evidence.error_code === 'atomic_work_failed' && diagnostic?.operation === 'provider.atomic_work'
 }
@@ -588,13 +591,6 @@ function finalReviewFinished(chain: BehaviorChain, observation: ChainObservation
         .includes('Repository inspection reached its round limit.'))
 }
 
-export function reviewCanPassRepairHold(chain: BehaviorChain, pull: ChainObservation['pull'] | undefined): boolean {
-  if (!chain.held || pull?.state !== 'open' || pull.draft || pull.conflict || pull.queueEntry) return false
-  return chain.invocations.some(invocation => invocation.behavior === 'repair-pr' && invocation.state === 'settled'
-    && invocation.evidence?.error_code === 'atomic_work_blocked' && invocation.evidence.error === chain.held
-    && invocation.request.context?.head === pull.head && resourceReleaseProven(invocation.evidence, true))
-}
-
 export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObservation, now: number,
   mergeEvidence?: MergeReviewEvidence): ChainDecision {
   const pending = chain.invocations.find((invocation) => invocation.state !== 'settled')
@@ -675,15 +671,6 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       reviewer: null, reason: 'close the verified redundant repair after original invocation settlement' }
   }
   if (chain.held) {
-    // A failed repair keeps its own state while the already published PR can be reviewed.
-    if (pull && reviewCanPassRepairHold(chain, pull)) {
-      const review = nextPrReview(chain, observation, pull, now)
-      if (review) return review
-      if (finalReviewFinished(chain, observation, now) && !pull.approved && !pull.changesRequested && !pull.unresolved && !pull.behind) {
-        return proposeApproval(chain, observation, chainBasis(['approve', pull.head, pull.reviewRevision, null]),
-          'review the current candidate and submit the native approval verdict', now)
-      }
-    }
     const held = heldCiRepair(chain), proof = observation.ciRefresh, publication = observation.publication
     const queue = pull && chainQueueSettlement(chain, pull)
     if (held && !held.hold.queue && !held.refresh && proof && pull?.state === 'open' && !pull.draft && !pull.conflict
@@ -696,6 +683,14 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
         held.evidence.publicationPlan, held.evidence.publicationReceipt].some(value => value != null)) {
       return { kind: 'invoke', behavior: 'refresh-pr-ci', actor: chain.author, reviewer: null, basis: ciRefreshBasis(held.hold),
         reason: 'refresh the held PR after independently verified shared CI recovery' }
+    }
+    if (pull && reviewCanPassRepairHold(chain, 'review-pr', observation)) {
+      const review = nextPrReview(chain, observation, pull, now)
+      if (review) return review
+      if (finalReviewFinished(chain, observation, now) && !pull.approved && !pull.changesRequested && !pull.unresolved && !pull.behind) {
+        return proposeApproval(chain, observation, chainBasis(['approve', pull.head, pull.reviewRevision, null]),
+          'review the current candidate and submit the native approval verdict', now)
+      }
     }
     return { kind: 'wait', reason: chain.held }
   }

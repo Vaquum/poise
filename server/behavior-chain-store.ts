@@ -4,6 +4,7 @@ import { cachedStatement } from './statements'
 import type { BehaviorCutoverState } from '../src/behavior-cutover'
 import { budgetShortfall, validateExecutionLimits, type BehaviorExecutionLimits, type BehaviorResourceBudget, type BehaviorResourceReservation } from './behavior-resources'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
+import type { ChainObservation } from './behavior-chain-decision'
 
 const CUTOVER_ID = '@behavior-admission'
 interface CutoverEvent { type: 'admission.changed', state: BehaviorCutoverState }
@@ -228,6 +229,18 @@ export function chainIdentity(repository: string, issue: number): string {
   return `${repository.toLowerCase()}#${issue}`
 }
 
+export function reviewCanPassRepairHold(chain: BehaviorChain, behavior: ChainBehavior,
+  observation = chain.observation as ChainObservation | null): boolean {
+  const hold = chain.ciHold, pull = observation?.pull
+  if (!(behavior === 'review-pr' || behavior === 'approve-pr') || !chain.held || !hold || hold.queue
+    || pull?.state !== 'open' || pull.draft || pull.conflict || pull.queueEntry || pull.head !== hold.head
+    || !observation?.issue.open || observation.existingPulls.length) return false
+  const repair = chain.invocations.find(invocation => invocation.id === hold.invocationId)
+  return repair?.behavior === 'repair-pr' && repair.state === 'settled' && repair.callId === hold.callId
+    && repair.evidence?.error_code === 'atomic_work_blocked' && repair.evidence.error === chain.held
+    && resourceReleaseProven(repair.evidence, true)
+}
+
 /** Every write advances this reducer. The current table is a disposable index,
  * never an independent source of admission, counters or ownership. */
 export function reduceChain(current: BehaviorChain | null, event: ChainEvent, sequence: number, id: string): BehaviorChain {
@@ -329,14 +342,14 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     const invocation = event.invocation
     if (next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
     if (invocation.behavior === 'refresh-pr-ci') {
-      const hold = next.ciHold, original = next.invocations.at(-1)
+      const hold = next.ciHold, original = next.invocations.find(item => item.id === hold?.invocationId)
       if (!next.held || !hold || hold.queue || original?.id !== hold.invocationId || original.callId !== hold.callId
         || original.behavior !== 'repair-pr' || !resourceReleaseProven(original.evidence ?? {}, true)
         || invocation.basis !== ciRefreshBasis(hold) || invocation.actor !== next.author || invocation.model !== null
         || invocation.request.command !== 'github-interface' || invocation.request.nativeResources !== 2) {
         throw new Error('CI refresh requires its original automatic hold and released repair Call')
       }
-    } else if (next.held) throw new Error('behavior chain does not admit invocations')
+    } else if (next.held && !reviewCanPassRepairHold(next, invocation.behavior)) throw new Error('behavior chain does not admit invocations')
     if (invocation.behavior === 'repair-pr' && next.repairRecovery) {
       const recovery = next.repairRecovery
       const prior = next.invocations.find(item => item.id === recovery.admission)

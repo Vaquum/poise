@@ -79,6 +79,9 @@ vi.mock('../server/process-lock', async (importOriginal) => {
     },
   }
 })
+vi.mock('../server/provider-clis', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../server/provider-clis')>(), prepareModelClis: vi.fn(async () => ({})),
+}))
 
 const pr = {
   repo: 'Vaquum/poise-test',

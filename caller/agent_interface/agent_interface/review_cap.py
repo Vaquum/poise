@@ -32,8 +32,8 @@ def marker(pr_number: str, head: str) -> str:
     return f"<!-- poise:review-cap #{pr_number}@{head.lower()} -->"
 
 
-def find_capped_issue(packet: str, pr_number: str, head: str) -> dict | None:
-    """The follow-up issue already filed for this pull request and head, if any."""
+def find_capped_issue(packet: str, pr_number: str, head: str, comments: list[dict] | None = None) -> dict | None:
+    """Reuse a follow-up only when it already records these findings."""
     needle = marker(pr_number, head)
     try:
         issues = json.loads(packet).get("linked_issues") or []
@@ -42,7 +42,10 @@ def find_capped_issue(packet: str, pr_number: str, head: str) -> dict | None:
     if not isinstance(issues, list):
         return None
     for issue in issues:
-        if isinstance(issue, dict) and needle in str(issue.get("body") or ""):
+        body = str(issue.get("body") or "") if isinstance(issue, dict) else ""
+        if needle in body and all(f"`{comment['path']}:{comment['line']}`" in body
+                                  and comment["body"].strip().casefold() in body.casefold()
+                                  for comment in comments or []):
             return issue
     return None
 
