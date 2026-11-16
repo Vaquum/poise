@@ -183,7 +183,7 @@ it.each(['merged', 'closed-pr', 'closed-seed'] as const)('distinguishes immediat
   if (kind === 'merged') current = record(journal, current, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: chain.repository,
     pull_number: pr.number, merged: true, merge_sha: MERGE, review_complete: false } })
   const before = journal.history(chain.id)
-  expect(journal.reconcilable('', now, false).map(row => row.id)).toContain(chain.id)
+  expect(journal.reconcilableIds('', now, false)).toContain(chain.id)
   expect(journal.reconciliationAt(current)).toBeNull()
   expect(behaviorChainSummary(current, journal, { at: journal.reconciliationAt(current) }).reconciliation).toMatchObject({
     nextObservationAt: null, waitingForOriginalResponse: false, waitingForResourceRelease: true })
@@ -207,7 +207,7 @@ it.each(['review-pr', 'approve-pr'] as const)('keeps open-PR %s observation elig
   const before = journal.history(chain.id)
   expect(journal.reconciliationAt(current)).toBe(0)
   expect(behaviorChainSummary(current, journal, { at: 0 }).reconciliation).toEqual({ nextObservationAt: 0, waitingForOriginalResponse: false })
-  expect(journal.reconcilable('', Date.now(), false).map(row => row.id)).toContain(chain.id)
+  expect(journal.reconcilableIds('', Date.now(), false)).toContain(chain.id)
   expect(journal.liveModelInvocationCount()).toBe(1)
   expect(journal.history(chain.id)).toEqual(before)
 })

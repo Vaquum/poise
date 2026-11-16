@@ -19,6 +19,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { diagnostic } from './logging'
 import type { ReviewSummary } from '../src/analytics-work-review'
 import type { OpenPrClosingList } from './chat/control'
 import { readDatastoreContent, readDatastoreView } from './datastore-reader'
@@ -486,10 +487,14 @@ async function readDatastore(org: Organization, args: string[]): Promise<Datasto
     }
   } else records = await readDatastoreCli(org, args)
   if (!Array.isArray(records)) throw new Error('datastore returned a non-array')
-  if (records.some((row) => !row || typeof row.repo !== 'string' || !repoBelongsTo(row.repo, org.login))) {
-    throw new Error(`datastore contains records outside ${org.login}`)
-  }
-  return records
+  const scoped = records.filter((row, index) => {
+    if (row && typeof row.repo === 'string' && repoBelongsTo(row.repo, org.login)) return true
+    diagnostic({ level: 'warning', operation: 'github-datastore.view', message: `Datastore row ${index} has no repository in ${org.login}`,
+      context: { organization: org.login, view: args[1], index } })
+    return false
+  })
+  if (records.length && !scoped.length) throw new Error(`datastore contains records outside ${org.login}`)
+  return scoped
 }
 
 async function readDatastoreCli(org: Organization, args: string[]): Promise<unknown> {
@@ -1357,19 +1362,28 @@ async function handleGhOperation(body: any, op: unknown, me: string): Promise<{ 
     await Promise.all(orgs.map(async (org) => {
       try {
         const rows = seedMode === 'label' ? await runCli(org, ['view', 'issue', '--status', 'open', '--label', label, '--format', 'json']) : []
-        const closing: [string, { number: number, url: string }][] = []
+        for (const row of rows) {
+          if (row && typeof row.repo === 'string' && Number.isSafeInteger(row.number) && row.number > 0) {
+            labelled.push(`${row.repo}#${row.number}`.toLowerCase())
+          } else {
+            errors.push({ org: org.login, error: 'Issue intake omitted a malformed labelled issue row' })
+          }
+        }
         let after: { repo: string, number: number } | undefined
+        let incomplete = false
         for (;;) {
           const page = await readClosingPage(org, after, readOpenPrClosingRefs)
-          if (!page || (page.truncated && !page.more) || page.prs.some((pr) => pr.closingTruncated)) throw new Error('open pull request references are incomplete')
-          for (const pr of page.prs) for (const ref of pr.closing) closing.push([`${ref.repo}#${ref.number}`.toLowerCase(), { number: pr.number, url: pr.url }])
+          if (!page) throw new Error('open pull request references are unavailable')
+          incomplete ||= !!page.incomplete || (page.truncated && !page.more) || page.prs.some(pr => pr.closingTruncated)
+          for (const pr of page.prs) for (const ref of pr.closing) {
+            (prs[`${ref.repo}#${ref.number}`.toLowerCase()] ??= []).push({ number: pr.number, url: pr.url })
+          }
           if (!page.more) break
-          const last = page.prs.at(-1)
+          const last = page.next ?? page.prs.at(-1)
           if (!last || (after?.repo === last.repo && after?.number === last.number)) throw new Error('open pull request pagination did not advance')
           after = { repo: last.repo, number: last.number }
         }
-        labelled.push(...rows.map((row) => `${row.repo}#${row.number}`.toLowerCase()))
-        for (const [issue, pr] of closing) (prs[issue] ??= []).push(pr)
+        if (incomplete) errors.push({ org: org.login, error: 'Some open pull request references are incomplete' })
       } catch (error) {
         errors.push({ org: org.login, error: error instanceof Error ? error.message : String(error) })
       }

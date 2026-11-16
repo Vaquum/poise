@@ -872,7 +872,7 @@ describe('native admission and recovery', () => {
       // Each release has another full page of later issues before #7. Without
       // global ordering they consume every release and the cursor never gets #7.
       for (let index = 0; index < 100; index++) queue.seed(1000 + turn * 100 + index)
-      expect(journal.reconcilable(turn ? `example/repo#${999 + turn * 100}` : '', NOW, false).map(item => item.id)).not.toContain(chain.id)
+      expect(journal.reconcilableIds(turn ? `example/repo#${999 + turn * 100}` : '', NOW, false)).not.toContain(chain.id)
       if (turn === 0) {
         release?.(); release = null
         if (busyCall) queue.complete(busyCall) // Reconciliation frees this slot inside the next page.
@@ -1065,8 +1065,8 @@ describe('native admission and recovery', () => {
     record(journal, chain, { type: 'chain.held', reason: 'review-issue failed before publication three times: Refresh credential was rejected' })
     record(journal, seed(8), { type: 'chain.held', reason: 'repair-pr failed before publication three times: required CI shard failed' })
     seed(9)
-    expect(journal.authenticationHolds('').map(held => held.id)).toEqual([chain.id])
-    expect(journal.authenticationHolds(chain.id)).toEqual([])
+    expect(journal.authenticationHoldIds('')).toEqual([chain.id])
+    expect(journal.authenticationHoldIds(chain.id)).toEqual([])
     const plan = (db.prepare(`EXPLAIN QUERY PLAN SELECT chain_id FROM behavior_chain_current INDEXED BY behavior_chain_authentication_holds
       WHERE merged = 0 AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%' AND chain_id > ?`)
       .all('') as Array<{ detail: string }>).map(row => row.detail).join('\n')

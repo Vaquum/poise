@@ -405,6 +405,29 @@ describe('Merge Pull Requests', () => {
     expect(mergeCalls()).toHaveLength(1)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ target: `${REPO}#8`, error: 'GitHub could not read this target' })])
   })
+  it.each(['malformed', 'missing', 'duplicate'])('merges a healthy PR alongside %s candidate evidence', async (problem) => {
+    enable(); pulls.push(pull(REPO, 8))
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await cli(command, args, options)
+      if (command !== 'github-interface' || args[0] !== '--merge-candidates') return result
+      const packet = JSON.parse(result.stdout)
+      const rejected = packet.records.find((row: { number: number }) => row.number === 8)
+      if (problem === 'malformed') rejected.ready = 'unknown'
+      if (problem === 'missing') packet.records = packet.records.filter((row: { number: number }) => row.number !== 8)
+      if (problem === 'duplicate') packet.records.push(rejected)
+      return { ...result, stdout: JSON.stringify(packet) }
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls().map(([, args]) => args[1])).toEqual(['#7'])
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({
+      target: `${REPO}#8`, error: expect.stringContaining(problem === 'missing' ? 'no matching' : problem),
+    })])
+  })
+  it('uses healthy open PR rows alongside malformed and duplicate rows', async () => {
+    enable(); pulls.push(pull(REPO, 8, { updated_at: 'unknown' }), pull(REPO, 9, { number: null }), pull(REPO, 10), pull(REPO, 10))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls().map(([, args]) => args[1])).toEqual(['#7'])
+  })
   it('holds on unreadable datastore state', async () => {
     enable(); healthError = new Error('datastore is stale')
     await runtime.runEnabledBehaviorsOnce()

@@ -829,6 +829,27 @@ class PrClosingTest(unittest.TestCase):
             self.assertEqual(listed["prs"][1]["closing"], [{"repo": "vaquum/other", "number": 3}])
             self.assertEqual(listed["prs"][2]["closing"], [])
 
+    def test_pr_closing_keeps_valid_references_next_to_malformed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            first = closing_pr_fixture(12, 112, "", closing=(7,), state="open")
+            first["pull"]["graphql"]["closingIssuesReferences"]["nodes"].extend([None, {"number": 8}])
+            healthy = closing_pr_fixture(13, 113, "", closing=(9,), state="open")
+            with conn:
+                upsert_repo(conn, first["repo"])
+            store_expanded(conn, first)
+            store_expanded(conn, healthy)
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path))
+            self.assertTrue(listed["truncated"])
+            self.assertEqual([(pr["closing"], pr["closing_truncated"]) for pr in listed["prs"]], [
+                ([{"repo": "vaquum/test", "number": 7}], True),
+                ([{"repo": "vaquum/test", "number": 9}], False),
+            ])
+
     def test_pr_closing_filters_by_repo_case_insensitively(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "db.sqlite"

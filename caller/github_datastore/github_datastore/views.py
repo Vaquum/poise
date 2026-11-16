@@ -333,7 +333,8 @@ def _connection_nodes(value: Any) -> tuple[list[dict[str, Any]] | None, bool]:
     nodes: list[dict[str, Any]] = []
     for node in value["nodes"]:
         if not isinstance(node, dict):
-            return None, True
+            truncated = True
+            continue
         nodes.append(node)
     return nodes, truncated
 
@@ -422,9 +423,12 @@ def _closing_refs(graphql: Any, body: str | None, repo: str) -> tuple[list[tuple
     for node in nodes:
         ref = _node_ref(node)
         if ref is None:
-            return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", True
+            truncated = True
+            continue
         title = node.get("title")
         refs.append((ref[0], ref[1], title if isinstance(title, str) and title else None))
+    if not refs and truncated:
+        return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", True
     return sorted(refs), "closing-references", truncated
 
 
@@ -487,7 +491,9 @@ def pr_dependents(
             targets = {(ref_repo, ref_number) for ref_repo, ref_number, _ in closing}
             scanned = conn.execute(
                 """SELECT repo_full_name, number, title, body,
-                          json_extract(expanded_json, '$.issue.graphql.blockedBy') AS blocked_by
+                          CASE WHEN json_valid(expanded_json)
+                               THEN json_extract(expanded_json, '$.issue.graphql.blockedBy')
+                               ELSE 0 END AS blocked_by
                    FROM items
                    WHERE repo_full_name = ? COLLATE NOCASE AND item_type = 'issue' AND state = 'open'
                    ORDER BY number LIMIT ?""",
@@ -519,8 +525,7 @@ def pr_dependents(
                         ref = _node_ref(node)
                         if ref is None:
                             truncated = True
-                            blocked = set()
-                            break
+                            continue
                         blocked.add(ref)
                 depends = parse_depends_on(candidate["body"], candidate["repo_full_name"])
                 via = [name for name, hits in (("blocked-by", blocked), ("depends-on", depends)) if hits & targets]
@@ -600,15 +605,17 @@ def pr_closing(
         truncated = more
         prs: list[dict[str, Any]] = []
         for row in rows[:cap]:
+            malformed_graph = False
             try:
                 expanded = json.loads(row["expanded_json"])
-            except ValueError:
+            except (TypeError, ValueError):
                 expanded = None
+                malformed_graph = True
             pull = expanded.get("pull") if isinstance(expanded, dict) else None
             graphql = pull.get("graphql") if isinstance(pull, dict) else None
             head_ref = _head_ref(graphql)
             closing, closes_via, refs_truncated = _closing_refs(graphql, row["body"], row["repo_full_name"])
-            closing_truncated = refs_truncated or len(closing) > CLOSED_MATCH_LIMIT
+            closing_truncated = malformed_graph or refs_truncated or len(closing) > CLOSED_MATCH_LIMIT
             if closing_truncated:
                 truncated = True
                 closing = closing[:CLOSED_MATCH_LIMIT]

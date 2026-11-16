@@ -4674,15 +4674,15 @@ it.each(['stale datastore', 'lost acknowledgement'])('rechecks pending implement
     const intent = reports(db)
     const postCount = posts().length, observations = observe.mock.calls.length
     expect(journal.reconciliationAt(current)).toBe(checkedAt + 120_000)
-    expect(journal.reconcilable('', checkedAt + 120_000, false)).toEqual([])
+    expect(journal.reconcilableIds('', checkedAt + 120_000, false)).toEqual([])
     vi.setSystemTime(checkedAt + 119_999)
     for (let pass = 0; pass < 2; pass++) await runtime.run()
-    expect(journal.reconcilable('', Date.now(), true)).toEqual([])
+    expect(journal.reconcilableIds('', Date.now(), true)).toEqual([])
     expect(journal.read(chain.id)).toEqual(current)
     expect(observe).toHaveBeenCalledTimes(observations)
     expect(reports(db)).toEqual(intent); expect(posts()).toHaveLength(postCount)
     vi.setSystemTime(checkedAt + 120_000)
-    expect(journal.reconcilable('', Date.now(), true).map(row => row.id)).toEqual([chain.id])
+    expect(journal.reconcilableIds('', Date.now(), true)).toEqual([chain.id])
     await runtime.run()
     expect(observe).toHaveBeenCalledTimes(observations + 1)
   }
@@ -4728,7 +4728,7 @@ it.each(['stale datastore', 'lost acknowledgement'])('rechecks pending implement
     const next = checkedAt + checkedAt - current.invocations[0].admittedAt
     expect(journal.reconciliationAt(current)).toBe(next)
     vi.setSystemTime(checkedAt + 120_000)
-    expect(journal.reconcilable('', Date.now(), true)).toEqual([])
+    expect(journal.reconcilableIds('', Date.now(), true)).toEqual([])
     await runtime.run()
     expect(journal.read(chain.id)).toEqual(current)
     vi.setSystemTime(next)
@@ -4760,7 +4760,7 @@ it.each(['operator hold', 'pre-Resume receipt'])('does not accelerate retained p
   expect(journal.reconciliationAt(source)).toBe(checkedAt + checkedAt - source.invocations[0].admittedAt)
   stale = false
   vi.setSystemTime(checkedAt + 120_000)
-  expect(journal.reconcilable('', Date.now(), true)).toEqual([])
+  expect(journal.reconcilableIds('', Date.now(), true)).toEqual([])
   for (let pass = 0; pass < 2; pass++) await runtime.run()
   expect(observe).toHaveBeenCalledTimes(1)
   expect(journal.read(chain.id)).toEqual(source)
