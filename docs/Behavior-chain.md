@@ -12,8 +12,8 @@ For `autonomio/poise`, the dedicated App's
 [Poise review clearance](Review-clearance.md) check also exposes the complete
 native review obligation at GitHub's PR-head and merge-group boundary. Its
 activation and audit are separate administrator rollout steps.
-A confirmed external merge is recorded separately: without qualifying pre-merge
-review evidence its review obligation remains open through journal recovery.
+A confirmed external merge is recorded separately. Original Calls and review
+receipts reconcile through the journal; merge observation grants no new work.
 A closed seed without a bound PR also discovers exactly one merged GitHub closing
 reference on the expected base repository and default branch, confirming its merge
 SHA through the normal PR read. Missing, ambiguous or contradictory evidence keeps
@@ -26,7 +26,18 @@ SHA on the unmerged binding is not evidence of a merge. Other linked PRs,
 uncertain publication, unsettled native resources and recorded review obligations
 still keep the chain active.
 
-After a confirmed merge, review reconciliation uses the last canonical
+Native merge admission retains the review contract version, exact repository,
+PR, head and context, required panel and original invocation, Call, review and
+response digest identities. Merged reconciliation uses that decision and the
+canonical observation preceding its admission, with the original contract's
+validation. Journals written before complete source coverage became mandatory
+have no decision metadata: their immutable `--review-response-json` admission,
+including `review_id`, can establish historical acceptance only with the matching
+original panel, Calls and GitHub receipts. Missing coverage or an old timestamp
+alone grants no legacy authority. Live review, clearance and merge admission
+continue to require today's complete-coverage contract.
+
+Without native merge admission, reconciliation uses the last canonical
 pre-merge observation recorded before both the actual merge time and the first
 merge event. Its target, head, review context and required reviewer slots remain
 fixed. Today's reviewer settings and post-merge PR edits cannot discharge that
@@ -35,10 +46,19 @@ its response and actual GitHub submission must precede the merge and match the
 original basis. The first recorded merged context and the current merged read
 must also match that basis; a mismatch recorded at the first merge cannot be
 erased by a later edit restoring the old title/body. Missing historical context
-or an empty panel stays unproven;
-the supported reviewer setting is one to three. This lookup reads existing
-immutable history and adds no state field, execution authority or polling loop.
-Previously completed histories are not rewritten or retroactively certified.
+or an empty panel stays unproven; the supported reviewer setting is one to three.
+Historical event payloads and state hashes remain unchanged across rebuild and
+restart. Previously completed histories are not rewritten or retroactively certified.
+
+A settled external merge whose closed source still carries the configured intake
+label ends with the existing `chain.review-hold-closed` audit event and
+`evidence-missing` status when the journal conclusively proves the original review
+is absent. This does not certify a review. Every original Call and native resource
+must settle first. A completed review awaiting its GitHub receipt, contradictory
+submissions or context, uncertain publication, unavailable Calls or cleanup, other
+linked work, and a removed intake label retain the actionable review obligation.
+The existing scheduler performs this reconciliation without a new polling loop
+or GitHub write.
 
 Status: the native implementation completed the ten real cycles documented below. The admission cutover and GUI changes carry separate local regression proof; those historical cycles do not prove production cutover. Production execution remains disabled by default.
 

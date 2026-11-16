@@ -1,0 +1,77 @@
+{
+  "revision": "20edd6aecfc963f6979f7f78b33c752dc8104cb1",
+  "rows": [
+    {
+      "sequence": 1,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-0",
+      "at": 1790000000000,
+      "payload": "{\"type\":\"chain.admitted\",\"repository\":\"acme/repo\",\"issue\":7,\"branch\":\"poise/issue-7\",\"author\":\"author\",\"reviewer\":\"reviewer\"}",
+      "state_hash": "a81e3d4c8e96c5d78e4f1c23e3f34221292d7562cec22848e049f6efa109b881"
+    },
+    {
+      "sequence": 2,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-1",
+      "at": 1790000000000,
+      "payload": "{\"type\":\"invocation.admitted\",\"invocation\":{\"id\":\"original-review\",\"behavior\":\"review-pr\",\"actor\":\"reviewer\",\"model\":\"fixture\",\"slot\":\"primary\",\"basis\":\"a178bc506f8ab58585e2aff3db7aeaf3900f4d22e63ef546de657cc82b88e7b1\",\"admittedAt\":1789999998000,\"request\":{\"command\":\"agent-interface\",\"cwd\":\"/fixture\",\"argv\":[]}}}",
+      "state_hash": "b94bd6bdc09ad0971aaa1d1bd257652e346b535f329911249c79fccbeb2db38c"
+    },
+    {
+      "sequence": 3,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-2",
+      "at": 1790000000000,
+      "payload": "{\"type\":\"invocation.settled\",\"invocationId\":\"original-review\",\"callId\":\"dddddddddddddddddddddddddddddddd\",\"outcome\":\"clean\",\"evidence\":{\"status\":\"completed\",\"action\":\"reviewed_clean\",\"outcome\":\"clean\",\"review_id\":91,\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"completedAt\":1790000000000,\"artifact\":{\"review_response\":{\"repository\":\"acme/repo\",\"pull_number\":17,\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"context_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reviewer\":\"reviewer\",\"model\":\"fixture\",\"invocation_id\":\"dddddddddddddddddddddddddddddddd\",\"completed_at\":1789999999000,\"assessment\":{\"verdict\":\"The changed validation has no remaining blocking defects.\",\"reviewed_context\":\"Inspected the immutable diff and affected callers.\",\"limitations\":\"No live provider calls.\"}}},\"resources_settled_at\":\"2026-09-21T14:13:20.000Z\",\"resource_ownership\":{\"version\":1,\"roots\":[],\"errors\":[]}}}",
+      "state_hash": "dbbe5520662400d223ee281d2c931e51ebe0033b45e2880225e5fa9fb198280f"
+    },
+    {
+      "sequence": 4,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-3",
+      "at": 1790000000000,
+      "payload": "{\"type\":\"chain.observed\",\"observation\":{\"checkedAt\":1790000000000,\"existingPulls\":[],\"issue\":{\"open\":true,\"eligible\":true,\"revision\":\"seed\",\"commentIds\":[]},\"issueReviewers\":[],\"prReviewers\":[{\"slot\":\"primary\",\"model\":\"fixture\",\"recovery\":\"fixture\"}],\"implementer\":{\"slot\":\"primary\",\"model\":\"fixture\",\"recovery\":\"fixture\"},\"repairer\":{\"slot\":\"primary\",\"model\":\"fixture\",\"recovery\":\"fixture\"},\"approver\":{\"slot\":\"primary\",\"model\":\"fixture\",\"recovery\":\"fixture\"},\"publication\":{\"pull_number\":17,\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"head_invocation\":\"implementation\",\"state\":\"open\",\"merged\":false,\"merge_sha\":null},\"pull\":{\"number\":17,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"headSince\":1789999990000,\"state\":\"open\",\"draft\":false,\"merged\":false,\"mergeSha\":null,\"queueEntry\":null,\"queueRemoval\":null,\"changesRequested\":false,\"unresolved\":0,\"approved\":true,\"ready\":true,\"reviewIds\":[91],\"reviewRevision\":\"review\",\"reviewContext\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reviewReceipts\":[{\"id\":91,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"state\":\"COMMENTED\",\"invocation\":\"dddddddddddddddddddddddddddddddd\",\"response\":{\"repository\":\"acme/repo\",\"pull_number\":17,\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"context_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reviewer\":\"reviewer\",\"model\":\"fixture\",\"invocation_id\":\"dddddddddddddddddddddddddddddddd\",\"completed_at\":1789999999000,\"assessment\":{\"verdict\":\"The changed validation has no remaining blocking defects.\",\"reviewed_context\":\"Inspected the immutable diff and affected callers.\",\"limitations\":\"No live provider calls.\"}},\"submittedAt\":1790000000000}],\"greyRuns\":[],\"pending\":false,\"failing\":[],\"conflict\":false,\"behind\":false}}}",
+      "state_hash": "bfa8a70b88a4a9d14a06ab4d7e69296c3176a006aef81bcc85dbfc366f436c41"
+    },
+    {
+      "sequence": 5,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-4",
+      "at": 1790000000000,
+      "payload": "{\"type\":\"invocation.admitted\",\"invocation\":{\"id\":\"original-merge\",\"behavior\":\"merge-pr\",\"actor\":\"reviewer\",\"model\":null,\"slot\":null,\"basis\":\"5dffaed0b02389b33d2a9881461865ec10f0cb12982cf3bd37886b01c49678d4\",\"admittedAt\":1790000001000,\"request\":{\"command\":\"github-interface\",\"cwd\":\"/fixture\",\"argv\":[\"--merge-if-ready\",\"17\",\"--author\",\"author\",\"--review-response-json\",\"{\\\"repository\\\":\\\"acme/repo\\\",\\\"pull_number\\\":17,\\\"head_sha\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"context_sha\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"reviewer\\\":\\\"reviewer\\\",\\\"model\\\":\\\"fixture\\\",\\\"invocation_id\\\":\\\"dddddddddddddddddddddddddddddddd\\\",\\\"completed_at\\\":1789999999000,\\\"assessment\\\":{\\\"verdict\\\":\\\"The changed validation has no remaining blocking defects.\\\",\\\"reviewed_context\\\":\\\"Inspected the immutable diff and affected callers.\\\",\\\"limitations\\\":\\\"No live provider calls.\\\"},\\\"review_id\\\":91}\",\"--expected-head\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"--token-user\",\"reviewer\"]}}}",
+      "state_hash": "0970426c7d4c319b86f8775f1ada5b6d21aa07291c1e554d68213bd189dc9daa"
+    },
+    {
+      "sequence": 6,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-5",
+      "at": 1790000000000,
+      "payload": "{\"type\":\"invocation.settled\",\"invocationId\":\"original-merge\",\"callId\":null,\"outcome\":\"enqueued\",\"evidence\":{\"status\":\"completed\",\"outcome\":\"enqueued\",\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"queue_entry_id\":\"original-queue\"}}",
+      "state_hash": "bd33653bffb343736555c78787e597b880f0679be6d7277ad7be35e140f82d52"
+    },
+    {
+      "sequence": 7,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-6",
+      "at": 1790000003000,
+      "payload": "{\"type\":\"chain.observed\",\"observation\":{\"checkedAt\":1790000003000,\"existingPulls\":[],\"issue\":{\"open\":false,\"eligible\":true,\"revision\":\"seed\",\"commentIds\":[]},\"issueReviewers\":[],\"prReviewers\":[{\"slot\":\"primary\",\"model\":\"fixture\",\"recovery\":\"fixture\"}],\"implementer\":{\"slot\":\"primary\",\"model\":\"fixture\",\"recovery\":\"fixture\"},\"repairer\":{\"slot\":\"primary\",\"model\":\"fixture\",\"recovery\":\"fixture\"},\"approver\":{\"slot\":\"primary\",\"model\":\"fixture\",\"recovery\":\"fixture\"},\"publication\":{\"pull_number\":17,\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"head_invocation\":\"implementation\",\"state\":\"closed\",\"merged\":true,\"merge_sha\":\"cccccccccccccccccccccccccccccccccccccccc\"},\"pull\":{\"number\":17,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"headSince\":1789999990000,\"state\":\"closed\",\"draft\":false,\"merged\":true,\"mergeSha\":\"cccccccccccccccccccccccccccccccccccccccc\",\"queueEntry\":null,\"queueRemoval\":null,\"changesRequested\":false,\"unresolved\":0,\"approved\":true,\"ready\":true,\"reviewIds\":[91],\"reviewRevision\":\"review\",\"reviewContext\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reviewReceipts\":[{\"id\":91,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"state\":\"COMMENTED\",\"invocation\":\"dddddddddddddddddddddddddddddddd\",\"response\":{\"repository\":\"acme/repo\",\"pull_number\":17,\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"context_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reviewer\":\"reviewer\",\"model\":\"fixture\",\"invocation_id\":\"dddddddddddddddddddddddddddddddd\",\"completed_at\":1789999999000,\"assessment\":{\"verdict\":\"The changed validation has no remaining blocking defects.\",\"reviewed_context\":\"Inspected the immutable diff and affected callers.\",\"limitations\":\"No live provider calls.\"}},\"submittedAt\":1790000000000}],\"greyRuns\":[],\"pending\":false,\"failing\":[],\"conflict\":false,\"behind\":false,\"mergedAt\":1790000002000}}}",
+      "state_hash": "a622c0cdbbd66a61d4694ef8ad8baf619f8d29032563a96e886efa5268e30a25"
+    },
+    {
+      "sequence": 8,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-7",
+      "at": 1790000003000,
+      "payload": "{\"type\":\"chain.merged\",\"mergeSha\":\"cccccccccccccccccccccccccccccccccccccccc\",\"evidence\":{\"repository\":\"acme/repo\",\"pull_number\":17,\"merged\":true,\"merge_sha\":\"cccccccccccccccccccccccccccccccccccccccc\",\"review_complete\":false}}",
+      "state_hash": "6a2b64476e05c5bd6a24ddecc8a2a35ca0ae4eff0b503b961dcfaa8895027be1"
+    },
+    {
+      "sequence": 9,
+      "chain_id": "acme/repo#7",
+      "event_id": "historical-8",
+      "at": 1790000003000,
+      "payload": "{\"type\":\"chain.held\",\"reason\":\"qualifying pre-merge review response is missing\"}",
+      "state_hash": "ba81a07bc56cb134a0124cbb565cec6e7decf5db94dd9e480c7361e840babf32"
+    }
+  ]
+}

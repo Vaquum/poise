@@ -216,6 +216,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const issueUpdatedAt = typeof issue.updated_at === 'string' ? Date.parse(issue.updated_at) : NaN
       const observation: ChainObservation = { checkedAt: Date.now(), existingPulls: publication.existing_pulls, issue: { open: issue.state === 'open',
         ...(Number.isFinite(issueUpdatedAt) ? { updatedAt: issueUpdatedAt } : {}),
+        ...(settings.seedMode === 'label' ? { intakeLabel: settings.label } : {}),
         revision: chainBasis([issue.title, issue.body || '']), eligible: settings.seedMode === 'all' || labels.some((label) => typeof label === 'string' && label.toLowerCase() === settings.label.toLowerCase()),
         commentIds: rawComments.comments.map((comment) => positive(object(comment, 'issue comment').id, 'issue comment')) }, ...roster,
         publication: { pull_number: publication.pull_number === null ? null : positive(publication.pull_number, 'publication'),

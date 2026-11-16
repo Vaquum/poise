@@ -1,4 +1,4 @@
-import { chainBasis, ciRefreshBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation, type CiRefreshProof } from './behavior-chain-store'
+import { canCloseMergedReviewHold, chainBasis, ciRefreshBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation, type CiRefreshProof, type MergeReviewDecision } from './behavior-chain-store'
 import { resumeLink, validReviewResponse, type ReviewResponse } from './review-response'
 import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
@@ -15,7 +15,7 @@ const CONVERSATION_BLOCKERS = new Set(['merge_state_not_clean', 'required_review
 export interface ChainReviewer { slot: string, model: string, recovery: string }
 export interface ChainObservation extends Record<string, unknown> {
   checkedAt: number
-  issue: { open: boolean, revision: string, eligible: boolean, commentIds: number[], updatedAt?: number }
+  issue: { open: boolean, revision: string, eligible: boolean, commentIds: number[], updatedAt?: number, intakeLabel?: string }
   issueReviewers: ChainReviewer[]
   prReviewers: ChainReviewer[]
   implementer: ChainReviewer
@@ -60,10 +60,11 @@ export type ChainDecision =
   | { kind: 'wait', reason: string }
   | { kind: 'hold', reason: string }
   | { kind: 'complete', mergeSha: string }
+  | { kind: 'close-review-hold', label: string, reason: string }
   | { kind: 'supersede', evidence: Record<string, unknown> }
   | { kind: 'invoke', behavior: ChainBehavior, basis: string, actor: string, reviewer: ChainReviewer | null, reason: string,
     checkpoint?: ReviewCheckpoint }
-export interface MergeReviewEvidence { before: ChainObservation | null, firstMerged: ChainObservation | null }
+export interface MergeReviewEvidence { before: ChainObservation | null, firstMerged: ChainObservation | null, admission?: ChainInvocation }
 
 export function heldCiRepair(chain: BehaviorChain) {
   const hold = chain.ciHold, last = chain.invocations.at(-1)
@@ -242,6 +243,11 @@ export function chainCiDependency(chain: BehaviorChain, removal?: string | null)
 
 export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvocation, observation: ChainObservation,
   now: number): ReviewResponse | null {
+  return reviewResponse(chain, invocation, observation, now, 2)
+}
+
+function reviewResponse(chain: BehaviorChain, invocation: ChainInvocation, observation: ChainObservation,
+  now: number, contract: 1 | 2): ReviewResponse | null {
   const pull = observation.pull
   const evidence = invocation.evidence
   const artifact = evidence?.artifact as Record<string, unknown> | null
@@ -253,7 +259,7 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
     && item.head === pull.head && item.state === ({ reviewed_clean: 'COMMENTED', approved: 'APPROVED', requested_changes: 'CHANGES_REQUESTED' } as Record<string, string>)[String(evidence?.action)])
   if (!pull || !evidence || !review || !invocation.callId || !invocation.model || !pull.reviewContext
     || !validReviewResponse(response, { repository: chain.repository, number: pull.number, head: pull.head,
-      actor: invocation.actor, callId: invocation.callId, model: invocation.model, context: pull.reviewContext,
+      actor: invocation.actor, callId: invocation.callId, model: invocation.model, context: pull.reviewContext, contract,
       incompleteFindings: evidence.action === 'requested_changes' && evidence.outcome === 'incomplete',
       legacyNegative: evidence.action === 'requested_changes' && evidence.outcome === 'changes_requested',
       recoveryModel: recoveryIndex >= 0 ? invocation.request.argv[recoveryIndex + 1] : null,
@@ -262,6 +268,82 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
     || response.completed_at > review.submittedAt + 999 || review.submittedAt > now) return null
   if (pull.merged && (typeof pull.mergedAt !== 'number' || !Number.isFinite(pull.mergedAt) || response.completed_at > pull.mergedAt || review.submittedAt > pull.mergedAt)) return null
   return response
+}
+
+function mergeReviewDecision(chain: BehaviorChain, observation: ChainObservation, now: number,
+  version: 1 | 2): MergeReviewDecision | null {
+  const pull = observation.pull
+  if (!pull?.reviewContext || !observation.prReviewers.length) return null
+  const basis = chainBasis(['pr', pull.head, pull.reviewContext])
+  const identity = (invocation: ChainInvocation | undefined) => {
+    if (!invocation || invocation.actor !== chain.reviewer || invocation.state !== 'settled'
+      || invocation.evidence?.status !== 'completed' || invocation.evidence.head_sha !== pull.head
+      || typeof invocation.evidence.review_id !== 'number' || !pull.reviewIds.includes(invocation.evidence.review_id)) return null
+    const response = reviewResponse(chain, invocation, observation, now, version)
+    return response && invocation.callId ? { invocation: invocation.id, call: invocation.callId,
+      review: invocation.evidence.review_id, response: chainBasis(response) } : null
+  }
+  const panel: MergeReviewDecision['panel'] = []
+  for (const reviewer of observation.prReviewers) {
+    const invocation = settled(chain, 'review-pr', basis, reviewer.slot).reverse().find(succeeded)
+    const proof = identity(invocation)
+    if (!proof || invocation?.model !== reviewer.model) return null
+    panel.push({ slot: reviewer.slot, model: reviewer.model, ...proof })
+  }
+  const final = [...chain.invocations].reverse().find(invocation => ['review-pr', 'approve-pr'].includes(invocation.behavior)
+    && ['reviewed_clean', 'approved'].includes(String(invocation.evidence?.action)) && identity(invocation))
+  const proof = identity(final)
+  return proof ? { version, acceptedAt: now, repository: chain.repository, number: pull.number, head: pull.head,
+    context: pull.reviewContext, panel, final: proof } : null
+}
+
+/** Saved with the immutable native merge request, before any merge effect. */
+export function chainMergeReviewDecision(chain: BehaviorChain, observation: ChainObservation, now: number): MergeReviewDecision | null {
+  return mergeReviewDecision(chain, observation, now, 2)
+}
+
+function retainedMergeReview(chain: BehaviorChain, observation: ChainObservation, before: ChainObservation,
+  admission: ChainInvocation): boolean {
+  const pull = observation.pull!, argv = admission.request.argv
+  const argument = (flag: string) => argv.filter(value => value === flag).length === 1 ? argv[argv.indexOf(flag) + 1] : undefined
+  if (admission.actor !== chain.reviewer || admission.model !== null || admission.slot !== null
+    || admission.request.command !== 'github-interface' || argv[0] !== '--merge-if-ready' || argv[1] !== String(pull.number)
+    || argument('--expected-head') !== pull.head || argument('--author') !== chain.author || argument('--token-user') !== chain.reviewer
+    || !Number.isFinite(admission.admittedAt) || admission.admittedAt > pull.mergedAt! || before.checkedAt > admission.admittedAt) return false
+  const saved = admission.reviewDecision
+  if (saved !== undefined && (!saved || saved.version !== 2 || !Number.isFinite(saved.acceptedAt)
+    || saved.acceptedAt < before.checkedAt || saved.acceptedAt > admission.admittedAt)) return false
+  // Only the original native admission grants the pre-coverage contract. An
+  // absent field or an old clock on an ordinary review grants no authority.
+  const original = { ...chain, invocations: chain.invocations.filter(invocation => invocation.admissionSequence < admission.admissionSequence) }
+  const decision = mergeReviewDecision(original, { ...observation, prReviewers: before.prReviewers },
+    saved?.acceptedAt ?? admission.admittedAt, saved ? 2 : 1)
+  if (!decision || saved && chainBasis(saved) !== chainBasis(decision)) return false
+  const final = original.invocations.find(invocation => invocation.id === decision.final.invocation)!
+  try {
+    const pinned: unknown = JSON.parse(argument('--review-response-json') ?? '')
+    return chainBasis(pinned) === chainBasis({ ...(final.evidence!.artifact as { review_response: ReviewResponse }).review_response,
+      review_id: decision.final.review })
+  } catch { return false }
+}
+
+function conclusivelyMissingMergeReview(chain: BehaviorChain, observation: ChainObservation, before: ChainObservation | null): boolean {
+  if (!canCloseMergedReviewHold(chain) || chain.invocations.some(invocation => invocation.behavior === 'merge-pr')) return false
+  if (observation.existingPulls.some(url => url.toLowerCase() !== `https://github.com/${chain.repository}/pull/${observation.pull!.number}`.toLowerCase())) return false
+  const reviews = chain.invocations.filter(invocation => ['review-pr', 'approve-pr'].includes(invocation.behavior))
+  if (observation.pull!.reviewReceipts.some(receipt => receipt.invocation !== null
+    && !reviews.some(invocation => invocation.callId === receipt.invocation
+      || resumeLink(invocation.evidence?.artifact as Record<string, unknown> | undefined)?.callId === receipt.invocation))) return false
+  return reviews.every(invocation => {
+    if (before?.pull && invocation.actor === chain.reviewer && invocation.evidence?.status === 'completed'
+      && chainReviewResponse(chain, invocation, { ...observation, prReviewers: before.prReviewers }, observation.checkedAt)) return true
+    const evidence = invocation.evidence ?? {}, artifact = evidence.artifact as Record<string, unknown> | undefined
+    return ['failed', 'deferred'].includes(String(evidence.status)) && evidence.action === 'not_started'
+      && [evidence.review_id, evidence.head_sha, evidence.receipts, evidence.publicationResume, evidence.publicationReceipt,
+        artifact?.review_response, artifact?.publication].every(value => value == null)
+      && (artifact?.phase == null || ['reviewing', 'admission_fenced'].includes(String(artifact.phase)))
+      && !observation.pull!.reviewReceipts.some(receipt => receipt.invocation === invocation.callId)
+  })
 }
 
 /** Review evidence only: repository readiness includes this required check. */
@@ -465,21 +547,41 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   const pull = observation.pull
   if (!Number.isFinite(observation.checkedAt) || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS || observation.checkedAt > now) return { kind: 'wait', reason: 'behavior observations need refreshing' }
   if (pull?.merged && pull.mergeSha && /^[0-9a-f]{40}$/i.test(pull.mergeSha)) {
+    if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation }))) {
+      return { kind: 'wait', reason: 'original native resource release must settle before review reconciliation' }
+    }
     const mergeBasis = mergeEvidence ? mergeEvidence.before : !chain.mergeSha ? chain.observation as ChainObservation | null : null
     const first = mergeEvidence ? mergeEvidence.firstMerged : !chain.mergeSha ? observation : null
-    if (!mergeBasis?.pull || mergeBasis.pull.merged !== false || !Number.isFinite(mergeBasis.checkedAt)
-      || typeof pull.mergedAt !== 'number' || !Number.isFinite(pull.mergedAt) || mergeBasis.checkedAt > pull.mergedAt
-      || mergeBasis.pull.number !== pull.number || mergeBasis.pull.head !== pull.head || !mergeBasis.pull.reviewContext
+    const missing = (reason = 'qualifying pre-merge review response is missing'): ChainDecision => !observation.issue.open && observation.issue.eligible && observation.issue.intakeLabel
+      && conclusivelyMissingMergeReview(chain, observation, mergeBasis)
+      ? { kind: 'close-review-hold', label: observation.issue.intakeLabel, reason: 'confirmed external merge has conclusively missing pre-merge review evidence' }
+      : { kind: 'hold', reason: `confirmed merge retains an open review obligation: ${reason}` }
+    if (typeof pull.mergedAt !== 'number' || !Number.isFinite(pull.mergedAt)
       || !first?.pull?.merged || first.pull.number !== pull.number || first.pull.head !== pull.head
       || first.pull.mergeSha !== pull.mergeSha || first.pull.mergedAt !== pull.mergedAt
-      || first.pull.reviewContext !== mergeBasis.pull.reviewContext || pull.reviewContext !== first.pull.reviewContext
-      || !Array.isArray(mergeBasis.prReviewers) || !mergeBasis.prReviewers.length) {
+      || pull.reviewContext !== first.pull.reviewContext
+      || mergeBasis && (!mergeBasis.pull || mergeBasis.pull.merged !== false || !Number.isFinite(mergeBasis.checkedAt)
+        || mergeBasis.checkedAt > pull.mergedAt || mergeBasis.pull.number !== pull.number || mergeBasis.pull.head !== pull.head
+        || mergeBasis.pull.reviewContext && first.pull.reviewContext !== mergeBasis.pull.reviewContext)) {
       return { kind: 'hold', reason: 'confirmed merge retains an open review obligation: original pre-merge review basis is missing or contradictory' }
     }
+    if (!mergeBasis?.pull?.reviewContext || !Array.isArray(mergeBasis.prReviewers) || !mergeBasis.prReviewers.length) {
+      return missing('original pre-merge review basis is missing or contradictory')
+    }
     const original = { ...observation, prReviewers: mergeBasis.prReviewers, pull: { ...pull, reviewContext: mergeBasis.pull.reviewContext } }
+    const admission = mergeEvidence?.admission ?? [...chain.invocations].reverse().find(invocation => invocation.behavior === 'merge-pr')
+    if (admission && admission.reviewDecision !== undefined) {
+      return retainedMergeReview(chain, original, mergeBasis, admission) ? { kind: 'complete', mergeSha: pull.mergeSha }
+        : { kind: 'hold', reason: 'confirmed merge retains an open review obligation: retained merge review decision conflicts with its original evidence' }
+    }
     const basis = chainBasis(['pr', pull.head, original.pull.reviewContext])
-    if (original.prReviewers.some((reviewer) => reviewComplete(chain, 'review-pr', basis, reviewer, original) !== 'complete')) {
-      return { kind: 'hold', reason: 'confirmed merge retains an open review obligation: qualifying pre-merge review response is missing' }
+    if (original.prReviewers.some((reviewer) => {
+      const invocation = settled(chain, 'review-pr', basis, reviewer.slot).reverse().find(succeeded)
+      return invocation?.actor !== chain.reviewer || invocation.model !== reviewer.model
+        || reviewComplete(chain, 'review-pr', basis, reviewer, original) !== 'complete'
+    })) {
+      if (admission && retainedMergeReview(chain, original, mergeBasis, admission)) return { kind: 'complete', mergeSha: pull.mergeSha }
+      return missing()
     }
     return { kind: 'complete', mergeSha: pull.mergeSha }
   }
