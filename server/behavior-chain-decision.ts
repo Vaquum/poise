@@ -291,8 +291,8 @@ function mergeReviewDecision(chain: BehaviorChain, observation: ChainObservation
   for (const reviewer of observation.prReviewers) {
     const invocation = settled(chain, 'review-pr', basis, reviewer.slot).reverse().find(succeeded)
     const proof = identity(invocation)
-    if (!proof || invocation?.model !== reviewer.model) return null
-    panel.push({ slot: reviewer.slot, model: reviewer.model, ...proof })
+    if (!proof || !invocation?.model || (version === 1 && invocation.model !== reviewer.model)) return null
+    panel.push({ slot: reviewer.slot, model: invocation.model, ...proof })
   }
   const final = [...chain.invocations].reverse().find(invocation => ['review-pr', 'approve-pr'].includes(invocation.behavior)
     && ['reviewed_clean', 'approved'].includes(String(invocation.evidence?.action)) && identity(invocation))
@@ -631,7 +631,7 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     const basis = chainBasis(['pr', pull.head, original.pull.reviewContext])
     if (original.prReviewers.some((reviewer) => {
       const invocation = settled(chain, 'review-pr', basis, reviewer.slot).reverse().find(succeeded)
-      return invocation?.actor !== chain.reviewer || invocation.model !== reviewer.model
+      return invocation?.actor !== chain.reviewer
         || reviewComplete(chain, 'review-pr', basis, reviewer, original) !== 'complete'
     })) {
       if (admission && retainedMergeReview(chain, original, mergeBasis, admission)) return { kind: 'complete', mergeSha: pull.mergeSha }
@@ -736,8 +736,6 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   if (queue?.removal && !['failed_checks', 'merge_conflict', 'merged'].includes(queue.removal.reason || '')) {
     return { kind: 'hold', reason: `queue removal requires a decision: ${queue.removal.reason || 'unknown reason'} (${queue.removal.id})` }
   }
-  const review = nextPrReview(chain, observation, pull, now)
-  if (review) return review
   const dependency = chainCiDependency(chain, pull.queueRemoval?.id)
   const queueRecovery = recoveredQueueRepair(chain, observation)
   let queueVerification = queueRecovery
@@ -761,6 +759,8 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       `diagnose and repair GitHub queue rejection ${removal.id}: ${removal.reason}; PR-head green checks do not prove integration success`, now)
     if (!removal.reviewClearanceOnly) queueVerification ??= chainBasis(['queue-verification', pull.head, removal.id, repair!.id])
   }
+  const review = nextPrReview(chain, observation, pull, now)
+  if (review) return review
   if (finalReviewFinished(chain, observation, now)
     && !pull.approved && !pull.changesRequested && !pull.unresolved && !pull.behind && !queueVerification) {
     const repair = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr' && succeeded(invocation))

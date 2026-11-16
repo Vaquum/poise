@@ -4472,7 +4472,7 @@ it('reports a terminal repair separately from a closed implementation report, in
       completedAt: Date.now(), resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
   fresh = observation()
   fresh.publication.head_invocation = publicationCall
-  fresh.prReviewers = [] // This fixture starts from an already-reviewed queue entry.
+  fresh.prReviewers = [reviewer]
   Object.assign(fresh.pull!, { changesRequested: false, unresolved: 0, approved: true, ready: true, checksState: 'SUCCESS' })
   current = record(journal, current, { type: 'chain.observed', observation: fresh })
   remote[0].state = 'closed'

@@ -610,7 +610,6 @@ describe('native admission and recovery', () => {
       const { journal, chain } = setup()
       const obs = observation(); pull(obs)
       obs.pull!.queueEntry = 'external-entry'
-      obs.prReviewers = [] // This fixture isolates queue-removal repair after review.
       let current = reviewed(journal, chain, obs)
       const repair = invocation('original-repair', 'repair-pr', chainBasis(['repair', HEAD]))
       const callId = 'c'.repeat(32)
