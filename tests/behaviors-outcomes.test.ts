@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import checkoutSuperseded from './fixtures/review-checkout-superseded.json'
 import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
+import type { LedgerAdmission, LedgerResult } from '../server/behavior-ledger-contract'
+import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture, datastoreHealthOutput } from './behaviors-runtime-fixture'
 
 describe('review outcome evidence and registration', () => {
@@ -531,35 +533,54 @@ describe('review outcome evidence and registration', () => {
   })
 
   it.each([HEAD_SHA, NEXT_HEAD_SHA])('releases a checkout-superseded review and reviews the current head (%s)', async (head) => {
-    const launched = await launchReviewBeforeCrash()
-    fixture.agentLogs = [agentLog({
-      ...checkoutSuperseded,
-      id: 'd'.repeat(32),
-      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
-      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
-      head_sha: head,
-      completed_at: new Date(Date.parse(launched.requestedAt) + 2_000).toISOString(),
-      expected_head: launched.expectedHead,
-      actor: launched.actor,
-      source: launched.source,
-      correlation_id: launched.correlationId,
-    })]
-    arrangeCli(false, false, { headSha: head })
-    await resetLogCache()
+    const ledger = new BehaviorLedgerStore(':memory:')
+    mocks.captureAdmission.mockImplementation((input: Omit<LedgerAdmission, 'type'>) => ledger.capture({ ...input, type: 'admit' }))
+    mocks.captureOutcome.mockImplementation((input: Omit<LedgerResult, 'type'>) => ledger.capture({ ...input, type: 'result' }))
+    try {
+      const launched = await launchReviewBeforeCrash()
+      const original = ledger.read({ operation: 'list' }).body.records!.find((record) => record.kind === 'attempt')!
+      expect(original).toMatchObject({ head: HEAD_SHA, state: 'pending' })
+      fixture.agentLogs = [agentLog({
+        ...checkoutSuperseded,
+        id: 'd'.repeat(32),
+        started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+        started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+        head_sha: head,
+        completed_at: new Date(Date.parse(launched.requestedAt) + 2_000).toISOString(),
+        expected_head: launched.expectedHead,
+        actor: launched.actor,
+        source: launched.source,
+        correlation_id: launched.correlationId,
+      })]
+      arrangeCli(false, false, { headSha: head })
+      await resetLogCache()
 
-    const { database: db, behaviors: runtime } = await restartModules()
-    runtime.startBehaviorsRuntime()
-    await runtime.runEnabledBehaviorsOnce()
+      const { database: db, behaviors: runtime } = await restartModules()
+      runtime.startBehaviorsRuntime()
+      await runtime.runEnabledBehaviorsOnce()
 
-    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
-    const argv = mocks.spawnDetached.mock.calls[1][1]
-    expect(argv[argv.indexOf('--expected-head') + 1]).toBe(head)
-    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(0)
-    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
-    expect(db.listBehaviorDeadLetters()).toEqual([])
-    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
-      nativeId: launched.correlationId, state: 'superseded', stateSource: 'native',
-    }))
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      const argv = mocks.spawnDetached.mock.calls[1][1]
+      expect(argv[argv.indexOf('--expected-head') + 1]).toBe(head)
+      expect(db.countReviewRounds(pr.repo, pr.number)).toBe(0)
+      expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+      expect(db.listBehaviorDeadLetters()).toEqual([])
+      expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+        nativeId: launched.correlationId, state: 'superseded', stateSource: 'native',
+      }))
+      const settled = ledger.read({ operation: 'get', id: original.id }).body.record!
+      expect(settled).toMatchObject({ head: HEAD_SHA, state: 'superseded', activity: 'settled', outcome: 'superseded' })
+      expect(settled.refs).toContainEqual({ kind: 'correlation', identity: launched.correlationId, availability: 'available' })
+      const caller = settled.refs.find((ref) => ref.kind === 'caller')!
+      const snapshot = await (await import('../server/agent')).fetchAgentLogSnapshot()
+      expect(snapshot.entries.find((call) => call.id === caller.identity)).toMatchObject({
+        id: 'd'.repeat(32), expected_head: HEAD_SHA, head_sha: head,
+      })
+      const attempts = ledger.read({ operation: 'list', parent: original.parentId! }).body.records!
+      expect(attempts).toHaveLength(2)
+      expect(attempts[1]).toMatchObject({ head, state: 'pending', kind: 'attempt' })
+      expect(attempts[1].id).not.toBe(original.id)
+    } finally { ledger.close() }
   })
 
   it.each([null, 91])('settles a closed-target review with retained publication evidence (%s)', async (reviewId) => {
