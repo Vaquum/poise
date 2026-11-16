@@ -136,18 +136,26 @@ describe('issue_intake', () => {
     expect(mocks.runFile.mock.calls.every((call) => call[0] === 'github-datastore')).toBe(true)
   })
 
-  it('reports an organization whose references or labels are incomplete, and keeps the others', async () => {
+  it('reports incomplete references alongside every readable issue label', async () => {
     for (const failed of [null, { ...closingPage([]), truncated: true }, closingPage([{ number: 1, closing: [], closingTruncated: true }]), closingPage([], true)]) {
       datastore({ '/alpha.sqlite': [{ repo: 'alpha/same', number: 7 }], '/beta.sqlite': [{ repo: 'beta/other', number: 8 }] })
       mocks.closing.mockImplementation(async (org: { login: string }) => org.login === 'alpha' ? failed : closingPage([]))
       const body = (await handleGhBody({ operation: 'issue_intake' })).body as { labelled: string[], errors: Array<{ org: string }> }
       expect(body.errors.map((entry) => entry.org)).toEqual(['alpha'])
-      expect(body.labelled).toEqual(['beta/other#8'])
+      expect(body.labelled).toEqual(expect.arrayContaining(['alpha/same#7', 'beta/other#8']))
     }
     mocks.closing.mockResolvedValue(closingPage([]))
     mocks.runFile.mockRejectedValue(new Error('issue label evidence is incomplete'))
     const body = (await handleGhBody({ operation: 'issue_intake', org: 'beta' })).body as { errors: unknown[] }
     expect(body.errors).toEqual([{ org: 'beta', error: 'issue label evidence is incomplete' }])
+  })
+
+  it('keeps known closing references from a partial page', async () => {
+    datastore({ '/alpha.sqlite': [{ repo: 'alpha/same', number: 7 }] })
+    mocks.closing.mockResolvedValue({ ...closingPage([{ number: 3, closing: [{ repo: 'alpha/same', number: 7 }] }]), incomplete: true })
+    const body = (await handleGhBody({ operation: 'issue_intake', org: 'alpha' })).body
+    expect(body).toMatchObject({ labelled: ['alpha/same#7'], prs: { 'alpha/same#7': [{ number: 3 }] },
+      errors: [{ org: 'alpha', error: 'Some open pull request references are incomplete' }] })
   })
 
   it('has no label to report when the chain takes every open issue', async () => {

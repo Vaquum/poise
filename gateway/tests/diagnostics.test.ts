@@ -19,6 +19,25 @@ afterEach(() => { for (const store of stores.splice(0)) store.close(); for (cons
 function directory() { const path = mkdtempSync(join(tmpdir(), 'poise-diagnostics-')); directories.push(path); return path }
 function store(policy = DEFAULT_LOG_POLICY) { const value = new DiagnosticStore(':memory:', policy, () => NOW); stores.push(value); return value }
 
+it('keeps health partial when the required external ingress coverage is unreadable', () => {
+  const path = join(directory(), 'logging.db')
+  const db = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW)
+  stores.push(db)
+  const active = { id: 'workspace-caller', workspace: 'alice', source: 'caller', status: 'connected' as const,
+    observedAt: null, ingestedAt: null, availableFrom: null, error: null, gaps: [] }
+  db.coverage({ ...active, id: 'external-ingress', source: 'ingress', workspace: null })
+  const writer = new Database(path)
+  try { writer.prepare("UPDATE log_coverage SET payload = 'null' WHERE id = 'external-ingress'").run() }
+  finally { writer.close() }
+  writeFileSync(path + '.coverage.json', JSON.stringify({ version: 1, writtenAt: new Date(NOW).toISOString(),
+    stopped: false, sinkError: null, dropped: 0, rejected: 0, sources: [active] }))
+  const result = executeLoggingRead({ path, now: NOW, policy: DEFAULT_LOG_POLICY, access: operator, operation: 'health', filter: {} })
+  expect(result.status).toBe(200)
+  expect(JSON.parse(result.body).collection).toMatchObject({ status: 'partial', currentStatus: 'partial', sources: expect.arrayContaining([
+    { ...active }, expect.objectContaining({ id: 'external-ingress', status: 'partial', currentStatus: 'unavailable', historyIncomplete: true }),
+  ]) })
+})
+
 it('upgrades legacy count metadata without losing retained events or existing snapshot cursors', () => {
   const path = join(directory(), 'logging.db')
   const original = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW)
@@ -389,6 +408,22 @@ describe('one diagnostic contract', () => {
 })
 
 describe('retained authorized queries', () => {
+  it('keeps a readable event and advances past an unreadable payload', () => {
+    const path = join(directory(), 'partial.db')
+    const db = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW)
+    stores.push(db)
+    const invalid = event('invalid-payload'), healthy = event('healthy-payload')
+    db.append([invalid, healthy])
+    const writer = new Database(path)
+    try { writer.prepare('UPDATE log_events SET payload = ? WHERE id = ?').run('{', invalid.id) }
+    finally { writer.close() }
+    expect(db.query(alice).events.map(row => row.id)).toEqual([healthy.id])
+    const first = db.delivery(alice, null, 1)
+    expect(first.events).toEqual([])
+    expect(first.hasMore).toBe(true)
+    expect(db.delivery(alice, first.cursor, 1).events.map(row => row.id)).toEqual([healthy.id])
+  })
+
   it('expires authorized tombstones in idle writable and read-only stores', () => {
     const policy = { retentionMs: 1000, maxBytes: 100_000, maxEvents: 1 }
     const path = join(directory(), 'tombstones.db'); let now = NOW

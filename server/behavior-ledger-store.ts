@@ -28,7 +28,18 @@ const cliBehavior = { 'review-new-prs': 'pr_review', 'approve-prs': 'pr_approve'
 const hash = () => createHash('sha256').update(randomUUID()).digest('hex')
 const iso = (value: string | null | undefined): boolean => value == null || (typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value)))
 const safeId = (value: number): boolean => Number.isSafeInteger(value) && value > 0
-const recordOf = (row: Row): LedgerRecord => JSON.parse(row.payload) as LedgerRecord
+function validRecord(record: LedgerRecord | null | undefined): record is LedgerRecord {
+  return !!record && typeof record.target?.repository === 'string' && safeId(record.target.number)
+    && BEHAVIOR_KEYS.includes(record.behavior) && LEDGER_STATES.includes(record.state)
+    && Array.isArray(record.plannedSlots) && Array.isArray(record.refs) && record.refs.every(ref => !!ref)
+}
+function recordOf(row: Row): LedgerRecord {
+  const record = JSON.parse(row.payload) as LedgerRecord | null
+  if (!validRecord(record) || record.id !== row.id || record.parentId !== row.parent_id) {
+    throw new Error('Invalid saved instance shape')
+  }
+  return record
+}
 const encodedBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value))
 const emptyHealth = (): LedgerHealth => ({ status: 'unavailable', unavailableReason: null, coverageStart: null, observedAt: null, callerObservedAt: null,
   pending: 0, dropped: 0, gaps: [], detailFloor: null, generation: null, retainedFrom: null, changeLowerBound: null, lastSequence: null, instances: null, changes: null })
@@ -60,6 +71,7 @@ export class BehaviorLedgerStore {
   private instanceBytes = 0
   private changeBytes = 0
   private pendingRows = new Map<string, LedgerPending>()
+  private unreadableInstances = new Set<string>()
 
   get budgetScanMs(): number { return this.budgetScanTime }
 
@@ -136,16 +148,17 @@ export class BehaviorLedgerStore {
       this.db.transaction(() => {
         // Older rows ranked terminal state alone. Rebuild eviction eligibility
         // from retained evidence before pruning, including unresolved children.
-        this.connection().exec(`UPDATE ledger_instances SET terminal =
+        this.connection().exec(`UPDATE ledger_instances SET terminal = coalesce(CASE WHEN json_valid(payload) THEN
           json_extract(payload,'$.state') IN ('completed','failed','superseded')
-          AND json_extract(payload,'$.activity') = 'settled';
+          AND json_extract(payload,'$.activity') = 'settled' END, 0);
           UPDATE ledger_instances SET terminal=0 WHERE parent_id IS NULL AND EXISTS (
             SELECT 1 FROM ledger_instances AS child WHERE child.parent_id=ledger_instances.id AND child.terminal=0);
           UPDATE ledger_instances SET no_write=0 WHERE terminal=0;`)
         // A detached direct command has no passive Caller row after its observer dies.
         this.pendingRows.clear()
         for (const row of this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL')) {
-          const record = recordOf(row)
+          const record = this.readableRecord(row)
+          if (!record) continue
           if (DIRECT.has(record.behavior) && !TERMINAL.has(record.state)) {
             this.put({ ...record, state: 'unknown', activity: 'unknown' }, row, true)
             if (record.parentId) this.aggregate(record.parentId)
@@ -175,6 +188,20 @@ export class BehaviorLedgerStore {
   private rows(sql: string, ...args: (string | number | null)[]): Row[] { return this.connection().prepare(sql).all(...args) as Row[] }
   private row(nativeId: string): Row | undefined { return this.connection().prepare('SELECT * FROM ledger_instances WHERE native_id=?').get(nativeId) as Row | undefined }
   private byId(id: string): Row | undefined { return this.connection().prepare('SELECT * FROM ledger_instances WHERE id=?').get(id) as Row | undefined }
+  private readableRecord(row: Row): LedgerRecord | null {
+    try { return recordOf(row) } catch (error) {
+      if (!this.unreadableInstances.has(row.id)) {
+        this.unreadableInstances.add(row.id)
+        console.warn(`[ledger] Saved instance ${row.id} cannot be read`, error instanceof SyntaxError ? 'invalid JSON' : 'invalid shape')
+      }
+      return null
+    }
+  }
+  private requireRecord(row: Row): LedgerRecord {
+    const record = this.readableRecord(row)
+    if (!record) throw new LedgerError(400, 'invalid_saved_record')
+    return record
+  }
   private gap(reason: LedgerGap['reason'], count = 0, since: string | null = null): void {
     this.data.dropped += count
     const now = this.time()
@@ -316,7 +343,7 @@ export class BehaviorLedgerStore {
     this.validateAdmission(input)
     const existing = this.row(input.nativeId)
     if (existing) {
-      const record = recordOf(existing)
+      const record = this.requireRecord(existing)
       if (record.behavior !== input.behavior || record.target.repository !== input.repository || record.target.number !== input.number
         || record.source !== input.source || record.actor !== input.actor || record.head !== input.head) throw new LedgerError(400, 'invalid_observation')
       return
@@ -335,7 +362,7 @@ export class BehaviorLedgerStore {
       this.insert(record, input.admissionKey, null)
       root = this.byId(id)!
     }
-    const parent = recordOf(root)
+    const parent = this.requireRecord(root)
     if (parent.behavior !== input.behavior || parent.source !== input.source || parent.target.repository !== input.repository
       || parent.target.number !== input.number || parent.owner !== input.owner) throw new LedgerError(400, 'invalid_observation')
     const direct = DIRECT.has(input.behavior)
@@ -365,7 +392,10 @@ export class BehaviorLedgerStore {
   private rebuildPending(): void {
     // Rebuild into a fresh map so a failed scan keeps the previous one.
     const rebuilt = new Map<string, LedgerPending>()
-    for (const row of this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL')) this.trackPending(row.native_id, recordOf(row), rebuilt)
+    for (const row of this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL')) {
+      const record = this.readableRecord(row)
+      if (record) this.trackPending(row.native_id, record, rebuilt)
+    }
     this.pendingRows = rebuilt
   }
   private insert(record: LedgerRecord, admissionKey: string | null, nativeId: string | null): void {
@@ -422,7 +452,7 @@ export class BehaviorLedgerStore {
     if (input.refs) this.validateRefs(input.refs)
     const row = this.row(input.nativeId)
     if (!row) return
-    const record = recordOf(row)
+    const record = this.requireRecord(row)
     const refs = [...record.refs]
     for (const ref of [...(input.refs ?? []), ...(input.callId ? [{ kind: 'caller' as const, identity: input.callId, availability: 'available' as const }] : [])]) {
       const index = refs.findIndex((current) => current.kind === ref.kind && current.identity === ref.identity)
@@ -447,7 +477,7 @@ export class BehaviorLedgerStore {
     if (!NATIVE.test(input.nativeId) || (input.callId !== null && !CALL.test(input.callId))) throw new LedgerError(400, 'invalid_observation')
     const row = this.row(input.nativeId)
     if (!row) return
-    const record = recordOf(row)
+    const record = this.requireRecord(row)
     if (DIRECT.has(record.behavior)) return
     if (row.native_override === 1 && TERMINAL.has(record.state) && record.activity === 'settled') return
     const knownCall = record.refs.find((ref) => ref.kind === 'caller')?.identity
@@ -483,8 +513,10 @@ export class BehaviorLedgerStore {
   private aggregate(id: string): void {
     const row = this.byId(id)
     if (!row) return
-    const root = recordOf(row)
-    const children = this.rows('SELECT * FROM ledger_instances WHERE parent_id=? ORDER BY creation_seq DESC', id).map(recordOf)
+    const root = this.readableRecord(row)
+    if (!root) return
+    const childRows = this.rows('SELECT * FROM ledger_instances WHERE parent_id=? ORDER BY creation_seq DESC', id)
+    const children = childRows.map(child => this.readableRecord(child)).filter(child => child !== null)
     const selected = root.plannedSlots.length ? root.plannedSlots.map((slot) => children.find((child) => child.slot === slot)) : [children[0]]
     const latest = children[0]
     // Closure ends the target's panel, including slots never admitted. A
@@ -498,7 +530,8 @@ export class BehaviorLedgerStore {
     const state = closed ? 'superseded' : PRECEDENCE.find((candidate) => states.includes(candidate)) ?? 'pending'
     // Older uncertain attempts still count as caused work; a retry cannot prove they stopped.
     const activity: LedgerActivity = children.some((child) => child.activity === 'running') ? 'running'
-      : (!closed && selected.some((child) => !child)) || children.some((child) => child.activity !== 'settled') ? 'unknown' : 'settled'
+      : children.length !== childRows.length || (!closed && selected.some((child) => !child))
+        || children.some((child) => child.activity !== 'settled') ? 'unknown' : 'settled'
     const required = closed ? children : selected
     const completions = required.flatMap((child) => child?.completedAt ? [child.completedAt] : [])
     const completedAt = completions.length === required.length
@@ -512,7 +545,8 @@ export class BehaviorLedgerStore {
     const cutoff = new Date(this.now() - LEDGER_STALE_MS).toISOString()
     const roots = new Set<string>()
     for (const row of this.budgetScan(() => this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL AND source_at < ?', cutoff))) {
-      const record = recordOf(row)
+      const record = this.readableRecord(row)
+      if (!record) continue
       if (record.activity === 'unknown' || (TERMINAL.has(record.state) && record.activity === 'settled')) continue
       this.put({ ...record, activity: 'unknown' }, row)
       if (record.parentId) roots.add(record.parentId)
@@ -521,11 +555,12 @@ export class BehaviorLedgerStore {
   }
 
   private remove(row: Row): void {
-    const record = recordOf(row)
-    if (!record.parentId) for (const child of this.rows('SELECT * FROM ledger_instances WHERE parent_id=?', row.id)) this.remove(child)
-    if (!TERMINAL.has(record.state) || record.activity !== 'settled') this.gap('eviction')
+    const record = this.readableRecord(row)
+    if (!row.parent_id) for (const child of this.rows('SELECT * FROM ledger_instances WHERE parent_id=?', row.id)) this.remove(child)
+    if (!record || !TERMINAL.has(record.state) || record.activity !== 'settled') this.gap('eviction')
     this.connection().prepare('DELETE FROM ledger_instances WHERE id=?').run(row.id)
     if (row.native_id !== null) this.pendingRows.delete(row.native_id)
+    this.unreadableInstances.delete(row.id)
     this.instanceCount--
     this.instanceBytes -= row.bytes
     const change = this.connection().prepare("INSERT INTO ledger_changes(id,op,payload,created_at,bytes) VALUES(?,'remove','',?,0)").run(row.id, this.time())
@@ -541,7 +576,9 @@ export class BehaviorLedgerStore {
     const latestSlots = new Set<string | null>()
     const victims: Row[] = []
     for (const row of rows) {
-      const slot = recordOf(row).slot
+      const record = this.readableRecord(row)
+      if (!record) { victims.push(row); continue }
+      const slot = record.slot
       if (!latestSlots.has(slot)) { latestSlots.add(slot); continue }
       victims.push(row)
     }
@@ -590,7 +627,8 @@ export class BehaviorLedgerStore {
     while (usage.instances > this.policy.maxInstances || usage.bytes > this.policy.maxBytes) {
       // Preserve panel work ahead of repetitive terminal direct no-write firings.
       const victim = this.budgetScan(() => this.rows('SELECT * FROM ledger_instances INDEXED BY ledger_pressure WHERE parent_id IS NULL ORDER BY no_write DESC,terminal DESC,creation_seq ASC LIMIT 1'))[0]
-      if (usage.instances > this.policy.maxInstances || !usage.changes || (victim?.terminal === 1 && directNoWrite(recordOf(victim)))) {
+      const terminalVictim = victim?.terminal === 1 ? this.readableRecord(victim) : null
+      if (usage.instances > this.policy.maxInstances || !usage.changes || terminalVictim && directNoWrite(terminalVictim)) {
         if (!victim) break
         this.remove(victim)
       } else {
@@ -675,16 +713,32 @@ export class BehaviorLedgerStore {
         if (request.operation === 'get') {
           if (!ID.test(request.id)) throw new LedgerError(400, 'invalid_id')
           const row = this.byId(request.id)
-          if (row) return envelope({ record: recordOf(row) })
+          if (row) {
+            const record = this.readableRecord(row)
+            if (!record) throw new LedgerError(503, 'invalid_saved_record')
+            return envelope({ record })
+          }
           const removed = this.connection().prepare("SELECT 1 FROM ledger_changes WHERE id=? AND op='remove' LIMIT 1").get(request.id)
           throw new LedgerError(removed ? 410 : 404, removed ? 'record_expired' : 'record_not_found')
         }
         if (request.operation === 'changes') {
           const cursor = this.parseCursor(request.cursor, 'changes', null)
           if (cursor.position < Number(this.meta('change_floor'))) throw new LedgerError(410, 'resync_required')
-          const rows = this.connection().prepare('SELECT payload FROM ledger_changes WHERE seq>? ORDER BY seq ASC LIMIT ?').all(cursor.position, limit + 1) as { payload: string }[]
-          const changes = rows.slice(0, limit).map((row) => JSON.parse(row.payload) as LedgerChange)
-          const position = changes.at(-1)?.sequence ?? cursor.position
+          const rows = this.connection().prepare('SELECT seq,id,op,payload FROM ledger_changes WHERE seq>? ORDER BY seq ASC LIMIT ?').all(cursor.position, limit + 1) as { seq: number, id: string, op: string, payload: string }[]
+          const page = rows.slice(0, limit)
+          const changes = page.flatMap(row => {
+            try {
+              const change = JSON.parse(row.payload) as LedgerChange
+              if (change?.sequence === row.seq && change.op === row.op
+                && (change.op === 'remove' && change.id === row.id && change.revision === row.seq
+                  || change.op === 'upsert' && validRecord(change.record) && change.record.id === row.id && change.record.revision === row.seq)) return [change]
+              throw new Error('Invalid ledger change shape')
+            } catch (error) {
+              console.warn(`[ledger] Saved change ${row.seq} cannot be read`, error instanceof SyntaxError ? 'invalid JSON' : 'invalid shape')
+              return []
+            }
+          })
+          const position = page.at(-1)?.seq ?? cursor.position
           return envelope({ changes, hasMore: rows.length > limit,
             nextCursor: this.cursor({ kind: 'changes', position, boundary: 0, watermark: position, parent: null }) })
         }
@@ -709,7 +763,7 @@ export class BehaviorLedgerStore {
           ...[...args, limit + 1])
         const selected = rows.slice(0, limit)
         const nextCursor = rows.length > limit ? this.cursor({ ...cursor, position: selected.at(-1)!.creation_seq }) : null
-        return envelope({ records: selected.map(recordOf), nextCursor,
+        return envelope({ records: selected.map(row => this.readableRecord(row)).filter(record => record !== null), nextCursor,
           watermark: this.cursor({ kind: 'changes', position: cursor.watermark, boundary: 0, watermark: cursor.watermark, parent: null }) })
       })()
       return { status: 200, body }
@@ -736,6 +790,7 @@ function completedPair(record: LedgerRecord, row: LedgerCaller): boolean {
   if (record.behavior === 'review-new-issues') return row.action === 'commented' && row.outcome === 'commented' && row.head === null
   if (row.head !== record.head) return false
   return row.action === 'requested_changes' && ['changes_requested', 'incomplete'].includes(row.outcome ?? '')
+    || row.action === 'reviewed_clean' && row.outcome === 'incomplete'
     || record.behavior === 'review-new-prs' && row.action === 'reviewed_clean' && row.outcome === 'clean'
     || record.behavior === 'approve-prs' && row.action === 'approved' && row.outcome === 'approved'
 }

@@ -144,6 +144,16 @@ afterEach(async () => {
 afterAll(async () => { database.closeDatabase(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }) })
 
 describe('one session per subject', () => {
+  it('lists a readable chat alongside a damaged saved session', async () => {
+    const response = await postSessions(createBody(card()))
+    const healthy = storage.getSession(response.json.session.id)!
+    const damaged = randomUUID()
+    storage.insertSession({ ...healthy, id: damaged, subject: undefined })
+    database.db.prepare('UPDATE chat_sessions SET record = ? WHERE id = ?').run('null', damaged)
+    expect(storage.listSessions(instance).map(session => session.id)).toContain(healthy.id)
+    expect(storage.listSessions(instance).map(session => session.id)).not.toContain(damaged)
+  }, 60_000)
+
   it('returns the subject\'s session instead of creating a second one', async () => {
     const first = await postSessions(createBody(card()))
     expect(first.status).toBe(201)

@@ -7,6 +7,7 @@
 // write is one short transaction; nothing here talks to an agent.
 
 import { db } from '../db'
+import { diagnosticFailure } from '../logging'
 import { cachedStatement } from '../statements'
 import { claimQueuedMessage, delegateQueue, deleteMessageQueue, pauseQueue, settleQueuedTurn, queueOwner, readQueue } from './message-queue'
 import type { ChatEnvelope, ChatEvent, SessionRecord, SessionStatus, MessageQueue, SubjectSurface } from './protocol'
@@ -230,9 +231,19 @@ export function sessionsForCheckout(checkout: string): CheckoutSession[] {
 }
 
 export function listSessions(instance: string): SessionRecord[] {
-  const rows = cachedStatement(db, 'SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
-    .all(instance) as Array<{ record: string, last_seq: number, status: string, role: string | null }>
-  return rows.map(parseRecord)
+  const rows = cachedStatement(db, 'SELECT id, record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
+    .all(instance) as Array<{ id: string, record: string, last_seq: number, status: string, role: string | null }>
+  return rows.flatMap(row => {
+    try {
+      const record = parseRecord(row)
+      if (record.id !== row.id || typeof record.agent !== 'string' || typeof record.checkout !== 'string'
+        || typeof record.branch?.name !== 'string') throw new Error('Saved chat record has invalid identity or workspace fields')
+      return [record]
+    } catch (error) {
+      diagnosticFailure('chat.session.read', error, { target: row.id }, { level: 'warning' })
+      return []
+    }
+  })
 }
 
 export interface ChatPageSelector {
@@ -387,13 +398,28 @@ export const appendEvent = db.transaction((sessionId: string, event: ChatEvent, 
 
 export const EVENT_PAGE_LIMIT = 5_000
 
+function readTranscriptEvent(sessionId: string, row: { seq: number, at: string, event: string }): ChatEnvelope {
+  let event: ChatEvent
+  try {
+    event = JSON.parse(row.event) as ChatEvent
+    if (typeof event?.type !== 'string') throw new Error('Saved chat event has an invalid type')
+  } catch (error) {
+    const cause = error instanceof SyntaxError ? new Error('Saved chat event contains invalid JSON') : error
+    diagnosticFailure('chat.event.read', cause, { target: sessionId, sequence: row.seq }, { level: 'warning' })
+    event = { type: 'history.unreadable' }
+  }
+  // Keep the sequence position so both live subscribers and paged readers
+  // can acknowledge this row and continue to the remaining transcript.
+  return { seq: row.seq, sessionId, at: row.at, event }
+}
+
 export function listEvents(sessionId: string, afterSeq: number, limit: number = EVENT_PAGE_LIMIT): { events: ChatEnvelope[], truncated: boolean } {
   const bounded = Math.max(1, Math.min(limit, EVENT_PAGE_LIMIT))
   const rows = cachedStatement(db, 'SELECT seq, at, event FROM chat_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?')
     .all(sessionId, afterSeq, bounded + 1) as Array<{ seq: number, at: string, event: string }>
   const truncated = rows.length > bounded
   return {
-    events: rows.slice(0, bounded).map((row) => ({ seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent })),
+    events: rows.slice(0, bounded).map(row => readTranscriptEvent(sessionId, row)),
     truncated,
   }
 }
@@ -426,7 +452,7 @@ export function lastTurnsStart(sessionId: string, turns: number, budget = Infini
 
 export function lastEvent(sessionId: string): ChatEnvelope | null {
   const row = cachedStatement(db, 'SELECT seq, at, event FROM chat_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1').get(sessionId) as { seq: number, at: string, event: string } | undefined
-  return row ? { seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent } : null
+  return row ? readTranscriptEvent(sessionId, row) : null
 }
 
 export function findEvent(sessionId: string, predicate: (event: ChatEvent) => boolean): ChatEnvelope | null {

@@ -12,7 +12,9 @@ import httpx
 from github_datastore.github_api import (
     GitHubApiError,
     GitHubClient,
+    GitHubGraphQLError,
     GitHubRateLimitError,
+    GitHubRequestError,
     _github_proxy,
     datastore_github_client,
 )
@@ -159,8 +161,8 @@ class PooledGraphQLTest(unittest.TestCase):
         for status, payload, error in [
             (403, {"message": "API rate limit exceeded for user"}, GitHubRateLimitError),
             (200, {"errors": [{"type": "RATE_LIMITED"}]}, GitHubRateLimitError),
-            (403, {"message": "Resource not accessible"}, GitHubApiError),
-            (200, {"errors": [{"message": "Cannot query field 'bad'"}], "data": DATA}, GitHubApiError),
+            (403, {"message": "Resource not accessible"}, GitHubRequestError),
+            (200, {"errors": [{"message": "Cannot query field 'bad'"}], "data": DATA}, GitHubGraphQLError),
         ]:
             with self.subTest(status=status, payload=payload):
                 calls = []

@@ -47,11 +47,12 @@ class TestGovernedClaudeContinuation(TestCase):
         self.review_state, self.review_reads = None, 0
         self.repository = SimpleNamespace(root=self.root, prompt=lambda: "\n\nPinned review repository: fixture",
             diff_packet=lambda value, _limit, **_kwargs: json.dumps({**json.loads(value),
-                "diff": self.node["diff"], "diff_deferred": False, "coverage": "complete"}),
+                "diff": self.node["diff"], "diff_deferred": False, "coverage": self.node["coverage"]}),
             inspect=lambda requests, **_kwargs: {"action": "review_context", "head_sha": HEAD, "results": [
                 {"request": request, "lines": [{"line": 1, "text": "pinned consumer evidence"}],
                  "truncated": False, "next_line": None} for request in requests]})
-        self.stack.enter_context(patch.object(review_repository, "prepare", side_effect=lambda *_args: nullcontext(self.repository)))
+        self.stack.enter_context(patch.object(review_repository, "prepare",
+            side_effect=lambda *_args, **_kwargs: nullcontext(self.repository)))
         watch = SimpleNamespace(run=self.launch, check_closed=lambda: None,
                                 gate_path=str(self.root / "gate"), receipt_path=str(self.root / "receipt"))
         for module in (structured_review, review_watch):
@@ -241,12 +242,16 @@ class TestGovernedClaudeContinuation(TestCase):
         self.assertEqual(row["error_code"], "stopped")
         self.assertEqual(self.posts, [])
 
-    def test_omitted_required_source_never_starts_claude_or_publishes(self):
-        self.node["omitted_files"] = ["src/omitted.py"]
-        _row, result = self.execute()
-        self.assertIn("required review source coverage is incomplete", result["error"])
-        self.assertEqual(self.launches, [])
-        self.assertEqual(self.posts, [])
+    def test_omitted_source_publishes_a_claude_review_note_with_incomplete_coverage(self):
+        self.node["coverage"] = "incomplete"
+        self.node["omitted_files"] = [{"path": "src/omitted.py", "reason": "capacity"}]
+        row, _result = self.execute(units=6)
+        self.assertTrue(self.launches)
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("--partial-note", self.posts[0][0])
+        artifact = json.loads(row["artifact"])
+        self.assertEqual(artifact["review_response"]["coverage"], "incomplete")
+        self.assertTrue(any("src/omitted.py" in warning for warning in artifact["review_context_warnings"]))
 
     def test_unknown_publication_retains_first_publisher_without_another_claude_launch(self):
         self.lost_ack = True

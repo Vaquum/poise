@@ -49,6 +49,7 @@ PR updates and merge-queue candidates run the essential tests on Node 22, and a 
 
 ## Proof obligations
 
+- Batch readers and workers preserve independent records and tasks across per-record failures. Record the rejected identity and cause, and exercise a failing item alongside one that completes.
 - A change to an interface in `docs/Service-architecture.md` updates the document and the tests on both sides of the interface.
 - Service-mode behavior is tested with `POISE_MODE=service` and an isolated `HOME`; nothing in a test may read or write the developer's real `~/.poise`, `~/.claude`, `~/.codex`, gh configuration or Espanso folder.
 - No test reaches a real agent CLI or its login.

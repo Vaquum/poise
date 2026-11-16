@@ -48,16 +48,25 @@ export class McpGrants {
     return row ? JSON.parse(row.redirects) as string[] : []
   }
   list(ownerId: number): McpGrant[] {
-    return (this.db.prepare('SELECT state FROM mcp_grants WHERE owner = ? ORDER BY id LIMIT 100').all(ownerId) as { state: string }[])
-      .map(row => JSON.parse(row.state) as StoredGrant).map(grant => {
-        const { resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools, repository } = grant
-        return { resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools: grantedTools(tools, grant),
-          ...(repository === undefined ? {} : { repository }) }
+    return (this.db.prepare('SELECT id, state FROM mcp_grants WHERE owner = ? ORDER BY id LIMIT 100').all(ownerId) as { id: string, state: string }[])
+      .flatMap(row => {
+        let grant: StoredGrant
+        try {
+          grant = JSON.parse(row.state) as StoredGrant
+          if (grant?.grantId !== row.id || grant.ownerId !== ownerId) throw new Error('Invalid saved grant identity')
+        } catch (error) {
+          console.warn(`[mcp-grants] Saved grant ${row.id} cannot be read`, error instanceof SyntaxError ? 'invalid JSON' : 'invalid identity')
+          return []
+        }
+        const { resource, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools, repository } = grant
+        return [{ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt, tools: grantedTools(tools, grant),
+          ...(repository === undefined ? {} : { repository }) }]
       })
   }
   create(scope: Omit<McpGrantScope, 'grantId'>, clientId: string, redirects: string[]) {
     this.db.prepare("DELETE FROM mcp_grants WHERE json_extract(state, '$.expiresAt') <= ?").run(this.now())
-    if (this.list(scope.ownerId).length >= 100) throw new Error('read grant capacity reached; wait for a retained grant to expire')
+    const { count } = this.db.prepare('SELECT count(*) AS count FROM mcp_grants WHERE owner = ?').get(scope.ownerId) as { count: number }
+    if (count >= 100) throw new Error('read grant capacity reached; wait for a retained grant to expire')
     const grant: StoredGrant = { ...scope, clientId, grantId: randomUUID(), createdAt: this.now(), expiresAt: this.now() + GRANT_MS,
       revokedAt: null, tools: mcpToolNames(scope),
       accessHash: '', refreshHash: '', accessExpires: 0 }

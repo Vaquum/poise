@@ -111,7 +111,7 @@ function prReviewMissingArtifact(chain: BehaviorChain, observation: ChainObserva
       && candidate.state === 'settled' && candidate.evidence?.status === 'completed')
     if (!invocation) return false
     const evidence = invocation.evidence!
-    const complete = !!chainReviewResponse(chain, invocation, observation, observation.checkedAt)
+    const complete = !!chainReviewResponse(chain, invocation, observation, observation.checkedAt, { allowPartialComment: true })
       && typeof evidence.review_id === 'number' && evidence.review_id > 0
       && !!observation.pull?.reviewIds.includes(evidence.review_id)
       && evidence.head_sha === observation.pull?.head
@@ -414,7 +414,9 @@ function invocationWorkImpact(journal: BehaviorChainJournal, match: ReturnType<B
             ? active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
               : chain.ciHold.queue ? String((chain.observation as ChainObservation | null)?.ciRecovery?.reason || chain.held)
                 : 'Automatically recheck CI before resuming; fresh review and queue checks still apply'
-            : `Resolve the hold and explicitly resume: ${chain.held}`
+            : active?.state === 'uncertain'
+              ? `Reconcile the original invocation receipt first. Resolve the hold and explicitly resume: ${chain.held}`
+              : `Resolve the hold and explicitly resume: ${chain.held}`
           : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
             : active ? 'Await the original invocation outcome' : chain.mergeSha ? null
               : retryAt !== null ? 'Automatic retry eligible after backoff, subject to existing admission gates'

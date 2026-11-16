@@ -237,6 +237,14 @@ and GitHub fixtures. These measurements apply to the fixed case.
 
 ### Review failures
 
+An unavailable optional repository lookup contributes a Warning to the
+Call and Logging. The reviewer keeps the usable results from the same batch
+and finishes with the available source. The published assessment records the
+operation, path and cause, including warnings from earlier continuations.
+A historical legacy hold from the old inspection checkpoint validator may
+retry on the same commit once the original Call proves it did not submit a
+review and released its resources.
+
 A structured provider exit or error terminal keeps `not_started` /
 `preflight_failed` with a typed `review_provider_exit` / `review_provider_error`
 cause (a Codex credential rejection is typed `authentication_failed`) and no

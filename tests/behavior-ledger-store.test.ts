@@ -51,6 +51,53 @@ afterEach(() => {
 })
 
 describe('behavior firing ledger store', () => {
+  it('advances the change cursor across an unreadable entry', () => {
+    const db = store()
+    const watermark = db.read({ operation: 'list' }).body.watermark!
+    db.capture(admission())
+    const writer = new Database(db.path)
+    writer.prepare(`UPDATE ledger_changes SET payload = '{"sequence":1,"op":"upsert"}' WHERE seq = 1`).run()
+    writer.close()
+
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const first = db.read({ operation: 'changes', cursor: watermark, limit: 1 })
+      expect(first).toMatchObject({ status: 200, body: { changes: [], hasMore: true } })
+      const next = db.read({ operation: 'changes', cursor: first.body.nextCursor! })
+      expect(next.body.changes?.[0]).toMatchObject({ sequence: 2, op: 'upsert' })
+      expect(warning).toHaveBeenCalledWith('[ledger] Saved change 1 cannot be read', 'invalid shape')
+    } finally { warning.mockRestore() }
+  })
+
+  it('reopens with an unreadable attempt and settles the remaining attempts', () => {
+    const db = store()
+    db.capture(admission('damaged'))
+    db.capture(admission('same-panel'))
+    db.capture(admission('next-panel', { admissionKey: 'native-panel:acme/project#8', number: 8 }))
+    db.close()
+
+    const writer = new Database(db.path)
+    const { id } = writer.prepare("SELECT id FROM ledger_instances WHERE native_id = 'damaged'").get() as { id: string }
+    writer.prepare("UPDATE ledger_instances SET payload = 'null' WHERE id = ?").run(id)
+    writer.close()
+
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const resumed = store({}, db.path)
+      expect(resumed.pending().map(row => row.nativeId)).toEqual(['same-panel', 'next-panel'])
+      complete(resumed, 'same-panel')
+      complete(resumed, 'next-panel')
+      expect(resumed.read({ operation: 'get', id })).toMatchObject({ status: 503, body: { error: 'invalid_saved_record' } })
+      const page = records(resumed)
+      expect(page).toHaveLength(4)
+      expect(page.filter(row => row.kind === 'attempt').map(row => row.state)).toEqual(['completed', 'completed'])
+      expect(page.find(row => row.kind === 'firing' && row.target.number === 7)?.activity).toBe('unknown')
+      expect(page.find(row => row.kind === 'firing' && row.target.number === 8)?.activity).toBe('settled')
+      expect(warning).toHaveBeenCalledOnce()
+      expect(warning).toHaveBeenCalledWith(`[ledger] Saved instance ${id} cannot be read`, 'invalid shape')
+    } finally { warning.mockRestore() }
+  })
+
   it('answers reads without scanning retained history or adding timing to the body', () => {
     const db = store()
     db.capture(admission())

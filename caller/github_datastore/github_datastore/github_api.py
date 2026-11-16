@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import ssl
 import subprocess
 import time
+from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,15 +17,31 @@ from typing import TYPE_CHECKING, Any, Callable, TypeVar
 if TYPE_CHECKING:
     import httpx
 
+logger = logging.getLogger(__name__)
+
 
 class GitHubApiError(RuntimeError):
     pass
 
 
+class GitHubRequestError(GitHubApiError):
+    pass
+
+
+class GitHubGraphQLError(GitHubRequestError):
+    def __init__(self, message: str, data: Any, errors: Any) -> None:
+        super().__init__(message)
+        self.data, self.errors = data, errors
+
+
+class ItemGraphError(GitHubApiError):
+    """A failed graph for one identified issue or pull request."""
+
+
 class GitHubRateLimitError(GitHubApiError):
-    def __init__(self, message: str, reset_at: int) -> None:
+    def __init__(self, message: str, reset_at: int | None) -> None:
         self.reset_at = reset_at
-        super().__init__(f"{message} GITHUB_RATE_LIMIT_RESET={reset_at}")
+        super().__init__(message if reset_at is None else f"{message} GITHUB_RATE_LIMIT_RESET={reset_at}")
 
 
 ENUMERATION_DRIFT_MAX_ATTEMPTS = 3
@@ -48,6 +66,19 @@ class GitHubStoredPullsMissingError(GitHubApiError):
 class PullReconciliation:
     items: list[dict[str, object]]
     missing_ids: set[int]
+
+
+@dataclass(frozen=True)
+class PartialItemInventory:
+    items: list[dict[str, Any]]
+    problems: list[str]
+    unreadable: dict[int, str]
+
+
+@dataclass(frozen=True)
+class PartialRepositoryInventory:
+    repos: list[dict[str, Any]]
+    problems: list[str]
 
 
 _T = TypeVar("_T")
@@ -93,7 +124,7 @@ def raise_rate_limit(headers: Mapping[str, str], diagnostic: str) -> None:
         return
     reset = headers.get("x-ratelimit-reset", "")
     if not reset.isdecimal() or int(reset) <= 0:
-        raise GitHubApiError(f"{diagnostic}; GraphQL rate limit response has no valid reset time")
+        raise GitHubRateLimitError(f"{diagnostic}; GraphQL rate limit response has no valid reset time", None)
     raise GitHubRateLimitError(diagnostic, int(reset))
 
 
@@ -492,10 +523,11 @@ class GitHubClient:
         # only as the account whose token it is given, never gh's active one.
         token = self._token if self._token is not None else environment.get("GH_TOKEN", "").strip()
         if not token:
-            raise GitHubApiError("GH_TOKEN is not set: github-datastore reads GitHub only as the account whose token it is given")
+            raise GitHubRequestError("GH_TOKEN is not set: github-datastore reads GitHub only as the account whose token it is given")
         fields = {key: value for key, value in (variables or {}).items() if value is not None}
         for attempt in range(1, self.attempts + 1):
-            if self._rate_limit_error is not None and time.time() < self._rate_limit_error.reset_at:
+            if self._rate_limit_error is not None and (self._rate_limit_error.reset_at is None
+                                                       or time.time() < self._rate_limit_error.reset_at):
                 raise self._rate_limit_error
             if self._http is None:
                 headers, body, failure, retryable = self._cli_request(query, fields, environment)
@@ -513,15 +545,15 @@ class GitHubClient:
                     if payload.get("errors"):
                         diagnostic = f"GraphQL errors: {json.dumps(payload['errors'])}"
                         self._raise_rate_limit(headers, diagnostic)
-                        raise GitHubApiError(diagnostic)
+                        raise GitHubGraphQLError(diagnostic, payload.get("data"), payload["errors"])
                     return payload["data"]
             last_error = failure
             self._raise_rate_limit(headers, f"GraphQL request failed: {last_error}")
             if not retryable or attempt == self.attempts:
-                raise GitHubApiError(f"GraphQL request failed: {last_error}")
+                raise GitHubRequestError(f"GraphQL request failed: {last_error}")
             time.sleep(self.retry_sleep_seconds)
 
-        raise GitHubApiError(f"GraphQL request failed: {last_error}")
+        raise GitHubRequestError(f"GraphQL request failed: {last_error}")
 
     def _cli_request(
         self, query: str, fields: dict[str, Any], environment: dict[str, str],
@@ -625,10 +657,10 @@ class GitHubOrgReader:
     def __init__(self, client: GitHubClient) -> None:
         self.client = client
 
-    def list_org_repos(self, org: str) -> list[dict[str, Any]]:
+    def list_org_repos(self, org: str) -> list[dict[str, Any]] | PartialRepositoryInventory:
         return _retry_enumeration_on_drift(lambda: self._list_org_repos_once(org))
 
-    def _list_org_repos_once(self, org: str) -> list[dict[str, Any]]:
+    def _list_org_repos_once(self, org: str) -> list[dict[str, Any]] | PartialRepositoryInventory:
         # Keep the historical method/CLI name while accepting either owner
         # kind. OWNER excludes organizations and repositories a user merely
         # collaborates on; those belong to their own datastore scope.
@@ -646,6 +678,8 @@ class GitHubOrgReader:
         }}
         """
         repos: list[dict[str, Any]] = []
+        problems: list[str] = []
+        received = 0
         cursor: str | None = None
         cursors: set[str] = set()
         expected_count: int | None = None
@@ -664,9 +698,18 @@ class GitHubOrgReader:
                 raise GitHubEnumerationDriftError(f"repository totalCount changed while listing {org}")
             expected_count = count
             for node in conn["nodes"]:
-                repo = graphql_repo_to_row(node)
-                if str(repo["owner"]["login"]).casefold() != org.casefold() or repo["full_name"].split("/", 1)[0].casefold() != org.casefold():
-                    raise GitHubApiError(f"repository outside requested owner {org}: {repo['full_name']}")
+                received += 1
+                try:
+                    if not isinstance(node, dict):
+                        raise GitHubApiError("GitHub returned a missing or malformed repository entry")
+                    repo = graphql_repo_to_row(node)
+                    if (str(repo["owner"]["login"]).casefold() != org.casefold()
+                        or repo["full_name"].casefold() != f"{org}/{repo['name']}".casefold()):
+                        raise GitHubApiError("repository identity is outside its requested owner or name")
+                except (GitHubApiError, KeyError, ValueError, TypeError, AttributeError) as error:
+                    name = node.get("nameWithOwner") if isinstance(node, dict) else None
+                    problems.append(f"{org} repository {name or f'row {received}'}: {error}")
+                    continue
                 repos.append(repo)
             if not conn["pageInfo"]["hasNextPage"]:
                 break
@@ -675,16 +718,23 @@ class GitHubOrgReader:
                 raise GitHubApiError(f"cyclic repository page cursor for {org}")
             cursors.add(cursor)
 
-        ids = [repo["id"] for repo in repos]
-        if len(ids) != len(set(ids)):
-            raise GitHubApiError(f"duplicate repo ids returned for owner {org}")
-        if len(repos) != expected_count:
-            raise GitHubEnumerationDriftError(f"incomplete repository enumeration for {org}: expected {expected_count}, got {len(repos)}")
-        return repos
+        if received != expected_count:
+            raise GitHubEnumerationDriftError(f"incomplete repository enumeration for {org}: expected {expected_count}, got {received}")
+        by_id = Counter(repo["id"] for repo in repos)
+        by_name = Counter(repo["full_name"].casefold() for repo in repos)
+        unique = []
+        for repo in repos:
+            if by_id[repo["id"]] != 1 or by_name[repo["full_name"].casefold()] != 1:
+                problems.append(f"{repo['full_name']}: duplicate repository identity")
+            else:
+                unique.append(repo)
+        if problems and not unique:
+            raise GitHubApiError(f"no readable repositories for {org}: {problems[0]}")
+        return PartialRepositoryInventory(unique, problems) if problems else unique
 
     def list_repo_issues(
         self, full_name: str, since: str | None = None, *, include_issues: bool = True,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | PartialItemInventory:
         owner, name = split_full_name(full_name)
         issues = _retry_enumeration_on_drift(
             lambda: self._list_issue_nodes(owner, name, since, changed_only=False)
@@ -697,13 +747,16 @@ class GitHubOrgReader:
         full_name: str,
         since: str | None,
         stored_pr_updated_at: dict[int, str],
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | PartialItemInventory:
         if since is None:
             return self.list_repo_issues(full_name)
         owner, name = split_full_name(full_name)
         issues, pulls = _retry_enumeration_on_drift(
             lambda: self._list_changed_issue_and_pull_nodes(owner, name, since)
         )
+        inventory = self._merge_item_nodes(full_name, issues, pulls)
+        if isinstance(inventory, PartialItemInventory):
+            return inventory
         pulls = self._changed_pull_nodes(full_name, pulls, stored_pr_updated_at)
         return self._merge_item_nodes(full_name, issues, pulls)
 
@@ -714,14 +767,14 @@ class GitHubOrgReader:
         stored_pr_updated_at: dict[str, dict[int, str]],
         *,
         include_issues: bool = True,
-    ) -> dict[str, list[dict[str, Any]] | PullReconciliation]:
+    ) -> dict[str, list[dict[str, Any]] | PullReconciliation | PartialItemInventory]:
         if len({name.casefold() for name in full_names}) != len(full_names):
             raise ValueError("duplicate repositories in changed-item batch")
         if since is None:
             return {name: self.list_repo_issues(name) if include_issues else
                     self.list_repo_issues(name, include_issues=False) for name in full_names}
         parse_graphql_datetime(since, "repository batch watermark")
-        result: dict[str, list[dict[str, Any]] | PullReconciliation] = {}
+        result: dict[str, list[dict[str, Any]] | PullReconciliation | PartialItemInventory] = {}
         # Only minimal stubs are batched. Their complete expanded graphs still
         # supply all direct-association evidence through the existing reader.
         for start in range(0, len(full_names), 20):
@@ -729,7 +782,15 @@ class GitHubOrgReader:
             completed = _retry_enumeration_on_drift(
                 lambda: self._list_changed_item_chunk(names, since, include_issues=include_issues)
             )
-            for full_name, (issues, pulls) in completed.items():
+            for full_name, source in completed.items():
+                if isinstance(source, PartialItemInventory):
+                    result[full_name] = source
+                    continue
+                issues, pulls = source
+                inventory = self._merge_item_nodes(full_name, issues, pulls)
+                if isinstance(inventory, PartialItemInventory):
+                    result[full_name] = inventory
+                    continue
                 stored = stored_pr_updated_at.get(full_name, {})
                 missing_ids: set[int] = set()
                 try:
@@ -739,7 +800,15 @@ class GitHubOrgReader:
                     repeated = _retry_enumeration_on_drift(
                         lambda: self._list_changed_item_chunk([full_name], since, include_issues=include_issues)
                     )
-                    issues, pulls = repeated[full_name]
+                    source = repeated[full_name]
+                    if isinstance(source, PartialItemInventory):
+                        result[full_name] = source
+                        continue
+                    issues, pulls = source
+                    inventory = self._merge_item_nodes(full_name, issues, pulls)
+                    if isinstance(inventory, PartialItemInventory):
+                        result[full_name] = inventory
+                        continue
                     missing_ids = error.ids - {int(required_id(node, "pr")) for node in pulls}
                     pulls = self._changed_pull_nodes(
                         full_name, pulls, {pull_id: updated for pull_id, updated in stored.items() if pull_id not in missing_ids}
@@ -754,7 +823,7 @@ class GitHubOrgReader:
         since: str,
         *,
         include_issues: bool,
-    ) -> dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+    ) -> dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]] | PartialItemInventory]:
         declarations = ["$since: DateTime!"] if include_issues else []
         fields: list[str] = []
         variables: dict[str, Any] = {"since": since} if include_issues else {}
@@ -782,15 +851,19 @@ class GitHubOrgReader:
             """)
         query = "query(" + ", ".join(declarations) + ") {" + "".join(fields) + "}"
         data = self.client.graphql(query, variables)
-        repositories = {}
+        repositories, unreadable = {}, {}
         for index, full_name in enumerate(names):
             repo = data.get(f"repo_{index}")
             if not isinstance(repo, dict):
-                raise GitHubApiError(f"missing repository batch result: {full_name}")
-            if str(repo.get("nameWithOwner", "")).casefold() != full_name.casefold():
-                raise GitHubApiError(f"repository batch result does not match: {full_name}")
-            repositories[full_name] = repo
-        return self._complete_changed_repository_batch(names, since, repositories, include_issues=include_issues)
+                unreadable[full_name] = PartialItemInventory([], [f"missing repository batch result: {full_name}"], {})
+            elif str(repo.get("nameWithOwner", "")).casefold() != full_name.casefold():
+                unreadable[full_name] = PartialItemInventory([], [f"repository batch result does not match: {full_name}"], {})
+            else:
+                repositories[full_name] = repo
+        if not repositories:
+            raise GitHubApiError(next(iter(unreadable.values())).problems[0])
+        complete = self._complete_changed_repository_batch(list(repositories), since, repositories, include_issues=include_issues)
+        return {**complete, **unreadable}
 
     def _complete_changed_repository_batch(
         self,
@@ -860,8 +933,7 @@ class GitHubOrgReader:
                     if total_count != totals[identity]:
                         raise GitHubEnumerationDriftError(f"{key} totalCount changed while enumerating {full_name}: {totals[identity]} to {total_count}")
                     for node in conn["nodes"]:
-                        updated_at = parse_graphql_datetime(node.get("updatedAt"), f"{full_name} {key} node")
-                        if key == "pullRequests" or updated_at >= since_at:
+                        if key == "pullRequests" or _changed_issue_node(node, since_at):
                             nodes[identity].append(node)
                     if conn["pageInfo"]["hasNextPage"]:
                         cursor = required_next_cursor(conn["pageInfo"], cursors[identity], owner, name, key)
@@ -979,9 +1051,12 @@ class GitHubOrgReader:
             if stored is None:
                 changed.append(node)
                 continue
-            stored_at = parse_graphql_datetime(
-                stored, f"stored pull request {pull_id} for {full_name}"
-            )
+            try:
+                stored_at = parse_graphql_datetime(stored, f"stored pull request {pull_id} for {full_name}")
+            except GitHubApiError as error:
+                logger.warning("Refreshing unreadable saved pull %s#%s: %s", full_name, node.get("number"), error)
+                changed.append(node)
+                continue
             # GitHub can correct timestamps backward; either change needs a fresh graph.
             if updated_at != stored_at:
                 changed.append(node)
@@ -993,17 +1068,35 @@ class GitHubOrgReader:
 
     def _merge_item_nodes(
         self, full_name: str, issues: list[dict[str, Any]], pulls: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        items = [graphql_item_stub_to_row(node, "issue") for node in issues]
-        items.extend(graphql_item_stub_to_row(node, "pr") for node in pulls)
-        item_ids = [item["id"] for item in items]
-        if len(item_ids) != len(set(item_ids)):
-            raise GitHubApiError(f"duplicate item ids returned for {full_name}")
-        numbers = [(item["number"], item["item_kind"]) for item in items]
-        if len(numbers) != len(set(numbers)):
-            raise GitHubApiError(f"duplicate item numbers returned for {full_name}")
+    ) -> list[dict[str, Any]] | PartialItemInventory:
+        items, problems, unreadable = [], [], {}
+        for kind, nodes in (("issue", issues), ("pr", pulls)):
+            for index, node in enumerate(nodes):
+                try:
+                    if not isinstance(node, dict):
+                        raise GitHubApiError(f"GitHub returned a missing or malformed {kind} entry")
+                    items.append(graphql_item_stub_to_row(node, kind))
+                except (GitHubApiError, KeyError, ValueError, TypeError, AttributeError) as error:
+                    number = node.get("number") if isinstance(node, dict) else None
+                    target = f"#{number}" if type(number) is int else f"row {index + 1}"
+                    reason = f"{full_name} {kind} {target}: {error}"
+                    problems.append(reason)
+                    if type(number) is int and number > 0:
+                        unreadable[number] = reason
+        by_id = Counter(item["id"] for item in items)
+        by_number = Counter(item["number"] for item in items)
+        unique = []
+        for item in items:
+            number = item["number"]
+            if by_id[item["id"]] > 1 or by_number[number] > 1:
+                reason = f"{full_name}#{number}: duplicate item identity"
+                problems.append(reason)
+                unreadable[number] = reason
+            elif number not in unreadable:
+                unique.append(item)
+        items = unique
         items.sort(key=lambda item: (item["updated_at"], item["number"]))
-        return items
+        return PartialItemInventory(items, problems, unreadable) if problems else items
 
     def expand_issue_or_pr(self, repo: dict[str, Any], issue_stub: dict[str, Any]) -> dict[str, Any]:
         owner, name = split_full_name(str(repo["full_name"]))
@@ -1014,7 +1107,7 @@ class GitHubOrgReader:
 
     def fetch_initial_item_graphs(
         self, repo: dict[str, Any], items: list[dict[str, Any]]
-    ) -> dict[int, dict[str, Any]]:
+    ) -> dict[int, dict[str, Any] | ItemGraphError]:
         if not 1 <= len(items) <= ITEM_GRAPH_BATCH_SIZE:
             raise ValueError(f"item graph batch must contain 1..{ITEM_GRAPH_BATCH_SIZE} items")
         numbers = [int(item["number"]) for item in items]
@@ -1042,23 +1135,41 @@ class GitHubOrgReader:
             "query(" + ", ".join(declarations) + ") {"
             " repository(owner: $owner, name: $name) { " + " ".join(selections) + " } }"
         )
-        data = self.client.graphql(query, variables)
-        nodes = data.get("repository")
         expected_aliases = {f"item_{index}" for index in range(len(items))}
-        if not isinstance(nodes, dict) or set(nodes) != expected_aliases:
+        failures: dict[str, str] = {}
+        try:
+            data = self.client.graphql(query, variables)
+        except GitHubGraphQLError as error:
+            if not isinstance(error.data, dict) or not isinstance(error.errors, list):
+                raise
+            for entry in error.errors:
+                path = entry.get("path") if isinstance(entry, dict) else None
+                if (not isinstance(path, list) or len(path) < 2 or path[0] != "repository"
+                        or not isinstance(path[1], str) or path[1] not in expected_aliases):
+                    raise
+                failures.setdefault(path[1], str(entry.get("message") or "GitHub returned a graph error"))
+            data = error.data
+        nodes = data.get("repository")
+        if not isinstance(nodes, dict):
             raise GitHubApiError(f"incomplete item graph batch for {owner}/{name}")
-        result = {}
+        result: dict[int, dict[str, Any] | ItemGraphError] = {}
         for index, item in enumerate(items):
-            node = nodes[f"item_{index}"]
+            alias = f"item_{index}"
+            node = nodes.get(alias)
+            number = numbers[index]
+            if alias in failures:
+                result[number] = ItemGraphError(f"{owner}/{name}#{number}: {failures[alias]}")
+                continue
             expected_type = "PullRequest" if item["item_kind"] == "pr" else "Issue"
-            if (
-                not isinstance(node, dict)
-                or node.get("__typename") != expected_type
-                or node.get("number") != numbers[index]
-                or int(required_id(node, item["item_kind"])) != int(item["id"])
-            ):
-                raise GitHubApiError(f"item graph identity mismatch for {owner}/{name}#{numbers[index]}")
-            result[numbers[index]] = {key: value for key, value in node.items() if key != "__typename"}
+            try:
+                if (not isinstance(node, dict) or node.get("__typename") != expected_type
+                        or type(node.get("number")) is not int or node["number"] != number
+                        or int(required_id(node, item["item_kind"])) != int(item["id"])):
+                    raise ItemGraphError("missing graph or identity mismatch")
+            except (GitHubApiError, ValueError, TypeError) as error:
+                result[number] = ItemGraphError(f"{owner}/{name}#{number}: {error}")
+                continue
+            result[number] = {key: value for key, value in node.items() if key != "__typename"}
         return result
 
     def expand_item_graph(
@@ -1066,9 +1177,14 @@ class GitHubOrgReader:
     ) -> dict[str, Any]:
         owner, name = split_full_name(str(repo["full_name"]))
         number = int(item["number"])
-        if item["item_kind"] == "pr":
-            return self._expand_pull_graph(repo, owner, name, number, node)
-        return self._expand_issue_graph(repo, owner, name, number, node)
+        try:
+            if item["item_kind"] == "pr":
+                return self._expand_pull_graph(repo, owner, name, number, node)
+            return self._expand_issue_graph(repo, owner, name, number, node)
+        except GitHubRateLimitError:
+            raise
+        except (GitHubApiError, KeyError, TypeError, ValueError, AttributeError) as error:
+            raise ItemGraphError(f"{owner}/{name}#{number}: {type(error).__name__}: {error}") from error
 
     def _list_issue_nodes(
         self,
@@ -1191,10 +1307,7 @@ class GitHubOrgReader:
                     )
             received_count += len(conn["nodes"])
             for node in conn["nodes"]:
-                updated_at = parse_graphql_datetime(
-                    node.get("updatedAt"), f"{owner}/{name} {key} node"
-                )
-                if since_at is None or updated_at >= since_at:
+                if since_at is None or _changed_issue_node(node, since_at):
                     nodes.append(node)
             if not conn["pageInfo"]["hasNextPage"]:
                 break
@@ -1590,12 +1703,24 @@ def required_total_count(
 def graphql_item_stub_to_row(node: dict[str, Any], item_kind: str) -> dict[str, Any]:
     updated_at = node.get("updatedAt")
     parse_graphql_datetime(updated_at, f"{item_kind} stub")
+    number = node.get("number")
+    if type(number) is not int or number <= 0:
+        raise GitHubApiError(f"{item_kind} stub lacks a valid number")
     return {
         "id": int(required_id(node, item_kind)),
-        "number": int(node["number"]),
+        "number": number,
         "updated_at": updated_at,
         "item_kind": item_kind,
     }
+
+
+def _changed_issue_node(node: Any, since: datetime) -> bool:
+    try:
+        return parse_graphql_datetime(node.get("updatedAt"), "issue stub") >= since
+    except (AttributeError, GitHubApiError):
+        # Keep its place until item validation, which records the reason and
+        # makes repository completeness unavailable for removal decisions.
+        return True
 
 
 def parse_graphql_datetime(value: Any, label: str) -> datetime:

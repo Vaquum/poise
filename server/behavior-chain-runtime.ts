@@ -419,17 +419,17 @@ export class BehaviorChainRuntime {
     if (!this.operations.closedSeedHints) return
     const hints = await this.operations.closedSeedHints(this.closedSeedCursor)
     if (!hints.length) this.closedSeedCursor = null
+    let failure: Error | null = null
     for (const hint of hints) {
       const now = Date.now()
       if (now - began > 45_000) break
       this.closedSeedCursor = hint
       if (!this.operations.ownsRepository(hint.repository) || hint.updatedAt > now) continue
-      let chain = this.journal.deferredSeedClosure(chainIdentity(hint.repository, hint.number), hint.updatedAt, now)
-      if (!chain) continue
-      // Use the usual observation, with no admission, reporting or recovery.
-      // An authoritative reopen also consumes the hint.
-      const observation = await this.operations.observe(chain)
       try {
+        let chain = this.journal.deferredSeedClosure(chainIdentity(hint.repository, hint.number), hint.updatedAt, now)
+        if (!chain) continue
+        // An authoritative reopen also consumes the hint.
+        const observation = await this.operations.observe(chain)
         chain = this.append(chain, { type: 'chain.observed', observation })
         if (observation.pull?.merged && observation.pull.mergeSha) {
           chain = this.recordMerge(chain, observation, false)
@@ -438,10 +438,25 @@ export class BehaviorChainRuntime {
           else if (decision.kind === 'close-review-hold') this.append(chain, { type: 'chain.review-hold-closed',
             closure: { mergeSha: chain.mergeSha!, actor: chain.author, label: decision.label } })
         }
+        break
+      } catch (error) {
+        if (!(error instanceof BehaviorChainRevisionConflict) && !staleDatastoreFailure(error)) {
+          const cause = this.targetFailure(`${hint.repository}#${hint.number}`, 'closed-seed-recheck', error)
+          failure ??= cause
+        }
       }
-      catch (error) { if (!(error instanceof BehaviorChainRevisionConflict)) throw error }
-      break
     }
+    if (failure) throw failure
+  }
+
+  private targetFailure(target: string, phase: string, error: unknown): Error {
+    const message = behaviorErrorMessage(error)
+    if (!(error instanceof CallerReceiptStoreError && error.diagnosticRecorded)) {
+      diagnostic({ level: 'error', operation: 'behavior-chain.target', target,
+        repository: target.split('#')[0], phase, message })
+    }
+    if (error instanceof CallerReceiptStoreError) return error
+    return new Error(`Behavior chain ${target} failed during ${phase}: ${message}`, { cause: error })
   }
 
   /** The first capacity refusal for this uninterrupted behavior/basis/slot.
@@ -488,12 +503,18 @@ export class BehaviorChainRuntime {
     if (!decision.reviewer) return false
     const turn = (chain.waiting && capacityWait(chain.waiting) ? this.capacityWaitSequence(chain) : null) ?? Infinity
     const now = Date.now()
-    const earlierCount = this.journal.capacityWaiters().filter(waiter => {
-      const observation = waiter.observation as ChainObservation | null
-      if (this.operations.ownsRepository(waiter.repository) || !observation || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return false
-      const earlier = admissionDecision(waiter, observation, now)
-      if (!earlier?.reviewer || !decision.checkpoint && !earlier.checkpoint) return false
-      return (this.capacityWaitSequence(waiter) ?? Infinity) < turn
+    const earlierCount = this.journal.capacityWaiterIds().filter(id => {
+      try {
+        const waiter = this.journal.read(id)
+        const observation = waiter?.observation as ChainObservation | null | undefined
+        if (!waiter || this.operations.ownsRepository(waiter.repository) || !observation || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return false
+        const earlier = admissionDecision(waiter, observation, now)
+        if (!earlier?.reviewer || !decision.checkpoint && !earlier.checkpoint) return false
+        return (this.capacityWaitSequence(waiter) ?? Infinity) < turn
+      } catch (error) {
+        this.targetFailure(id, 'capacity-ordering', error)
+        return false
+      }
     }).length
     if (!earlierCount) return false
     const free = Math.min(this.operations.availableSlots?.() ?? 1, this.operations.capacity() - this.journal.liveModelInvocationCount())
@@ -600,10 +621,15 @@ export class BehaviorChainRuntime {
         if (this.operations.enabled()) {
           const accounts = this.operations.accounts()
           for (const seed of await this.operations.discover()) {
-            const id = chainIdentity(seed.repository, seed.number)
-            if (this.journal.read(id)) continue
-            this.journal.append(id, `admit:${id}`, 0, { type: 'chain.admitted', repository: seed.repository, issue: seed.number,
-              branch: `poise/issue-${seed.number}-${chainBasis(id).slice(0, 12)}`, ...accounts })
+            try {
+              const id = chainIdentity(seed.repository, seed.number)
+              if (this.journal.read(id)) continue
+              this.journal.append(id, `admit:${id}`, 0, { type: 'chain.admitted', repository: seed.repository, issue: seed.number,
+                branch: `poise/issue-${seed.number}-${chainBasis(id).slice(0, 12)}`, ...accounts })
+            } catch (error) {
+              const failure = this.targetFailure(`${seed.repository}#${seed.number}`, 'intake', error)
+              intakeError ??= failure
+            }
           }
         }
       } catch (error) {
@@ -611,25 +637,36 @@ export class BehaviorChainRuntime {
         if (!staleDatastoreFailure(intakeError)) console.error('[behavior-chain] intake failed; admitted chains continue', intakeError)
       }
       const began = Date.now()
+      let observationError: Error | null = null
+      const retryLater = new Set<string>()
+      const fail = (id: string, phase: string, error: unknown) => {
+        retryLater.add(id)
+        observationError = preferObservationError(observationError, this.targetFailure(id, phase, error))
+      }
       // Auth-only automatic holds need no new GitHub read to retire their
       // retry boundary. Do this before the ordinary held-chain cadence.
-      let authHolds = this.journal.authenticationHolds(this.authenticationCursor)
+      let authHolds = this.journal.authenticationHoldIds(this.authenticationCursor)
       if (!authHolds.length && this.authenticationCursor) {
         this.authenticationCursor = ''
-        authHolds = this.journal.authenticationHolds('')
+        authHolds = this.journal.authenticationHoldIds('')
       }
-      for (const held of authHolds) {
-        this.authenticationCursor = held.id
-        if (this.operations.ownsRepository(held.repository)) this.recoverAuthentication(held)
+      for (const id of authHolds) {
+        this.authenticationCursor = id
+        try {
+          const held = this.journal.read(id)
+          if (held && this.operations.ownsRepository(held.repository)) this.recoverAuthentication(held)
+        } catch (error) { fail(id, 'authentication-recovery', error) }
       }
-      let observationError: Error | null = null
-      const conflicted = new Set<string>()
-      const waiters = this.journal.capacityWaiters().flatMap(chain => {
-        const sequence = this.capacityWaitSequence(chain)
-        if (sequence === null) return []
-        const observation = chain.observation as ChainObservation | null
-        const model = !!observation && admissionNeedsModel(chain, observation, observation.checkedAt)
-        return [{ chain, sequence, model }]
+      const waiters = this.journal.capacityWaiterIds().flatMap(id => {
+        if (retryLater.has(id)) return []
+        try {
+          const chain = this.journal.read(id)
+          const sequence = chain && this.capacityWaitSequence(chain)
+          if (!chain || sequence === null) return []
+          const observation = chain.observation as ChainObservation | null
+          const model = !!observation && admissionNeedsModel(chain, observation, observation.checkedAt)
+          return [{ chain, sequence, model }]
+        } catch (error) { fail(id, 'capacity-ordering', error); return [] }
       }).sort((a, b) => a.sequence - b.sequence)
       const offered = new Set<string>()
       const visited = new Set<string>()
@@ -646,19 +683,26 @@ export class BehaviorChainRuntime {
           if (Date.now() - began > 45_000) break
         }
         const cursorKey = deferred ? 'reconciliationCursor' : 'cursor'
-        let page = this.journal.reconcilable(this[cursorKey], Date.now(), deferred)
-        if (!page.length && this[cursorKey]) {
+        let ids = this.journal.reconcilableIds(this[cursorKey], Date.now(), deferred)
+        if (!ids.length && this[cursorKey]) {
           this[cursorKey] = ''
-          page = this.journal.reconcilable('', Date.now(), deferred)
+          ids = this.journal.reconcilableIds('', Date.now(), deferred)
         }
-        if (!page.length) { this[cursorKey] = ''; continue }
-        const snapshot = await this.readInvocations(page.filter(chain => !conflicted.has(chain.id) && !visited.has(chain.id)))
+        if (!ids.length) { this[cursorKey] = ''; continue }
+        const page = ids.flatMap(id => {
+          if (retryLater.has(id) || visited.has(id)) return []
+          try {
+            const chain = this.journal.read(id)
+            return chain ? [chain] : []
+          } catch (error) { fail(id, 'projection-read', error); return [] }
+        })
+        const snapshot = await this.readInvocations(page)
         const work: Array<{ chain: BehaviorChain, priority: number | null, cursor: boolean, model?: boolean }> = page.map(chain => ({ chain, priority: null, cursor: true }))
         for (let index = 0; index < work.length; index++) {
           let { chain } = work[index]
           if (Date.now() - began > 45_000) break
           if (work[index].cursor) this[cursorKey] = chain.id
-          if (conflicted.has(chain.id)) continue
+          if (retryLater.has(chain.id)) continue
           // A due recovery can enter the later active page before Caller has
           // registered its launch. Explicit capacity retries remain eligible.
           if (work[index].cursor) {
@@ -674,10 +718,9 @@ export class BehaviorChainRuntime {
               offered.add(chain.id)
               continue
             }
-            chain = this.current(chain)
             offered.add(chain.id)
           }
-          let chainSnapshot = work[index].priority !== null ? await this.readInvocations([chain]) : snapshot
+          let chainSnapshot = snapshot
           let phase = 'reconciliation'
           let conflictPhase: string | null = null
           let conflictDeferred = false
@@ -689,7 +732,7 @@ export class BehaviorChainRuntime {
             retry = false
             attempts++
             try {
-              if (conflictPhase) {
+              if (conflictPhase || work[index].priority !== null) {
                 phase = 'receipt-read'
                 chain = this.current(chain)
                 chainSnapshot = await this.readInvocations([chain])
@@ -1055,11 +1098,14 @@ export class BehaviorChainRuntime {
                 if (this.renewsWait(chain, reason)) this.append(chain, { type: 'chain.waiting', reason })
               }
             } catch (error) {
-              if (!(error instanceof BehaviorChainRevisionConflict)) throw error
+              retryLater.add(chain.id)
+              if (!(error instanceof BehaviorChainRevisionConflict)) {
+                fail(chain.id, phase, error)
+                continue
+              }
               retry = conflictPhase === null && Date.now() - began <= 45_000
               conflictPhase = phase
               conflictDeferred = !retry
-              conflicted.add(chain.id)
             }
           } while (retry)
           if (conflictPhase) diagnostic({ level: 'warning', operation: 'behavior-chain.revision-conflict', target: chain.id,
@@ -1067,6 +1113,7 @@ export class BehaviorChainRuntime {
               ? 'Behavior chain revision conflict deferred to a later sweep' : 'Behavior chain revision conflict recovered with a fresh attempt',
             context: { outcome: conflictDeferred ? 'deferred' : 'recovered', attempts } })
         }
+        if (Date.now() - began <= 45_000) this[cursorKey] = ids.at(-1)!
       }
       if (observationError) {
         if (intakeError) throw new AggregateError([intakeError, observationError], `${intakeError.message}; ${observationError.message}`)
@@ -1268,9 +1315,9 @@ export class BehaviorChainRuntime {
         || prior?.replies_started === true || prior?.result != null
         || (prior?.publication_head != null && prior.publication_head !== call.artifact?.publication_head)
         || !repairQueueBlocker(chain, { ...invocation, callId: call.id, evidence })) {
-        const conflicted = { ...evidence, queueBlockerConflict: true }
-        if (!sameReceipt(invocation.evidence, conflicted)) chain = this.append(chain, {
-          type: 'invocation.reconciled', invocationId: invocation.id, evidence: conflicted })
+        const retryLater = { ...evidence, queueBlockerConflict: true }
+        if (!sameReceipt(invocation.evidence, retryLater)) chain = this.append(chain, {
+          type: 'invocation.reconciled', invocationId: invocation.id, evidence: retryLater })
         return invocation.state === 'uncertain' && invocation.outcome === reason ? chain
           : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id, reason })
       }
@@ -1496,10 +1543,11 @@ export class BehaviorChainRuntime {
       const action = review?.state === 'APPROVED' ? 'approved' : review?.state === 'CHANGES_REQUESTED' ? 'requested_changes' : review?.state === 'COMMENTED' ? 'reviewed_clean' : null
       const coverage = (artifact?.review_response as { coverage?: unknown } | null)?.coverage
       // A published partial keeps its incomplete disposition; the failed call outcome cannot speak for it.
-      const partial = action === 'requested_changes' && coverage === 'incomplete'
+      const partial = (action === 'requested_changes' || action === 'reviewed_clean') && coverage === 'incomplete'
       if (review && action && chainReviewResponse(chain, { ...invocation, callId: nativeId,
-        evidence: { ...invocation.evidence, action, review_id: review.id, ...(partial ? { outcome: 'incomplete' } : {}) } }, observation, Date.now())) {
-        const outcome = action === 'approved' ? 'approved' : action === 'requested_changes' ? (partial ? 'incomplete' : 'changes_requested') : 'clean'
+        evidence: { ...invocation.evidence, action, review_id: review.id, ...(partial ? { outcome: 'incomplete' } : {}) } },
+      observation, Date.now(), { allowPartialComment: true })) {
+        const outcome = partial ? 'incomplete' : action === 'approved' ? 'approved' : action === 'requested_changes' ? 'changes_requested' : 'clean'
         this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: nativeId, outcome,
           evidence: { ...invocation.evidence, status: 'completed', action, outcome, review_id: review.id, head_sha: review.head,
             reconciliation: 'native invocation marker verified on the actual GitHub review' } })

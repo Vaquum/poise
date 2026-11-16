@@ -266,6 +266,10 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
       model.blocks.push({ kind: 'note', key: `compact:${env.seq}`, rev: ++model.rev, text: e.detail })
       return
     }
+    case 'history.unreadable': {
+      model.blocks.push({ kind: 'note', key: `unreadable:${env.seq}`, rev: ++model.rev, text: `Saved transcript entry ${env.seq} could not be read.` })
+      return
+    }
     case 'turn.started': {
       // The optimistic turn for this prompt becomes the real one.
       dropOptimisticTurns(model)

@@ -447,8 +447,11 @@ shared across requests; dense batches return shorter pages with lossless `next_l
 An entry too large for its share asks for a separate request. Git metadata, untracked files, symlinks,
 path escapes, writes, test execution, and arbitrary commands are unavailable.
 Reading a non-UTF-8 file returns an explicit per-file error and no text; other
-requests in the batch still return their results. Binary content is not decoded
-with replacement characters or treated as inspected source.
+requests in the batch still return their results. Caller gives the reviewer the
+successful results and the failed operation, path and cause. The review uses the
+source it has. The Call records those failures as a Warning in progress and
+Logging, and the published assessment includes the limitations. Resumed Calls
+retain the warnings.
 
 Claude reviews with the governed `github-interface` tools and can invoke that
 inspection command from the pinned checkout. Every other provider
@@ -457,8 +460,9 @@ one existing `github-interface` terminal command with the original PR, actor, an
 expected head. For PR review these providers can first return `action: "inspect"`
 with provisional `comments` and a `requests` array; Caller reads the requested
 source and supplies the result in their next turn. Terminal verdicts require
-`requests: []`. At most 12 inspection rounds fit within the existing total review
-deadline and 3 MB prompt limit; exhausting inspection never submits a review.
+`requests: []`. Caller allows at most 12 inspection rounds within the existing
+total review deadline and 3 MB prompt limit. When optional inspection reaches
+either limit, the reviewer returns a verdict using the source already supplied.
 After a successful provider call, an invalid response gets one correction attempt
 with the rejected output and validation error, within the remaining review budget
 and prompt limit. Codex reuses the same review conversation. The same validation
@@ -556,20 +560,12 @@ The limit applies per response. `pr_approve` has no inspection tool, so all its 
 is one response, and Claude Code restarts a response cut at the limit without that reasoning.
 Other behaviors retain their existing model assignments and limits.
 
-Local pinned-repository inspection has a separate 30-second deadline, capped by
-the remaining review budget. Structured analysis also caps each inspection by
-the remaining analysis allowance and current file group's deadline, keeping the
-60-second submission and 60-second verification reserves even after a provider
-returns near the analysis cutoff.
-A local 30-second timeout records `review_inspection_timeout` and
-retains the inspection phase, deadline and pinned target in the existing process
-diagnostic, without command arguments or inspection content in the error.
-If a file-group, provider-analysis or overall deadline limits the inspection
-first, that limiting phase is retained with `review_budget_exhausted` instead.
-Poise excludes local inspection timeouts from provider backoff, including older calls
-labeled `review_budget_exhausted`. The existing behavior chain retries the same
-review basis and slot after resource release and native failure backoff, holding
-after three failed attempts; Caller adds no inspection retry loop.
+Optional pinned-repository lookups have a 30-second ceiling and receive at most
+half of the available analysis time. A lookup timeout records a Warning for the
+request and the review continues with its remaining time. If the whole review
+deadline expires during inspection, the failure retains the local operation
+and the limiting phase. Poise keeps the existing 60-second submission and
+verification reserves.
 
 A Grok Build `pr_review` or `pr_approve` also has an 800-second analysis ceiling,
 counted from when analysis starts, for one file group or many, with or without
@@ -666,10 +662,10 @@ guide. A group can borrow slack after reserving the mean observed analysis time
 of completed groups for each remaining group, excluding the common-context turn
 and capping each later group's reserve at half the current equal share. An expensive
 early prefix therefore cannot reserve away the current group's borrowing room.
-After half the equal share, Caller asks the provider to omit optional inspection;
-required inspection and subsequent provider turns can still use the borrowed time.
-The inspection schema stays available even at the round limit, so a need for
-further evidence fails explicitly as incomplete analysis rather than forcing a verdict.
+After half the equal share, Caller asks the provider to finish using the
+available source. At the inspection limit, Caller asks for a verdict and records
+any unread pages in the assessment. A provider that still cannot return a
+valid verdict fails with the specific validation cause.
 Provider execution and inspection stay within the group's deadline and the shared
 analysis cutoff. Deadline failures retain the limiting phase (`file_group`,
 `provider_analysis`, `inspection` or `overall`), group/count, elapsed time and
@@ -744,11 +740,11 @@ The original Call's `artifact.review_progress` retains the generation, current
 unit, claimant, cumulative spend and bounded evidence references in the existing
 response store. Validated inspection pages, unfinished cursors, provisional
 findings and verified repair revisions survive interruption before a group
-verdict. Providers must account for the supplied evidence IDs; missing evidence,
-unfinished required pages and incomplete source inventories grant no review
-authority. A required final integration unit receives every unit's assessment,
-findings and boundary evidence, and can inspect cross-file contracts before
-returning the single verdict.
+verdict. Providers must account for the supplied evidence IDs. When a checkout
+or diff page is unavailable, Caller retains the cause as a warning and reviews
+the source it received. A required final integration unit receives every unit's
+assessment, findings and boundary evidence, and can inspect cross-file contracts
+before returning the single verdict.
 
 The Call's `artifact.review_checkpoint` retains the original root and generation
 with completed and required units, attempts, cumulative time and the last
@@ -775,8 +771,11 @@ finalization. Its checkpoint retains the complete verdict, the original response
 identity and whether position remapping finished. After a proven pre-write
 deadline and positive resource settlement, the next claimant resumes that step
 without provider analysis. Already remapped LEFT locations are never remapped
-again. Changed review input, altered retained evidence, incomplete coverage and
-more than 100 inline findings remain held with all findings retained.
+again. Changed review input, altered retained evidence and more than 100 inline
+findings remain held with all findings retained. Partial source produces a
+GitHub review with its limitations and any supported findings. A neutral note
+from partial source retains an `incomplete` result. Approval and review clearance
+require complete source coverage.
 
 The existing head-pinned submission reserves the shared progress receipt
 atomically. The response and GitHub marker keep the original finalizing Call's

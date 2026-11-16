@@ -4674,15 +4674,15 @@ it.each(['stale datastore', 'lost acknowledgement'])('rechecks pending implement
     const intent = reports(db)
     const postCount = posts().length, observations = observe.mock.calls.length
     expect(journal.reconciliationAt(current)).toBe(checkedAt + 120_000)
-    expect(journal.reconcilable('', checkedAt + 120_000, false)).toEqual([])
+    expect(journal.reconcilableIds('', checkedAt + 120_000, false)).toEqual([])
     vi.setSystemTime(checkedAt + 119_999)
     for (let pass = 0; pass < 2; pass++) await runtime.run()
-    expect(journal.reconcilable('', Date.now(), true)).toEqual([])
+    expect(journal.reconcilableIds('', Date.now(), true)).toEqual([])
     expect(journal.read(chain.id)).toEqual(current)
     expect(observe).toHaveBeenCalledTimes(observations)
     expect(reports(db)).toEqual(intent); expect(posts()).toHaveLength(postCount)
     vi.setSystemTime(checkedAt + 120_000)
-    expect(journal.reconcilable('', Date.now(), true).map(row => row.id)).toEqual([chain.id])
+    expect(journal.reconcilableIds('', Date.now(), true)).toEqual([chain.id])
     await runtime.run()
     expect(observe).toHaveBeenCalledTimes(observations + 1)
   }
@@ -4728,7 +4728,7 @@ it.each(['stale datastore', 'lost acknowledgement'])('rechecks pending implement
     const next = checkedAt + checkedAt - current.invocations[0].admittedAt
     expect(journal.reconciliationAt(current)).toBe(next)
     vi.setSystemTime(checkedAt + 120_000)
-    expect(journal.reconcilable('', Date.now(), true)).toEqual([])
+    expect(journal.reconcilableIds('', Date.now(), true)).toEqual([])
     await runtime.run()
     expect(journal.read(chain.id)).toEqual(current)
     vi.setSystemTime(next)
@@ -4760,7 +4760,7 @@ it.each(['operator hold', 'pre-Resume receipt'])('does not accelerate retained p
   expect(journal.reconciliationAt(source)).toBe(checkedAt + checkedAt - source.invocations[0].admittedAt)
   stale = false
   vi.setSystemTime(checkedAt + 120_000)
-  expect(journal.reconcilable('', Date.now(), true)).toEqual([])
+  expect(journal.reconcilableIds('', Date.now(), true)).toEqual([])
   for (let pass = 0; pass < 2; pass++) await runtime.run()
   expect(observe).toHaveBeenCalledTimes(1)
   expect(journal.read(chain.id)).toEqual(source)
@@ -4954,6 +4954,19 @@ it('blocks budget report implementation when the acknowledgement was lost', asyn
   expect(current.waiting).toContain('awaits a current explicit')
   expect(JSON.parse(reports(db)[0].value).issueNumber).toBe(99)
   expect(posts()).toHaveLength(1)
+})
+
+it('omits private operator hold details from receipt-first work impact in generated reports', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = uncertainImplementation(journal)
+  record(journal, chain, { type: 'chain.held', reason: 'private operator context\nprivate reviewer identity' })
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  expect(behaviorChainWorkImpact(journal, null, call.correlation_id!)?.nextAction)
+    .toContain('Reconcile the original invocation receipt first. Resolve the hold and explicitly resume: private operator context')
+  expect(remote[0].body).toContain('Next action: Reconcile the original invocation receipt first. Resolve the hold and explicitly resume; inspect the original journal evidence for the cause.')
+  expect(remote[0].body).not.toMatch(/private operator context|private reviewer identity/)
 })
 
 it.each(['new report', 'lost acknowledgement', 'closed markerless link'])('reports an unheld uncertain implementation once across restart: %s', async mode => {

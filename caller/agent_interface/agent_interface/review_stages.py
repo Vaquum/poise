@@ -104,6 +104,36 @@ def stage_count(packet: str) -> int:
     return 1 if planned is None else len(planned[1])
 
 
+def available_source(packet: str) -> tuple[str, list[str]]:
+    """Stage the readable diff and identify each missing file or section."""
+    node = json.loads(packet)
+    if not isinstance(node.get("files"), list) or not isinstance(node.get("diff"), str):
+        return packet, []
+    files = {entry["filename"]: entry for entry in node["files"]
+             if isinstance(entry, dict) and isinstance(entry.get("filename"), str)}
+    warnings = []
+    if len(files) != len(node["files"]):
+        warnings.append("The PR packet listed invalid or duplicate changed-file records.")
+    available, covered = [], set()
+    for section in _sections(node["diff"]):
+        try:
+            paths = _covers(section, list(files))
+        except StageError as error:
+            warnings.append(str(error))
+            continue
+        available.extend(section)
+        covered.update(paths)
+    omitted = node.get("omitted_files", [])
+    unread = [filename for filename in files if filename not in covered]
+    warnings.extend(f"No readable PR diff for {filename}." for filename in unread)
+    if not warnings:
+        return packet, warnings
+    unread_files = [{"path": filename, "reason": "PR diff unavailable"} for filename in unread]
+    return json.dumps({**node, "diff": "\n".join(available), "coverage": "incomplete",
+                       "files": [entry for filename, entry in files.items() if filename in covered],
+                       "omitted_files": [*omitted, *unread_files] if isinstance(omitted, list) else unread_files}), warnings
+
+
 def required_stages(packet: str, *, max_units: int) -> Iterator[str]:
     """Bound continuation units, including individual large source hunks.
 

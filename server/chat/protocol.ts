@@ -495,6 +495,7 @@ export type ChatEvent =
   | { type: 'mode.updated', mode: string, modes: ModeOption[] }
   | { type: 'model.updated', model: string, modelId: string, effort: string, efforts?: string[] }
   | { type: 'history.imported', legacyId: string, turns: Array<{ prompt: string, reply: string, at: string, status: string }>, omitted: number }
+  | { type: 'history.unreadable' }
   | { type: 'edit.decided', turnId: string, messageId: string, index: number, decision: EditDecision }
   | { type: 'content.started', topic: string, launchId: string, callId?: string }
   | { type: 'consensus.started', id: string, topic: string }

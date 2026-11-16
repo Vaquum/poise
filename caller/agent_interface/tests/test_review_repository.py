@@ -238,7 +238,7 @@ class TestRepositoryLifecycle(TestCase):
             with rr.prepare("/repo", PR, "bot", HEAD, PACKET):
                 self.fail("wrong checkout yielded")
 
-    def test_initial_inspection_process_error_keeps_its_own_phase_path_and_deadline(self):
+    def test_initial_inspection_process_error_is_returned_with_its_cause(self):
         for timed_out in (False, True):
             checkout = {}
             def command(argv, **kwargs):
@@ -250,15 +250,12 @@ class TestRepositoryLifecycle(TestCase):
                 if timed_out:
                     raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
                 raise FileNotFoundError('inspection executable absent')
-            with self.subTest(timed_out=timed_out), patch.object(rr.subprocess, 'run', side_effect=command), self.assertRaises(atoms.AgentPreflightError) as failure:
+            with self.subTest(timed_out=timed_out), patch.object(rr.subprocess, 'run', side_effect=command):
                 with rr.prepare('/repo', PR, 'bot', HEAD, PACKET) as repository:
-                    repository.prompt()
-            self.assertEqual(failure.exception.diagnostic['phase'], 'inspection')
-            self.assertEqual(failure.exception.diagnostic['cwd'], checkout['root'])
-            self.assertEqual(failure.exception.diagnostic['timeout_seconds'], 30)
-            if timed_out:
-                self.assertEqual(failure.exception.code, 'review_inspection_timeout')
-                self.assertNotIn('--requests-json', str(failure.exception))
+                    prompt = repository.prompt()
+                    self.assertIn('timed out after 30 seconds' if timed_out else 'inspection executable absent', prompt)
+                    self.assertIn('Repository list of . from line 1 failed', repository.warnings[0])
+                    self.assertNotIn('--requests-json', repository.warnings[0])
 
     def test_all_provider_prompts_receive_identical_guidance_and_scoped_access(self):
         repo = SimpleNamespace(root=Path("/tmp/review"), prompt=lambda: "trusted merge-base AGENTS.md guidance")
@@ -290,6 +287,16 @@ class TestRepositoryLifecycle(TestCase):
 
 
 class TestStructuredInspection(TestCase):
+    def test_lookup_keeps_readable_lines_beside_a_malformed_entry(self):
+        repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
+        healthy = {"line": 2, "text": "real source"}
+        warnings = []
+        with patch.object(repo, "inspect", return_value={"action": "review_context", "head_sha": HEAD, "results": [
+            {"request": REQUEST, "truncated": False, "next_line": None, "lines": [{"line": "unknown"}, healthy]},
+        ]}):
+            retained = rr.inspect_context(repo, [REQUEST], warnings)
+        self.assertEqual(retained["results"][0]["lines"], [healthy])
+        self.assertIn("omitted 1 malformed evidence record", warnings[0])
     def test_real_cli_reports_a_binary_read_and_allows_one_informed_verdict(self):
         actual_run = subprocess.run
         with tempfile.TemporaryDirectory() as work:
@@ -386,7 +393,8 @@ class TestStructuredInspection(TestCase):
                 return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING], "requests": []})
             repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
             result = {"action": "review_context", "head_sha": HEAD,
-                      "results": [{"lines": [{"line": 1, "text": "old_contract()"}]}]}
+                      "results": [{"request": REQUEST, "lines": [{"line": 1, "text": "old_contract()"}],
+                                   "truncated": False, "next_line": None}]}
             model = CATALOG.resolve(identity)
             submissions = []
 
@@ -419,12 +427,11 @@ class TestStructuredInspection(TestCase):
         reply = json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST]})
         with patch.dict(sr.ASK, {"codex": lambda *args: reply}), patch.object(repo, "inspect", return_value={}), \
                 patch.object(sr.subprocess, "run") as submit, patch.object(sr, "MAX_INSPECTION_ROUNDS", 2), \
-                self.assertRaisesRegex(sr.review_budget.ReviewLimitError, "inspection limit") as failure:
+                self.assertRaisesRegex(atoms.AgentPreflightError, "instead of returning a verdict") as failure:
             sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR, "bot", HEAD, 60, repository=repo)
         submit.assert_not_called()
-        self.assertEqual(failure.exception.code, "review_budget_exhausted")
-        self.assertIn("incomplete analysis", str(failure.exception))
-        self.assertEqual(failure.exception.diagnostic["phase"], "inspection_rounds")
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertEqual(failure.exception.diagnostic["phase"], "validating")
         self.assertEqual(failure.exception.diagnostic["submission"], "none")
 
     def test_invalid_inspection_contract_has_a_terminal_failure_code(self):
@@ -445,13 +452,15 @@ class TestStructuredInspection(TestCase):
                 repo.inspect([REQUEST])
             self.assertEqual(failure.exception.code, code)
 
-    def test_inspection_failure_cannot_become_a_clean_review(self):
+    def test_reviewer_that_only_requests_inspection_fails_with_the_actual_reason(self):
         repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
         with patch.dict(sr.ASK, {"codex": lambda *args: json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST]})}), \
                 patch.object(repo, "inspect", side_effect=atoms.AgentPreflightError("path escaped")), \
-                patch.object(sr.subprocess, "run") as submit, self.assertRaises(atoms.AgentPreflightError):
+                patch.object(sr.subprocess, "run") as submit, \
+                self.assertRaisesRegex(atoms.AgentPreflightError, "instead of returning a verdict"):
             sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR, "bot", HEAD, 60, repository=repo)
         submit.assert_not_called()
+        self.assertIn("path escaped", repo.warnings[0])
 
     def test_final_inspection_round_keeps_required_inspection_available(self):
         repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})

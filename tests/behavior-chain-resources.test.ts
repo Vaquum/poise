@@ -138,13 +138,13 @@ describe('durable resource admission order', () => {
       await new BehaviorChainRuntime(journal, ops).run()
       expect(journal.read(chain.id)!.waiting).toContain(refusal === 'budget' ? 'budget is exhausted' : 'resource headroom')
       expect(journal.liveModelInvocationCount()).toBe(0)
-      expect(journal.capacityWaiters().map(current => current.id)).toEqual([chain.id])
+      expect(journal.capacityWaiterIds()).toEqual([chain.id])
       // Replace the runtime while the older obligation is still waiting.
       journal.rebuild()
       const runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), ops)
       for (let turn = 0; turn < 3; turn++) {
         for (let index = 0; index < 100; index++) queue.add(1000 + turn * 100 + index, index === 0)
-        expect(journal.reconcilable('', Date.now(), false).map(current => current.id)).not.toContain(chain.id)
+        expect(journal.reconcilableIds('', Date.now(), false)).not.toContain(chain.id)
         if (turn === 0) queue.release()
         else queue.finish(launches.at(-1)!)
         await Promise.all([runtime.run(), runtime.run()])
@@ -161,7 +161,7 @@ describe('durable resource admission order', () => {
   it.each(['memory', 'disk'] as const)('offers an older direct %s waiter even while model slots are unavailable', async dimension => {
     const queue = resourceQueue(dimension, 'headroom', true)
     await new BehaviorChainRuntime(queue.journal, queue.ops).run()
-    expect(queue.journal.capacityWaiters().map(current => current.id)).toEqual([queue.chain.id])
+    expect(queue.journal.capacityWaiterIds()).toEqual([queue.chain.id])
     for (let index = 0; index < 100; index++) queue.add(1000 + index)
     queue.ops.available = () => false
     queue.release()
@@ -175,10 +175,10 @@ describe('durable resource admission order', () => {
   it('runs newer direct work without observing older model waiters while model slots are unavailable', async () => {
     const queue = resourceQueue('memory', 'headroom')
     await new BehaviorChainRuntime(queue.journal, queue.ops).run()
-    expect(queue.journal.capacityWaiters().map(current => current.id)).toEqual([queue.chain.id])
+    expect(queue.journal.capacityWaiterIds()).toEqual([queue.chain.id])
     const direct = queue.add(1000, true)
     for (let index = 1; index < 100; index++) queue.add(1000 + index)
-    expect(queue.journal.reconcilable('', Date.now(), false).map(current => current.id)).not.toContain(queue.chain.id)
+    expect(queue.journal.reconcilableIds('', Date.now(), false)).not.toContain(queue.chain.id)
     queue.release()
     queue.ops.available = () => false
     const observed: string[] = []
@@ -197,10 +197,10 @@ describe('durable resource admission order', () => {
     await setupRuntime.run()
     const second = queue.add(8)
     await setupRuntime.run()
-    expect(queue.journal.capacityWaiters().map(current => current.id).sort()).toEqual([queue.chain.id, second.id].sort())
+    expect(queue.journal.capacityWaiterIds().sort()).toEqual([queue.chain.id, second.id].sort())
     const direct = queue.add(1000, true)
     for (let index = 1; index < 100; index++) queue.add(1000 + index)
-    const page = queue.journal.reconcilable('', Date.now(), false).map(current => current.id)
+    const page = queue.journal.reconcilableIds('', Date.now(), false)
     expect(page).not.toContain(queue.chain.id)
     expect(page).not.toContain(second.id)
     vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '20')

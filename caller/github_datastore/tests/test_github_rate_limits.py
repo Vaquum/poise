@@ -84,7 +84,8 @@ class GitHubRateLimitTest(unittest.TestCase):
             with self.subTest(reset=reset), patch("github_datastore.github_api.subprocess.run", return_value=response({"errors": RATE_ERRORS}, reset=reset)) as run:
                 with self.assertRaises(GitHubApiError) as caught:
                     GitHubClient().graphql("query { viewer { login } }")
-                self.assertNotIsInstance(caught.exception, GitHubRateLimitError)
+                self.assertIsInstance(caught.exception, GitHubRateLimitError)
+                self.assertIsNone(caught.exception.reset_at)
                 self.assertIn("no valid reset time", str(caught.exception))
                 self.assertNotIn("GITHUB_RATE_LIMIT_RESET=", str(caught.exception))
                 run.assert_called_once()

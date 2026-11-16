@@ -5,13 +5,15 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from github_datastore.cli import main
+from github_datastore import views
 from github_datastore.db import connect, get_state, init_db, set_state, upsert_repo
-from github_datastore.store import INITIALIZATION_KEY, init_org, iter_expanded, store_expanded, sync_once
+from github_datastore.github_api import GitHubRateLimitError, ItemGraphError, PartialItemInventory
+from github_datastore.store import INITIALIZATION_KEY, INVENTORY_RETRY_KEY, ITEM_SYNC_ERRORS, init_org, iter_expanded, store_expanded, sync_once
 from tests.test_store import BatchReader, base_expanded, repo_row
 
 
@@ -134,6 +136,65 @@ class InitializationTest(unittest.TestCase):
         self.assertEqual(self.item_ids(), [100, 200, 201])
         self.assertEqual(self.state("last_sync_at"), CATCHUP)
         self.assertEqual(json.loads(self.state(INITIALIZATION_KEY))["status"], "complete")
+
+    def test_unreadable_item_allows_initialization_and_retries_only_that_item(self) -> None:
+        reader = InitializationReader([self.repo, self.other_repo], {
+            self.repo["full_name"]: [expansion(self.repo, 100, 1), expansion(self.repo, 101, 2)],
+            self.other_repo["full_name"]: [expansion(self.other_repo, 200, 1)],
+        })
+        expand = reader.expand_issue_or_pr
+
+        def read(repo, item):
+            if item["id"] == 100:
+                raise ItemGraphError("missing comment page for issue #1")
+            return expand(repo, item)
+
+        with patch.object(reader, "expand_issue_or_pr", side_effect=read):
+            self.initialize(reader)
+        self.assertEqual(self.item_ids(), [101, 200])
+        self.assertEqual(json.loads(self.state(INITIALIZATION_KEY))["status"], "complete")
+        with closing(connect(self.path)) as conn:
+            saved = json.loads(get_state(conn, ITEM_SYNC_ERRORS, "100"))
+            self.assertEqual(saved["reason"], "missing comment page for issue #1")
+        reader.expanded.clear()
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader):
+            sync_once(self.path, workers=1)
+        self.assertEqual(reader.expanded, [100])
+        self.assertEqual(self.item_ids(), [100, 101, 200])
+        with closing(connect(self.path)) as conn:
+            self.assertIsNone(get_state(conn, ITEM_SYNC_ERRORS, "100"))
+
+    def test_partial_inventory_preserves_the_old_item_and_repairs_only_the_affected_repo(self) -> None:
+        first, second = self.repo["full_name"], self.other_repo["full_name"]
+        unchanged = expansion(self.repo, 100, 1)
+        reader = InitializationReader([self.repo, self.other_repo], {first: [unchanged], second: []})
+        self.initialize(reader)
+        healthy = expansion(self.repo, 101, 2)
+        sibling = expansion(self.other_repo, 200, 1)
+        reader.items.update({first: [unchanged, healthy], second: [sibling]})
+        reader.expanded.clear()
+        cause = f"{first} issue #1: invalid timestamp"
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader):
+            with patch.object(reader, "list_repos_changed_items", return_value={
+                first: PartialItemInventory([stub(healthy)], [cause], {1: cause}),
+                second: [stub(sibling)],
+            }):
+                sync_once(self.path, workers=1)
+            self.assertEqual(reader.expanded, [101, 200])
+            self.assertEqual(self.item_ids(), [100, 101, 200])
+            with closing(connect(self.path)) as conn:
+                saved = json.loads(get_state(conn, ITEM_SYNC_ERRORS, "100"))
+                self.assertEqual(saved["reason"], cause)
+                self.assertIsNotNone(get_state(conn, "repo:10", INVENTORY_RETRY_KEY))
+
+            reader.listed.clear()
+            reader.expanded.clear()
+            sync_once(self.path, workers=1)
+        self.assertEqual(reader.listed, [first])
+        self.assertEqual(reader.expanded, [100])
+        with closing(connect(self.path)) as conn:
+            self.assertIsNone(get_state(conn, ITEM_SYNC_ERRORS, "100"))
+            self.assertIsNone(get_state(conn, "repo:10", INVENTORY_RETRY_KEY))
 
     def test_resume_refreshes_changes_prunes_deletions_and_adds_new_items(self) -> None:
         first = self.reader([expansion(self.repo, 100, 1), expansion(self.repo, 101, 2), expansion(self.repo, 102, 3)])
@@ -374,13 +435,23 @@ class InitializationTest(unittest.TestCase):
         self.assertIsNone(self.state("last_sync_at"))
         self.assertEqual(self.item_ids(), [100])
 
-    def test_resume_rejects_corrupt_progress_and_expansion_identity(self) -> None:
+    def test_resume_repairs_an_unreadable_saved_expansion(self) -> None:
+        self.partial()
+        with closing(connect(self.path)) as conn:
+            with conn:
+                conn.execute("UPDATE items SET expanded_json = '{}', updated_at = 'invalid' WHERE item_id = 100")
+        reader = self.reader([expansion(self.repo, 100, 1), expansion(self.repo, 101, 2)])
+        with self.assertLogs("github_datastore.store", level="WARNING") as reasons:
+            self.initialize(reader, resume=True)
+        self.assertEqual(reader.expanded, [100, 101])
+        self.assertEqual(self.item_ids(), [100, 101])
+        self.assertIn("Refreshing unreadable saved item Vaquum/Test#1", "\n".join(reasons.output))
+
+    def test_resume_rejects_corrupt_shared_progress_and_repository_owner(self) -> None:
         cases = [
             ("UPDATE sync_state SET value = 'not-json' WHERE key = ?", (INITIALIZATION_KEY,), "invalid initialization"),
             ("UPDATE sync_state SET value = 'invalid' WHERE key = ?", ("full_build_markers_v1_initialized",), "marker state"),
             ("UPDATE repos SET owner = 'Other'", (), "different repository owner"),
-            ("UPDATE items SET expanded_json = '{}'", (), "invalid stored expansion"),
-            ("UPDATE items SET number = 99", (), "identity mismatch"),
         ]
         for statement, params, message in cases:
             with self.subTest(message=message):
@@ -457,6 +528,85 @@ class InitializationTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_sync_keeps_the_last_bad_item_snapshot_and_advances_healthy_items(self) -> None:
+        first = expansion(self.repo, 100, 1)
+        second = expansion(self.repo, 101, 2)
+        reader = self.reader([first, second])
+        with patch("github_datastore.store.utc_now", return_value=START):
+            self.initialize(reader)
+        updated = "2026-09-01T12:00:00Z"
+        reader.catchup_items[self.repo["full_name"]] = [
+            expansion(self.repo, 100, 1, updated), expansion(self.repo, 101, 2, updated),
+        ]
+        original = reader.expand_issue_or_pr
+
+        def expand(repo, item):
+            if item["number"] == 1:
+                raise ItemGraphError("issue labels missing")
+            return original(repo, item)
+
+        def timestamps():
+            conn = connect(self.path)
+            try:
+                return [row[0] for row in conn.execute("SELECT updated_at FROM items ORDER BY number")]
+            finally:
+                conn.close()
+
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader), \
+                patch("github_datastore.store.utc_now", return_value=updated), \
+                patch.object(reader, "expand_issue_or_pr", side_effect=expand), \
+                self.assertLogs("github_datastore.store", level="WARNING") as warning:
+            self.assertTrue(sync_once(self.path, workers=2))
+        self.assertIn("Vaquum/Test#1", warning.output[0])
+        self.assertIn("issue labels missing", warning.output[0])
+        self.assertEqual(timestamps(), [first["issue"]["updated_at"], updated])
+        self.assertEqual(self.state("last_sync_at"), updated)
+        projected = {row["number"]: row for row in json.loads(views.issue(db_path=self.path))}
+        self.assertEqual(projected[1]["sync_error"], "issue labels missing")
+        self.assertNotIn("sync_error", projected[2])
+
+        reader.catchup_items.clear()
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader):
+            self.assertTrue(sync_once(self.path, workers=2))
+        self.assertEqual(timestamps(), [updated, updated])
+        self.assertTrue(all("sync_error" not in row for row in json.loads(views.issue(db_path=self.path))))
+
+    def test_failed_items_respect_the_reconciliation_deadline(self) -> None:
+        reader = self.reader([expansion(self.repo, 100, 1), expansion(self.repo, 101, 2)])
+        self.initialize(reader)
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader), \
+                patch("github_datastore.store.time.monotonic", side_effect=[0, 2]), \
+                patch.object(reader, "expand_issue_or_pr", side_effect=ItemGraphError("bad graph")) as expand:
+            self.assertFalse(sync_once(self.path, workers=1, reconcile=True, reconcile_max_seconds=1))
+        expand.assert_called_once()
+
+    def test_quota_exhaustion_survives_closing_during_healthy_result_delivery(self) -> None:
+        second_started, draining = threading.Event(), threading.Event()
+        quota = GitHubRateLimitError("quota exceeded", 2_000_000_000)
+
+        class Executor(ThreadPoolExecutor):
+            def shutdown(self, *, wait=True, cancel_futures=False):
+                draining.set()
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+        class Reader(BatchReader):
+            def expand_issue_or_pr(self, repo, item):
+                if item["number"] == 1:
+                    if not second_started.wait(5):
+                        raise AssertionError("second worker did not start")
+                    raise quota
+                second_started.set()
+                if not draining.wait(5):
+                    raise AssertionError("quota did not start draining")
+                return item
+
+        with patch("github_datastore.store.ThreadPoolExecutor", Executor):
+            expansions = iter_expanded(Reader(), self.repo, [{"number": 1}, {"number": 2}], 2)
+            self.assertEqual(next(expansions), {"number": 2})
+            with self.assertRaises(GitHubRateLimitError) as error:
+                expansions.close()
+        self.assertIs(error.exception, quota)
+
     def test_quota_failure_cancels_queued_expansions(self) -> None:
         release = threading.Event()
         shutdown = threading.Event()
@@ -472,7 +622,7 @@ class InitializationTest(unittest.TestCase):
             def expand_issue_or_pr(self, repo: dict, issue: dict) -> dict:
                 calls.append(issue["number"])
                 if issue["number"] == 1:
-                    raise RuntimeError("quota exceeded")
+                    raise GitHubRateLimitError("quota exceeded", 2_000_000_000)
                 if not release.wait(5):
                     raise AssertionError("test did not release running expansion")
                 return {}

@@ -133,6 +133,11 @@ churn during integration never masquerades as the blocker. A vanished queue
 entry reads as a removal without inventing its cause. Flags are display
 only and never raise alerts or influence execution.
 
+Legacy CI blocker lines append ` · conflicts with base` when the same fresh
+cached head has merge state `DIRTY`. Both causes appear on Board while its CI
+state and phase stay unchanged. Stale evidence and native queue membership
+retain the precedence above.
+
 Legacy rows also include live PR-scoped review and approval check failures in
 `blocker.details`, ahead of historical details, with their recorded target, lane,
 review slot, reason and retry time. Their revision is unverified. An uncleared

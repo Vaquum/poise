@@ -242,12 +242,12 @@ export function chainCiDependency(chain: BehaviorChain, removal?: string | null)
 }
 
 export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvocation, observation: ChainObservation,
-  now: number): ReviewResponse | null {
-  return reviewResponse(chain, invocation, observation, now, 2)
+  now: number, { allowPartialComment = false } = {}): ReviewResponse | null {
+  return reviewResponse(chain, invocation, observation, now, 2, allowPartialComment)
 }
 
 function reviewResponse(chain: BehaviorChain, invocation: ChainInvocation, observation: ChainObservation,
-  now: number, contract: 1 | 2): ReviewResponse | null {
+  now: number, contract: 1 | 2, allowPartialComment = false): ReviewResponse | null {
   const pull = observation.pull
   const evidence = invocation.evidence
   const artifact = evidence?.artifact as Record<string, unknown> | null
@@ -260,7 +260,8 @@ function reviewResponse(chain: BehaviorChain, invocation: ChainInvocation, obser
   if (!pull || !evidence || !review || !invocation.callId || !invocation.model || !pull.reviewContext
     || !validReviewResponse(response, { repository: chain.repository, number: pull.number, head: pull.head,
       actor: invocation.actor, callId: invocation.callId, model: invocation.model, context: pull.reviewContext, contract,
-      incompleteFindings: evidence.action === 'requested_changes' && evidence.outcome === 'incomplete',
+      incompleteFindings: evidence.outcome === 'incomplete'
+        && (evidence.action === 'requested_changes' || allowPartialComment && evidence.action === 'reviewed_clean'),
       legacyNegative: evidence.action === 'requested_changes' && evidence.outcome === 'changes_requested',
       recoveryModel: recoveryIndex >= 0 ? invocation.request.argv[recoveryIndex + 1] : null,
       startedAt: invocation.admittedAt, completedAt: Number(evidence.completedAt), resumedFrom }, now)
@@ -359,7 +360,7 @@ export function chainReviewClearance(chain: BehaviorChain, observation: ChainObs
       && invocation.slot === reviewer.slot && invocation.basis === basis)
     if (!review || review.state !== 'settled' || review.evidence?.status !== 'completed'
       || review.actor !== chain.reviewer || review.model !== reviewer.model
-      || !chainReviewResponse(chain, review, observation, now)) return `review slot ${reviewer.slot} lacks its current-head/context receipt`
+      || !chainReviewResponse(chain, review, observation, now, { allowPartialComment: true })) return `review slot ${reviewer.slot} lacks its current-head/context receipt`
   }
   const current = chain.invocations.filter(invocation => ['review-pr', 'approve-pr'].includes(invocation.behavior)
     && (invocation.basis === basis || invocation.request.argv[invocation.request.argv.indexOf('--expected-head') + 1] === pull.head))
@@ -367,7 +368,7 @@ export function chainReviewClearance(chain: BehaviorChain, observation: ChainObs
   if (current.some(invocation => {
     const response = (invocation.evidence?.artifact as { review_response?: { context_sha?: string } } | undefined)?.review_response
     return invocation.evidence?.review_id != null && (!response?.context_sha || response.context_sha === pull.reviewContext)
-      && !chainReviewResponse(chain, invocation, observation, now)
+      && !chainReviewResponse(chain, invocation, observation, now, { allowPartialComment: true })
   })) return 'a current native submission lacks its retained review receipt'
   const negative = current.filter(invocation => invocation.evidence?.action === 'requested_changes'
     && chainReviewResponse(chain, invocation, observation, now))
@@ -453,7 +454,7 @@ function reviewComplete(chain: BehaviorChain, behavior: 'review-issue' | 'review
   const invocation = settled(chain, behavior, basis, reviewer.slot).reverse().find(succeeded)
   if (!invocation) return 'needed'
   const evidence = invocation.evidence!
-  if (behavior === 'review-pr') return !!chainReviewResponse(chain, invocation, observation, observation.checkedAt)
+  if (behavior === 'review-pr') return !!chainReviewResponse(chain, invocation, observation, observation.checkedAt, { allowPartialComment: true })
     && typeof evidence.review_id === 'number' && Number(evidence.review_id) > 0
     && observation.pull?.reviewIds.includes(evidence.review_id) && evidence.head_sha === observation.pull?.head
     && ['reviewed_clean', 'requested_changes'].includes(String(evidence.action)) ? 'complete' : 'missing-artifact'

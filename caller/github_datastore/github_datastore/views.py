@@ -333,7 +333,8 @@ def _connection_nodes(value: Any) -> tuple[list[dict[str, Any]] | None, bool]:
     nodes: list[dict[str, Any]] = []
     for node in value["nodes"]:
         if not isinstance(node, dict):
-            return None, True
+            truncated = True
+            continue
         nodes.append(node)
     return nodes, truncated
 
@@ -422,9 +423,12 @@ def _closing_refs(graphql: Any, body: str | None, repo: str) -> tuple[list[tuple
     for node in nodes:
         ref = _node_ref(node)
         if ref is None:
-            return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", True
+            truncated = True
+            continue
         title = node.get("title")
         refs.append((ref[0], ref[1], title if isinstance(title, str) and title else None))
+    if not refs and truncated:
+        return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", True
     return sorted(refs), "closing-references", truncated
 
 
@@ -487,7 +491,9 @@ def pr_dependents(
             targets = {(ref_repo, ref_number) for ref_repo, ref_number, _ in closing}
             scanned = conn.execute(
                 """SELECT repo_full_name, number, title, body,
-                          json_extract(expanded_json, '$.issue.graphql.blockedBy') AS blocked_by
+                          CASE WHEN json_valid(expanded_json)
+                               THEN json_extract(expanded_json, '$.issue.graphql.blockedBy')
+                               ELSE 0 END AS blocked_by
                    FROM items
                    WHERE repo_full_name = ? COLLATE NOCASE AND item_type = 'issue' AND state = 'open'
                    ORDER BY number LIMIT ?""",
@@ -519,8 +525,7 @@ def pr_dependents(
                         ref = _node_ref(node)
                         if ref is None:
                             truncated = True
-                            blocked = set()
-                            break
+                            continue
                         blocked.add(ref)
                 depends = parse_depends_on(candidate["body"], candidate["repo_full_name"])
                 via = [name for name, hits in (("blocked-by", blocked), ("depends-on", depends)) if hits & targets]
@@ -600,15 +605,17 @@ def pr_closing(
         truncated = more
         prs: list[dict[str, Any]] = []
         for row in rows[:cap]:
+            malformed_graph = False
             try:
                 expanded = json.loads(row["expanded_json"])
-            except ValueError:
+            except (TypeError, ValueError):
                 expanded = None
+                malformed_graph = True
             pull = expanded.get("pull") if isinstance(expanded, dict) else None
             graphql = pull.get("graphql") if isinstance(pull, dict) else None
             head_ref = _head_ref(graphql)
             closing, closes_via, refs_truncated = _closing_refs(graphql, row["body"], row["repo_full_name"])
-            closing_truncated = refs_truncated or len(closing) > CLOSED_MATCH_LIMIT
+            closing_truncated = malformed_graph or refs_truncated or len(closing) > CLOSED_MATCH_LIMIT
             if closing_truncated:
                 truncated = True
                 closing = closing[:CLOSED_MATCH_LIMIT]
@@ -649,9 +656,10 @@ def _select(db_path: str | Path, view_name: str, output: Output, filters: dict[s
         if view_name != "issues" or not isinstance(label, str) or not label.strip():
             raise ValueError("issue label must be a nonempty string")
         where.append("""EXISTS (SELECT 1 FROM items chain_issue,
-          json_each(chain_issue.expanded_json, '$.issue.labels') chain_label
+          json_each(CASE WHEN json_valid(chain_issue.expanded_json) THEN chain_issue.expanded_json ELSE '{}' END,
+                    '$.issue.labels') chain_label
           WHERE chain_issue.item_id = issues.payload_ref
-            AND json_extract(chain_label.value, '$.name') = ? COLLATE NOCASE)""")
+            AND CASE WHEN chain_label.type = 'object' THEN json_extract(chain_label.value, '$.name') END = ? COLLATE NOCASE)""")
         params.append(label)
     sql = f"SELECT * FROM {view_name}"
     if where:
@@ -665,10 +673,18 @@ def _select(db_path: str | Path, view_name: str, output: Output, filters: dict[s
 
     conn = _read_connect(db_path)
     try:
-        if label is not None and conn.execute("SELECT 1 FROM items WHERE item_type='issue' "
-                                             "AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array' LIMIT 1").fetchone():
-            raise RuntimeError('issue label evidence is incomplete; ordinary datastore synchronization must refresh the old snapshots')
+        if label is not None:
+            valid_labels = "coalesce(CASE WHEN json_valid(expanded_json) THEN json_type(expanded_json,'$.issue.labels') END,'missing')"
+            if (conn.execute(f"SELECT 1 FROM items WHERE item_type='issue' AND {valid_labels} != 'array' LIMIT 1").fetchone()
+                    and not conn.execute(f"SELECT 1 FROM items WHERE item_type='issue' AND {valid_labels} = 'array' LIMIT 1").fetchone()):
+                raise RuntimeError('issue label evidence is incomplete; ordinary datastore synchronization must refresh the old snapshots')
         rows = conn.execute(sql, params).fetchall()
+        if output == "json" and rows:
+            failures = dict(conn.execute("SELECT key, CASE WHEN json_valid(value) THEN json_extract(value, '$.reason') END "
+                                         "FROM sync_state WHERE scope = 'item-sync-errors'"))
+            if failures:
+                return json.dumps([({**dict(row), "sync_error": failures[str(row["payload_ref"])] or "Unreadable sync failure"}
+                                    if str(row["payload_ref"]) in failures else dict(row)) for row in rows], ensure_ascii=False)
         columns = [column[0] for column in conn.execute(f"SELECT * FROM {view_name} LIMIT 0").description]
         return _render(rows, columns, output)
     except sqlite3.Error as exc:

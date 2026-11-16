@@ -53,6 +53,10 @@ prs_csv = views.pr(status="open", limit=50, output="csv")
 
 ## Views
 
+JSON item views add `sync_error` to a retained snapshot when the latest read
+failed for that item. The error names the failure and the next sync retries its
+item. Use other rows normally and skip actions based on the marked snapshot.
+
 ### `views.pr(...)`
 
 Pull requests.

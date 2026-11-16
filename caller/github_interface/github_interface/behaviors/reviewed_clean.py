@@ -25,7 +25,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             f"pull-request head changed: expected {required_head}, got {actual_head or 'missing'}"
         )
 
-    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor, require_complete=True)
+    incomplete = payload.get("partial_note") is True
+    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor,
+                                   require_complete=not incomplete)
+    if incomplete and response.get("coverage") != "incomplete":
+        raise RuntimeError("partial review note requires its retained incomplete source assessment")
     review = await comment_review(
         client,
         owner,
@@ -51,10 +55,10 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "repository": f"{owner}/{repo}",
         "pull_number": number,
         "actor": actor,
-        "outcome": "clean",
+        "outcome": "incomplete" if incomplete else "clean",
         "head_sha": required_head,
         "review_id": review.get("id"),
         "submitted_at": review.get("submitted_at"),
         "review_response": response,
-        **await resolve_verified_fixes(client, owner, repo, response, review.get("id")),
+        **({} if incomplete else await resolve_verified_fixes(client, owner, repo, response, review.get("id"))),
     }

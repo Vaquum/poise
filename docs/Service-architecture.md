@@ -1494,8 +1494,8 @@ gateway writes the diagnostic store. Externally owned coverage lives in that
 store, and runtime journal flushes cannot overwrite it. The version-1 stdin
 protocol carries one bounded projected source window after a domain/checkpoint
 handshake with a new random challenge and gateway-issued observation time.
-Central events, coverage and its compare-and-set checkpoint commit together
-before acknowledgement. Coverage includes an optional 90-second
+Readable events, coverage gaps for rejected records, and the compare-and-set
+checkpoint commit together before acknowledgement. Coverage includes an optional 90-second
 `observationExpiresAt` lease starting at challenge issue, enforced at read time even when the
 reporter is dead. Retained history and initial/rotation/read-bound uncertainty
 remain independent of current connectivity. A stopped observation opens a gap

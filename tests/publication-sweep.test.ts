@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -93,6 +93,19 @@ afterEach(async () => {
 })
 
 describe('the publication review sweep', () => {
+  it('reads and reviews healthy publications beside an unreadable document ledger and record', async () => {
+    await editor.writeDoc('damaged', '# Damaged publication ledger')
+    await writeFile(join(root, 'editor', 'damaged.publish.json'), '{')
+    await writeFile(join(root, 'editor', 'draft.publish.json'), JSON.stringify({ records: [null, record()] }))
+
+    const result = await list()
+    expect(result.status).toBe(200)
+    expect(result.body.publications.map(row => row.pr)).toEqual([7])
+    expect((await api.runPublicationReviewSweepOnce()).read).toMatchObject({ slug: 'draft', pr: 7 })
+    expect(pullQueries()).toBe(1)
+    await expect(editor.readPublishLedger('draft')).rejects.toThrow('publishing record beside draft is unreadable')
+  })
+
   it('reads a cold publication as your GitHub account, which the list then shows', async () => {
     const cold = await list()
     expect(cold.status).toBe(200)
