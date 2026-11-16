@@ -1,27 +1,29 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
+import { pathToFileURL } from 'node:url'
 import { parse } from 'yaml'
-import { browserShards, callerAffected, drawsFullRun, failedTests, failureReport, reusableRun, selectTests, selectUnitTests, verify } from '../.github/workflows/ci.mjs'
+import { browserShards, callerAffected, failedTests, failureReport, reusableRun, selectTests, selectUnitTests, verify } from '../.github/workflows/ci.mjs'
 
 const core = ['service-mode', 'ui-frame'].map(name => `tests/e2e/${name}.spec.ts`)
 const browsers = [...core, ...['ui-overview', 'ui-settings', 'ui-chat', 'ui-editor-chat', 'ui-article-reviews'].map(name => `tests/e2e/${name}.spec.ts`)]
-const select = (paths, event = 'pull_request') => selectTests(event, paths, browsers)
+const select = (paths, event = 'pull_request') => selectTests(event, paths, browsers, 'autonomio/poise')
 const ciScript = resolve('.github/workflows/ci.mjs')
-const notDrawn = '1'.repeat(40)
-const drawn = '0'.repeat(40)
+const pushSha = '1'.repeat(40)
+const formerlySampledSha = '00000000' + '1'.repeat(32)
 
 describe('what runs every time', () => {
-  it('runs everything on main, by hand and when nothing says what changed', () => {
-    expect(select(['server/process.ts'], 'push').mode).toBe('full')
+  it('runs the full suite on dispatches and fork pushes', () => {
     expect(select(['server/process.ts'], 'workflow_dispatch').mode).toBe('full')
-    expect(select([]).mode).toBe('full')
-    expect(select([], 'merge_group').mode).toBe('full')
+    expect(selectTests('push', [], browsers, 'Vaquum/poise').mode).toBe('full')
+  })
+
+  it.each(['pull_request', 'merge_group', 'push'])('runs the essential set for an empty diff on %s', (event) => {
+    expect(select([], event)).toEqual({ mode: 'essential', browserFiles: core })
   })
 
   it.each(['pull_request', 'merge_group'])('runs the affected browser area and core journeys on %s', (event) => {
@@ -67,8 +69,10 @@ describe('what runs every time', () => {
 
   it.each(['package.json', 'package-lock.json', '.node-version', 'vitest.config.ts', 'playwright.config.ts', 'vite.config.ts', 'tsconfig.server.json',
     'tests/essential.txt', 'tests/e2e/fixtures/chat.ts', 'tests/home-isolation.ts', '.github/workflows/ci.mjs', '.github/workflows/ci.yml'])
-  ('runs everything when what every test proves can change: %s', (path) => {
-    for (const event of ['pull_request', 'merge_group']) expect(select([path, 'server/process.ts'], event).mode).toBe('full')
+  ('keeps the essential set when shared configuration changes: %s', (path) => {
+    for (const event of ['pull_request', 'merge_group', 'push']) {
+      expect(select([path, 'server/process.ts'], event)).toEqual({ mode: 'essential', browserFiles: core })
+    }
   })
 
   it('skips application work only for documentation-only changes', () => {
@@ -76,6 +80,7 @@ describe('what runs every time', () => {
       expect(select(['README.md', 'docs/Testing.md'], event).mode).toBe('none')
       expect(select(['README.md', 'server/process.ts'], event).mode).toBe('essential')
     }
+    expect(select(['README.md'], 'push').mode).toBe('essential')
   })
 
   it('fails rather than silently dropping missing smoke or feature coverage', () => {
@@ -169,18 +174,6 @@ describe('essential application tests', () => {
   })
 })
 
-describe('the full-run draw', () => {
-  it('draws about one merge in ten, and the same answer on a rerun', () => {
-    const shas = Array.from({ length: 5000 }, (_, n) => createHash('sha1').update(String(n)).digest('hex'))
-    const share = shas.filter(drawsFullRun).length / shas.length
-    expect(share).toBeGreaterThan(0.085)
-    expect(share).toBeLessThan(0.115)
-    expect(shas.filter(drawsFullRun)).toEqual(shas.filter(drawsFullRun))
-    expect(drawsFullRun(drawn)).toBe(true)
-    expect(drawsFullRun(notDrawn)).toBe(false)
-  })
-})
-
 const identity = { repository: 'autonomio/poise', sha: 'a'.repeat(40), workflow: 'ci.yml' }
 const success = {
   id: 10, event: 'merge_group', head_sha: identity.sha, path: '.github/workflows/ci.yml',
@@ -267,7 +260,7 @@ describe('how CI and the commands reach the choice', () => {
       CI_TEST_SHARD: '${{ matrix.shard }}', CI_TEST_SHARDS: '${{ strategy.job-total }}' })
   })
 
-  it('never lets a merge cancel a full run here, and leaves a fork superseding its pushes', () => {
+  it('retains verification for each upstream push and lets a fork supersede its pushes', () => {
     expect(ci.concurrency.group).toContain("github.repository == 'autonomio/poise' && github.event_name == 'push' && github.sha || github.event_name")
   })
 
@@ -304,7 +297,7 @@ describe('how CI and the commands reach the choice', () => {
     expect(full.jobs.nightly.steps[0].run).toContain('--ref main')
     expect(full.jobs.report.if).toContain("github.repository == 'autonomio/poise'")
     expect(full.jobs.report.if).toContain('github.event.workflow_run.head_repository.full_name == github.repository')
-    expect(full.jobs.report.if).toContain("github.event.workflow_run.event == 'push'")
+    expect(full.jobs.report.if).not.toContain("github.event.workflow_run.event == 'push'")
     expect(full.jobs.report.if).toContain("github.event.workflow_run.event == 'workflow_dispatch'")
     expect(full.jobs.report.if).not.toContain('pull_request')
     expect(full.jobs.report.permissions.issues).toBe('write')
@@ -384,7 +377,7 @@ const exec = promisify(execFile)
 async function ci(root, args, env = {}, { path = process.env.PATH } = {}) {
   const outputFile = join(tempRoot(), 'output')
   // CI runs these tests with its own settings for this very script.
-  const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(?:GITHUB_|CI_|BASE$|REPORTS$|RUN_ID$)/.test(name)))
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(?:GITHUB_|CI_|(?:PUSH_)?BASE$|REPORTS$|RUN_ID$)/.test(name)))
   const result = await exec(process.execPath, [ciScript, ...args], {
     cwd: root, encoding: 'utf8', env: { ...inherited, PATH: path, GITHUB_OUTPUT: outputFile, ...env },
   }).then(({ stdout, stderr }) => ({ code: 0, stdout, stderr }), error => ({ code: error.code, stdout: error.stdout, stderr: error.stderr }))
@@ -450,25 +443,31 @@ describe('the plan each CI event gets', () => {
 
   const evidence = sha => ({ workflow_runs: [{ ...success, head_sha: sha }] })
 
-  it('reuses the queue evidence of a commit that did not draw the full run', async () => {
-    const api = await github({ 'GET actions/workflows/ci.yml/runs': evidence(notDrawn) })
-    const { code, outputs } = await ci(repo.root, ['plan', 'ci.yml'], { GITHUB_EVENT_NAME: 'push', GITHUB_SHA: notDrawn, ...api.env })
+  it.each([pushSha, formerlySampledSha])('reuses successful queue evidence on an upstream push of %s', async (sha) => {
+    const api = await github({ 'GET actions/workflows/ci.yml/runs': evidence(sha) })
+    const { code, outputs } = await ci(repo.root, ['plan', 'ci.yml'], { GITHUB_EVENT_NAME: 'push', GITHUB_SHA: sha, ...api.env })
     expect(code).toBe(0)
-    expect(outputs).toMatchObject({ mode: 'reuse', reuse_url: success.html_url })
+    expect(outputs).toMatchObject({ mode: 'reuse', reuse_url: success.html_url, unit_files: [], browser_files: [] })
     expect(api.requests[0].auth).toBe('Bearer test-token')
   })
 
-  it('runs everything on a commit that drew the full run, whatever evidence it has', async () => {
-    const api = await github({ 'GET actions/workflows/ci.yml/runs': evidence(drawn) })
-    const { code, outputs } = await ci(repo.root, ['plan', 'ci.yml'], { GITHUB_EVENT_NAME: 'push', GITHUB_SHA: drawn, ...api.env })
-    expect(code).toBe(0)
-    expect(outputs).toMatchObject({ mode: 'full', unit_shards: [1, 2], browser_shards: [1, 2, 3, 4, 5, 6] })
-    expect(api.requests).toEqual([])
+  it('fetches the push base and selects essential and affected tests without queue evidence', async () => {
+    const shallow = tempRoot()
+    execFileSync('git', ['clone', '-q', '--depth=1', '--branch', 'change', pathToFileURL(repo.root).href, shallow])
+    const api = await github({ 'GET actions/workflows/ci.yml/runs': { workflow_runs: [] } })
+    const { code, outputs, stderr } = await ci(shallow, ['plan', 'ci.yml'], {
+      ...api.env, GITHUB_EVENT_NAME: 'push', GITHUB_SHA: formerlySampledSha, PUSH_BASE: repo.base,
+    })
+    expect(code, stderr).toBe(0)
+    expect(outputs).toMatchObject({
+      mode: 'essential', unit_shards: [1], browser_shards: [1],
+      unit_files: ['tests/guard.test.ts', 'tests/linked.test.ts'], browser_files: core,
+    })
   })
 
-  it('keeps Caller reusing queue evidence on a commit that drew the full run', async () => {
-    const api = await github({ 'GET actions/workflows/caller.yml/runs': { workflow_runs: [{ ...success, head_sha: drawn, path: '.github/workflows/caller.yml' }] } })
-    const { code, outputs } = await ci(repo.root, ['plan', 'caller.yml'], { GITHUB_EVENT_NAME: 'push', GITHUB_SHA: drawn, ...api.env })
+  it('keeps Caller reusing queue evidence on an upstream push', async () => {
+    const api = await github({ 'GET actions/workflows/caller.yml/runs': { workflow_runs: [{ ...success, head_sha: formerlySampledSha, path: '.github/workflows/caller.yml' }] } })
+    const { code, outputs } = await ci(repo.root, ['plan', 'caller.yml'], { GITHUB_EVENT_NAME: 'push', GITHUB_SHA: formerlySampledSha, ...api.env })
     expect(code).toBe(0)
     expect(outputs).toMatchObject({ mode: 'reuse', run: false })
   })
@@ -477,7 +476,7 @@ describe('the plan each CI event gets', () => {
 describe('complete upstream evidence on a fork push', () => {
   const repo = sharedCheckout()
   const source = {
-    ...success, repository: { full_name: identity.repository }, head_sha: notDrawn, run_attempt: 1,
+    ...success, repository: { full_name: identity.repository }, head_sha: pushSha, run_attempt: 1,
   }
   const push = { event: 'push', head_branch: 'main', id: 11 }
   const complete = { status: 'completed', conclusion: 'success' }
@@ -496,7 +495,7 @@ describe('complete upstream evidence on a fork push', () => {
   const jobsResponse = jobs => ({ total_count: jobs.length, jobs })
   const runsResponse = (...runs) => ({ total_count: runs.length, workflow_runs: runs })
   const fork = {
-    GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'Vaquum/poise', GITHUB_SHA: notDrawn,
+    GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'Vaquum/poise', GITHUB_SHA: pushSha,
     GITHUB_SERVER_URL: 'https://github.com', GITHUB_REF: 'refs/heads/main',
   }
 
@@ -519,11 +518,11 @@ describe('complete upstream evidence on a fork push', () => {
       mode: 'reuse', reuse_url: `https://github.com/autonomio/poise/actions/runs/${run.id}/attempts/1`,
     })
     expect(api.requests).toHaveLength(3)
-    expect(api.requests[0].url).toContain(`head_sha=${notDrawn}`)
+    expect(api.requests[0].url).toContain(`head_sha=${pushSha}`)
     expect(api.requests.every(request => request.repository === identity.repository && request.auth === undefined)).toBe(true)
   })
 
-  it('uses a full merge group while the non-sampled upstream push is relaying it', async () => {
+  it('uses a full merge group while the upstream push is still starting', async () => {
     const api = await github({
       'GET actions/workflows/ci.yml/runs': runsResponse({ ...source, ...push, status: 'in_progress', conclusion: null }, source),
       'GET actions/runs/10/attempts/1/jobs': jobsResponse(fullCI(source)),
@@ -542,7 +541,7 @@ describe('complete upstream evidence on a fork push', () => {
   it.each([
     ['an unavailable API', null],
     ['missing evidence', []],
-    ['another commit', [{ ...source, head_sha: drawn }]],
+    ['another commit', [{ ...source, head_sha: formerlySampledSha }]],
     ['another workflow', [{ ...source, path: '.github/workflows/other.yml' }]],
     ['another repository', [{ ...source, repository: { full_name: fork.GITHUB_REPOSITORY } }]],
     ['a fork head', [{ ...source, head_repository: { full_name: fork.GITHUB_REPOSITORY } }]],
@@ -764,9 +763,10 @@ describe('the commands that run the tests', () => {
 
 describe('what a full run on main reports', () => {
   const unit = conclusion => ({ name: 'Unit & integration (2)', conclusion })
-  const failedRun = { id: 7, conclusion: 'failure', head_sha: 'f'.repeat(40), html_url: 'https://github.test/runs/7' }
+  const failedRun = { id: 7, event: 'workflow_dispatch', conclusion: 'failure', head_sha: 'f'.repeat(40), html_url: 'https://github.test/runs/7' }
   const passedRun = { ...failedRun, conclusion: 'success' }
-  const earlier = [{ id: 7, event: 'push', head_sha: drawn }, { id: 6, event: 'push', head_sha: notDrawn }, { id: 5, event: 'push', head_sha: drawn }]
+  const previousDispatchSha = '2'.repeat(40)
+  const earlier = [{ id: 5, event: 'workflow_dispatch', head_sha: previousDispatchSha }]
   const merge = (number, title) => ({ sha: `${number}`.repeat(8), parents: [{}, {}], commit: { message: `Merge pull request #${number} from autonomio/x\n\n${title}` } })
   const openIssue = { number: 42, title: 'fix: the full test suite fails on main' }
   const routes = (run, jobs, issues = []) => ({
@@ -812,9 +812,10 @@ describe('what a full run on main reports', () => {
     expect(body.body).toContain('- tests/e2e/b.spec.ts > b nested')
     expect(body.body).not.toContain('works')
     expect(body.body).toContain('Did not pass: Unit & integration (2), Browser Chromium (1).')
-    expect(body.body).toContain(`Merged since the last full run that passed (${drawn}):\n- #11 fix: one\n- #12 feat: two`)
+    expect(body.body).toContain(`Merged since the last full run that passed (${previousDispatchSha}):\n- #11 fix: one\n- #12 feat: two`)
     expect(body.body).not.toContain('a branch commit')
-    expect(api.requests.map(item => item.url)).toContain(`compare/${drawn}...${failedRun.head_sha}`)
+    expect(api.requests.map(item => item.url)).toContain(`compare/${previousDispatchSha}...${failedRun.head_sha}`)
+    expect(api.requests.map(item => item.url)).toContain('actions/workflows/ci.yml/runs?branch=main&event=workflow_dispatch&status=success&per_page=100')
   })
 
   it('adds a comment to an open issue instead of editing it or filing another', async () => {
@@ -849,8 +850,8 @@ describe('what a full run on main reports', () => {
     const api = await github({ ...routes(passedRun, [unit('success')], [openIssue]), 'GET compare/': { status: 'behind', commits: [] } })
     expect((await report(api)).code).toBe(0)
     expect(api.writes()).toEqual([])
-    expect(api.requests.map(item => item.url)).toContain(`compare/${drawn}...${passedRun.head_sha}`)
-    expect(api.requests.map(item => item.url)).toContain('actions/workflows/ci.yml/runs?branch=main&status=failure&per_page=100')
+    expect(api.requests.map(item => item.url)).toContain(`compare/${previousDispatchSha}...${passedRun.head_sha}`)
+    expect(api.requests.map(item => item.url)).toContain('actions/workflows/ci.yml/runs?branch=main&event=workflow_dispatch&status=failure&per_page=100')
   })
 
   it.each(['ahead', 'identical'])('closes the open issue once a full run passes on a commit %s of the latest failure', async (status) => {
@@ -874,7 +875,7 @@ describe('what a full run on main reports', () => {
   })
 
   it.each([
-    ['skipped its tests after reusing queue evidence', { ...failedRun, conclusion: 'success' }, [unit('skipped')]],
+    ['came from a push', { ...failedRun, event: 'push' }, failingJobs],
     ['failed before its tests', failedRun, [{ name: 'Select tests or reuse queue evidence', conclusion: 'failure' }]],
   ])('stays quiet about a run that %s', async (_case, run, jobs) => {
     const api = await github(routes(run, jobs, [openIssue]))

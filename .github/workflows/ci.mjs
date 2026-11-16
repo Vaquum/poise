@@ -20,8 +20,6 @@ const areas = [
   [/^src\/(?:views\/notification-rail|notification-[^/]+)\.(?:ts|css)$/, /^ui-overview$/],
   [/^src\/(?:motion[^/]*|views\/motion[^/]*)\.(?:ts|css)$/, /^ui-frame$/],
 ]
-// A change to one of these can change what every test proves, so only the full suite can vouch for it.
-const sharedSetup = /^(?:package(?:-lock)?\.json$|\.node-version$|(?:vitest|playwright|vite)\.config\.ts$|tsconfig[^/]*\.json$|\.github\/workflows\/|tests\/essential\.txt$|tests\/e2e\/fixtures\/|tests\/[^/]+-isolation\.ts$)/
 const unitTest = /^tests\/.+\.test\.(?:ts|mjs)$/
 const browserSpec = /^tests\/e2e\/[^/]+\.spec\.ts$/
 const importSpecifier = /(?:\bfrom\s+|\bimport\s*\(\s*|\bimport\s+|\brequire\(\s*|\bvi\.(?:mock|doMock|importActual)(?:<[^>]*>)?\(\s*)['"`]([^'"`]+)['"`]/g
@@ -61,10 +59,12 @@ export function browserShards(files, read) {
   return shardList(Math.min(fullBrowserShards, Math.max(1, Math.ceil(tests / 80))))
 }
 
-export function selectTests(event, paths, browserFiles) {
-  if (!['pull_request', 'merge_group'].includes(event) || !paths.length) return { mode: 'full', browserFiles: [] }
-  if (paths.every(documentation)) return { mode: 'none', browserFiles: [] }
-  if (paths.some(path => sharedSetup.test(path))) return { mode: 'full', browserFiles: [] }
+export function selectTests(event, paths, browserFiles, repository) {
+  if (event === 'pull_request' || event === 'merge_group') {
+    if (paths.length && paths.every(documentation)) return { mode: 'none', browserFiles: [] }
+  } else if (event !== 'push' || repository !== upstream) {
+    return { mode: 'full', browserFiles: [] }
+  }
   return { mode: 'essential', browserFiles: selectBrowserTests(paths, browserFiles) }
 }
 
@@ -76,11 +76,6 @@ export function selectUnitTests(paths, testFiles, essential, read) {
   const linked = testFiles.filter(file => paths.includes(file) || [...read(file).matchAll(importSpecifier)]
     .some(([, specifier]) => specifier.startsWith('.') && changed.has(moduleKey(posix.join(posix.dirname(file), specifier)))))
   return [...new Set([...essential, ...linked])].sort()
-}
-
-// One merge in ten, decided by its commit ID: no state to keep, and a rerun draws the same.
-export function drawsFullRun(sha) {
-  return parseInt(sha.slice(0, 8), 16) % 10 === 0
 }
 
 export function callerAffected(paths) {
@@ -140,10 +135,8 @@ async function upstreamEvidence(workflow, sha) {
     const candidates = runs.filter(trusted).sort((a, b) => b.id - a.id)
     const queue = candidates.find(run => run.event === 'merge_group')
     for (const run of candidates) {
-      // A non-sampled upstream push normally only relays the already-green queue.
-      // Its startup should not delay reuse of the queue's full results.
-      if (run.event === 'push' && run.status !== 'completed' && passed(queue)
-        && (workflow === 'caller.yml' || !drawsFullRun(sha))) continue
+      // The queue's verification is already available while the upstream push starts.
+      if (run.event === 'push' && run.status !== 'completed' && passed(queue)) continue
       if (!passed(run)) return ''
       const path = `runs/${run.id}/attempts/${run.run_attempt}`
       const { total_count: total, jobs } = await read(`${path}/jobs?per_page=100`)
@@ -261,13 +254,13 @@ function essentialUnitTests(paths) {
 
 export async function plan(workflow) {
   if (!['ci.yml', 'caller.yml'].includes(workflow)) throw new Error('Expected CI or Caller workflow')
-  const { GITHUB_EVENT_NAME: event, GITHUB_SHA: sha, BASE: base, GITHUB_REPOSITORY: repository } = process.env
+  const { GITHUB_EVENT_NAME: event, GITHUB_SHA: sha, BASE: base, PUSH_BASE: pushBase, GITHUB_REPOSITORY: repository } = process.env
   if (!['pull_request', 'merge_group', 'push', 'workflow_dispatch'].includes(event)) throw new Error(`Unsupported event: ${event}`)
+  const upstreamPush = event === 'push' && repository === upstream
   let reuseUrl = ''
-  const drawn = event === 'push' && repository === upstream && workflow === 'ci.yml' && drawsFullRun(sha ?? '')
-  if (event === 'push' && !drawn) {
+  if (event === 'push') {
     if (!/^[a-f0-9]{40}$/.test(sha ?? '')) throw new Error('Missing reuse API configuration')
-    if (repository === upstream) {
+    if (upstreamPush) {
       const data = await github(`actions/workflows/${workflow}/runs?event=merge_group&head_sha=${sha}&per_page=100`)
       if (!Array.isArray(data.workflow_runs)) throw new Error('Invalid workflow-runs response')
       reuseUrl = reusableRun(data.workflow_runs, { repository, sha, workflow })?.html_url ?? ''
@@ -275,21 +268,27 @@ export async function plan(workflow) {
       reuseUrl = await upstreamEvidence(workflow, sha)
     }
   }
+  const usePushDiff = upstreamPush && workflow === 'ci.yml' && !reuseUrl
   let paths = []
-  if (event === 'pull_request' || (event === 'merge_group' && workflow === 'ci.yml')) {
-    if (!/^[a-f0-9]{40}$/.test(base ?? '')) throw new Error('Missing comparison base SHA')
-    paths = git('diff', '--name-only', '--no-renames', '-z', base, 'HEAD').split('\0').filter(Boolean)
+  if (event === 'pull_request' || (event === 'merge_group' && workflow === 'ci.yml') || usePushDiff) {
+    const comparisonBase = usePushDiff ? pushBase : base
+    if (!/^[a-f0-9]{40}$/.test(comparisonBase ?? '')) throw new Error('Missing comparison base SHA')
+    if (usePushDiff && spawnSync('git', ['cat-file', '-e', `${comparisonBase}^{commit}`]).status !== 0) {
+      git('fetch', '--no-tags', '--depth=1', 'origin', comparisonBase)
+    }
+    paths = git('diff', '--name-only', '--no-renames', '-z', comparisonBase, 'HEAD').split('\0').filter(Boolean)
   }
-  const selection = selectTests(event, paths, testFiles(browserSpec))
-  const mode = reuseUrl ? 'reuse' : selection.mode
+  const { mode, browserFiles } = reuseUrl
+    ? { mode: 'reuse', browserFiles: [] }
+    : selectTests(event, paths, testFiles(browserSpec), repository)
   const version = JSON.parse(readFileSync('package-lock.json', 'utf8')).packages['node_modules/@playwright/test'].version
   if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Expected a stable locked Playwright version')
   const values = {
-    mode, browser_files: selection.browserFiles,
-    unit_files: workflow === 'ci.yml' && selection.mode === 'essential' ? essentialUnitTests(paths) : [],
+    mode, browser_files: browserFiles,
+    unit_files: workflow === 'ci.yml' && mode === 'essential' ? essentialUnitTests(paths) : [],
     browser_image: `mcr.microsoft.com/playwright:v${version}-noble`,
     unit_shards: mode === 'full' ? shardList(fullUnitShards) : [1],
-    browser_shards: mode === 'full' ? shardList(fullBrowserShards) : browserShards(selection.browserFiles, file => readFileSync(file, 'utf8')),
+    browser_shards: mode === 'full' ? shardList(fullBrowserShards) : browserShards(browserFiles, file => readFileSync(file, 'utf8')),
     reuse_url: reuseUrl,
     run: !reuseUrl && (event !== 'pull_request' || callerAffected(paths)),
   }
@@ -297,7 +296,6 @@ export async function plan(workflow) {
   if (process.env.GITHUB_STEP_SUMMARY) {
     let detail = `Changed paths: ${paths.length}.`
     if (reuseUrl) detail = `Reuses ${reuseUrl} for exact commit ${sha}.`
-    else if (drawn) detail = `Commit ${sha} drew the full run.`
     else if (event === 'push' && repository !== upstream) detail = 'Running the complete fork checks.'
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, `CI mode: **${mode}**. ${detail}\n`)
   }
@@ -325,8 +323,7 @@ function runTests(kind) {
   const args = kind === 'unit'
     ? ['test:full', '--', `--shard=${shard}/${shards}`, '--maxWorkers=1', '--reporter=default', '--reporter=json', '--outputFile=test-results/vitest.json']
     : ['test:e2e:full', '--', `--shard=${shard}/${shards}`, '--workers=1']
-  // A full run on main speaks for many merges, so a test must fail twice to count.
-  // Playwright's own CI retries already do this for the browser tests.
+  // Post-merge unit testing retries once. Playwright already retries in CI.
   if (kind === 'unit' && ['push', 'workflow_dispatch'].includes(process.env.GITHUB_EVENT_NAME)) args.push('--retry=1')
   if (mode === 'essential') args.push(...(kind === 'unit' ? selectedFiles('CI_UNIT_FILES', unitTest) : selectedFiles('CI_BROWSER_FILES', browserSpec)))
   npmRun(args)
@@ -365,8 +362,6 @@ function runEssential(kind, args) {
   npmRun([script, '--', ...files, ...args])
 }
 
-const isFullRun = run => run.event === 'workflow_dispatch' || (run.event === 'push' && drawsFullRun(run.head_sha))
-
 // Files what a finished full run on main found as one issue, which Poise's chain then fixes.
 export async function report() {
   const id = process.env.RUN_ID
@@ -374,23 +369,22 @@ export async function report() {
   const [run, { jobs }] = await Promise.all([github(`actions/runs/${id}`), github(`actions/runs/${id}/jobs?per_page=100`)])
   // Superseded or stopped by hand, so it says nothing about the code. A job that
   // runs out of time is different: its run concludes as failed.
-  if (run.conclusion === 'cancelled') return
-  // A commit that reused queue evidence skips its tests; only a full run has a second unit shard.
+  if (run.event !== 'workflow_dispatch' || run.conclusion === 'cancelled') return
+  // The second unit shard shows that the dispatch reached the full test jobs.
   if (!jobs.some(job => job.name === 'Unit & integration (2)' && job.conclusion !== 'skipped')) return
   const issues = await github('issues?state=open&labels=poise&per_page=100')
   const open = issues.find(issue => issue.title === fullRunIssueTitle && !issue.pull_request)
   if (run.conclusion === 'success') {
     if (!open) return
     // Full runs overlap, and a pass on an older commit says nothing about a newer failure.
-    const { workflow_runs: failures } = await github('actions/workflows/ci.yml/runs?branch=main&status=failure&per_page=100')
-    const failure = failures.find(isFullRun)
+    const { workflow_runs: [failure] } = await github('actions/workflows/ci.yml/runs?branch=main&event=workflow_dispatch&status=failure&per_page=100')
     if (failure && (await github(`compare/${failure.head_sha}...${run.head_sha}`)).status === 'behind') return
     await github(`issues/${open.number}/comments`, { method: 'POST', body: { body: `The full suite passed at ${run.head_sha}: ${run.html_url}\n\nClosing.` } })
     await github(`issues/${open.number}`, { method: 'PATCH', body: { state: 'closed' } })
     return
   }
-  const { workflow_runs: passes } = await github('actions/workflows/ci.yml/runs?branch=main&status=success&per_page=100')
-  const previous = passes.find(other => other.id !== run.id && isFullRun(other))
+  const { workflow_runs: passes } = await github('actions/workflows/ci.yml/runs?branch=main&event=workflow_dispatch&status=success&per_page=100')
+  const previous = passes.find(other => other.id !== run.id)
   const compared = previous ? await github(`compare/${previous.head_sha}...${run.head_sha}`) : { commits: [] }
   // Nor does a failure on an older commit once a newer one has passed.
   if (compared.status === 'behind') return

@@ -15,8 +15,7 @@ permissions:
   actions: read
 
 concurrency:
-  # On main here a merge must not cancel the full run the merge before it drew.
-  # A fork's pushes keep superseding each other: only its tip can deploy.
+  # Give each upstream main push its own result. Only a fork's tip can deploy.
   group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.repository == 'autonomio/poise' && github.event_name == 'push' && github.sha || github.event_name }}
   cancel-in-progress: true
 
