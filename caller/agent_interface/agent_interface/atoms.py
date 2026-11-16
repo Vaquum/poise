@@ -334,13 +334,13 @@ def run_agent(
 ) -> str:
     spec = CATALOG.review_model(behavior, model)
     from . import review_continuation
-    if review_continuation.enabled() and (spec.provider == "claude" or repository is None):
-        raise AgentPreflightError("review continuation requires structured analysis with a pinned repository")
+    if review_continuation.enabled() and repository is None:
+        raise AgentPreflightError("review continuation requires a pinned repository")
     policy = analysis_policy(system, text, packet)
     if review_continuation.enabled():
         policy += "\n" + json.dumps([capped, review_round, review_cap])
     review_receipt.prepare_response(packet, spec.identity, review_scope, policy=policy)
-    if spec.provider == "claude":
+    if spec.provider == "claude" and not review_continuation.enabled():
         prompt_bytes = len(text.encode("utf-8"))
         if prompt_bytes > MAX_GOVERNED_PROMPT_BYTES:
             raise AgentPreflightError(

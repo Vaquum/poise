@@ -3,7 +3,7 @@ from __future__ import annotations
 import shlex
 
 from . import atoms
-from . import review_repository
+from . import review_continuation, review_repository
 
 SYSTEM = (
     "You get one pass at this review. Be thorough, report only defects you can "
@@ -74,12 +74,13 @@ def run(
     review_scope: str = "",
 ) -> str:
     spec = atoms.CATALOG.review_model("pr_review", model)
-    tools = allowed(pr, actor, expected_head) if spec.provider == "claude" else []
     packet = atoms.packet(pwd, pr, actor, expected_head, p)
+    governed = spec.provider == "claude" and not review_continuation.enabled()
+    tools = allowed(pr, actor, expected_head) if governed else []
     with review_repository.prepare(pwd, pr, actor, expected_head, packet) as repository:
         if spec.provider == "claude":
             tools.append(review_repository.INSPECTION_RULE)
-        policy = POLICY if spec.provider == "claude" else atoms.STRUCTURED_POLICY + " " + review_repository.REQUEST_POLICY
+        policy = POLICY if governed else atoms.STRUCTURED_POLICY + " " + review_repository.REQUEST_POLICY
         text = atoms.prompt(policy, SEVERITY, RULES, packet, tools, note, p) + repository.prompt()
         return atoms.run_agent(
             pwd, SYSTEM + " " + review_repository.POLICY, text, tools, "pr_review", timeout_s,

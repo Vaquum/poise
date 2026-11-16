@@ -3354,7 +3354,7 @@ interface PreparedReviewTarget {
 }
 
 function continuationModel(catalog: Catalog | null, identity: string): boolean {
-  return !!catalog?.models.some(model => model.identity === identity && model.provider !== 'claude')
+  return !!catalog?.models.some(model => model.identity === identity)
 }
 
 function legacyReviewSlot(catalog: Catalog, model: string, slot: string, target: string): string | undefined {
@@ -5119,7 +5119,7 @@ async function fireApprove(
   const reviewCap = getReviewCap()
   const reviewRound = reviewCap === null ? null : reviewRoundNumber(pr.repo, pr.number)
   const reviewCapReached = reviewCap !== null && reviewRound !== null && reviewRound >= reviewCap
-  const reviewSlot = reviewCapReached ? undefined : legacyReviewSlot(catalog, model, slot, claimTarget)
+  const reviewSlot = legacyReviewSlot(catalog, model, slot, claimTarget)
   const args = [
     '--pr-approve',
     `#${num}`,
@@ -5150,7 +5150,7 @@ async function fireApprove(
     pr.number, expectedHead, actor, model, claimTarget)
   const checkpoint = legacyReviewCheckpoint(stopSnapshot, retry.calls.filter(call => call.model === model), legacyReviewSlotId(slot, claimTarget))
   if (checkpoint && !reviewSlot) {
-    recordBehaviorFailure('approve-prs', 'operation', `Review Call ${checkpoint.root_call} awaits its original uncapped Caller path`,
+    recordBehaviorFailure('approve-prs', 'operation', `Review Call ${checkpoint.root_call} awaits its original Caller continuation path`,
       `${pr.repo}#${pr.number}:check`, { noBackoff: true })
     return false
   }

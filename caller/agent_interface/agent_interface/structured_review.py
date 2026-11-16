@@ -1,18 +1,20 @@
 """Structured verdicts, submitted only through the governed GitHub interface.
 
-Claude reviews with governed tools (claude_acl). Every other provider —
+Small Claude reviews use governed tools (claude_acl). Every other provider —
 Codex, Grok Build, Antigravity, Muse — gets the same immutable packet with
 no tools, in an empty work directory, and answers with one JSON verdict that
 Caller validates and submits. Invalid responses get one correction attempt;
 a run that used a tool, failed, or still has no valid verdict submits nothing.
 A packet larger than one provider call reliably finishes is reviewed in
 file-group stages; every stage's findings combine into the single submitted verdict.
+Bounded Claude analysis uses the shared checkpoints with governed read tools only.
 """
 from __future__ import annotations
 
 import json
 from collections.abc import Iterator
 from contextlib import ExitStack
+from functools import partial
 from hashlib import sha256
 import os
 import re
@@ -605,6 +607,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     ask = ASK.get(model.provider)
     if ask is None:
         raise AgentPreflightError(f"{model.provider} cannot return a structured review verdict")
+    if model.provider == "claude":
+        ask = partial(ask, repository=repository)
     capped_note = ""
     checkpoint = None
     from . import review_continuation
@@ -817,6 +821,42 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     # after the POST, because GitHub pins the stale verdict instead of
     # rejecting it.
     return raw.strip() + "\n" + (done.stdout or done.stderr).strip() + capped_note
+
+
+# ── Claude bounded analysis ───────────────────────────────────────────
+def ask_claude(root: Path, model: Model, system: str, text: str, schema: dict,
+               watch: ReviewWatch, timeout: float, *, repository) -> str:
+    from .claude_acl import env, settings, tools_arg
+    from .provider_progress import claude_error
+    from .review_repository import INSPECTION_RULE
+
+    # No terminal mutations, including capped follow-up issues, are available
+    # to a partial unit. Publication belongs to the shared completion path.
+    tools = [INSPECTION_RULE]
+    done = watch.run([
+        os.getenv("CLAUDE_CLI", "claude"), "--print",
+        "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+        "--thinking-display", "summarized", "--model", model.selector, "--effort", model.effort,
+        "--permission-mode", "dontAsk", "--setting-sources", "", "--tools", tools_arg(tools),
+        "--no-session-persistence", "--allowedTools", *tools,
+        "--settings", settings(tools, review_gate=watch.gate_path, output_tokens=review_budget.OUTPUT_TOKENS,
+                               review_root=str(repository.root)),
+        "--system-prompt", system,
+    ], input=text + instructions(schema), cwd=str(repository.root), timeout=timeout,
+        env={**env(tools), "GITHUB_INTERFACE_REVIEW_ROOT": str(repository.root)}, provider="claude")
+    results = [event for event in events(done.stdout) if event.get("type") == "result"]
+    if done.returncode or len(results) == 1 and (results[0].get("is_error") or results[0].get("subtype") != "success"):
+        error = claude_error(done.stdout) or done.stderr or f"agent exited {done.returncode}"
+        cause = bounded_cause(error)
+        if "output token maximum" in error or "context window limit" in error:
+            raise review_budget.ReviewLimitError(cause, "review_budget_exhausted",
+                _diagnostic("claude", "analysis", cause=cause))
+        if "Prompt is too long" in error:
+            raise AgentPreflightError(cause, "review_packet_too_large")
+        provider_failure(cause, provider="claude", exit_code=done.returncode)
+    if len(results) != 1 or not isinstance(results[0].get("result"), str):
+        raise InvalidVerdict("Claude bounded review requires one successful result")
+    return unfenced(results[0]["result"])
 
 
 # ── Codex ─────────────────────────────────────────────────────────────
@@ -1166,4 +1206,4 @@ def ask_muse(root: Path, model: Model, system: str, text: str, schema: dict, wat
     return unfenced(answer)
 
 
-ASK = {"codex": ask_codex, "grok": ask_grok, "antigravity": ask_antigravity, "muse": ask_muse}
+ASK = {"claude": ask_claude, "codex": ask_codex, "grok": ask_grok, "antigravity": ask_antigravity, "muse": ask_muse}

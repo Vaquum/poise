@@ -155,20 +155,26 @@ def run(
         # round: review the full diff once, and say so in the prompt.
         lost_since = since
         packet_text = atoms.packet(pwd, pr, actor, expected_head, p, since_head=None)
-    if capped and not review_continuation.enabled() and review_receipt.coverage_disposition(json.loads(packet_text)) != "complete":
+    bounded = review_continuation.enabled()
+    if bounded:
+        tools = [review_repository.INSPECTION_RULE] if spec.provider == "claude" else []
+    if capped and not bounded and review_receipt.coverage_disposition(json.loads(packet_text)) != "complete":
         capped = False
         if spec.provider == "claude":
             tools = allowed(pr, actor, expected_head)
-    if capped and spec.provider == "claude":
+    if capped and spec.provider == "claude" and not bounded:
         policy: str = capped_policy(review_round or 0, review_cap or 0)
         rules = capped_rules(repo_name(pr, pwd), pr, expected_head, review_round or 0, review_cap or 0, actor)
     else:
         # Structured providers review as usual; the harness files the
         # follow-up issue and approves only explicitly nonbreaking findings.
-        policy = POLICY if spec.provider == "claude" else atoms.STRUCTURED_POLICY
+        policy = POLICY if spec.provider == "claude" and not bounded else atoms.STRUCTURED_POLICY
         rules = RULES
     if review_continuation.enabled():
         policy += " " + review_repository.REQUEST_POLICY
+        if capped:
+            policy += (f" Caller applies review round {review_round} of a {review_cap}-round cap only after "
+                       "complete analysis. Return every finding regardless of severity; Caller owns issue filing and approval.")
     text = atoms.prompt(
         policy,
         SEVERITY,
