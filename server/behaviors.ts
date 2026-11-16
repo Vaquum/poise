@@ -4741,6 +4741,14 @@ async function releaseFailedBehaviorIfNoAction(
       }
     }
   }
+  if (call.error_code === 'review_continuation_held'
+    && call.error.startsWith('review checkpoint validation failed: inspection checkpoint ')
+    && reviewContinuationNoWrite(call)
+    && resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) {
+    // The old checkpoint validator stopped for optional context errors. Its
+    // released, unsubmitted Call can be reconsidered under the new review rules.
+    return releaseFailedBehaviorLaunch(behavior, target, failed.launchCallId, failed.launchExpectedHead)
+  }
   let observedHead: string | null = null
   if (prReviewRetryState(snapshot, behavior, repo, number, failed.launchExpectedHead,
     failed.launchActor, configuredModel ?? call.model, target).stopped

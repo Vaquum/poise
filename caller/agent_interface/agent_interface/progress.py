@@ -55,6 +55,35 @@ def warning() -> None:
                 current._event(message)
 
 
+def review_context_warning(warnings: list[str]) -> None:
+    current = _current.get()
+    if not current:
+        return
+    from . import caller_store
+    from .process_diagnostic import diagnostic_envelope
+
+    message = "Review continuing with limited repository context."
+    with current.lock:
+        current.state["warning"] = message
+        current._event(warnings[-1])
+    evidence = diagnostic_envelope(operation="github-interface.review-context", phase="inspection",
+                                   outcome="incomplete_context", severity="warning", message=message,
+                                   stderr="\n".join(warnings), event_time=stamp(), call_id=current.call_id)
+    try:
+        connection = caller_store.connect(current.database, timeout=0.1)
+        try:
+            with connection:
+                connection.execute("""update calls set
+                    artifact=json_set(coalesce(artifact, '{}'), '$.review_context_warnings', json(?)),
+                    diagnostic=case when json_extract(diagnostic, '$.severity') = 'error' then diagnostic else ? end
+                    where id=? and status='running'""",
+                    (json.dumps(warnings), json.dumps(evidence), current.call_id))
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as error:
+        print(f"[agent-interface] Review lookup warning could not be recorded ({type(error).__name__}).", file=sys.stderr)
+
+
 def phase() -> str | None:
     current = _current.get()
     if current:
