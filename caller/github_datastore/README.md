@@ -126,6 +126,11 @@ repository/item identities, updates changed items, removes deletions, and catche
 up before marking the index complete. Incomplete builds have no freshness marker.
 Without `--resume`, initialization still clears and rebuilds the index.
 
+Initialization and sync keep readable repository and item records when a
+neighbour is malformed. The affected item keeps its last usable snapshot and
+its retry reason. Incomplete inventories preserve missing records and schedule
+a full read of the affected repository before using absence to remove records.
+
 Incremental sync batches the first issue/PR probe for up to 20 repositories per
 GraphQL request. Subsequent pages share requests across up to 20 independent
 issue/PR connections, using each connection's own returned cursor. Every page

@@ -5,15 +5,15 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from github_datastore.cli import main
 from github_datastore import views
 from github_datastore.db import connect, get_state, init_db, set_state, upsert_repo
-from github_datastore.github_api import GitHubRateLimitError, ItemGraphError
-from github_datastore.store import INITIALIZATION_KEY, init_org, iter_expanded, store_expanded, sync_once
+from github_datastore.github_api import GitHubRateLimitError, ItemGraphError, PartialItemInventory
+from github_datastore.store import INITIALIZATION_KEY, INVENTORY_RETRY_KEY, ITEM_SYNC_ERRORS, init_org, iter_expanded, store_expanded, sync_once
 from tests.test_store import BatchReader, base_expanded, repo_row
 
 
@@ -136,6 +136,65 @@ class InitializationTest(unittest.TestCase):
         self.assertEqual(self.item_ids(), [100, 200, 201])
         self.assertEqual(self.state("last_sync_at"), CATCHUP)
         self.assertEqual(json.loads(self.state(INITIALIZATION_KEY))["status"], "complete")
+
+    def test_unreadable_item_allows_initialization_and_retries_only_that_item(self) -> None:
+        reader = InitializationReader([self.repo, self.other_repo], {
+            self.repo["full_name"]: [expansion(self.repo, 100, 1), expansion(self.repo, 101, 2)],
+            self.other_repo["full_name"]: [expansion(self.other_repo, 200, 1)],
+        })
+        expand = reader.expand_issue_or_pr
+
+        def read(repo, item):
+            if item["id"] == 100:
+                raise ItemGraphError("missing comment page for issue #1")
+            return expand(repo, item)
+
+        with patch.object(reader, "expand_issue_or_pr", side_effect=read):
+            self.initialize(reader)
+        self.assertEqual(self.item_ids(), [101, 200])
+        self.assertEqual(json.loads(self.state(INITIALIZATION_KEY))["status"], "complete")
+        with closing(connect(self.path)) as conn:
+            saved = json.loads(get_state(conn, ITEM_SYNC_ERRORS, "100"))
+            self.assertEqual(saved["reason"], "missing comment page for issue #1")
+        reader.expanded.clear()
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader):
+            sync_once(self.path, workers=1)
+        self.assertEqual(reader.expanded, [100])
+        self.assertEqual(self.item_ids(), [100, 101, 200])
+        with closing(connect(self.path)) as conn:
+            self.assertIsNone(get_state(conn, ITEM_SYNC_ERRORS, "100"))
+
+    def test_partial_inventory_preserves_the_old_item_and_repairs_only_the_affected_repo(self) -> None:
+        first, second = self.repo["full_name"], self.other_repo["full_name"]
+        unchanged = expansion(self.repo, 100, 1)
+        reader = InitializationReader([self.repo, self.other_repo], {first: [unchanged], second: []})
+        self.initialize(reader)
+        healthy = expansion(self.repo, 101, 2)
+        sibling = expansion(self.other_repo, 200, 1)
+        reader.items.update({first: [unchanged, healthy], second: [sibling]})
+        reader.expanded.clear()
+        cause = f"{first} issue #1: invalid timestamp"
+        with patch("github_datastore.store.GitHubOrgReader", return_value=reader):
+            with patch.object(reader, "list_repos_changed_items", return_value={
+                first: PartialItemInventory([stub(healthy)], [cause], {1: cause}),
+                second: [stub(sibling)],
+            }):
+                sync_once(self.path, workers=1)
+            self.assertEqual(reader.expanded, [101, 200])
+            self.assertEqual(self.item_ids(), [100, 101, 200])
+            with closing(connect(self.path)) as conn:
+                saved = json.loads(get_state(conn, ITEM_SYNC_ERRORS, "100"))
+                self.assertEqual(saved["reason"], cause)
+                self.assertIsNotNone(get_state(conn, "repo:10", INVENTORY_RETRY_KEY))
+
+            reader.listed.clear()
+            reader.expanded.clear()
+            sync_once(self.path, workers=1)
+        self.assertEqual(reader.listed, [first])
+        self.assertEqual(reader.expanded, [100])
+        with closing(connect(self.path)) as conn:
+            self.assertIsNone(get_state(conn, ITEM_SYNC_ERRORS, "100"))
+            self.assertIsNone(get_state(conn, "repo:10", INVENTORY_RETRY_KEY))
 
     def test_resume_refreshes_changes_prunes_deletions_and_adds_new_items(self) -> None:
         first = self.reader([expansion(self.repo, 100, 1), expansion(self.repo, 101, 2), expansion(self.repo, 102, 3)])
@@ -376,13 +435,23 @@ class InitializationTest(unittest.TestCase):
         self.assertIsNone(self.state("last_sync_at"))
         self.assertEqual(self.item_ids(), [100])
 
-    def test_resume_rejects_corrupt_progress_and_expansion_identity(self) -> None:
+    def test_resume_repairs_an_unreadable_saved_expansion(self) -> None:
+        self.partial()
+        with closing(connect(self.path)) as conn:
+            with conn:
+                conn.execute("UPDATE items SET expanded_json = '{}', updated_at = 'invalid' WHERE item_id = 100")
+        reader = self.reader([expansion(self.repo, 100, 1), expansion(self.repo, 101, 2)])
+        with self.assertLogs("github_datastore.store", level="WARNING") as reasons:
+            self.initialize(reader, resume=True)
+        self.assertEqual(reader.expanded, [100, 101])
+        self.assertEqual(self.item_ids(), [100, 101])
+        self.assertIn("Refreshing unreadable saved item Vaquum/Test#1", "\n".join(reasons.output))
+
+    def test_resume_rejects_corrupt_shared_progress_and_repository_owner(self) -> None:
         cases = [
             ("UPDATE sync_state SET value = 'not-json' WHERE key = ?", (INITIALIZATION_KEY,), "invalid initialization"),
             ("UPDATE sync_state SET value = 'invalid' WHERE key = ?", ("full_build_markers_v1_initialized",), "marker state"),
             ("UPDATE repos SET owner = 'Other'", (), "different repository owner"),
-            ("UPDATE items SET expanded_json = '{}'", (), "invalid stored expansion"),
-            ("UPDATE items SET number = 99", (), "identity mismatch"),
         ]
         for statement, params, message in cases:
             with self.subTest(message=message):

@@ -37,6 +37,8 @@ from .github_api import (
     GitHubOrgReader,
     GitHubRateLimitError,
     ItemGraphError,
+    PartialItemInventory,
+    PartialRepositoryInventory,
     PullReconciliation,
     datastore_github_client,
     parse_graphql_datetime,
@@ -50,6 +52,7 @@ FULL_BUILD_COMPLETE_KEY = "full_build_complete"
 FULL_BUILD_MARKERS_INITIALIZED_KEY = "full_build_markers_v1_initialized"
 FULL_BUILD_RETRY_KEY = "full_build_retry_required"
 ITEM_SYNC_ERRORS = "item-sync-errors"
+INVENTORY_RETRY_KEY = "item_inventory_retry"
 INITIALIZATION_KEY = "initialization_v1"
 RECONCILE_PROGRESS_KEY = "reconcile_progress_v1"
 
@@ -73,7 +76,8 @@ def init_org(
             initialization_to_resume(conn, org, include_repos, exclude_repos)
             if resume else None
         )
-        all_repos = reader.list_org_repos(org)
+        repo_inventory = reader.list_org_repos(org)
+        all_repos = readable_repositories(conn, org, repo_inventory)
         if prior and get_state(conn, "org", INITIALIZATION_KEY) is None:
             verify_legacy_initialization_filter(conn, all_repos, prior)
         repos = (
@@ -109,19 +113,22 @@ def init_org(
             for repo in repos:
                 upsert_repo(conn, repo)
                 clear_full_build_marker(conn, int(repo["id"]))
-            prune_repos(conn, [int(repo["id"]) for repo in repos])
+            if not isinstance(repo_inventory, PartialRepositoryInventory):
+                prune_repos(conn, [int(repo["id"]) for repo in repos])
             users = list_users(conn)
 
         # Re-list on every attempt: a saved expansion is reusable only when its
         # current identity and timestamp still match. This also removes deletions.
         for repo in repos:
             repo_id = int(repo["id"])
-            all_issues = list_repo_items(reader, repo)
+            inventory = list_repo_items(reader, repo)
+            all_issues = readable_items(conn, repo, inventory)
             issues = items_requiring_full_refresh(conn, repo_id, repo["full_name"], all_issues)
-            with conn:
-                prune_items_for_repo(conn, repo_id, [int(issue["id"]) for issue in all_issues])
-            for expanded in iter_expanded(reader, repo, issues, workers):
-                store_expanded(conn, expanded, users)
+            if not isinstance(inventory, PartialItemInventory):
+                with conn:
+                    prune_items_for_repo(conn, repo_id, [int(issue["id"]) for issue in all_issues])
+                    clear_inventory_retry(conn, repo_id)
+            store_available_items(conn, reader, repo, issues, workers, users)
             with conn:
                 mark_full_build_completed(conn, repo_id)
 
@@ -131,10 +138,9 @@ def init_org(
         changed = changed_items_for_repos(reader, conn, repos, state["started_at"])
         for repo in repos:
             issues = items_requiring_full_refresh(
-                conn, int(repo["id"]), repo["full_name"], changed[repo["full_name"]]
+                conn, int(repo["id"]), repo["full_name"], readable_items(conn, repo, changed[repo["full_name"]])
             )
-            for expanded in iter_expanded(reader, repo, issues, workers):
-                store_expanded(conn, expanded, users)
+            store_available_items(conn, reader, repo, issues, workers, users)
 
         with conn:
             assert_no_duplicate_items(conn)
@@ -235,24 +241,6 @@ def initialization_to_resume(
             raise RuntimeError("initialization has pending reconciliation state")
     if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise RuntimeError("initialization database has broken foreign keys")
-    for item in conn.execute("SELECT * FROM items"):
-        try:
-            expanded = json.loads(item["expanded_json"])
-            identity_matches = (
-                expanded["repo"]["id"] == item["repo_id"]
-                and expanded["repo"]["full_name"] == item["repo_full_name"]
-                and expanded["repo"]["owner"]["login"].casefold() == org.casefold()
-                and expanded["issue"]["id"] == item["item_id"]
-                and expanded["issue"]["node_id"] == item["node_id"]
-                and expanded["issue"]["number"] == item["number"]
-                and expanded["issue"]["updated_at"] == item["updated_at"]
-                and ("pr" if expanded["is_pr"] else "issue") == item["item_type"]
-            )
-        except (ValueError, TypeError, KeyError, AttributeError) as error:
-            raise RuntimeError(f"invalid stored expansion for item {item['item_id']}") from error
-        if not identity_matches:
-            raise RuntimeError(f"stored expansion identity mismatch for item {item['item_id']}")
-        parse_graphql_datetime(item["updated_at"], f"stored item {item['item_id']}")
     return state
 
 
@@ -292,10 +280,57 @@ def verify_legacy_initialization_filter(
         raise RuntimeError("legacy initialization repo filter identities do not match stored ids")
 
 
-def list_repo_items(reader: GitHubOrgReader, repo: dict[str, Any]) -> list[dict[str, Any]]:
-    if repo.get("has_issues"):
-        return reader.list_repo_issues(repo["full_name"])
-    return reader.list_repo_issues(repo["full_name"], include_issues=False)
+def list_repo_items(reader: GitHubOrgReader, repo: dict[str, Any]) -> list[dict[str, Any]] | PartialItemInventory:
+    try:
+        if repo.get("has_issues"):
+            return reader.list_repo_issues(repo["full_name"])
+        return reader.list_repo_issues(repo["full_name"], include_issues=False)
+    except GitHubRateLimitError:
+        raise
+    except (GitHubApiError, KeyError, ValueError, TypeError, AttributeError) as error:
+        return PartialItemInventory([], [f"Could not list {repo['full_name']}: {error}"], {})
+
+
+def readable_repositories(
+    conn: sqlite3.Connection, owner: str, inventory: list[dict[str, Any]] | PartialRepositoryInventory,
+) -> list[dict[str, Any]]:
+    if not isinstance(inventory, PartialRepositoryInventory):
+        return inventory
+    logger.warning("Incomplete repository inventory for %s (%d invalid rows): %s",
+                   owner, len(inventory.problems), "; ".join(reason[:500] for reason in inventory.problems[:8]))
+    visible = {repo["id"] for repo in inventory.repos}
+    with conn:
+        for (repo_id,) in conn.execute("SELECT repo_id FROM repos"):
+            if repo_id not in visible:
+                set_state(conn, repo_state_scope(repo_id), INVENTORY_RETRY_KEY,
+                          f"Incomplete repository inventory for {owner}; check the next full item listing")
+    return inventory.repos
+
+
+def readable_items(
+    conn: sqlite3.Connection, repo: dict[str, Any], inventory: list[dict[str, Any]] | PartialItemInventory,
+) -> list[dict[str, Any]]:
+    if not isinstance(inventory, PartialItemInventory):
+        return inventory
+    problems = [reason[:500] for reason in inventory.problems[:8]]
+    logger.warning("Incomplete item inventory for %s (%d invalid rows): %s",
+                   repo["full_name"], len(inventory.problems), "; ".join(problems))
+    repo_id = int(repo["id"])
+    with conn:
+        set_state(conn, repo_state_scope(repo_id), INVENTORY_RETRY_KEY, json.dumps(problems))
+        for number, reason in inventory.unreadable.items():
+            row = conn.execute("SELECT item_id, item_type, updated_at FROM items WHERE repo_id = ? AND number = ?",
+                               (repo_id, number)).fetchone()
+            if row is not None:
+                item = {"id": row["item_id"], "number": number, "updated_at": row["updated_at"], "item_kind": row["item_type"]}
+                set_state(conn, ITEM_SYNC_ERRORS, str(row["item_id"]), json.dumps({
+                    "repo_id": repo_id, "item": item, "reason": reason[:500],
+                }))
+    return inventory.items
+
+
+def clear_inventory_retry(conn: sqlite3.Connection, repo_id: int) -> None:
+    conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (repo_state_scope(repo_id), INVENTORY_RETRY_KEY))
 
 
 def changed_items_for_repos(
@@ -303,7 +338,7 @@ def changed_items_for_repos(
     conn: sqlite3.Connection,
     repos: list[dict[str, Any]],
     since: str | None,
-) -> dict[str, list[dict[str, Any]]]:
+) -> dict[str, list[dict[str, Any]] | PartialItemInventory]:
     changed = {}
     reconciliations = []
     # Keep each batch's connection set uniform; disabled Issues never exclude PRs.
@@ -362,6 +397,35 @@ class ReconciliationDeadline(Exception):
     pass
 
 
+def store_available_items(
+    conn: sqlite3.Connection, reader: GitHubOrgReader, repo: dict[str, Any],
+    items: list[dict[str, Any]], workers: int, users: list[str],
+    *, observe: Callable[[int | None], None] = lambda _item_id: None,
+) -> None:
+    by_number = {item["number"]: item for item in items}
+
+    def retain_failure(number: int | str, error: Exception) -> None:
+        logger.warning("Could not sync %s#%s; keeping the last snapshot: %s", repo["full_name"], number, error)
+        item = by_number.get(number)
+        if item is not None:
+            with conn:
+                set_state(conn, ITEM_SYNC_ERRORS, str(item["id"]), json.dumps({
+                    "repo_id": int(repo["id"]), "item": item, "reason": str(error)[:500],
+                }))
+        observe(None)
+
+    with closing(iter_expanded(reader, repo, items, workers, on_item_error=retain_failure)) as expansions:
+        for expanded in expansions:
+            try:
+                item_id = store_expanded(conn, expanded, users)
+            except (GitHubApiError, ValueError, TypeError, KeyError, AttributeError, sqlite3.IntegrityError) as error:
+                issue = expanded.get("issue") if isinstance(expanded, dict) else None
+                number = issue.get("number", "unknown") if isinstance(issue, dict) else "unknown"
+                retain_failure(number, error)
+                continue
+            observe(item_id)
+
+
 def sync_once(
     db_path: str | Path,
     workers: int = 8,
@@ -405,7 +469,8 @@ def sync_once(
                                     "AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array'"):
                 clear_full_build_marker(conn, int(row["repo_id"]))
         since = get_state(conn, "org", "last_sync_at")
-        repos = reader.list_org_repos(org)
+        repo_inventory = reader.list_org_repos(org)
+        repos = readable_repositories(conn, org, repo_inventory)
         repos = apply_sync_repo_filter(conn, repos, include_repos, exclude_repos)
         users = list_users(conn)
         known_repos = {
@@ -424,7 +489,8 @@ def sync_once(
                 ):
                     clear_full_build_marker(conn, repo_id)
                 upsert_repo(conn, repo)
-            prune_repos(conn, [int(repo["id"]) for repo in repos])
+            if not isinstance(repo_inventory, PartialRepositoryInventory):
+                prune_repos(conn, [int(repo["id"]) for repo in repos])
 
         if reconcile:
             raw_progress = get_state(conn, "org", RECONCILE_PROGRESS_KEY)
@@ -455,6 +521,7 @@ def sync_once(
             if not reconcile
             and full_build_completed(conn, int(repo["id"]))
             and not full_build_retry_required(conn, int(repo["id"]))
+            and not get_state(conn, repo_state_scope(int(repo["id"])), INVENTORY_RETRY_KEY)
         ]
         changed = changed_items_for_repos(reader, conn, incremental_repos, since)
         pending: dict[int, dict[int, dict[str, Any]]] = {}
@@ -479,12 +546,14 @@ def sync_once(
                 or prior_repo[1] != repo["full_name"]
                 or not full_build_completed(conn, repo_id)
             )
-            full_enumeration = reconcile or retry_full_build or requires_initial_full
+            retry_inventory = get_state(conn, repo_state_scope(repo_id), INVENTORY_RETRY_KEY) is not None
+            full_enumeration = reconcile or retry_full_build or requires_initial_full or retry_inventory
             if full_enumeration:
                 if not reconcile:
                     with conn:
                         clear_full_build_marker(conn, repo_id)
-                all_issues = list_repo_items(reader, repo)
+                inventory = list_repo_items(reader, repo)
+                all_issues = readable_items(conn, repo, inventory)
                 refresh = (
                     all_issues
                     if reconcile or retry_full_build
@@ -497,12 +566,13 @@ def sync_once(
                 for item_id in retries:
                     if item_id in versions_in_repo:
                         issues[item_id] = versions_in_repo[item_id]
-                with conn:
-                    prune_items_for_repo(
-                        conn, repo_id, [int(issue["id"]) for issue in all_issues]
-                    )
-                    for missing_id in retries.keys() - versions_in_repo.keys():
-                        conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (ITEM_SYNC_ERRORS, str(missing_id)))
+                if not isinstance(inventory, PartialItemInventory):
+                    with conn:
+                        prune_items_for_repo(
+                            conn, repo_id, [int(issue["id"]) for issue in all_issues]
+                        )
+                        for missing_id in retries.keys() - versions_in_repo.keys():
+                            conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (ITEM_SYNC_ERRORS, str(missing_id)))
                 # Each expansion and its source version survive a killed CLI.
                 # A new enumeration still discovers transfers, removals and edits.
                 checkpoint_scope = f"full-refresh:{repo_id}"
@@ -523,54 +593,36 @@ def sync_once(
                          get_state(conn, checkpoint_scope, str(item_id)) != versions[item_id]]
             else:
                 by_number = {item["number"]: item for item in retries.values()}
-                by_number.update({item["number"]: item for item in changed[repo["full_name"]]})
+                inventory = changed[repo["full_name"]]
+                available = readable_items(conn, repo, inventory)
+                if isinstance(inventory, PartialItemInventory):
+                    available = items_requiring_full_refresh(conn, repo_id, repo["full_name"], available)
+                    for number in inventory.unreadable:
+                        by_number.pop(number, None)
+                by_number.update({item["number"]: item for item in available})
                 items = list(by_number.values())
             outstanding = len(items)
-            by_number = {item["number"]: item for item in items}
 
-            def checked_attempt() -> None:
+            def checked_attempt(item_id: int | None) -> None:
                 nonlocal outstanding
+                if full_enumeration and item_id is not None:
+                    with conn:
+                        set_state(conn, checkpoint_scope, str(item_id), versions[item_id])
                 outstanding -= 1
                 if reconcile_sleep:
                     time.sleep(reconcile_sleep)
                 if deadline is not None and outstanding and time.monotonic() >= deadline:
                     raise ReconciliationDeadline()
 
-            def retain_item_failure(number: int | str, error: Exception) -> None:
-                logger.warning("Could not sync %s#%s; keeping the last snapshot: %s", repo["full_name"], number, error)
-                item = by_number.get(number)
-                if item is not None:
-                    with conn:
-                        set_state(conn, ITEM_SYNC_ERRORS, str(item["id"]), json.dumps({
-                            "repo_id": repo_id, "item": item, "reason": str(error)[:500],
-                        }))
-                checked_attempt()
-
-            expansions = iter_expanded(reader, repo, items, workers, on_item_error=retain_item_failure)
             try:
-                for expanded in expansions:
-                    try:
-                        item_id = store_expanded(conn, expanded, users)
-                    except (GitHubApiError, ValueError, TypeError, KeyError, AttributeError, sqlite3.IntegrityError) as error:
-                        issue = expanded.get("issue") if isinstance(expanded, dict) else None
-                        number = issue.get("number", "unknown") if isinstance(issue, dict) else "unknown"
-                        retain_item_failure(number, error)
-                        continue
-                    if full_enumeration or item_id in retries:
-                        with conn:
-                            if full_enumeration:
-                                set_state(conn, checkpoint_scope, str(item_id), versions[item_id])
-                            if item_id in retries:
-                                conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (ITEM_SYNC_ERRORS, str(item_id)))
-                    checked_attempt()
+                store_available_items(conn, reader, repo, items, workers, users, observe=checked_attempt)
             except ReconciliationDeadline:
                 return False
-            finally:
-                # Closing explicitly propagates errors from workers still in flight.
-                expansions.close()
             if full_enumeration:
                 with conn:
                     mark_full_build_completed(conn, repo_id)
+                    if not isinstance(inventory, PartialItemInventory):
+                        clear_inventory_retry(conn, repo_id)
                     conn.execute("DELETE FROM sync_state WHERE scope = ?", (checkpoint_scope,))
                     if reconcile:
                         progress["remaining"].remove(str(repo_id))
@@ -606,7 +658,7 @@ def items_requiring_full_refresh(
         int(row["item_id"]): row
         for row in conn.execute(
             """
-            SELECT item_id, repo_full_name, number, item_type, state, updated_at, expanded_json
+            SELECT item_id, node_id, repo_full_name, number, item_type, state, updated_at, expanded_json
             FROM items
             WHERE repo_id = ?
             """,
@@ -623,15 +675,22 @@ def items_requiring_full_refresh(
         current_at = parse_graphql_datetime(
             item.get("updated_at"), f"item {item_id} for {repo_full_name}"
         )
-        stored_at = parse_graphql_datetime(
-            row["updated_at"], f"stored item {item_id} for {repo_full_name}"
-        )
-        issue_labels = True
-        if row["item_type"] == "issue":
-            try:
-                issue_labels = isinstance(json.loads(row["expanded_json"])["issue"].get("labels"), list)
-            except (ValueError, TypeError, KeyError, AttributeError):
-                issue_labels = False
+        try:
+            stored_at = parse_graphql_datetime(row["updated_at"], f"stored item {item_id}")
+            expanded = json.loads(row["expanded_json"])
+            stored_repo = expanded["repo"]
+            stored_issue = expanded["issue"]
+            if (stored_repo["id"] != repo_id or stored_repo["full_name"] != row["repo_full_name"]
+                or stored_repo["owner"]["login"].casefold() != row["repo_full_name"].split("/", 1)[0].casefold()
+                or stored_issue["id"] != item_id or stored_issue["node_id"] != row["node_id"]
+                or stored_issue["number"] != row["number"] or stored_issue["updated_at"] != row["updated_at"]
+                or ("pr" if expanded["is_pr"] else "issue") != row["item_type"]):
+                raise ValueError("stored expansion identity mismatch")
+            issue_labels = row["item_type"] != "issue" or isinstance(stored_issue.get("labels"), list)
+        except (GitHubApiError, ValueError, TypeError, KeyError, AttributeError) as error:
+            logger.warning("Refreshing unreadable saved item %s#%s: %s", repo_full_name, item["number"], error)
+            refresh.append(item)
+            continue
         if (
             current_at != stored_at
             or int(row["number"]) != int(item["number"])
@@ -732,9 +791,13 @@ def store_expanded(
             "SELECT updated_at, expanded_json FROM items WHERE item_id = ?",
             (int(issue["id"]),),
         ).fetchone()
-        regressed = previous is not None and parse_graphql_datetime(
-            issue["updated_at"], f"item {issue['id']}"
-        ) < parse_graphql_datetime(previous["updated_at"], f"stored item {issue['id']}")
+        received_at = parse_graphql_datetime(issue["updated_at"], f"item {issue['id']}")
+        regressed = False
+        if previous is not None:
+            try:
+                regressed = received_at < parse_graphql_datetime(previous["updated_at"], f"stored item {issue['id']}")
+            except GitHubApiError as error:
+                logger.warning("Replacing invalid timestamp for %s#%s: %s", expanded["repo"]["full_name"], issue["number"], error)
         if regressed:
             # Keep the complete prior graph atomically with its replacement: a
             # timestamp alone cannot distinguish clock correction from old content.
@@ -752,6 +815,7 @@ def store_expanded(
         for username in users or list_users(conn):
             associations = extract_associations(expanded, username)
             replace_associations(conn, item_id, username, associations)
+        conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (ITEM_SYNC_ERRORS, str(item_id)))
     if regressed:
         logger.warning(
             "item timestamp moved backward for %s: %s (%s -> %s); "
