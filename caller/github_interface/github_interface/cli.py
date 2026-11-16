@@ -294,6 +294,8 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior in {"--approve-pr", "--reviewed-clean"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
         parser.add_argument("--assessment-json", required=behavior == "--reviewed-clean", default=argparse.SUPPRESS)
+        if behavior == "--reviewed-clean":
+            parser.add_argument("--partial-note", action="store_true", default=argparse.SUPPRESS)
         _add_expected_head(parser)
         _add_repository(parser)
         return parser

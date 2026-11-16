@@ -6,16 +6,17 @@ import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture, datastoreHealthOutput } from './behaviors-runtime-fixture'
 
 describe('review outcome evidence and registration', () => {
-  it('settles a receipted partial change request without quarantining or clearing its coverage', async () => {
+  it.each([['requested_changes', 'changes_requested'], ['reviewed_clean', 'incomplete']] as const)
+  ('settles a receipted partial %s and retains incomplete coverage', async (action, disposition) => {
     const launched = await launchReviewBeforeCrash()
     fixture.agentLogs = [agentLog({ started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
       actor: launched.actor, source: launched.source, correlation_id: launched.correlationId,
-      status: 'completed', action: 'requested_changes', outcome: 'incomplete', head_sha: launched.expectedHead,
+      status: 'completed', action, outcome: 'incomplete', head_sha: launched.expectedHead,
       review_id: 91, artifact: { review_response: { coverage: 'incomplete' } } })]
     await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.db.prepare('SELECT launch_action, launch_outcome, launch_quarantine FROM behavior_seen WHERE key = ? AND target = ?')
-      .get('review-new-prs', launched.target)).toMatchObject({ launch_action: 'requested_changes', launch_outcome: 'changes_requested', launch_quarantine: null })
+      .get('review-new-prs', launched.target)).toMatchObject({ launch_action: action, launch_outcome: disposition, launch_quarantine: null })
     expect(fixture.agentLogs[0]).toMatchObject({ outcome: 'incomplete', artifact: { review_response: { coverage: 'incomplete' } } })
     expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
       nativeId: launched.correlationId, state: 'completed', activity: 'settled', outcome: 'incomplete',

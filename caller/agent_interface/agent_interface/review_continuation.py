@@ -109,11 +109,11 @@ def _write(conn, call_id: str, artifact: dict) -> None:
     conn.execute("update calls set artifact=? where id=?", (encoded, call_id))
 
 
-def authority(conn, call_id: str, artifact: dict, *, publishing: bool = False) -> bool:
+def authority(conn, call_id: str, artifact: dict, *, publishing: bool = False) -> str | None:
     """Use the same transaction as response retention / the native POST fence."""
     link = artifact.get("review_resume")
     if link is None:
-        return False
+        return None
     original = _artifact(conn, link["root_call"])
     saved = original["review_progress"]
     if saved["owner"] != call_id or saved["generation"] != link["generation"] \
@@ -135,7 +135,9 @@ def authority(conn, call_id: str, artifact: dict, *, publishing: bool = False) -
             raise RuntimeError("original follow-up creation must be reconciled before review submission")
         saved.update(phase="publishing", publisher=finalization.get("call", call_id))
         _write(conn, link["root_call"], original)
-    return True
+    # Saved reviews from before partial-source support only reached this
+    # point with complete source coverage.
+    return saved.get("coverage", "complete")
 
 
 def reconciled(call_id: str, receipt: dict) -> bool:
@@ -483,12 +485,13 @@ class Session:
     def initialize(self, repository) -> None:
         if self.manifest is not None:
             return
-        packet = self.funded(lambda grant: repository.diff_packet(self.packet, MAX_STORAGE_BYTES // 3, timeout_s=grant),
+        packet = self.funded(lambda grant: repository.diff_packet(self.packet, MAX_STORAGE_BYTES // 3, timeout_s=grant / 2),
                              review_budget.timeout(review_budget.REVIEW_TIMEOUT_SECONDS,
                                                    reserve=FINALIZATION_RESERVE_SECONDS))
-        node = json.loads(packet)
-        if review_receipt.coverage_disposition(node) != "complete":
-            self.stop("required review source coverage is incomplete")
+        from .review_repository import warn
+        packet, missing = review_stages.available_source(packet)
+        for reason in missing:
+            warn(self.state["warnings"], reason)
         self.packet = packet
         self.manifest = {"packet": self.put(packet), "units": [self.put(unit) for unit in
             review_stages.required_stages(packet, max_units=MAX_UNITS)]}
@@ -497,6 +500,7 @@ class Session:
             conn.execute("begin immediate")
             original, saved = self.owned(conn)
             saved["manifest"] = reference
+            saved["coverage"] = review_receipt.coverage_disposition(json.loads(packet))
             _write(conn, self.root, original)
         self.checkpoint(advanced=True)
 
@@ -664,7 +668,7 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
                     lines = source["diff"].splitlines()
                     summaries.append({"evidence_id": reference["sha256"], "files": source["files"],
                                       "boundary_diff": lines[:16] + lines[-16:], "verdict": verdict})
-                stage_packet = json.dumps({**json.loads(packet), "required_cross_unit_evidence": summaries,
+                stage_packet = json.dumps({**json.loads(session.packet), "required_cross_unit_evidence": summaries,
                     "review_scope": "Verify cross-unit contracts and both sides of every subdivision boundary. "
                                     "Inspect pinned source for any missing context before a final verdict."})
                 identities = [ref["sha256"] for ref in units]

@@ -77,7 +77,7 @@ def run(
     packet = atoms.packet(pwd, pr, actor, expected_head, p)
     governed = spec.provider == "claude" and not review_continuation.enabled()
     tools = allowed(pr, actor, expected_head) if governed else []
-    with review_repository.prepare(pwd, pr, actor, expected_head, packet) as repository:
+    with review_repository.prepare(pwd, pr, actor, expected_head, packet, allow_unavailable=not governed) as repository:
         if spec.provider == "claude":
             tools.append(review_repository.INSPECTION_RULE)
         policy = POLICY if governed else atoms.STRUCTURED_POLICY + " " + review_repository.REQUEST_POLICY

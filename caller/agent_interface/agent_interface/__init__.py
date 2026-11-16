@@ -2375,7 +2375,11 @@ def run_governed_behavior(
         except review_receipt.SubmissionError as e:
             # Publication may have been accepted before its response failed.
             # Leave action unknown; Poise verifies live receipts before retry.
-            finish(id_, "failed", response=response, error=str(e), error_code="review_submission_failed")
+            cause = atoms.bounded_cause(str(e)) or type(e).__name__
+            diagnostic = _caller_context(diagnostic_envelope(operation="github-interface.review-submission",
+                phase=progress.phase() or "submitting", outcome="publication_uncertain", stderr=cause),
+                id_, correlation_id, repo, mod.pr_number(pr), actor, behavior, expected_head)
+            finish(id_, "failed", response=response, error=cause, error_code="review_submission_failed", diagnostic=diagnostic)
             print(json.dumps({"id": id_, "error": str(e), "error_code": "review_submission_failed"}))
             raise SystemExit(1)
         except review_continuation.Continuation as e:
@@ -2424,7 +2428,11 @@ def run_governed_behavior(
             }, indent=2))
             raise SystemExit(1)
         except Exception as e:
-            finish(id_, "failed", response=response, error=str(e))
+            cause = atoms.bounded_cause(str(e)) or type(e).__name__
+            diagnostic = _caller_context(diagnostic_envelope(operation="provider.review",
+                phase=progress.phase() or "reviewing", outcome="exception", stderr=cause, message=type(e).__name__),
+                id_, correlation_id, repo, mod.pr_number(pr), actor, behavior, expected_head)
+            finish(id_, "failed", response=response, error=cause, diagnostic=diagnostic)
             print(json.dumps({
                 "id": id_,
                 "model": name,
@@ -2805,6 +2813,10 @@ def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: di
     if str(review.get("commit") or "").lower() != expected_head:
         raise RuntimeError("terminal review is not attached to the expected head")
     _parse_time(str(review.get("submitted_at") or ""), "submitted_at")
+    incomplete = receipt is not None and isinstance(receipt.get("review_response"), dict) \
+        and receipt["review_response"].get("coverage") != "complete"
+    if state == "COMMENTED" and incomplete:
+        return {"action": "reviewed_clean", "outcome": "incomplete", "head_sha": expected_head}
     if behavior == "pr_review":
         if state == "APPROVED":
             raise RuntimeError("review behavior produced an unexpected approval")
@@ -2813,8 +2825,6 @@ def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: di
     elif state == "APPROVED":
         return {"action": "approved", "outcome": "approved", "head_sha": expected_head}
     if state == "CHANGES_REQUESTED":
-        incomplete = receipt is not None and isinstance(receipt.get("review_response"), dict) \
-            and receipt["review_response"].get("coverage") != "complete"
         return {"action": "requested_changes", "outcome": "incomplete" if incomplete else "changes_requested", "head_sha": expected_head}
     raise RuntimeError("latest review state does not match the terminal behavior action")
 

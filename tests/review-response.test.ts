@@ -13,13 +13,20 @@ const response = { repository: target.repository, pull_number: 7, head_sha: targ
   coverage: 'complete', assessment: { verdict: 'The changed validation rejects stale review coverage correctly.',
     reviewed_context: 'Inspected the immutable PR diff, callers and negative cases.', limitations: 'No live provider calls.' } }
 
-it('decodes incomplete native findings and refusals without accepting clean or approval outcomes', () => {
+it('decodes incomplete native notes and findings with a pinned review receipt', () => {
   const call = completedReviewCall('example/repo', 7, target.head, 'reviewer')
   const partial = { ...call, outcome: 'incomplete', action: 'requested_changes', artifact: { review_response: { coverage: 'incomplete' } } }
   expect(parseAgentLogList([partial]).quarantined).toEqual([])
   expect(parseAgentLogList([{ ...partial, status: 'failed', action: null, error_code: 'review_incomplete', error: 'Coverage incomplete' }]).quarantined).toEqual([])
-  for (const action of ['reviewed_clean', 'approved']) {
-    expect(parseAgentLogList([{ ...partial, action }]).quarantined).toHaveLength(1)
+  for (const behavior of ['pr_review', 'pr_approve']) {
+    const note = { ...partial, behavior, action: 'reviewed_clean' }
+    const logs = parseAgentLogList([note])
+    expect(logs.quarantined).toEqual([])
+    expect(logs.entries[0]).toMatchObject({ review_id: 91, action: 'reviewed_clean', outcome: 'incomplete' })
+    expect(callReviewResponse(logs.entries[0]!, Date.now())).toBeNull()
+    for (const change of [{ action: 'approved' }, { review_id: null }, { artifact: {} }, { expected_head: 'b'.repeat(40) }]) {
+      expect(parseAgentLogList([{ ...note, ...change }]).quarantined).toHaveLength(1)
+    }
   }
 })
 

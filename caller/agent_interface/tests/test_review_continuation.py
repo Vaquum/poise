@@ -349,6 +349,38 @@ class TestReviewContinuation(TestCase):
         self.assertEqual(self.inspections, [missing])
         self.assertEqual(len(self.posts), 1)
 
+    def test_deferred_diff_keeps_the_available_file_and_submits_a_partial_note(self):
+        source, node = packet(), packet(2)
+        node.update(diff="", diff_deferred=True)
+        repo = review_repository.Repository(Path(self.directory.name), {"head_sha": HEAD})
+        lines = source["diff"].splitlines()
+
+        def inspect(requests, *, timeout_s):
+            request = requests[0]
+            if request["start_line"] == 1:
+                result = {"request": request, "lines": [{"line": index, "text": line}
+                    for index, line in enumerate(lines, 1)], "truncated": True, "next_line": len(lines) + 1}
+            else:
+                result = {"request": request, "error": "git diff process exited"}
+            return {"action": "review_context", "head_sha": HEAD, "results": [result]}
+
+        def ask(*args):
+            self.assertIn("consumer(contract)", supplied(args[3])["diff"])
+            return verdict(args[3])
+
+        self.repository = repo
+        with patch.object(repo, "inspect", side_effect=inspect), self.call(node) as root:
+            self.run_review(node, ask)
+        command, _ = self.posts[0]
+        self.assertIn("--partial-note", command)
+        self.assertNotIn("--approve-pr", command)
+        assessment = json.loads(command[command.index("--assessment-json") + 1])
+        self.assertIn("git diff process exited", assessment["limitations"])
+        self.assertIn("src/f001.py", assessment["limitations"])
+        with sqlite3.connect(api.DB) as conn:
+            artifact = json.loads(conn.execute("select artifact from calls where id=?", (root,)).fetchone()[0])
+        self.assertEqual(artifact["review_response"]["coverage"], "incomplete")
+
     def test_inspection_cap_keeps_findings_and_warns_about_unread_pages(self):
         node = packet(37)
         read = {"operation": "read", "path": "src/f016.py", "query": "", "start_line": 1}

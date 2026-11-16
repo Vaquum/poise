@@ -85,6 +85,8 @@ class TestReviewCoverage(TestCase):
         module = {"--request-changes": request_changes, "--reviewed-clean": reviewed_clean, "--approve-pr": approve_pr}[argv[1]]
         payload = {"repository": "o/r", "pr": "12", "expected_head": self.head, "token_user": "reviewer",
                    "assessment": json.loads(argv[argv.index("--assessment-json") + 1])}
+        if "--partial-note" in argv:
+            payload["partial_note"] = True
         if "--comments-json" in argv:
             payload["comments"] = json.loads(argv[argv.index("--comments-json") + 1])
         elif "--comments" in argv:
@@ -133,19 +135,19 @@ class TestReviewCoverage(TestCase):
                 pwd=self.directory.name, model="gpt-6-astra-ultra", **options)
 
     def test_clean_prefix_cannot_clear_the_omitted_sole_defect(self):
-        with self.assertRaises(SystemExit):
-            self.run_review("pr_review")
+        self.run_review("pr_review")
         self.assertEqual(self.packets[0]["coverage"], "incomplete")
         self.assertNotIn("1 / 0", self.packets[0]["diff"])
         self.assertEqual(self.packets[0]["omitted_files"][0]["path"], "z.py")
-        self.client.post.assert_not_awaited()
+        self.client.post.assert_awaited_once()
         self.assertEqual(api.logs()[0]["outcome"], "incomplete")
+        self.assertIsNone(self.activity()["reviewer_latest_complete_commit"])
         self.head = NEXT
-        with self.assertRaises(SystemExit):
-            self.run_review("pr_approve")
+        self.run_review("pr_approve")
         self.assertIsNone(self.packets[-1]["since_head_sha"])
         self.assertIn("z.py", [entry["path"] for entry in self.packets[-1]["omitted_files"]])
-        self.client.post.assert_not_awaited()
+        self.assertEqual([review["state"] for review in self.reviews], ["COMMENTED", "COMMENTED"])
+        self.assertTrue(all("Coverage: incomplete" in review["body"] and "z.py" in review["body"] for review in self.reviews))
 
     def test_partial_change_request_keeps_its_receipt_but_never_becomes_a_capped_approval_or_baseline(self):
         self.retained_finding = True
@@ -263,15 +265,16 @@ class TestReviewCoverage(TestCase):
                     diff_limit = 300
                     posts = self.client.post.await_count
                     for behavior in ("pr_review", "pr_approve"):
-                        with self.assertRaises(SystemExit):
-                            self.run_review(behavior, **(
-                                {"capped": True, "review_round": 5, "review_cap": 5}
-                                if behavior == "pr_approve" else {}))
+                        self.run_review(behavior, **(
+                            {"capped": True, "review_round": 5, "review_cap": 5}
+                            if behavior == "pr_approve" else {}))
                         node = self.packets[-1]
                         self.assertEqual(node["coverage"], "incomplete")
                         self.assertEqual([entry["path"] for entry in node["omitted_files"]], ["src/permissions.json"])
                         self.assertEqual(api.logs()[-1]["outcome"], "incomplete")
-                    self.assertEqual(self.client.post.await_count, posts)
+                    self.assertEqual(self.client.post.await_count, posts + 2)
+                    self.assertEqual([review["state"] for review in self.reviews], ["COMMENTED", "COMMENTED"])
+                    self.assertIsNone(self.activity()["reviewer_latest_complete_commit"])
                     followup.assert_not_called()
 
     def test_claude_terminal_commands_refuse_incomplete_or_unproven_coverage_before_post(self):
