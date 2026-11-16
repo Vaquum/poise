@@ -15,7 +15,7 @@ describe('scheduled review model selection', () => {
     runtime.startBehaviorsRuntime()
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
-    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--model', 'gpt-6-astra-ultra', '--recovery-model', 'opus-5-xhigh']))
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--model', 'gpt-6-astra-ultra', '--recovery-model', 'grok-4.6-xhigh']))
     expect(mocks.requireAuth).not.toHaveBeenCalled()
   })
 

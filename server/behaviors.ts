@@ -1150,11 +1150,13 @@ function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, 
 // The reviewers that launch now: the admitted slots as targets, each running
 // the next untripped model — the substitute verdict lands on the waiting
 // slot instead of stranding its ledger aggregate.
-async function launchReviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review', seedKey?: string): Promise<ReviewPanel> {
+async function launchReviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review', seedKey?: string,
+  replaceSignedOut = count === 1 && place === 'pr_review'): Promise<ReviewPanel> {
   const full = await reviewPanel(REVIEWER_SLOTS.length, place, seedKey === undefined ? Math.random : seededRandom(seedKey))
   const targets = full.reviewers.slice(0, count)
-  const models = full.reviewers.filter(({ model }) => place === 'issue_review'
-    ? !reviewerTripped(model) : reviewModelAvailable(full.catalog, model)).slice(0, count)
+  // An unstarted panel member keeps its assigned slot when peers can run.
+  const models = full.reviewers.filter(({ model }) => replaceSignedOut
+    ? reviewModelAvailable(full.catalog, model) : !reviewerTripped(model)).slice(0, count)
   const reviewers = targets.slice(0, models.length).map((target, index) => ({
     slot: target.slot, model: models[index].model, recovery: liveReviewRecovery(full.catalog, place, models[index].model, models[index].recovery),
   }))
@@ -8674,7 +8676,7 @@ async function runBehaviorChains(): Promise<void> {
         }
         if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
           const place = decision.behavior === 'review-issue' ? 'issue_review' : 'pr_review'
-          const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), place, `${chainKey}:${place}:panel`)
+          const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), place, `${chainKey}:${place}:panel`, true)
           const reviewer = panel.reviewers.find((entry) => entry.slot === decision.reviewer?.slot)
           if (!reviewer || !claimReviewerTripProbe(reviewer.model)) return null
           return reviewer
