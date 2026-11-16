@@ -923,6 +923,28 @@ describe('manual review model selection', () => {
     ]))
   })
 
+  it('counts completed manual reviews on the same head, including across replay', async () => {
+    const { rememberDetachedReviewRounds } = await import('../server/db')
+    const { triggerPrReview, replayAgentJob } = await import('../server/agent')
+    const { spawnDetached } = await import('../server/process')
+    const target = 'manual/round-fixture', head = 'a'.repeat(40)
+    const receipt = (index: number, source: string) => logRow({ id: String(index).repeat(32), repo: target,
+      source, action: 'reviewed_clean', outcome: 'clean', expected_head: head, head_sha: head, review_id: index,
+      correlation_id: `fixture-${index}` })
+    const first = receipt(1, 'poise:manual-review')
+    const second = receipt(2, 'poise:replay')
+    const snapshot = parseAgentLogList([first, second])
+    rememberDetachedReviewRounds(snapshot.entries)
+    rememberDetachedReviewRounds(snapshot.entries)
+    await replayAgentJob({ behavior: 'pr_review', repo: target, pr_id: 12 }, mocks.admit)
+    expect(vi.mocked(spawnDetached).mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--review-round', '3', '--review-cap', '3', '--review-cap-reached',
+    ]))
+    rememberDetachedReviewRounds(parseAgentLogList([receipt(3, 'poise:manual-review')]).entries)
+    await expect(triggerPrReview(`https://github.com/${target}/pull/12`)).rejects.toThrow('All 3 PR review rounds are complete')
+    expect(spawnDetached).toHaveBeenCalledOnce()
+  })
+
   it('launches the catalog default with its recovery model when nothing is chosen', async () => {
     const { triggerPrReview, replayAgentJob } = await import('../server/agent')
     const { spawnDetached } = await import('../server/process')

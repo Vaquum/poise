@@ -27,6 +27,8 @@ import { claudeAuth, ClaudeAuthReadinessError } from './claude-auth'
 import { HttpError } from './http'
 import { needsClaude, randomDrawStillValid, reviewChoice, type ReviewChoice } from './review-model'
 import { isPlaceModel, MODEL_SLOTS, resolveSlots } from './models'
+import { behaviorChainForPull } from './behavior-chain-journal'
+import { completedChainReviewRounds } from './behavior-chain-decision'
 import { claudeSubscriptionEnvironment, isExpectedFailure, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic, diagnosticFailure } from './logging'
@@ -648,6 +650,7 @@ async function buildDevelopmentLogWorker(source: URL): Promise<DevelopmentLogWor
 export interface AgentLogSelection {
   latest: Array<{ behavior: string, source: string, owner: string }>
   ids: string[]
+  correlations?: string[]
 }
 
 export async function fetchSelectedAgentLogSnapshot(
@@ -837,6 +840,18 @@ export async function stopAgentJob(callId: string): Promise<StopResult> {
   return { id: value.id, stopped: value.stopped, status: value.status, error_code: typeof value.error_code === 'string' ? value.error_code : null }
 }
 
+function completedPrReviewRounds(repo: string, number: number): number {
+  const standalone = countReviewRounds(repo, number)
+  const chain = behaviorChainForPull(repo, number)
+  return chain ? completedChainReviewRounds(chain, undefined, standalone) : standalone
+}
+
+function observeDetachedReview(correlationId: string): void {
+  void fetchSelectedAgentLogSnapshot({ latest: [], ids: [], correlations: [correlationId] }, { fresh: true })
+    .then(observeAgentSnapshot)
+    .catch(error => diagnosticFailure('agent-interface.review-receipt', error, { correlationId }, { level: 'warning' }))
+}
+
 async function preparePrReviewer(place: 'pr_review' | 'pr_approve', choice: ReviewChoice) {
   const { catalog } = choice
   const slots = resolveSlots(catalog, getModelSettings().slots)
@@ -874,6 +889,8 @@ export async function triggerPrReview(
   if (!m) throw new Error('not a github PR url')
   const [, owner, repo, num] = m
   const repoFullName = `${owner}/${repo}`
+  const completed = completedPrReviewRounds(repoFullName, Number(num))
+  if (completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
   const accounts = prAccounts()
   const author = await getPrAuthor(repoFullName, Number(num), accounts.agent)
     .catch(() => getPrAuthor(repoFullName, Number(num), accounts.me))
@@ -882,8 +899,6 @@ export async function triggerPrReview(
   const { model, recovery, claude, modelCliEnv } = await preparePrReviewer('pr_review', choice)
   const { slot } = choice
   const expectedHead = await getHeadSha(repoFullName, Number(num), { actor })
-  const completed = countReviewRounds(repoFullName, Number(num), expectedHead)
-  if (completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
   const pwd = await resolveReviewCheckout(owner, repo, Number(num), actor, expectedHead)
   const source = 'poise:manual-review'
   const correlationId = randomUUID()
@@ -922,7 +937,10 @@ export async function triggerPrReview(
   ], {
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
-    onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
+    onExit: (result) => {
+      if (claude) claudeAuth.observeProcessFailure(result)
+      observeDetachedReview(correlationId)
+    },
   }) } catch (error) {
     captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
     throw error
@@ -969,6 +987,10 @@ export async function replayAgentJob(input: {
   if (!admission) throw new Error('Replay admission returned no PR author')
   const actor = admission.actor
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
+  const reviewCap = admission.reviewCap ?? DEFAULT_PR_REVIEW_CAP
+  const completed = completedPrReviewRounds(repo, Number(prId))
+  if (behavior === 'pr_review' && completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
+  const capFlags = reviewRoundArgs(completed, reviewCap)
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
   const choice = await reviewChoice(place)
   const { model, recovery, claude, modelCliEnv } = await preparePrReviewer(place, choice)
@@ -988,10 +1010,6 @@ export async function replayAgentJob(input: {
   const drawValid = stored === 'random' ? await randomDrawStillValid(place, choice.model) : selectedModel === choice.model
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   if (!drawValid) throw new Error('Review model changed; retry the request')
-  const reviewCap = admission.reviewCap ?? DEFAULT_PR_REVIEW_CAP
-  const completed = countReviewRounds(repo, Number(prId), behavior === 'pr_review' ? expectedHead : null)
-  const capFlags = reviewRoundArgs(completed, reviewCap)
-  if (behavior === 'pr_review' && completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
     repository: repo, number: Number(prId), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
@@ -1016,7 +1034,10 @@ export async function replayAgentJob(input: {
   ], {
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv, ...admission.reviewEnvironment },
-    onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
+    onExit: (result) => {
+      if (claude) claudeAuth.observeProcessFailure(result)
+      observeDetachedReview(correlationId)
+    },
   }) } catch (error) {
     captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
     throw error

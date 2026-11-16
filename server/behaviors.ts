@@ -860,7 +860,7 @@ export function setReviewCap(cap: number | null): void {
 // completed change-request rounds so far, plus one for the run itself. Read
 // from the durable launch ledger, so it survives restarts.
 export function reviewRoundNumber(repo: string, number: number): number {
-  return countReviewRounds(repo, number) + 1
+  return Math.min(countReviewRounds(repo, number) + 1, getReviewCap() ?? DEFAULT_PR_REVIEW_CAP)
 }
 
 // The primary reviewer keeps the pull request's own claim key, so ledgers
@@ -979,6 +979,8 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // A provider CLI that died outright trips like one that errored: before a
   // verdict, the next slot is strictly more useful than the same dead run.
   if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit'
+    || call.error_code === 'review_recovery_failed' && call.diagnostic?.operation === 'provider.review'
+      && call.diagnostic.context.submission === 'none'
     || call.error_code === 'launch_preflight_failed' && call.diagnostic?.operation === 'provider.cli_update'
     || call.error_code === 'atomic_work_failed' && call.diagnostic?.operation === 'provider.atomic_work') return 'provider'
   if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)

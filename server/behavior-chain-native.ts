@@ -20,6 +20,7 @@ import { releaseReplacementPending } from './release-background'
 import { DEFAULT_PR_REVIEW_CAP, reviewContinuationArgs, reviewRoundArgs } from './review-continuation'
 import { reviewClearanceOnly } from './review-clearance'
 import { diagnosticFailure } from './logging'
+import { countReviewRounds } from './db'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver' | 'reviewCap'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
@@ -389,6 +390,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const headSince = prior?.pull?.head === head ? prior.pull.headSince : Date.now()
       if (typeof state.review_context !== 'string' || !/^[0-9a-f]{64}$/.test(state.review_context) || !Array.isArray(state.my_reviews)) throw new Error('native pull state lacks its review context')
       const reviews = state.my_reviews.map((item) => object(item, 'native review'))
+      observation.reviewsOutsideChain = countReviewRounds(chain.repository, number)
       const reviewReceipts = reviews.filter((review) => review.state !== 'PENDING').map((review) => ({ id: positive(review.id, 'review'),
         head: sha(review.commit_id, 'review commit'), state: String(review.state), invocation: typeof review.invocation_id === 'string' ? review.invocation_id : null,
         response: review.review_response, submittedAt: Date.parse(String(review.submitted_at)) }))
@@ -625,7 +627,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         if (checkpoint && (selected.model !== decision.reviewer?.model || selected.slot !== decision.reviewer.slot
           || !hooks.reviewContinuation?.(selected.model))) return null
         const continuation = hooks.reviewContinuation?.(selected.model) ? reviewContinuationArgs(selected.slot, checkpoint) : []
-        const round = reviewRoundArgs(completedChainReviewRounds(chain, decision.behavior === 'review-pr' ? decision.basis : undefined),
+        const round = reviewRoundArgs(completedChainReviewRounds(chain,
+          decision.behavior === 'review-pr' ? decision.basis : undefined, observation.reviewsOutsideChain),
           observation.reviewCap ?? DEFAULT_PR_REVIEW_CAP)
         return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `https://github.com/${chain.repository}/pull/${pull.number}`,
           ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior),

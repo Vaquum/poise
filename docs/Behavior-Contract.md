@@ -270,8 +270,9 @@ must be present in live evidence before it becomes durable approval evidence.
 Poise allows three PR review rounds by default. The existing PR review rounds
 setting accepts 2–10 and applies to chain and standalone reviews. A completed
 initial review panel counts once on each reviewed head; an approval pass that
-requests changes counts as another round. Provider retries and saved analysis
-slices keep the same round. Each reviewer sees its round and the limit.
+posts findings or a partial review counts as another round. Manual reviews and replays count on
+their GitHub receipt, even on an unchanged head. Provider retries and saved
+analysis slices keep the same round. Each reviewer sees its round and the limit.
 
 Caller allows three optional repository inspection rounds within a review,
 including resumed analysis. At the start of the last inspection round and of

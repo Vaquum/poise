@@ -22,6 +22,7 @@ export interface ChainObservation extends Record<string, unknown> {
   repairer: ChainReviewer
   approver: ChainReviewer
   reviewCap?: number
+  reviewsOutsideChain?: number
   publication: { pull_number: number | null, head_sha: string | null, head_invocation: string | null, state: string | null, merged: boolean, merge_sha: string | null }
   reviewPublication?: { callId: string, planSha?: string, complete: boolean, issueRevision: string,
     receipts: Array<{ issue: string, comment_id: number, author: string, url: string | null }> }
@@ -389,11 +390,12 @@ export function chainReviewClearance(chain: BehaviorChain, observation: ChainObs
   return repair ? null : 'native changes requested; a retained independent repair verification is required'
 }
 
-export function completedChainReviewRounds(chain: BehaviorChain, currentPanelBasis?: string): number {
+export function completedChainReviewRounds(chain: BehaviorChain, currentPanelBasis?: string, outsideChain = 0): number {
   const reviews = chain.invocations.filter(invocation => succeeded(invocation) && invocation.evidence?.review_id != null)
   const panels = new Set(reviews.filter(invocation => invocation.behavior === 'review-pr' && invocation.basis !== currentPanelBasis)
     .map(invocation => invocation.basis))
-  return panels.size + reviews.filter(invocation => invocation.behavior === 'approve-pr' && invocation.evidence?.action === 'requested_changes').length
+  return outsideChain + panels.size + reviews.filter(invocation => invocation.behavior === 'approve-pr'
+    && ['requested_changes', 'reviewed_clean'].includes(String(invocation.evidence?.action))).length
 }
 
 function providerFailedBeforeWrite(invocation: ChainInvocation): boolean {
@@ -575,7 +577,7 @@ function nextPrReview(chain: BehaviorChain, observation: ChainObservation, pull:
     if (reviewed === 'missing-artifact') return { kind: 'hold', reason: `PR review ${reviewer.slot} lacks its exact-head submission receipt` }
     if (reviewed === 'needed') {
       const cap = observation.reviewCap ?? DEFAULT_PR_REVIEW_CAP
-      if (completedChainReviewRounds(chain, reviewedHeadBasis) >= cap) {
+      if (completedChainReviewRounds(chain, reviewedHeadBasis, observation.reviewsOutsideChain) >= cap) {
         return { kind: 'wait', reason: `All ${cap} PR review rounds are complete; the current head needs a maintainer review` }
       }
       return propose(chain, 'review-pr', reviewedHeadBasis, chain.reviewer, reviewer, 'review the actual current pull-request head', now)
@@ -585,7 +587,7 @@ function nextPrReview(chain: BehaviorChain, observation: ChainObservation, pull:
 }
 
 function finalReviewFinished(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
-  return completedChainReviewRounds(chain) >= (observation.reviewCap ?? DEFAULT_PR_REVIEW_CAP)
+  return completedChainReviewRounds(chain, undefined, observation.reviewsOutsideChain) >= (observation.reviewCap ?? DEFAULT_PR_REVIEW_CAP)
     || chain.invocations.some(invocation => invocation.behavior === 'review-pr' && invocation.evidence?.action === 'reviewed_clean'
       && chainReviewResponse(chain, invocation, observation, now)?.assessment.limitations
         .includes('Repository inspection reached its round limit.'))

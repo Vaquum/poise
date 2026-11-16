@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, existsSync } from 'node:fs'
 import { homedir } from 'os'
 import { join, dirname } from 'path'
 import { cachedStatement } from './statements'
+import type { LogEntry } from './agent-log-parse'
 
 // Poise's local SQLite holds:
 //   meta          — small key-value store for org / me / timezone settings
@@ -109,6 +110,14 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'running',
     note TEXT,
     outcome TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS detached_pr_review_rounds (
+    repository TEXT NOT NULL COLLATE NOCASE,
+    pull INTEGER NOT NULL,
+    review_id INTEGER NOT NULL,
+    call_id TEXT NOT NULL,
+    PRIMARY KEY (repository, pull, review_id)
   );
   CREATE INDEX IF NOT EXISTS behavior_runs_started
     ON behavior_runs(unixepoch(started_at, 'subsec'));
@@ -1163,34 +1172,46 @@ export function listCompletedBehaviorActions(): CompletedBehaviorAction[] {
   `).all() as CompletedBehaviorAction[])
 }
 
-// How many review rounds a pull request has completed: the initial
-// review counts once however wide its panel, and every approve-prs follow-up
-// counts — including follow-ups on an unchanged head, which author replies
-// re-arm without a new commit. Only launches that reconciled cleanly count:
-// failed, held and quarantined runs never completed, and neither do manual
-// reviews nor superseded runs that posted nothing. A superseded run that
-// posted is quarantined for a person instead of being silently released. The
-// review-round cap reads this at launch time.
+export function rememberDetachedReviewRounds(entries: readonly LogEntry[]): void {
+  const completed = entries.filter(call => (call.source === 'poise:manual-review' || call.source === 'poise:replay')
+    && (call.behavior === 'pr_review' || call.behavior === 'pr_approve')
+    && call.status === 'completed' && call.repo && /^[1-9]\d*$/.test(call.pr_id ?? '')
+    && call.head_sha && call.head_sha === call.expected_head && Number.isSafeInteger(call.review_id) && Number(call.review_id) > 0
+    && (call.action === 'requested_changes' || call.action === 'reviewed_clean'))
+  if (!completed.length) return
+  const insert = cachedStatement(db, 'INSERT OR IGNORE INTO detached_pr_review_rounds VALUES (?, ?, ?, ?)')
+  db.transaction(() => {
+    for (const call of completed) insert.run(call.repo, Number(call.pr_id), call.review_id, call.id)
+  })()
+}
+
+// Count a scheduled panel once per head, each revision of requested changes,
+// and each completed manual review. An approval itself is the next step.
 export function countReviewRounds(repo: string, pr: number, currentPanelHead: string | null = null): number {
   const row = cachedStatement(db, `
-    SELECT
-      COUNT(DISTINCT CASE WHEN key = 'review-new-prs' AND launch_head_sha IS NOT ? THEN launch_head_sha END)
-      + COUNT(CASE WHEN key = 'approve-prs' THEN 1 END) AS n
-    FROM behavior_seen
+    WITH completed AS (SELECT key, launch_head_sha, launch_call_id FROM behavior_seen
     WHERE claim_id = '' AND launch_error IS NULL AND launch_quarantine IS NULL
-      AND launch_repo = ? AND launch_pr = ?
+      AND launch_repo = @repo AND launch_pr = @pr
       AND (
         (key = 'review-new-prs' AND launch_behavior = 'pr_review'
           AND launch_source IN ('poise:review-new-prs', 'poise:replay')
-          AND (launch_action, launch_outcome) IN (VALUES ('reviewed_clean', 'clean'), ('requested_changes', 'changes_requested')))
+          AND (launch_action, launch_outcome) IN (VALUES ('reviewed_clean', 'clean'), ('requested_changes', 'changes_requested'),
+            ('reviewed_clean', 'incomplete'), ('requested_changes', 'incomplete')))
         OR (key = 'approve-prs' AND launch_behavior = 'pr_approve'
           AND launch_source IN ('poise:approve-prs', 'poise:replay')
-          AND launch_action = 'requested_changes' AND launch_outcome = 'changes_requested')
+          AND (launch_action, launch_outcome) IN (VALUES ('requested_changes', 'changes_requested'),
+            ('reviewed_clean', 'incomplete'), ('requested_changes', 'incomplete')))
       )
       AND launch_requested_at IS NOT NULL
       AND launch_call_id IS NOT NULL AND launch_call_id <> ''
-      AND launch_completed_at IS NOT NULL AND launch_expected_head = launch_head_sha
-  `).get(currentPanelHead, repo, pr) as { n: number }
+      AND launch_completed_at IS NOT NULL AND launch_expected_head = launch_head_sha)
+    SELECT COUNT(DISTINCT CASE WHEN key = 'review-new-prs' AND launch_head_sha IS NOT @head THEN launch_head_sha END)
+      + COUNT(CASE WHEN key = 'approve-prs' THEN 1 END)
+      + (SELECT COUNT(*) FROM detached_pr_review_rounds detached
+        WHERE detached.repository = @repo AND detached.pull = @pr
+          AND NOT EXISTS (SELECT 1 FROM completed WHERE completed.launch_call_id = detached.call_id))
+      AS n FROM completed
+  `).get({ repo, pr, head: currentPanelHead }) as { n: number }
   return row.n
 }
 
