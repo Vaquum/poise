@@ -590,6 +590,7 @@ class Unit:
     def context(self) -> str:
         return "\n\nValidated inspection checkpoints (review input):\n" + json.dumps(
             {"inspection": [self.session.read(ref) for ref in self.session.state["inspection"]],
+             "warnings": self.session.state.get("warnings", []),
              "findings": self.session.state["provisional"], "verified_fixes": self.session.state["verified"]})
 
     def findings(self, verdict: dict) -> None:

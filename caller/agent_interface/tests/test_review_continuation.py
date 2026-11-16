@@ -320,6 +320,35 @@ class TestReviewContinuation(TestCase):
         self.assertIn("src/missing.py", assessment["limitations"])
         self.assertIn("tracked regular file not found", assessment["limitations"])
 
+    def test_resumed_prompt_contains_the_cause_when_every_lookup_failed(self):
+        node = packet()
+        missing = {"operation": "read", "path": "src/missing.py", "query": "", "start_line": 1}
+
+        def inspect(requests, *, timeout_s):
+            self.inspections.extend(requests)
+            return {"action": "review_context", "head_sha": HEAD,
+                    "results": [{"request": missing, "error": "tracked regular file not found"}]}
+
+        def timeout_after_inspection(*args):
+            if not self.inspections:
+                return verdict(args[3], requests=[missing])
+            raise subprocess.TimeoutExpired("isolated provider", args[-1])
+
+        def resumed(*args):
+            prompt = args[3]
+            self.assertIn('"inspection": []', prompt)
+            self.assertIn("Repository read of src/missing.py from line 1 failed. tracked regular file not found", prompt)
+            return verdict(prompt)
+
+        self.repository.inspect = inspect
+        with self.call(node) as root, self.assertRaises(continuation.Continuation) as yielded:
+            self.run_review(node, timeout_after_inspection)
+        self.assertEqual(yielded.exception.result["outcome"], "continuation_required")
+        with self.call(node, self.resume(root)):
+            self.run_review(node, resumed)
+        self.assertEqual(self.inspections, [missing])
+        self.assertEqual(len(self.posts), 1)
+
     def test_inspection_cap_keeps_findings_and_warns_about_unread_pages(self):
         node = packet(37)
         read = {"operation": "read", "path": "src/f016.py", "query": "", "start_line": 1}

@@ -148,7 +148,9 @@ class Repository:
             diagnostic = diagnostic_from_stderr(done.stderr, "inspection")
             raise atoms.AgentPreflightError(diagnostic_message(diagnostic) if diagnostic else message, code, diagnostic)
         response = json.loads(done.stdout)
-        if response.get("action") != "review_context" or response.get("head_sha") != self.info["head_sha"]:
+        if not isinstance(response, dict) or response.get("action") != "review_context":
+            raise atoms.AgentPreflightError("inspection command returned an invalid repository response")
+        if response.get("head_sha") != self.info["head_sha"]:
             raise atoms.AgentPreflightError("repository inspection returned a different head")
         return response
 
