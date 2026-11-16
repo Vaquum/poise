@@ -111,7 +111,7 @@ function prReviewMissingArtifact(chain: BehaviorChain, observation: ChainObserva
       && candidate.state === 'settled' && candidate.evidence?.status === 'completed')
     if (!invocation) return false
     const evidence = invocation.evidence!
-    const complete = !!chainReviewResponse(chain, invocation, observation, observation.checkedAt)
+    const complete = !!chainReviewResponse(chain, invocation, observation, observation.checkedAt, { allowPartialComment: true })
       && typeof evidence.review_id === 'number' && evidence.review_id > 0
       && !!observation.pull?.reviewIds.includes(evidence.review_id)
       && evidence.head_sha === observation.pull?.head

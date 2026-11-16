@@ -1485,10 +1485,11 @@ export class BehaviorChainRuntime {
       const action = review?.state === 'APPROVED' ? 'approved' : review?.state === 'CHANGES_REQUESTED' ? 'requested_changes' : review?.state === 'COMMENTED' ? 'reviewed_clean' : null
       const coverage = (artifact?.review_response as { coverage?: unknown } | null)?.coverage
       // A published partial keeps its incomplete disposition; the failed call outcome cannot speak for it.
-      const partial = action === 'requested_changes' && coverage === 'incomplete'
+      const partial = (action === 'requested_changes' || action === 'reviewed_clean') && coverage === 'incomplete'
       if (review && action && chainReviewResponse(chain, { ...invocation, callId: nativeId,
-        evidence: { ...invocation.evidence, action, review_id: review.id, ...(partial ? { outcome: 'incomplete' } : {}) } }, observation, Date.now())) {
-        const outcome = action === 'approved' ? 'approved' : action === 'requested_changes' ? (partial ? 'incomplete' : 'changes_requested') : 'clean'
+        evidence: { ...invocation.evidence, action, review_id: review.id, ...(partial ? { outcome: 'incomplete' } : {}) } },
+      observation, Date.now(), { allowPartialComment: true })) {
+        const outcome = partial ? 'incomplete' : action === 'approved' ? 'approved' : action === 'requested_changes' ? 'changes_requested' : 'clean'
         this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: nativeId, outcome,
           evidence: { ...invocation.evidence, status: 'completed', action, outcome, review_id: review.id, head_sha: review.head,
             reconciliation: 'native invocation marker verified on the actual GitHub review' } })

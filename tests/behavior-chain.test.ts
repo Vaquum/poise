@@ -212,6 +212,20 @@ describe('completion-driven atomic behavior decisions', () => {
       reason: 'merge requires a retained substantive final-context review response' })
   })
 
+  it('advances a receipted partial review to approval and still requires a substantive merge verdict', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'incomplete', review_id: 27, head_sha: HEAD })
+    const receipt = { ...reviewResponse(chainBasis('pr-review').slice(0, 32)), coverage: 'incomplete' }
+    current.invocations.at(-1)!.evidence!.artifact = { review_response: receipt }
+    obs.pull!.reviewReceipts[0].response = receipt
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+    obs.pull!.approved = true; obs.pull!.ready = true
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'hold',
+      reason: 'merge requires a retained substantive final-context review response' })
+  })
+
   it('keeps acknowledgements pending and rejects metadata, late and superseded response coverage', () => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
     let current = reviewed(journal, chain, obs)

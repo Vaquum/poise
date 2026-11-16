@@ -311,8 +311,9 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
   }
   const incompleteReview = (behavior === 'pr_review' || behavior === 'pr_approve') && headSha === expectedHead
     && (status === 'failed' && action === null && errorCode === 'review_incomplete'
-      || status === 'completed' && action === 'requested_changes'
-        && ((artifact as Record<string, unknown> | null)?.review_response as Record<string, unknown> | undefined)?.coverage === 'incomplete')
+      || status === 'completed' && (action === 'requested_changes' || action === 'reviewed_clean')
+        && headSha !== null && Number.isSafeInteger(row.review_id) && Number(row.review_id) > 0
+        && (reviewArtifact?.review_response as Record<string, unknown> | undefined)?.coverage === 'incomplete')
   if (artifact !== null && typeof artifact === 'object' && 'failed_source' in artifact) {
     if (behavior !== 'implement_issue' || source !== 'poise:behavior-chain') throw new Error('failed source lacks its managed implementation')
     parseFailedSource(artifact.failed_source)

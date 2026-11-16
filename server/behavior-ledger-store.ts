@@ -736,6 +736,7 @@ function completedPair(record: LedgerRecord, row: LedgerCaller): boolean {
   if (record.behavior === 'review-new-issues') return row.action === 'commented' && row.outcome === 'commented' && row.head === null
   if (row.head !== record.head) return false
   return row.action === 'requested_changes' && ['changes_requested', 'incomplete'].includes(row.outcome ?? '')
+    || row.action === 'reviewed_clean' && row.outcome === 'incomplete'
     || record.behavior === 'review-new-prs' && row.action === 'reviewed_clean' && row.outcome === 'clean'
     || record.behavior === 'approve-prs' && row.action === 'approved' && row.outcome === 'approved'
 }

@@ -14,7 +14,7 @@ export interface ReviewResponse extends Record<string, unknown> {
 
 export function validReviewResponse(value: unknown, target: { repository: string, number: number, head: string,
   actor: string, callId: string, model: string, recoveryModel?: string | null, context?: string, startedAt: number, completedAt: number,
-  incompleteFindings?: boolean, legacyNegative?: boolean, resumedFrom?: { callId: string, startedAt: number } }, now: number): value is ReviewResponse {
+  allowIncomplete?: boolean, legacyNegative?: boolean, resumedFrom?: { callId: string, startedAt: number } }, now: number): value is ReviewResponse {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const response = value as Record<string, unknown>
   const assessment = response.assessment as Record<string, unknown> | null
@@ -24,7 +24,7 @@ export function validReviewResponse(value: unknown, target: { repository: string
   const callId = resumed?.callId ?? target.callId
   const startedAt = resumed?.startedAt ?? target.startedAt
   return response.repository === target.repository && response.pull_number === target.number && response.head_sha === target.head
-    && (response.coverage === 'complete' || target.incompleteFindings === true && response.coverage === 'incomplete'
+    && (response.coverage === 'complete' || target.allowIncomplete === true && response.coverage === 'incomplete'
       || target.legacyNegative === true && response.coverage === undefined)
     && response.reviewer === target.actor && response.invocation_id === callId && /^[0-9a-f]{32}$/.test(callId)
     && (response.model === target.model || (typeof target.recoveryModel === 'string' && response.model === target.recoveryModel))
