@@ -2445,7 +2445,7 @@ async function reconcileBehaviorLaunchClaims(
       if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
         captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
           state: 'superseded', activity: status === 'superseded' ? 'settled' : 'unknown', stateSource: 'native',
-          outcome: 'superseded', head: call.head_sha, completedAt: call.completed_at })
+          outcome: 'superseded', completedAt: call.completed_at })
         clearBehaviorFailure(behavior, claim.target, claim.launchActor)
       }
       console.log(
