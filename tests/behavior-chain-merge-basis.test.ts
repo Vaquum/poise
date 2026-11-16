@@ -1,11 +1,12 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, type ChainEvent } from '../server/behavior-chain-store'
-import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
+import { chainMergeReviewDecision, chainReviewClearance, chainReviewResponse, decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
+import { behaviorChainSummary } from '../server/behavior-chain-summary'
 import { completedReviewCall } from './review-response-fixture'
 
 const databases: Database.Database[] = []
@@ -35,14 +36,127 @@ function setup(path = ':memory:') {
     admittedAt: Date.parse(call.started_at), request: { command: 'agent-interface', cwd: '/fixture', argv: [] } } })
   record({ type: 'invocation.settled', invocationId: 'original-review', callId: call.id, outcome: 'clean',
     evidence: { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: call.review_id,
-      head_sha: HEAD, completedAt: Date.parse(call.completed_at!), artifact: call.artifact } })
+      head_sha: HEAD, completedAt: Date.parse(call.completed_at!), artifact: call.artifact,
+      resources_settled_at: call.completed_at, resource_ownership: { version: 1, roots: [], errors: [] } } })
   function merge(live: ChainObservation) {
     vi.setSystemTime(Date.now() + 1000)
     return { ...structuredClone(live), checkedAt: Date.now(), pull: { ...live.pull!, merged: true, state: 'closed', mergeSha: MERGE,
       mergedAt: Date.now() - 500 } }
   }
-  return { db, journal, record, observation, merge, current: () => chain }
+  return { db, journal, record, observation, merge, call, current: () => chain }
 }
+
+function reconciliation(live: ChainObservation): ChainRuntimeOperations {
+  const forbidden = async () => { throw new Error('merge reconciliation cannot start work') }
+  return { enabled: () => false, accounts: () => ({ author: 'author', reviewer: 'reviewer' }),
+    discover: async () => [], ownsRepository: () => true, observe: async () => ({ ...live, checkedAt: Date.now() }),
+    readInvocations: async () => ({ entries: [], quarantined: [] }), received: () => {}, available: () => false, capacity: () => 3,
+    permitted: () => false, request: forbidden, launch: forbidden, perform: forbidden, readActionResult: forbidden,
+    resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {} }
+}
+
+it('reopens a journal written by the pre-coverage reducer and recovers its actual native merge admission without rewriting history', async () => {
+  // Rows and hashes were frozen using the unmodified reducer at this revision,
+  // before #1540. Neither the writer nor today's reducer generates this proof.
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/pre-coverage-merge-journal.json', import.meta.url), 'utf8')) as {
+    revision: string, rows: Array<{ sequence: number, chain_id: string, event_id: string, at: number, payload: string, state_hash: string }>
+  }
+  expect(fixture.revision).toBe('20edd6aecfc963f6979f7f78b33c752dc8104cb1')
+  const root = mkdtempSync(join(tmpdir(), 'poise-pre-coverage-'))
+  try {
+    const path = join(root, 'journal.db'), original = new Database(path)
+    new BehaviorChainJournal(original)
+    const insert = original.prepare('INSERT INTO behavior_chain_events(sequence, chain_id, event_id, at, payload, state_hash) VALUES (@sequence, @chain_id, @event_id, @at, @payload, @state_hash)')
+    for (const row of fixture.rows) insert.run(row)
+    original.close()
+    const db = new Database(path); databases.push(db)
+    const journal = new BehaviorChainJournal(db)
+    journal.rebuild()
+    const id = 'acme/repo#7', historical = journal.read(id)!
+    expect(historical.invocations.every(invocation => !invocation.reviewDecision)).toBe(true)
+    const live = structuredClone(historical.observation) as ChainObservation
+    vi.useFakeTimers(); vi.setSystemTime(live.checkedAt + 86400_000)
+    live.issue.intakeLabel = 'poise'
+    live.prReviewers.push({ ...reviewer, slot: 'secondary' })
+    const open = { ...live, pull: { ...live.pull!, state: 'open', merged: false } }
+    expect(chainReviewResponse(historical, historical.invocations[0], open, Date.now())).toBeNull()
+    expect(chainReviewClearance(historical, open, Date.now())).toContain('lacks its current-head/context receipt')
+    expect(chainMergeReviewDecision(historical, open, Date.now())).toBeNull()
+    await new BehaviorChainRuntime(journal, reconciliation(live)).run()
+    expect(journal.read(id)).toMatchObject({ mergeSha: MERGE, reviewPending: false, invocations: historical.invocations })
+    expect(journal.read(id)?.reviewHoldClosure).toBeUndefined()
+    journal.rebuild()
+    expect(db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence LIMIT ?').all(fixture.rows.length)).toEqual(fixture.rows)
+    expect(journal.read(id)?.reviewPending).toBe(false)
+    const recovered = journal.read(id)!
+    expect(() => behaviorChainSummary(recovered, journal)).not.toThrow()
+    expect(behaviorChainSummary(recovered, journal)).toMatchObject({ reviewStatus: 'complete', mergedReviewWarning: null })
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+it('retains the versioned panel and receipt identities at actual native merge admission and uses them after restart', async () => {
+  const { journal, observation, merge, call, current } = setup()
+  const request = { command: 'github-interface' as const, cwd: '/fixture', argv: ['--merge-if-ready', '17', '--author', 'author',
+    '--review-response-json', JSON.stringify({ ...call.artifact!.review_response as object, review_id: call.review_id }),
+    '--expected-head', HEAD, '--token-user', 'reviewer'] }
+  const operations = { ...reconciliation(observation), enabled: () => true, available: () => true, permitted: () => true,
+    request: async () => request, perform: async () => ({ action: 'merge_if_ready', repository: 'acme/repo', pull_number: 17,
+      head_sha: HEAD, outcome: 'enqueued', queue_entry_id: 'queue', merged: false }) }
+  await new BehaviorChainRuntime(journal, operations).run()
+  const admitted = journal.read(current().id)!.invocations.at(-1)!
+  expect(admitted).toMatchObject({ behavior: 'merge-pr', state: 'settled', request,
+    reviewDecision: { version: 2, repository: 'acme/repo', number: 17, head: HEAD, context: observation.pull!.reviewContext,
+      panel: [{ slot: 'primary', model: 'fixture', invocation: 'original-review', call: call.id, review: call.review_id,
+        response: chainBasis(call.artifact!.review_response) }],
+      final: { invocation: 'original-review', call: call.id, review: call.review_id } } })
+  expect(admitted.request).not.toHaveProperty('reviewDecision')
+  // A later settings change before the merge must not replace the admitted panel.
+  const later = structuredClone(observation)
+  later.prReviewers.push({ ...reviewer, slot: 'secondary' })
+  let saved = journal.read(current().id)!
+  saved = journal.append(saved.id, 'later-panel', saved.sequence, { type: 'chain.observed', observation: later })
+  const live = merge(later)
+  const authority = journal.history(saved.id)
+  journal.rebuild()
+  await new BehaviorChainRuntime(journal, reconciliation(live)).run()
+  expect(journal.read(saved.id)).toMatchObject({ mergeSha: MERGE, reviewPending: false })
+  expect(journal.read(saved.id)?.invocations.at(-1)?.reviewDecision).toEqual(admitted.reviewDecision)
+  expect(journal.history(saved.id).slice(0, authority.length)).toEqual(authority)
+})
+
+it.each(['no admission', 'wrong review', 'wrong repository', 'wrong PR', 'wrong head', 'wrong context', 'wrong Call',
+  'wrong panel', 'late admission', 'late submission', 'altered response', 'incomplete coverage'])(
+  'does not infer legacy authority from absent coverage with %s', mode => {
+    const { record, observation, merge, current, call } = setup()
+    const response = call.artifact!.review_response as Record<string, unknown>
+    delete response.coverage
+    observation.pull!.reviewReceipts[0].response = response
+    // The fixture's persisted Call must carry the same old-format response.
+    const chain = structuredClone(current())
+    ;(chain.invocations[0].evidence!.artifact as { review_response: unknown }).review_response = response
+    const pinned: Record<string, unknown> = { ...response, review_id: call.review_id }
+    if (mode === 'wrong review') pinned.review_id = 99
+    if (mode === 'wrong repository') pinned.repository = 'other/repo'
+    if (mode === 'wrong PR') pinned.pull_number = 18
+    if (mode === 'wrong head') pinned.head_sha = 'e'.repeat(40)
+    if (mode === 'wrong context') pinned.context_sha = 'e'.repeat(64)
+    if (mode === 'wrong Call') pinned.invocation_id = 'e'.repeat(32)
+    if (mode === 'altered response') pinned.assessment = { verdict: 'A changed verdict without original acceptance.' }
+    if (mode === 'incomplete coverage') response.coverage = pinned.coverage = 'incomplete'
+    record({ type: 'chain.observed', observation })
+    const live = merge(observation)
+    if (mode === 'late submission') live.pull.reviewReceipts[0].submittedAt = live.pull.mergedAt! + 1
+    if (mode === 'wrong panel') observation.prReviewers.push({ ...reviewer, slot: 'secondary' })
+    if (mode !== 'no admission') chain.invocations.push({ id: 'native-merge', behavior: 'merge-pr', actor: chain.reviewer,
+      model: null, slot: null, basis: 'merge', admissionSequence: chain.sequence + 2,
+      admittedAt: mode === 'late admission' ? live.pull.mergedAt! + 1 : observation.checkedAt,
+      request: { command: 'github-interface', cwd: '/fixture', argv: ['--merge-if-ready', '17', '--author', chain.author,
+        '--review-response-json', JSON.stringify(pinned), '--expected-head', HEAD, '--token-user', chain.reviewer] },
+      state: 'settled', callId: null, outcome: 'enqueued', evidence: { status: 'completed' } })
+    chain.observation = observation
+    expect(decideBehaviorChain(chain, live, Date.now())).toMatchObject({ kind: 'hold' })
+    expect(chainReviewResponse(chain, chain.invocations[0], observation, Date.now())).toBeNull()
+  })
 
 it('does not discharge an old obligation when the PR context is restored after merge', () => {
   const { record, observation, merge, current } = setup()

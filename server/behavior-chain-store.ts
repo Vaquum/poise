@@ -16,6 +16,16 @@ export interface PublicationPlanCondition {
   missingAt: number
   recoveredAt: number | null
 }
+export interface MergeReviewDecision {
+  version: 1 | 2
+  acceptedAt: number
+  repository: string
+  number: number
+  head: string
+  context: string
+  panel: Array<{ slot: string, model: string, invocation: string, call: string, review: number, response: string }>
+  final: { invocation: string, call: string, review: number, response: string }
+}
 export interface ChainInvocation {
   id: string
   behavior: ChainBehavior
@@ -29,6 +39,7 @@ export interface ChainInvocation {
   reservation?: BehaviorResourceReservation | null
   admittedAt: number
   admissionSequence: number
+  reviewDecision?: MergeReviewDecision
   request: { command: 'agent-interface' | 'github-interface', argv: string[], cwd: string, nativeResources?: 2, resourceLimits?: BehaviorExecutionLimits,
     implementationSource?: { id: string, sequence: number },
     context?: { head: string, reviewRevision: string, queueRemoval?: string } }
@@ -625,7 +636,7 @@ export class BehaviorChainJournal {
 
   /** Original recorded context/panel, never today's settings or a later
    * observation of an already-merged target. Old history stays immutable. */
-  preMergeObservation(id: string, mergedAt: number): Record<string, unknown> | null {
+  preMergeObservation(id: string, mergedAt: number, admission?: ChainInvocation): Record<string, unknown> | null {
     if (!Number.isSafeInteger(mergedAt) || mergedAt < 0) return null
     const firstMerge = cachedStatement(this.db, `SELECT sequence FROM behavior_chain_events
       WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.merged' ORDER BY sequence LIMIT 1`)
@@ -634,7 +645,8 @@ export class BehaviorChainJournal {
       WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.observed' AND sequence < ?
         AND at <= ? AND json_extract(payload, '$.observation.checkedAt') <= ?
         AND json_extract(payload, '$.observation.pull.merged') = 0
-      ORDER BY sequence DESC LIMIT 1`).get(id, firstMerge?.sequence ?? Number.MAX_SAFE_INTEGER, mergedAt, mergedAt) as { payload: string } | undefined
+      ORDER BY sequence DESC LIMIT 1`).get(id, Math.min(firstMerge?.sequence ?? Number.MAX_SAFE_INTEGER,
+        admission?.admissionSequence ?? Number.MAX_SAFE_INTEGER), mergedAt, Math.min(mergedAt, admission?.admittedAt ?? mergedAt)) as { payload: string } | undefined
     return row ? (JSON.parse(row.payload) as Extract<ChainEvent, { type: 'chain.observed' }>).observation : null
   }
 

@@ -1633,7 +1633,14 @@ unfiltered/history reads as defined in [Behavior chain](Behavior-chain.md).
 For a closed seed without an owned PR, Caller's seed read can identify a sole
 merged closing PR on the expected base repository and default branch. The normal
 PR read confirms its merge SHA before reconciliation records the external outcome;
-missing original review evidence remains pending and publication ownership is unchanged.
+publication ownership is unchanged. Native merge admissions retain their versioned
+exact-head review decisions and receipt identities across upgrades; older journals
+can recover historical acceptance from their original pinned merge request and
+matching evidence. A settled external merge with conclusively absent original
+review evidence and a closed, still-labelled source uses the existing terminal
+`evidence-missing` audit disposition. Contradictory, pending or unavailable Call,
+review and cleanup evidence remains actionable. Live admission stays strict; see
+[merged review reconciliation](Behavior-chain.md).
 For a bound PR confirmed closed without merge, the same verifier retains a
 different merged closing PR separately in `externalMerge`. Only that verified
 closing reference is discounted from the active-list exclusion; the original

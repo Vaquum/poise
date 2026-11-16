@@ -1,7 +1,7 @@
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
 import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
-import { APPROVAL_CONVERSATION_WAIT, approvalConversationRefusal, CHAIN_OBSERVATION_MAX_AGE_MS, chainQueueSettlement, chainReviewResponse, closedChainTarget, decideBehaviorChain, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
+import { APPROVAL_CONVERSATION_WAIT, approvalConversationRefusal, CHAIN_OBSERVATION_MAX_AGE_MS, chainQueueSettlement, chainReviewResponse, closedChainTarget, decideBehaviorChain, recoveredQueueRepair, retainedMergeReview, type ChainObservation } from './behavior-chain-decision'
 import { nativeBehavior } from './behavior-chain-runtime'
 import { canCloseMergedReviewHold, chainBasis, chainReviewStatus, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
@@ -777,15 +777,22 @@ function mergedReviewWarning(chain: BehaviorChain, journal?: BehaviorChainJourna
   if (chain.invocations.some(invocation => invocation.evidence?.status === 'completed'
     && ['reviewed_clean', 'approved'].includes(String(invocation.evidence.action))
     && chainReviewResponse(chain, invocation, original, original.checkedAt))) return null
+  const admission = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'merge-pr')
+  // A retained admission already proved its favorable original response under
+  // that contract; it is qualifying evidence, not unmet clearance.
+  if (admission && retainedMergeReview(chain, original, before!, admission)) return null
   const basis = chainBasis(['pr', pull.head, original.pull.reviewContext])
   const url = (id: number) => `https://github.com/${chain.repository}/pull/${pull.number}#pullrequestreview-${id}`
-  const reviews = original.prReviewers.map(reviewer => {
+  const reviews: Array<{ id: number, head: string, submittedAt: number, url: string, verdict: string }> = []
+  for (const reviewer of original.prReviewers) {
     const invocation = [...chain.invocations].reverse().find(item => item.behavior === 'review-pr' && item.basis === basis
-      && item.slot === reviewer.slot && item.state === 'settled' && item.evidence?.status === 'completed')!
-    const response = chainReviewResponse(chain, invocation, original, original.checkedAt)!
-    const receipt = pull.reviewReceipts.find(item => item.id === invocation.evidence!.review_id)!
-    return { id: receipt.id, head: receipt.head, submittedAt: receipt.submittedAt!, url: url(receipt.id), verdict: response.assessment.verdict }
-  })
+      && item.slot === reviewer.slot && item.state === 'settled' && item.evidence?.status === 'completed')
+    const response = invocation && chainReviewResponse(chain, invocation, original, original.checkedAt)
+    const reviewId = invocation?.evidence?.review_id
+    const receipt = typeof reviewId === 'number' ? pull.reviewReceipts.find(item => item.id === reviewId) : undefined
+    if (!invocation || !response || !receipt || typeof receipt.submittedAt !== 'number') return null
+    reviews.push({ id: receipt.id, head: receipt.head, submittedAt: receipt.submittedAt, url: url(receipt.id), verdict: response.assessment.verdict })
+  }
   const lastReviewAt = Math.max(...reviews.map(review => review.submittedAt))
   const approval = pull.reviewReceipts.filter(receipt => receipt.state === 'APPROVED' && receipt.head === pull.head
     && Number.isSafeInteger(receipt.id) && receipt.id > 0 && pull.reviewIds.includes(receipt.id)

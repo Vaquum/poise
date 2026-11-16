@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, expect, it, vi } from 'vitest'
-import { BehaviorChainJournal, canCloseMergedReviewHold, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
+import { BehaviorChainJournal, canCloseMergedReviewHold, chainBasis, chainReviewStatus, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { behaviorChainAttention, behaviorChainSummary } from '../server/behavior-chain-summary'
@@ -1575,6 +1575,7 @@ it.each([false, true])('rechecks late original review visibility within the boun
   let visible = false
   const observe = vi.fn(async () => {
     const live = observation()
+    live.issue = { ...live.issue, open: false, intakeLabel: 'poise' }
     live.pull!.mergedAt = NOW + 500
     if (visible) {
       live.pull!.reviewIds = [call.review_id!]
@@ -1627,4 +1628,101 @@ it.each([false, true])('does not defer original model/resource settlement, with 
   expect(journal.read(chain.id)?.invocations[0].state).toBe('settled')
   expect(journal.liveModelInvocationCount()).toBe(0)
   expect(observe).toHaveBeenCalledTimes(1)
+})
+
+it('ends a settled, still-labelled external merge with the existing explicit missing-evidence audit outcome across restart', async () => {
+  const { db, journal } = setup()
+  const chain = seed(journal)
+  const live = observation()
+  live.issue = { ...live.issue, open: false, intakeLabel: 'poise' }
+  const observe = vi.fn(async () => ({ ...live, checkedAt: Date.now() }))
+  const forbidden = vi.fn(async () => { throw new Error('a merged target cannot start work') })
+  await new BehaviorChainRuntime(journal, operations({ observe, request: forbidden, launch: forbidden,
+    perform: forbidden, fenceClosedTarget: forbidden, resumePublication: forbidden })).run()
+  const terminal = journal.read(chain.id)!
+  expect(terminal).toMatchObject({ mergeSha: MERGE, reviewPending: false, held: null, waiting: null,
+    reviewHoldClosure: { mergeSha: MERGE, actor: chain.author, label: 'poise' } })
+  expect(chainReviewStatus(terminal)).toBe('evidence-missing')
+  expect(behaviorChainSummary(terminal, journal).reviewStatus).toBe('evidence-missing')
+  expect(behaviorChainAttention(journal, Date.now())).toEqual([])
+  const events = journal.history(chain.id)
+  expect(events.map(row => JSON.parse(row.payload).type)).toEqual(['chain.admitted', 'chain.observed', 'chain.merged', 'chain.review-hold-closed'])
+  const restarted = new BehaviorChainJournal(db)
+  restarted.rebuild()
+  vi.setSystemTime(NOW + 3 * 86400_000)
+  await new BehaviorChainRuntime(restarted, operations({ observe })).run()
+  expect(restarted.read(chain.id)).toEqual(terminal)
+  expect(restarted.history(chain.id)).toEqual(events)
+  expect(observe).toHaveBeenCalledTimes(1)
+  expect(forbidden).not.toHaveBeenCalled()
+})
+
+it.each(['label removed', 'source open', 'missing label observation', 'missing receipt', 'contradictory receipt',
+  'missing cleanup', 'pending cleanup', 'uncertain Call', 'unavailable Calls'])(
+  'keeps external merge review evidence actionable with %s', async mode => {
+    const { journal } = setup()
+    let chain = seed(journal)
+    const live = observation()
+    live.issue = { ...live.issue, open: false, intakeLabel: 'poise' }
+    if (mode === 'label removed') live.issue.eligible = false
+    if (mode === 'source open') live.issue.open = true
+    if (mode === 'missing label observation') delete live.issue.intakeLabel
+    if (!['label removed', 'source open', 'missing label observation'].includes(mode)) {
+      const call = completedReviewCall(chain.repository, 17, live.pull!.head, chain.reviewer)
+      chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-review', behavior: 'review-pr',
+        actor: chain.reviewer, model: reviewer.model, slot: reviewer.slot,
+        basis: chainBasis(['pr', live.pull!.head, live.pull!.reviewContext]), admittedAt: NOW - 5000,
+        request: { command: 'agent-interface', cwd: '/fixture', argv: ['--pr-review', 'https://github.com/acme/repo/pull/17',
+          '--expected-head', live.pull!.head] } } })
+      if (['uncertain Call', 'unavailable Calls'].includes(mode)) {
+        chain = record(journal, chain, { type: 'invocation.started', invocationId: 'original-review' })
+      } else {
+        chain = record(journal, chain, { type: 'invocation.settled', invocationId: 'original-review', callId: call.id,
+          outcome: 'preflight_failed', evidence: { status: mode === 'missing receipt' ? 'completed' : 'failed',
+            action: mode === 'missing receipt' ? 'reviewed_clean' : 'not_started',
+            ...(mode === 'missing receipt' ? { review_id: call.review_id, head_sha: call.head_sha, artifact: call.artifact } : {}),
+            completedAt: NOW, resources_settled_at: mode === 'missing cleanup' ? null : call.completed_at,
+            resource_ownership: { version: 1, roots: [], errors: [], process_pending: mode === 'pending cleanup' } } })
+        if (mode === 'contradictory receipt') {
+          live.pull!.reviewReceipts.push({ id: call.review_id!, head: live.pull!.head, state: 'COMMENTED', invocation: call.id,
+            response: call.artifact!.review_response, submittedAt: NOW - 2000 })
+        }
+      }
+    }
+    chain = record(journal, chain, { type: 'chain.observed', observation: live })
+    chain = record(journal, chain, { type: 'chain.merged', mergeSha: MERGE, evidence: { repository: chain.repository,
+      pull_number: 17, merged: true, merge_sha: MERGE, review_complete: false } })
+    const ops = operations({ observe: async () => live, fenceClosedTarget: async () => false,
+      readInvocations: async () => { if (mode === 'unavailable Calls') throw new Error('receipt store unavailable'); return { entries: [], quarantined: [] } } })
+    const runtime = new BehaviorChainRuntime(journal, ops)
+    vi.setSystemTime(NOW + 120_000)
+    live.checkedAt = Date.now()
+    if (mode === 'unavailable Calls') await expect(runtime.run()).rejects.toThrow('receipt store unavailable')
+    else await runtime.run()
+    expect(journal.read(chain.id)).toMatchObject({ mergeSha: MERGE, reviewPending: true })
+    expect(journal.read(chain.id)?.reviewHoldClosure).toBeUndefined()
+  })
+
+it('closes missing review evidence only after the original no-publication Call and its cleanup settle', async () => {
+  const { journal } = setup()
+  let chain = seed(journal)
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-review', behavior: 'review-pr',
+    actor: chain.reviewer, model: reviewer.model, slot: reviewer.slot, basis: 'original', admittedAt: NOW - 5000,
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--pr-review', 'https://github.com/acme/repo/pull/17', '--expected-head', 'a'.repeat(40)] } } })
+  chain = record(journal, chain, { type: 'invocation.started', invocationId: 'original-review' })
+  const live = observation()
+  live.issue = { ...live.issue, open: false, intakeLabel: 'poise' }
+  const call = completedReviewCall(chain.repository, 17, live.pull!.head, chain.reviewer)
+  Object.assign(call, { source: 'poise:behavior-chain', correlation_id: 'original-review', status: 'failed', action: 'not_started',
+    outcome: 'preflight_failed', head_sha: null, review_id: null, artifact: { phase: 'reviewing' }, resources_settled_at: null,
+    resource_ownership: { version: 1, roots: [], errors: [], process_pending: true } })
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => live,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }))
+  await runtime.run()
+  expect(journal.read(chain.id)?.reviewHoldClosure).toBeUndefined()
+  Object.assign(call, { resources_settled_at: call.completed_at, resource_ownership: { version: 1, roots: [], errors: [] } })
+  await runtime.run()
+  expect(journal.read(chain.id)).toMatchObject({ mergeSha: MERGE, reviewPending: false,
+    reviewHoldClosure: { mergeSha: MERGE, actor: chain.author, label: 'poise' },
+    invocations: [{ state: 'settled', callId: call.id, evidence: { action: 'not_started' } }] })
 })

@@ -4,7 +4,7 @@ import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
 import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS,
-  chainReviewResponse, ciRefreshRequest, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold,
+  chainMergeReviewDecision, chainReviewResponse, ciRefreshRequest, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold,
   heldCiRepair, implementationTestDependency, queueCiBlocker, repairQueueBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
@@ -406,9 +406,11 @@ export class BehaviorChainRuntime {
   }
 
   private decision(chain: BehaviorChain, observation: ChainObservation): ChainDecision {
+    const admission = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'merge-pr')
     const mergeEvidence = observation.pull?.merged ? {
-      before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
+      before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN, admission) as ChainObservation | null,
       firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
+      admission,
     } : undefined
     return decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
   }
@@ -431,7 +433,10 @@ export class BehaviorChainRuntime {
         chain = this.append(chain, { type: 'chain.observed', observation })
         if (observation.pull?.merged && observation.pull.mergeSha) {
           chain = this.recordMerge(chain, observation, false)
-          if (this.decision(chain, observation).kind === 'complete') this.recordMerge(chain, observation, true)
+          const decision = this.decision(chain, observation)
+          if (decision.kind === 'complete') this.recordMerge(chain, observation, true)
+          else if (decision.kind === 'close-review-hold') this.append(chain, { type: 'chain.review-hold-closed',
+            closure: { mergeSha: chain.mergeSha!, actor: chain.author, label: decision.label } })
         }
         break
       } catch (error) {
@@ -886,6 +891,9 @@ export class BehaviorChainRuntime {
               }
               if (decision.kind === 'complete') {
                 this.recordMerge(chain, observation, true)
+              } else if (decision.kind === 'close-review-hold') {
+                this.append(chain, { type: 'chain.review-hold-closed',
+                  closure: { mergeSha: chain.mergeSha!, actor: chain.author, label: decision.label } })
               } else if (decision.kind === 'supersede') {
                 this.append(chain, { type: 'chain.superseded', evidence: decision.evidence })
               } else if (decision.kind === 'hold') {
@@ -1066,8 +1074,11 @@ export class BehaviorChainRuntime {
                   this.waitForCapacity(chain, REVIEW_CAPACITY_WAIT)
                   continue
                 }
+                const reviewDecision = decision.behavior === 'merge-pr' ? chainMergeReviewDecision(chain, observation, Date.now()) : null
+                if (decision.behavior === 'merge-pr' && !reviewDecision) throw new Error('native merge lacks its retained review decision')
                 const admitted = this.journal.admitInvocation(chain, randomUUID(), { id, behavior: decision.behavior, basis: decision.basis,
                   actor: decision.actor, model: request.command === 'agent-interface' ? request.argv[request.argv.indexOf('--model') + 1] : null, slot: decision.reviewer?.slot ?? null,
+                  ...(reviewDecision ? { reviewDecision } : {}),
                   ...(resources ? { reservation: resources.reservation } : {}),
                   admittedAt: Date.now(), request }, this.operations.capacity(), resources?.budget ?? null)
                 if (!admitted) {
