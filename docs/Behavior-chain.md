@@ -1390,11 +1390,14 @@ complete retained `UNPROCESSABLE` refusal at `enqueuePullRequest` saying
 `Pull request is already in the queue`, even when the historical Call retained
 `submission: uncertain` and `action: null`. Its original admission, request digest,
 Call diagnostic, pinned target, positive resource release and confirmed merge must
-agree with current chain ownership. It settles through the no-action failure path
-without an enqueue receipt or another GitHub write. The original Call, diagnostic,
-release time and observed merge remain intact; existing review reconciliation
-still requires the original review and context. Missing, truncated, conflicting
-or generic resolver evidence retains uncertainty through restart and rebuild.
+agree with current chain ownership. After GitHub deletes the branch, the bound
+merged PR still supplies the pinned head. A conflicting branch head or branch
+marker without a head retains uncertainty. A matching refusal settles through
+the no-action failure path without an enqueue receipt or another GitHub write.
+The journal retains the original Call, diagnostic, release time and observed
+merge. Existing review reconciliation still requires the original review and
+context. Missing, truncated, conflicting or generic resolver evidence retains
+uncertainty through restart and rebuild.
 
 Conversation resolution checkpoints each attempted thread and validated mutation
 response in the original Call's `artifact.resolution_progress` before another
