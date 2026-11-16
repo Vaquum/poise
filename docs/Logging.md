@@ -113,6 +113,9 @@ unreadable associations show unknown. A failed workspace read leaves retained
 Logging evidence usable, including in service mode. Source severity and Count
 (retained event/occurrence count) keep their separate meanings. This annotation
 neither starts work nor changes execution or holds.
+When an uncertain invocation also has an operator hold, the next action puts
+original receipt reconciliation before explicit Resume and keeps the hold visible.
+Resume does not reconcile the original receipt.
 For a new typed analysis handoff with positive no-submission evidence, the
 displayed severity is Warning only after a later admission for that original
 Call's same PR, head, review basis and slot, or its attributed substantive
