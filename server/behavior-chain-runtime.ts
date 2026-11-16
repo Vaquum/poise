@@ -84,9 +84,13 @@ function rejectedMergedEnqueue(chain: BehaviorChain, invocation: ChainInvocation
   const startedAt = Date.parse(call.started_at_precise ?? call.started_at)
   const completedAt = Date.parse(call.completed_at ?? '')
   const releasedAt = Date.parse(call.resources_settled_at ?? '')
+  // A deleted branch has no head or invocation marker. The merged PR still
+  // retains the head pinned by the original request.
   if (!chain.mergeSha || !pull?.merged || pull.state !== 'closed' || pull.mergeSha !== chain.mergeSha
     || observation?.publication.merged !== true || observation.publication.merge_sha !== chain.mergeSha
-    || observation.publication.pull_number !== pull.number || observation.publication.head_sha !== pull.head
+    || observation.publication.pull_number !== pull.number
+    || (observation.publication.head_sha !== pull.head
+      && (observation.publication.head_sha !== null || observation.publication.head_invocation !== null))
     || invocation.behavior !== 'merge-pr' || invocation.model !== null || invocation.request.command !== 'github-interface'
     || chain.invocations.at(-1)?.id !== invocation.id || invocation.actor !== chain.reviewer
     || argv[0] !== '--merge-if-ready' || argv[1]?.replace(/^#/, '') !== String(pull.number)

@@ -59,7 +59,7 @@ function operations(overrides: Partial<ChainRuntimeOperations> = {}): ChainRunti
     launch: forbidden, perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {}, ...overrides }
 }
 
-function persistedEnqueueRefusal(journal: BehaviorChainJournal, review = 'complete') {
+function persistedEnqueueRefusal(journal: BehaviorChainJournal, review = 'complete', branchDeleted = false) {
   vi.setSystemTime(NOW - 70_000)
   let chain = seed(journal)
   vi.setSystemTime(NOW - 60_000)
@@ -109,6 +109,7 @@ function persistedEnqueueRefusal(journal: BehaviorChainJournal, review = 'comple
   chain = record(journal, chain, { type: 'invocation.uncertain', invocationId: invocation.id, reason: 'original effect remains uncertain' })
   vi.setSystemTime(NOW)
   const merged = observation()
+  if (branchDeleted) merged.publication.head_sha = null
   merged.pull!.reviewIds = before.pull!.reviewIds
   merged.pull!.reviewReceipts = before.pull!.reviewReceipts
   merged.pull!.reviewContext = before.pull!.reviewContext
@@ -118,10 +119,12 @@ function persistedEnqueueRefusal(journal: BehaviorChainJournal, review = 'comple
   return { chain, call, merged }
 }
 
-it.each(['complete', 'missing review', 'missing context'])('reconciles one historical enqueue refusal on an already-merged chain: %s', async review => {
+it.each([
+  ['complete', false], ['missing review', false], ['missing context', false], ['complete', true],
+] as const)('reconciles a historical enqueue refusal with %s review context and branch deleted: %s', async (review, branchDeleted) => {
   const root = mkdtempSync(join(tmpdir(), 'poise-merged-refusal-')); roots.push(root)
   const path = join(root, 'journal.sqlite'), { db, journal } = setup(path)
-  const { chain, call, merged } = persistedEnqueueRefusal(journal, review)
+  const { chain, call, merged } = persistedEnqueueRefusal(journal, review, branchDeleted)
   const original = journal.history(chain.id)
   expect(chain.invocations.at(-1)).toMatchObject({ state: 'uncertain', evidence: { action: null,
     diagnostic: { context: { submission: 'uncertain' } } } })
@@ -161,7 +164,8 @@ it.each(['missing Call', 'duplicate Call', 'quarantined Call', 'missing diagnost
   'generic resolver error', 'wrong error type', 'wrong mutation', 'different refusal', 'partial error', 'additional error',
   'wrong diagnostic Call', 'conflicting diagnostic head', 'missing request digest', 'unreleased resources', 'contradictory resources',
   'response digest', 'unexpected response', 'changed Call request', 'changed Call head', 'changed Call identity', 'changed Call actor',
-  'release after merge', 'completion before admission', 'missing merge time', 'changed head', 'changed publication', 'merge conflict', 'not owned'])(
+  'release after merge', 'completion before admission', 'missing merge time', 'changed head', 'changed publication',
+  'conflicting branch head', 'branch marker without head', 'merge conflict', 'not owned'])(
   'retains merged enqueue uncertainty with %s', async mode => {
     const { journal } = setup()
     const { chain, call, merged } = persistedEnqueueRefusal(journal)
@@ -191,8 +195,11 @@ it.each(['missing Call', 'duplicate Call', 'quarantined Call', 'missing diagnost
     if (mode === 'missing merge time') delete merged.pull!.mergedAt
     if (mode === 'changed head') merged.pull!.head = merged.publication.head_sha = 'e'.repeat(40)
     if (mode === 'changed publication') merged.publication.pull_number = 18
+    if (mode === 'conflicting branch head') merged.publication.head_sha = 'e'.repeat(40)
+    if (mode === 'branch marker without head') Object.assign(merged.publication, { head_sha: null, head_invocation: call.id })
     if (mode === 'merge conflict') merged.pull!.mergeSha = 'e'.repeat(40)
-    if (['missing merge time', 'changed head', 'changed publication', 'merge conflict'].includes(mode)) {
+    if (['missing merge time', 'changed head', 'changed publication', 'conflicting branch head',
+      'branch marker without head', 'merge conflict'].includes(mode)) {
       record(journal, chain, { type: 'chain.observed', observation: merged })
     }
     const perform = vi.fn(async () => ({}))
