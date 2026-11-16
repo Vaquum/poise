@@ -389,6 +389,22 @@ describe('one diagnostic contract', () => {
 })
 
 describe('retained authorized queries', () => {
+  it('keeps a readable event and advances past an unreadable payload', () => {
+    const path = join(directory(), 'partial.db')
+    const db = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW)
+    stores.push(db)
+    const invalid = event('invalid-payload'), healthy = event('healthy-payload')
+    db.append([invalid, healthy])
+    const writer = new Database(path)
+    try { writer.prepare('UPDATE log_events SET payload = ? WHERE id = ?').run('{', invalid.id) }
+    finally { writer.close() }
+    expect(db.query(alice).events.map(row => row.id)).toEqual([healthy.id])
+    const first = db.delivery(alice, null, 1)
+    expect(first.events).toEqual([])
+    expect(first.hasMore).toBe(true)
+    expect(db.delivery(alice, first.cursor, 1).events.map(row => row.id)).toEqual([healthy.id])
+  })
+
   it('expires authorized tombstones in idle writable and read-only stores', () => {
     const policy = { retentionMs: 1000, maxBytes: 100_000, maxEvents: 1 }
     const path = join(directory(), 'tombstones.db'); let now = NOW

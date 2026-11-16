@@ -8,6 +8,7 @@ import { randomBytes } from 'node:crypto'
 import { auth, type OAuthClientProvider, type OAuthDiscoveryState } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js'
 import { connectionSignInCleared } from '../alerts/producers'
+import { diagnostic } from '../logging'
 import { ExtensionError, addEvent, eraseSecret, extensionSignInLost, oauthFlows, readSecret, storedServer, writeSecret } from './store'
 
 /** Where the provider sends the browser back: a page of the app, because an
@@ -133,7 +134,17 @@ export async function startSignIn(id: string, origin: unknown): Promise<{ author
 /** Finish signing in with what the provider returned to the browser. */
 export async function finishSignIn(input: { state?: unknown, code?: unknown, error?: unknown }): Promise<{ id: string }> {
   if (typeof input.state !== 'string' || !input.state) throw new ExtensionError(400, 'The sign-in returned without its state.')
-  const match = oauthFlows().map(({ id, value }) => ({ id, flow: JSON.parse(value) as Flow })).find(({ flow }) => flow.state === input.state)
+  const match = oauthFlows().flatMap(({ id, value }) => {
+    try {
+      const flow = JSON.parse(value) as Flow
+      if (typeof flow?.state === 'string' && typeof flow.redirectUrl === 'string' && Number.isFinite(flow.createdAt)) return [{ id, flow }]
+      throw new Error('Invalid saved sign-in fields')
+    } catch (error) {
+      diagnostic({ level: 'warning', operation: 'extensions.oauth.read', target: id,
+        message: error instanceof SyntaxError ? 'Saved sign-in contains invalid JSON' : 'Invalid saved sign-in fields' })
+      return []
+    }
+  }).find(({ flow }) => flow.state === input.state)
   if (!match) throw new ExtensionError(400, 'That sign-in is unknown or already finished. Sign in again.')
   const { id, flow } = match
   eraseSecret(id, 'oauth:flow')

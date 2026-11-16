@@ -27,6 +27,15 @@ async function complete(engine: import('../server/jev/runtime').JevRuntime, id: 
   return engine.run(id)
 }
 describe('JEV primitives', () => {
+  it('opens the runtime and completes another evaluation beside a damaged saved run', async () => {
+    const damaged = setup()
+    database.db.prepare('INSERT INTO jev_runs VALUES (?, ?, ?, ?, ?, ?)').run(
+      randomUUID(), damaged.session.id, 'fixture', 'running', 2_000_000_000, '{')
+    const healthy = setup()
+    const run = healthy.engine.start(healthy.session.id, randomUUID(), request)
+    expect((await complete(healthy.engine, run.id)).result).toEqual(answer)
+    expect(healthy.engine.runs(damaged.session.id).runs).toEqual([])
+  })
   it('round-trips all types and structured instructions/criteria without narrowing them', () => {
     const value: JevRequest = { model: 'jev-preview', state: { ticket: ['context', { amount: 42 }] }, questions: {
       route: { type: 'choice', instructions: { question: 'Which category?', examples: ['a'] }, criteria: { a: null, b: { includes: ['b'] } } },

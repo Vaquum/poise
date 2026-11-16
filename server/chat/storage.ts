@@ -7,6 +7,7 @@
 // write is one short transaction; nothing here talks to an agent.
 
 import { db } from '../db'
+import { diagnosticFailure } from '../logging'
 import { cachedStatement } from '../statements'
 import { claimQueuedMessage, delegateQueue, deleteMessageQueue, pauseQueue, settleQueuedTurn, queueOwner, readQueue } from './message-queue'
 import type { ChatEnvelope, ChatEvent, SessionRecord, SessionStatus, MessageQueue, SubjectSurface } from './protocol'
@@ -230,9 +231,19 @@ export function sessionsForCheckout(checkout: string): CheckoutSession[] {
 }
 
 export function listSessions(instance: string): SessionRecord[] {
-  const rows = cachedStatement(db, 'SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
-    .all(instance) as Array<{ record: string, last_seq: number, status: string, role: string | null }>
-  return rows.map(parseRecord)
+  const rows = cachedStatement(db, 'SELECT id, record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
+    .all(instance) as Array<{ id: string, record: string, last_seq: number, status: string, role: string | null }>
+  return rows.flatMap(row => {
+    try {
+      const record = parseRecord(row)
+      if (record.id !== row.id || typeof record.agent !== 'string' || typeof record.checkout !== 'string'
+        || typeof record.branch?.name !== 'string') throw new Error('Saved chat record has invalid identity or workspace fields')
+      return [record]
+    } catch (error) {
+      diagnosticFailure('chat.session.read', error, { target: row.id }, { level: 'warning' })
+      return []
+    }
+  })
 }
 
 export interface ChatPageSelector {
@@ -393,7 +404,16 @@ export function listEvents(sessionId: string, afterSeq: number, limit: number = 
     .all(sessionId, afterSeq, bounded + 1) as Array<{ seq: number, at: string, event: string }>
   const truncated = rows.length > bounded
   return {
-    events: rows.slice(0, bounded).map((row) => ({ seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent })),
+    events: rows.slice(0, bounded).flatMap(row => {
+      try {
+        const event = JSON.parse(row.event) as ChatEvent
+        if (typeof event?.type !== 'string') throw new Error('Saved chat event has an invalid type')
+        return [{ seq: row.seq, sessionId, at: row.at, event }]
+      } catch (error) {
+        diagnosticFailure('chat.event.read', error, { target: sessionId, sequence: row.seq }, { level: 'warning' })
+        return []
+      }
+    }),
     truncated,
   }
 }

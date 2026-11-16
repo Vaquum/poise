@@ -7,6 +7,7 @@
 import { randomUUID } from 'node:crypto'
 import { db } from '../db'
 import { connectionSignInCleared, connectionSignInNeeded } from '../alerts/producers'
+import { diagnosticFailure } from '../logging'
 import { redact } from '../../gateway/src/diagnostics/redaction.mjs'
 import { secretSlots, type Enablement, type ServerEvent, type ServerSpec, type ServerStatus, type ServerView } from './types'
 
@@ -71,7 +72,20 @@ function toView(server: StoredServer): ServerView {
 }
 
 export function storedServers(): StoredServer[] {
-  return (db.prepare('SELECT * FROM extension_servers ORDER BY created_at').all() as Row[]).map(parse)
+  const rows = db.prepare('SELECT * FROM extension_servers ORDER BY created_at').all() as Row[]
+  return rows.flatMap(row => {
+    try {
+      const server = parse(row)
+      if (server.spec?.name !== row.name || !server.enabled?.workspaces || typeof server.status?.state !== 'string'
+        || (server.spec.env && !Array.isArray(server.spec.env)) || (server.spec.headers && !Array.isArray(server.spec.headers))) {
+        throw new Error('Saved extension has invalid configuration fields')
+      }
+      return [server]
+    } catch (error) {
+      diagnosticFailure('extensions.server.read', error, { target: row.id }, { level: 'warning', stderr: false })
+      return []
+    }
+  })
 }
 
 export function storedServer(id: string): StoredServer {

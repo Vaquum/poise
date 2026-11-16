@@ -191,7 +191,7 @@ it('rejects wrong domains, malformed/oversized/future records without acknowledg
   } finally { db.close() }
 })
 
-it('rolls back earlier events and coverage if an immutable replay conflicts', async () => {
+it('keeps an independent event and records a conflicting replay in coverage', async () => {
   const db = store()
   try {
     const first = batch(); const [, ack] = await send(db, first)
@@ -199,9 +199,24 @@ it('rolls back earlier events and coverage if an immutable replay conflicts', as
       { ...first.records[0], id: '2'.repeat(64), time: first.until },
       { ...first.records[0], time: first.until, log: { ...first.records[0].log, msg: 'conflicting native record' } },
     ] }
-    await expect(send(db, next)).rejects.toThrow(/immutable/)
-    expect(db.checkpoint('external-ingress-window')).toBe(ack.checkpoint)
+    const [, result] = await send(db, next)
+    expect(result).toMatchObject({ accepted: true, currentStatus: 'partial', events: 1 })
+    expect(db.checkpoint('external-ingress-window')).toBe(result.checkpoint)
+    expect(db.query(access).total).toBe(2)
+    expect(db.readCoverage(access).find(source => source.id === 'external-ingress')?.gaps)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ reason: expect.stringMatching(/Record 2.*immutable/) })]))
+  } finally { db.close() }
+})
+
+it('keeps valid ingress beside a malformed record and records the omitted cause', async () => {
+  const db = store()
+  try {
+    const input = batch()
+    const [, ack] = await send(db, { ...input, records: [{ ...input.records[0], id: 'invalid' }, ...input.records] })
+    expect(ack).toMatchObject({ accepted: true, events: 1, currentStatus: 'partial' })
     expect(db.query(access).total).toBe(1)
+    expect(db.readCoverage(access).find(source => source.id === 'external-ingress')?.gaps)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ reason: expect.stringMatching(/Record 1.*Invalid or oversized/) })]))
   } finally { db.close() }
 })
 

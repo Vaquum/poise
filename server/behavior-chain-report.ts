@@ -110,8 +110,8 @@ async function seedScopeDirective(repository: string, issue: number, author: str
 
 export async function repairReportReviewScope(db: Database, chain: Pick<BehaviorChain, 'repository' | 'issue' | 'author'>, pull: number): Promise<string> {
   const { repository, issue } = chain
-  const report = db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
-    AND json_extract(value, '$.issueNumber') = ? LIMIT 1`).get(PREFIX + '*', repository.toLowerCase() + '#*', issue)
+  const report = db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') GLOB ?
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') = ? LIMIT 1`).get(PREFIX + '*', repository.toLowerCase() + '#*', issue)
   if (!report && !(await seedScopeDirective(repository, issue, chain.author))) return ''
   const org = organizationForRepository(repository)
   if (!org) throw new Error('Repair report review requires its followed organization')
@@ -192,8 +192,8 @@ function enabled(db: Database, repository: string): boolean {
 // between the legacy ledger and a chain with a different source issue.
 function existingReviewReport(db: Database, repository: string, pull: number) {
   const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
-    AND json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.pull') = ?
-    ORDER BY json_extract(value, '$.issueNumber') IS NULL, key`)
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.pull') = ?
+    ORDER BY json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') IS NULL, key`)
     .all(PREFIX + '*', repository.toLowerCase() + '#*', pull) as Array<{ key: string, value: string }>
   return rows.find(row => {
     const report = JSON.parse(row.value) as RepairReport
@@ -213,7 +213,7 @@ function reserveReport(db: Database, report: RepairReport): boolean {
 
 function bindReportIssue(db: Database, key: string, number: number): boolean {
   return db.prepare(`UPDATE meta SET value = json_set(value, '$.issueNumber', ?)
-    WHERE key = ? AND (json_extract(value, '$.issueNumber') IS NULL OR json_extract(value, '$.issueNumber') = ?)`)
+    WHERE key = ? AND (json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') IS NULL OR json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') = ?)`)
     .run(number, PREFIX + key, number).changes === 1
 }
 
@@ -642,7 +642,7 @@ function implementationReportIdentity(report: RepairReport, storageKey = PREFIX 
 
 function implementationReport(db: Database, chain: BehaviorChain): RepairReport | null {
   const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
-    AND json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.issueNumber') = ?`)
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') = ?`)
     .all(PREFIX + '*', chain.repository.toLowerCase() + '#*', chain.issue) as Array<{ key: string, value: string }>
   const reports = rows.filter(row => {
     const report = JSON.parse(row.value) as RepairReport
@@ -690,7 +690,7 @@ export function implementationReportBinding(db: Database, chain: BehaviorChain) 
 
 function reviewReport(db: Database, chain: BehaviorChain): RepairReport | null {
   const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
-    AND json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.issueNumber') = ?`)
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') = ?`)
     .all(PREFIX + '*', chain.repository.toLowerCase() + '#*', chain.issue) as Array<{ key: string, value: string }>
   const reports = rows.filter(row => {
     const report = JSON.parse(row.value) as RepairReport
@@ -713,7 +713,7 @@ export function reviewReportBinding(db: Database, chain: BehaviorChain) {
 
 function unconfirmedReviewReports(db: Database, repository: string): RepairReport[] {
   const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
-    AND json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.issueNumber') IS NULL`)
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') IS NULL`)
     .all(PREFIX + '*', repository.toLowerCase() + '#*') as Array<{ key: string, value: string }>
   return rows.flatMap(row => {
     const report = JSON.parse(row.value) as RepairReport
@@ -726,7 +726,7 @@ function unconfirmedReviewReports(db: Database, repository: string): RepairRepor
 
 function unconfirmedImplementationReports(db: Database, repository: string): RepairReport[] {
   const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
-    AND json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.issueNumber') IS NULL`)
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') IS NULL`)
     .all(PREFIX + '*', repository.toLowerCase() + '#*') as Array<{ key: string, value: string }>
   return rows.flatMap(row => {
     const report = JSON.parse(row.value) as RepairReport
@@ -1250,8 +1250,8 @@ function qualifyingImplementationPublication(chain: BehaviorChain, observation: 
 
 function repairExhaustionReports(db: Database, chain: BehaviorChain, reportIssue = false): RepairReport[] {
   const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ? AND ${reportIssue
-    ? "json_extract(value, '$.source') GLOB ? AND json_extract(value, '$.issueNumber') = ?"
-    : "json_extract(value, '$.source') = ?"}`)
+    ? "json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') = ?"
+    : "json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') = ?"}`)
     .all(PREFIX + '*', reportIssue ? chain.repository.toLowerCase() + '#*' : chain.id,
       ...(reportIssue ? [chain.issue] : [])) as Array<{ key: string, value: string }>
   return rows.flatMap(row => {
@@ -1528,9 +1528,9 @@ function prePrFailure(invocation: BehaviorChain['invocations'][number]) {
 
 function prePrReports(db: Database, chainId: string) {
   const rows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
-    AND json_extract(value, '$.source') = ? AND json_extract(value, '$.pull') IS NULL
-    AND json_extract(value, '$.holdSequence') IS NOT NULL
-    ORDER BY json_extract(value, '$.holdSequence') DESC`)
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') = ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.pull') IS NULL
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.holdSequence') IS NOT NULL
+    ORDER BY json_extract(CASE WHEN json_valid(value) THEN value END, '$.holdSequence') DESC`)
     .all(PREFIX + '*', chainId) as Array<{ key: string, value: string }>
   return rows.map(row => ({ storageKey: row.key, value: row.value, report: JSON.parse(row.value) as RepairReport }))
     .filter(candidate => candidate.report.attempts.length === 1)
@@ -1896,7 +1896,7 @@ async function recoverReportedImplementation(db: Database, journal: BehaviorChai
  * can reopen that intent for another POST. Intake remains the normal reader. */
 export async function reportRepairExhaustion(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   verify: () => Promise<ChainObservation>, allowed: () => boolean): Promise<string | null> {
-  const repairRows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') = ?`)
+  const repairRows = db.prepare(`SELECT key, value FROM meta WHERE key GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') = ?`)
     .all(PREFIX + '*', chain.id) as Array<{ key: string, value: string }>
   for (const row of repairRows) {
     const repair = JSON.parse(row.value) as RepairReport
@@ -1990,9 +1990,9 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   // another cause, an uncertain merge's invocation-based key, or a legacy
   // PR-scoped source after a v2 chain takes ownership.
   const linked = closed ? db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
-    AND json_extract(value, '$.pull') = ?
-    AND (json_extract(value, '$.source') = ? OR json_extract(value, '$.source') = ?)
-    ORDER BY json_extract(value, '$.issueNumber') IS NULL, key LIMIT 1`)
+    AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.pull') = ?
+    AND (json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') = ? OR json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') = ?)
+    ORDER BY json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') IS NULL, key LIMIT 1`)
     .get(PREFIX + '*', observation.pull!.number, chain.id,
       `${chain.repository.toLowerCase()}#${observation.pull!.number}`) as { key: string, value: string } | undefined
     : qualifying?.cause === 'review_budget_exhausted' ? existingReviewReport(db, chain.repository, observation.pull!.number) : undefined
@@ -2074,8 +2074,8 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     if (cause === CLOSED_CAUSE ? !closed : implementationReport ? !implementation || implementationCause !== cause : cause === MERGE_CAUSE ? !merge : qualifying?.cause !== cause) return cause === MERGE_CAUSE || implementationReport
       ? `${label} reporting: source has no verified failure on the current basis`
       : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
-    if (db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
-      AND json_extract(value, '$.issueNumber') = ? LIMIT 1`).get(PREFIX + '*', chain.repository.toLowerCase() + '#*', chain.issue)) {
+    if (db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.source') GLOB ?
+      AND json_extract(CASE WHEN json_valid(value) THEN value END, '$.issueNumber') = ? LIMIT 1`).get(PREFIX + '*', chain.repository.toLowerCase() + '#*', chain.issue)) {
       return `${label} reporting suppressed for a generated remediation issue; its ordinary hold or uncertainty remains active`
     }
     // verify performs the existing datastore health check before re-reading

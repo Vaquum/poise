@@ -2,7 +2,7 @@ import { classifyHost, hostName } from '../hosts.js'
 import { createHash, randomBytes } from 'node:crypto'
 import { normalize, environmentSecrets, type LogEvent } from './contract.js'
 import { nativeDiagnostic } from './sources.js'
-import type { DiagnosticStore, Coverage } from './store.js'
+import { DiagnosticConflictError, DiagnosticEventError, type DiagnosticStore, type Coverage } from './store.js'
 
 export const INGRESS_LEASE_MS = 90_000
 const KEY = 'external-ingress-window'
@@ -45,23 +45,30 @@ export async function receiveIngress(db: DiagnosticStore, domain: string, stdin:
   if (cursor !== null && (!object(cursor) || typeof cursor.container !== 'string' || typeof cursor.until !== 'string')) throw new Error('Invalid retained ingress checkpoint')
   if (object(cursor) && cursor.container === batch.container && cursor.until !== batch.from) throw new Error('Ingress window must continue the committed checkpoint')
   const events: LogEvent[] = []
-  for (const record of batch.records) {
-    if (!object(record) || typeof record.id !== 'string' || !/^[a-f0-9]{64}$/.test(record.id) || !object(record.log) || Buffer.byteLength(JSON.stringify(record)) > 64 * 1024) throw new Error('Invalid or oversized ingress record')
-    const time = timestamp(record.time)
-    if (time < from || time > until) throw new Error('Ingress record lies outside its source window')
-    const request = record.log.request
-    const header = object(request) && typeof request.host === 'string' ? request.host : record.log.server_name ?? record.log.identifier
-    const host = typeof header === 'string' ? hostName(header) : null
-    if (typeof header !== 'string' || /:\d+$/.test(header) && Number(header.slice(header.lastIndexOf(':') + 1)) > 65535 || classifyHost(header, domain).kind === 'unknown') throw new Error('Ingress record is outside the configured Poise domain')
-    const id = createHash('sha256').update(batch.container + ':' + record.id).digest('hex')
-    if (/^http\.log\.access(?:\.|$)/.test(String(record.log.logger))) continue
-    const input = nativeDiagnostic(record.log, 'ingress', id, null)
-    input.time ??= record.time as string
-    input.container = batch.container
-    input.context = { ...input.context, host, status: typeof record.log.status === 'number' ? record.log.status : null, errorId: record.log.err_id ?? null, errorTrace: record.log.err_trace ?? null, integration: 'external-proxy-window' }
-    const event = normalize(input, at, environmentSecrets())
-    if (event) events.push(event)
+  const rejected: string[] = []
+  const eventIndices = new Map<LogEvent, number>()
+  let validRecords = 0
+  for (const [index, record] of batch.records.entries()) {
+    try {
+      if (!object(record) || typeof record.id !== 'string' || !/^[a-f0-9]{64}$/.test(record.id) || !object(record.log) || Buffer.byteLength(JSON.stringify(record)) > 64 * 1024) throw new Error('Invalid or oversized ingress record')
+      const time = timestamp(record.time)
+      if (time < from || time > until) throw new Error('Ingress record lies outside its source window')
+      const request = record.log.request
+      const header = object(request) && typeof request.host === 'string' ? request.host : record.log.server_name ?? record.log.identifier
+      const host = typeof header === 'string' ? hostName(header) : null
+      if (typeof header !== 'string' || /:\d+$/.test(header) && Number(header.slice(header.lastIndexOf(':') + 1)) > 65535 || classifyHost(header, domain).kind === 'unknown') throw new Error('Ingress record is outside the configured Poise domain')
+      const id = createHash('sha256').update(batch.container + ':' + record.id).digest('hex')
+      validRecords++
+      if (/^http\.log\.access(?:\.|$)/.test(String(record.log.logger))) continue
+      const input = nativeDiagnostic(record.log, 'ingress', id, null)
+      input.time ??= record.time as string
+      input.container = batch.container
+      input.context = { ...input.context, host, status: typeof record.log.status === 'number' ? record.log.status : null, errorId: record.log.err_id ?? null, errorTrace: record.log.err_trace ?? null, integration: 'external-proxy-window' }
+      const event = normalize(input, at, environmentSecrets())
+      if (event) { events.push(event); eventIndices.set(event, index) }
+    } catch (error) { rejected.push(`Record ${index + 1}: ${error instanceof Error ? error.message : 'invalid record'}`) }
   }
+  if (!validRecords && rejected.length) throw new Error(rejected[0])
   const previous = db.readCoverage(access).find((source) => source.id === 'external-ingress')
   const gaps: Coverage['gaps'] = (previous?.gaps ?? []).map((gap) => ({ ...gap, to: batch.state === 'unavailable' ? gap.to : gap.to ?? new Date(at).toISOString() }))
   if (batch.retainedFrom !== undefined && batch.retainedFrom !== null) {
@@ -71,17 +78,31 @@ export async function receiveIngress(db: DiagnosticStore, domain: string, stdin:
   if (object(cursor) && cursor.container !== batch.container) gaps.push({ from: cursor.until as string, to: new Date(Math.max(Date.parse(cursor.until as string), until)).toISOString(), reason: 'External proxy container replaced; preceding source history is unavailable' })
   if (batch.state === 'bounded') gaps.push({ from: batch.from as string, to: batch.until as string, reason: 'External proxy source window exceeded its read bound' })
   if (batch.state === 'unavailable' && !gaps.some((gap) => gap.to === null)) gaps.push({ from: previous?.observedAt ?? batch.from as string, to: null, reason: 'External proxy source is unavailable' })
-  const currentStatus = batch.state === 'unavailable' ? 'unavailable' : batch.state === 'bounded' || at - until > 45_000 ? 'partial' : 'connected'
-  const coverage: Coverage = { id: 'external-ingress', source: 'ingress', workspace: null, currentStatus,
-    status: gaps.length || currentStatus !== 'connected' ? 'partial' : 'connected', observedAt: new Date(issuedAt).toISOString(),
-    observationExpiresAt: new Date(issuedAt + INGRESS_LEASE_MS).toISOString(),
-    historyIncomplete: previous?.historyIncomplete || gaps.length > 32,
-    ingestedAt: events.length ? new Date(at).toISOString() : previous?.ingestedAt ?? null,
-    availableFrom: batch.state === 'unavailable' ? previous?.availableFrom ?? null : previous?.availableFrom && Date.parse(previous.availableFrom) < from ? previous.availableFrom : batch.from as string, gaps: gaps.slice(-32),
-    error: batch.state === 'unavailable' ? batch.failure === 'clock-skew' ? 'External proxy and gateway clocks differ by more than five seconds' : 'External proxy source could not be read' : currentStatus === 'partial' ? 'External proxy replay is incomplete' : null }
   const next = batch.state === 'unavailable' ? expected : JSON.stringify({ container: batch.container, until: batch.until })
-  db.commitCollection(events, KEY, expected, next, coverage)
-  write(JSON.stringify({ accepted: true, checkpoint: next, events: events.length, currentStatus }))
+  for (;;) {
+    const currentStatus = batch.state === 'unavailable' ? 'unavailable' : batch.state === 'bounded' || rejected.length || at - until > 45_000 ? 'partial' : 'connected'
+    const recordedGaps = [...gaps, ...rejected.map(reason => ({ from: batch.from as string, to: batch.until as string, reason }))]
+    const coverage: Coverage = { id: 'external-ingress', source: 'ingress', workspace: null, currentStatus,
+      status: recordedGaps.length || currentStatus !== 'connected' ? 'partial' : 'connected', observedAt: new Date(issuedAt).toISOString(),
+      observationExpiresAt: new Date(issuedAt + INGRESS_LEASE_MS).toISOString(),
+      historyIncomplete: previous?.historyIncomplete || recordedGaps.length > 32,
+      ingestedAt: events.length ? new Date(at).toISOString() : previous?.ingestedAt ?? null,
+      availableFrom: batch.state === 'unavailable' ? previous?.availableFrom ?? null : previous?.availableFrom && Date.parse(previous.availableFrom) < from ? previous.availableFrom : batch.from as string,
+      gaps: recordedGaps.slice(-32),
+      error: batch.state === 'unavailable' ? batch.failure === 'clock-skew' ? 'External proxy and gateway clocks differ by more than five seconds' : 'External proxy source could not be read'
+        : rejected.length ? `${rejected.length} ingress records were rejected` : currentStatus === 'partial' ? 'External proxy replay is incomplete' : null }
+    try {
+      db.commitCollection(events, KEY, expected, next, coverage)
+      write(JSON.stringify({ accepted: true, checkpoint: next, events: events.length, currentStatus }))
+      return
+    } catch (error) {
+      if (!(error instanceof DiagnosticEventError || error instanceof DiagnosticConflictError)) throw error
+      const index = events.indexOf(error.record)
+      if (index < 0) throw error
+      rejected.push(`Record ${eventIndices.get(error.record)! + 1}: ${error.message}`)
+      events.splice(index, 1)
+    }
+  }
 }
 
 /** Preserve the original manual occurrence namespace; it cannot renew a scan lease. */

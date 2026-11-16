@@ -165,10 +165,19 @@ export function recordStaleMirrorBlock(error: StaleDatastoreError, behavior: str
 }
 
 export function openStaleMirrors(org: Organization | null): StaleMirrorEpisode[] {
-  const rows = cachedStatement(db, 'SELECT value FROM meta WHERE key >= ? AND key < ?').all(...prefixRange(EPISODE_PREFIX)) as Array<{ value: string }>
-  return rows.map(({ value }) => JSON.parse(value) as StaleMirrorEpisode).filter((episode) => !episode.recoveredAt
-    && episode.account === (org?.login.toLowerCase() ?? 'legacy')
-    && (!org?.datastorePath || episode.database === resolve(org.datastorePath)))
+  const rows = cachedStatement(db, 'SELECT key, value FROM meta WHERE key >= ? AND key < ?').all(...prefixRange(EPISODE_PREFIX)) as Array<{ key: string, value: string }>
+  return rows.flatMap(({ key, value }) => {
+    try {
+      const episode = JSON.parse(value) as StaleMirrorEpisode
+      if (!episode?.id || !episode.latest || !Array.isArray(episode.behaviors)) throw new Error('Saved observation has invalid freshness evidence')
+      return !episode.recoveredAt && episode.account === (org?.login.toLowerCase() ?? 'legacy')
+        && (!org?.datastorePath || episode.database === resolve(org.datastorePath)) ? [episode] : []
+    } catch (error) {
+      diagnostic({ level: 'warning', operation: 'github-datastore.stale', target: key,
+        message: error instanceof SyntaxError ? 'Saved freshness observation contains invalid JSON' : behaviorErrorMessage(error) })
+      return []
+    }
+  })
 }
 
 /** Reporting only: native probes retain their exit-based admission rules. */

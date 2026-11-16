@@ -682,9 +682,19 @@ export class BehaviorLedgerStore {
         if (request.operation === 'changes') {
           const cursor = this.parseCursor(request.cursor, 'changes', null)
           if (cursor.position < Number(this.meta('change_floor'))) throw new LedgerError(410, 'resync_required')
-          const rows = this.connection().prepare('SELECT payload FROM ledger_changes WHERE seq>? ORDER BY seq ASC LIMIT ?').all(cursor.position, limit + 1) as { payload: string }[]
-          const changes = rows.slice(0, limit).map((row) => JSON.parse(row.payload) as LedgerChange)
-          const position = changes.at(-1)?.sequence ?? cursor.position
+          const rows = this.connection().prepare('SELECT seq,payload FROM ledger_changes WHERE seq>? ORDER BY seq ASC LIMIT ?').all(cursor.position, limit + 1) as { seq: number, payload: string }[]
+          const page = rows.slice(0, limit)
+          const changes = page.flatMap(row => {
+            try {
+              const change = JSON.parse(row.payload) as LedgerChange
+              if (change?.sequence === row.seq) return [change]
+              throw new Error('Invalid ledger change sequence')
+            } catch (error) {
+              console.warn(`[ledger] Saved change ${row.seq} cannot be read`, error instanceof SyntaxError ? 'invalid JSON' : 'invalid sequence')
+              return []
+            }
+          })
+          const position = page.at(-1)?.seq ?? cursor.position
           return envelope({ changes, hasMore: rows.length > limit,
             nextCursor: this.cursor({ kind: 'changes', position, boundary: 0, watermark: position, parent: null }) })
         }
