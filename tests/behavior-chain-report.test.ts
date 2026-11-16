@@ -4956,6 +4956,19 @@ it('blocks budget report implementation when the acknowledgement was lost', asyn
   expect(posts()).toHaveLength(1)
 })
 
+it('omits private operator hold details from receipt-first work impact in generated reports', async () => {
+  const { db, journal } = setup()
+  const { chain, call } = uncertainImplementation(journal)
+  record(journal, chain, { type: 'chain.held', reason: 'private operator context\nprivate reviewer identity' })
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  expect(behaviorChainWorkImpact(journal, null, call.correlation_id!)?.nextAction)
+    .toContain('Reconcile the original invocation receipt first. Resolve the hold and explicitly resume: private operator context')
+  expect(remote[0].body).toContain('Next action: Reconcile the original invocation receipt first. Resolve the hold and explicitly resume; inspect the original journal evidence for the cause.')
+  expect(remote[0].body).not.toMatch(/private operator context|private reviewer identity/)
+})
+
 it.each(['new report', 'lost acknowledgement', 'closed markerless link'])('reports an unheld uncertain implementation once across restart: %s', async mode => {
   const root = mkdtempSync(join(tmpdir(), 'uncertain-implementation-report-')); roots.push(root)
   const path = join(root, 'journal.sqlite')

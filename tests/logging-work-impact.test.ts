@@ -61,7 +61,26 @@ it('requires progress after the exact failure and retains an independent hold af
   expect(behaviorChainWorkImpact(journal, laterCall, laterCorrelation)).toMatchObject({ recovered: false, progressAt: at + 4000 })
   fixture.append({ type: 'chain.held', reason: 'independent publication hold' }, at + 7000)
   expect(behaviorChainWorkImpact(journal, call, correlation)).toMatchObject({ impact: 'blocked', recovered: true,
-    nextAction: expect.stringContaining('independent publication hold') })
+    retryAt: null, nextAction: 'Resolve the hold and explicitly resume: independent publication hold' })
+})
+
+it('puts original receipt reconciliation before Resume while retaining the operator hold', () => {
+  const journal = new BehaviorChainJournal(db)
+  let chain = journal.append('acme/repo#7', 'seed:7', 0, { type: 'chain.admitted', repository: 'acme/repo', issue: 7,
+    branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' }, at)
+  chain = journal.append(chain.id, 'admission', chain.sequence, { type: 'invocation.admitted', invocation: {
+    id: correlation, behavior: 'implement-issue', basis: 'implementation', actor: 'author', model: 'fixture', slot: 'primary',
+    admittedAt: at + 1000, request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] },
+  } }, at + 1000)
+  chain = journal.append(chain.id, 'started', chain.sequence, { type: 'invocation.started', invocationId: correlation }, at + 2000)
+  chain = journal.append(chain.id, 'uncertain', chain.sequence, { type: 'invocation.uncertain', invocationId: correlation,
+    reason: 'Original invocation ended without a durable result or proof that its resources were released' }, at + 3000)
+  chain = journal.append(chain.id, 'hold', chain.sequence, { type: 'chain.held', reason: 'New invocations held by the person' }, at + 4000)
+  expect(chain.invocations[0]).toMatchObject({ state: 'uncertain', callId: null })
+  const work = behaviorChainWorkImpact(journal, null, correlation)
+  expect(work).toMatchObject({ impact: 'blocked', invocationId: correlation, stage: 'implement-issue: uncertain', retryAt: null,
+    nextAction: 'Reconcile the original invocation receipt first. Resolve the hold and explicitly resume: New invocations held by the person' })
+  expect(behaviorChainWorkImpacts(journal, [{ callId: null, correlationId: correlation }])).toEqual([work])
 })
 
 it('keeps the original failed invocation boundary when resource reconciliation repeats its failure receipt', () => {

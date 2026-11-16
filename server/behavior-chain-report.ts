@@ -2187,8 +2187,8 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         const origin = readServiceConfig()?.publicOrigin
         // Report causes already use their vetted detail paths; the live hold
         // text may contain private diagnostics or review comment identities.
-        const nextAction = work.nextAction?.startsWith('Resolve the hold and explicitly resume:')
-          ? 'Resolve the hold and explicitly resume; inspect the original journal evidence for the cause' : work.nextAction
+        const nextAction = work.nextAction?.replace(/Resolve the hold and explicitly resume:[\s\S]*$/,
+          'Resolve the hold and explicitly resume; inspect the original journal evidence for the cause')
         workSnapshot = [`Work impact snapshot as of ${snapshotAt} (at filing; not live status).`,
           `Current impact: ${work.impact}. Work target: ${work.target}. Work stage: ${work.stage}.`,
           `Last verified progress: ${new Date(work.progressAt).toISOString()}.`,
