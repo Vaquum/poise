@@ -130,7 +130,8 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
   let stage = 'unknown'
   let blocker = chainCoverage.reason
   if (chain) {
-    stage = chain.mergeSha ? chain.reviewPending === false ? 'complete' : chain.reviewPending === true ? 'merged_review_pending' : 'merged_review_not_recorded'
+    stage = chain.mergeSha ? chain.reviewHoldClosure ? 'merged_review_evidence_missing' : chain.reviewPending === false ? 'complete'
+      : chain.reviewPending === true ? 'merged_review_pending' : 'merged_review_not_recorded'
       : chain.supersession ? 'superseded' : chain.held ? 'held' : active?.state === 'uncertain' ? 'unknown'
         : active ? active.state === 'admitted' ? 'admitted' : missingReceipt ? 'unknown' : 'running' : summary?.waiting ? 'delayed'
           : latest?.evidence?.status === 'failed' && latest.admissionSequence > chain.resumedAfterSequence ? 'failed' : 'waiting'
@@ -191,7 +192,7 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
 
 function nextWorkAction(stage: string, blocker: string | null, chain: BehaviorChain | null, active: BehaviorChain['invocations'][number] | undefined,
   observation: ChainObservation | null, source: Coverage, now: number, eligible: boolean | null) {
-  if (stage === 'complete' || stage === 'superseded' || stage === 'merged_review_not_recorded') return null
+  if (stage === 'complete' || stage === 'superseded' || stage === 'merged_review_not_recorded' || stage === 'merged_review_evidence_missing') return null
   if (stage === 'unknown') return { actor: 'workspace-owner', action: 'inspect-evidence', reason: blocker ?? 'Coverage is incomplete' }
   if (active) return { actor: active.actor, action: 'await-original-receipt', reason: blocker }
   if (stage === 'held') return { actor: 'workspace-owner', action: 'inspect-hold', reason: blocker }

@@ -5,7 +5,8 @@ import { HttpError, endJson, httpStatus, readJson } from './http'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { getBehaviorChainCapacity, getBehaviorChainRuntimeHealth } from './behaviors'
 import { behaviorCutoverBlockers } from './behavior-cutover'
-import type { BehaviorChain, ChainEvent } from './behavior-chain-store'
+import { BehaviorChainRevisionConflict, canCloseMergedReviewHold, chainIdentity, type BehaviorChain, type BehaviorChainJournal, type ChainEvent } from './behavior-chain-store'
+import { closedIssuesWithLabel, requireConfiguredRepository } from './gh'
 import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact, behaviorChainWorkImpacts } from './behavior-chain-summary'
 import { nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { parseHandoffCandidates } from '../gateway/src/diagnostics/query-handoff'
@@ -31,7 +32,51 @@ export function invalidateBehaviorChainReads(): void {
   attentionReuse = null
 }
 
-export async function handleBehaviorChains(req: IncomingMessage, res: ServerResponse, url: string, chatInstance: string | null = null): Promise<void> {
+async function closeMergedReviewHolds(journal: BehaviorChainJournal, repository: unknown, targets: unknown) {
+  if (typeof repository !== 'string' || !Array.isArray(targets) || !targets.length || targets.length > 100) {
+    throw new HttpError(400, 'Choose a repository and up to 100 observed review holds')
+  }
+  requireConfiguredRepository(repository)
+  const { seedMode, label } = getBehaviorChainSettings()
+  const actor = getSettings().me
+  if (seedMode !== 'label' || !label || !actor) throw new HttpError(409, 'Closing review holds requires the configured GitHub account and intake label')
+  const ids = new Set<string>()
+  const candidates: BehaviorChain[] = []
+  for (const target of targets) {
+    if (typeof target?.id !== 'string' || !Number.isSafeInteger(target.sequence) || target.sequence < 1 || ids.has(target.id)) {
+      throw new HttpError(400, 'Each review hold needs a unique chain and its observed sequence')
+    }
+    const number = Number(target.id.slice(target.id.lastIndexOf('#') + 1))
+    if (!Number.isSafeInteger(number) || number < 1 || number > 2_147_483_647 || target.id !== chainIdentity(repository, number)) {
+      throw new HttpError(400, 'Review holds must belong to the selected repository')
+    }
+    ids.add(target.id)
+    const chain = journal.read(target.id)
+    if (chain && chain.sequence === target.sequence && canCloseMergedReviewHold(chain)) candidates.push(chain)
+  }
+  const closed: string[] = []
+  if (candidates.length) {
+    const eligible = await closedIssuesWithLabel(repository, candidates.map(chain => chain.issue), actor, label)
+    const intake = getBehaviorChainSettings()
+    requireConfiguredRepository(repository)
+    if (intake.seedMode !== seedMode || intake.label !== label || getSettings().me !== actor) {
+      throw new HttpError(409, 'The GitHub account or intake label changed during the check')
+    }
+    for (const chain of candidates) {
+      if (!eligible.has(chain.issue)) continue
+      try {
+        journal.append(chain.id, randomUUID(), chain.sequence, { type: 'chain.review-hold-closed',
+          closure: { mergeSha: chain.mergeSha!, actor, label } })
+        closed.push(chain.id)
+      } catch (error) {
+        if (!(error instanceof BehaviorChainRevisionConflict)) throw error
+      }
+    }
+  }
+  return { closed, skipped: [...ids].filter(id => !closed.includes(id)) }
+}
+
+export async function handleBehaviorChains(req: IncomingMessage, res: ServerResponse, url: string, chatInstance: string | null = null, person = false): Promise<void> {
   let clearAfter = false
   try {
     const params = new URL(url, 'http://localhost').searchParams
@@ -74,6 +119,7 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
             ...('reason' in event ? { reason: event.reason } : {}),
             ...('outcome' in event ? { outcome: event.outcome } : {}),
             ...(event.type === 'chain.resumed' ? { recovery: event.recovery ?? null } : {}),
+            ...(event.type === 'chain.review-hold-closed' ? { reviewHoldClosure: event.closure } : {}),
             ...('evidence' in event ? { callId: 'callId' in event ? event.callId : event.evidence.nativeCallId ?? event.evidence.callId ?? null,
               evidence: { diagnostic: event.evidence.diagnostic,
                 ...(event.type === 'chain.merged' && typeof event.evidence.review_complete === 'boolean'
@@ -108,6 +154,11 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
     // this one awaits its body or a check must not keep what came before it.
     clearAfter = true
     const body = await readJson<unknown>(req)
+    if (body && typeof body === 'object' && 'operation' in body && body.operation === 'close-merged-review-holds') {
+      if (!person) throw new HttpError(403, 'Review holds are closed by the workspace owner in Tasks')
+      return reply(res, 200, await closeMergedReviewHolds(journal,
+        'repository' in body ? body.repository : null, 'targets' in body ? body.targets : null))
+    }
     if (body && typeof body === 'object' && 'operation' in body && ['switch-to-v2', 'cancel-cutover'].includes(String(body.operation))) {
       if (!('sequence' in body) || !Number.isSafeInteger(body.sequence)) throw new HttpError(400, 'current cutover sequence is required')
       const accounts = getSettings()

@@ -11,6 +11,14 @@ import { parseProcessDiagnostic } from '../server/process-diagnostic'
 import { eventWords, readChain, readJournalPage, taskState, timelineLines } from '../src/ui/places/observe/chains'
 import { readFrom } from '../src/ui/places/observe/journal'
 
+const githubReviewSources = vi.hoisted(() => vi.fn())
+vi.mock('../server/gh', async importOriginal => {
+  const actual = await importOriginal<typeof import('../server/gh')>()
+  return { ...actual, closedIssuesWithLabel: githubReviewSources, requireConfiguredRepository: (repository: string) => {
+    if (repository !== 'closure/demo') actual.requireConfiguredRepository(repository)
+  } }
+})
+
 const native = vi.hoisted(() => ({ support: { status: 'supported', error: null as string | null } }))
 vi.mock('../server/native-cleanup-support', () => ({
   nativeCleanupSupport: () => native.support,
@@ -626,4 +634,57 @@ it('keeps merge confirmation and original review completion distinct across hist
     expect(journal.history(chain.id)).toEqual(before)
     expect(journal.read(chain.id)).toEqual(chain)
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+})
+
+it('closes explicitly selected merged review holds only for the owner and the current opted-in source', async () => {
+  const original = ['me', 'behavior_chain_settings'].map(key => ({ key, value: getMeta(key) }))
+  setMeta('me', 'author')
+  setMeta('behavior_chain_settings', JSON.stringify({ enabled: true, seedMode: 'label', label: 'poise' }))
+  const journal = behaviorChainJournal()
+  const repository = 'closure/demo', mergeSha = 'a'.repeat(40)
+  const targets = [7, 8, 9].map(issue => {
+    const id = `${repository}#${issue}`
+    const seed = journal.append(id, `admit:${id}`, 0, { type: 'chain.admitted', repository, issue, branch: `poise/${issue}`, author: 'author', reviewer: 'reviewer' })
+    const merged = journal.append(id, `merge:${id}`, seed.sequence, { type: 'chain.merged', mergeSha,
+      evidence: { repository, pull_number: issue + 10, merged: true, merge_sha: mergeSha, review_complete: false } })
+    return { id, sequence: merged.sequence }
+  })
+  githubReviewSources.mockImplementationOnce(async () => {
+    journal.append(targets[2].id, 'concurrent-review-hold-update', targets[2].sequence, { type: 'chain.waiting', reason: 'Original review updated' })
+    return new Set([7, 9])
+  })
+  const server = createServer((req, res) => {
+    void handleBehaviorChains(req, res, req.url || '/', null, req.headers['x-test-owner'] === '1')
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  const post = (person: boolean, selected = targets) => fetch(base, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-test-owner': String(Number(person)) },
+    body: JSON.stringify({ operation: 'close-merged-review-holds', repository, targets: selected }) })
+  try {
+    expect((await post(false)).status).toBe(403)
+    expect((await post(true, [{ id: 'outside/site#7', sequence: targets[0].sequence }])).status).toBe(400)
+    expect(githubReviewSources).not.toHaveBeenCalled()
+    const response = await post(true)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ closed: [targets[0].id], skipped: targets.slice(1).map(target => target.id) })
+    expect(githubReviewSources).toHaveBeenCalledWith(repository, [7, 8, 9], 'author', 'poise')
+    const id = encodeURIComponent(targets[0].id)
+    const detail = await (await fetch(`${base}?id=${id}&after=${targets[0].sequence}`)).json()
+    expect(detail.chain).toMatchObject({ reviewStatus: 'evidence-missing', reviewPending: false, mergeSha })
+    expect(detail.events).toMatchObject([{ type: 'chain.review-hold-closed', reviewHoldClosure: { mergeSha, actor: 'author', label: 'poise' } }])
+    expect(await (await post(true, [targets[0]])).json()).toEqual({ closed: [], skipped: [targets[0].id] })
+    expect(journal.read(targets[1].id)?.reviewPending).toBe(true)
+    expect(journal.read(targets[2].id)?.reviewPending).toBe(true)
+    expect(githubReviewSources).toHaveBeenCalledTimes(1)
+  } finally {
+    githubReviewSources.mockReset()
+    for (const { key, value } of original) {
+      if (value === null) db.prepare('DELETE FROM meta WHERE key = ?').run(key)
+      else setMeta(key, value)
+    }
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
 })

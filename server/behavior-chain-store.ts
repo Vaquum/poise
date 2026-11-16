@@ -66,9 +66,34 @@ export interface BehaviorChain {
   mergeSha: string | null
   supersession?: Record<string, unknown>
   reviewPending?: boolean
+  reviewHoldClosure?: MergedReviewHoldClosure
   observation: Record<string, unknown> | null
   invocations: ChainInvocation[]
 }
+export interface MergedReviewHoldClosure {
+  mergeSha: string
+  actor: string
+  label: string
+}
+
+export type ChainReviewStatus = 'pending' | 'complete' | 'not-recorded' | 'evidence-missing'
+
+export function chainReviewStatus(chain: BehaviorChain): ChainReviewStatus {
+  if (chain.reviewHoldClosure) return 'evidence-missing'
+  return chain.reviewPending === true ? 'pending' : chain.reviewPending === false ? 'complete' : 'not-recorded'
+}
+
+export function canCloseMergedReviewHold(chain: BehaviorChain): boolean {
+  return !!chain.mergeSha && chain.reviewPending === true && !chain.reviewHoldClosure
+    && chain.invocations.every(invocation => {
+      const evidence = invocation.evidence ?? {}
+      const hasCall = invocation.callId || evidence.nativeCallId || evidence.callId
+      return invocation.state === 'settled' && evidence.status !== 'running'
+        && !nativeResourcesPending({ ...invocation })
+        && (hasCall ? resourceReleaseProven(evidence) : invocation.model === null || evidence.action === 'not_started')
+    })
+}
+
 /** Admission payload: the reservation is optional so admissions that predate
  *  resource budgets and quick native actions without an agent stay valid. */
 export type ChainAdmission = Omit<ChainInvocation, 'state' | 'callId' | 'outcome' | 'evidence' | 'admissionSequence' | 'reservation'> & { reservation?: BehaviorResourceReservation | null }
@@ -92,6 +117,7 @@ export type ChainEvent =
     repairRecovery?: BehaviorChain['repairRecovery'], approvalRecovery?: string, recovery?: ChainRecoveryOrigin,
     delegation?: DelegatedChainAuthority }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
+  | { type: 'chain.review-hold-closed', closure: MergedReviewHoldClosure }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
   | { type: 'invocation.started', invocationId: string }
@@ -258,6 +284,7 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     delete next.testHold
   }
   else if (event.type === 'chain.merged') {
+    if (next.reviewHoldClosure) throw new Error('A closed review hold retains its recorded merge outcome')
     if (!SHA.test(event.mergeSha) || event.evidence.merged !== true || event.evidence.merge_sha !== event.mergeSha
       || event.evidence.repository !== next.repository || !Number.isSafeInteger(event.evidence.pull_number)
       || Number(event.evidence.pull_number) < 1) throw new Error('chain completion requires a verified GitHub merge artifact')
@@ -265,6 +292,16 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (next.mergeSha && next.mergeSha !== event.mergeSha) throw new Error('behavior chain merge evidence conflicts')
     next.mergeSha = event.mergeSha.toLowerCase()
     if (typeof event.evidence.review_complete === 'boolean') next.reviewPending = !event.evidence.review_complete
+  } else if (event.type === 'chain.review-hold-closed') {
+    const { mergeSha, actor, label } = event.closure
+    if (!canCloseMergedReviewHold(current) || !SHA.test(mergeSha) || mergeSha !== current.mergeSha
+      || typeof actor !== 'string' || !actor.trim() || typeof label !== 'string' || !label.trim()) {
+      throw new Error('Closing a review hold requires its confirmed merge and settled Calls and resources')
+    }
+    next.reviewHoldClosure = event.closure
+    next.reviewPending = false
+    next.held = null
+    next.waiting = null
   } else if (event.type === 'chain.superseded') {
     const close = next.invocations.at(-1)
     const result = (close?.evidence?.nativeActionReceipt as { result?: Record<string, unknown> } | undefined)?.result

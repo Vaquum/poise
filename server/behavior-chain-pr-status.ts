@@ -1,5 +1,5 @@
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainQueueSettlement, chainReviewResponse, type ChainObservation } from './behavior-chain-decision'
-import { chainBasis, type BehaviorChain, type BehaviorChainJournal, type ChainInvocation } from './behavior-chain-store'
+import { chainBasis, chainReviewStatus, type BehaviorChain, type BehaviorChainJournal, type ChainInvocation } from './behavior-chain-store'
 import { attributedNativeAction, matchingNativeActionReceipt, type NativeActionReceipt } from './behavior-chain-action'
 import { chainWaitsForResourceRelease, currentChainWaiting } from './behavior-chain-summary'
 import type { PrBlockerId, PrStatusRow, PrStatusVerdict } from './behavior-pr-status'
@@ -109,7 +109,7 @@ export function projectChainPrStatus(chain: BehaviorChain, journal: BehaviorChai
     repository: pr.repo, number: pr.number, org, author: pr.author, createdAt: pr.created_at,
     ageMinutes: Number.isFinite(created) ? Math.max(0, Math.floor((now - created) / 60_000)) : null,
     ownership: { engine: 'v2', chainId: chain.id, sequence: chain.sequence, reviewPending: chain.reviewPending ?? null,
-      reviewStatus: chain.reviewPending === true ? 'pending' : chain.reviewPending === false ? 'complete' : 'not-recorded',
+      reviewStatus: chainReviewStatus(chain),
       observation: observationState,
       ...(recheckAt !== undefined ? { reconciliation: { nextObservationAt: recheckAt !== null && recheckAt > 0 ? new Date(recheckAt).toISOString() : null,
         ...(waitingForResourceRelease ? { waitingForResourceRelease: true } : {}),

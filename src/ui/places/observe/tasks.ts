@@ -41,6 +41,8 @@ export function createTasks(ctx: PartContext): ObservePart {
       <input class="search" type="search" placeholder="Filter…" aria-label="Filter tasks" data-tk-search data-ref="tk.search">
       <div class="seg" role="group" aria-label="Which tasks" data-tk-which data-ref="tk.which"><button type="button" aria-pressed="true" data-v="active">Active</button><button type="button" aria-pressed="false" data-v="attention" data-ref="tk.attention">Needs attention</button><button type="button" aria-pressed="false" data-v="merged">Merged</button><button type="button" aria-pressed="false" data-v="all">All</button></div>
       <span class="obv-count" data-tk-count></span>
+      <button type="button" class="btn-ghost" data-act="tk-close-review-holds" hidden>Close settled review holds</button>
+      <span data-tk-review-hold-result role="status"></span>
       <div class="obv-note tk-note" data-tk-note data-ref="tk.note"></div>
     </div>
     <div class="tk-split">
@@ -76,6 +78,7 @@ export function createTasks(ctx: PartContext): ObservePart {
   let timelineGeneration = 0
   let journalReadAt = 0
   let acting: string | null = null
+  let closingReviewHolds = false
   let note: { id: string, text: string, tone: 'done' | 'failed' } | null = null
 
   const byId = (id: string | null): ChainRow | undefined => (id ? chains.find((c) => c.id === id) ?? extra.get(id) : undefined)
@@ -209,7 +212,16 @@ export function createTasks(ctx: PartContext): ObservePart {
     return `<li><button type="button" class="tk-row${open === id ? ' is-open' : ''}" data-act="tk-open" data-id="${esc(id)}" aria-expanded="${open === id}" data-ref="tk.row"><span class="tk-t"><span class="tk-id">${esc(identity(c.repository, c.issue, c.pullNumber))}</span></span><span class="tk-r">${railHTML(c)}</span><span class="tk-s">${capsule(state)}<b>${esc(term(`state.${state}`))}</b><span class="tk-why">${esc(reason)}</span>${ageNote}</span></button></li>`
   }
 
+  function reviewHoldTargets(): Array<{ id: string, sequence: number }> {
+    if (which !== 'attention' || meta?.capacity?.intake?.seedMode !== 'label' || !REPOSITORY.test(search) || !inScope(search)) return []
+    return attention.flatMap(row => row.repository.toLowerCase() === search.toLowerCase() && row.reviewHoldSequence
+      ? [{ id: row.id, sequence: row.reviewHoldSequence }] : [])
+  }
+
   function paintList(): void {
+    const closeButton = root.querySelector<HTMLButtonElement>('[data-act="tk-close-review-holds"]')!
+    closeButton.hidden = !!failure || !reviewHoldTargets().length
+    closeButton.disabled = closingReviewHolds
     const all = rows()
     const shown = all.filter(matches)
     const list = $('[data-tk-list]', root)
@@ -458,6 +470,35 @@ export function createTasks(ctx: PartContext): ObservePart {
     }
   }
 
+  async function closeReviewHolds(): Promise<void> {
+    const targets = reviewHoldTargets()
+    if (!targets.length || closingReviewHolds || failure) return
+    const repository = search
+    closingReviewHolds = true
+    const result = $('[data-tk-review-hold-result]', root)
+    result.textContent = 'Checking source labels and settled Calls…'
+    paintList()
+    let closed = 0
+    let skipped = 0
+    try {
+      for (let index = 0; index < targets.length; index += 100) {
+        const data = await postJson('/api/behavior-chains', {
+          operation: 'close-merged-review-holds', repository, targets: targets.slice(index, index + 100),
+        }, ctx.signal) as { closed?: unknown, skipped?: unknown }
+        if (!Array.isArray(data.closed) || !Array.isArray(data.skipped)) throw new Error('Review hold outcome was not confirmed')
+        closed += data.closed.length
+        skipped += data.skipped.length
+      }
+      result.textContent = `Closed ${closed} review hold${closed === 1 ? '' : 's'}.${skipped ? ` Skipped ${skipped} after verification.` : ''}`
+    } catch (error) {
+      if (!aborted(error)) result.textContent = `Closed ${closed} review holds before this error. ${message(error)}`
+    } finally {
+      closingReviewHolds = false
+      paintList()
+      void read()
+    }
+  }
+
   function paint(): void {
     paintNote()
     paintList()
@@ -485,6 +526,7 @@ export function createTasks(ctx: PartContext): ObservePart {
       case 'tk-more': void read(true); break
       case 'tk-hold': void control(id, 'hold'); break
       case 'tk-resume': void control(id, 'resume'); break
+      case 'tk-close-review-holds': void closeReviewHolds(); break
       case 'tk-later': void readJournal('later'); break
       case 'tk-earlier': void readJournal('earlier'); break
       case 'tk-journal': void readJournal(timeline ? 'later' : 'open'); break

@@ -21,7 +21,7 @@ const CALL = hex(32, 'c')
 interface Invocation { id: string, behavior: string, state: string, callId?: string | null, model?: string | null, slot?: string | null, outcome?: string | null }
 function chain(issue: number, over: Record<string, unknown> = {}, invocations: Invocation[] = []) {
   return { id: `acme/site#${issue}`, repository: 'acme/site', issue, branch: `poise/${issue}`, author: 'me', reviewer: 'bot', sequence: 400 + issue,
-    held: null, waiting: null, mergeSha: null, supersession: null, reviewPending: null, reviewStatus: 'not-recorded',
+    held: null, waiting: null, mergeSha: null, supersession: null, reviewPending: null as boolean | null, reviewStatus: 'not-recorded',
     reconciliation: { nextObservationAt: null, waitingForOriginalResponse: false }, pullNumber: issue + 1, invocationCount: invocations.length,
     invocations: invocations.map((i) => ({ callId: null, model: 'Opus 5', slot: 'primary', outcome: null, admittedAt: NOW - minutes(30), nativeAction: null, evidence: null, ...i })), ...over }
 }
@@ -32,7 +32,7 @@ const CHAINS = [
   chain(501, { held: 'queue removal requires a decision: manual (q86)' }, [{ id: 'i501a', behavior: 'merge-pr', state: 'settled', outcome: 'enqueued' }]),
 ]
 const attention = (c: ReturnType<typeof chain>, progressAgo: number, blocker: string, nudge?: ChainNudge) => ({
-  id: c.id, repository: c.repository, issue: c.issue, pullNumber: c.pullNumber, step: 'step', progressAt: NOW - progressAgo, ageMs: progressAgo, blocker,
+  id: c.id, repository: c.repository, issue: c.issue, pullNumber: c.pullNumber, reviewHoldSequence: null as number | null, step: 'step', progressAt: NOW - progressAgo, ageMs: progressAgo, blocker,
   evidence: { state: 'fresh', checkedAt: NOW - minutes(2), gates: ['Head 2aa6f19', 'Required CI passed'] }, nextAction: 'Resolve the durable hold, then explicitly resume the chain',
   retryAt: null, reconciliation: { nextObservationAt: null, waitingForResourceRelease: false }, journal: `/api/behavior-chains?id=${encodeURIComponent(c.id)}&after=${c.sequence - 1}`, nudge,
 })
@@ -291,6 +291,38 @@ test('a notice’s journal link opens the task’s timeline at its step, newest 
   await tasks(page).getByRole('button', { name: 'Resume' }).click()
   await expect(tasks(page).locator('.tk-act-note')).toContainText('Resumed.')
   expect(posts).toEqual([{ id: 'acme/site#501', sequence: 901, operation: 'resume' }])
+})
+
+test('Tasks closes settled review holds for the exact repository and shows the terminal result', async ({ page }) => {
+  const mergeSha = hex(40, 'a')
+  const settled = chain(603, { mergeSha, held: 'Original review evidence pending', reviewPending: true, reviewStatus: 'pending' })
+  const unsettled = chain(604, { mergeSha, reviewPending: true, reviewStatus: 'pending' }, [{ id: 'uncertain', behavior: 'merge-pr', state: 'uncertain' }])
+  const other = { ...settled, id: 'acme/site-other#603', repository: 'acme/site-other' }
+  const served: Served = { chains: [settled, unsettled, other], attention: [
+    { ...attention(settled, minutes(60), 'Review evidence pending'), reviewHoldSequence: settled.sequence },
+    attention(unsettled, minutes(60), 'Original Call uncertain'),
+    { ...attention(other, minutes(60), 'Review evidence pending'), reviewHoldSequence: other.sequence },
+  ] }
+  const posts: unknown[] = []
+  await serveChains(page, served)
+  await page.route(url => url.pathname === '/api/behavior-chains', async route => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    posts.push(route.request().postDataJSON())
+    served.chains = [{ ...settled, held: null, reviewPending: false, reviewStatus: 'evidence-missing' }, unsettled, other]
+    served.attention = served.attention!.filter(row => row.id !== settled.id)
+    return route.fulfill({ json: { closed: [settled.id], skipped: [] } })
+  })
+  await page.goto('/?view=observe&part=tasks&which=attention')
+  const close = page.getByRole('button', { name: 'Close settled review holds' })
+  await expect(close).toBeHidden()
+  await page.getByRole('searchbox', { name: 'Filter tasks' }).fill('acme/site')
+  await close.click()
+  await expect(page.getByText('Closed 1 review hold.')).toBeVisible()
+  expect(posts).toEqual([{ operation: 'close-merged-review-holds', repository: 'acme/site',
+    targets: [{ id: settled.id, sequence: settled.sequence }] }])
+  await expect(page.getByRole('button', { name: /acme\/site#604/ })).toBeVisible()
+  await page.getByRole('button', { name: 'Merged', exact: true }).click()
+  await expect(page.getByRole('button', { name: /acme\/site#603/ })).toContainText('review evidence missing')
 })
 
 test('completed merged tasks retain unmet native clearance and separately identify the later GitHub approval', async ({ page }) => {

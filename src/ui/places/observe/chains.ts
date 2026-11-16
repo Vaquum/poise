@@ -41,7 +41,7 @@ export interface ChainRow {
   waiting: string | null
   mergeSha: string | null
   reviewPending: boolean | null
-  reviewStatus: 'pending' | 'complete' | 'not-recorded'
+  reviewStatus: 'pending' | 'complete' | 'not-recorded' | 'evidence-missing'
   mergedReviewWarning: MergedReviewWarning | null
   supersession: ChainSupersession | null
   reconciliation: { nextObservationAt: number | null, waitingForOriginalResponse: boolean, waitingForResourceRelease: boolean } | null
@@ -55,6 +55,7 @@ export interface AttentionRow {
   repository: string
   issue: number
   pullNumber: number | null
+  reviewHoldSequence?: number | null
   step: string
   progressAt: number
   ageMs: number
@@ -141,7 +142,8 @@ export function readChain(value: unknown): ChainRow {
     id: value.id, repository: value.repository, issue: Number(value.issue), sequence: Number(value.sequence),
     held: text(value.held), waiting: text(value.waiting), mergeSha: text(value.mergeSha),
     reviewPending: typeof value.reviewPending === 'boolean' ? value.reviewPending : null,
-    reviewStatus: value.reviewStatus === 'pending' || value.reviewStatus === 'complete' ? value.reviewStatus : 'not-recorded',
+    reviewStatus: value.reviewStatus === 'pending' || value.reviewStatus === 'complete' || value.reviewStatus === 'evidence-missing'
+      ? value.reviewStatus : 'not-recorded',
     mergedReviewWarning: mergedReviewWarning(value.mergedReviewWarning),
     supersession,
     reconciliation: object(r) ? { nextObservationAt: count(r.nextObservationAt), waitingForOriginalResponse: r.waitingForOriginalResponse === true, waitingForResourceRelease: r.waitingForResourceRelease === true } : null,
@@ -158,6 +160,7 @@ function attentionRow(value: unknown): AttentionRow {
   const r = object(value.reconciliation) ? value.reconciliation : {}
   return {
     id: value.id, repository: value.repository, issue: Number(value.issue),
+    reviewHoldSequence: count(value.reviewHoldSequence),
     pullNumber: Number.isSafeInteger(value.pullNumber) ? Number(value.pullNumber) : null,
     step: String(value.step ?? ''), progressAt: Number(value.progressAt), ageMs: Number(value.ageMs), blocker: String(value.blocker ?? ''),
     evidence: { state: String(e.state ?? 'unavailable'), checkedAt: count(e.checkedAt), gates: Array.isArray(e.gates) ? e.gates.map(String) : [] },
@@ -291,6 +294,7 @@ export function taskState(chain: ChainRow): { state: StateKey, reason: string } 
   }
   if (chain.mergeSha) {
     if (chain.reviewPending) return { state: 'waiting', reason: `Merged as ${sha(chain.mergeSha)} · review evidence pending` }
+    if (chain.reviewStatus === 'evidence-missing') return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · review evidence missing` }
     if (chain.mergedReviewWarning) return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · native review clearance unmet` }
     if (chain.reviewStatus === 'not-recorded') return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)} · pre-merge review completion not recorded` }
     return { state: 'done', reason: `Merged as ${sha(chain.mergeSha)}` }
@@ -352,6 +356,7 @@ export function eventWords(event: JournalEvent, invocations: ReadonlyMap<string,
     case 'chain.waiting': return { kind: 'event', text: `Waiting: ${reasonWords(event.reason ?? 'no reason recorded')}`, call: null }
     case 'chain.resumed': return { kind: 'event', text: 'Resumed', call: null }
     case 'chain.merged': return { kind: 'event', text: event.reviewComplete === true ? 'Original review evidence complete' : 'Merged', call }
+    case 'chain.review-hold-closed': return { kind: 'event', text: 'Review hold closed · original evidence missing', call: null }
     case 'chain.superseded': return { kind: 'event', text: 'Superseded by a merge that covered it', call }
     case 'invocation.admitted': return { kind: 'run', text: 'A step was admitted', call: null }
     case 'invocation.started': return { kind: 'run', text: `${step} started${by ? ` · ${by}` : ''}`, call }

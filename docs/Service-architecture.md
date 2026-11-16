@@ -1763,9 +1763,14 @@ implementation. Caller serializes the retirement fence with publication
 planning, and Poise requires that Call's release proof before recording a
 deferred `target_closed` outcome. See [Behavior chain](Behavior-chain.md#authority-and-recovery).
 Existing Calls and uncertain resources are never released by closure alone.
-Merged-chain Hold/Resume writes
-return 409 and the GUI retains History and read-only reconciliation. No new
-endpoint, signal or journal event type is added; the Caller contract is in
+Merged-chain Hold and Resume return 409. A same-origin workspace-owner
+request to the existing chain endpoint may close a selected set of review
+holds on already-merged chains after checking the exact chain revisions,
+settled Calls, resource release and current closed, labelled source issues.
+The journal adds `chain.review-hold-closed` and exposes the terminal
+`evidence-missing` review status in History. It retains the original merge
+and independent review records. The Caller contract for fencing closed
+targets is in
 [agent_interface](../caller/agent_interface/README.md#fencing-a-closed-behavior).
 Poise's existing log decoder validates the fence's exact terminal no-effect
 shape and native resource-release timestamp before the journal can settle its

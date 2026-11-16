@@ -1157,6 +1157,35 @@ async function addIssueLabel(endpoint: string, label: string, token: string, tim
   }
 }
 
+/** Live issue state for an owner operation against explicit journal targets. */
+export async function closedIssuesWithLabel(repository: string, numbers: readonly number[], actor: string, label: string): Promise<Set<number>> {
+  requireConfiguredRepository(repository)
+  const [owner, name] = repository.split('/')
+  const fields = numbers.map(number => `i${number}: issue(number:${number}) { number state labels(first:100) { nodes { name } } }`)
+  const query = `query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) { nameWithOwner ${fields.join(' ')} } }`
+  try {
+    const token = await resolveMeToken(actor)
+    const { stdout } = await runFile(GH, ['api', 'graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `name=${name}`], {
+      env: githubAccountEnv(token), timeoutMs: 15_000, maxOutputBytes: 2 * 1024 * 1024,
+    })
+    const response = JSON.parse(stdout) as { data?: { repository?: Record<string, unknown> }, errors?: unknown }
+    const source = response.data?.repository
+    if (response.errors || typeof source?.nameWithOwner !== 'string' || source.nameWithOwner.toLowerCase() !== repository.toLowerCase()) {
+      throw new Error('Repository identity is unavailable')
+    }
+    const wanted = label.toLowerCase()
+    return new Set(numbers.filter(number => {
+      const issue = source[`i${number}`] as { number?: unknown, state?: unknown, labels?: { nodes?: unknown } } | null
+      if (issue === null) return false
+      if (issue?.number !== number || (issue.state !== 'OPEN' && issue.state !== 'CLOSED') || !Array.isArray(issue.labels?.nodes)
+        || !issue.labels.nodes.every(node => typeof node?.name === 'string')) throw new Error('Issue identity or labels are unavailable')
+      return issue.state === 'CLOSED' && issue.labels.nodes.some(node => node.name.toLowerCase() === wanted)
+    }))
+  } catch {
+    throw new HttpError(502, 'GitHub could not verify the current source issue labels')
+  }
+}
+
 export interface IssueLabelBasis { issueId: number; updatedAt: string; revision: string; label: string }
 export async function readIssueLabel(repository: string, issue: number, owner: string,
   apply?: { expected: IssueLabelBasis; beforeWrite: () => void }) {

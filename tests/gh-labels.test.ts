@@ -17,7 +17,7 @@ vi.mock('../server/organizations', () => ({
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
 vi.mock('../server/chat/control', () => ({ readOpenPrClosingRefs: mocks.closing }))
-const { handleGhBody } = await import('../server/gh')
+const { closedIssuesWithLabel, handleGhBody } = await import('../server/gh')
 
 beforeEach(() => {
   mocks.meta = { me: 'octocat' }
@@ -27,6 +27,20 @@ beforeEach(() => {
     if (args[0] === 'auth') return { stdout: 'selected-token\n', stderr: '' }
     throw new Error(`unexpected gh call: ${args.join(' ')}`)
   })
+})
+
+it('reads the current label of each exact closed source issue using the selected GitHub account', async () => {
+  const issue = (number: number, state: string, labels: string[]) => ({ number, state, labels: { nodes: labels.map(name => ({ name })) } })
+  const repository = { nameWithOwner: 'alpha/same', i7: issue(7, 'CLOSED', ['Poise']), i8: issue(8, 'CLOSED', ['desktop']),
+    i9: issue(9, 'OPEN', ['poise']), i10: null }
+  mocks.runFile.mockResolvedValueOnce({ stdout: 'selected-token', stderr: '' })
+    .mockResolvedValueOnce({ stdout: JSON.stringify({ data: { repository } }), stderr: '' })
+  expect(await closedIssuesWithLabel('alpha/same', [7, 8, 9, 10], 'octocat', 'poise')).toEqual(new Set([7]))
+  expect(mocks.runFile.mock.calls[1][2].env).toMatchObject({ GH_HOST: 'github.com', GH_TOKEN: 'selected-token' })
+  expect(mocks.runFile.mock.calls[1][1]).toContain('owner=alpha')
+  mocks.runFile.mockResolvedValueOnce({ stdout: 'selected-token', stderr: '' })
+    .mockResolvedValueOnce({ stdout: JSON.stringify({ data: { repository: { ...repository, nameWithOwner: 'beta/same' } } }), stderr: '' })
+  await expect(closedIssuesWithLabel('alpha/same', [7], 'octocat', 'poise')).rejects.toThrow('verify the current source issue labels')
 })
 
 describe('assign_issue', () => {
