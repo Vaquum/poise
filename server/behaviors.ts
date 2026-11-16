@@ -2865,7 +2865,7 @@ export function datastorePr(row: unknown, index: number): DatastorePr {
   const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
   const status = String(value.status || '')
   const updatedAt = String(value.updated_at || '')
-  const createdAt = value.created_at ?? null
+  const createdAt = typeof value.created_at === 'string' && Number.isFinite(Date.parse(value.created_at)) ? value.created_at : null
   const headRef = value.head_ref ?? null
   const headRepo = value.head_repo ?? null
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
@@ -2874,14 +2874,13 @@ export function datastorePr(row: unknown, index: number): DatastorePr {
     || !['open', 'closed', 'merged'].includes(status)
     || !author
     || !Number.isFinite(Date.parse(updatedAt))
-    || (createdAt !== null && (typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))))
     || url !== `https://github.com/${repo}/pull/${number}`
     || (headRef !== null && (typeof headRef !== 'string' || !headRef))
     || (headRepo !== null && (typeof headRepo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(headRepo)))) {
     throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
   }
   return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt,
-    created_at: createdAt as string | null,
+    created_at: createdAt,
     headRef: headRef as string | null, headRepo: headRepo as string | null }
 }
 

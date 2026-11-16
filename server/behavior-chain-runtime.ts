@@ -446,8 +446,11 @@ export class BehaviorChainRuntime {
 
   private targetFailure(target: string, phase: string, error: unknown): Error {
     const message = behaviorErrorMessage(error)
-    diagnostic({ level: 'error', operation: 'behavior-chain.target', target,
-      repository: target.split('#')[0], phase, message })
+    if (!(error instanceof CallerReceiptStoreError && error.diagnosticRecorded)) {
+      diagnostic({ level: 'error', operation: 'behavior-chain.target', target,
+        repository: target.split('#')[0], phase, message })
+    }
+    if (error instanceof CallerReceiptStoreError) return error
     return new Error(`Behavior chain ${target} failed during ${phase}: ${message}`, { cause: error })
   }
 
