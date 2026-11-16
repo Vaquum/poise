@@ -25,6 +25,9 @@ REQUEST = {"operation": "read", "path": "consumer.py", "query": "", "start_line"
 FINDING = {"path": "contract.py", "line": 1, "side": "RIGHT", "body": "[p1] Unchanged consumer still calls the removed contract."}
 PACKET = json.dumps({"repository": "o/r", "head_sha": HEAD, "merge_base_sha": BASE,
                      "pull": {"base": {"sha": BASE}}})
+INSPECTION_PACKET = json.dumps({**json.loads(PACKET), "pull_number": 12, "coverage": "complete",
+    "files": [{"filename": "contract.py"}], "diff": "diff --git a/contract.py b/contract.py\n"
+        "--- a/contract.py\n+++ b/contract.py\n@@ -1 +1 @@\n-old\n+new\n"})
 
 
 class TestRepositoryLifecycle(TestCase):
@@ -349,6 +352,7 @@ class TestStructuredInspection(TestCase):
             received = {name: [] for name in names}
             next_requests = [{**REQUEST, "path": name} for name in names]
             submissions = []; rounds = []
+            followups = []
 
             def command(args, **kwargs):
                 if "--review-context" in args:
@@ -362,8 +366,12 @@ class TestStructuredInspection(TestCase):
                         if result["truncated"]:
                             next_requests.append({**request, "start_line": result["next_line"]})
                     return done
+                if "--create-pr-linked-issue" in args:
+                    followups.append(args[args.index("--body") + 1])
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({
+                        "action": "created_pr_linked_issue", "issue": {"number": 13, "html_url": "https://github.com/o/r/issues/13"}}), stderr="")
                 submissions.append(args)
-                return SimpleNamespace(returncode=0, stdout=json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD}), stderr="")
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": HEAD}), stderr="")
 
             def ask(*args):
                 rounds.append(args[3])
@@ -374,10 +382,14 @@ class TestStructuredInspection(TestCase):
 
             with patch.dict(sr.ASK, {"codex": ask}), patch.object(sr.subprocess, "run", side_effect=command):
                 sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR,
-                       "bot", HEAD, 60, repository=repo)
+                       "bot", HEAD, 60, repository=repo, packet=INSPECTION_PACKET)
             self.assertGreater(len(rounds), 2)
             self.assertEqual(len(submissions), 1)
+            self.assertIn("--reviewed-clean", submissions[0])
             self.assertEqual(submissions[0][-4:], ["--expected-head", HEAD, "--token-user", "bot"])
+            self.assertEqual(len(followups), 1)
+            self.assertIn(FINDING["body"], followups[0])
+            self.assertIn("final repository inspection", followups[0])
             for lines in received.values():
                 self.assertEqual([line["line"] for line in lines], list(range(1, 101)))
 
@@ -465,12 +477,13 @@ class TestStructuredInspection(TestCase):
     def test_final_inspection_round_keeps_required_inspection_available(self):
         repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
         schemas = []
+        breaking = {**FINDING, "body": "[p0] All existing consumers crash on startup."}
 
         def ask(*args):
             schemas.append(args[4])
             if len(schemas) == 1:
                 return json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST]})
-            return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING], "requests": []})
+            return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [breaking], "requests": []})
 
         receipt = json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD})
         with patch.dict(sr.ASK, {"codex": ask}), patch.object(repo, "inspect", return_value={}), \
@@ -478,7 +491,7 @@ class TestStructuredInspection(TestCase):
                 patch.object(sr.subprocess, "run",
                              return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit:
             sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR,
-                   "bot", HEAD, 60, repository=repo)
+                   "bot", HEAD, 60, repository=repo, packet=INSPECTION_PACKET)
         self.assertEqual(len(schemas), 2)
         self.assertIn("requests", schemas[0].get("properties", {}))
         self.assertIn("requests", schemas[1].get("properties", {}))
