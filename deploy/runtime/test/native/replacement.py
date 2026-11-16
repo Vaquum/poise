@@ -127,6 +127,11 @@ else:
     assert hashlib.sha256(foreign.read_bytes()).hexdigest() == hashlib.sha256(b'foreign persistent fixture').hexdigest()
     if mode == 'cooperative':
         assert rows == original['receipt'], (rows, original['receipt'])
+        deadline = time.monotonic() + 15
+        while not answer['idle']:
+            assert time.monotonic() < deadline, answer
+            time.sleep(0.1)
+            answer = health()
         assert answer['unsettledNativeCalls'] == 0 and answer['idle'], answer
         assert not Path(original['root']).exists()
     elif mode == 'retained':
