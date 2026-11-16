@@ -16,6 +16,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
+import { diagnosticFailure } from './logging'
 import { withProcessLock } from './process-lock'
 import type { GooglePublication } from './google/types'
 
@@ -802,7 +803,7 @@ function isLanded(value: unknown): boolean {
     && (landed.unknown === undefined || landed.unknown === true)
 }
 
-export async function readPublishLedger(slug: string, options: { noFollow?: boolean } = {}): Promise<PublishLedger> {
+export async function readPublishLedger(slug: string, options: { noFollow?: boolean, readableOnly?: boolean } = {}): Promise<PublishLedger> {
   await editorReady
   const path = publishLedgerFileFor(slug)
   let raw: string
@@ -814,11 +815,21 @@ export async function readPublishLedger(slug: string, options: { noFollow?: bool
   }
   // A record that cannot be read is never taken for "not published": that
   // would open a second pull request for a piece already on its way.
-  const parsed = JSON.parse(raw) as { records?: unknown }
-  if (!parsed || !Array.isArray(parsed.records) || !parsed.records.every(isPublishRecord)) {
+  let parsed: { records?: unknown } | null
+  try { parsed = JSON.parse(raw) } catch {
+    throw new Error(`the publishing record beside ${canonicalSlug(slug)} contains invalid JSON`)
+  }
+  if (!parsed || !Array.isArray(parsed.records)) {
     throw new Error(`the publishing record beside ${canonicalSlug(slug)} is unreadable`)
   }
-  return { records: parsed.records }
+  const records = parsed.records.filter((record: unknown, index): record is PublishRecord => {
+    if (isPublishRecord(record)) return true
+    const cause = new Error(`Saved publication ${index + 1} has an invalid record`)
+    if (!options.readableOnly) throw new Error(`the publishing record beside ${canonicalSlug(slug)} is unreadable`, { cause })
+    diagnosticFailure('publishing.read-ledger', cause, { document: slug, recordIndex: index }, { level: 'warning' })
+    return false
+  })
+  return { records }
 }
 
 export async function writePublishLedger(slug: string, ledger: PublishLedger): Promise<void> {

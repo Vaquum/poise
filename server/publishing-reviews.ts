@@ -4,6 +4,7 @@ import { REVIEW_INTERVAL_MS } from '../src/publishing-review'
 import { db, getMeta, setMeta, writeObservation } from './db'
 import { listDocs, readDoc, readPublishLedger, type PublishRecord } from './editor'
 import { HttpError, readJson } from './http'
+import { diagnosticFailure } from './logging'
 import { isRepositoryPath, parsePost, PostFileError } from './publishing'
 import { fileAt, GitHubError, queryGitHub, repositoryById, signIn, type GitHubSession } from './publishing-github'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
@@ -241,7 +242,7 @@ async function refresh(me: string, record: PublishRecord, force: boolean, pollin
 /** Cached GET never reaches GitHub. Only a visible editor asks POST to synchronize. */
 export async function articleReviews(slug: string, synchronize = false, force = false, polling = false): Promise<ArticleReviews> {
   await readDoc(slug)
-  const { records } = await readPublishLedger(slug)
+  const { records } = await readPublishLedger(slug, { readableOnly: true })
   return reviewsForPublications(records, { synchronize, force, polling })
 }
 
@@ -337,12 +338,17 @@ async function listCandidates(me: string): Promise<Candidate[]> {
   // Sixteen ledgers at a time: one after another, each read waited its own
   // turn of a busy server's loop; all at once could run out of descriptors.
   const docs = await listDocs()
-  const ledgers: Awaited<ReturnType<typeof readPublishLedger>>[] = []
   for (let start = 0; start < docs.length; start += LEDGER_READS_AT_ONCE) {
-    ledgers.push(...await Promise.all(docs.slice(start, start + LEDGER_READS_AT_ONCE).map((doc) => readPublishLedger(doc.slug))))
-  }
-  for (const [index, doc] of docs.entries()) {
-    for (const record of ledgers[index]!.records) out.push({ slug: doc.slug, record, value: cached(keyFor(me, record)) })
+    const batch = docs.slice(start, start + LEDGER_READS_AT_ONCE)
+    const ledgers = await Promise.allSettled(batch.map(doc => readPublishLedger(doc.slug, { readableOnly: true })))
+    for (const [index, ledger] of ledgers.entries()) {
+      const slug = batch[index]!.slug
+      if (ledger.status === 'rejected') {
+        diagnosticFailure('publishing.read-ledger', ledger.reason, { document: slug }, { level: 'warning' })
+        continue
+      }
+      for (const record of ledger.value.records) out.push({ slug, record, value: cached(keyFor(me, record)) })
+    }
   }
   // The publication checked longest ago goes first, each publication
   // separately, so documents published to several sites progress per site.
