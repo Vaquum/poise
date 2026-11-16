@@ -5,8 +5,8 @@ Poise uses Node 22 (minimum 22.13), matching the workspace image and gateway.
 
 ## Gates and parallelism
 
-Most runs use only the essential tests. The whole suite runs on a sample of
-merges.
+Upstream CI uses the essential tests for PRs, merge-queue candidates and pushes
+to main. The full suite runs nightly, on demand and for release forks.
 
 `npm test` and `npm run test:e2e` run the essential tests. `npm run check` is
 lint, those tests and the production build, and `npm run verify` adds the
@@ -49,11 +49,12 @@ stops with a message if it cannot reach `origin/main`. While `main` is being
 merged in, the comparison is with its side, so what it brings does not count as
 the change.
 
-A change to dependencies, test or build configuration, CI or
-`tests/essential.txt` runs everything in CI, because it can change what every
-test proves. Documentation-only changes omit application jobs. Caller omits
-Python work for frontend/browser/documentation-only PR changes; shared and
-unknown paths still run it. Every merge-queue candidate runs all Caller tests.
+The same selection applies to dependency, test, build and CI changes. PRs and
+merge-queue candidates with an empty diff run the fixed essential set and core
+browser journeys. Nonempty documentation-only diffs omit application jobs on
+PRs and in the merge queue. Caller omits Python work for
+frontend/browser/documentation-only PR changes. Shared and unknown paths run
+it. Every merge-queue candidate runs all Caller tests.
 
 The set comes from the record. Of about 400 PRs merged in October 2026, tests
 caught a real defect on 24. The 17 unit catches were spread over 34 files, and
@@ -69,13 +70,8 @@ the next full run.
 
 ### The full run
 
-A push to `main` here draws the full run when the first eight hex digits of its
-commit, modulo 10, are zero: about one merge in ten, with no state to keep and
-the same answer on a rerun. That commit skips its queue evidence and runs the
-complete gates. `.github/workflows/full-suite.yml` also starts one at 03:41 UTC
-every night, so a quiet stretch cannot hide a defect for days, and
-`gh workflow run ci.yml --ref main` starts one by hand. Each push to `main` here
-has its own concurrency group, so a later merge cannot cancel one.
+`.github/workflows/full-suite.yml` schedules a full run on upstream `main`
+every night at 03:41 UTC. `gh workflow run ci.yml --ref main` starts one by hand.
 
 On these runs a unit test gets one retry, as browser tests in CI get Playwright's
 two, so a lone flake does not count.
@@ -120,11 +116,12 @@ image, with VERSION read from the locked `@playwright/test` package. Its browser
 and system libraries are already installed. A version/executable mismatch fails
 before tests. Browser isolation and every existing assertion are unchanged.
 
-A push to upstream main that did not draw the full run looks for the latest
-merge-queue run of the same workflow for the **exact same commit**, repository
-and queue branch. A completed success is reused, with its URL recorded in the
-Actions summary. Missing, failed, cancelled or unfinished evidence runs the
-complete main gates. API errors fail visibly.
+A push to upstream main looks for the latest merge-queue run of the same
+workflow for the **exact same commit**, repository and queue branch. A completed
+success is reused, with its URL recorded in the Actions summary. With missing,
+failed, cancelled or unfinished queue evidence, Poise runs the essential tests
+selected against the previous tip from the push event. API errors fail visibly.
+Each upstream push keeps its own verification result.
 
 A GitHub.com fork push can reuse a successful upstream merge group, main
 push, or main dispatch on the exact same commit. The planner reads the
