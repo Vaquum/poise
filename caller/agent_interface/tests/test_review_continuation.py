@@ -287,7 +287,7 @@ class TestReviewContinuation(TestCase):
 
         def inspect(requests, *, timeout_s):
             result = self.inspect(requests, timeout_s=timeout_s)
-            result["results"][0] = {"request": missing, "error": "tracked regular file not found"}
+            result["results"] = [result["results"][1], {"request": missing, "error": "tracked regular file not found"}]
             return result
 
         def ask(*args):

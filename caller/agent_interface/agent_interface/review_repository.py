@@ -98,13 +98,20 @@ def inspect_context(repository, requests: list[dict], warnings: list[str], *,
             batch_error = "The inspection tool did not return a repository context response."
         elif expected_head is not None and result.get("head_sha") != expected_head:
             batch_error = "The inspection response did not match the commit being reviewed."
-        elif len(json.dumps(result).encode()) > 64 * 1024:
-            batch_error = "The inspection response exceeded the 64 KiB limit."
     items = result["results"] if batch_error is None else []
     available = []
-    for index, request in enumerate(requests):
-        item = items[index] if index < len(items) else None
-        reason = batch_error or _inspection_problem(request, item)
+    remaining_bytes = 64 * 1024
+    for request in requests:
+        matches = [item for item in items if isinstance(item, dict) and item.get("request") == request]
+        item = matches[0] if len(matches) == 1 else None
+        reason = batch_error or ("The inspection tool returned duplicate results for the lookup."
+                                 if len(matches) > 1 else _inspection_problem(request, item))
+        if not reason:
+            size = len(json.dumps(item).encode())
+            if size > remaining_bytes:
+                reason = "The lookup exceeded the 64 KiB inspection allowance."
+            else:
+                remaining_bytes -= size
         if reason:
             warn(warnings, f"{inspection_target(request)} failed. {reason}")
             item = {"request": request, "error": reason, "truncated": False, "next_line": None}

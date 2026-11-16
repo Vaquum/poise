@@ -506,7 +506,8 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                      "Review the supplied diff and available repository context. "
                      "If a lookup is unavailable, proceed and describe the limitation in your assessment. "
                      "Do not repeat completed or failed reads or searches."
-                     + (" The equal-share inspection allowance is spent. Finish using the source already supplied." if finish_soon else "")
+                     + (" The equal-share inspection allowance is spent; omit optional inspection. "
+                        "Finish using the source already supplied." if finish_soon else "")
                      if repository is not None else "")
         if lookup_closed:
             remaining += "\nRepository inspection is finished. Return your verdict using the available source and requests=[]."
