@@ -158,7 +158,12 @@ const RECHECK_AT_SQL = `CASE
   WHEN json_extract(state, '$.mergeSha') IS NOT NULL AND json_extract(state, '$.invocations[#-1].state') != 'settled'
     AND json_extract(state, '$.invocations[#-1].request.command') = 'github-interface'
     AND json_extract(state, '$.invocations[#-1].behavior') IN ('merge-pr', 'resolve-threads') THEN
-      CASE WHEN json_type(state, '$.invocations[#-1].evidence.nativeActionReceipt') IS NULL THEN NULL ELSE 0 END
+      CASE WHEN json_type(state, '$.invocations[#-1].evidence.nativeActionReceipt') IS NOT NULL
+        OR (json_extract(state, '$.invocations[#-1].behavior') = 'merge-pr'
+          AND json_extract(state, '$.invocations[#-1].evidence.diagnostic.operation') = 'merge_if_ready'
+          AND json_extract(state, '$.invocations[#-1].evidence.diagnostic.phase') = 'native_action'
+          AND json_extract(state, '$.invocations[#-1].evidence.diagnostic.context.submission') = 'uncertain')
+        THEN 0 ELSE NULL END
   WHEN json_extract(state, '$.observation.checkedAt') IS NULL THEN 0
   WHEN json_extract(state, '$.ciHold') IS NOT NULL OR json_extract(state, '$.testHold') IS NOT NULL
     OR (json_extract(state, '$.held') IS NOT NULL AND json_extract(state, '$.mergeSha') IS NULL

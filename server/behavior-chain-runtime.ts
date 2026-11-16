@@ -77,6 +77,43 @@ function nativeResourcesReleased(call: LogEntry): boolean {
   return resourceReleaseProven(receipt(call), !fence)
 }
 
+function rejectedMergedEnqueue(chain: BehaviorChain, invocation: ChainInvocation, call: LogEntry): boolean {
+  const observation = chain.observation as ChainObservation | null
+  const pull = observation?.pull, argv = invocation.request.argv, diagnostic = call.diagnostic
+  const argument = (flag: string) => argv.filter(value => value === flag).length === 1 ? argv[argv.indexOf(flag) + 1] : undefined
+  const startedAt = Date.parse(call.started_at_precise ?? call.started_at)
+  const completedAt = Date.parse(call.completed_at ?? '')
+  const releasedAt = Date.parse(call.resources_settled_at ?? '')
+  if (!chain.mergeSha || !pull?.merged || pull.state !== 'closed' || pull.mergeSha !== chain.mergeSha
+    || observation?.publication.merged !== true || observation.publication.merge_sha !== chain.mergeSha
+    || observation.publication.pull_number !== pull.number || observation.publication.head_sha !== pull.head
+    || invocation.behavior !== 'merge-pr' || invocation.model !== null || invocation.request.command !== 'github-interface'
+    || chain.invocations.at(-1)?.id !== invocation.id || invocation.actor !== chain.reviewer
+    || argv[0] !== '--merge-if-ready' || argv[1]?.replace(/^#/, '') !== String(pull.number)
+    || argument('--expected-head') !== pull.head || !/^[a-f0-9]{40}$/i.test(pull.head)
+    || argument('--token-user') !== invocation.actor || argument('--author') !== chain.author
+    || call.status !== 'failed' || call.error_code !== 'native_action_failed' || call.action !== null || call.outcome !== null
+    || call.head_sha !== null || call.response !== null || call.review_id != null || call.receipts != null
+    || call.artifact?.phase !== 'performing_native_action' || call.artifact.request_sha !== nativeRequestSha(invocation.request)
+    || call.artifact.response_sha != null || invocation.evidence?.nativeActionReceipt != null
+    || invocation.evidence?.nativeActionResult != null || invocation.evidence?.nativeResponseSha != null
+    || invocation.evidence?.callId != null && invocation.evidence.callId !== call.id
+    || !nativeResourcesReleased(call) || ![startedAt, completedAt, releasedAt, pull.mergedAt, observation.checkedAt].every(Number.isFinite)
+    || startedAt < invocation.admittedAt || completedAt < startedAt || releasedAt < completedAt
+    || releasedAt > pull.mergedAt! || pull.mergedAt! > observation.checkedAt || observation.checkedAt > Date.now()
+    || diagnostic?.version !== 1 || diagnostic.source !== 'caller' || diagnostic.severity !== 'error'
+    || diagnostic.operation !== 'merge_if_ready' || diagnostic.phase !== 'native_action' || diagnostic.outcome !== 'unknown'
+    || diagnostic.stderr_truncated !== false || diagnostic.context.submission !== 'uncertain'
+    || diagnostic.context.refusal != null || diagnostic.context.call_id !== call.id
+    || Object.entries({ correlation_id: invocation.id, repository: chain.repository, pr: call.pr_id,
+      expected_head: pull.head, reviewer: invocation.actor, behavior: 'native_action' })
+      .some(([key, value]) => diagnostic.context[key] != null && diagnostic.context[key] !== value)) return false
+  // GitHubClient retained str(errors), a Python repr of this single refusal.
+  // Match the complete response: a substring or another resolver error cannot
+  // prove that the original, non-retried enqueue was rejected.
+  return /^\[\{'type': 'UNPROCESSABLE', 'path': \['enqueuePullRequest'\], 'locations': \[\{'line': [1-9][0-9]*, 'column': [1-9][0-9]*\}\], 'message': 'Pull request is already in the queue'\}\]$/.test(diagnostic.stderr ?? '')
+}
+
 function beforeNativeScope(call: LogEntry): boolean {
   const ownership = call.resource_ownership
   return call.status === 'failed' && call.error_code === 'launch_preflight_failed'
@@ -1151,9 +1188,11 @@ export class BehaviorChainRuntime {
         throw new Error('native action Call conflicts with its immutable journal request')
       }
       const responded = call.artifact?.phase === 'received_native_action' && typeof call.artifact.response_sha === 'string' && !!call.response
-      if (call.status === 'failed' && call.action === 'not_started' && !responded) {
+      const rejected = rejectedMergedEnqueue(chain, invocation, call)
+      if (call.status === 'failed' && (call.action === 'not_started' || rejected) && !responded) {
         this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
-          outcome: call.outcome || 'preflight_failed', evidence: physical })
+          outcome: call.outcome || 'preflight_failed', evidence: { ...physical,
+            ...(rejected ? { action: 'not_started', outcome: 'preflight_failed' } : {}) } })
         this.operations.wake()
         return this.current(chain)
       }

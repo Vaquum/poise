@@ -1648,7 +1648,12 @@ action performs head-checked retirement; a lost close response stays uncertain.
 The normal-work and due quiescent reconciliation pages alternate first use of
 the shared sweep budget; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
-GitHub observation. The optional `reconciliation` read fields add no write
+GitHub observation. Pending merged enqueue refusals also remain eligible for
+original Caller receipt reconciliation after resource release. A fully matched
+retained refusal settles as a no-action failure; the observed merge attribution
+and existing original-review requirements remain unchanged. See
+[native action receipts](Behavior-chain.md#native-action-receipts).
+The optional `reconciliation` read fields add no write
 operation or authority; a deliberate wait keeps GitHub facets unknown without
 declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
