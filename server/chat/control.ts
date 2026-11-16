@@ -437,7 +437,7 @@ export async function readWorkMergeWake(target: store.WorkTarget): Promise<Merge
  *  has them; null when the datastore cannot be asked. Local rows only —
  *  the sync owns freshness, and this read adds zero GitHub traffic. */
 export interface OpenPrClosingRefs { repo: string, number: number, url: string, closing: Array<{ repo: string, number: number }>, closesVia: 'closing-references' | 'body-keywords', closingTruncated: boolean, headRef: string | null, headRepo: string | null }
-export interface OpenPrClosingList { prs: OpenPrClosingRefs[], truncated: boolean, more: boolean }
+export interface OpenPrClosingList { prs: OpenPrClosingRefs[], truncated: boolean, more: boolean, incomplete?: boolean, next?: { repo: string, number: number } }
 export async function readOpenPrClosingRefs(org: Organization, after?: { repo: string, number: number }): Promise<OpenPrClosingList | null> {
   try {
     const { stdout } = await runFile('github-datastore',
@@ -448,33 +448,54 @@ export async function readOpenPrClosingRefs(org: Organization, after?: { repo: s
     if (!value || typeof value !== 'object') return null
     const row = value as Record<string, unknown>
     if (!Array.isArray(row.prs) || row.prs.length > 501 || typeof row.truncated !== 'boolean' || typeof row.more !== 'boolean') return null
-    const prs: OpenPrClosingRefs[] = []
-    for (const entry of row.prs) {
-      if (!entry || typeof entry !== 'object') return null
-      const pr = entry as Record<string, unknown>
-      if (typeof pr.repo !== 'string' || !pr.repo || typeof pr.number !== 'number' || !Number.isSafeInteger(pr.number) || pr.number <= 0
-        || typeof pr.url !== 'string' || !pr.url || !Array.isArray(pr.closing) || pr.closing.length > 100
-        || (pr.closes_via !== 'closing-references' && pr.closes_via !== 'body-keywords')
-        || typeof pr.closing_truncated !== 'boolean') return null
-      const closing: OpenPrClosingRefs['closing'] = []
-      for (const ref of pr.closing) {
-        if (!ref || typeof ref !== 'object') return null
-        const target = ref as Record<string, unknown>
-        if (typeof target.repo !== 'string' || !target.repo || typeof target.number !== 'number'
-          || !Number.isSafeInteger(target.number) || target.number <= 0) return null
-        closing.push({ repo: target.repo, number: target.number })
+    const prs = new Map<string, OpenPrClosingRefs>()
+    const seen = new Set<string>()
+    let next: OpenPrClosingList['next']
+    let incomplete = false
+    for (const [index, entry] of row.prs.entries()) {
+      const pr = entry as Record<string, unknown> | null
+      let target: string | null = null
+      const warn = (message: string) => {
+        incomplete = true
+        diagnostic({ level: 'warning', operation: 'github-datastore.pr-closing', target, message, context: { organization: org.login, index } })
       }
-      // Absent head fields are rows synced before head tracking: branch
-      // matching skips them. Present-but-malformed ones fail the listing,
-      // like every other malformed field.
-      const headRef = 'head_ref' in pr ? pr.head_ref : null
-      const headRepo = 'head_repo' in pr ? pr.head_repo : null
+      if (typeof pr?.repo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(pr.repo) || typeof pr.number !== 'number'
+        || !Number.isSafeInteger(pr.number) || pr.number <= 0) { warn('Open PR row has an invalid repository or number'); continue }
+      next = { repo: pr.repo, number: pr.number }
+      target = `${pr.repo}#${pr.number}`
+      const key = target.toLowerCase()
+      if (seen.has(key)) { prs.delete(key); warn('Open PR row has a duplicate identity'); continue }
+      seen.add(key)
+      if (pr.url !== `https://github.com/${pr.repo}/pull/${pr.number}`) { warn('Open PR row URL does not match its identity'); continue }
+      const closesVia = pr.closes_via
+      if (!Array.isArray(pr.closing) || pr.closing.length > 100
+        || (closesVia !== 'closing-references' && closesVia !== 'body-keywords')
+        || typeof pr.closing_truncated !== 'boolean') { warn('Open PR row has invalid closing reference metadata'); continue }
+      const closing: OpenPrClosingRefs['closing'] = []
+      let closingTruncated = pr.closing_truncated
+      for (const entry of pr.closing) {
+        const ref = entry as Record<string, unknown> | null
+        if (typeof ref?.repo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(ref.repo) || typeof ref.number !== 'number'
+          || !Number.isSafeInteger(ref.number) || ref.number <= 0) {
+          closingTruncated = true
+          warn('Open PR row has a malformed closing reference')
+          continue
+        }
+        closing.push({ repo: ref.repo, number: ref.number })
+      }
+      // Older rows omit the branch identity. Malformed branch evidence can
+      // be omitted independently of the PR's closing references.
+      let headRef = pr.head_ref ?? null
+      let headRepo = pr.head_repo ?? null
       if ((headRef !== null && (typeof headRef !== 'string' || !headRef))
-        || (headRepo !== null && (typeof headRepo !== 'string' || !headRepo))) return null
-      prs.push({ repo: pr.repo, number: pr.number, url: pr.url, closing, closesVia: pr.closes_via, closingTruncated: pr.closing_truncated,
-        headRef, headRepo })
+        || (headRepo !== null && (typeof headRepo !== 'string' || !headRepo))) {
+        warn('Open PR row has an invalid head branch or repository')
+        headRef = headRepo = null
+      }
+      prs.set(key, { repo: pr.repo, number: pr.number, url: pr.url, closing, closesVia, closingTruncated,
+        headRef: headRef as string | null, headRepo: headRepo as string | null })
     }
-    return { prs, truncated: row.truncated, more: row.more }
+    return { prs: [...prs.values()], truncated: row.truncated || incomplete, more: row.more, incomplete, next }
   } catch {
     return null
   }
@@ -1218,7 +1239,7 @@ export class ChatControl {
           const pr = page.prs.find((pr) => pr.repo.toLowerCase() === target.repo.toLowerCase() && pr.number === target.number)
           if (pr) { identity = pr; break }
           if (!page.more) break
-          const last = page.prs.at(-1)
+          const last = page.next ?? page.prs.at(-1)
           if (!last || (after?.repo === last.repo && after.number === last.number)) throw new HttpError(409, 'PR ownership observations did not advance')
           after = { repo: last.repo, number: last.number }
         }
@@ -1550,7 +1571,7 @@ export class ChatControl {
           const [session] = union
           if (session && store.bindWorkAuto(instance, session, url, pr)) bound.add(url)
         }
-        const last = listed.prs.at(-1)
+        const last = listed.next ?? listed.prs.at(-1)
         // The (repository, number) cursor always moves; a page that makes
         // no progress ends the sweep instead of spinning.
         if (!listed.more) break

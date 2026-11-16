@@ -280,21 +280,84 @@ class TestReviewContinuation(TestCase):
         self.assertEqual(observed.count("src/f024.py"), 2)
         self.assertEqual(self.saved(root)["unit"], groups + 1)
 
-    def test_inspection_cap_carries_unfinished_position_and_provisional_findings_across_calls(self):
-        # PR #1637's 12-round cap, and #841's unfinished third group, share
-        # the same saved inspection protocol. Units 1 and 2 remain credited.
+    def test_failed_lookup_warns_and_valid_sibling_evidence_survives_resume(self):
+        node = packet()
+        missing = {"operation": "read", "path": "src/missing.py", "query": "", "start_line": 1}
+        available = {**missing, "path": "src/f000.py"}
+
+        def inspect(requests, *, timeout_s):
+            result = self.inspect(requests, timeout_s=timeout_s)
+            result["results"] = [result["results"][1], {"request": missing, "error": "tracked regular file not found"}]
+            return result
+
+        def ask(*args):
+            prompt = args[3]
+            if not self.inspections:
+                return verdict(prompt, requests=[missing, available])
+            self.assertIn("tracked regular file not found", prompt)
+            self.assertIn("pinned evidence", prompt)
+            return verdict(prompt)
+
+        self.repository.inspect = inspect
+        with self.call(node, units_per_call=1) as root:
+            with api.progress.Progress(api.DB, root), self.assertRaises(continuation.Continuation) as yielded:
+                self.run_review(node, ask)
+        self.assertEqual(yielded.exception.result["outcome"], "continuation_required")
+        with sqlite3.connect(api.DB) as conn:
+            event = json.loads(conn.execute("select diagnostic from calls where id=?", (root,)).fetchone()[0])
+        self.assertEqual(event["severity"], "warning")
+        self.assertEqual(event["operation"], "github-interface.review-context")
+        self.assertIn("Repository read of src/missing.py from line 1 failed. tracked regular file not found", event["stderr"])
+        self.assertEqual(self.inspections, [missing, available])
+        self.assertEqual(self.posts, [])
+
+        with self.call(node, self.resume(root), units_per_call=1), patch.object(atoms, "packet", return_value=json.dumps(node)):
+            self.run_review(node, lambda *args: verdict(args[3]))
+        self.assertEqual(len(self.posts), 1)
+        command, _ = self.posts[0]
+        self.assertIn("--reviewed-clean", command)
+        assessment = json.loads(command[command.index("--assessment-json") + 1])
+        self.assertIn("src/missing.py", assessment["limitations"])
+        self.assertIn("tracked regular file not found", assessment["limitations"])
+
+    def test_resumed_prompt_contains_the_cause_when_every_lookup_failed(self):
+        node = packet()
+        missing = {"operation": "read", "path": "src/missing.py", "query": "", "start_line": 1}
+
+        def inspect(requests, *, timeout_s):
+            self.inspections.extend(requests)
+            return {"action": "review_context", "head_sha": HEAD,
+                    "results": [{"request": missing, "error": "tracked regular file not found"}]}
+
+        def timeout_after_inspection(*args):
+            if not self.inspections:
+                return verdict(args[3], requests=[missing])
+            raise subprocess.TimeoutExpired("isolated provider", args[-1])
+
+        def resumed(*args):
+            prompt = args[3]
+            self.assertIn('"inspection": []', prompt)
+            self.assertIn("Repository read of src/missing.py from line 1 failed. tracked regular file not found", prompt)
+            return verdict(prompt)
+
+        self.repository.inspect = inspect
+        with self.call(node) as root, self.assertRaises(continuation.Continuation) as yielded:
+            self.run_review(node, timeout_after_inspection)
+        self.assertEqual(yielded.exception.result["outcome"], "continuation_required")
+        with self.call(node, self.resume(root)):
+            self.run_review(node, resumed)
+        self.assertEqual(self.inspections, [missing])
+        self.assertEqual(len(self.posts), 1)
+
+    def test_inspection_cap_keeps_findings_and_warns_about_unread_pages(self):
         node = packet(37)
         read = {"operation": "read", "path": "src/f016.py", "query": "", "start_line": 1}
         finding = {"path": "src/f016.py", "line": 2, "side": "RIGHT", "body": "[p1] Consumer uses the wrong contract."}
-        finished = False
-
         def inspect(requests, *, timeout_s):
-            nonlocal finished
             response = self.inspect(requests, timeout_s=timeout_s)
             result = response["results"][0]
             result.update(truncated=requests[0]["start_line"] < 14,
                           next_line=requests[0]["start_line"] + 1 if requests[0]["start_line"] < 14 else None)
-            finished = not result["truncated"]
             return response
 
         self.repository.inspect = inspect
@@ -303,25 +366,22 @@ class TestReviewContinuation(TestCase):
         def ask(_root, _model, _system, prompt, *_args):
             value = supplied(prompt)
             if "file group 3 of 5" in value.get("review_scope", ""):
-                pending = json.loads(prompt.split("Required unfinished inspection requests: ", 1)[1].splitlines()[0])
+                pending = json.loads(prompt.split("Optional unfinished inspection requests: ", 1)[1].splitlines()[0])
                 request = pending or [read]
                 calls.append(request[0]["start_line"])
-                if request[0]["start_line"] <= 14:
+                if "Repository inspection is finished" not in prompt:
                     return verdict(prompt, [finding], request)
             return verdict(prompt)
 
         with self.call(node) as root:
-            with self.assertRaises(continuation.Continuation):
-                self.run_review(node, ask)
-            self.assertEqual(self.saved(root)["unit"], 2)
-        with self.call(node, self.resume(root)):
-            # The second Call starts at page 13, then reaches the terminal
-            # verdict only after the pending page has completed.
-            self.run_review(node, lambda *args: verdict(args[3]) if finished else ask(*args))
-        self.assertEqual(calls[:13], list(range(1, 14)))
-        self.assertEqual([request["start_line"] for request in self.inspections], list(range(1, 15)))
+            self.run_review(node, ask)
+        self.assertEqual(calls, list(range(1, 14)))
+        self.assertEqual([request["start_line"] for request in self.inspections], list(range(1, 13)))
         command = self.posts[0][0]
         self.assertEqual(json.loads(command[command.index("--comments") + 1]), [finding])
+        assessment = json.loads(command[command.index("--assessment-json") + 1])
+        self.assertIn("src/f016.py from line 13 was not read", assessment["limitations"])
+        self.assertIn("reached its round limit", assessment["limitations"])
 
     def test_changed_answer_revision_same_head_and_changed_policy_invalidate_progress(self):
         node = packet()
@@ -808,7 +868,7 @@ class TestReviewContinuation(TestCase):
                 self.run_review(node, lambda *_args: self.fail("exhausted allowance launched work"))
         self.assertEqual(self.posts, [])
 
-    def test_identical_inspection_and_ordinary_output_do_not_reset_stall_bound(self):
+    def test_identical_inspections_do_not_add_evidence_and_a_missing_verdict_names_its_cause(self):
         node = packet()
         read = {"operation": "read", "path": "src/f000.py", "query": "", "start_line": 1}
 
@@ -816,14 +876,12 @@ class TestReviewContinuation(TestCase):
             return verdict(args[3], requests=[read])
 
         with self.call(node) as root:
-            with self.assertRaises(continuation.Continuation):
+            with self.assertRaisesRegex(atoms.ReviewVerdictError, "Reviewer requested more source after inspection ended") as stopped:
                 self.run_review(node, ask)
-        for attempt in range(2):
-            with self.call(node, self.resume(root)):
-                with self.assertRaises(continuation.Continuation) as stopped:
-                    self.run_review(node, ask)
-                self.assertEqual(stopped.exception.result["outcome"], "held" if attempt else "continuation_required")
-        self.assertIn("no validated advancement in two attempts", stopped.exception.result["reason"])
+        self.assertEqual(stopped.exception.diagnostic["phase"], "validating")
+        saved = self.saved(root)
+        state = json.loads((api.RESPONSES / f"{saved['checkpoint']['id']}.txt").read_text())
+        self.assertEqual(len(state["inspection"]), 1)
         self.assertEqual(self.posts, [])
 
     def test_isomora_841_two_later_deadlines_resume_validated_pages_within_cumulative_allowance(self):
@@ -847,7 +905,7 @@ class TestReviewContinuation(TestCase):
                 turns += 1
                 self.clock.now += 0.1
                 if turns == 1:
-                    pending = json.loads(prompt.split("Required unfinished inspection requests: ", 1)[1].splitlines()[0])
+                    pending = json.loads(prompt.split("Optional unfinished inspection requests: ", 1)[1].splitlines()[0])
                     return verdict(prompt, requests=pending or [read])
                 if failures < 2:
                     failures += 1

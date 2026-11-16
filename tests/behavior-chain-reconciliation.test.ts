@@ -28,7 +28,7 @@ afterEach(async () => {
 })
 
 function setup(path = ':memory:') {
-  vi.useFakeTimers(); vi.setSystemTime(NOW)
+  vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(NOW)
   const db = new Database(path); databases.push(db)
   return { db, journal: new BehaviorChainJournal(db) }
 }
@@ -133,7 +133,7 @@ it.each([
   const reopened = new Database(path); databases.push(reopened)
   const recovered = new BehaviorChainJournal(reopened)
   recovered.rebuild()
-  expect(recovered.reconcilable('', NOW, true).map(item => item.id)).toContain(chain.id)
+  expect(recovered.reconcilableIds('', NOW, true)).toContain(chain.id)
   const observe = vi.fn(async () => merged)
   const ops = operations({ enabled: () => true, available: () => true, permitted: () => true, observe,
     readInvocations: async () => ({ entries: [call], quarantined: [] }) })
@@ -352,7 +352,7 @@ it.each([false, true])('records a late merge through a closure hint with retaine
   expect(journal.read(chain.id)).toMatchObject({ held: chain.held, invocations: chain.invocations, mergeSha: MERGE, reviewPending: !reviewed })
 })
 
-function captureDiagnostics() {
+function captureDiagnostics(operation = 'behavior-chain.revision-conflict') {
   const root = mkdtempSync(join(tmpdir(), 'poise-chain-conflict-')); roots.push(root)
   vi.stubEnv('POISE_DB', join(root, 'cache.db'))
   vi.stubEnv('POISE_WORKSPACE_HANDLE', 'fixture')
@@ -362,7 +362,7 @@ function captureDiagnostics() {
   startLogging()
   return () => {
     loggingRuntime()!.flush()
-    return diagnosticPage(null).events.filter(event => event.operation === 'behavior-chain.revision-conflict')
+    return diagnosticPage(null).events.filter(event => event.operation === operation)
   }
 }
 
@@ -605,17 +605,35 @@ it('defers a revision conflict when the existing sweep budget is exhausted', asy
   expect(diagnostics()).toMatchObject([{ target: chain.id, phase: 'observation', context: { outcome: 'deferred', attempts: 1 } }])
 })
 
-it('surfaces a real journal failure even when its message matches a revision conflict', async () => {
+it('surfaces a journal failure for its chain and reconciles the next chain', async () => {
   const { db, journal } = setup()
-  seed(journal)
-  const diagnostics = captureDiagnostics()
+  const failed = seed(journal)
+  const healthy = seed(journal, 'acme/repo', 8)
+  const diagnostics = captureDiagnostics('behavior-chain.target')
   db.exec(`CREATE TRIGGER fail_observation BEFORE INSERT ON behavior_chain_events
-    WHEN json_extract(NEW.payload, '$.type') = 'chain.observed'
+    WHEN NEW.chain_id = '${failed.id}' AND json_extract(NEW.payload, '$.type') = 'chain.observed'
     BEGIN SELECT RAISE(ABORT, 'behavior chain changed before event admission'); END`)
   const observe = vi.fn(async () => observation(false))
   await expect(new BehaviorChainRuntime(journal, operations({ observe })).run()).rejects.toThrow('behavior chain changed before event admission')
-  expect(observe).toHaveBeenCalledTimes(1)
-  expect(diagnostics()).toEqual([])
+  expect(observe).toHaveBeenCalledTimes(2)
+  expect(journal.read(failed.id)?.observation).toBeNull()
+  expect(journal.read(healthy.id)?.observation).toMatchObject({ checkedAt: NOW })
+  expect(diagnostics()).toMatchObject([{ target: failed.id, phase: 'observation',
+    message: 'behavior chain changed before event admission' }])
+})
+
+it('reconciles a healthy chain alongside a corrupt projection', async () => {
+  const { db, journal } = setup()
+  const failed = seed(journal)
+  const healthy = seed(journal, 'acme/repo', 8)
+  db.prepare("UPDATE behavior_chain_current SET state = json_set(state, '$.author', 'corrupt') WHERE chain_id = ?").run(failed.id)
+  const diagnostics = captureDiagnostics('behavior-chain.target')
+  const observe = vi.fn(async () => observation(false))
+  await expect(new BehaviorChainRuntime(journal, operations({ observe })).run()).rejects.toThrow(`Behavior chain ${failed.id} failed during projection-read`)
+  expect(observe).toHaveBeenCalledOnce()
+  expect(journal.read(healthy.id)?.observation).toMatchObject({ checkedAt: NOW })
+  expect(diagnostics()).toMatchObject([{ target: failed.id, phase: 'projection-read',
+    message: 'behavior projection disagrees with the authoritative event journal' }])
 })
 
 it.each(['recovery', 'base update', 'base update review', 'operator hold', 'uncertain publication', 'publication receipt',

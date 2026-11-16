@@ -252,6 +252,17 @@ describe('prepare pool startup', () => {
       }
     })).rejects.toBe(first)
   })
+
+  it('continues queued work after an item fails on the only worker', async () => {
+    const { behaviors: runtime } = await loadModules()
+    const failure = new Error('item failed')
+    const completed: string[] = []
+    await expect(runtime.forEachPool(['a', 'b'], 1, async (item) => {
+      if (item === 'a') throw failure
+      completed.push(item)
+    })).rejects.toBe(failure)
+    expect(completed).toEqual(['b'])
+  })
 })
 
 describe('review checkout in the launch phase', () => {
@@ -406,7 +417,7 @@ describe('event-loop visibility', () => {
 })
 
 describe('batch evidence alignment', () => {
-  it('rejects mismatched records instead of evaluating the wrong pull request', async () => {
+  it('associates reordered records by PR identity and reports an unmatched target', async () => {
     fixture.listedPrs = openPrs(2)
     arrangeCli(true)
     mocks.spawnDetached.mockResolvedValue(undefined)
@@ -414,6 +425,8 @@ describe('batch evidence alignment', () => {
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
       if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json')) {
         const packet = JSON.parse((await original(command, args, options)).stdout)
+        const unmatched = packet.records[0].pull_number
+        packet.records[0].pull_number = unmatched + 100
         return {
           stdout: JSON.stringify({ ...packet, records: [...packet.records].reverse() }),
           stderr: '',
@@ -428,12 +441,12 @@ describe('batch evidence alignment', () => {
 
     await runtime.runEnabledBehaviorsOnce()
 
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toContain(`#${fixture.listedPrs[1].number}`)
     const failures = runtime.getBehaviorsRuntimeHealth().failures
-    expect(failures).toHaveLength(2)
-    for (const failure of failures) {
-      expect(failure.error).toMatch(/misaligned batch evidence/)
-    }
+    expect(failures).toEqual([expect.objectContaining({
+      target: `${fixture.listedPrs[0].repo}#${fixture.listedPrs[0].number}:check`, error: 'GitHub returned no matching evidence for this PR',
+    })])
   })
 })
 

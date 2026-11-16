@@ -2872,7 +2872,7 @@ export function datastorePr(row: unknown, index: number): DatastorePr {
   const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
   const status = String(value.status || '')
   const updatedAt = String(value.updated_at || '')
-  const createdAt = value.created_at ?? null
+  const createdAt = typeof value.created_at === 'string' && Number.isFinite(Date.parse(value.created_at)) ? value.created_at : null
   const headRef = value.head_ref ?? null
   const headRepo = value.head_repo ?? null
   const syncError = rowSyncError(value)
@@ -2882,14 +2882,13 @@ export function datastorePr(row: unknown, index: number): DatastorePr {
     || !['open', 'closed', 'merged'].includes(status)
     || !author
     || !Number.isFinite(Date.parse(updatedAt))
-    || (createdAt !== null && (typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))))
     || url !== `https://github.com/${repo}/pull/${number}`
     || (headRef !== null && (typeof headRef !== 'string' || !headRef))
     || (headRepo !== null && (typeof headRepo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(headRepo)))) {
     throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
   }
   return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt,
-    created_at: createdAt as string | null,
+    created_at: createdAt,
     ...(syncError ? { syncError } : {}),
     headRef: headRef as string | null, headRepo: headRepo as string | null }
 }
@@ -2914,28 +2913,51 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
 // gate, dead-letter reconciliation, failure/queue retirement, or eligibility
 // filtering the tick applies. Read-only callers (the per-PR status
 // projection) use this so a GET never mutates execution state.
-export async function fetchOpenPrRows(): Promise<DatastorePr[]> {
+async function readOpenPrRows() {
   const parsed = await datastoreView(['view', 'pr', '--status', 'open', '--format', 'json'], 32 * 1024 * 1024)
   if (!Array.isArray(parsed)) throw new Error('github-datastore view pr returned a non-array')
   const seen = new Set<string>()
-  return parsed.map((row, index) => {
-    const pr = datastorePr(row, index)
-    if (pr.status !== 'open') throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
-    const key = `${pr.repo}#${pr.number}`
-    if (seen.has(key)) throw new Error(`github-datastore returned duplicate PR ${key}`)
-    seen.add(key)
-    return pr
+  const candidates = new Map<string, DatastorePr>()
+  let identitiesComplete = true
+  parsed.forEach((row, index) => {
+    let target: string | undefined
+    try {
+      const value = objectValue(row, `github-datastore PR row ${index}`)
+      const number = safeInteger(value.number, `github-datastore PR row ${index} number`)
+      if (typeof value.repo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(value.repo) || number < 1) {
+        throw new Error(`github-datastore PR row ${index} has an invalid repository or PR number`)
+      }
+      target = `${value.repo}#${number}`
+      if (seen.has(target)) {
+        candidates.delete(target)
+        throw new Error(`github-datastore returned duplicate PR ${target}`)
+      }
+      seen.add(target)
+      const pr = datastorePr(value, index)
+      if (pr.status !== 'open') throw new Error(`github-datastore open PR listing returned ${pr.status} for ${target}`)
+      candidates.set(target, pr)
+    } catch (error) {
+      if (!target) identitiesComplete = false
+      diagnosticFailure('github-datastore.view-pr', error, { target, index }, { level: 'warning' })
+    }
   })
+  return { prs: [...candidates.values()], seen, identitiesComplete }
+}
+
+export async function fetchOpenPrRows(): Promise<DatastorePr[]> {
+  return (await readOpenPrRows()).prs
 }
 
 async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
   await requireFreshDatastore()
-  const prs = await fetchOpenPrRows()
-  const seen = new Set(prs.map((pr) => `${pr.repo}#${pr.number}`))
-  const reconciled = reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
-  settleSupersededApprovalFirings(reconciled)
-  settleClosedTargetFirings(reconciled)
-  retireClosedQueueAdmissions(seen)
+  const { prs, seen, identitiesComplete } = await readOpenPrRows()
+  // Absence proves closure only when every returned identity was readable.
+  if (identitiesComplete) {
+    const reconciled = reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
+    settleSupersededApprovalFirings(reconciled)
+    settleClosedTargetFirings(reconciled)
+    retireClosedQueueAdmissions(seen)
+  }
   return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(getMeta('me') || '', `${pr.repo}#${pr.number}`, pr))
 }
 
@@ -2944,7 +2966,16 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
 async function listEligiblePrs(behavior: SkippableBehavior, author: string): Promise<DatastorePr[]> {
   const prs = await listOpenPrsByAuthor(author)
   const policy = pullRequestPolicy(behavior)
-  return prs.filter((pr) => !behaviorAdmissionDraining() && !chainOwnsPr(pr) && !pullRequestRefusal(policy, pr.repo, pr.number, pr))
+  return prs.filter((pr) => {
+    try {
+      return !behaviorAdmissionDraining() && !chainOwnsPr(pr) && !pullRequestRefusal(policy, pr.repo, pr.number, pr)
+    } catch (error) {
+      diagnosticFailure('application.behaviors.pr-eligibility', error, {
+        repository: pr.repo, target: `${pr.repo}#${pr.number}`, behavior,
+      }, { level: 'warning' })
+      return false
+    }
+  })
 }
 
 function chainOwnsPr(pr: DatastorePr): boolean {
@@ -2990,29 +3021,25 @@ function loopTurn(): Promise<void> {
 // Exported for the fixture-backed startup and failure guards only.
 export async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
   let next = 0
+  let firstFailure: { error: unknown } | undefined
   const worker = async (): Promise<void> => {
     for (;;) {
       if (behaviorAborted()) return
       const index = next++
       if (index >= items.length) return
-      await task(items[index]!)
+      try { await task(items[index]!) }
+      catch (error) { firstFailure ??= { error } }
       if (next < items.length && !behaviorAborted()) await loopTurn()
     }
   }
   const workers: Array<Promise<void>> = []
-  let firstFailure: { error: unknown } | undefined
   const count = Math.min(limit, items.length)
   for (let started = 0; started < count; started++) {
-    const running = worker()
-    // Own the rejection before the stagger below yields: a worker that fails
-    // fast must not read as unhandled while Promise.all is not yet attached.
-    // Retain time order too: already-rejected promises in the later aggregate
-    // would otherwise select by array order instead of original failure order.
-    void running.catch((error: unknown) => { firstFailure ??= { error } })
-    workers.push(running)
+    workers.push(worker())
     if (started + 1 < count) await loopTurn()
   }
-  await Promise.all(workers).catch((error: unknown) => { throw firstFailure ? firstFailure.error : error })
+  await Promise.all(workers)
+  if (firstFailure) throw firstFailure.error
 }
 
 // One pull request as the datastore has it, whatever its state; null when it
@@ -3844,7 +3871,7 @@ async function tickReviewNewPrs(): Promise<void> {
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
       }
-    })
+    }).catch(error => { failure ??= error })
     // An expired operation deadline must not discard prepared reviews: a slow
     // sweep still claims and launches what it managed to prepare, and the next
     // sweep prepares the rest.
@@ -4750,6 +4777,14 @@ async function releaseFailedBehaviorIfNoAction(
       }
     }
   }
+  if (call.error_code === 'review_continuation_held'
+    && call.error.startsWith('review checkpoint validation failed: inspection checkpoint ')
+    && reviewContinuationNoWrite(call)
+    && resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) {
+    // The old checkpoint validator stopped for optional context errors. Its
+    // released, unsubmitted Call can be reconsidered under the new review rules.
+    return releaseFailedBehaviorLaunch(behavior, target, failed.launchCallId, failed.launchExpectedHead)
+  }
   let observedHead: string | null = null
   if (prReviewRetryState(snapshot, behavior, repo, number, failed.launchExpectedHead,
     failed.launchActor, configuredModel ?? call.model, target).stopped
@@ -4938,6 +4973,24 @@ interface BatchRead<T> {
   error: string | null
 }
 
+function prBatchRecords(rows: unknown[], numberField: 'number' | 'pull_number') {
+  const records = new Map<string, Record<string, unknown> | null>()
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue
+    const record = row as Record<string, unknown>
+    const number = record[numberField]
+    if (typeof record.repository !== 'string' || typeof number !== 'number' || !Number.isSafeInteger(number)) continue
+    const key = `${record.repository}#${number}`
+    records.set(key, records.has(key) ? null : record)
+  }
+  return (pr: DatastorePr) => {
+    const record = records.get(`${pr.repo}#${pr.number}`)
+    if (record === null) throw new Error('GitHub returned duplicate evidence for this PR')
+    if (!record) throw new Error('GitHub returned no matching evidence for this PR')
+    return record
+  }
+}
+
 // One process per batch, not one per pull request: the same evidence reads
 // the single-PR commands run, gathered on one client. One PR's error holds
 // only that target's check, never the whole sweep.
@@ -4956,25 +5009,26 @@ async function readChangesAddressedBatch(
   )
   if (packet.action !== 'requested_changes_addressed_batch'
     || String(packet.username || '').toLowerCase() !== reviewer.toLowerCase()
-    || !Array.isArray(packet.records) || packet.records.length !== prs.length) {
+    || !Array.isArray(packet.records)) {
     throw new Error('github-interface --requested-changes-addressed returned malformed batch evidence')
   }
-  return packet.records.map((row: unknown, index: number) => {
-    const pr = prs[index]!
-    const record = objectValue(row, 'changes-addressed record')
-    if (record.repository !== pr.repo || record.pull_number !== pr.number) {
-      throw new Error('github-interface --requested-changes-addressed returned misaligned batch evidence')
-    }
-    if (record.error === null) {
-      if (typeof record.pr_author !== 'string' || record.pr_author.toLowerCase() !== pr.author.toLowerCase()) {
-        return { pr, result: null, error: 'Live PR author is missing or differs from the admitted author' }
+  const recordFor = prBatchRecords(packet.records, 'pull_number')
+  return prs.map(pr => {
+    try {
+      const record = recordFor(pr)
+      if (record.error === null) {
+        if (typeof record.pr_author !== 'string' || record.pr_author.toLowerCase() !== pr.author.toLowerCase()) {
+          return { pr, result: null, error: 'Live PR author is missing or differs from the admitted author' }
+        }
+        return { pr, result: parseChangesAddressedResult(record, pr.repo, pr.number, reviewer), error: null }
       }
-      return { pr, result: parseChangesAddressedResult(record, pr.repo, pr.number, reviewer), error: null }
+      if (typeof record.error !== 'string' || !record.error) {
+        throw new Error('github-interface --requested-changes-addressed returned malformed record evidence')
+      }
+      return { pr, result: null, error: record.error }
+    } catch (error) {
+      return { pr, result: null, error: behaviorErrorMessage(error) }
     }
-    if (typeof record.error !== 'string' || !record.error) {
-      throw new Error('github-interface --requested-changes-addressed returned malformed record evidence')
-    }
-    return { pr, result: null, error: record.error }
   })
 }
 
@@ -4995,22 +5049,23 @@ async function readReviewActivityBatch(
   )
   if (packet.action !== 'review_activity_since_batch'
     || String(packet.username || '').toLowerCase() !== reviewer.toLowerCase()
-    || !Array.isArray(packet.records) || packet.records.length !== requests.length) {
+    || !Array.isArray(packet.records)) {
     throw new Error('github-interface --review-activity-since returned malformed batch evidence')
   }
-  return packet.records.map((row: unknown, index: number) => {
-    const pr = requests[index]!.pr
-    const record = objectValue(row, 'review-activity record')
-    if (record.repository !== pr.repo || record.pull_number !== pr.number) {
-      throw new Error('github-interface --review-activity-since returned misaligned batch evidence')
+  const recordFor = prBatchRecords(packet.records, 'pull_number')
+  return requests.map(({ pr }) => pr).map(pr => {
+    try {
+      const record = recordFor(pr)
+      if (record.error === null) {
+        return { pr, result: parseReviewActivityResult(record, pr.repo, pr.number, reviewer), error: null }
+      }
+      if (typeof record.error !== 'string' || !record.error) {
+        throw new Error('github-interface --review-activity-since returned malformed record evidence')
+      }
+      return { pr, result: null, error: record.error }
+    } catch (error) {
+      return { pr, result: null, error: behaviorErrorMessage(error) }
     }
-    if (record.error === null) {
-      return { pr, result: parseReviewActivityResult(record, pr.repo, pr.number, reviewer), error: null }
-    }
-    if (typeof record.error !== 'string' || !record.error) {
-      throw new Error('github-interface --review-activity-since returned malformed record evidence')
-    }
-    return { pr, result: null, error: record.error }
   })
 }
 
@@ -6483,47 +6538,56 @@ async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<M
   if (result.action !== 'merge_candidates' || typeof result.actor !== 'string'
     || result.actor.toLowerCase() !== actor.toLowerCase()
     || !Number.isSafeInteger(result.graphql_cost) || Number(result.graphql_cost) < 1
-    || !Array.isArray(result.records) || result.records.length !== prs.length) {
+    || !Array.isArray(result.records)) {
     throw new Error('github-interface --merge-candidates returned malformed batch evidence')
   }
-  return result.records.map((row: unknown, index: number) => {
-    const record = objectValue(row, 'merge candidate')
-    const pr = prs[index]!
-    // The status-projection fields are absent from older Callers; absent
-    // reads as unknown, never as a malformed batch.
-    const rollupState = record.rollup_state ?? null
-    const reviewDecision = record.review_decision ?? null
-    const mergeStateStatus = record.merge_state_status ?? null
-    const unresolvedThreads = record.unresolved_threads ?? null
-    const threadsComplete = record.threads_complete ?? null
-    const queueEnabled = record.queue_enabled ?? null
-    if (record.repository !== pr.repo || record.number !== pr.number || typeof record.ready !== 'boolean'
-      || typeof record.behind !== 'boolean'
-      || !(record.head_sha === null || (typeof record.head_sha === 'string' && SHA_PATTERN.test(record.head_sha)))
-      || !(record.author === null || typeof record.author === 'string')
-      || !(record.approved_at === null || (typeof record.approved_at === 'string' && Number.isFinite(Date.parse(record.approved_at))))
-      || !(record.queue_entry_id === null || (typeof record.queue_entry_id === 'string' && record.queue_entry_id.length > 0))
-      || !(record.error === null || (typeof record.error === 'string' && record.error.length > 0))
-      || !(rollupState === null || typeof rollupState === 'string')
-      || !(reviewDecision === null || typeof reviewDecision === 'string')
-      || !(mergeStateStatus === null || typeof mergeStateStatus === 'string')
-      || !(unresolvedThreads === null || (Number.isSafeInteger(unresolvedThreads) && (unresolvedThreads as number) >= 0))
-      || !(threadsComplete === null || typeof threadsComplete === 'boolean')
-      || !(queueEnabled === null || typeof queueEnabled === 'boolean')
-      || (record.ready && (record.head_sha === null || !record.author || record.error !== null))
-      || (record.behind && (record.ready || record.head_sha === null || !record.author || record.error !== null))) {
-      throw new Error('github-interface --merge-candidates returned malformed candidate evidence')
+  const recordFor = prBatchRecords(result.records, 'number')
+  return prs.map(pr => {
+    try {
+      const record = recordFor(pr)
+      // The status-projection fields are absent from older Callers; absent
+      // reads as unknown, never as a malformed batch.
+      const rollupState = record.rollup_state ?? null
+      const reviewDecision = record.review_decision ?? null
+      const mergeStateStatus = record.merge_state_status ?? null
+      const unresolvedThreads = record.unresolved_threads ?? null
+      const threadsComplete = record.threads_complete ?? null
+      const queueEnabled = record.queue_enabled ?? null
+      if (typeof record.ready !== 'boolean'
+        || typeof record.behind !== 'boolean'
+        || !(record.head_sha === null || (typeof record.head_sha === 'string' && SHA_PATTERN.test(record.head_sha)))
+        || !(record.author === null || typeof record.author === 'string')
+        || !(record.approved_at === null || (typeof record.approved_at === 'string' && Number.isFinite(Date.parse(record.approved_at))))
+        || !(record.queue_entry_id === null || (typeof record.queue_entry_id === 'string' && record.queue_entry_id.length > 0))
+        || !(record.error === null || (typeof record.error === 'string' && record.error.length > 0))
+        || !(rollupState === null || typeof rollupState === 'string')
+        || !(reviewDecision === null || typeof reviewDecision === 'string')
+        || !(mergeStateStatus === null || typeof mergeStateStatus === 'string')
+        || !(unresolvedThreads === null || (Number.isSafeInteger(unresolvedThreads) && (unresolvedThreads as number) >= 0))
+        || !(threadsComplete === null || typeof threadsComplete === 'boolean')
+        || !(queueEnabled === null || typeof queueEnabled === 'boolean')
+        || (record.ready && (record.head_sha === null || !record.author || record.error !== null))
+        || (record.behind && (record.ready || record.head_sha === null || !record.author || record.error !== null))) {
+        throw new Error('github-interface --merge-candidates returned malformed candidate evidence')
+      }
+      const candidate = { pr, actor, ready: record.ready, behind: record.behind, head: record.head_sha as string | null,
+        author: record.author as string | null, approvedAt: record.approved_at as string | null,
+        queueEntryId: record.queue_entry_id as string | null, error: record.error as string | null,
+        rollupState: rollupState as string | null, reviewDecision: reviewDecision as string | null,
+        mergeStateStatus: mergeStateStatus as string | null,
+        unresolvedThreads: unresolvedThreads as number | null, threadsComplete: threadsComplete as boolean | null,
+        queueEnabled: queueEnabled as boolean | null }
+      const { pr: _pr, actor: _actor, ...cached } = candidate
+      cacheMergeCandidate(pr.repo, pr.number, cached)
+      return candidate
+    } catch (error) {
+      const candidate: MergeCandidate = { pr, actor, ready: false, behind: false, head: null, author: null,
+        approvedAt: null, queueEntryId: null, error: behaviorErrorMessage(error), rollupState: null,
+        reviewDecision: null, mergeStateStatus: null, unresolvedThreads: null, threadsComplete: null, queueEnabled: null }
+      const { pr: _pr, actor: _actor, ...cached } = candidate
+      cacheMergeCandidate(pr.repo, pr.number, cached)
+      return candidate
     }
-    const candidate = { pr, actor, ready: record.ready, behind: record.behind, head: record.head_sha as string | null,
-      author: record.author as string | null, approvedAt: record.approved_at as string | null,
-      queueEntryId: record.queue_entry_id as string | null, error: record.error as string | null,
-      rollupState: rollupState as string | null, reviewDecision: reviewDecision as string | null,
-      mergeStateStatus: mergeStateStatus as string | null,
-      unresolvedThreads: unresolvedThreads as number | null, threadsComplete: threadsComplete as boolean | null,
-      queueEnabled: queueEnabled as boolean | null }
-    const { pr: _pr, actor: _actor, ...cached } = candidate
-    cacheMergeCandidate(pr.repo, pr.number, cached)
-    return candidate
   })
 }
 
@@ -6920,7 +6984,7 @@ async function tickRerunGreyCi(): Promise<void> {
       packet = objectValue(parseJson(stdout, 'grey CI candidates'), 'grey CI candidates')
       if (packet.action !== 'grey_ci_candidates' || packet.actor !== actor
         || !Number.isSafeInteger(packet.graphql_cost) || Number(packet.graphql_cost) < 1
-        || !Array.isArray(packet.records) || packet.records.length !== batch.length) {
+        || !Array.isArray(packet.records)) {
         throw new Error('github-interface returned malformed grey CI batch evidence')
       }
     } catch (error) {
@@ -6932,16 +6996,16 @@ async function tickRerunGreyCi(): Promise<void> {
       for (const pr of batch) recordBehaviorFailure(behavior, 'operation', error, `${pr.repo}#${pr.number}`, { hold: false })
       continue
     }
-    for (let index = 0; index < batch.length; index++) {
+    const recordFor = prBatchRecords(packet.records as unknown[], 'number')
+    for (const pr of batch) {
       if (!isEnabled(behavior) || behaviorAborted()) return
-      const pr = batch[index]!
       const target = `${pr.repo}#${pr.number}`
-      setMeta('behavior_rerun_grey_ci_cursor', target)
-      if (!stillEligible(behavior, pr) || !behaviorRetryDue(behavior, target)) continue
       let row: Record<string, unknown>
       try {
-        row = objectValue(packet.records[index], 'grey CI candidate')
-        if (row.repository !== pr.repo || row.number !== pr.number || !Array.isArray(row.runs)
+        setMeta('behavior_rerun_grey_ci_cursor', target)
+        if (!stillEligible(behavior, pr) || !behaviorRetryDue(behavior, target)) continue
+        row = recordFor(pr)
+        if (!Array.isArray(row.runs)
           || !(row.error === null || typeof row.error === 'string')) throw new Error('malformed grey CI target evidence')
         if (row.error !== null) { recordBehaviorFailure(behavior, 'operation', row.error, target, { actingAccount: actor }); continue }
         if (typeof row.head_sha !== 'string' || !SHA_PATTERN.test(row.head_sha)
@@ -8775,10 +8839,12 @@ async function runBehaviorChains(): Promise<void> {
         let cursor: { repo: string, number: number } | undefined
         for (;;) {
           const page = await readOpenPrClosingRefs(org, cursor)
-          if (!page || (page.truncated && !page.more) || page.prs.some((pr) => pr.closingTruncated)) throw new Error('existing issue-to-PR ownership cannot be established from complete observations')
+          if (!page) throw new Error('existing issue-to-PR ownership observations are unavailable')
+          // Keep positive matches. Each seed still checks its existing PRs
+          // directly in GitHub before an invocation can be admitted.
           for (const pr of page.prs) for (const ref of pr.closing) { const key = `${ref.repo.toLowerCase()}#${ref.number}`; if (wanted.has(key)) existing.add(key) }
           if (!page.more) break
-          const last = page.prs.at(-1)
+          const last = page.next ?? page.prs.at(-1)
           if (!last || (cursor?.repo === last.repo && cursor?.number === last.number)) throw new Error('existing PR ownership pagination did not advance')
           cursor = { repo: last.repo, number: last.number }
         }
@@ -8909,13 +8975,13 @@ export async function runEnabledBehaviorsOnce(
           let cursor: { repo: string, number: number } | undefined
           for (;;) {
             const page = await readOpenPrClosingRefs(org, cursor)
-            if (!page || (page.truncated && !page.more) || page.prs.some((pr) => pr.closingTruncated)) throw new Error('Cutover cannot establish complete legacy PR ownership')
+            if (!page || page.incomplete || (page.truncated && !page.more) || page.prs.some((pr) => pr.closingTruncated)) throw new Error('Cutover cannot establish complete legacy PR ownership')
             for (const pr of page.prs) {
               if (pr.repo.split('/')[0].toLowerCase() !== org.login.toLowerCase()) throw new Error('Cutover PR observation escaped its followed organization')
               if (!behaviorChainOwner(pr.repo, pr.number, 'pull', pr)) pulls.push(`${pr.repo}#${pr.number}`)
             }
             if (!page.more) break
-            const last = page.prs.at(-1)
+            const last = page.next ?? page.prs.at(-1)
             if (!last || (cursor?.repo === last.repo && cursor?.number === last.number)) throw new Error('Cutover PR pagination did not advance')
             cursor = { repo: last.repo, number: last.number }
           }

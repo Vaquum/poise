@@ -13,7 +13,8 @@ from hashlib import sha256
 from time import monotonic, time
 from uuid import uuid4
 
-from . import caller_store, resource_ownership, review_budget, review_receipt, review_stages
+from . import caller_store, progress, resource_ownership, review_budget, review_receipt, review_stages
+from .process_diagnostic import diagnostic_envelope
 
 MAX_UNITS = 256
 MAX_STORAGE_BYTES = 32_000_000
@@ -25,8 +26,11 @@ _request: ContextVar[tuple[str, str | None, int | None] | None] = ContextVar("re
 
 class Continuation(review_budget.ReviewLimitError):
     def __init__(self, reason: str, result: dict):
-        super().__init__(reason, "review_continuation_required" if result["outcome"] == "continuation_required"
-                         else "review_continuation_held")
+        held = result["outcome"] == "held"
+        diagnostic = diagnostic_envelope(operation="provider.review", phase=progress.phase() or "analysis",
+                                         outcome="held", message=reason[:500],
+                                         submission="uncertain" if result["publication_started"] else "none") if held else None
+        super().__init__(reason, "review_continuation_held" if held else "review_continuation_required", diagnostic)
         self.result = {**result, "reason": reason}
 
 
@@ -573,8 +577,9 @@ def analysis_remaining_ms(saved: dict) -> int:
 class Unit:
     def __init__(self, session: Session, identities: list[str], packet: str):
         self.session, self.identities = session, identities
-        self.locations = review_stages.diff_line_sets(json.loads(packet)["diff"],
-                            [entry["filename"] for entry in json.loads(packet)["files"]])
+        source = json.loads(packet)
+        self.head = json.loads(session.packet)["head_sha"]
+        self.locations = review_stages.diff_line_sets(source["diff"], [entry["filename"] for entry in source["files"]])
 
     def evidence(self) -> list[str]:
         return self.identities + [ref["sha256"] for ref in self.session.state["inspection"]]
@@ -585,6 +590,7 @@ class Unit:
     def context(self) -> str:
         return "\n\nValidated inspection checkpoints (review input):\n" + json.dumps(
             {"inspection": [self.session.read(ref) for ref in self.session.state["inspection"]],
+             "warnings": self.session.state.get("warnings", []),
              "findings": self.session.state["provisional"], "verified_fixes": self.session.state["verified"]})
 
     def findings(self, verdict: dict) -> None:
@@ -597,47 +603,15 @@ class Unit:
 
     def inspected(self, step: dict, result: dict) -> None:
         state = self.session.state
-        requests, results = step["requests"], result.get("results")
-        if result.get("action") != "review_context" or result.get("head_sha") != json.loads(self.session.packet)["head_sha"] \
-                or not isinstance(results, list) or len(results) != len(requests) \
-                or len(json.dumps(result).encode()) > 64 * 1024:
-            raise ValueError("inspection checkpoint lacks bounded pinned evidence")
-        pending = list(state["pending"])
-        for request, response in zip(requests, results, strict=True):
-            if response.get("request") != request or response.get("error") \
-                    or type(response.get("truncated")) is not bool:
-                raise ValueError("inspection checkpoint contains missing or malformed evidence")
-            field = {"read": "lines", "list": "paths", "search": "matches"}.get(request["operation"])
-            entries = response.get(field) if field else None
-            if not isinstance(entries, list) or len(entries) > (100 if field == "matches" else 200):
-                raise ValueError("inspection checkpoint lacks its requested evidence entries")
-            if field == "paths":
-                valid = all(isinstance(entry, str) and entry for entry in entries)
-            else:
-                valid = all(isinstance(entry, dict) and type(entry.get("line")) is int and entry["line"] > 0
-                            and isinstance(entry.get("text"), str) for entry in entries)
-            if not valid:
-                raise ValueError("inspection checkpoint evidence entries are malformed")
-            if request in pending:
-                pending.remove(request)
-            if response["truncated"]:
-                cursor = response.get("next_line")
-                if type(cursor) is not int or cursor <= request["start_line"]:
-                    raise ValueError("inspection checkpoint has no advancing page cursor")
-                following = {**request, "start_line": cursor}
-                if following not in pending:
-                    pending.append(following)
-            elif response.get("next_line") is not None:
-                raise ValueError("inspection checkpoint has a contradictory page cursor")
+        results = result["results"]
         self.findings(step)
         evidence = {"step": step, "result": result}
         # Provider prose and identical reads cannot reset the no-progress bound.
         known = [self.session.read(ref)["result"] for ref in state["inspection"]]
         changed = False
-        if result not in known:
+        if any(not response.get("error") for response in results) and result not in known:
             state["inspection"].append(self.session.put(evidence))
             state["stalled"] = 0
-            state["pending"] = pending
             changed = True
         for finding in step["comments"]:
             if finding not in state["provisional"]:
@@ -647,15 +621,13 @@ class Unit:
         if any(state["verified"].get(key) != value for key, value in verified.items()):
             state["verified"].update(verified)
             changed = True
-        if changed:
-            self.session.checkpoint(advanced=True)
+        if changed or any(response.get("error") for response in results):
+            self.session.checkpoint(advanced=changed)
 
     def terminal(self, verdict: dict, evidence) -> dict:
         if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence) \
                 or len(evidence) != len(set(evidence)) or set(evidence) != set(self.evidence()):
             raise ValueError("terminal review must account for every required unit and inspected evidence ID")
-        if self.session.state["pending"]:
-            raise ValueError("required repository inspection pages remain unfinished")
         self.findings(verdict)
         for finding in self.session.state["provisional"]:
             if finding not in verdict["comments"]:
@@ -668,10 +640,12 @@ class Unit:
         return verdict
 
 
-def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, repository, packet, root, watch, ask):
+def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, repository, packet, root, watch, ask, warnings):
     from . import atoms, structured_review
     from .atoms import AgentPreflightError, ReviewVerdictError
     session = Session(packet, model.identity)
+    warnings[:] = list(dict.fromkeys([*session.state.get("warnings", []), *warnings]))
+    session.state["warnings"] = warnings
     try:
         if session.finalization:
             return session.read(session.finalization["verdict"]), session.packet, session
@@ -714,7 +688,7 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
                 watch, seconds, deadline, Inspection(), behavior, bool(json.loads(packet).get("verification_candidates")),
                 groups_remaining=len(units) + 1 - index, total_groups=len(units) + 1,
                 expected_group_seconds=session.state.get("mean_seconds", 60),
-                checkpoint=unit)
+                checkpoint=unit, warnings=warnings)
             candidates = set(json.loads(packet).get("verification_candidates", []))
             if set(review_receipt.verified_fix_ids(verdict["assessment"])) - candidates:
                 raise ValueError("verified repair differs from its original answer revision")

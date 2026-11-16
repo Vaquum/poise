@@ -127,7 +127,8 @@ describe('Close Old Pull Requests', () => {
     await enable()
     await runtime.runEnabledBehaviorsOnce()
     expect(closes()).toEqual([])
-    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ behavior: 'close-old-prs', kind: 'operation' })])
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ behavior: 'close-old-prs', kind: 'operation',
+      target: `${pulls[0].repo}#7`, error: expect.stringContaining('invalid or future created_at') })])
   })
   it.each(['already_closed', 'not_ready'])('records %s between discovery and dispatch as a no-op without last-fired', async result => {
     outcome = result
