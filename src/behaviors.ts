@@ -174,9 +174,8 @@ export function isValidDays(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
 }
 
-// The review-round cap for Approve Pull Requests: null is off, otherwise the
-// round from which a run files its findings as one follow-up issue and
-// approves. Only the server's approve-prs row carries it.
+// The PR review limit lives on the Approve Pull Requests settings row.
+// Null selects the default of three rounds.
 const reviewCapByKey: Partial<Record<BehaviorKey, number | null>> = {}
 
 export function getReviewCap(key: BehaviorKey): number | null {

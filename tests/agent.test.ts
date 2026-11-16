@@ -6,12 +6,13 @@ const mocks = vi.hoisted(() => ({
   captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
   diagnostic: vi.fn(),
   diagnosticFailure: vi.fn(),
+  prepareClis: vi.fn<(_catalog: import('../server/models').Catalog, identities: string[], forReview?: boolean) => Promise<NodeJS.ProcessEnv>>(),
   runFile: vi.fn(),
   workerBuild: vi.fn<(outfile: string) => void>(),
   models: {} as import('../server/models').ModelSettings,
   agentAccount: 'bit-mis',
   // The scheduler's replay check; these tests admit everything unless told not to.
-  admit: vi.fn(async (): Promise<{ author: string, actor: string, accounts: { me: string, agent: string }, reviewCapReached?: { reviewRound: number, reviewCap: number } }> => ({ author: 'poise-user', actor: 'bit-mis', accounts: { me: 'poise-user', agent: 'bit-mis' } })),
+  admit: vi.fn(async (): Promise<{ author: string, actor: string, accounts: { me: string, agent: string }, reviewCap?: number }> => ({ author: 'poise-user', actor: 'bit-mis', accounts: { me: 'poise-user', agent: 'bit-mis' } })),
 }))
 
 vi.mock('esbuild', async importOriginal => {
@@ -40,12 +41,18 @@ vi.mock('../server/logging', () => ({
   diagnosticFailure: mocks.diagnosticFailure,
 }))
 
+vi.mock('../server/provider-clis', async importOriginal => ({
+  ...await importOriginal<typeof import('../server/provider-clis')>(), prepareModelClis: mocks.prepareClis,
+}))
+
 vi.mock('../server/process', () => ({
+  CLAUDE_SUBSCRIPTION_CLI: '/fixture/claude',
   claudeSubscriptionEnvironment: vi.fn(),
   runFile: mocks.runFile,
   spawnDetached: vi.fn(),
 }))
-vi.mock('../server/claude-auth', () => ({
+vi.mock('../server/claude-auth', async importOriginal => ({
+  ...await importOriginal<typeof import('../server/claude-auth')>(),
   claudeAuth: {
     observeProcessFailure: vi.fn(),
     requireReady: vi.fn(),
@@ -886,6 +893,7 @@ describe('agent log snapshot sharing', () => {
 describe('manual review model selection', () => {
   beforeEach(async () => {
     mocks.models = {}
+    mocks.prepareClis.mockReset().mockResolvedValue({})
     mocks.runFile.mockReset().mockResolvedValue({ stdout: CATALOG_STDOUT, stderr: '' })
     const { invalidateCatalog } = await import('../server/models')
     invalidateCatalog()
@@ -900,6 +908,41 @@ describe('manual review model selection', () => {
     vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
     const { claudeAuth } = await import('../server/claude-auth')
     vi.mocked(claudeAuth.requireReady).mockReset().mockResolvedValue(undefined)
+  })
+
+  it('tries the next reviewer when preparation fails and gives it the same round', async () => {
+    const { ProviderCliUnavailable } = await import('../server/provider-clis')
+    mocks.prepareClis.mockRejectedValueOnce(new ProviderCliUnavailable('claude', 'launcher is missing'))
+    const { triggerPrReview } = await import('../server/agent')
+    const { spawnDetached } = await import('../server/process')
+    await triggerPrReview('https://github.com/owner/repo/pull/12')
+    expect(mocks.prepareClis).toHaveBeenCalledTimes(2)
+    expect(spawnDetached).toHaveBeenCalledOnce()
+    expect(vi.mocked(spawnDetached).mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--model', 'gpt-6-astra-ultra', '--review-round', '1', '--review-cap', '3',
+    ]))
+  })
+
+  it('counts completed manual reviews on the same head, including across replay', async () => {
+    const { rememberDetachedReviewRounds } = await import('../server/db')
+    const { triggerPrReview, replayAgentJob } = await import('../server/agent')
+    const { spawnDetached } = await import('../server/process')
+    const target = 'manual/round-fixture', head = 'a'.repeat(40)
+    const receipt = (index: number, source: string) => logRow({ id: String(index).repeat(32), repo: target,
+      source, action: 'reviewed_clean', outcome: 'clean', expected_head: head, head_sha: head, review_id: index,
+      correlation_id: `fixture-${index}` })
+    const first = receipt(1, 'poise:manual-review')
+    const second = receipt(2, 'poise:replay')
+    const snapshot = parseAgentLogList([first, second])
+    rememberDetachedReviewRounds(snapshot.entries)
+    rememberDetachedReviewRounds(snapshot.entries)
+    await replayAgentJob({ behavior: 'pr_review', repo: target, pr_id: 12 }, mocks.admit)
+    expect(vi.mocked(spawnDetached).mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--review-round', '3', '--review-cap', '3', '--review-cap-reached',
+    ]))
+    rememberDetachedReviewRounds(parseAgentLogList([receipt(3, 'poise:manual-review')]).entries)
+    await expect(triggerPrReview(`https://github.com/${target}/pull/12`)).rejects.toThrow('All 3 PR review rounds are complete')
+    expect(spawnDetached).toHaveBeenCalledOnce()
   })
 
   it('launches the catalog default with its recovery model when nothing is chosen', async () => {
@@ -927,10 +970,10 @@ describe('manual review model selection', () => {
     const { spawnDetached } = await import('../server/process')
     mocks.admit.mockResolvedValueOnce({ author: 'poise-user', actor: 'bit-mis',
       accounts: { me: 'poise-user', agent: 'bit-mis' },
-      reviewCapReached: { reviewRound: 5, reviewCap: 5 } })
+      reviewCap: 5 })
     await replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)
     expect(vi.mocked(spawnDetached).mock.calls[0][1]).toEqual(expect.arrayContaining(
-      ['--pr-approve', '--review-cap-reached', '--review-round', '5', '--review-cap', '5']))
+      ['--pr-approve', '--review-round', '1', '--review-cap', '5']))
   })
 
   it('records a rejected spawn and preserves its exact error', async () => {

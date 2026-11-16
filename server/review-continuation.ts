@@ -1,5 +1,12 @@
 import type { LogEntry } from './agent-log-parse'
 
+export const DEFAULT_PR_REVIEW_CAP = 3
+
+export function reviewRoundArgs(completed: number, cap: number): string[] {
+  const round = Math.min(completed + 1, cap)
+  return ['--review-round', String(round), '--review-cap', String(cap), ...(round === cap ? ['--review-cap-reached'] : [])]
+}
+
 export interface ReviewCheckpoint {
   root_call: string
   basis: string

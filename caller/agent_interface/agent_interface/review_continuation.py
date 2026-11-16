@@ -625,8 +625,7 @@ class Unit:
         if any(state["verified"].get(key) != value for key, value in verified.items()):
             state["verified"].update(verified)
             changed = True
-        if changed or any(response.get("error") for response in results):
-            self.session.checkpoint(advanced=changed)
+        self.session.checkpoint(advanced=changed)
 
     def terminal(self, verdict: dict, evidence) -> dict:
         if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence) \

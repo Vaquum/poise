@@ -6,7 +6,7 @@ import { agentInterfaceCwd } from './models'
 import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import { chainCiDependency, chainReviewResponse, ciRefreshRequest, heldCiRepair, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { chainCiDependency, chainReviewResponse, completedChainReviewRounds, ciRefreshRequest, heldCiRepair, implementationTestDependency, queueCiBlocker, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { datastoreViewOrCli, organizationDatastorePath, readDatastoreView } from './datastore-reader'
@@ -17,11 +17,12 @@ import { isExpectedFailure, runFile, spawnDetached } from './process'
 import { runDatastoreHealth, validatedHealth } from './datastore-health'
 import { requireCallerReceipts } from './service/caller-calls'
 import { releaseReplacementPending } from './release-background'
-import { reviewContinuationArgs } from './review-continuation'
+import { DEFAULT_PR_REVIEW_CAP, reviewContinuationArgs, reviewRoundArgs } from './review-continuation'
 import { reviewClearanceOnly } from './review-clearance'
 import { diagnosticFailure } from './logging'
+import { countReviewRounds } from './db'
 
-type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
+type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver' | 'reviewCap'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
 // Caller contains a 30-second GitHub command in a 60-second execution scope.
 // Leave the outer client room for startup, receipt commits and teardown too.
@@ -389,6 +390,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const headSince = prior?.pull?.head === head ? prior.pull.headSince : Date.now()
       if (typeof state.review_context !== 'string' || !/^[0-9a-f]{64}$/.test(state.review_context) || !Array.isArray(state.my_reviews)) throw new Error('native pull state lacks its review context')
       const reviews = state.my_reviews.map((item) => object(item, 'native review'))
+      observation.reviewsOutsideChain = countReviewRounds(chain.repository, number)
       const reviewReceipts = reviews.filter((review) => review.state !== 'PENDING').map((review) => ({ id: positive(review.id, 'review'),
         head: sha(review.commit_id, 'review commit'), state: String(review.state), invocation: typeof review.invocation_id === 'string' ? review.invocation_id : null,
         response: review.review_response, submittedAt: Date.parse(String(review.submitted_at)) }))
@@ -625,9 +627,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         if (checkpoint && (selected.model !== decision.reviewer?.model || selected.slot !== decision.reviewer.slot
           || !hooks.reviewContinuation?.(selected.model))) return null
         const continuation = hooks.reviewContinuation?.(selected.model) ? reviewContinuationArgs(selected.slot, checkpoint) : []
+        const round = reviewRoundArgs(completedChainReviewRounds(chain,
+          decision.behavior === 'review-pr' ? decision.basis : undefined, observation.reviewsOutsideChain),
+          observation.reviewCap ?? DEFAULT_PR_REVIEW_CAP)
         return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `https://github.com/${chain.repository}/pull/${pull.number}`,
           ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior),
-          ...(scope ? ['--review-scope', scope] : []), '--note', reviewNote, ...continuation] }
+          ...(scope ? ['--review-scope', scope] : []), '--note', reviewNote, ...round, ...continuation] }
       }
       if (decision.behavior === 'publish-issue') {
         const partial = [...chain.invocations].reverse().find((invocation) => invocation.callId === observation.publication.head_invocation)

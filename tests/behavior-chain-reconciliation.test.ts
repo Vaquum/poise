@@ -805,6 +805,7 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
   'revalidates one held red candidate through the original Call across restart and base advance: %s', async scenario => {
     const { db, journal } = setup()
     const obs = observation()
+    obs.prReviewers = []
     const head = obs.pull!.head, base = 'b'.repeat(40), updated = 'c'.repeat(40)
     const originalId = 'blocked-repair'
     const repairCall = 'a'.repeat(32), refreshCall = 'b'.repeat(32)
@@ -848,7 +849,10 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
       return { ...result, nativeCallId: refreshCall }
     })
     const readActionResult = vi.fn(async () => result)
-    const launch = vi.fn(async () => true)
+    const launch = vi.fn<ChainRuntimeOperations['launch']>(async (_invocation, _exit, allowed) => {
+      expect(allowed()).toBe(true)
+      return true
+    })
     const native = operations({ enabled: () => true, available: () => true, permitted: () => true, perform, readActionResult, launch,
       observe: async () => ({ ...structuredClone(obs), checkedAt: Date.now() }),
       readInvocations: async () => parseAgentLogStdout(JSON.stringify(calls), 'CI refresh regression'),
@@ -863,6 +867,7 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
     expect(chain.held).toBe('CI failed')
     if (scenario !== 'missing proof') obs.ciRefresh = { head, base, report: 18, remediation: base, workflow: 2,
       failedRun: 40, baselineRun: 42, passedRun: 43, checks: [41] }
+    if (scenario === 'missing proof') obs.prReviewers = [reviewer]
     if (scenario === 'operator hold') chain = record(journal, chain, { type: 'chain.held', reason: chain.held! })
     if (scenario === 'changed head') { obs.pull!.head = updated; obs.publication.head_sha = updated }
     if (scenario === 'queue entry') obs.pull!.queueEntry = 'queue-entry'
@@ -886,6 +891,7 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
       journal.rebuild()
       expect(journal.pendingResourcePage({ chain: '', position: -1 })).toEqual([])
       chain = record(journal, chain, { type: 'chain.resumed' })
+      obs.prReviewers = [reviewer]
       Object.assign(obs.pull!, { checksState: 'SUCCESS', failing: [] })
       chain = await tick()
       expect(chain.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
@@ -896,7 +902,12 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
     if (scenario !== 'accepted response' && !lost) {
       expect(perform).not.toHaveBeenCalled()
       expect(chain.held).toBe('CI failed')
-      expect(launch).not.toHaveBeenCalled()
+      if (scenario === 'missing proof') {
+        expect(chain.invocations.at(-1)).toMatchObject({ behavior: 'review-pr', state: 'started' })
+        expect(launch).toHaveBeenCalledOnce()
+        journal.rebuild()
+        expect(journal.read(chain.id)).toEqual(chain)
+      } else expect(launch).not.toHaveBeenCalled()
       return
     }
     expect(chain.held).toBe('CI failed')
@@ -917,6 +928,7 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
     Object.assign(obs.pull!, { checksState: 'SUCCESS', pending: false })
     // Even successful unrelated checks cannot release the hold.
     if (!lost) expect((await tick()).held).toBe('CI failed')
+    obs.prReviewers = [reviewer]
     obs.ciRefreshPassed = updated
     chain = await tick()
     if (lost) {
@@ -937,6 +949,7 @@ it.each(['accepted response', 'lost PUT response', 'operator hold', 'changed hea
 it('admits only a scoped exact-head conflict repair and never replenishes its retry budget across CI holds and rebuilds', async () => {
   const { db, journal } = setup()
   const obs = observation()
+  obs.prReviewers = []
   Object.assign(obs.publication, { state: 'open', merged: false, merge_sha: null })
   Object.assign(obs.pull!, { state: 'open', merged: false, mergeSha: null, checksState: 'FAILURE', failing: ['unit:failure'] })
   let chain = seed(journal)
@@ -1030,6 +1043,7 @@ it('admits only a scoped exact-head conflict repair and never replenishes its re
 it('releases a CI-only hold for a pending issue review when CI recovers on the conflicted head', async () => {
   const { journal } = setup()
   const obs = observation()
+  obs.prReviewers = []
   Object.assign(obs.publication, { state: 'open', merged: false, merge_sha: null })
   Object.assign(obs.pull!, { state: 'open', merged: false, mergeSha: null, checksState: 'FAILURE', failing: ['unit:failure'] })
   let chain = seed(journal)

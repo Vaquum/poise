@@ -33,7 +33,8 @@ from . import progress, review_budget, review_receipt, review_repository, review
 from . import review_cap as followup
 
 
-MAX_INSPECTION_ROUNDS = 12
+MAX_INSPECTION_ROUNDS = 3
+INSPECTION_LIMIT_WARNING = "Repository inspection reached its round limit. Review used the source gathered so far."
 SUBMISSION_RESERVE_SECONDS = 60
 VERIFICATION_RESERVE_SECONDS = 60
 CODEX_MAX_INPUT_CHARS = 1_048_576
@@ -204,7 +205,7 @@ def events(stdout: str) -> list[dict]:
 
 
 def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
-                          review_round: int, review_cap: int,
+                          review_round: int | None, review_cap: int | None,
                           comments: list, pwd: str, *, checkpoint=None) -> str:
     try:
         node = json.loads(packet)
@@ -224,7 +225,7 @@ def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
             "a capped approval round needs a readable PR packet", "review_contract_violation")
     existing = checkpoint.followup_issue() if checkpoint is not None else None
     if existing is None:
-        existing = followup.find_capped_issue(packet, str(number), head)
+        existing = followup.find_capped_issue(packet, str(number), head, comments)
     if existing is not None:
         return followup.issue_reference(existing)
     issue = followup.file_followup_issue(
@@ -265,6 +266,13 @@ def _stage_texts(text: str, packet: str) -> Iterator[str]:
         yield text.replace(packet, stage, 1)
 
 
+_PRIORITY_PREFIX = re.compile(r"^\s*\[p([0-3])\]\s*", re.IGNORECASE)
+
+
+def _finding_text(body: str) -> str:
+    return " ".join(_PRIORITY_PREFIX.sub("", body).casefold().split())
+
+
 def _reaffirming_thread(comment: dict, threads: list[dict], *, in_since_diff: bool) -> dict | None:
     """The unresolved thread this comment reaffirms, if any.
 
@@ -275,18 +283,45 @@ def _reaffirming_thread(comment: dict, threads: list[dict], *, in_since_diff: bo
     collides with an unrelated thread's base line, and remapping must
     win so the finding is not discarded as a duplicate.
     """
-    body = " ".join(comment["body"].lower().split())
+    body = _finding_text(comment["body"])
     for thread in threads:
         if thread.get("is_resolved") or thread.get("path") != comment["path"]:
             continue
         if thread.get("is_outdated"):
-            if any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
+            if any(body == _finding_text(text) for text in thread.get("bodies", [])):
                 return thread
         elif thread.get("line") == comment["line"] and thread.get("side") == comment["side"]:
             if not in_since_diff or \
-                    any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
+                    any(body == _finding_text(text) for text in thread.get("bodies", [])):
                 return thread
     return None
+
+
+def _final_findings(packet: str, comments: list[dict]) -> tuple[list[dict], list[dict]]:
+    threads = json.loads(packet).get("review_threads", [])
+    findings: dict[tuple, tuple[int | None, dict]] = {}
+    for comment in comments:
+        text = _finding_text(comment["body"])
+        key = (comment["path"], comment["line"], comment["side"], text)
+        mark = _PRIORITY_PREFIX.match(comment["body"])
+        rank = int(mark[1]) if mark else None
+        previous = findings.get(key)
+        if previous is None or rank is not None and (previous[0] is None or rank < previous[0]):
+            findings[key] = (rank, comment)
+    breaking, deferred = [], []
+    for rank, comment in findings.values():
+        thread = _reaffirming_thread(comment, threads, in_since_diff=True)
+        original = next((body for body in (thread or {}).get("bodies", [])
+                         if _finding_text(body) == _finding_text(comment["body"])), None)
+        if original is not None and rank is None:
+            mark = _PRIORITY_PREFIX.match(original)
+            # A reaffirmed legacy blocker cannot be cleared without reclassification.
+            rank = int(mark[1]) if mark else 0
+        if rank == 0:
+            breaking.append({**comment, "body": original} if original is not None else comment)
+        else:
+            deferred.append(comment)
+    return breaking, deferred
 
 
 def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str,
@@ -406,8 +441,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                  timeout_s: int, deadline: float, repository, behavior: str, verify_fixes: bool = False,
                  groups_remaining: int | None = None, initializing: bool = False,
                  total_groups: int = 1, expected_group_seconds: float | None = None,
-                 checkpoint=None, warnings: list[str] | None = None) -> tuple[str, dict, float]:
+                 checkpoint=None, warnings: list[str] | None = None,
+                 inspection_state: dict | None = None) -> tuple[str, dict, float]:
     warnings = warnings if warnings is not None else []
+    state = checkpoint.session.state if checkpoint is not None else inspection_state if inspection_state is not None else {}
     expected = checkpoint.head if checkpoint is not None else getattr(repository, "info", {}).get("head_sha")
     schema = verdict_schema(behavior, inspection=repository is not None, verify_fixes=verify_fixes)
     if checkpoint is not None:
@@ -418,7 +455,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
     (root / "verdict.schema.json").write_text(json.dumps(schema))
     context = checkpoint.context() if checkpoint is not None else ""
     pending = checkpoint.session.state["pending"] if checkpoint is not None else []
-    round_number = 0
+    round_number = min(state.get("inspection_rounds", 0), MAX_INSPECTION_ROUNDS)
     correction_attempted = False
     group_deadline = None
     inspection_cutoff = None
@@ -500,7 +537,8 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                                     outcome="resource_failure", provider=model.provider))
         lookup_closed = round_number == MAX_INSPECTION_ROUNDS
         finish_soon = inspection_cutoff is not None and monotonic() >= inspection_cutoff
-        remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
+        remaining = (f"\n\nInspection round {min(round_number + 1, MAX_INSPECTION_ROUNDS)} of {MAX_INSPECTION_ROUNDS}. "
+                     f"Inspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
                      f"Analysis time remaining: {int(timeout)} seconds. "
                      "Batch independent inspection requests in one step. "
                      "Review the supplied diff and available repository context. "
@@ -509,6 +547,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                      + (" The equal-share inspection allowance is spent; omit optional inspection. "
                         "Finish using the source already supplied." if finish_soon else "")
                      if repository is not None else "")
+        if repository is not None and round_number >= MAX_INSPECTION_ROUNDS - 1:
+            if not lookup_closed:
+                remaining += "\nThis is the last inspection round. No further inspection rounds will follow. "
+            remaining += followup.FINAL_FINDINGS_POLICY
         if lookup_closed:
             remaining += "\nRepository inspection is finished. Return your verdict using the available source and requests=[]."
         if checkpoint is not None:
@@ -542,6 +584,9 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                         verdict = checkpoint.terminal(verdict, evidence)
                     except ValueError as error:
                         raise InvalidVerdict(str(error)) from error
+                if repository is not None and round_number >= MAX_INSPECTION_ROUNDS - 1:
+                    state["inspection_rounds"] = MAX_INSPECTION_ROUNDS
+                    review_repository.warn(warnings, INSPECTION_LIMIT_WARNING)
                 for request in pending:
                     review_repository.warn(warnings,
                                            f"{review_repository.inspection_target(request)} was not read before the verdict.")
@@ -592,7 +637,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             added = ""
             round_number = MAX_INSPECTION_ROUNDS
         elif round_number == MAX_INSPECTION_ROUNDS:
-            review_repository.warn(warnings, "Repository inspection reached its round limit. Review used the source gathered so far.")
+            review_repository.warn(warnings, INSPECTION_LIMIT_WARNING)
         for response in result["results"]:
             request = response["request"]
             if request in pending:
@@ -601,6 +646,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                 following = {**request, "start_line": response["next_line"]}
                 if following not in pending:
                     pending.append(following)
+        state["inspection_rounds"] = round_number
         if checkpoint is not None:
             checkpoint.inspected(step, result)
         context += added
@@ -632,13 +678,14 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     try:
         total = review_stages.stage_count(packet) if packet and not review_continuation.enabled() else 1
         staged = total > 1
-        candidates = set(json.loads(packet).get("verification_candidates", [])) if packet and not capped else set()
+        candidates = set(json.loads(packet).get("verification_candidates", [])) if packet else set()
         verified: set[int] = set()
         with resource_ownership.temporary_directory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
             root = Path(work)
             deadline = monotonic() + min(timeout_s, PROVIDER_ANALYSIS_SECONDS.get(model.provider, timeout_s))
             prior: list[dict] = []
+            inspection_state: dict[str, int] = {}
             assessment: dict | None = None
             expected_group_seconds = None
             if review_continuation.enabled():
@@ -664,7 +711,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                              timeout_s, deadline, repository, behavior, bool(candidates),
                                              groups_remaining=total - index if staged else None,
                                              initializing=staged and index == 0, total_groups=total,
-                                             expected_group_seconds=expected_group_seconds, warnings=warnings)
+                                             expected_group_seconds=expected_group_seconds, warnings=warnings,
+                                             inspection_state=inspection_state)
                 expected_group_seconds = ((expected_group_seconds or 0) * index + group_seconds) / (index + 1)
                 prior.extend(verdict["comments"])
                 assessment = verdict["assessment"]
@@ -688,9 +736,12 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                         review_repository.warn(warnings, f"PR diff for {file['path']} omitted. {file.get('reason') or 'Source unavailable.'}")
                 if verdict["action"] == "approve":
                     verdict = {**verdict, "action": "reviewed_clean"}
+            inspection_finished = (checkpoint.state if checkpoint is not None else inspection_state).get("inspection_rounds") == MAX_INSPECTION_ROUNDS
             if warnings and (checkpoint is None or checkpoint.finalization is None):
                 limitations = verdict["assessment"]["limitations"]
-                note = "\n\nRepository inspection warnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
+                reported = [INSPECTION_LIMIT_WARNING, *[warning for warning in warnings if warning != INSPECTION_LIMIT_WARNING]] \
+                    if inspection_finished else warnings
+                note = "\n\nRepository inspection warnings:\n" + "\n".join(f"- {warning}" for warning in reported)
                 note = note[:2500]
                 verdict["assessment"]["limitations"] = limitations[:4000 - len(note)] + note
             watch.check_closed()
@@ -707,16 +758,6 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     "review_contract_violation",
                     diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
                                         stderr=cause, provider=model.provider, submission="none")) from error
-            if len(verdict["comments"]) > 100:
-                failure = review_budget.ReviewLimitError(
-                    f"Completed review has {len(verdict['comments'])} findings; the single-review inline limit is 100; "
-                    "complete findings retained on the original Call; no review submitted",
-                    "review_contract_violation",
-                    diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
-                                        provider=model.provider, submission="none"))
-                if checkpoint is not None:
-                    checkpoint.finalization_failure(failure)
-                raise failure
             try:
                 if checkpoint is None:
                     _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
@@ -725,23 +766,16 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     checkpoint.remap(lambda: _validate_since_positions(pwd, pr, actor_name, head, packet, verdict))
                     checkpoint.retain_finalization(verdict, head, "ready")
                 raw = json.dumps(verdict, ensure_ascii=False)
-                if not packet and verdict["action"] != "request_changes":
-                    review_receipt.complete_response(verdict["assessment"], head)
-                    raise review_budget.ReviewLimitError(
-                        "Review incomplete: required source coverage is not complete; no clearance submitted",
-                        "review_incomplete", diagnostic_envelope(operation="provider.review", phase="validating",
-                                                                outcome="incomplete", submission="none"))
-                if coverage == "complete" and capped and behavior == "pr_approve" and verdict["action"] == "request_changes" \
-                        and all(re.match(r"\s*\[p[12]\]", comment["body"], re.IGNORECASE) for comment in verdict["comments"]):
-                    # Only explicitly nonbreaking findings may be deferred.
-                    if review_round is None or review_cap is None:
-                        raise review_budget.ReviewLimitError(
-                            "a capped approval round needs its round and cap numbers", "review_contract_violation")
-                    reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
-                                                      verdict["comments"], pwd, checkpoint=checkpoint)
-                    verdict = {**verdict, "action": "approve", "comments": []}
-                    capped_note = (f"\nReview cap reached (round {review_round} of {review_cap}); "
-                                   f"findings filed as {reference}.")
+                final_round = capped or inspection_finished
+                if final_round and verdict["action"] == "request_changes":
+                    breaking, deferred = _final_findings(packet, verdict["comments"])
+                    if deferred:
+                        reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
+                                                          deferred, pwd, checkpoint=checkpoint)
+                        capped_note = f"\nNonbreaking findings filed as {reference}."
+                    action = ("request_changes" if breaking else "approve" if behavior == "pr_approve" and coverage == "complete"
+                              else "reviewed_clean")
+                    verdict = {**verdict, "action": action, "comments": breaking}
             except (review_budget.ReviewLimitError, AgentPreflightError, OSError, ValueError) as error:
                 if isinstance(error, review_continuation.Continuation):
                     raise
@@ -757,6 +791,22 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     "no review submitted", "review_contract_violation",
                     diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
                                         stderr=cause, provider=model.provider, submission="none")) from error
+            if not packet and verdict["action"] != "request_changes":
+                review_receipt.complete_response(verdict["assessment"], head)
+                raise review_budget.ReviewLimitError(
+                    "Review incomplete: required source coverage is not complete; no clearance submitted",
+                    "review_incomplete", diagnostic_envelope(operation="provider.review", phase="validating",
+                                                            outcome="incomplete", submission="none"))
+            if len(verdict["comments"]) > 100:
+                failure = review_budget.ReviewLimitError(
+                    f"Completed review has {len(verdict['comments'])} findings; the single-review inline limit is 100; "
+                    "complete findings retained on the original Call; no review submitted",
+                    "review_contract_violation",
+                    diagnostic_envelope(operation="provider.review", phase="finalizing", outcome="resource_failure",
+                                        provider=model.provider, submission="none"))
+                if checkpoint is not None:
+                    checkpoint.finalization_failure(failure)
+                raise failure
     except review_stages.StageError as error:
         cause = bounded_cause(str(error) or "invalid review packet stages")
         diagnostic = diagnostic_envelope(operation="provider.review", phase="staging",

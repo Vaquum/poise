@@ -6,7 +6,7 @@ import type { DetachedProcessExit } from './process'
 import { APPROVAL_CONVERSATION_REFUSAL, approvalConversationRefusal, automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS,
   chainMergeReviewDecision, chainReviewResponse, ciRefreshRequest, closedChainTarget, decideBehaviorChain, exhaustedApprovalConversationHold,
   heldCiRepair, implementationTestDependency, queueCiBlocker, repairQueueBlocker, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
-import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
+import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, reviewCanPassRepairHold, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
@@ -559,7 +559,8 @@ export class BehaviorChainRuntime {
     return current.invocations.some(candidate => candidate.id === invocation.id && candidate.state !== 'settled')
       && (!source || this.journal.read(source.id)?.sequence === source.sequence)
       && !closedChainTarget(current, current.observation as ChainObservation | null, invocation.behavior)
-      && !current.held && this.operations.enabled() && accounts.author.toLowerCase() === current.author.toLowerCase() && accounts.reviewer.toLowerCase() === current.reviewer.toLowerCase()
+      && (!current.held || reviewCanPassRepairHold(current, invocation.behavior))
+      && this.operations.enabled() && accounts.author.toLowerCase() === current.author.toLowerCase() && accounts.reviewer.toLowerCase() === current.reviewer.toLowerCase()
       && this.operations.permitted(current, { kind: 'invoke', behavior: invocation.behavior, actor: invocation.actor,
         basis: invocation.basis, reviewer: null, reason: 'start the previously admitted native invocation' })
   }
@@ -1655,7 +1656,8 @@ export class BehaviorChainRuntime {
           status: 'completed', ...evidence } })
       return
     }
-    if (!this.operations.enabled() || !this.operations.available() || chain.held || invocation.state === 'uncertain') return
+    if (!this.operations.enabled() || !this.operations.available() || invocation.state === 'uncertain'
+      || chain.held && !reviewCanPassRepairHold(chain, invocation.behavior, observation)) return
     const accounts = this.operations.accounts()
     if (accounts.author.toLowerCase() !== chain.author.toLowerCase() || accounts.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()
       || !this.operations.permitted(chain, { kind: 'invoke', actor: invocation.actor, behavior: invocation.behavior, basis: invocation.basis,

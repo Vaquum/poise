@@ -42,6 +42,7 @@ class TestGovernedClaudeContinuation(TestCase):
         self.stack.enter_context(patch.object(issue_review, "_cwd_pids", return_value=[]))
         self.stack.enter_context(patch.dict(os.environ, {"CLAUDE_CLI": "fixture-claude"}))
         self.posts, self.launches = [], []
+        self.followups = []
         self.reply = lambda prompt: verdict(prompt)
         self.lost_ack = False
         self.review_state, self.review_reads = None, 0
@@ -86,6 +87,10 @@ class TestGovernedClaudeContinuation(TestCase):
             self.assertIsNotNone(self.review_state)
             self.review_reads += 1
             return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(self.review_state))
+        if flag == "--create-pr-linked-issue":
+            self.followups.append(command[command.index("--body") + 1])
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+                "action": "created_pr_linked_issue", "issue": {"number": 13, "html_url": "https://github.com/o/r/issues/13"}}))
         self.assertIn(flag, ("--request-changes", "--approve-pr", "--reviewed-clean"))
         body = review_receipt.begin_submission("Verified final verdict", HEAD)
         self.posts.append((submission_args(command), body))
@@ -141,7 +146,8 @@ class TestGovernedClaudeContinuation(TestCase):
         rules = [review_repository.INSPECTION_RULE]
         self.assertEqual(json.loads(command[command.index("--settings") + 1])["permissions"]["allow"], rules)
         self.assertEqual(kwargs["env"]["GITHUB_INTERFACE_REVIEW_ROOT"], str(self.root))
-        attempts = pr_approve.allowed("#12", "reviewer", HEAD, capped=True) + pr_review.allowed("#12", "reviewer", HEAD)
+        attempts = pr_approve.allowed("#12", "reviewer", HEAD) + pr_review.allowed("#12", "reviewer", HEAD) + [
+            "Bash(github-interface --create-pr-linked-issue '#12' --title * --body * --token-user reviewer)"]
         for rule in attempts:
             mutation = rule[5:-1].replace("*", "'[]'")
             with patch.dict(os.environ, kwargs["env"]), patch.object(sys, "argv", ["guard", mutation]), \
@@ -194,14 +200,20 @@ class TestGovernedClaudeContinuation(TestCase):
         self.assertEqual(self.progress(root)["publisher"], row["id"])
         self.assertEqual(len(self.posts), 1)
         command, body = self.posts[0]
-        self.assertEqual(json.loads(command[command.index("--comments") + 1]), [EARLY, LATE])
+        self.assertEqual(json.loads(command[command.index("--comments") + 1]), [LATE] if capped else [EARLY, LATE])
+        if capped:
+            self.assertEqual(len(self.followups), 1)
+            self.assertIn(EARLY["body"], self.followups[0])
+            self.assertNotIn(LATE["body"], self.followups[0])
+        else:
+            self.assertEqual(self.followups, [])
         self.assertIn(row["id"], body)
         self.assertEqual(len({call for call, _command, _kwargs in self.launches}), 4)
 
     def test_governed_large_review_resumes_validated_inspection_without_provider_recovery(self):
         self.large_review("pr_review")
 
-    def test_governed_capped_approval_keeps_early_p1_and_late_p0_without_partial_writes(self):
+    def test_governed_capped_approval_files_an_early_p1_and_requests_changes_for_a_late_p0(self):
         self.large_review("pr_approve", capped=True)
 
     def test_original_resources_must_release_before_claude_can_resume(self):

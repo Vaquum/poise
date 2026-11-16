@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import type { Catalog } from '../server/models'
 
-const mocks = vi.hoisted(() => ({ ensure: vi.fn(), finished: vi.fn() }))
+const mocks = vi.hoisted(() => ({ ensure: vi.fn(), finished: vi.fn(), providerFailure: vi.fn() }))
 vi.unmock('../server/provider-clis')
 vi.mock('../scripts/provider-cli-updates.mjs', () => ({ ensureProviderCli: mocks.ensure }))
 vi.mock('../server/release-background', () => ({ trackReleaseBackground: () => mocks.finished }))
+vi.mock('../server/alerts/producers', () => ({ providerFailure: mocks.providerFailure }))
 import { prepareModelClis } from '../server/provider-clis'
 
 const catalog = { models: [{ identity: 'sol-max', provider: 'codex' }] } as Catalog
@@ -29,4 +30,13 @@ it('preserves the operator configured Codex wrapper for Caller workers', async (
   mocks.ensure.mockResolvedValue({ provider: 'codex', status: 'current', launchPath: '/immutable/codex/bin/codex.js' })
   expect(await prepareModelClis(catalog, ['sol-max'])).toEqual({})
   expect(process.env.CODEX_CLI).toBe('/operator/codex-wrapper')
+})
+
+it('keeps a runnable review when its recovery CLI is unavailable and reports that provider once', async () => {
+  const reviewCatalog = { models: [...catalog.models, { identity: 'opus', provider: 'claude' }] } as Catalog
+  mocks.ensure.mockImplementation(async (provider) => provider === 'claude'
+    ? { status: 'current', launchPath: '/fixture/claude' }
+    : { status: 'unavailable', error: 'broken installation' })
+  expect(await prepareModelClis(reviewCatalog, ['opus', 'sol-max'], true)).toEqual({})
+  expect(mocks.providerFailure).toHaveBeenCalledExactlyOnceWith('codex', expect.stringContaining('broken installation'))
 })

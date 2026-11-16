@@ -4,6 +4,7 @@ export const NOTIFICATION_PLACEMENT = {
   chat_waiting: { actor: 'user', logging: 'none', lifecycle: 'pending-session' },
   chat_turn_finished: { actor: 'user', logging: 'separate-failure-only', lifecycle: 'long-turn-one-hour' },
   sign_in_needed: { actor: 'user', logging: 'confirmed-failure-only', lifecycle: 'confirmed-false-until-true' },
+  provider_unavailable: { actor: 'user', logging: 'provider-failure', lifecycle: 'provider-failure-until-success' },
   behavior_held: { actor: 'cause-owner', logging: 'exact-attempt-cause', lifecycle: 'material-cause-until-authoritative-clearance' },
   datastore_sync_failing: { actor: 'user-operator', logging: 'account-sync-condition', lifecycle: 'fifteen-minutes-until-success' },
   storage_low: { actor: 'user-operator', logging: 'exact-crossing', lifecycle: 'five-gib-downward-rearm-six' },

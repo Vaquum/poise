@@ -46,6 +46,16 @@ function setup(path = ':memory:') {
   return { db, journal, record, observation, merge, call, current: () => chain }
 }
 
+it('retains the admitted replacement model as the review proof for its slot', () => {
+  const { observation, current } = setup()
+  observation.prReviewers = [{ ...reviewer, model: 'unavailable', recovery: reviewer.model }]
+  const chain = current()
+  expect(chainReviewClearance(chain, observation, Date.now())).toBeNull()
+  expect(chainMergeReviewDecision(chain, observation, Date.now())?.panel).toMatchObject([
+    { slot: reviewer.slot, model: reviewer.model, invocation: 'original-review' },
+  ])
+})
+
 function reconciliation(live: ChainObservation): ChainRuntimeOperations {
   const forbidden = async () => { throw new Error('merge reconciliation cannot start work') }
   return { enabled: () => false, accounts: () => ({ author: 'author', reviewer: 'reviewer' }),

@@ -375,8 +375,14 @@ async function exhaustedReviews(journal: BehaviorChainJournal,
         resources_settled_at: new Date(NOW - 100_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
   }
   const decision = decideBehaviorChain(chain, fresh, NOW)
-  if (decision.kind !== 'hold') throw new Error('Fixture must exhaust its PR review attempts')
-  return record(journal, chain, { type: 'chain.held', reason: decision.reason })
+  if (decision.kind === 'hold') return record(journal, chain, { type: 'chain.held', reason: decision.reason })
+  // Exercise reporting on holds retained from before provider fall-through.
+  if (!failures.some(failure => ['review_provider_exit', 'authentication_failed'].includes(failure.error_code ?? ''))) {
+    throw new Error('Fixture must exhaust its PR review attempts')
+  }
+  expect(decision).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+  return record(journal, chain, { type: 'chain.held',
+    reason: `review-pr failed before publication three times: ${failures.at(-1)!.error}` })
 }
 async function exhaustedApprovals(journal: BehaviorChainJournal,
   failures: Array<Pick<LogEntry, 'error' | 'error_code' | 'diagnostic'> & { callId?: string }> = REVIEW_ERRORS.map(error => ({ error, error_code: 'review_budget_exhausted' }))) {

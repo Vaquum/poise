@@ -22,7 +22,7 @@ import { projectChainPrStatus } from './behavior-chain-pr-status'
 import { getBehaviorChainSettings } from './settings'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { releaseBackgroundPaused } from './release-background'
-import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
+import { DEFAULT_PR_REVIEW_CAP, parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 import {
   BEHAVIOR_KEYS,
   chainBehaviorKey,
@@ -420,7 +420,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
   const mergePrsEnabled = isEnabled('merge-prs')
   const mergePrsPaused = isPaused('merge-prs')
   const mergePrsRunnable = mergePrsEnabled && !mergePrsPaused
-  const cap = getReviewCap()
+  const cap = getReviewCap() ?? DEFAULT_PR_REVIEW_CAP
   // Only the reported pull requests' launches are looked up below.
   const reviewStates = listPrReviewStates(inventory.map(({ pr }) => pr.number))
   const liveClaims = listLiveReviewClaims()

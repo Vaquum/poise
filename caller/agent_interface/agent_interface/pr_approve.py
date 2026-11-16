@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 import shlex
 
-from . import atoms, review_continuation, review_receipt, review_repository
+from . import atoms, review_continuation, review_repository
 from . import review_cap as followup
 from .pr_review import VERIFY_FIXES
 
@@ -22,6 +21,7 @@ SEVERITY = (
     "p0: breaks a common path — data loss, crash, security hole, auth bypass.",
     "p1: wrong on an edge or inverse case, a swallowed error, a race, missing backoff.",
     "p2: a real defect worth blocking on, with smaller blast radius.",
+    "p3: a real but normally non-blocking defect.",
 )
 RULES = (
     "Review for correctness, not style.",
@@ -46,74 +46,9 @@ pr_number = atoms.pr_number
 repo_name = atoms.repo_name
 
 
-def capped_policy(review_round: int, review_cap: int) -> str:
-    return (
-        f"This is review round {review_round} of a {review_cap}-round cap. "
-        "Review the supplied immutable PR packet as usual. On and after the capped round, "
-        "if any verified p0 (breaks a common path) remains, request changes exactly once "
-        "with ALL blocking inline findings, including p1/p2 findings. Missing or unrecognized "
-        "severity also stays blocking. Only when every finding body explicitly starts with "
-        "[p1] or [p2] (case-insensitive), file the findings as ONE follow-up issue, then approve exactly once."
-        " Pass --assessment-json with a JSON object: verdict (your substantive assessment, "
-        "20-4000 characters), reviewed_context (what you inspected, 20-4000 characters), "
-        "and limitations (including unverified tests, 4-4000 characters)."
-    )
-
-
-def capped_rules(
-    repo: str,
-    pr: str,
-    head: str,
-    review_round: int,
-    review_cap: int,
-    actor: str,
-) -> tuple[str, ...]:
-    number = atoms.pr_number(pr)
-    ref = shlex.quote(atoms.pr_ref(pr))
-    issue_command = (
-        f"github-interface --create-pr-linked-issue {ref} --title "
-        f"{shlex.quote(followup.render_title(repo, number, review_round))} "
-        f"--body <body> --token-user {atoms.actor(actor)}"
-    )
-    return (
-        "Review for correctness, not style.",
-        "Confirm requested changes are addressed on the supplied head.",
-        "Review the changed contract and every diff-scoped consumer.",
-        "Confirm every defect against the cited diff line before commenting.",
-        "Do not block on unverified assumptions about dependency internals; require evidence in the supplied packet.",
-        "State the defect and impact in one sentence; do not write the fix.",
-        "Prefix each new finding body with [p0], [p1], or [p2]; preserve original bodies when reaffirming existing threads.",
-        "Put one inline comment per {levels} finding into the single change request or follow-up issue; for non-{levels}, do nothing.",
-        "Never publish duplicate findings or re-litigate resolved findings.",
-        "Reaffirm an unresolved current or outdated finding only after confirming it still blocks the supplied head, using its original body and thread coordinates.",
-        "github-interface deduplicates existing findings and can submit a summary-only change request reaffirming the unresolved blocker.",
-        "Check for p0, missing or unrecognized severity BEFORE checking linked issues. If any remains, "
-        "submit the ordinary atomic change request with ALL blocking findings; do not defer any or approve, even if a marked follow-up issue exists.",
-        f"Only when all findings explicitly start with [p1] or [p2] (case-insensitive), check the packet's linked_issues for an issue whose body contains "
-        f"`{followup.marker(number, head)}`. If one exists, reuse it: file nothing.",
-        "If only explicitly nonbreaking findings remain and no such issue exists, file ONE follow-up issue with "
-        f"exactly this command shape: `{issue_command}`. The body starts with the marker line "
-        f"`{followup.marker(number, head)}`, then one section per finding with its severity, "
-        "path, line, side, a permalink pinned to the supplied head for new-side findings or "
-        "to the packet's pull.base.sha for removed-side findings (URL-encode the path, so a "
-        "`#` or space cannot break the link), and the defect-and-impact "
-        "sentence. The issue links back to the pull request itself.",
-        "File the issue BEFORE approving. If no blocking finding remains, approve without filing an issue.",
-        "If filing the issue fails, submit NOTHING and report the error: never approve a round whose findings were lost.",
-        "Finish with exactly one atomic review: a change request when any finding must stay blocking, otherwise an approval.",
-    )
-
-
-def allowed(pr: str, actor: str, expected_head: str, capped: bool = False) -> list[str]:
+def allowed(pr: str, actor: str, expected_head: str) -> list[str]:
     ref = shlex.quote(atoms.pr_ref(pr))
     fixed = atoms.fixed_mutation_args(actor, expected_head)
-    if capped:
-        token = f"--token-user {atoms.actor(actor)}"
-        return [
-            f"Bash(github-interface --request-changes {ref} --comments-json * --assessment-json * {fixed})",
-            f"Bash(github-interface --create-pr-linked-issue {ref} --title * --body * {token})",
-            f"Bash(github-interface --approve-pr {ref} --assessment-json * {fixed})",
-        ]
     return [
         f"Bash(github-interface --request-changes {ref} --comments-json * --assessment-json * {fixed})",
         f"Bash(github-interface --approve-pr {ref} --assessment-json * {fixed})",
@@ -137,7 +72,9 @@ def run(
     if capped and (review_round is None or review_cap is None):
         raise ValueError("a capped approval round needs its round and cap numbers")
     spec = atoms.CATALOG.review_model("pr_approve", model)
-    tools = allowed(pr, actor, expected_head, capped) if spec.provider == "claude" else []
+    bounded = review_continuation.enabled() or (review_round is not None and spec.provider == "claude")
+    governed = spec.provider == "claude" and not bounded
+    tools = allowed(pr, actor, expected_head) if governed else []
     # A follow-up round reviews the diff since the last reviewed head, not
     # the whole PR again. The same head (or no prior review) reviews everything.
     since = atoms.last_reviewed_head(pwd, pr, actor)
@@ -155,30 +92,18 @@ def run(
         # round: review the full diff once, and say so in the prompt.
         lost_since = since
         packet_text = atoms.packet(pwd, pr, actor, expected_head, p, since_head=None)
-    bounded = review_continuation.enabled()
+    policy = POLICY if governed else atoms.STRUCTURED_POLICY
     if bounded:
-        tools = [review_repository.INSPECTION_RULE] if spec.provider == "claude" else []
-    if capped and not bounded and review_receipt.coverage_disposition(json.loads(packet_text)) != "complete":
-        capped = False
         if spec.provider == "claude":
-            tools = allowed(pr, actor, expected_head)
-    if capped and spec.provider == "claude" and not bounded:
-        policy: str = capped_policy(review_round or 0, review_cap or 0)
-        rules = capped_rules(repo_name(pr, pwd), pr, expected_head, review_round or 0, review_cap or 0, actor)
-    else:
-        # Structured providers review as usual; the harness files the
-        # follow-up issue and approves only explicitly nonbreaking findings.
-        policy = POLICY if spec.provider == "claude" and not bounded else atoms.STRUCTURED_POLICY
-        rules = RULES
-    if review_continuation.enabled():
+            tools = [review_repository.INSPECTION_RULE]
         policy += " " + review_repository.REQUEST_POLICY
-        if capped:
-            policy += (f" Caller applies review round {review_round} of a {review_cap}-round cap only after "
-                       "complete analysis. Return every finding regardless of severity; Caller owns issue filing and approval.")
+    round_note = followup.round_policy(review_round, review_cap, capped)
+    if round_note:
+        policy += " " + round_note
     text = atoms.prompt(
         policy,
         SEVERITY,
-        rules,
+        RULES,
         packet_text,
         tools,
         note,
@@ -187,7 +112,7 @@ def run(
     if lost_since is not None and not review_continuation.enabled():
         text += (f"\n\nThe last reviewed head ({lost_since}) is no longer fetchable; "
                  "this round reviews the full diff instead.")
-    if review_continuation.enabled():
+    if bounded:
         with review_repository.prepare(pwd, pr, actor, expected_head, packet_text, allow_unavailable=True) as repository:
             return atoms.run_agent(pwd, SYSTEM + " " + review_repository.POLICY,
                 text + repository.prompt(), tools, "pr_approve", timeout_s,

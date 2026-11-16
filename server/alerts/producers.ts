@@ -121,6 +121,20 @@ export function providerSignInRejected(id: AccountId, failure: { callId: string,
   })
 }
 
+export function providerFailure(provider: string, cause: string): void {
+  const dedupeKey = `provider-unavailable:${provider}`
+  const title = `${ACCOUNT_NAMES[provider as AccountId] ?? provider} needs your attention`
+  const body = clip(cause, 500)
+  record('the provider failure alert', () => {
+    raiseAlert({ kind: 'provider_unavailable', dedupeKey, title, body, path: FRONT_PAGE, target: { view: 'behaviors' } })
+    updateAlertDetails(dedupeKey, title, body)
+  })
+}
+
+export function providerRecovered(provider: string): void {
+  record('the end of a provider failure', () => resolveAlert(`provider-unavailable:${provider}`))
+}
+
 export function providerSignInVerified(id: AccountId): void {
   if (providerSignInFailure(id)?.verifiedAt == null) return
   record(`the end of the ${id} runtime sign-in alert`, () => resolveAlert(`sign-in:${id}`))

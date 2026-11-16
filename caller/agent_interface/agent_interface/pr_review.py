@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shlex
 
-from . import atoms
+from . import atoms, review_cap as followup
 from . import review_continuation, review_repository
 
 SYSTEM = (
@@ -72,18 +72,24 @@ def run(
     p: str | None = None,
     model: str | None = None,
     review_scope: str = "",
+    capped: bool = False,
+    review_round: int | None = None,
+    review_cap: int | None = None,
 ) -> str:
     spec = atoms.CATALOG.review_model("pr_review", model)
     packet = atoms.packet(pwd, pr, actor, expected_head, p)
-    governed = spec.provider == "claude" and not review_continuation.enabled()
+    governed = spec.provider == "claude" and review_round is None and not review_continuation.enabled()
     tools = allowed(pr, actor, expected_head) if governed else []
     with review_repository.prepare(pwd, pr, actor, expected_head, packet, allow_unavailable=not governed) as repository:
         if spec.provider == "claude":
             tools.append(review_repository.INSPECTION_RULE)
         policy = POLICY if governed else atoms.STRUCTURED_POLICY + " " + review_repository.REQUEST_POLICY
+        round_note = followup.round_policy(review_round, review_cap, capped)
+        policy = " ".join(part for part in (policy, round_note) if part)
         text = atoms.prompt(policy, SEVERITY, RULES, packet, tools, note, p) + repository.prompt()
         return atoms.run_agent(
             pwd, SYSTEM + " " + review_repository.POLICY, text, tools, "pr_review", timeout_s,
             model=spec.identity, pr=pr, actor_name=actor, head=expected_head, repository=repository,
-            packet=packet, note=note, review_scope=review_scope,
+            packet=packet, note=note, review_scope=review_scope, capped=capped,
+            review_round=review_round, review_cap=review_cap,
         )

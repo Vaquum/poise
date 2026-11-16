@@ -1,6 +1,6 @@
-import { canCloseMergedReviewHold, chainBasis, ciRefreshBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation, type CiRefreshProof, type MergeReviewDecision } from './behavior-chain-store'
+import { canCloseMergedReviewHold, chainBasis, ciRefreshBasis, reviewCanPassRepairHold, type BehaviorChain, type ChainBehavior, type ChainInvocation, type CiRefreshProof, type MergeReviewDecision } from './behavior-chain-store'
 import { resumeLink, validReviewResponse, type ReviewResponse } from './review-response'
-import { parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
+import { DEFAULT_PR_REVIEW_CAP, parseReviewCheckpoint, type ReviewCheckpoint } from './review-continuation'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { matchingNativeActionReceipt } from './behavior-chain-action'
 import type { ProcessDiagnostic } from './process-diagnostic'
@@ -21,6 +21,8 @@ export interface ChainObservation extends Record<string, unknown> {
   implementer: ChainReviewer
   repairer: ChainReviewer
   approver: ChainReviewer
+  reviewCap?: number
+  reviewsOutsideChain?: number
   publication: { pull_number: number | null, head_sha: string | null, head_invocation: string | null, state: string | null, merged: boolean, merge_sha: string | null }
   reviewPublication?: { callId: string, planSha?: string, complete: boolean, issueRevision: string,
     receipts: Array<{ issue: string, comment_id: number, author: string, url: string | null }> }
@@ -67,10 +69,11 @@ export type ChainDecision =
 export interface MergeReviewEvidence { before: ChainObservation | null, firstMerged: ChainObservation | null, admission?: ChainInvocation }
 
 export function heldCiRepair(chain: BehaviorChain) {
-  const hold = chain.ciHold, last = chain.invocations.at(-1)
-  if (!chain.held || !hold || chain.mergeSha || chain.supersession || !last) return null
-  const refresh = !hold.queue && last.behavior === 'refresh-pr-ci' && last.basis === ciRefreshBasis(hold) ? last : null
-  const original = refresh ? chain.invocations.find(invocation => invocation.id === hold.invocationId) : last
+  const hold = chain.ciHold
+  if (!chain.held || !hold || chain.mergeSha || chain.supersession) return null
+  const original = chain.invocations.find(invocation => invocation.id === hold.invocationId)
+  const refresh = hold.queue ? null : [...chain.invocations].reverse().find(invocation =>
+    invocation.behavior === 'refresh-pr-ci' && invocation.basis === ciRefreshBasis(hold)) ?? null
   const evidence = original?.evidence, artifact = evidence?.artifact as Record<string, unknown> | undefined
   if (original?.id !== hold.invocationId || original.state !== 'settled' || original.callId !== hold.callId
     || evidence?.status !== 'failed' || evidence.error_code !== 'atomic_work_blocked' || evidence.action !== 'not_started'
@@ -288,8 +291,8 @@ function mergeReviewDecision(chain: BehaviorChain, observation: ChainObservation
   for (const reviewer of observation.prReviewers) {
     const invocation = settled(chain, 'review-pr', basis, reviewer.slot).reverse().find(succeeded)
     const proof = identity(invocation)
-    if (!proof || invocation?.model !== reviewer.model) return null
-    panel.push({ slot: reviewer.slot, model: reviewer.model, ...proof })
+    if (!proof || !invocation?.model || (version === 1 && invocation.model !== reviewer.model)) return null
+    panel.push({ slot: reviewer.slot, model: invocation.model, ...proof })
   }
   const final = [...chain.invocations].reverse().find(invocation => ['review-pr', 'approve-pr'].includes(invocation.behavior)
     && ['reviewed_clean', 'approved'].includes(String(invocation.evidence?.action)) && identity(invocation))
@@ -359,7 +362,7 @@ export function chainReviewClearance(chain: BehaviorChain, observation: ChainObs
     const review = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'review-pr'
       && invocation.slot === reviewer.slot && invocation.basis === basis)
     if (!review || review.state !== 'settled' || review.evidence?.status !== 'completed'
-      || review.actor !== chain.reviewer || review.model !== reviewer.model
+      || review.actor !== chain.reviewer
       || !chainReviewResponse(chain, review, observation, now, { allowPartialComment: true })) return `review slot ${reviewer.slot} lacks its current-head/context receipt`
   }
   const current = chain.invocations.filter(invocation => ['review-pr', 'approve-pr'].includes(invocation.behavior)
@@ -387,6 +390,26 @@ export function chainReviewClearance(chain: BehaviorChain, observation: ChainObs
   return repair ? null : 'native changes requested; a retained independent repair verification is required'
 }
 
+export function completedChainReviewRounds(chain: BehaviorChain, currentPanelBasis?: string, outsideChain = 0): number {
+  const reviews = chain.invocations.filter(invocation => succeeded(invocation) && invocation.evidence?.review_id != null)
+  const panels = new Set(reviews.filter(invocation => invocation.behavior === 'review-pr' && invocation.basis !== currentPanelBasis)
+    .map(invocation => invocation.basis))
+  return outsideChain + panels.size + reviews.filter(invocation => invocation.behavior === 'approve-pr'
+    && ['requested_changes', 'reviewed_clean'].includes(String(invocation.evidence?.action))).length
+}
+
+function providerFailedBeforeWrite(invocation: ChainInvocation): boolean {
+  const evidence = invocation.evidence
+  if (evidence?.status !== 'failed' || evidence.action !== 'not_started' || evidence.review_id != null
+    || evidence.receipts != null || evidence.head_sha || !resourceReleaseProven(evidence, true)) return false
+  const diagnostic = evidence.diagnostic as ProcessDiagnostic | undefined
+  if (diagnostic?.context?.submission !== 'none') return false
+  return diagnostic.operation === 'provider.review'
+    && ['authentication_failed', 'review_provider_error', 'review_provider_exit', 'review_recovery_failed'].includes(String(evidence.error_code))
+    || evidence.error_code === 'launch_preflight_failed' && diagnostic?.operation === 'provider.cli_update'
+    || evidence.error_code === 'atomic_work_failed' && diagnostic?.operation === 'provider.atomic_work'
+}
+
 function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, actor: string,
   reviewer: ChainReviewer | null, reason: string, now: number): ChainDecision {
   const history = settled(chain, behavior, basis, reviewer?.slot ?? null)
@@ -394,8 +417,9 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
   const successful = recent.find(succeeded)
   if (successful) return { kind: 'wait', reason: `${behavior} finished; waiting for its verified artifact or changed input` }
   const latestReview = (behavior === 'review-pr' || behavior === 'approve-pr') && reviewer
-    ? recent.find(invocation => invocation.actor === actor && invocation.model === reviewer.model
-      && (invocation.outcome === 'review_continuation_required' || invocation.evidence?.error_code === 'review_continuation_held')) : undefined
+    ? recent.find(item => providerFailedBeforeWrite(item)
+      || (item.actor === actor && (item.outcome === 'review_continuation_required' || item.evidence?.error_code === 'review_continuation_held')))
+    : undefined
   if (latestReview?.evidence?.error_code === 'review_continuation_held' && resourceReleaseProven(latestReview.evidence, true)) {
     return { kind: 'wait', reason: `${latestReview.evidence.error}; inspect review Call ${latestReview.callId} before changing the review input` }
   }
@@ -416,6 +440,7 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
     return { kind: 'invoke', behavior, basis, actor, reviewer, reason }
   }
   const attempts = history.filter((invocation) => invocation.evidence?.status !== 'deferred'
+    && !providerFailedBeforeWrite(invocation)
     && invocation.admissionSequence > chain.resumedAfterSequence && !approvalConversationRefusal(chain, invocation))
   if (attempts.length) {
     const last = attempts.at(-1)!
@@ -427,10 +452,13 @@ function propose(chain: BehaviorChain, behavior: ChainBehavior, basis: string, a
     const completedAt = Number(last.evidence?.completedAt)
     if (!Number.isFinite(completedAt) || now < completedAt + 60_000 * 2 ** (attempts.length - 1)) return { kind: 'wait', reason: `${behavior} is in native failure backoff` }
   }
-  if (latestReview?.outcome === 'review_continuation_required' && resourceReleaseProven(latestReview.evidence ?? {}, true)) {
+  if (latestReview?.outcome === 'review_continuation_required' && resourceReleaseProven(latestReview.evidence ?? {}, true)
+    && reviewer && latestReview.model) {
     const checkpoint = parseReviewCheckpoint(latestReview.evidence?.artifact as Record<string, unknown> | null)
     if (!checkpoint) throw new Error('settled review continuation lacks its saved checkpoint')
-    return { kind: 'invoke', behavior, basis, actor, reviewer, reason, checkpoint }
+    const index = latestReview.request.argv.indexOf('--recovery-model')
+    const recovery = index >= 0 ? latestReview.request.argv[index + 1] : latestReview.model
+    return { kind: 'invoke', behavior, basis, actor, reviewer: { ...reviewer, model: latestReview.model, recovery }, reason, checkpoint }
   }
   return { kind: 'invoke', behavior, basis, actor, reviewer, reason }
 }
@@ -542,6 +570,29 @@ export function automaticClosureHold(reason: string | null): boolean {
 
 /** No timers, processes, GitHub writes or Chat sessions. The scheduler commits
  * this decision's admission before handing one invocation to native Caller. */
+function nextPrReview(chain: BehaviorChain, observation: ChainObservation, pull: NonNullable<ChainObservation['pull']>, now: number): ChainDecision | null {
+  const reviewedHeadBasis = chainBasis(['pr', pull.head, pull.reviewContext])
+  for (const reviewer of observation.prReviewers) {
+    const reviewed = reviewComplete(chain, 'review-pr', reviewedHeadBasis, reviewer, observation)
+    if (reviewed === 'missing-artifact') return { kind: 'hold', reason: `PR review ${reviewer.slot} lacks its exact-head submission receipt` }
+    if (reviewed === 'needed') {
+      const cap = observation.reviewCap ?? DEFAULT_PR_REVIEW_CAP
+      if (completedChainReviewRounds(chain, reviewedHeadBasis, observation.reviewsOutsideChain) >= cap) {
+        return { kind: 'wait', reason: `All ${cap} PR review rounds are complete; the current head needs a maintainer review` }
+      }
+      return propose(chain, 'review-pr', reviewedHeadBasis, chain.reviewer, reviewer, 'review the actual current pull-request head', now)
+    }
+  }
+  return null
+}
+
+function finalReviewFinished(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
+  return completedChainReviewRounds(chain, undefined, observation.reviewsOutsideChain) >= (observation.reviewCap ?? DEFAULT_PR_REVIEW_CAP)
+    || chain.invocations.some(invocation => invocation.behavior === 'review-pr' && invocation.evidence?.action === 'reviewed_clean'
+      && chainReviewResponse(chain, invocation, observation, now)?.assessment.limitations
+        .includes('Repository inspection reached its round limit.'))
+}
+
 export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObservation, now: number,
   mergeEvidence?: MergeReviewEvidence): ChainDecision {
   const pending = chain.invocations.find((invocation) => invocation.state !== 'settled')
@@ -580,7 +631,7 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     const basis = chainBasis(['pr', pull.head, original.pull.reviewContext])
     if (original.prReviewers.some((reviewer) => {
       const invocation = settled(chain, 'review-pr', basis, reviewer.slot).reverse().find(succeeded)
-      return invocation?.actor !== chain.reviewer || invocation.model !== reviewer.model
+      return invocation?.actor !== chain.reviewer
         || reviewComplete(chain, 'review-pr', basis, reviewer, original) !== 'complete'
     })) {
       if (admission && retainedMergeReview(chain, original, mergeBasis, admission)) return { kind: 'complete', mergeSha: pull.mergeSha }
@@ -635,6 +686,14 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       return { kind: 'invoke', behavior: 'refresh-pr-ci', actor: chain.author, reviewer: null, basis: ciRefreshBasis(held.hold),
         reason: 'refresh the held PR after independently verified shared CI recovery' }
     }
+    if (pull && reviewCanPassRepairHold(chain, 'review-pr', observation)) {
+      const review = nextPrReview(chain, observation, pull, now)
+      if (review) return review
+      if (finalReviewFinished(chain, observation, now) && !pull.approved && !pull.changesRequested && !pull.unresolved && !pull.behind) {
+        return proposeApproval(chain, observation, chainBasis(['approve', pull.head, pull.reviewRevision, null]),
+          'review the current candidate and submit the native approval verdict', now)
+      }
+    }
     return { kind: 'wait', reason: chain.held }
   }
   if (!observation.issue.open && !pull) return { kind: 'hold', reason: 'seed issue closed without a confirmed merged pull request' }
@@ -669,7 +728,12 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   const dismissed = pull.reviewReceipts.find((review) => review.head === pull.head && review.state === 'DISMISSED'
     && chain.invocations.some((invocation) => invocation.behavior === 'approve-pr' && invocation.callId === review.invocation))
   if (dismissed) return { kind: 'hold', reason: `approval ${dismissed.id} was dismissed on the current head; a decision is required` }
+  const repairBasis = chainBasis(['repair', pull.head, pull.failing, pull.conflict, pull.behind, pull.changesRequested, pull.unresolved, pull.reviewRevision, observation.issue.revision])
   const queue = chainQueueSettlement(chain, pull)
+  if (queue && !queue.removal) return { kind: 'wait', reason: 'queue entry disappeared; awaiting GitHub removal evidence' }
+  if (queue?.removal && !['failed_checks', 'merge_conflict', 'merged'].includes(queue.removal.reason || '')) {
+    return { kind: 'hold', reason: `queue removal requires a decision: ${queue.removal.reason || 'unknown reason'} (${queue.removal.id})` }
+  }
   const dependency = chainCiDependency(chain, pull.queueRemoval?.id)
   const queueRecovery = recoveredQueueRepair(chain, observation)
   let queueVerification = queueRecovery
@@ -685,7 +749,6 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     const removal = queue.removal
     if (!removal) return { kind: 'wait', reason: 'queue entry disappeared; awaiting GitHub removal evidence' }
     if (removal.reason === 'merged') return { kind: 'wait', reason: 'GitHub queue reports a merge; awaiting confirmed merge evidence' }
-    if (!['failed_checks', 'merge_conflict'].includes(removal.reason || '')) return { kind: 'hold', reason: `queue removal requires a decision: ${removal.reason || 'unknown reason'} (${removal.id})` }
     const repair = [...chain.invocations].reverse().find((invocation) => invocation.behavior === 'repair-pr' && succeeded(invocation)
       && invocation.request.context?.head === pull.head && invocation.request.context.queueRemoval === removal.id) ?? queueRecovery
     if (!removal.reviewClearanceOnly && (!repair || ((pull.changesRequested || pull.failing.length || pull.conflict || pull.behind)
@@ -694,19 +757,17 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       `diagnose and repair GitHub queue rejection ${removal.id}: ${removal.reason}; PR-head green checks do not prove integration success`, now)
     if (!removal.reviewClearanceOnly) queueVerification ??= chainBasis(['queue-verification', pull.head, removal.id, repair!.id])
   }
-  const repairBasis = chainBasis(['repair', pull.head, pull.failing, pull.conflict, pull.behind, pull.changesRequested, pull.unresolved, pull.reviewRevision, observation.issue.revision])
-  const grey = pull.greyRuns[0]
   if (pull.conflict) return propose(chain, 'repair-pr', repairBasis, chain.author, observation.repairer,
     'repair the confirmed branch conflict before reviewing the current head', now)
-  // Completed exact-head CI failures use the same scoped repair; grey recovery keeps its post-review guard below.
-  if (pull.failing.length && !grey) return propose(chain, 'repair-pr', repairBasis, chain.author, observation.repairer,
-    'repair the confirmed exact-head CI failure before reviewing the current head', now)
-  const reviewedHeadBasis = chainBasis(['pr', pull.head, pull.reviewContext])
-  for (const reviewer of observation.prReviewers) {
-    const reviewed = reviewComplete(chain, 'review-pr', reviewedHeadBasis, reviewer, observation)
-    if (reviewed === 'missing-artifact') return { kind: 'hold', reason: `PR review ${reviewer.slot} lacks its exact-head submission receipt` }
-    if (reviewed === 'needed') return propose(chain, 'review-pr', reviewedHeadBasis, chain.reviewer, reviewer, 'review the actual current pull-request head', now)
+  const review = nextPrReview(chain, observation, pull, now)
+  if (review) return review
+  if (finalReviewFinished(chain, observation, now)
+    && !pull.approved && !pull.changesRequested && !pull.unresolved && !pull.behind && !queueVerification) {
+    const repair = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr' && succeeded(invocation))
+    return proposeApproval(chain, observation, chainBasis(['approve', pull.head, pull.reviewRevision, repair?.id ?? null]),
+      'review the current candidate and submit the native approval verdict', now)
   }
+  const grey = pull.greyRuns[0]
   if (grey) return propose(chain, 'rerun-grey-ci', chainBasis(['grey', pull.head, grey.id, grey.attempt]), chain.reviewer, null,
     `recover completed grey workflow ${grey.id} attempt ${grey.attempt} through the existing native guard`, now)
   const answered = chain.invocations.some((invocation) => invocation.behavior === 'repair-pr' && succeeded(invocation)

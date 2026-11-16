@@ -122,7 +122,7 @@ describe('provider preparation and authentication', () => {
     expect(runtime.getBehaviorsRuntimeHealth().failures.filter(row => row.kind === 'operation')).toEqual([])
   })
 
-  it('pauses Claude-backed behaviors before external work and resumes once authenticated', async () => {
+  it('starts PR review on the next model when Claude is signed out', async () => {
     arrangeCli(false)
     mocks.spawnDetached.mockResolvedValue(undefined)
     const { database: db, behaviors: runtime } = await loadModules()
@@ -134,12 +134,8 @@ describe('provider preparation and authentication', () => {
 
     mocks.authStatus = 'reauth_required'
     await runtime.runEnabledBehaviorsOnce()
-    expect(externalCalls()).toEqual([])
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
-
-    mocks.authStatus = 'authenticated'
-    await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--pr-review', '--model', 'gpt-6-astra-ultra']))
   })
 
   // A drain (the release controller's or the gateway's) pauses background
@@ -202,7 +198,7 @@ describe('provider preparation and authentication', () => {
     } finally { background.markReleaseSwitch(false); launched.resolve(); await cycle }
   })
 
-  it('pauses approval work and resumes it once authenticated', async () => {
+  it('starts PR approval on the next model when Claude is signed out', async () => {
     arrangeCli(true)
     mocks.spawnDetached.mockResolvedValue(undefined)
     const { database: db, behaviors: runtime } = await loadModules()
@@ -212,11 +208,7 @@ describe('provider preparation and authentication', () => {
 
     mocks.authStatus = 'reauth_required'
     await runtime.runEnabledBehaviorsOnce()
-    expect(externalCalls()).toEqual([])
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
-
-    mocks.authStatus = 'authenticated'
-    await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--pr-approve', '--model', 'gpt-6-astra-ultra']))
   })
 })

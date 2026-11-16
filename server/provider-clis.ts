@@ -2,6 +2,14 @@ import { diagnostic } from './logging'
 import { trackReleaseBackground } from './release-background'
 import { ensureProviderCli, type Provider, type CliUpdate } from '../scripts/provider-cli-updates.mjs'
 import type { Catalog } from './models'
+import { providerFailure } from './alerts/producers'
+
+export class ProviderCliUnavailable extends Error {
+  constructor(readonly provider: string, cause: string) {
+    super(`${provider} CLI has no verified launcher: ${cause}`)
+    this.name = 'ProviderCliUnavailable'
+  }
+}
 
 /** Cancelling one startup must not cancel an update shared by another chat. */
 export async function prepareProviderCli(provider: Provider, signal?: AbortSignal): Promise<CliUpdate> {
@@ -25,12 +33,19 @@ export async function prepareProviderCli(provider: Provider, signal?: AbortSigna
 }
 
 /** Existing Caller-backed surfaces use the same maintenance as native Chat. */
-export async function prepareModelClis(catalog: Catalog, identities: string[]): Promise<NodeJS.ProcessEnv> {
+export async function prepareModelClis(catalog: Catalog, identities: string[], forReview = false): Promise<NodeJS.ProcessEnv> {
+  const primary = catalog.models.find(row => row.identity === identities[0])?.provider
   const providers = new Set(identities.map(identity => catalog.models.find(row => row.identity === identity)?.provider).filter(Boolean) as Provider[])
   const env: NodeJS.ProcessEnv = {}
   await Promise.all([...providers].map(async provider => {
     const result = await prepareProviderCli(provider)
     if (result.status === 'unavailable') console.warn(`[models] ${provider}: latest CLI could not be verified — ${result.error}`)
+    if (forReview && result.status === 'unavailable' && !result.launchPath && !process.env[`${provider.toUpperCase()}_CLI`]) {
+      const error = new ProviderCliUnavailable(provider, result.error || 'version check failed')
+      providerFailure(provider, error.message)
+      if (provider === primary) throw error
+      return
+    }
     if (provider === 'codex' && !process.env.CODEX_CLI) {
       if (!result.launchPath) throw new Error(`Codex CLI has no verified launcher: ${result.error || 'version check failed'}`)
       env.CODEX_CLI = result.launchPath

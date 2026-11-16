@@ -18,6 +18,7 @@ vi.mock('../server/process', async (importOriginal) => ({
   runningCallerLaunches: () => 0,
   claudeSubscriptionEnvironment: () => ({ CLAUDE_CLI: '/poise/claude-subscription' }),
 }))
+vi.mock('../server/provider-clis', () => ({ prepareModelClis: vi.fn(async () => ({})) }))
 vi.mock('../server/claude-auth', () => ({
   claudeAuth: {
     snapshot: () => ({ status: 'authenticated' }),

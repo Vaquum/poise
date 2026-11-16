@@ -1089,7 +1089,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               enabled: enabled['approve-prs'],
               setting: null,
               reviewers: null,
-              // The review-round cap: null is off, otherwise 2-10 rounds.
+              // Null selects the default of three PR review rounds.
               reviewCap: getReviewCap(),
               skipRepos: getRepositorySkips('approve-prs'),
               scratchpad: scratch['approve-prs'],
@@ -1459,7 +1459,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (url === '/api/pr-review' && req.method === 'POST') {
           try {
             const body = await readJson<any>(req)
-            const result = await triggerPrReview(String(body.url || ''))
+            const result = await triggerPrReview(String(body.url || ''), getReviewCap() ?? undefined)
             return json(res, 200, result)
           } catch (err: any) {
             const stderr = err?.stderr?.toString?.() || ''

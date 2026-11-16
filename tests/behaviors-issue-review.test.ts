@@ -22,6 +22,8 @@ vi.mock('../server/behavior-ledger', () => ({
   observeAgentSnapshot: mocks.observeSnapshot, behaviorLedgerHeartbeat: vi.fn(),
 }))
 
+vi.mock('../server/provider-clis', () => ({ prepareModelClis: vi.fn(async () => ({})) }))
+
 vi.mock('../server/process', () => ({
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
@@ -1734,7 +1736,7 @@ describe('Review New Issues reviewer account trips', () => {
     expect(behaviors.getBehaviorsRuntimeHealth().failures).toHaveLength(1)
   })
 
-  it('trips the recovery model on its 402 and holds the issue', async () => {
+  it('trips the recovery model on its 402 and reviews the issue on the next slot', async () => {
     const { behaviors, database } = await start({ reviewers: 1 })
     database.setMeta('models', JSON.stringify({ issue_review: {
       default: 'opus-5-xhigh', fallback: 'gpt-6-astra-ultra',
@@ -1755,14 +1757,15 @@ describe('Review New Issues reviewer account trips', () => {
     await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
 
-    expect(database.listBehaviorDeadLetters()).toHaveLength(1)
-    expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([
+    expect(database.listBehaviorDeadLetters()).toEqual([])
+    expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
       expect.objectContaining({
         behavior: KEY, target: 'reviewer:grok-4.6-xhigh', kind: 'operation',
         error: expect.stringContaining('grok-4.6-xhigh cannot review'),
       }),
-    ])
-    expect(launches()).toHaveLength(1)
+    ]))
+    expect(launches()).toHaveLength(2)
+    expect(flag(launches()[1], '--model')).toBe('gpt-6-astra-ultra')
   })
 
   it('holds an issue whose run posted before its account error, without tripping', async () => {

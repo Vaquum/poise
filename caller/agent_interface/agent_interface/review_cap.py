@@ -1,10 +1,4 @@
-"""Deferrable capped review findings: file one follow-up issue, then approve.
-
-When Poise launches an approve-prs run at or past the configured review-round
-cap, only findings explicitly classified as p1/p2 can be deferred. Other findings
-retain the ordinary atomic change request. The issue carries a marker for its
-pull request and head, so a retry or replay reuses it instead of filing again.
-"""
+"""Defer nonbreaking findings at the end of a bounded review."""
 from __future__ import annotations
 
 import json
@@ -17,12 +11,30 @@ from .atoms import bounded_cause
 from .process_diagnostic import diagnostic_envelope
 
 
+FINAL_FINDINGS_POLICY = (
+    "Only breaking changes introduced by this PR block it. Prefix each confirmed breaking finding with [p0]. "
+    "Return all other confirmed findings with [p1], [p2] or [p3] even below the normal severity threshold; "
+    "Classify reaffirmed threads too: use the current severity prefix and copy the original finding text after it. "
+    "Caller preserves existing thread wording and files nonbreaking findings in a linked ticket. "
+    "When there are only nonbreaking findings, return them for the ticket so Caller can move the PR to approval."
+)
+
+
+def round_policy(round_number: int | None, cap: int | None, final: bool) -> str:
+    if round_number is None or cap is None:
+        return ""
+    text = f"PR review round {round_number} of {cap}. Poise allows {cap} review rounds for this PR."
+    if final:
+        text += " This is the final PR review round. " + FINAL_FINDINGS_POLICY
+    return text
+
+
 def marker(pr_number: str, head: str) -> str:
     return f"<!-- poise:review-cap #{pr_number}@{head.lower()} -->"
 
 
-def find_capped_issue(packet: str, pr_number: str, head: str) -> dict | None:
-    """The follow-up issue already filed for this pull request and head, if any."""
+def find_capped_issue(packet: str, pr_number: str, head: str, comments: list[dict] | None = None) -> dict | None:
+    """Reuse a follow-up only when it already records these findings."""
     needle = marker(pr_number, head)
     try:
         issues = json.loads(packet).get("linked_issues") or []
@@ -31,7 +43,10 @@ def find_capped_issue(packet: str, pr_number: str, head: str) -> dict | None:
     if not isinstance(issues, list):
         return None
     for issue in issues:
-        if isinstance(issue, dict) and needle in str(issue.get("body") or ""):
+        body = str(issue.get("body") or "") if isinstance(issue, dict) else ""
+        if needle in body and all(f"`{comment['path']}:{comment['line']}`" in body
+                                  and comment["body"].strip().casefold() in body.casefold()
+                                  for comment in comments or []):
             return issue
     return None
 
@@ -44,8 +59,9 @@ def issue_reference(issue: dict) -> str:
     return "the existing follow-up issue"
 
 
-def render_title(repo: str, pr_number: str, review_round: int) -> str:
-    return f"Review follow-up for {repo}#{pr_number} (round {review_round})"
+def render_title(repo: str, pr_number: str, review_round: int | None) -> str:
+    stage = f"round {review_round}" if review_round is not None else "final inspection"
+    return f"Review follow-up for {repo}#{pr_number} ({stage})"
 
 
 def render_body(
@@ -53,15 +69,15 @@ def render_body(
     pr_number: str,
     head: str,
     base: str,
-    review_round: int,
-    review_cap: int,
+    review_round: int | None,
+    review_cap: int | None,
     comments: list[dict],
 ) -> str:
+    stage = f"review round {review_round} of {review_cap}" if review_round is not None else "the final repository inspection"
     lines = [
         marker(pr_number, head),
         "",
-        f"Review round {review_round} reached the configured cap of {review_cap} rounds, "
-        f"so these findings were deferred here and the pull request approved.",
+        f"Nonbreaking findings from {stage} were deferred here.",
         "",
         f"## Findings (on `{head[:7]}`)",
         "",

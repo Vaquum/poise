@@ -1,4 +1,4 @@
-import { prepareModelClis } from './provider-clis'
+import { prepareModelClis, ProviderCliUnavailable } from './provider-clis'
 import { captureBehaviorAdmission, captureBehaviorOutcome, observeAgentSnapshot } from './behavior-ledger'
 // Bridge to the local `agent-interface` CLI for Swarm's data source.
 //
@@ -20,11 +20,15 @@ import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
-import { releaseIssueReviewRevision, requestIssueReviewRevision } from './db'
+import { countReviewRounds, releaseIssueReviewRevision, requestIssueReviewRevision } from './db'
+import { DEFAULT_PR_REVIEW_CAP, reviewRoundArgs } from './review-continuation'
 import { getHeadSha, getPrAuthor } from './gh'
-import { claudeAuth } from './claude-auth'
+import { claudeAuth, ClaudeAuthReadinessError } from './claude-auth'
 import { HttpError } from './http'
-import { needsClaude, randomDrawStillValid, reviewChoice } from './review-model'
+import { needsClaude, randomDrawStillValid, reviewChoice, type ReviewChoice } from './review-model'
+import { isPlaceModel, MODEL_SLOTS, resolveSlots } from './models'
+import { behaviorChainForPull } from './behavior-chain-journal'
+import { completedChainReviewRounds } from './behavior-chain-decision'
 import { claudeSubscriptionEnvironment, isExpectedFailure, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic, diagnosticFailure } from './logging'
@@ -646,6 +650,7 @@ async function buildDevelopmentLogWorker(source: URL): Promise<DevelopmentLogWor
 export interface AgentLogSelection {
   latest: Array<{ behavior: string, source: string, owner: string }>
   ids: string[]
+  correlations?: string[]
 }
 
 export async function fetchSelectedAgentLogSnapshot(
@@ -835,6 +840,42 @@ export async function stopAgentJob(callId: string): Promise<StopResult> {
   return { id: value.id, stopped: value.stopped, status: value.status, error_code: typeof value.error_code === 'string' ? value.error_code : null }
 }
 
+function completedPrReviewRounds(repo: string, number: number): number {
+  const standalone = countReviewRounds(repo, number)
+  const chain = behaviorChainForPull(repo, number)
+  return chain ? completedChainReviewRounds(chain, undefined, standalone) : standalone
+}
+
+function observeDetachedReview(correlationId: string): void {
+  void fetchSelectedAgentLogSnapshot({ latest: [], ids: [], correlations: [correlationId] }, { fresh: true })
+    .then(observeAgentSnapshot)
+    .catch(error => diagnosticFailure('agent-interface.review-receipt', error, { correlationId }, { level: 'warning' }))
+}
+
+async function preparePrReviewer(place: 'pr_review' | 'pr_approve', choice: ReviewChoice) {
+  const { catalog } = choice
+  const slots = resolveSlots(catalog, getModelSettings().slots)
+  const candidates = [...new Set([choice.model, choice.recovery, ...MODEL_SLOTS.map(slot => slots[slot])])]
+    .filter(model => isPlaceModel(catalog, place, model))
+  const unavailable = new Set<string>()
+  for (const model of candidates) {
+    if (unavailable.has(model)) continue
+    const recovery = candidates.find(identity => identity !== model && !unavailable.has(identity)) ?? model
+    const claude = needsClaude(catalog, model)
+    try {
+      if (claude) await claudeAuth.requireReady()
+      const modelCliEnv = await prepareModelClis(catalog, [model, recovery], true)
+      return { model, recovery, claude, modelCliEnv }
+    } catch (error) {
+      if (!(error instanceof ProviderCliUnavailable || error instanceof ClaudeAuthReadinessError)) throw error
+      const provider = catalog.models.find(entry => entry.identity === model)?.provider
+      for (const entry of catalog.models) if (entry.provider === provider) unavailable.add(entry.identity)
+      if (!candidates.some(identity => !unavailable.has(identity))) throw error
+    }
+  }
+  throw new Error('No configured PR reviewer is available')
+}
+
 // Kick off `agent-interface --pr-review #<num> --pwd <local-checkout>`.
 // The underlying claude run takes minutes; we spawn detached and return
 // immediately. The user watches progress in the Swarm view (the agent
@@ -842,19 +883,21 @@ export async function stopAgentJob(callId: string): Promise<StopResult> {
 // fires upstream, then settles to completed/failed).
 export async function triggerPrReview(
   prUrl: string,
+  reviewCap = DEFAULT_PR_REVIEW_CAP,
 ): Promise<{ ok: true, source: string, correlationId: string }> {
   const m = String(prUrl || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url')
   const [, owner, repo, num] = m
   const repoFullName = `${owner}/${repo}`
+  const completed = completedPrReviewRounds(repoFullName, Number(num))
+  if (completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
   const accounts = prAccounts()
   const author = await getPrAuthor(repoFullName, Number(num), accounts.agent)
     .catch(() => getPrAuthor(repoFullName, Number(num), accounts.me))
   const actor = prReviewer(author, true)
-  const { model, recovery, slot, catalog } = await reviewChoice('pr_review')
-  const claude = needsClaude(catalog, model)
-  if (claude) await claudeAuth.requireReady()
-  const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
+  const choice = await reviewChoice('pr_review')
+  const { model, recovery, claude, modelCliEnv } = await preparePrReviewer('pr_review', choice)
+  const { slot } = choice
   const expectedHead = await getHeadSha(repoFullName, Number(num), { actor })
   const pwd = await resolveReviewCheckout(owner, repo, Number(num), actor, expectedHead)
   const source = 'poise:manual-review'
@@ -867,7 +910,7 @@ export async function triggerPrReview(
   // runnable slots instead of identity with a fresh draw.
   const stored = getModelSettings().places?.['pr_review']?.slot ?? 'primary'
   const selectedModel = stored === 'random' ? null : (await reviewChoice('pr_review')).model
-  const drawValid = stored === 'random' ? await randomDrawStillValid('pr_review', model) : selectedModel === model
+  const drawValid = stored === 'random' ? await randomDrawStillValid('pr_review', choice.model) : selectedModel === choice.model
   if (!prAccountsMatch(accounts) || prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
   if (!drawValid) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
@@ -890,10 +933,14 @@ export async function triggerPrReview(
     correlationId,
     '--pwd',
     pwd,
+    ...reviewRoundArgs(completed, reviewCap),
   ], {
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
-    onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
+    onExit: (result) => {
+      if (claude) claudeAuth.observeProcessFailure(result)
+      observeDetachedReview(correlationId)
+    },
   }) } catch (error) {
     captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
     throw error
@@ -905,7 +952,7 @@ export async function triggerPrReview(
 // admitReplay): it reads the target fresh and throws when the scheduler would
 // not act on it. Passed in rather than imported, so this bridge to Caller does
 // not depend on the behavior runtime.
-export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCapReached?: { reviewRound: number, reviewCap: number } } | void>
+export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCap?: number } | void>
 
 // Replay an existing agent-interface job — used by the Swarm view's
 // Replay column. The frontend sends the row's `behavior` + `repo` +
@@ -940,12 +987,15 @@ export async function replayAgentJob(input: {
   if (!admission) throw new Error('Replay admission returned no PR author')
   const actor = admission.actor
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
+  const reviewCap = admission.reviewCap ?? DEFAULT_PR_REVIEW_CAP
+  const completed = completedPrReviewRounds(repo, Number(prId))
+  if (behavior === 'pr_review' && completed >= reviewCap) throw new HttpError(409, `All ${reviewCap} PR review rounds are complete`)
+  const capFlags = reviewRoundArgs(completed, reviewCap)
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
-  const { model, recovery, slot, catalog } = await reviewChoice(place)
-  const claude = needsClaude(catalog, model)
-  if (claude) await claudeAuth.requireReady()
+  const choice = await reviewChoice(place)
+  const { model, recovery, claude, modelCliEnv } = await preparePrReviewer(place, choice)
+  const { slot } = choice
   const [owner, repoName] = repo.split('/', 2)
-  const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
   const expectedHead = await getHeadSha(repo, Number(prId), { actor })
   const pwd = await resolveReviewCheckout(owner, repoName, Number(prId), actor, expectedHead)
   const source = 'poise:replay'
@@ -957,19 +1007,12 @@ export async function replayAgentJob(input: {
   // runnable slots instead of identity with a fresh draw.
   const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
   const selectedModel = stored === 'random' ? null : (await reviewChoice(place)).model
-  const drawValid = stored === 'random' ? await randomDrawStillValid(place, model) : selectedModel === model
+  const drawValid = stored === 'random' ? await randomDrawStillValid(place, choice.model) : selectedModel === choice.model
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   if (!drawValid) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
     repository: repo, number: Number(prId), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
-  // An approval replay runs under the same effective cap as a scheduled
-  // approve-prs launch: at or past the capped round it files (or reuses)
-  // the follow-up issue and approves instead of requesting changes again.
-  const capFlags = behavior === 'pr_approve' && admission.reviewCapReached
-    ? ['--review-cap-reached', '--review-round', String(admission.reviewCapReached.reviewRound),
-      '--review-cap', String(admission.reviewCapReached.reviewCap)]
-    : []
   try { await spawnDetached(CLI, [
     flag,
     `#${prId}`,
@@ -991,7 +1034,10 @@ export async function replayAgentJob(input: {
   ], {
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv, ...admission.reviewEnvironment },
-    onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
+    onExit: (result) => {
+      if (claude) claudeAuth.observeProcessFailure(result)
+      observeDetachedReview(correlationId)
+    },
   }) } catch (error) {
     captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
     throw error

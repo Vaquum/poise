@@ -323,7 +323,7 @@ def _prepare_native_clis(call_id: str) -> None:
         recovery = CATALOG.behaviors["review_recovery"]
     if recovery:
         models.append(recovery)
-    providers = sorted({CATALOG.resolve(model).provider for model in models})
+    providers = list(dict.fromkeys(CATALOG.resolve(model).provider for model in models))
     node, prepare = os.environ.get("POISE_NATIVE_NODE"), os.environ.get("POISE_NATIVE_PREPARE")
     if not node or not prepare or not Path(node).is_absolute() or not Path(prepare).is_absolute():
         raise RuntimeError("native provider preparation requires the workspace's pinned Node and preparation module")
@@ -1406,6 +1406,9 @@ def run_pr_review(
     review_slot: str | None = None,
     resume_review: str | None = None,
     review_units_per_call: int | None = None,
+    capped: bool = False,
+    review_round: int | None = None,
+    review_cap: int | None = None,
 ):
     return run_governed_behavior(
         pr_review,
@@ -1421,7 +1424,7 @@ def run_pr_review(
         p,
         model,
         recovery_model,
-        review_scope=review_scope,
+        capped=capped, review_round=review_round, review_cap=review_cap, review_scope=review_scope,
         review_slot=review_slot, resume_review=resume_review, review_units_per_call=review_units_per_call,
     )
 
@@ -2207,8 +2210,8 @@ def run_governed_behavior(
     resume_review: str | None = None,
     review_units_per_call: int | None = None,
 ):
-    if capped and (behavior != "pr_approve" or review_round is None or review_cap is None):
-        raise ValueError("a capped round needs pr_approve with its round and cap numbers")
+    if capped and (review_round is None or review_cap is None):
+        raise ValueError("a capped review needs its round and cap numbers")
     spec = CATALOG.review_model(behavior, model)
     recovery = CATALOG.review_model(behavior, recovery_model or CATALOG.behaviors["review_recovery"])
     name = spec.identity
@@ -2505,8 +2508,8 @@ def _pre_post_no_action_proof(call_id: str, failure: review_budget.ReviewLimitEr
 
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
                               capped=False, review_round=None, review_cap=None, review_scope=""):
-    # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
-    cap_kwargs = {"capped": capped, "review_round": review_round, "review_cap": review_cap} if behavior == "pr_approve" else {}
+    cap_kwargs = {"capped": capped, "review_round": review_round, "review_cap": review_cap} \
+        if behavior == "pr_approve" or review_round is not None else {}
     if review_scope:
         cap_kwargs["review_scope"] = review_scope
     try:
@@ -3256,15 +3259,17 @@ def required_flag(flag: str) -> str:
     return value
 
 
-def _review_cap_number(flag: str, capped: bool) -> int | None:
-    value = flag_value(flag)
-    if value is None:
-        return None
-    if not capped:
-        usage(error=f"{flag} needs --review-cap-reached")
-    if not value.isdigit() or int(value) < 1:
-        usage(error=f"{flag} must be a positive integer")
-    return int(value)
+def _review_round_options() -> dict:
+    values = {}
+    for key, flag in (("review_round", "--review-round"), ("review_cap", "--review-cap")):
+        value = flag_value(flag)
+        if value is not None and (not value.isdigit() or int(value) < 1):
+            usage(error=f"{flag} must be a positive integer")
+        values[key] = int(value) if value is not None else None
+    current, cap = values["review_round"], values["review_cap"]
+    if (current is None) != (cap is None) or ("--review-cap-reached" in sys.argv and current is None):
+        usage(error="review round control needs --review-round N and --review-cap N")
+    return {**values, "capped": current is not None and cap is not None and current >= cap}
 
 
 def _review_units_per_call() -> int | None:
@@ -3589,14 +3594,10 @@ def _main():
             review_scope=flag_value("--review-scope") or "",
             review_slot=flag_value("--review-slot"), resume_review=flag_value("--resume-review"),
             review_units_per_call=_review_units_per_call(),
+            **_review_round_options(),
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--pr-approve":
-        capped = "--review-cap-reached" in sys.argv
-        review_round = _review_cap_number("--review-round", capped)
-        review_cap = _review_cap_number("--review-cap", capped)
-        if capped and (review_round is None or review_cap is None):
-            usage(error="--review-cap-reached needs --review-round N and --review-cap N")
         run_pr_approve(
             sys.argv[2],
             required_flag("--actor"),
@@ -3608,12 +3609,10 @@ def _main():
             p=flag_value("--p"),
             model=flag_value("--model"),
             recovery_model=flag_value("--recovery-model"),
-            capped=capped,
-            review_round=review_round,
-            review_cap=review_cap,
             review_scope=flag_value("--review-scope") or "",
             review_slot=flag_value("--review-slot"), resume_review=flag_value("--resume-review"),
             review_units_per_call=_review_units_per_call(),
+            **_review_round_options(),
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--fix-failing-ci":

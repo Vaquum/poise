@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { AgentLogSnapshot, LogEntry } from './agent'
 import { recordHandling } from './alerts/handling'
 import { AGENT_BEHAVIORS } from './behavior-estimates'
-import { db } from './db'
+import { db, rememberDetachedReviewRounds } from './db'
 import { LEDGER_CAPTURE_BATCH_LIMIT } from './behavior-ledger-contract'
 import type {
   LedgerAdmission, LedgerCaller, LedgerHealth, LedgerObservation, LedgerPending, LedgerPolicy,
@@ -583,6 +583,7 @@ export function captureBehaviorOutcome(input: Omit<LedgerResult, 'type'>): void 
 }
 export function observeAgentSnapshot(snapshot: AgentLogSnapshot): void {
   observer?.observe(snapshot)
+  rememberDetachedReviewRounds(snapshot.entries)
   recordCallerCompletions(snapshot)
 }
 

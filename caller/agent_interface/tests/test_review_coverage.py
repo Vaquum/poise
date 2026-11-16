@@ -36,6 +36,7 @@ class TestReviewCoverage(TestCase):
         self.head = HEAD
         self.base = BASE
         self.reviews = []
+        self.followups = []
         self.review_number = 90
         self.packets = []
         self.client = AsyncMock()
@@ -82,6 +83,10 @@ class TestReviewCoverage(TestCase):
     def command(self, argv, **_kwargs):
         if argv[1] == "--review-activity-since":
             return SimpleNamespace(returncode=0, stdout=json.dumps(self.activity()), stderr="")
+        if argv[1] == "--create-pr-linked-issue":
+            self.followups.append(argv[argv.index("--body") + 1])
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+                "action": "created_pr_linked_issue", "issue": {"number": 13, "html_url": "https://github.com/o/r/issues/13"}}))
         module = {"--request-changes": request_changes, "--reviewed-clean": reviewed_clean, "--approve-pr": approve_pr}[argv[1]]
         payload = {"repository": "o/r", "pr": "12", "expected_head": self.head, "token_user": "reviewer",
                    "assessment": json.loads(argv[argv.index("--assessment-json") + 1])}
@@ -149,7 +154,7 @@ class TestReviewCoverage(TestCase):
         self.assertEqual([review["state"] for review in self.reviews], ["COMMENTED", "COMMENTED"])
         self.assertTrue(all("Coverage: incomplete" in review["body"] and "z.py" in review["body"] for review in self.reviews))
 
-    def test_partial_change_request_keeps_its_receipt_but_never_becomes_a_capped_approval_or_baseline(self):
+    def test_partial_review_defers_nonbreaking_findings_without_approval_or_a_complete_baseline(self):
         self.retained_finding = True
         self.run_review("pr_review", [FINDING])
         row = api.logs()[0]
@@ -160,7 +165,10 @@ class TestReviewCoverage(TestCase):
         self.run_review("pr_approve", [FINDING], capped=True, review_round=5, review_cap=5)
         self.assertIsNone(self.packets[-1]["since_head_sha"])
         self.assertIn("z.py", [entry["path"] for entry in self.packets[-1]["omitted_files"]])
-        self.assertEqual([review["state"] for review in self.reviews], ["CHANGES_REQUESTED", "CHANGES_REQUESTED"])
+        self.assertEqual([review["state"] for review in self.reviews], ["CHANGES_REQUESTED", "COMMENTED"])
+        self.assertEqual(len(self.followups), 1)
+        self.assertIn(FINDING["body"], self.followups[0])
+        self.assertIsNone(self.activity()["reviewer_latest_complete_commit"])
 
     def test_pinned_runtime_json_stays_required_through_compaction_followup_and_cap(self):
         native_git = review_diff._git

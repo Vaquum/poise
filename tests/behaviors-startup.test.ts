@@ -10,6 +10,7 @@ describe('startup snapshots and recovery', () => {
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.setMeta('behavior_review_new_prs_enabled', '1')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
+    db.setMeta('models', JSON.stringify({ slots: { primary: 'opus-5-xhigh', secondary: 'opus-5-max', tertiary: 'fable-5.1-max' } }))
     mocks.authStatus = 'reauth_required'
 
     runtime.startBehaviorsRuntime()
