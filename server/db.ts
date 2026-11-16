@@ -1090,7 +1090,7 @@ export function completeSeenOwned(key: string, target: string, claimId: string):
 }
 
 export type ReviewLaunchOutcome = 'clean' | 'changes_requested'
-export type BehaviorLaunchOutcome = ReviewLaunchOutcome | 'approved'
+export type BehaviorLaunchOutcome = ReviewLaunchOutcome | 'approved' | 'incomplete'
 export type BehaviorLaunchAction = 'reviewed_clean' | 'requested_changes' | 'approved'
 
 export function completeBehaviorLaunchOwned(input: {
@@ -1113,7 +1113,8 @@ export function completeBehaviorLaunchOwned(input: {
     requested_changes: 'changes_requested',
     approved: 'approved',
   }
-  if (expectedPair[input.action] !== input.outcome) {
+  if (expectedPair[input.action] !== input.outcome
+    && !(input.action === 'reviewed_clean' && input.outcome === 'incomplete')) {
     throw new Error('behavior completion action/outcome mismatch')
   }
   return db.transaction(() => {

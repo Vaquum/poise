@@ -740,11 +740,11 @@ The original Call's `artifact.review_progress` retains the generation, current
 unit, claimant, cumulative spend and bounded evidence references in the existing
 response store. Validated inspection pages, unfinished cursors, provisional
 findings and verified repair revisions survive interruption before a group
-verdict. Providers must account for the supplied evidence IDs; missing evidence,
-unfinished required pages and incomplete source inventories grant no review
-authority. A required final integration unit receives every unit's assessment,
-findings and boundary evidence, and can inspect cross-file contracts before
-returning the single verdict.
+verdict. Providers must account for the supplied evidence IDs. When a checkout
+or diff page is unavailable, Caller retains the cause as a warning and reviews
+the source it received. A required final integration unit receives every unit's
+assessment, findings and boundary evidence, and can inspect cross-file contracts
+before returning the single verdict.
 
 The Call's `artifact.review_checkpoint` retains the original root and generation
 with completed and required units, attempts, cumulative time and the last
@@ -771,8 +771,11 @@ finalization. Its checkpoint retains the complete verdict, the original response
 identity and whether position remapping finished. After a proven pre-write
 deadline and positive resource settlement, the next claimant resumes that step
 without provider analysis. Already remapped LEFT locations are never remapped
-again. Changed review input, altered retained evidence, incomplete coverage and
-more than 100 inline findings remain held with all findings retained.
+again. Changed review input, altered retained evidence and more than 100 inline
+findings remain held with all findings retained. Partial source produces a
+GitHub review with its limitations and any supported findings. A neutral note
+from partial source retains an `incomplete` result. Approval and review clearance
+require complete source coverage.
 
 The existing head-pinned submission reserves the shared progress receipt
 atomically. The response and GitHub marker keep the original finalizing Call's

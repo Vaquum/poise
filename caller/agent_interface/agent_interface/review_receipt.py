@@ -107,8 +107,9 @@ def complete_response(assessment: dict, head: str) -> dict | None:
         if not context or context["head_sha"] != head:
             raise RuntimeError("review response lacks its pinned review context")
         from .review_continuation import authority
-        if authority(conn, call_id, artifact):
-            context = {**context, "coverage": "complete"}
+        coverage = authority(conn, call_id, artifact)
+        if coverage is not None:
+            context = {**context, "coverage": coverage}
         candidates = artifact.get("verification_candidates", {})
         if roots and (row[3] not in {"pr_review", "pr_approve"} or any(str(root) not in candidates for root in roots)):
             raise ValueError("verified fix must name an answered thread in the original review packet")

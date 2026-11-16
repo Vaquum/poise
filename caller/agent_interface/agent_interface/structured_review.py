@@ -678,6 +678,16 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 # Each group was validated against the bounded provider schema.
                 # The aggregate's capacity is a publication constraint.
                 verdict = {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}
+            coverage = review_receipt.coverage_disposition(json.loads(packet)) if packet else "incomplete"
+            if packet and coverage == "incomplete":
+                omitted = json.loads(packet).get("omitted_files", [])
+                detail = f" The packet lists {len(omitted)} omitted files." if isinstance(omitted, list) and omitted else ""
+                review_repository.warn(warnings, "PR source coverage is incomplete. Review used the available diff." + detail)
+                for file in omitted if isinstance(omitted, list) else ():
+                    if isinstance(file, dict) and file.get("path"):
+                        review_repository.warn(warnings, f"PR diff for {file['path']} omitted. {file.get('reason') or 'Source unavailable.'}")
+                if verdict["action"] == "approve":
+                    verdict = {**verdict, "action": "reviewed_clean"}
             if warnings and (checkpoint is None or checkpoint.finalization is None):
                 limitations = verdict["assessment"]["limitations"]
                 note = "\n\nRepository inspection warnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
@@ -715,8 +725,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     checkpoint.remap(lambda: _validate_since_positions(pwd, pr, actor_name, head, packet, verdict))
                     checkpoint.retain_finalization(verdict, head, "ready")
                 raw = json.dumps(verdict, ensure_ascii=False)
-                coverage = review_receipt.coverage_disposition(json.loads(packet)) if packet else "incomplete"
-                if coverage != "complete" and verdict["action"] != "request_changes":
+                if not packet and verdict["action"] != "request_changes":
                     review_receipt.complete_response(verdict["assessment"], head)
                     raise review_budget.ReviewLimitError(
                         "Review incomplete: required source coverage is not complete; no clearance submitted",
@@ -769,6 +778,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     flag = {"request_changes": "--request-changes", "reviewed_clean": "--reviewed-clean",
             "approve": "--approve-pr"}[verdict["action"]]
     args = [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), flag, ref]
+    if flag == "--reviewed-clean" and coverage == "incomplete":
+        args.append("--partial-note")
     review_receipt.complete_response(verdict["assessment"], head)
     with ExitStack() as files:
         try:

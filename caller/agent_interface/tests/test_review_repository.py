@@ -287,6 +287,16 @@ class TestRepositoryLifecycle(TestCase):
 
 
 class TestStructuredInspection(TestCase):
+    def test_lookup_keeps_readable_lines_beside_a_malformed_entry(self):
+        repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
+        healthy = {"line": 2, "text": "real source"}
+        warnings = []
+        with patch.object(repo, "inspect", return_value={"action": "review_context", "head_sha": HEAD, "results": [
+            {"request": REQUEST, "truncated": False, "next_line": None, "lines": [{"line": "unknown"}, healthy]},
+        ]}):
+            retained = rr.inspect_context(repo, [REQUEST], warnings)
+        self.assertEqual(retained["results"][0]["lines"], [healthy])
+        self.assertIn("omitted 1 malformed evidence record", warnings[0])
     def test_real_cli_reports_a_binary_read_and_allows_one_informed_verdict(self):
         actual_run = subprocess.run
         with tempfile.TemporaryDirectory() as work:

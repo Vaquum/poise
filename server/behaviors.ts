@@ -2079,6 +2079,12 @@ function partialReviewFindings(call: LogEntry): boolean {
     && (call.artifact?.review_response as Record<string, unknown> | undefined)?.coverage === 'incomplete'
 }
 
+function partialReviewComment(call: LogEntry): boolean {
+  return ['pr_review', 'pr_approve'].includes(call.behavior || '')
+    && call.action === 'reviewed_clean' && call.outcome === 'incomplete'
+    && (call.artifact?.review_response as Record<string, unknown> | undefined)?.coverage === 'incomplete'
+}
+
 function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry, snapshot: AgentLogSnapshot): boolean {
   if (claim.launchQuarantine === 'invalid_result') return false
   const actions = claim.launchBehavior === 'issue_review'
@@ -2099,7 +2105,8 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
     || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
     || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)
     || call.status.toLowerCase() !== 'completed'
-    || actions.get(call.action || '') !== (partialReviewFindings(call) ? 'changes_requested' : call.outcome)
+    || (actions.get(call.action || '') !== (partialReviewFindings(call) ? 'changes_requested' : call.outcome)
+      && !partialReviewComment(call))
     || !Number.isFinite(Date.parse(call.completed_at || ''))
     || (claim.launchBehavior !== 'issue_review' && call.head_sha !== claim.launchExpectedHead)) {
     quarantineFailedClaim(claim, 'invalid_result',
@@ -2240,7 +2247,7 @@ async function reconcileBehaviorLaunchClaims(
       && String(call.actor || '').toLowerCase() === String(letter.actor || '').toLowerCase()
       && call.source === letter.source
       && call.correlation_id === letter.correlationId
-      && expectedActions.get(action) === outcome
+      && (expectedActions.get(action) === outcome || partialReviewComment(call))
       && SHA_PATTERN.test(String(call.head_sha || '').toLowerCase())
       && Number.isFinite(Date.parse(completedAt))) {
       if (retireBehaviorDeadLetter(letter.id)) {
@@ -2533,7 +2540,7 @@ async function reconcileBehaviorLaunchClaims(
       const outcome = partialFindings ? 'changes_requested' : String(call.outcome || '')
       const completedAt = String(call.completed_at || '')
       const headSha = String(call.head_sha || '').toLowerCase()
-      if (expectedActions.get(action) !== outcome
+      if ((expectedActions.get(action) !== outcome && !partialReviewComment(call))
         || !Number.isFinite(Date.parse(completedAt))
         || headSha !== claim.launchExpectedHead) {
         const error = 'completed agent call is missing authoritative action/outcome/head metadata'
@@ -2550,7 +2557,7 @@ async function reconcileBehaviorLaunchClaims(
         target: claim.target,
         claimId: claim.claimId,
         action: action as 'reviewed_clean' | 'requested_changes' | 'approved',
-        outcome: outcome as 'clean' | 'changes_requested' | 'approved',
+        outcome: outcome as 'clean' | 'changes_requested' | 'approved' | 'incomplete',
         completedAt,
         headSha,
       })
@@ -4717,7 +4724,7 @@ async function releaseFailedBehaviorIfNoAction(
       && Date.parse(row.completed_at!) >= Date.parse(agentCallStartedAt(row))
       && !!row.correlation_id && unambiguousAgentCall(snapshot, row)
       && Number.isSafeInteger(row.review_id) && (row.review_id || 0) > 0
-      && (row.action === 'requested_changes' && (row.outcome === 'changes_requested' || partialReviewFindings(row))
+      && (partialReviewComment(row) || row.action === 'requested_changes' && (row.outcome === 'changes_requested' || partialReviewFindings(row))
         || launchBehavior === 'pr_review' && row.action === 'reviewed_clean' && row.outcome === 'clean'
         || launchBehavior === 'pr_approve' && row.action === 'approved' && row.outcome === 'approved'))
       .sort((a, b) => Date.parse(b.completed_at!) - Date.parse(a.completed_at!))
@@ -4730,7 +4737,7 @@ async function releaseFailedBehaviorIfNoAction(
           headSha: failed.launchExpectedHead, callId: replay.id, correlationId: replay.correlation_id!,
           startedAt: agentCallStartedAt(replay), completedAt: replay.completed_at!,
           action: replay.action as 'reviewed_clean' | 'requested_changes' | 'approved',
-          outcome: (partialReviewFindings(replay) ? 'changes_requested' : replay.outcome) as 'clean' | 'changes_requested' | 'approved' })) {
+          outcome: (partialReviewFindings(replay) ? 'changes_requested' : replay.outcome) as 'clean' | 'changes_requested' | 'approved' | 'incomplete' })) {
         captureBehaviorOutcome({ nativeId: failed.launchCorrelationId, callId: call.id,
           state: 'completed', activity: 'settled', stateSource: 'native', outcome: 'adopted',
           head: replay.head_sha, completedAt: replay.completed_at,
