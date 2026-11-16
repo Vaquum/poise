@@ -29,7 +29,7 @@ from .atoms import packet as fetch_packet
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
 from .review_watch import ReviewSuperseded, ReviewWatch
-from . import progress, review_budget, review_receipt, review_stages, resource_ownership
+from . import progress, review_budget, review_receipt, review_repository, review_stages, resource_ownership
 from . import review_cap as followup
 
 
@@ -406,7 +406,9 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                  timeout_s: int, deadline: float, repository, behavior: str, verify_fixes: bool = False,
                  groups_remaining: int | None = None, initializing: bool = False,
                  total_groups: int = 1, expected_group_seconds: float | None = None,
-                 checkpoint=None) -> tuple[str, dict, float]:
+                 checkpoint=None, warnings: list[str] | None = None) -> tuple[str, dict, float]:
+    warnings = warnings if warnings is not None else []
+    expected = checkpoint.head if checkpoint is not None else getattr(repository, "info", {}).get("head_sha")
     schema = verdict_schema(behavior, inspection=repository is not None, verify_fixes=verify_fixes)
     if checkpoint is not None:
         schema["required"].append("evidence")
@@ -415,6 +417,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
     # must require the same evidence the continuation validates below.
     (root / "verdict.schema.json").write_text(json.dumps(schema))
     context = checkpoint.context() if checkpoint is not None else ""
+    pending = checkpoint.session.state["pending"] if checkpoint is not None else []
     round_number = 0
     correction_attempted = False
     group_deadline = None
@@ -495,19 +498,22 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                 "review_budget_exhausted",
                 diagnostic_envelope(operation="provider.review", phase="inspection_context",
                                     outcome="resource_failure", provider=model.provider))
+        lookup_closed = round_number == MAX_INSPECTION_ROUNDS
         finish_soon = inspection_cutoff is not None and monotonic() >= inspection_cutoff
         remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
                      f"Analysis time remaining: {int(timeout)} seconds. "
                      "Batch independent inspection requests in one step. "
-                     "Return a terminal verdict as soon as the supplied evidence is sufficient. "
-                     "Do not repeat completed reads or searches."
+                     "Review the supplied diff and available repository context. "
+                     "If a lookup is unavailable, proceed and describe the limitation in your assessment. "
+                     "Do not repeat completed or failed reads or searches."
                      + (" The equal-share inspection allowance is spent; omit optional inspection. "
-                        "If further inspection is required for a complete assessment, request it; "
-                        "never return a verdict on incomplete analysis." if finish_soon else "")
+                        "Finish using the source already supplied." if finish_soon else "")
                      if repository is not None else "")
+        if lookup_closed:
+            remaining += "\nRepository inspection is finished. Return your verdict using the available source and requests=[]."
         if checkpoint is not None:
             remaining += ("\nRequired evidence IDs for a terminal verdict: " + json.dumps(checkpoint.evidence())
-                          + "\nRequired unfinished inspection requests: " + json.dumps(checkpoint.session.state["pending"])
+                          + "\nOptional unfinished inspection requests: " + json.dumps(pending)
                           + "\nReturn evidence=[] on an inspection step. Account for every listed evidence ID at termination.")
         try:
             raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
@@ -536,19 +542,15 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                         verdict = checkpoint.terminal(verdict, evidence)
                     except ValueError as error:
                         raise InvalidVerdict(str(error)) from error
+                for request in pending:
+                    review_repository.warn(warnings,
+                                           f"{review_repository.inspection_target(request)} was not read before the verdict.")
+                pending.clear()
                 return raw, verdict, monotonic() - group_started
             if checkpoint is not None and evidence != []:
                 raise InvalidVerdict("inspection steps must leave terminal evidence empty")
-            if round_number == MAX_INSPECTION_ROUNDS:
-                raise review_budget.ReviewLimitError(
-                    "Repository inspection limit reached; incomplete analysis; needs attention",
-                    "review_budget_exhausted",
-                    diagnostic_envelope(operation="provider.review", phase="inspection_rounds",
-                                        outcome="resource_failure", provider=model.provider,
-                                        message=f"Incomplete analysis in file group {group_number} of {total_groups}; "
-                                                f"{MAX_INSPECTION_ROUNDS} inspection rounds used; remaining allowance {timeout:.1f}s",
-                                        elapsed_ms=round((monotonic() - group_started) * 1000),
-                                        timeout_seconds=timeout, submission="none"))
+            if lookup_closed:
+                raise InvalidVerdict("Reviewer requested more source after inspection ended instead of returning a verdict")
             if not 1 <= len(requests) <= 8:
                 raise InvalidVerdict("invalid repository inspection request count")
             # Validate provisional findings without submitting anything.
@@ -569,25 +571,39 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                         "preserving your substantive assessment and findings.")
             continue
         progress.stage("inspecting", "Inspecting pinned repository")
-        inspection_timeout, phase = wait_allowance(30)
+        available, limiting_phase = wait_allowance()
+        inspection_timeout = min(30, available / 2)
+        result = review_repository.inspect_context(repository, requests, warnings,
+                                                   timeout_s=inspection_timeout, expected_head=expected)
         try:
-            result = repository.inspect(requests, timeout_s=inspection_timeout)
-        except AgentPreflightError as error:
-            if error.code != "review_inspection_timeout":
-                raise
-            actual_timeout = (error.diagnostic or {}).get("timeout_seconds")
-            failure = timed_out(phase, actual_timeout if isinstance(actual_timeout, (int, float)) else inspection_timeout,
-                                error.diagnostic)
-            if phase == "inspection":
-                error.diagnostic = failure.diagnostic
-                raise
-            raise failure from error
-        except subprocess.TimeoutExpired as error:
-            raise timed_out(phase, inspection_timeout) from error
+            wait_allowance()
+        except review_budget.ReviewLimitError as error:
+            detail = next((item["error"] for item in result["results"] if item.get("error")), "Inspection consumed the available review time.")
+            diagnostic = diagnostic_envelope(operation="github-interface", phase="inspection",
+                                             outcome="timed_out", stderr=detail, submission="none")
+            raise timed_out(limiting_phase, inspection_timeout, diagnostic) from error
+        added = "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
+        round_number += 1
+        if len((system + text + context + added).encode()) > MAX_GOVERNED_PROMPT_BYTES - 4096:
+            reason = "Additional repository context would exceed the review prompt limit."
+            for request in requests:
+                review_repository.warn(warnings, f"{review_repository.inspection_target(request)} was omitted. {reason}")
+            result["results"] = [{"request": request, "error": reason} for request in requests]
+            added = ""
+            round_number = MAX_INSPECTION_ROUNDS
+        elif round_number == MAX_INSPECTION_ROUNDS:
+            review_repository.warn(warnings, "Repository inspection reached its round limit. Review used the source gathered so far.")
+        for response in result["results"]:
+            request = response["request"]
+            if request in pending:
+                pending.remove(request)
+            if not response.get("error") and response["truncated"]:
+                following = {**request, "start_line": response["next_line"]}
+                if following not in pending:
+                    pending.append(following)
         if checkpoint is not None:
             checkpoint.inspected(step, result)
-        context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
-        round_number += 1
+        context += added
     raise AssertionError("review rounds did not return a verdict")
 
 
@@ -611,6 +627,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         ask = partial(ask, repository=repository)
     capped_note = ""
     checkpoint = None
+    warnings = getattr(repository, "warnings", [])
     from . import review_continuation
     try:
         total = review_stages.stage_count(packet) if packet and not review_continuation.enabled() else 1
@@ -626,7 +643,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             expected_group_seconds = None
             if review_continuation.enabled():
                 verdict, packet, checkpoint = review_continuation.analyze(pwd, system, text, model, behavior, pr, actor_name,
-                    head, timeout_s, repository, packet, root, watch, ask)
+                    head, timeout_s, repository, packet, root, watch, ask, warnings)
                 if checkpoint.finalization and checkpoint.finalization["step"] == "submitting":
                     return checkpoint.reconcile_review(pwd, pr, actor_name)
                 staged = False
@@ -647,7 +664,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                              timeout_s, deadline, repository, behavior, bool(candidates),
                                              groups_remaining=total - index if staged else None,
                                              initializing=staged and index == 0, total_groups=total,
-                                             expected_group_seconds=expected_group_seconds)
+                                             expected_group_seconds=expected_group_seconds, warnings=warnings)
                 expected_group_seconds = ((expected_group_seconds or 0) * index + group_seconds) / (index + 1)
                 prior.extend(verdict["comments"])
                 assessment = verdict["assessment"]
@@ -661,6 +678,11 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 # Each group was validated against the bounded provider schema.
                 # The aggregate's capacity is a publication constraint.
                 verdict = {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}
+            if warnings and (checkpoint is None or checkpoint.finalization is None):
+                limitations = verdict["assessment"]["limitations"]
+                note = "\n\nRepository inspection warnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
+                note = note[:2500]
+                verdict["assessment"]["limitations"] = limitations[:4000 - len(note)] + note
             watch.check_closed()
             try:
                 if checkpoint is not None:

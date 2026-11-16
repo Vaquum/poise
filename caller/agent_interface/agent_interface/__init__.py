@@ -2380,7 +2380,9 @@ def run_governed_behavior(
             raise SystemExit(1)
         except review_continuation.Continuation as e:
             action = None if e.result["publication_started"] else "not_started"
-            finish(id_, "failed", error=str(e), error_code=e.code, action=action, outcome="incomplete")
+            diagnostic = _caller_context(e.diagnostic, id_, correlation_id, repo, mod.pr_number(pr),
+                                         actor, behavior, expected_head) if e.diagnostic else None
+            finish(id_, "failed", error=str(e), error_code=e.code, action=action, outcome="incomplete", diagnostic=diagnostic)
             print(json.dumps({"id": id_, "error": str(e), "error_code": e.code,
                               "action": action, "outcome": "incomplete", "continuation": e.result}))
             raise SystemExit(1)
