@@ -3,10 +3,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, expect, it, vi } from 'vitest'
-import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
+import { BehaviorChainJournal, canCloseMergedReviewHold, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
-import { behaviorChainAttention } from '../server/behavior-chain-summary'
+import { behaviorChainAttention, behaviorChainSummary } from '../server/behavior-chain-summary'
 import { nativeActionReceipt, nativeRequestSha } from '../server/behavior-chain-action'
 import { completedReviewCall } from './review-response-fixture'
 import { parseAgentLogStdout, type LogEntry } from '../server/agent-log-parse'
@@ -158,6 +158,34 @@ it.each([
   })).toHaveLength(1)
   expect(observe).toHaveBeenCalledTimes(1)
   for (const write of writes) expect(write).not.toHaveBeenCalled()
+})
+
+it('closes a merged review hold after original Calls and resources settle and replays the terminal outcome', async () => {
+  const { journal } = setup()
+  const { chain, call, merged } = persistedEnqueueRefusal(journal, 'missing review', true)
+  const closure = { type: 'chain.review-hold-closed', closure: { mergeSha: MERGE, actor: chain.author, label: 'poise' } } as const
+  expect(canCloseMergedReviewHold(chain)).toBe(false)
+  expect(() => journal.append(chain.id, 'early-review-closure', chain.sequence, closure)).toThrow('settled Calls and resources')
+  await new BehaviorChainRuntime(journal, operations({
+    observe: async () => merged,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }),
+  })).run()
+  const settled = journal.read(chain.id)!
+  expect(canCloseMergedReviewHold(settled)).toBe(true)
+  expect(canCloseMergedReviewHold({ ...settled, invocations: settled.invocations.map(invocation => ({
+    ...invocation, evidence: { ...invocation.evidence, resources_settled_at: null },
+  })) })).toBe(false)
+  expect(behaviorChainAttention(journal).find(row => row.id === chain.id)?.reviewHoldSequence).toBe(settled.sequence)
+  const history = journal.history(chain.id)
+  const closed = journal.append(chain.id, 'review-closure', settled.sequence, closure)
+  expect(behaviorChainSummary(closed)).toMatchObject({ mergeSha: MERGE, reviewPending: false, reviewStatus: 'evidence-missing', held: null, waiting: null })
+  expect(closed.invocations).toEqual(settled.invocations)
+  expect(behaviorChainAttention(journal).some(row => row.id === chain.id)).toBe(false)
+  expect(journal.page('', 100, true).map(row => row.id)).toContain(chain.id)
+  expect(journal.append(chain.id, 'review-closure', settled.sequence, closure)).toEqual(closed)
+  expect(journal.history(chain.id).slice(0, history.length)).toEqual(history)
+  journal.rebuild()
+  expect(journal.read(chain.id)).toEqual(closed)
 })
 
 it.each(['missing Call', 'duplicate Call', 'quarantined Call', 'missing diagnostic', 'truncated diagnostic', 'unknown truncation',

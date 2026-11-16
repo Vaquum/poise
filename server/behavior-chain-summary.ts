@@ -3,7 +3,7 @@ import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
 import { APPROVAL_CONVERSATION_WAIT, approvalConversationRefusal, CHAIN_OBSERVATION_MAX_AGE_MS, chainQueueSettlement, chainReviewResponse, closedChainTarget, decideBehaviorChain, recoveredQueueRepair, type ChainObservation } from './behavior-chain-decision'
 import { nativeBehavior } from './behavior-chain-runtime'
-import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
+import { canCloseMergedReviewHold, chainBasis, chainReviewStatus, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
 import type { ProcessDiagnostic } from './process-diagnostic'
 import type { ChainNudge, ChainWorkLink } from '../src/behavior-chain-nudge'
@@ -735,6 +735,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                         : { kind: 'unknown', action: 'No automatic next step verified. Inspect the recorded blocker.', prerequisite: null, work }
       entries.push({ id: chain.id, repository: chain.repository, issue: chain.issue,
         held: chain.held, sequence: chain.sequence, mergeSha: chain.mergeSha,
+        reviewHoldSequence: canCloseMergedReviewHold(chain) ? chain.sequence : null,
         pullNumber: observation?.publication?.pull_number ?? null,
         step: active ? `${active.behavior}: ${active.state}` : chain.reviewPending ? 'Merged; review evidence pending'
           : !chain.held ? waiting || (pull ? 'PR merge gates' : 'Issue admission')
@@ -805,7 +806,7 @@ export function behaviorChainSummary(chain: BehaviorChain, journal?: BehaviorCha
     mergeSha: chain.mergeSha,
     supersession: chain.supersession ?? null,
     reviewPending: chain.reviewPending ?? null,
-    reviewStatus: chain.reviewPending === true ? 'pending' : chain.reviewPending === false ? 'complete' : 'not-recorded',
+    reviewStatus: chainReviewStatus(chain),
     mergedReviewWarning: mergedReviewWarning(chain, journal),
     reconciliation: reconciliation ? { nextObservationAt: reconciliation.at,
       ...(chainWaitsForResourceRelease(chain) ? { waitingForResourceRelease: true } : {}),

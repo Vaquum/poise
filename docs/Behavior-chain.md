@@ -488,6 +488,20 @@ does not shrink accumulated history or rewrite historical hashes.
 
 The existing authorized HTTP API supports interactive and headless controls: `GET /api/behavior-chains`, optional `state=active|merged`, cursor `after`, or `id` with an event-sequence cursor; `POST` accepts `id`, current `sequence` and `operation=hold|resume`. Cutover controls instead send the current cutover `sequence` and `operation=switch-to-v2|cancel-cutover`. Reads include `cutover` (mode, sequence, request time, recorded legacy targets and current drain blockers). Summaries/events are paginated. Stale writes fail instead of overwriting a later decision.
 
+In Observe → Tasks, choose Needs attention and filter by the full repository
+name to close settled review holds. The workspace owner's action checks the
+current closed source issue and configured intake label on GitHub. Each
+selected chain needs a verified merge, settled original Calls and positive
+resource-release evidence. A changed chain sequence or an ineligible source
+leaves that hold in attention. The journal records “merged, review evidence
+missing” as a terminal outcome and retains the original merge, evidence and
+hold events in History. Live merges require their usual review proof.
+
+The action uses `POST /api/behavior-chains` with
+`operation=close-merged-review-holds`, an exact `repository`, and up to 100
+`targets` containing `id` and `sequence`. It returns the closed and skipped
+chain IDs. The owner uses the same-origin browser control.
+
 ## Handoffs and outcomes
 
 An implementation or repair that explicitly reports a blocker records

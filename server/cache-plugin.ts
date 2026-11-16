@@ -500,7 +500,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         if (await handleJevApi(req, res, url)) return
-        if (path === '/api/behavior-chains') return handleBehaviorChains(req, res, url, chatRuntime?.instance)
+        if (path === '/api/behavior-chains') return handleBehaviorChains(req, res, url, chatRuntime?.instance, speaksForPerson(req, !!service, authority))
 
         if (url === '/api/health' && req.method === 'GET') {
           const claudeAuthState = auth.snapshot()

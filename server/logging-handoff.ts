@@ -16,7 +16,7 @@ export function verifiedLoggingHandoffs(candidates: HandoffCandidate[], journal:
       const observation = chain.observation as ChainObservation | null
       const scoped = successor && successor.state === 'settled' && successor.evidence?.status === 'completed'
         ? scopedSuccessorObservation(successor, observation) : null
-      return !!successor && !chain.held && !chain.reviewPending
+      return !!successor && !chain.held && !chain.reviewPending && !chain.reviewHoldClosure
         && !chain.invocations.some(item => item.state === 'uncertain' || item.evidence && resourceReleaseContradicted(item.evidence))
         && reviewAdmissionHead(invocation) === candidate.head && invocation.evidence?.completedAt === candidate.completedAt
         && match.invocation.actor.toLowerCase() === candidate.actor.toLowerCase()
