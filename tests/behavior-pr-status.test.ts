@@ -5,6 +5,7 @@ import { computePrBlocker, parsePrStatusRead, type BlockerInput } from '../serve
 import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
 import { HEAD_SHA, NEXT_HEAD_SHA, agentLog, arrangeCli, fixture, loadModules, mocks, pr, recordCompletedInitialReview } from './behaviors-runtime-fixture'
 import { prGroup } from '../src/ui/places/overview/entries'
+import { phaseOf, toItem } from '../src/ui/places/board/model'
 
 const HEAD = HEAD_SHA
 const NEXT = NEXT_HEAD_SHA
@@ -711,6 +712,50 @@ describe('readPrStatus', () => {
     expect(row.blocker.line).toBe('approved, not enqueued: waiting for merge-prs scan')
     expect(row.flags).toEqual({ age: false, staleBlocker: false })
     expect(row.ledger).toBe(`/api/behavior-ledger?repository=${pr.repo}&number=${pr.number}`)
+  })
+
+  it.each([
+    ['PENDING', 'ci_pending', 'pending', 'waiting', 'PR review'],
+    ['FAILURE', 'ci_failing', 'failing', 'failed', 'Repair'],
+    ['ERROR', 'ci_failing', 'failing', 'failed', 'Repair'],
+  ] as const)('shows verified conflicts beside %s CI without moving the Board row', async (rollupState, id, word, state, phase) => {
+    const { db, runtime, status } = await setup()
+    recordApproval(db, {
+      target: `${pr.repo}#${pr.number}@head=${HEAD}`,
+      headSha: HEAD, callId: 'e'.repeat(32), completedAt: '2026-10-29T10:00:00Z',
+    })
+    const now = Date.parse('2026-10-29T10:30:00Z')
+    const at = new Date(now).toISOString()
+    seedCache(runtime, at, { rollupState })
+    const before = (await status.readPrStatus(50, now)).rows[0]
+    seedCache(runtime, at, { rollupState, mergeStateStatus: 'DIRTY' })
+    const row = (await status.readPrStatus(50, now + 1)).rows[0]
+    const line = `CI ${word} on ${SHORT} · conflicts with base`
+    expect(row.ci).toEqual(before.ci)
+    expect(row.blocker).toMatchObject({ id, line, since: before.blocker.since })
+    const boardRow = toItem({
+      record: { kind: 'pr', repo: pr.repo, number: pr.number, state: 'open', title: 'Conflicting pull request',
+        url: pr.url, created_at: at, updated_at: at, merged_at: null },
+      status: row, chain: null, run: null, labelled: false, closing: null,
+    })
+    expect(boardRow).toMatchObject({ state, detail: line })
+    expect(phaseOf(boardRow).word).toBe(phase)
+    expect(computePrBlocker(baseInput({ rollupState, mergeState: 'DIRTY', greyPending: true }))).toMatchObject({
+      id, key: `ci:${HEAD}`, line: `CI ${word} on ${SHORT} · grey rerun pending · conflicts with base`,
+    })
+
+    const staleAt = now + runtime.MERGE_CANDIDATE_CACHE_STALE_MS + 1
+    const stale = (await status.readPrStatus(50, staleAt)).rows[0]
+    expect(stale.ci.state).toBe('unknown')
+    expect(stale.blocker.id).toBe('awaiting_review')
+    expect(stale.blocker.line).not.toContain('conflicts with base')
+
+    seedCache(runtime, new Date(staleAt + 1).toISOString(), { rollupState, mergeStateStatus: 'DIRTY', queueEntryId: 'MQE_1' })
+    const queued = (await status.readPrStatus(50, staleAt + 1)).rows[0]
+    expect(queued.queue.state).toBe('queued')
+    expect(queued.blocker).toMatchObject({ id: 'in_queue', line: 'in merge queue since 10:35Z' })
+    expect(mocks.runFile.mock.calls.every(([command]) => command === 'github-datastore')).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
   it('lists drafts and skipped repos with refusal reasons', async () => {

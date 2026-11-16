@@ -216,14 +216,15 @@ export function computePrBlocker(input: BlockerInput): ComputedBlocker {
   if (!input.evidenceFresh) missing.push(input.evidenceWhy ?? 'merge-candidate evidence')
   if (input.evidenceFresh) {
     const rollup = input.rollupState
+    const conflict = input.mergeState === 'DIRTY' ? ' · conflicts with base' : ''
     if (rollup === 'FAILURE' || rollup === 'ERROR') {
       const grey = input.greyPending ? ' · grey rerun pending' : ''
-      return done('ci_failing', `CI failing on ${shortHead(input.currentHead)}${grey}`, `ci:${input.currentHead}`)
+      return done('ci_failing', `CI failing on ${shortHead(input.currentHead)}${grey}${conflict}`, `ci:${input.currentHead}`)
     }
     // The queue path requires SUCCESS; the direct path tolerates no checks.
     if (rollup !== 'SUCCESS' && !(rollup === null && input.queueEnabled === false)) {
       const grey = input.greyPending ? ' · grey rerun pending' : ''
-      return done('ci_pending', `CI pending on ${shortHead(input.currentHead)}${grey}`, `ci:${input.currentHead}`)
+      return done('ci_pending', `CI pending on ${shortHead(input.currentHead)}${grey}${conflict}`, `ci:${input.currentHead}`)
     }
   }
   if (input.evidenceFresh) {

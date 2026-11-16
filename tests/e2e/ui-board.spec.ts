@@ -94,6 +94,29 @@ test('List stays as you left it across a reload, and a link’s view is not reme
   await expect(view(page, 'Lanes')).toHaveAttribute('aria-pressed', 'true')
 })
 
+test('CI rows show conflicts with base and keep their state and phase', async ({ page }) => {
+  const cases = [
+    [44, 'ci_pending', 'CI pending on aaaaaaaa · conflicts with base', 'waiting', 'PR review'],
+    [45, 'ci_failing', 'CI failing on aaaaaaaa · conflicts with base', 'failed', 'Repair'],
+  ] as const
+  await board(page, { records: cases.map(([number, , line]) => record('pr', number, line)) })
+  await page.route('**/api/behavior-ledger/pr-status**', (route) => route.fulfill({ json: {
+    version: 2, totalOpen: 2, truncated: false,
+    rows: cases.map(([number, id, line]) => ({ repository: 'acme/site', number,
+      blocker: { id, line, since: iso(5), sinceRestart: false, details: [] } })),
+  } }))
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  for (const layout of ['Lanes', 'List'] as const) {
+    await view(page, layout).click()
+    for (const [, , line, state, phase] of cases) {
+      const row = card(page, line)
+      await expect(row.locator('[data-ref="card.blocker"]')).toContainText(line)
+      await expect(row).toHaveAttribute('data-state', state)
+      if (layout === 'List') await expect(row.getByRole('img', { name: `Phase: ${phase}`, exact: true })).toBeVisible()
+    }
+  }
+})
+
 test('Today means changed today on Updated, and opened today on Opened', async ({ page }) => {
   // Fresh today stamps: RECORDS' 20–60m offsets are yesterday once the run crosses midnight.
   const now = new Date().toISOString()
