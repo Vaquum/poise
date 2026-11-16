@@ -66,6 +66,12 @@ describe('runCli with the in-process datastore reader', () => {
     await expect(runCli(mocks.org as never, ARGS)).rejects.toThrow('datastore contains records outside alpha')
   })
 
+  it('keeps rows in the requested organization alongside a foreign row', async () => {
+    const healthy = row('alpha/one', 1)
+    mocks.read.mockReturnValue(Promise.resolve([row('beta/one', 1), healthy]))
+    await expect(runCli(mocks.org as never, ARGS)).resolves.toEqual([healthy])
+  })
+
   it('joins an identical read in flight, and reads afresh once it settles', async () => {
     let release!: (rows: unknown[]) => void
     mocks.read.mockReturnValueOnce(new Promise((resolve) => { release = resolve }))
@@ -220,7 +226,7 @@ describe('runCli with the in-process datastore reader', () => {
       mark = 'mark-3'
       appendFileSync(`${path}-wal`, 'another item frame')
       mocks.closing.mockResolvedValue(null)
-      expect((await intake()).errors).toEqual([{ org: 'alpha', error: 'open pull request references are incomplete' }])
+      expect((await intake()).errors).toEqual([{ org: 'alpha', error: 'open pull request references are unavailable' }])
       mocks.closing.mockResolvedValue(page)
       expect((await intake()).errors).toEqual([])
       expect(mocks.closing).toHaveBeenCalledTimes(4)

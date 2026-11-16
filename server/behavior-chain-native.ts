@@ -19,6 +19,7 @@ import { requireCallerReceipts } from './service/caller-calls'
 import { releaseReplacementPending } from './release-background'
 import { reviewContinuationArgs } from './review-continuation'
 import { reviewClearanceOnly } from './review-clearance'
+import { diagnosticFailure } from './logging'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
@@ -151,19 +152,37 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         ...(settings.seedMode === 'label' ? ['--label', settings.label] : [])]
       // The latest page catches newly labelled old issues immediately; the
       // stable repository/number page drains older intake without truncation.
-      const pages = await Promise.all([base, [...base, '--after-repo', discoveryCursor.repo, '--after-number', String(discoveryCursor.number)]].map(async (args) => {
+      const results = await Promise.allSettled([base, [...base, '--after-repo', discoveryCursor.repo, '--after-number', String(discoveryCursor.number)]].map(async (args) => {
         const rows = await datastoreViewOrCli(org.datastorePath, args, async () =>
           (await runFile('github-datastore', organizationArgs(org, args), { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })).stdout)
         if (!Array.isArray(rows) || rows.length > 100) throw new Error('datastore issue intake returned an invalid page')
-        return rows.map((raw) => {
-          const row = object(raw, 'issue intake')
-          if (typeof row.repo !== 'string' || !ownsRepository(row.repo) || row.status !== 'open') throw new Error('issue intake escaped its followed organization')
-          return { repository: row.repo, number: positive(row.number, 'issue intake') }
+        const seeds = rows.flatMap((raw, index) => {
+          try {
+            const row = object(raw, 'issue intake')
+            if (typeof row.repo !== 'string' || !ownsRepository(row.repo) || row.status !== 'open') throw new Error('issue intake row is outside its followed organization or is closed')
+            return [{ repository: row.repo, number: positive(row.number, 'issue intake') }]
+          } catch (error) {
+            diagnosticFailure('behavior-chain.issue-intake', error, { organization: org.login, index }, { level: 'warning' })
+            return []
+          }
         })
+        return { seeds, more: rows.length === 100 }
       }))
-      const tail = pages[1].at(-1)
-      discoveryCursor = pages[1].length === 100 && tail ? { repo: tail.repository, number: tail.number } : { repo: '', number: 0 }
-      const seeds = [...new Map(pages.flat().map((seed) => [`${seed.repository}#${seed.number}`, seed])).values()]
+      const [recent, paged] = results
+      if (recent.status === 'rejected' && paged.status === 'rejected') throw recent.reason
+      if (paged.status === 'fulfilled') {
+        const tail = paged.value.seeds.at(-1)
+        discoveryCursor = paged.value.more && tail ? { repo: tail.repository, number: tail.number } : { repo: '', number: 0 }
+      }
+      const seedsById = new Map<string, ChainSeed>()
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          diagnosticFailure('behavior-chain.issue-intake', result.reason, { organization: org.login }, { level: 'warning' })
+          continue
+        }
+        for (const seed of result.value.seeds) seedsById.set(`${seed.repository.toLowerCase()}#${seed.number}`, seed)
+      }
+      const seeds = [...seedsById.values()]
       const existing = await hooks.existing(seeds)
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
@@ -175,10 +194,18 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       if (!rows?.length) return []
       const { stdout } = await runDatastoreHealth(org, { timeoutMs: 5_000 })
       if (validatedHealth(stdout, { ...org, datastorePath })?.status !== 'healthy') return []
-      return rows.flatMap(row => {
-        const updatedAt = typeof row.updated_at === 'string' ? Date.parse(row.updated_at) : NaN
-        return typeof row.repo === 'string' && ownsRepository(row.repo) && row.status === 'closed' && Number.isFinite(updatedAt)
-          ? [{ repository: row.repo, number: positive(row.number, 'closed issue hint'), updatedAt }] : []
+      return rows.flatMap((raw, index) => {
+        try {
+          const row = object(raw, 'closed issue hint')
+          const updatedAt = typeof row.updated_at === 'string' ? Date.parse(row.updated_at) : NaN
+          if (typeof row.repo !== 'string' || !ownsRepository(row.repo) || row.status !== 'closed' || !Number.isFinite(updatedAt)) {
+            throw new Error('closed issue hint has an invalid repository, state or updated timestamp')
+          }
+          return [{ repository: row.repo, number: positive(row.number, 'closed issue hint'), updatedAt }]
+        } catch (error) {
+          diagnosticFailure('behavior-chain.closed-issue-hint', error, { organization: org.login, index }, { level: 'warning' })
+          return []
+        }
       })
     },
     readInvocations: readNativeInvocations,
