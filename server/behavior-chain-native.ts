@@ -164,7 +164,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const tail = pages[1].at(-1)
       discoveryCursor = pages[1].length === 100 && tail ? { repo: tail.repository, number: tail.number } : { repo: '', number: 0 }
       const seeds = [...new Map(pages.flat().filter(seed => !seed.stale)
-        .map((seed) => [`${seed.repository}#${seed.number}`, seed])).values()]
+        .map(({ repository, number }) => [`${repository}#${number}`, { repository, number }])).values()]
       const existing = await hooks.existing(seeds)
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
