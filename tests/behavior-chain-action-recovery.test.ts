@@ -372,6 +372,7 @@ it('retains a large accepted conversation batch once within the existing journal
 function reviewed(journal: BehaviorChainJournal, chain: BehaviorChain, obs: ChainObservation): BehaviorChain {
   const call = completedReviewCall(chain.repository, 21, HEAD, chain.reviewer)
   const response = call.artifact!.review_response as { context_sha: string }
+  obs.prReviewers = [{ slot: 'primary', model: 'fixture', recovery: 'fixture' }]
   Object.assign(obs.pull!, { reviewContext: response.context_sha, reviewIds: [call.review_id!], reviewReceipts: [{
     id: call.review_id!, head: HEAD, state: 'COMMENTED', invocation: call.id, response,
     submittedAt: Date.parse(call.completed_at!),
