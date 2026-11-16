@@ -105,10 +105,10 @@ class ReconcileResumeTest(unittest.TestCase):
         self.reader.fail_on = 101
         with self.assertRaisesRegex(RuntimeError, "interrupted expansion"):
             sync_once(self.path, workers=1)
-        self.assertEqual(self.reader.expanded, [100])
+        self.assertEqual(self.reader.expanded, [100, 102])
         self.reader.fail_on = None
         self.assertTrue(sync_once(self.path, workers=1))
-        self.assertEqual(self.reader.expanded, [100, 101, 102])
+        self.assertEqual(self.reader.expanded, [100, 102, 101])
         self.assertIsNone(self.state("full_build_retry_required", "repo:10"))
 
     def test_completed_repository_is_not_repeated_after_budget_yields(self) -> None:

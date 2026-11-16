@@ -160,7 +160,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           try {
             const row = object(raw, 'issue intake')
             if (typeof row.repo !== 'string' || !ownsRepository(row.repo) || row.status !== 'open') throw new Error('issue intake row is outside its followed organization or is closed')
-            return [{ repository: row.repo, number: positive(row.number, 'issue intake') }]
+            return [{ repository: row.repo, number: positive(row.number, 'issue intake'), stale: row.sync_error !== undefined }]
           } catch (error) {
             diagnosticFailure('behavior-chain.issue-intake', error, { organization: org.login, index }, { level: 'warning' })
             return []
@@ -174,15 +174,19 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         const tail = paged.value.seeds.at(-1)
         discoveryCursor = paged.value.more && tail ? { repo: tail.repository, number: tail.number } : { repo: '', number: 0 }
       }
-      const seedsById = new Map<string, ChainSeed>()
+      const seedsById = new Map<string, ChainSeed | null>()
       for (const result of results) {
         if (result.status === 'rejected') {
           diagnosticFailure('behavior-chain.issue-intake', result.reason, { organization: org.login }, { level: 'warning' })
           continue
         }
-        for (const seed of result.value.seeds) seedsById.set(`${seed.repository.toLowerCase()}#${seed.number}`, seed)
+        for (const { repository, number, stale } of result.value.seeds) {
+          const key = `${repository.toLowerCase()}#${number}`
+          if (stale) seedsById.set(key, null)
+          else if (seedsById.get(key) !== null) seedsById.set(key, { repository, number })
+        }
       }
-      const seeds = [...seedsById.values()]
+      const seeds = [...seedsById.values()].filter(seed => seed !== null)
       const existing = await hooks.existing(seeds)
       return seeds.filter((seed) => !existing.has(`${seed.repository.toLowerCase()}#${seed.number}`))
     },
@@ -197,6 +201,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return rows.flatMap((raw, index) => {
         try {
           const row = object(raw, 'closed issue hint')
+          if (row.sync_error !== undefined) return []
           const updatedAt = typeof row.updated_at === 'string' ? Date.parse(row.updated_at) : NaN
           if (typeof row.repo !== 'string' || !ownsRepository(row.repo) || row.status !== 'closed' || !Number.isFinite(updatedAt)) {
             throw new Error('closed issue hint has an invalid repository, state or updated timestamp')

@@ -1,8 +1,9 @@
 import copy
 import unittest
+from unittest.mock import patch
 
 from github_datastore.extract import extract_associations
-from github_datastore.github_api import GitHubApiError, GitHubOrgReader
+from github_datastore.github_api import GitHubApiError, GitHubGraphQLError, GitHubOrgReader
 from github_datastore.store import iter_expanded
 from tests.test_github_api import ScriptedClient, connection
 from tests.test_store import repo_row
@@ -121,7 +122,7 @@ class ItemGraphBatchTest(unittest.TestCase):
 
     def test_malformed_identity_or_incomplete_aliases_fail_before_any_item_is_emitted(self):
         node = graph()
-        cases = [None, {}, {'item_0': None}, {'item_0': node, 'extra': node}]
+        cases = [None, {}, {'item_0': None}]
         for field, bad in [('__typename', 'PullRequest'), ('number', 2), ('fullDatabaseId', '999')]:
             changed = copy.deepcopy(node)
             changed[field] = bad
@@ -133,6 +134,46 @@ class ItemGraphBatchTest(unittest.TestCase):
                     list(iter_expanded(GitHubOrgReader(client), repo_row(), [stub(node)], 1))
                 client.assert_exhausted()
 
+    def test_missing_or_malformed_item_does_not_hide_the_healthy_sibling(self):
+        first, healthy = graph(1), graph(2)
+        for bad in ({}, {'item_0': None}, {'item_0': graph(17)}):
+            with self.subTest(bad=bad):
+                client = ScriptedClient([{'repository': {**bad, 'item_1': healthy, 'extra': first}}])
+                completed = []
+                with self.assertRaisesRegex(GitHubApiError, 'Vaquum/Test#1'):
+                    for expanded in iter_expanded(GitHubOrgReader(client), repo_row(), [stub(first), stub(healthy)], 2):
+                        completed.append(expanded['issue']['number'])
+                self.assertEqual(completed, [2])
+
+    def test_graphql_error_for_one_alias_keeps_other_data(self):
+        first, healthy = graph(1), graph(2)
+        client = ScriptedClient([])
+        failure = GitHubGraphQLError('GraphQL errors', {'repository': {'item_0': None, 'item_1': healthy}},
+                                    [{'path': ['repository', 'item_0'], 'message': 'Cannot resolve item'}])
+        with patch.object(client, 'graphql', side_effect=failure):
+            completed = []
+            with self.assertRaisesRegex(GitHubApiError, 'Vaquum/Test#1: Cannot resolve item'):
+                for expanded in iter_expanded(GitHubOrgReader(client), repo_row(), [stub(first), stub(healthy)], 2):
+                    completed.append(expanded['issue']['number'])
+        self.assertEqual(completed, [2])
+
+    def test_generic_worker_error_does_not_cancel_other_item_expansions(self):
+        items = [graph(number) for number in range(1, 5)]
+        client = ScriptedClient([{'repository': {f'item_{i}': item for i, item in enumerate(items)}}])
+        reader = GitHubOrgReader(client)
+        expand = reader.expand_item_graph
+
+        def worker(repo, item, node):
+            if item['number'] == 1:
+                raise RuntimeError('item worker failed')
+            return expand(repo, item, node)
+
+        completed = []
+        with patch.object(reader, 'expand_item_graph', side_effect=worker), self.assertRaisesRegex(RuntimeError, 'item worker failed'):
+            for expanded in iter_expanded(reader, repo_row(), [stub(item) for item in items], 2):
+                completed.append(expanded['issue']['number'])
+        self.assertCountEqual(completed, [2, 3, 4])
+
     def test_batches_are_bounded_and_next_batch_is_not_fetched_after_failure(self):
         nodes = [graph(n) for n in range(1, 26)]
         client = ScriptedClient([
@@ -143,7 +184,7 @@ class ItemGraphBatchTest(unittest.TestCase):
         self.assertEqual(len(rows), 25)
         self.assertEqual([len(v) - 2 for _, v in client.calls], [20, 5])
         client.assert_exhausted()
-        client = ScriptedClient([{'repository': {}}])
+        client = ScriptedClient([{'repository': None}])
         with self.assertRaises(GitHubApiError):
             list(iter_expanded(GitHubOrgReader(client), repo_row(), [stub(n) for n in nodes], 2))
         self.assertEqual(len(client.calls), 1)

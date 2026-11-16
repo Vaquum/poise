@@ -1353,6 +1353,7 @@ export interface PullRequestFacts {
   updated_at: string
   /** Opened time as the datastore reports it; null when the row predates it. */
   created_at: string | null
+  syncError?: string
 }
 
 // Whose pull requests a PR behavior acts on and where it is skipped, read once
@@ -1374,7 +1375,8 @@ export function pullRequestPolicy(behavior: SkippableBehavior): PullRequestPolic
 }
 
 // Open, not a draft and yours: what every PR behavior and the baseline require.
-export function ownPullRequestRefusal(me: string, ref: string, pr: Pick<PullRequestFacts, 'author' | 'status' | 'draft'> | null, agent = agentAccount()): string | null {
+export function ownPullRequestRefusal(me: string, ref: string, pr: Pick<PullRequestFacts, 'author' | 'status' | 'draft' | 'syncError'> | null, agent = agentAccount()): string | null {
+  if (pr?.syncError) return `${ref} is waiting for its GitHub snapshot to refresh: ${pr.syncError}`
   if (pr?.status !== 'open') return `${ref} is not an open pull request`
   if (pr.draft) return `${ref} is a draft`
   if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → General`
@@ -1387,7 +1389,7 @@ export function ownPullRequestRefusal(me: string, ref: string, pr: Pick<PullRequ
 // The one check a pull request passes before a PR behavior acts on it, applied
 // by the scheduler and by a replay from Swarm alike. It names what failed;
 // `pr` is null when the datastore does not have the pull request.
-export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, number: number, pr: Pick<PullRequestFacts, 'author' | 'status' | 'draft'> | null): string | null {
+export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, number: number, pr: Pick<PullRequestFacts, 'author' | 'status' | 'draft' | 'syncError'> | null): string | null {
   return ownPullRequestRefusal(policy.me, `${repo}#${number}`, pr, policy.agentAccount)
     ?? (policy.skipped.has(repo.toLowerCase()) ? `${repo} is in the Skip repositories list of ${SKIPPABLE_LABELS[policy.behavior]}` : null)
     ?? (pr ? repoHoldRefusal(repo, prReviewer(pr.author)) : null)
@@ -2759,6 +2761,11 @@ function safeInteger(value: unknown, field: string): number {
   return Number(value)
 }
 
+function rowSyncError(row: Record<string, unknown>): string | undefined {
+  return row.sync_error === undefined ? undefined
+    : typeof row.sync_error === 'string' && row.sync_error ? row.sync_error : 'Unreadable sync failure'
+}
+
 async function requireFreshDatastore(): Promise<void> {
   const checkedAt = new Date().toISOString()
   try {
@@ -2868,6 +2875,7 @@ export function datastorePr(row: unknown, index: number): DatastorePr {
   const createdAt = typeof value.created_at === 'string' && Number.isFinite(Date.parse(value.created_at)) ? value.created_at : null
   const headRef = value.head_ref ?? null
   const headRepo = value.head_repo ?? null
+  const syncError = rowSyncError(value)
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
     || number < 1
     || draft > 1
@@ -2881,6 +2889,7 @@ export function datastorePr(row: unknown, index: number): DatastorePr {
   }
   return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt,
     created_at: createdAt,
+    ...(syncError ? { syncError } : {}),
     headRef: headRef as string | null, headRepo: headRepo as string | null }
 }
 
@@ -7365,6 +7374,7 @@ function setIssueSlotSince(previous: ReviewerCount, next: ReviewerCount): void {
 }
 
 export interface IssueFacts {
+  syncError?: string
   repo: string
   number: number
   status: string
@@ -7389,6 +7399,7 @@ export function issueReviewPolicy(): IssueReviewPolicy {
 // is null when the datastore does not have the issue.
 export function issueReviewRefusal(policy: IssueReviewPolicy, repo: string, number: number, issue: IssueFacts | null): string | null {
   const ref = `${repo}#${number}`
+  if (issue?.syncError) return `${ref} is waiting for its GitHub snapshot to refresh: ${issue.syncError}`
   if (!policy.repositories.has(repo.toLowerCase())) return `${repo} is not opted in to Review New Issues`
   if (issue?.status !== 'open') return `${ref} is not an open issue`
   if (!policy.authors.has(issue.author.toLowerCase())) return `${ref} was opened by ${issue.author}, who is not a trusted author of Review New Issues`
@@ -7413,16 +7424,22 @@ function datastoreIssue(row: unknown, index: number, repo: string): DatastoreIss
     || value.url !== `https://github.com/${repo}/issues/${number}`) {
     throw new Error(`github-datastore issue row ${index} violates the candidate contract`)
   }
-  return { repo, number, author, createdAt, status }
+  const syncError = rowSyncError(value)
+  return { repo, number, author, createdAt, status, ...(syncError ? { syncError } : {}) }
 }
 
 async function listOpenIssues(repo: string, since: string): Promise<DatastoreIssue[]> {
   const parsed = await datastoreView(['view', 'issue', '--repo', repo, '--status', 'open', '--created-since-datetime', since, '--limit', '500', '--format', 'json'], 32 * 1024 * 1024)
   if (!Array.isArray(parsed)) throw new Error('github-datastore view issue returned a non-array')
-  return parsed.map((row, index) => {
-    const issue = datastoreIssue(row, index, repo)
-    if (issue.status !== 'open') throw new Error(`github-datastore issue row ${index} violates the candidate contract`)
-    return issue
+  return parsed.flatMap((row, index) => {
+    try {
+      const issue = datastoreIssue(row, index, repo)
+      if (issue.status !== 'open') throw new Error(`github-datastore issue row ${index} violates the candidate contract`)
+      return [issue]
+    } catch (error) {
+      diagnosticFailure('github-datastore.view-issue', error, { repository: repo, index }, { level: 'warning' })
+      return []
+    }
   })
 }
 

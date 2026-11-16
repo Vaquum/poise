@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from . import views
 from .db import (
@@ -33,8 +33,10 @@ from .db import (
 from .extract import extract_associations
 from .github_api import (
     ITEM_GRAPH_BATCH_SIZE,
+    GitHubApiError,
     GitHubOrgReader,
     GitHubRateLimitError,
+    ItemGraphError,
     PullReconciliation,
     datastore_github_client,
     parse_graphql_datetime,
@@ -47,6 +49,7 @@ logger = logging.getLogger(__name__)
 FULL_BUILD_COMPLETE_KEY = "full_build_complete"
 FULL_BUILD_MARKERS_INITIALIZED_KEY = "full_build_markers_v1_initialized"
 FULL_BUILD_RETRY_KEY = "full_build_retry_required"
+ITEM_SYNC_ERRORS = "item-sync-errors"
 INITIALIZATION_KEY = "initialization_v1"
 RECONCILE_PROGRESS_KEY = "reconcile_progress_v1"
 
@@ -332,6 +335,8 @@ def changed_items_for_repos(
 
 
 def build_user(username: str, db_path: str | Path) -> None:
+    if not username.strip():
+        raise ValueError("username is required")
     conn = connect(db_path)
     try:
         init_db(conn)
@@ -341,12 +346,20 @@ def build_user(username: str, db_path: str | Path) -> None:
         with conn:
             add_user(conn, username)
             for row in rows:
-                expanded = json.loads(row["expanded_json"])
-                associations = extract_associations(expanded, username)
+                try:
+                    expanded = json.loads(row["expanded_json"])
+                    associations = extract_associations(expanded, username)
+                except (ValueError, TypeError, KeyError, AttributeError) as error:
+                    logger.warning("Could not index %s associations for item %s: %s", username, row["item_id"], error)
+                    continue
                 replace_associations(conn, int(row["item_id"]), username, associations)
             assert_no_duplicate_items(conn)
     finally:
         conn.close()
+
+
+class ReconciliationDeadline(Exception):
+    pass
 
 
 def sync_once(
@@ -444,9 +457,21 @@ def sync_once(
             and not full_build_retry_required(conn, int(repo["id"]))
         ]
         changed = changed_items_for_repos(reader, conn, incremental_repos, since)
+        pending: dict[int, dict[int, dict[str, Any]]] = {}
+        for row in conn.execute("SELECT key, value FROM sync_state WHERE scope = ?", (ITEM_SYNC_ERRORS,)):
+            try:
+                saved = json.loads(row["value"])
+                item = saved["item"]
+                item_id = int(row["key"])
+                if int(item["id"]) != item_id or type(item["number"]) is not int or item["item_kind"] not in ("pr", "issue"):
+                    raise ValueError("saved retry has an invalid item identity")
+                pending.setdefault(int(saved["repo_id"]), {})[item_id] = item
+            except (ValueError, TypeError, KeyError) as error:
+                logger.warning("Could not read sync retry for item %s: %s", row["key"], error)
 
         for repo in repos:
             repo_id = int(repo["id"])
+            retries = pending.get(repo_id, {})
             prior_repo = known_repos.get(repo_id)
             retry_full_build = full_build_retry_required(conn, repo_id)
             requires_initial_full = (
@@ -460,24 +485,31 @@ def sync_once(
                     with conn:
                         clear_full_build_marker(conn, repo_id)
                 all_issues = list_repo_items(reader, repo)
-                issues = (
+                refresh = (
                     all_issues
                     if reconcile or retry_full_build
                     else items_requiring_full_refresh(
                         conn, repo_id, repo["full_name"], all_issues
                     )
                 )
+                issues = {int(issue["id"]): issue for issue in refresh}
+                versions_in_repo = {int(issue["id"]): issue for issue in all_issues}
+                for item_id in retries:
+                    if item_id in versions_in_repo:
+                        issues[item_id] = versions_in_repo[item_id]
                 with conn:
                     prune_items_for_repo(
                         conn, repo_id, [int(issue["id"]) for issue in all_issues]
                     )
+                    for missing_id in retries.keys() - versions_in_repo.keys():
+                        conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (ITEM_SYNC_ERRORS, str(missing_id)))
                 # Each expansion and its source version survive a killed CLI.
                 # A new enumeration still discovers transfers, removals and edits.
                 checkpoint_scope = f"full-refresh:{repo_id}"
                 versions = {
                     int(issue["id"]): json.dumps([
                         repo["full_name"], issue["number"], issue["item_kind"], issue["updated_at"],
-                    ]) for issue in issues
+                    ]) for issue in issues.values()
                 }
                 stored_versions = {
                     int(row["item_id"]): json.dumps([
@@ -487,23 +519,52 @@ def sync_once(
                         (repo_id,),
                     )
                 }
-                issues = [issue for issue in issues if stored_versions.get(int(issue["id"])) != versions[int(issue["id"])] or
-                          get_state(conn, checkpoint_scope, str(issue["id"])) != versions[int(issue["id"])]]
+                items = [issue for item_id, issue in issues.items() if item_id in retries or stored_versions.get(item_id) != versions[item_id] or
+                         get_state(conn, checkpoint_scope, str(item_id)) != versions[item_id]]
             else:
-                issues = changed[repo["full_name"]]
-            outstanding = len(issues)
-            expansions = iter_expanded(reader, repo, issues, workers)
+                by_number = {item["number"]: item for item in retries.values()}
+                by_number.update({item["number"]: item for item in changed[repo["full_name"]]})
+                items = list(by_number.values())
+            outstanding = len(items)
+            by_number = {item["number"]: item for item in items}
+
+            def checked_attempt() -> None:
+                nonlocal outstanding
+                outstanding -= 1
+                if reconcile_sleep:
+                    time.sleep(reconcile_sleep)
+                if deadline is not None and outstanding and time.monotonic() >= deadline:
+                    raise ReconciliationDeadline()
+
+            def retain_item_failure(number: int | str, error: Exception) -> None:
+                logger.warning("Could not sync %s#%s; keeping the last snapshot: %s", repo["full_name"], number, error)
+                item = by_number.get(number)
+                if item is not None:
+                    with conn:
+                        set_state(conn, ITEM_SYNC_ERRORS, str(item["id"]), json.dumps({
+                            "repo_id": repo_id, "item": item, "reason": str(error)[:500],
+                        }))
+                checked_attempt()
+
+            expansions = iter_expanded(reader, repo, items, workers, on_item_error=retain_item_failure)
             try:
                 for expanded in expansions:
-                    item_id = store_expanded(conn, expanded, users)
-                    if full_enumeration:
+                    try:
+                        item_id = store_expanded(conn, expanded, users)
+                    except (GitHubApiError, ValueError, TypeError, KeyError, AttributeError, sqlite3.IntegrityError) as error:
+                        issue = expanded.get("issue") if isinstance(expanded, dict) else None
+                        number = issue.get("number", "unknown") if isinstance(issue, dict) else "unknown"
+                        retain_item_failure(number, error)
+                        continue
+                    if full_enumeration or item_id in retries:
                         with conn:
-                            set_state(conn, checkpoint_scope, str(item_id), versions[item_id])
-                    outstanding -= 1
-                    if reconcile_sleep:
-                        time.sleep(reconcile_sleep)
-                    if deadline is not None and outstanding and time.monotonic() >= deadline:
-                        return False
+                            if full_enumeration:
+                                set_state(conn, checkpoint_scope, str(item_id), versions[item_id])
+                            if item_id in retries:
+                                conn.execute("DELETE FROM sync_state WHERE scope = ? AND key = ?", (ITEM_SYNC_ERRORS, str(item_id)))
+                    checked_attempt()
+            except ReconciliationDeadline:
+                return False
             finally:
                 # Closing explicitly propagates errors from workers still in flight.
                 expansions.close()
@@ -565,12 +626,18 @@ def items_requiring_full_refresh(
         stored_at = parse_graphql_datetime(
             row["updated_at"], f"stored item {item_id} for {repo_full_name}"
         )
+        issue_labels = True
+        if row["item_type"] == "issue":
+            try:
+                issue_labels = isinstance(json.loads(row["expanded_json"])["issue"].get("labels"), list)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                issue_labels = False
         if (
             current_at != stored_at
             or int(row["number"]) != int(item["number"])
             or str(row["item_type"]) != item["item_kind"]
             or str(row["repo_full_name"]) != repo_full_name
-            or (row["item_type"] == "issue" and not isinstance(json.loads(row["expanded_json"])["issue"].get("labels"), list))
+            or not issue_labels
         ):
             refresh.append(item)
     return refresh
@@ -695,36 +762,87 @@ def store_expanded(
 
 
 def iter_expanded(
-    reader: GitHubOrgReader, repo: dict[str, Any], issues: list[dict[str, Any]], workers: int
+    reader: GitHubOrgReader, repo: dict[str, Any], issues: list[dict[str, Any]], workers: int,
+    *, on_item_error: Callable[[int, ItemGraphError], None] | None = None,
 ) -> Iterator[dict[str, Any]]:
+    first_error: Exception | None = None
+
+    def failed(number: int, error: Exception) -> None:
+        nonlocal first_error
+        if isinstance(error, ItemGraphError) and on_item_error is not None:
+            on_item_error(number, error)
+        else:
+            logger.warning("Could not expand %s#%s: %s", repo["full_name"], number, error)
+            if first_error is None:
+                first_error = error
+
     for offset in range(0, len(issues), ITEM_GRAPH_BATCH_SIZE):
         batch = issues[offset:offset + ITEM_GRAPH_BATCH_SIZE]
         graphs = reader.fetch_initial_item_graphs(repo, batch)
+
+        def expand(issue: dict[str, Any]) -> dict[str, Any]:
+            number = issue["number"]
+            graph = graphs.get(number)
+            if isinstance(graph, ItemGraphError):
+                raise graph
+            if graph is None:
+                raise ItemGraphError("GitHub omitted this item's graph")
+            return reader.expand_item_graph(repo, issue, graph)
+
         if workers == 1 or len(batch) == 1:
             for issue in batch:
-                yield reader.expand_item_graph(repo, issue, graphs[issue["number"]])
+                try:
+                    expanded = expand(issue)
+                except GitHubRateLimitError:
+                    raise
+                except Exception as error:
+                    failed(issue["number"], error)
+                    continue
+                yield expanded
             continue
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures, processed = {}, set()
+        rate_error = None
+        try:
             futures = {
-                pool.submit(reader.expand_item_graph, repo, issue, graphs[issue["number"]]): issue["number"]
+                pool.submit(expand, issue): issue["number"]
                 for issue in batch
             }
-            try:
-                for future in as_completed(futures):
-                    yield future.result()
-            finally:
-                # Do not fetch the next batch after a quota or consumer error;
-                # cancel queued pagination and wait for already-running calls.
-                for future in futures:
-                    future.cancel()
-                pool.shutdown(wait=True, cancel_futures=True)
-                errors = [error for future in futures if not future.cancelled()
-                          and (error := future.exception()) is not None]
-                for error in errors:
+            for future in as_completed(futures):
+                processed.add(future)
+                try:
+                    expanded = future.result()
+                except GitHubRateLimitError as error:
+                    rate_error = error
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                except Exception as error:
+                    failed(futures[future], error)
+                    continue
+                yield expanded
+            if rate_error is not None:
+                for future in as_completed([f for f in futures if f not in processed and not f.cancelled()]):
+                    processed.add(future)
+                    try:
+                        expanded = future.result()
+                    except Exception as error:
+                        failed(futures[future], error)
+                        continue
+                    yield expanded
+                raise rate_error
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            if rate_error is not None:
+                raise rate_error
+            # A consumer ending at a deadline can still encounter a quota
+            # failure from a worker it did not get to consume.
+            for future in futures:
+                if future not in processed and not future.cancelled():
+                    error = future.exception()
                     if isinstance(error, GitHubRateLimitError):
                         raise error
-                if errors:
-                    raise errors[0]
+    if first_error is not None:
+        raise first_error
 
 
 def validate_repo_filter(

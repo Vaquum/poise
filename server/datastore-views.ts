@@ -153,9 +153,10 @@ export function selectView(db: Database.Database, query: DatastoreViewQuery): Re
   }
   if (filters.label !== undefined) {
     where.push(`EXISTS (SELECT 1 FROM items chain_issue,
-          json_each(chain_issue.expanded_json, '$.issue.labels') chain_label
+          json_each(CASE WHEN json_valid(chain_issue.expanded_json) THEN chain_issue.expanded_json ELSE '{}' END,
+                    '$.issue.labels') chain_label
           WHERE chain_issue.item_id = issues.payload_ref
-            AND json_extract(chain_label.value, '$.name') = ? COLLATE NOCASE)`)
+            AND CASE WHEN chain_label.type = 'object' THEN json_extract(chain_label.value, '$.name') END = ? COLLATE NOCASE)`)
     params.push(filters.label)
   }
   let sql = `SELECT * FROM ${view}`
@@ -163,15 +164,21 @@ export function selectView(db: Database.Database, query: DatastoreViewQuery): Re
   sql += paged ? ' ORDER BY repo ASC, number ASC' : ' ORDER BY updated_at DESC, repo ASC, number ASC'
   if (limit !== null) { sql += ' LIMIT ?'; params.push(limit) }
 
-  if (filters.label !== undefined && db.prepare(`SELECT 1 FROM items WHERE item_type='issue' `
-    + `AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array' LIMIT 1`).get()) {
-    throw new Error('issue label evidence is incomplete; ordinary datastore synchronization must refresh the old snapshots')
+  if (filters.label !== undefined) {
+    const labels = `coalesce(CASE WHEN json_valid(expanded_json) THEN json_type(expanded_json,'$.issue.labels') END,'missing')`
+    if (db.prepare(`SELECT 1 FROM items WHERE item_type='issue' AND ${labels} != 'array' LIMIT 1`).get()
+      && !db.prepare(`SELECT 1 FROM items WHERE item_type='issue' AND ${labels} = 'array' LIMIT 1`).get()) {
+      throw new Error('issue label evidence is incomplete; ordinary datastore synchronization must refresh the old snapshots')
+    }
   }
   const rows = db.prepare(sql).all(...params) as Record<string, unknown>[]
+  const failures = new Map(syncErrors(db).map(row => [row.key, row.reason ?? 'Unreadable sync failure']))
   for (const row of rows) {
     for (const value of Object.values(row)) {
       if (typeof value === 'bigint' || Buffer.isBuffer(value)) throw new Error(`${view} returned a value JSON cannot carry`)
     }
+    const error = failures.get(String(row.payload_ref))
+    if (error !== undefined) row.sync_error = error
   }
   return rows
 }
@@ -186,9 +193,15 @@ const CONTENT = `SELECT count(*) AS items, coalesce(max(updated_at), '') AS late
     coalesce((SELECT max(rowid) FROM associations), 0) AS evidence
   FROM items`
 
+function syncErrors(db: Database.Database): Array<{ key: string, reason: string | null }> {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='sync_state' AND type='table'").get()) return []
+  return db.prepare("SELECT key, CASE WHEN json_valid(value) THEN json_extract(value, '$.reason') END AS reason "
+    + "FROM sync_state WHERE scope = 'item-sync-errors' ORDER BY key").all() as Array<{ key: string, reason: string | null }>
+}
+
 /** What the views' answers depend on, as one string: equal marks mean no item
  *  or evidence changed between two reads. */
 export function datastoreContent(db: Database.Database): string {
   const mark = db.prepare(CONTENT).get() as { items: number, latest: string, spread: number, evidence: number }
-  return `${mark.items}|${mark.latest}|${mark.spread}|${mark.evidence}`
+  return `${mark.items}|${mark.latest}|${mark.spread}|${mark.evidence}|${JSON.stringify(syncErrors(db))}`
 }

@@ -656,9 +656,10 @@ def _select(db_path: str | Path, view_name: str, output: Output, filters: dict[s
         if view_name != "issues" or not isinstance(label, str) or not label.strip():
             raise ValueError("issue label must be a nonempty string")
         where.append("""EXISTS (SELECT 1 FROM items chain_issue,
-          json_each(chain_issue.expanded_json, '$.issue.labels') chain_label
+          json_each(CASE WHEN json_valid(chain_issue.expanded_json) THEN chain_issue.expanded_json ELSE '{}' END,
+                    '$.issue.labels') chain_label
           WHERE chain_issue.item_id = issues.payload_ref
-            AND json_extract(chain_label.value, '$.name') = ? COLLATE NOCASE)""")
+            AND CASE WHEN chain_label.type = 'object' THEN json_extract(chain_label.value, '$.name') END = ? COLLATE NOCASE)""")
         params.append(label)
     sql = f"SELECT * FROM {view_name}"
     if where:
@@ -672,10 +673,18 @@ def _select(db_path: str | Path, view_name: str, output: Output, filters: dict[s
 
     conn = _read_connect(db_path)
     try:
-        if label is not None and conn.execute("SELECT 1 FROM items WHERE item_type='issue' "
-                                             "AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array' LIMIT 1").fetchone():
-            raise RuntimeError('issue label evidence is incomplete; ordinary datastore synchronization must refresh the old snapshots')
+        if label is not None:
+            valid_labels = "coalesce(CASE WHEN json_valid(expanded_json) THEN json_type(expanded_json,'$.issue.labels') END,'missing')"
+            if (conn.execute(f"SELECT 1 FROM items WHERE item_type='issue' AND {valid_labels} != 'array' LIMIT 1").fetchone()
+                    and not conn.execute(f"SELECT 1 FROM items WHERE item_type='issue' AND {valid_labels} = 'array' LIMIT 1").fetchone()):
+                raise RuntimeError('issue label evidence is incomplete; ordinary datastore synchronization must refresh the old snapshots')
         rows = conn.execute(sql, params).fetchall()
+        if output == "json" and rows:
+            failures = dict(conn.execute("SELECT key, CASE WHEN json_valid(value) THEN json_extract(value, '$.reason') END "
+                                         "FROM sync_state WHERE scope = 'item-sync-errors'"))
+            if failures:
+                return json.dumps([({**dict(row), "sync_error": failures[str(row["payload_ref"])] or "Unreadable sync failure"}
+                                    if str(row["payload_ref"]) in failures else dict(row)) for row in rows], ensure_ascii=False)
         columns = [column[0] for column in conn.execute(f"SELECT * FROM {view_name} LIMIT 0").description]
         return _render(rows, columns, output)
     except sqlite3.Error as exc:
