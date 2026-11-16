@@ -12,6 +12,7 @@ import { nativeResourcesPending, resourceReleaseContradicted } from './behavior-
 import { dependencySnapshot, type LedgerHistory, type Dependencies } from './health'
 import { getOrganizations, type Organization } from './organizations'
 import { HttpError } from './http'
+import { diagnostic } from './logging'
 import { refreshServed, servedRead, type ServedRead } from './served-read'
 
 const DAY = 86_400_000
@@ -54,7 +55,18 @@ function historyRows(journal: BehaviorChainJournal, id: string) {
     after = page.at(-1)!.sequence
   }
   keepHistory(kept, id, raw, HISTORY_KEPT_ROWS)
-  return raw.map(row => ({ ...row, event: JSON.parse(row.payload) as ChainEvent }))
+  return raw.flatMap(row => {
+    try {
+      const event = JSON.parse(row.payload) as ChainEvent
+      if (typeof event?.type === 'string') return [{ ...row, event }]
+      throw new Error('Invalid event type')
+    } catch (error) {
+      diagnostic({ level: 'warning', operation: 'analytics.chain-history.read', target: id,
+        message: error instanceof SyntaxError ? 'Saved chain event contains invalid JSON' : 'Saved chain event has an invalid type',
+        context: { sequence: row.sequence } })
+      return []
+    }
+  })
 }
 
 /** Keeps `rows` as chain `id`'s, read most recently, within `bound` rows in

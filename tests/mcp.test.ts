@@ -349,6 +349,12 @@ it('pages Chat records and retained transcript events with independent consent a
     expect(JSON.stringify(transcript)).not.toContain('private runtime appendix')
     const continued = await page(full.client, 'poise_changes', { ...changes, cursor: transcript.nextCursor })
     expect(continued.items).toMatchObject([{ sequence: 2, type: 'text.delta', detail: { text: 'Fixture answer' } }])
+    db.prepare("UPDATE chat_events SET event = 'null' WHERE session_id = ? AND seq = 2").run(ids[0])
+    const gap = await page(full.client, 'poise_changes', { ...changes, cursor: transcript.nextCursor })
+    expect(gap).toMatchObject({ coverage: 'partial', hasMore: true, watermark: 2,
+      items: [{ sequence: 2, type: 'history.unreadable', detail: { reason: 'Saved transcript entry could not be read' } }] })
+    expect((await page(full.client, 'poise_changes', { ...changes, cursor: gap.nextCursor })).items)
+      .toMatchObject([{ sequence: 3, type: 'turn.finished' }])
     const { envelope } = resetConversation(getSession(ids[0])!)
     const afterReset = await page(full.client, 'poise_changes', { ...changes, cursor: transcript.nextCursor })
     expect(afterReset).toMatchObject({ coverage: 'expired', retainedFrom: envelope.seq,

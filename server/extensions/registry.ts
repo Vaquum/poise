@@ -7,6 +7,7 @@
 import { accessSync, constants } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { db, getMeta, setMeta } from '../db'
+import { diagnostic } from '../logging'
 import { BUILTIN_ENTRIES } from './builtin'
 import { ExtensionError } from './store'
 import { nameFrom, type DirectoryEntry, type DirectoryInput, type DirectoryStatus, type Field, type InstallOption, type ServerSpec } from './types'
@@ -60,7 +61,21 @@ let running: Promise<void> | null = null
 function all(): DirectoryEntry[] {
   const { n, g } = db.prepare('SELECT COUNT(*) AS n, COALESCE(MAX(generation), 0) AS g FROM extension_directory').get() as { n: number, g: number }
   const stamp = `${n}:${g}`
-  if (entries?.stamp !== stamp) entries = { stamp, list: (db.prepare('SELECT entry FROM extension_directory ORDER BY name').all() as Array<{ entry: string }>).map((row) => JSON.parse(row.entry) as DirectoryEntry) }
+  if (entries?.stamp !== stamp) {
+    const rows = db.prepare('SELECT name, entry FROM extension_directory ORDER BY name').all() as Array<{ name: string, entry: string }>
+    const list = rows.flatMap(row => {
+      try {
+        const entry = JSON.parse(row.entry) as DirectoryEntry
+        if (entry?.name === row.name) return [entry]
+        throw new Error('Saved extension directory identity does not match its row')
+      } catch (error) {
+        diagnostic({ level: 'warning', operation: 'extensions.directory.read', target: row.name,
+          message: error instanceof SyntaxError ? 'Saved extension directory entry contains invalid JSON' : 'Saved extension directory identity does not match its row' })
+        return []
+      }
+    })
+    entries = { stamp, list }
+  }
   return entries.list
 }
 

@@ -76,6 +76,13 @@ describe('server definitions', () => {
 describe('the store', () => {
   beforeEach(reset)
 
+  it('keeps valid extensions when one saved definition is damaged', () => {
+    const damaged = addServer(local('damaged'), { 'env:TOKEN': 'fixture-secret' }, everywhere)
+    const healthy = addServer(local('healthy'), { 'env:TOKEN': 'fixture-secret' }, everywhere)
+    db.prepare('UPDATE extension_servers SET spec = ? WHERE id = ?').run('{', damaged.id)
+    expect(listServers().map(server => server.id)).toEqual([healthy.id])
+  })
+
   it('keeps secrets out of every view and needs a value for each', () => {
     expect(() => addServer(local('probe'), {}, everywhere)).toThrow(/Enter a value for TOKEN/)
     const view = addServer(local('probe'), { 'env:TOKEN': 'tok-abcdef-123456' }, everywhere)

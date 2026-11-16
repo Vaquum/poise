@@ -32,6 +32,7 @@ export function createJevWorkspace(parent: HTMLElement, sidebar: HTMLElement, ha
   let active: string | null = null, visible = false, configured = false, initialized = false, navigation = 0
   let submitting = false, saveTimer: ReturnType<typeof setTimeout> | undefined, pollTimer: ReturnType<typeof setTimeout> | undefined
   let runLoadGeneration = 0
+  let loadedEarlierRuns = false
   let runs: JevRun[] = [], selectedRun = '', nextPage: number | undefined, preview: JevRequest | null = null, localSafe = true
   const title = el.querySelector<HTMLInputElement>('.jev-title')!
   const notice = el.querySelector<HTMLElement>('.jev-notice')!
@@ -119,7 +120,7 @@ export function createJevWorkspace(parent: HTMLElement, sidebar: HTMLElement, ha
     el.querySelector<HTMLElement>('.jev-scroll')!.scrollTop = 0
     try { sessionStorage.setItem(ACTIVE, sessionId) } catch { /* optional selection */ }
     handlers.activate(sessionId); title.value = e.title; builder.set(e.draft)
-    runs = []; selectedRun = ''; nextPage = undefined; preview = null
+    runs = []; selectedRun = ''; nextPage = undefined; loadedEarlierRuns = false; preview = null
     el.querySelector<HTMLElement>('.jev-request-preview')!.hidden = true
     message(e.error || ''); renderRuns(); renderList(); controls()
     if (e.created) void loadRuns()
@@ -138,7 +139,8 @@ export function createJevWorkspace(parent: HTMLElement, sidebar: HTMLElement, ha
       if (active !== origin || generation !== navigation || requestGeneration !== runLoadGeneration) return
       const incoming = response.runs.map(run => keepSettledRun(runs.find(old => old.id === run.id), run))
       runs = earlier ? [...runs, ...incoming.filter(run => !runs.some(old => old.id === run.id))] : [...incoming, ...runs.filter(run => !incoming.some(newer => newer.id === run.id))]
-      if (earlier || runs.length <= 20) nextPage = response.next
+      if (earlier) loadedEarlierRuns = true
+      if (earlier || !loadedEarlierRuns) nextPage = response.next
       if (!selectedRun || !runs.some(run => run.id === selectedRun)) selectedRun = runs[0]?.id || ''
       const e = current()!
       if (e.pendingId && runs.some(run => run.id === e.pendingId)) { selectedRun = e.pendingId; e.pendingId = undefined; e.pendingRequest = undefined; persist(e) }
@@ -153,14 +155,17 @@ export function createJevWorkspace(parent: HTMLElement, sidebar: HTMLElement, ha
   let resultsFingerprint = ''
   function renderRuns() {
     // The day and zone too: a run's time gains its date after midnight.
-    const fingerprint = JSON.stringify({ runs, selectedRun, day: clockDay(effectiveTimezone(), Date.now()) })
+    const fingerprint = JSON.stringify({ runs, selectedRun, nextPage, day: clockDay(effectiveTimezone(), Date.now()) })
     if (fingerprint === resultsFingerprint) return
     resultsFingerprint = fingerprint
     const panel = el.querySelector<HTMLElement>('.jev-run-view')!
-    panel.hidden = !runs.length
+    panel.hidden = !runs.length && nextPage === undefined
     const select = panel.querySelector<HTMLSelectElement>('.jev-run-select')!
+    select.hidden = !runs.length
     select.innerHTML = runs.map(run => `<option value="${run.id}" ${run.id === selectedRun ? 'selected' : ''}>${esc(logTime(run.startedAt, effectiveTimezone(), Date.now()))} · ${Object.keys(run.request.questions).length} questions · ${run.status}</option>`).join('')
     const run = runs.find(run => run.id === selectedRun)
+    panel.querySelector<HTMLElement>('.jev-result-actions')!.hidden = !run
+    panel.querySelector<HTMLElement>('.jev-run-json')!.hidden = !run
     patchContent(panel.querySelector<HTMLElement>('.jev-result')!, run ? renderJevRun(run) : '')
     panel.querySelector<HTMLElement>('.jev-run-json pre')!.textContent = run ? JSON.stringify({ request: run.request, response: run.result || null }, null, 2) : ''
     panel.querySelector<HTMLElement>('.jev-older')!.hidden = !nextPage

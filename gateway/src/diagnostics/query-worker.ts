@@ -86,7 +86,8 @@ function exportEvents(db: DiagnosticStore, request: LoggingRead): LoggingReply {
   if (bytes + metadataBytes > LOGGING_RESPONSE_BYTES) throw new LoggingQueryError(503, 'logging_unavailable', 'Export metadata exceeds its bounded read budget.')
   while (cursor && lines.length < maxEvents) {
     const before = cursor
-    const page = db.query(request.access, { ...request.filter, cursor: before, limit: Math.min(100, maxEvents - lines.length) })
+    const eventCursors = new Map<string, string>()
+    const page = db.query(request.access, { ...request.filter, cursor: before, limit: Math.min(100, maxEvents - lines.length) }, eventCursors)
     checkEvents(page.events)
     let included = 0
     for (const event of page.events) {
@@ -95,7 +96,7 @@ function exportEvents(db: DiagnosticStore, request: LoggingRead): LoggingReply {
       lines.push(line); bytes += Buffer.byteLength(line); included++
     }
     if (included < page.events.length) {
-      cursor = included ? db.query(request.access, { ...request.filter, cursor: before, limit: included }).nextCursor : before
+      cursor = included ? eventCursors.get(page.events[included - 1]!.id)! : before
       break
     }
     cursor = page.nextCursor

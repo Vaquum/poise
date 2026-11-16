@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { db } from '../db'
 import { HttpError } from '../http'
+import { diagnostic } from '../logging'
 import { readMemories } from '../chat/memories'
 import { releaseBackgroundPaused, trackReleaseBackground } from '../release-background'
 import { parseJevDraft } from '../../src/jev-draft'
@@ -18,6 +19,19 @@ function draft(value: unknown): asserts value is string {
 }
 interface Options { fetch?: typeof fetch; key?: () => string | undefined; memories?: () => string; timeoutMs?: number }
 interface Row { body: string }
+
+function storedRecord<T extends { id: string }>(row: Row & { id: string }): T | undefined {
+  try {
+    const value = JSON.parse(row.body) as T
+    if (value?.id === row.id) return value
+    throw new Error('Invalid evaluation record identity')
+  } catch (error) {
+    diagnostic({ level: 'warning', operation: 'jev.record.read', target: row.id,
+      message: error instanceof SyntaxError ? 'Saved evaluation record contains invalid JSON' : 'Saved evaluation record has an invalid identity' })
+    return undefined
+  }
+}
+
 /** Stateless typed evaluations, separate from native agents, tools and checkouts. */
 export class JevRuntime {
   private jobs = new Map<string, { abort: AbortController; task: Promise<void> }>()
@@ -30,8 +44,9 @@ export class JevRuntime {
       CREATE TABLE IF NOT EXISTS jev_runs (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES jev_sessions(id) ON DELETE CASCADE, fingerprint TEXT NOT NULL, status TEXT NOT NULL, owner INTEGER NOT NULL, body TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS jev_runs_session ON jev_runs(session_id);
       CREATE UNIQUE INDEX IF NOT EXISTS jev_running_session ON jev_runs(session_id) WHERE status = 'running';`)
-    for (const row of db.prepare("SELECT body, owner FROM jev_runs WHERE status = 'running'").all() as (Row & { owner: number })[]) {
-      const run = JSON.parse(row.body) as JevRun
+    for (const row of db.prepare("SELECT id, body, owner FROM jev_runs WHERE status = 'running'").all() as (Row & { id: string, owner: number })[]) {
+      const run = storedRecord<JevRun>(row)
+      if (!run) continue
       let alive = true
       try { process.kill(row.owner, 0) } catch (error) { alive = (error as NodeJS.ErrnoException).code !== 'ESRCH' }
       if (!alive || (row.owner === process.pid && !liveRuns.has(run.id))) this.finish({ ...run, status: 'interrupted', error: 'Poise stopped before the result was recorded. This evaluation was not replayed; it may have been billed.' })
@@ -46,7 +61,10 @@ export class JevRuntime {
     this.modelRequest ??= listJevModels(key, this.options.fetch).then(value => { this.modelCache = { at: Date.now(), value }; return value }).finally(() => { this.modelRequest = undefined })
     return this.modelRequest
   }
-  list(): JevSession[] { return (db.prepare('SELECT body FROM jev_sessions ORDER BY rowid DESC').all() as Row[]).map(row => JSON.parse(row.body)) }
+  list(): JevSession[] {
+    const rows = db.prepare('SELECT id, body FROM jev_sessions ORDER BY rowid DESC').all() as (Row & { id: string })[]
+    return rows.flatMap(row => storedRecord<JevSession>(row) ?? [])
+  }
   get(sessionId: string): JevSession {
     id(sessionId)
     const row = db.prepare('SELECT body FROM jev_sessions WHERE id=?').get(sessionId) as Row | undefined
@@ -90,8 +108,9 @@ export class JevRuntime {
   }
   runs(sessionId: string, before?: number): { runs: JevRun[]; next?: number } {
     this.get(sessionId); this.flushResults()
-    const rows = db.prepare('SELECT rowid AS seq, body FROM jev_runs WHERE session_id=? AND rowid<? ORDER BY rowid DESC LIMIT 21').all(sessionId, before || Number.MAX_SAFE_INTEGER) as (Row & { seq: number })[]
-    return { runs: rows.slice(0, 20).map(row => { const run = JSON.parse(row.body) as JevRun; return this.unsaved.get(run.id) || run }), ...(rows.length > 20 ? { next: rows[19].seq } : {}) }
+    const rows = db.prepare('SELECT rowid AS seq, id, body FROM jev_runs WHERE session_id=? AND rowid<? ORDER BY rowid DESC LIMIT 21').all(sessionId, before || Number.MAX_SAFE_INTEGER) as (Row & { id: string, seq: number })[]
+    return { runs: rows.slice(0, 20).flatMap(row => this.unsaved.get(row.id) ?? storedRecord<JevRun>(row) ?? []),
+      ...(rows.length > 20 ? { next: rows[19].seq } : {}) }
   }
   run(runId: string): JevRun {
     id(runId); this.flushResults()

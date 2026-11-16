@@ -138,7 +138,10 @@ export class DiagnosticStore {
         }
         const existing = this.db.prepare('SELECT payload FROM log_events WHERE id=?').get(event.id) as { payload: string } | undefined
         if (existing) {
-          if (!isDeepStrictEqual({ ...JSON.parse(existing.payload), ingestedAt: null }, { ...event, ingestedAt: null })) throw new DiagnosticConflictError(event.id, event)
+          let stored: LogEvent
+          try { stored = JSON.parse(existing.payload) as LogEvent }
+          catch { throw new DiagnosticConflictError(event.id, event) }
+          if (!isDeepStrictEqual({ ...stored, ingestedAt: null }, { ...event, ingestedAt: null })) throw new DiagnosticConflictError(event.id, event)
           continue
         }
         const search = [event.message, event.target, event.id, event.incidentId, event.callId, event.correlationId,
@@ -230,24 +233,39 @@ export class DiagnosticStore {
   }
 
   readCoverage(access: LogAccess): Coverage[] {
-    const rows = this.db.prepare('SELECT payload FROM log_coverage WHERE workspace=? OR workspace IS NULL').all(access.workspace) as Array<{ payload: string }>
-    return rows.map(({ payload }) => projectCoverage(observedCoverage(JSON.parse(payload) as Coverage, this.now()), access))
+    const rows = this.db.prepare('SELECT id,workspace,payload FROM log_coverage WHERE workspace=? OR workspace IS NULL').all(access.workspace) as Array<Pick<Coverage, 'id' | 'workspace'> & { payload: string }>
+    return rows.map(({ id, workspace, payload }) => {
+      try {
+        const value = JSON.parse(payload) as Coverage
+        if (value?.id !== id || value.workspace !== workspace || typeof value.source !== 'string'
+          || !['connected', 'unavailable', 'partial', 'not-configured'].includes(value.status) || !Array.isArray(value.gaps)) {
+          throw new Error('Invalid saved coverage')
+        }
+        return projectCoverage(observedCoverage(value, this.now()), access)
+      } catch {
+        console.warn(`[logging] Saved coverage record ${id} cannot be read`)
+        return projectCoverage({ id, workspace, source: id === 'external-ingress' ? 'ingress' : 'unknown',
+          status: 'partial', currentStatus: 'unavailable', historyIncomplete: true, observedAt: null,
+          ingestedAt: null, availableFrom: null, error: 'Saved collection coverage is unreadable.', gaps: [] }, access)
+      }
+    })
   }
 
-  query(access: LogAccess, filter: LogFilter = {}): LoggingPage {
-    return this.db.transaction(() => this.querySnapshot(access, filter))()
+  query(access: LogAccess, filter: LogFilter = {}, eventCursors?: Map<string, string>): LoggingPage {
+    return this.db.transaction(() => this.querySnapshot(access, filter, eventCursors))()
   }
 
   handoffs(access: LogAccess, eventId?: string): { high: number; candidates: HandoffCandidate[] } {
     return this.db.transaction(() => {
       const high = this.high()
-      const rows = this.db.prepare(`SELECT payload FROM log_events WHERE workspace=? AND visibility='workspace'
+      const rows = this.db.prepare(`SELECT id,payload FROM log_events WHERE workspace=? AND visibility='workspace'
         AND source='caller' AND severity='error' AND component IN ('pr_review','pr_approve') AND seq<=? AND ingested_at>=?
         ${eventId ? 'AND id=?' : ''}`).iterate(access.workspace, high, new Date(this.now() - this.policy.retentionMs).toISOString(),
-        ...(eventId ? [eventId] : [])) as IterableIterator<{ payload: string }>
+        ...(eventId ? [eventId] : [])) as IterableIterator<{ id: string, payload: string }>
       const candidates: HandoffCandidate[] = []
       for (const row of rows) {
-        const candidate = handoffCandidate(JSON.parse(row.payload) as LogEvent)
+        const event = this.readEvent(row.payload, row.id)
+        const candidate = event && handoffCandidate(event)
         if (candidate) candidates.push(candidate)
       }
       return { high, candidates }
@@ -264,7 +282,7 @@ export class DiagnosticStore {
     return changed.length ? createHash('sha256').update(JSON.stringify(changed)).digest('hex') : ''
   }
 
-  private querySnapshot(access: LogAccess, filter: LogFilter): LoggingPage {
+  private querySnapshot(access: LogAccess, filter: LogFilter, eventCursors?: Map<string, string>): LoggingPage {
     const levels = filter.severities ?? [...SEVERITIES]
     if (!Array.isArray(levels) || !levels.every((level) => SEVERITIES.includes(level))) throw new Error('Select only Critical, Error and Warning')
     const limit = filter.limit ?? 50
@@ -319,16 +337,19 @@ export class DiagnosticStore {
     const pageHint = this.indexes.has(pageIndex) ? ` INDEXED BY ${pageIndex}` : ''
     const positions = total ? this.db.prepare(`SELECT id,sort_time FROM log_events${pageHint} WHERE ${pageWhere} ORDER BY sort_time DESC,id DESC LIMIT ?`).all(...pageValues) as Array<Pick<EventRow, 'id' | 'sort_time'>> : []
     const loadPayload = this.db.prepare('SELECT payload FROM log_events WHERE id=?')
-    const page = positions.slice(0, limit).map((position) => {
+    const cursorAt = (position: Pick<EventRow, 'id' | 'sort_time'>) =>
+      this.sealToken({ kind: 'page', high, time: position.sort_time, id: position.id, filter: fingerprint, classification: snapshot })
+    const page = positions.slice(0, limit).flatMap((position) => {
       const row = loadPayload.get(position.id) as { payload: string } | undefined
-      if (!row) throw new Error('Retained diagnostic payload is absent from its read snapshot')
-      return { ...position, payload: row.payload }
+      const event = row ? this.readEvent(row.payload, position.id) : null
+      if (!row) console.warn(`[logging] Saved event ${position.id} lacks its payload`)
+      if (event && eventCursors) eventCursors.set(event.id, cursorAt(position))
+      return event ? [event] : []
     })
     const occurrenceCounts = new Map<string, number>()
     const countIncident = this.db.prepare('SELECT COUNT(*) AS count FROM log_events WHERE incident_id=? AND ingested_at>=?')
     const retentionAfter = new Date(this.now() - this.policy.retentionMs).toISOString()
-    const events = page.map((row) => {
-      const event = JSON.parse(row.payload) as LogEvent
+    const events = page.map((event) => {
       let occurrences = occurrenceCounts.get(event.incidentId)
       if (occurrences === undefined) {
         occurrences = (countIncident.get(event.incidentId, retentionAfter) as { count: number }).count
@@ -336,9 +357,8 @@ export class DiagnosticStore {
       }
       return { ...event, severity: event.severity === 'error' && this.warnings.has(event.id) ? 'warning' as const : event.severity, occurrences }
     })
-    const last = page.at(-1)
-    return { version: 1, events, total, countKind: 'events', nextCursor: positions.length > limit && last
-      ? this.sealToken({ kind: 'page', high, time: last.sort_time, id: last.id, filter: fingerprint, classification: snapshot }) : null,
+    const last = positions[limit - 1]
+    return { version: 1, events, total, countKind: 'events', nextCursor: positions.length > limit && last ? cursorAt(last) : null,
     watermark: this.sealToken({ kind: 'watermark', high, filter: filterHash, classification: snapshot }),
     coverage: this.readCoverage(access), bounds: this.bounds(access), policy: this.policy }
   }
@@ -349,11 +369,25 @@ export class DiagnosticStore {
     const after = cursor ? this.openToken(cursor, 'delivery', filter).high : 0
     const predicate = access.operator ? "(visibility IN ('operator','infrastructure') OR (workspace=? AND visibility='workspace'))"
       : "workspace=? AND visibility IN ('workspace','infrastructure')"
-    const rows = this.db.prepare(`SELECT seq,payload FROM log_events WHERE ${predicate} AND seq>? AND ingested_at>=? ORDER BY seq LIMIT ?`)
-      .all(access.workspace, after, new Date(this.now() - this.policy.retentionMs).toISOString(), limit + 1) as Array<{ seq: number; payload: string }>
+    const rows = this.db.prepare(`SELECT seq,id,payload FROM log_events WHERE ${predicate} AND seq>? AND ingested_at>=? ORDER BY seq LIMIT ?`)
+      .all(access.workspace, after, new Date(this.now() - this.policy.retentionMs).toISOString(), limit + 1) as Array<{ seq: number; id: string; payload: string }>
     const page = rows.slice(0, limit)
-    return { version: 1, events: page.map((row) => JSON.parse(row.payload) as LogEvent),
+    return { version: 1, events: page.flatMap(row => this.readEvent(row.payload, row.id) ?? []),
       cursor: this.sealToken({ kind: 'delivery', high: page.at(-1)?.seq ?? after, filter }), hasMore: rows.length > limit }
+  }
+
+  private readEvent(payload: string, id: string): LogEvent | null {
+    try {
+      const event = JSON.parse(payload) as LogEvent
+      if (event?.id !== id || event.version !== 1 || typeof event.incidentId !== 'string' || !SEVERITIES.includes(event.severity)) {
+        throw new Error('invalid event identity, version or severity')
+      }
+      return event
+    } catch (error) {
+      const reason = error instanceof SyntaxError ? 'invalid JSON' : error instanceof Error ? error.message : 'unknown cause'
+      console.warn(`[logging] Saved event ${id} cannot be read: ${reason}`)
+      return null
+    }
   }
 
   checkpoint(key: string): string | null {
