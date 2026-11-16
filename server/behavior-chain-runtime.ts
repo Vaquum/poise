@@ -691,7 +691,7 @@ export class BehaviorChainRuntime {
                 if (Date.now() - began > 45_000) { conflictDeferred = true; continue }
               }
               phase = 'reconciliation'
-              if (!this.operations.ownsRepository(chain.repository)) continue
+              if (chain.reviewHoldClosure || !this.operations.ownsRepository(chain.repository)) continue
               const contradicted = chain.invocations.find(invocation => invocation.evidence
                 && resourceReleaseContradicted(invocation.evidence))
               if (contradicted) {
@@ -793,6 +793,7 @@ export class BehaviorChainRuntime {
               if (this.operations.recoverReport) {
                 const reason = await this.operations.recoverReport(chain, observation)
                 chain = this.current(chain)
+                if (chain.reviewHoldClosure) continue
                 observation = chain.observation as ChainObservation
                 if (reason) {
                   if (chain.repairRecovery && !chain.repairRecovery.admission && !chain.held) chain = this.append(chain, { type: 'chain.held', reason })

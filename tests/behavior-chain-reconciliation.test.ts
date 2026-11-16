@@ -532,6 +532,44 @@ it.each(['receipt-read', 'observation', 'request-preparation'] as const)(
       context: { outcome: 'recovered', attempts: 2 } }])
   })
 
+it.each(['observation', 'report recovery'] as const)(
+  'continues the sweep when an operator closes a review hold during %s', async phase => {
+    const { journal } = setup()
+    const { chain, call, merged } = persistedEnqueueRefusal(journal)
+    const eligible = record(journal, chain, { type: 'invocation.settled', invocationId: 'original-merge',
+      callId: call.id, outcome: 'preflight_failed', evidence: {
+        ...chain.invocations.at(-1)!.evidence, action: 'not_started', outcome: 'preflight_failed',
+      } })
+    expect(canCloseMergedReviewHold(eligible)).toBe(true)
+    const later = record(journal, seed(journal, 'zzz/repo'), { type: 'chain.held', reason: 'unrelated hold' })
+    vi.setSystemTime(NOW + 120_001)
+    merged.checkedAt = Date.now()
+    let closed: BehaviorChain | undefined
+    const close = () => {
+      if (closed) return
+      closed = record(journal, journal.read(eligible.id)!, { type: 'chain.review-hold-closed',
+        closure: { mergeSha: MERGE, actor: eligible.author, label: 'poise' } })
+    }
+    const observe = vi.fn(async (candidate: BehaviorChain) => {
+      if (candidate.id !== eligible.id) {
+        expect(closed?.reviewHoldClosure).toBeDefined()
+        return observation(false)
+      }
+      if (phase === 'observation') close()
+      return merged
+    })
+    const runtime = new BehaviorChainRuntime(journal, operations({ observe, recoverReport: async candidate => {
+      if (candidate.id === eligible.id && phase === 'report recovery') close()
+      return null
+    } }))
+
+    await runtime.run()
+    expect(closed?.reviewHoldClosure).toBeDefined()
+    expect(journal.read(eligible.id)).toEqual(closed)
+    expect(observe.mock.calls.filter(([candidate]) => candidate.id === eligible.id)).toHaveLength(1)
+    expect(journal.read(later.id)?.observation).toMatchObject({ pull: null })
+  })
+
 it('defers repeated conflicts after one retry, including a chain moved to the deferred page', async () => {
   const { journal } = setup()
   const first = seed(journal, 'aaa/repo'), second = seed(journal, 'zzz/repo')
