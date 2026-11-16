@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { availableParallelism, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { expect, it } from 'vitest'
 import { normalize, type LogEvent } from '../src/diagnostics/contract.js'
 import { LoggingQueryPool } from '../src/diagnostics/query-pool.js'
@@ -115,19 +116,23 @@ it('queries 100,000 retained records with independent filter/count/export and sn
   expect(total).toBeLessThan(120_000)
 }, 120_000)
 
-it('exports an honest byte-bounded prefix and resumes exactly at the first omitted event', () => {
+it('exports a byte-bounded prefix without repeating events after a damaged row', () => {
   const dir = mkdtempSync(join(tmpdir(), 'logging-export-bytes-')); const now = Date.now(); const path = join(dir, 'logging.db')
   const db = new DiagnosticStore(path)
   const events = Array.from({ length: 400 }, (_, i) => normalize({ id: 'large-' + i, time: new Date(now + i).toISOString(), source: 'caller', workspace: 'alice', level: 'error', operation: 'large', message: 'large retained cause', stderr: 'retained stderr line\n'.repeat(820), stack: 'retained stack frame\n'.repeat(410), cause: Array(8).fill('retained cause '.repeat(36)), context: { details: 'recorded context '.repeat(480) } }, now)!)
   const request: LoggingRead = { path, now, policy: DEFAULT_LOG_POLICY, access: { workspace: 'alice', operator: false }, operation: 'export', filter: {} }
   try {
     for (let i = 0; i < events.length; i += 100) db.append(events.slice(i, i + 100))
+    const corrupt = events[events.length - 2]!
+    const writer = new Database(path)
+    try { writer.prepare("UPDATE log_events SET payload = 'null' WHERE id = ?").run(corrupt.id) }
+    finally { writer.close() }
     const first = executeLoggingRead(request); const lines = first.body.trim().split('\n').map((line) => JSON.parse(line))
     expect(Buffer.byteLength(first.body)).toBeLessThanOrEqual(LOGGING_RESPONSE_BYTES)
     expect(lines[0].truncated).toBe(true); expect(lines[0].exported).toBeLessThan(400)
     const next = executeLoggingRead({ ...request, filter: { cursor: lines[0].resumeCursor } }).body.trim().split('\n').map((line) => JSON.parse(line))
     expect(next[0].truncated).toBe(false)
-    expect([...lines.slice(1), ...next.slice(1)].map((line) => line.event.id)).toEqual([...events].reverse().map((event) => event.id))
+    expect([...lines.slice(1), ...next.slice(1)].map((line) => line.event.id)).toEqual([...events].reverse().filter(event => event.id !== corrupt.id).map(event => event.id))
     writeFileSync(path + '.coverage.json', JSON.stringify({ version: 1, writtenAt: new Date(now).toISOString(), stopped: false, sinkError: null, dropped: 10, rejected: 0, sources: [
       { id: 'private-bob', source: 'caller', workspace: 'bob', status: 'unavailable', error: 'bob-private-counts-and-cause', observedAt: null, ingestedAt: null, availableFrom: null, gaps: [] },
       { id: 'shared-host', source: 'kernel', workspace: null, status: 'unavailable', error: 'operator-private-cause', observedAt: null, ingestedAt: null, availableFrom: null, gaps: [{ from: new Date(now).toISOString(), to: null, reason: 'operator-private-gap' }] },

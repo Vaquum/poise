@@ -19,6 +19,25 @@ afterEach(() => { for (const store of stores.splice(0)) store.close(); for (cons
 function directory() { const path = mkdtempSync(join(tmpdir(), 'poise-diagnostics-')); directories.push(path); return path }
 function store(policy = DEFAULT_LOG_POLICY) { const value = new DiagnosticStore(':memory:', policy, () => NOW); stores.push(value); return value }
 
+it('keeps health partial when the required external ingress coverage is unreadable', () => {
+  const path = join(directory(), 'logging.db')
+  const db = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW)
+  stores.push(db)
+  const active = { id: 'workspace-caller', workspace: 'alice', source: 'caller', status: 'connected' as const,
+    observedAt: null, ingestedAt: null, availableFrom: null, error: null, gaps: [] }
+  db.coverage({ ...active, id: 'external-ingress', source: 'ingress', workspace: null })
+  const writer = new Database(path)
+  try { writer.prepare("UPDATE log_coverage SET payload = 'null' WHERE id = 'external-ingress'").run() }
+  finally { writer.close() }
+  writeFileSync(path + '.coverage.json', JSON.stringify({ version: 1, writtenAt: new Date(NOW).toISOString(),
+    stopped: false, sinkError: null, dropped: 0, rejected: 0, sources: [active] }))
+  const result = executeLoggingRead({ path, now: NOW, policy: DEFAULT_LOG_POLICY, access: operator, operation: 'health', filter: {} })
+  expect(result.status).toBe(200)
+  expect(JSON.parse(result.body).collection).toMatchObject({ status: 'partial', currentStatus: 'partial', sources: expect.arrayContaining([
+    { ...active }, expect.objectContaining({ id: 'external-ingress', status: 'partial', currentStatus: 'unavailable', historyIncomplete: true }),
+  ]) })
+})
+
 it('upgrades legacy count metadata without losing retained events or existing snapshot cursors', () => {
   const path = join(directory(), 'logging.db')
   const original = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW)

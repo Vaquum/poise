@@ -2,6 +2,7 @@ import { isMcpRecordId, mcpRepositoryAllowed, type McpChatChangesArguments, type
 import type { ChatEvent } from './chat/protocol'
 import { getSession, listEvents, pageChatSessions, sessionInstance, type ChatPageSelector } from './chat/storage'
 import { HttpError } from './http'
+import { diagnosticFailure } from './logging'
 import { mcpCursor } from './mcp-cursor'
 
 export function readMcpChatList(instance: string, grant: McpGrantScope, args: McpChatListArguments) {
@@ -51,6 +52,8 @@ function eventDetail(event: ChatEvent) {
         ({ content: content.slice(0, 150), status, priority })), truncated: event.entries.length > 10 || event.entries.some(row => row.content.length > 150) }
     case 'diff':
       return { turnId: event.turnId, diffId: event.diffId, metadataOnly: true }
+    case 'history.unreadable':
+      return { metadataOnly: true, reason: 'Saved transcript entry could not be read' }
     default:
       return { metadataOnly: true }
   }
@@ -75,7 +78,13 @@ export function readMcpChatChanges(instance: string, grant: McpGrantScope, args:
   const floor = session.contextResetSeq ? session.contextResetSeq - 1 : 0
   const after = Math.max(requested, floor)
   const page = listEvents(args.id, after, args.limit)
-  const items = page.events.map(({ seq, at, event }) => ({ sequence: seq, at, type: event.type, detail: eventDetail(event) }))
+  const items = page.events.map(({ seq, at, event }) => {
+    try { return { sequence: seq, at, type: event.type, detail: eventDetail(event) } }
+    catch (error) {
+      diagnosticFailure('chat.event.project', error, { target: args.id, sequence: seq, eventType: event.type }, { level: 'warning' })
+      return { sequence: seq, at, type: 'history.unreadable', detail: eventDetail({ type: 'history.unreadable' }) }
+    }
+  })
   const retainedFrom = session.contextResetSeq ?? null
   const coverage = requested < floor ? 'expired'
     : items.some(({ detail }) => ('truncated' in detail && detail.truncated) || detail.metadataOnly) ? 'partial' : 'complete'

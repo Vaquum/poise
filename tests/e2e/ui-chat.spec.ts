@@ -1,6 +1,7 @@
 // The scenarios of chat.spec.ts, in the new interface's Chat (#556 PR 3): the same
 // mocked service and socket, opened at /?view=chat.
 import type { ChatSwitches } from '../../src/chat-switches'
+import { emptyJevDraft } from '../../src/jev-draft'
 import { expect, test, type Page } from '@playwright/test'
 import type { ChatEnvelope, ChatEvent } from '../../server/chat/protocol'
 import { NOW, AGENTS, session, installRoutes, installSocket, env, makeState, input } from './fixtures/chat'
@@ -861,6 +862,29 @@ test('bulk delete leaves an open JEV builder alone', async ({ page }) => {
   await expect(page.locator('.jev-workspace')).toBeVisible()
   await expect(page.locator('.chat-v-composer')).toBeHidden()
   await expect(page.locator('.chat-notice')).toHaveText('Deleted 2 chats.')
+})
+
+test('JEV history reaches older evaluations when the newest page has no readable runs', async ({ page }) => {
+  const id = '12345678-1234-4123-8123-123456789abc'
+  await installRoutes(page, makeState([]))
+  await installSocket(page)
+  await page.addInitScript(id => sessionStorage.setItem('poise-jev-active', id), id)
+  await page.route('**/api/jev/**', async route => {
+    const url = new URL(route.request().url())
+    if (url.pathname.endsWith('/config')) return route.fulfill({ json: { configured: true } })
+    if (url.pathname.endsWith('/sessions')) return route.fulfill({ json: { sessions: [
+      { id, title: 'Example evaluations', revision: 1, draft: JSON.stringify(emptyJevDraft()), createdAt: NOW, updatedAt: NOW },
+    ] } })
+    if (!url.searchParams.has('before')) return route.fulfill({ json: { runs: [], next: 21 } })
+    expect(url.searchParams.get('before')).toBe('21')
+    return route.fulfill({ json: { runs: [{ id: 'older-evaluation', sessionId: id, status: 'completed', startedAt: NOW,
+      request: { model: 'jev-latest', state: 'Example', questions: { saved: { type: 'noul', instructions: 'Earlier evaluation' } } },
+      result: { model: 'jev-latest', answers: { saved: { type: 'noul', noul: 0.75 } }, usage: { input_tokens: 1, output_tokens: 1 } },
+    }] } })
+  })
+  await page.goto('/?view=chat')
+  await page.getByRole('button', { name: 'Earlier runs' }).click()
+  await expect(page.getByText('Earlier evaluation', { exact: true })).toBeVisible()
 })
 
 test('bulk delete moves to a survivor at once and keeps one opened mid-flight intact', async ({ page }) => {
