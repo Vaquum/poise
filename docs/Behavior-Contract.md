@@ -218,12 +218,15 @@ The [Caller contract](../caller/agent_interface/README.md#explicit-review-contin
 defines the exact analysis basis, cumulative allowance and single publisher.
 The final pass rereads the material packet before reserving submission. A
 changed head or review context invalidates the saved analysis. A checkpoint
-yield leaves the provider and failure counters unchanged. An exhausted
-obligation reports its cause and original Call in the existing work status.
-Status retains completed and required units, attempts, cumulative time and
-the timestamp of the last verified progress. A checkpoint grants no verdict
-or queue authority. A possibly submitted review retains its original write
-fence until reconciled through the existing receipt path.
+yield leaves the provider and failure counters unchanged. When the final
+comparison detects changed inputs, standalone PR automation can start a fresh
+review on the same commit after the original Call proves it never submitted
+and released its resources. Poise records the original attempt as superseded.
+An exhausted obligation reports its cause and original Call in the existing
+work status. Status retains completed and required units, attempts, cumulative
+time and the timestamp of the last verified progress. A checkpoint grants no
+verdict or queue authority. A possibly submitted review retains its original
+write fence until reconciled through the existing receipt path.
 
 The fixed acceptance case used 176 files across 22 source groups plus the
 integration pass. With live `gpt-6.1-sol-max` and `muse-spark-1.3-contributor-max`,
