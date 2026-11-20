@@ -4798,7 +4798,7 @@ async function releaseFailedBehaviorIfNoAction(
     && call.error === 'material review basis changed before submission; inspect the current review inputs'
     && unambiguousAgentCall(snapshot, call)
     && reviewContinuationNoWrite(call)
-    && resourceReleaseProven(call, true)) {
+    && resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) {
     const released = db.transaction(() => {
       if (!releaseFailedBehaviorLaunch(behavior, target, call.id, failed.launchExpectedHead)) return false
       const checkedAt = new Date().toISOString()
