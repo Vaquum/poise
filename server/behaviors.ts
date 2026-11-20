@@ -4795,6 +4795,25 @@ async function releaseFailedBehaviorIfNoAction(
     }
   }
   if (call.error_code === 'review_continuation_held'
+    && call.error === 'material review basis changed before submission; inspect the current review inputs'
+    && unambiguousAgentCall(snapshot, call)
+    && reviewContinuationNoWrite(call)
+    && resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) {
+    const released = db.transaction(() => {
+      if (!releaseFailedBehaviorLaunch(behavior, target, call.id, failed.launchExpectedHead)) return false
+      const checkedAt = new Date().toISOString()
+      cachedStatement(db, `
+        UPDATE behavior_dead_letters SET retired_at = ?, resolution = 'superseded', resolution_evidence = ?, resolved_at = ?
+        WHERE behavior = ? AND target = ? AND correlation_id = ? AND (call_id IS NULL OR call_id = ?) AND retired_at IS NULL
+      `).run(checkedAt, JSON.stringify({ callId: call.id, reason: call.error, checkedAt }), checkedAt,
+        behavior, target, failed.launchCorrelationId, call.id)
+      return true
+    })()
+    if (released) captureBehaviorOutcome({ nativeId: failed.launchCorrelationId, callId: call.id,
+      state: 'superseded', activity: 'settled', stateSource: 'native', outcome: 'superseded', completedAt: call.completed_at })
+    return released
+  }
+  if (call.error_code === 'review_continuation_held'
     && call.error.startsWith('review checkpoint validation failed: inspection checkpoint ')
     && reviewContinuationNoWrite(call)
     && resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) {

@@ -47,6 +47,70 @@ async function reviewWorker(behavior: 'review-new-prs' | 'approve-prs' = 'review
 }
 
 describe('managed legacy review continuation', () => {
+  it('starts a fresh same-head review after a pre-submission input change and resource release', async () => {
+    vi.stubEnv('POISE_NATIVE_CONTROL', 'fixture')
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-20T10:42:00Z'))
+    try {
+      arrangeCli(false)
+      mocks.spawnDetached.mockResolvedValue(undefined)
+      let { database, behaviors } = await loadModules()
+      const model = 'gpt-6-astra-ultra'
+      database.setMeta('me', 'poise-user')
+      database.setMeta('models', JSON.stringify({ slots: { primary: model }, places: { pr_review: { slot: 'primary' } } }))
+      database.setMeta('behavior_review_new_prs_enabled', '1')
+      database.setMeta('behavior_review_new_prs_keyver', '3')
+      database.recordSeen('review-new-prs', '__snapshot_v3__')
+      await behaviors.runEnabledBehaviorsOnce()
+      const original = database.listBehaviorLaunchClaims('review-new-prs')[0]
+      const rootCall = 'a'.repeat(32)
+      const link = { root_call: rootCall, generation: 7, basis: '7'.repeat(64), slot: original.launchReviewSlot }
+      const checkpoint = { root_call: rootCall, generation: link.generation, basis: link.basis, unit: 6, required_units: 8,
+        attempts: 6, spent_ms: 408_000, allowance_ms: 2_826_000, last_progress_at: Date.now(), progress_call: rootCall }
+      const yielded = agentLog({ id: rootCall, model, status: 'failed', error: 'Saved the scheduled review units',
+        error_code: 'review_continuation_required', action: 'not_started', outcome: 'incomplete',
+        actor: original.launchActor, source: original.launchSource, correlation_id: original.launchCorrelationId,
+        artifact: { phase: 'reviewing', review_resume: link, review_checkpoint: checkpoint },
+        completed_at: new Date().toISOString(), resources_settled_at: new Date().toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] } })
+      fixture.agentLogs = [yielded]
+      vi.setSystemTime(Date.now() + 1_000)
+      await resetLogCache()
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      expect(mocks.spawnDetached.mock.lastCall![1]).toContain(`${rootCall}:7`)
+
+      const resumed = database.listBehaviorLaunchClaims('review-new-prs')[0]
+      const heldCall = 'b'.repeat(32)
+      const ended = new Date(Date.now() + 1_000).toISOString()
+      const held = { ...yielded, id: heldCall, correlation_id: resumed.launchCorrelationId,
+        started_at: resumed.launchRequestedAt, started_at_precise: resumed.launchRequestedAt, completed_at: ended,
+        error_code: 'review_continuation_held', resources_settled_at: null as string | null,
+        error: 'material review basis changed before submission; inspect the current review inputs',
+        artifact: { phase: 'reviewing', review_resume: { ...link, generation: 10 },
+          review_checkpoint: { ...checkpoint, generation: 10, unit: 8, progress_call: heldCall } } }
+      fixture.agentLogs.push(held)
+      vi.setSystemTime(Date.parse(ended))
+      ;({ database, behaviors } = await restartModules())
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+
+      held.resources_settled_at = ended
+      await resetLogCache()
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+      expect(mocks.spawnDetached.mock.lastCall![1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA, '--model', model]))
+      expect(mocks.spawnDetached.mock.lastCall![1]).not.toContain('--resume-review')
+      expect(database.listBehaviorLaunchClaims('review-new-prs')[0].launchCorrelationId).not.toBe(resumed.launchCorrelationId)
+      expect(database.listBehaviorDeadLetters()).toEqual([])
+      expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+        nativeId: resumed.launchCorrelationId, callId: held.id, state: 'superseded', activity: 'settled',
+      }))
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    } finally { vi.unstubAllEnvs() }
+  })
+
   it.each([
     ['review-new-prs', 'gpt-6-astra-ultra'], ['approve-prs', 'gpt-6-astra-ultra'],
     ['review-new-prs', 'opus-5-xhigh'], ['approve-prs', 'opus-5-xhigh'],
