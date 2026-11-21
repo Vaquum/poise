@@ -292,9 +292,14 @@ GitHub's merge checks continue independently. A provider failure with proof
 that it posted nothing leaves the PR eligible for the next runnable provider.
 The failed provider gets one Needs You item per incident.
 
-`resolve-unblocking` uses the upstream strong
-resolution primitive, which revalidates the complete gate before every thread
-mutation. Before Caller starts, an admitted resolution persists its target,
+`resolve-unblocking` uses the upstream strong resolution primitive, which
+revalidates the complete gate before every thread mutation. When missing checks
+are the sole blocker, Caller requires fresh GitHub evidence that the same head
+is `CLEAN`, has no merge queue and has no check rollup. Its successful receipt
+records `checks_not_required: true` alongside `checks_present: false`. The
+native chain continues to require checks.
+
+Before Caller starts, an admitted resolution persists its target,
 actor, head and shared direct-run/firing/diagnostic identity. Every post-admission exit,
 including deadline cancellation, disable and access holds, retains recovery
 independently of the presentation failure row. Validated retry scheduling reads
