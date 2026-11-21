@@ -101,6 +101,30 @@ describe('resolve-unblocking run lineage', () => {
     expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 
+  it.each([true, undefined])('validates a resolved PR without CI checks using Caller evidence %s', async (proof) => {
+    const { behaviors } = await enableResolve({ resolveResolvedCount: 2 })
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, ...rest) => {
+      const result = await original(command, args, ...rest)
+      if (command !== 'github-interface' || args[0] !== RESOLVE) return result
+      const receipt = JSON.parse(result.stdout)
+      return { ...result, stdout: JSON.stringify({ ...receipt, checks_present: false, checks_not_required: proof }) }
+    })
+
+    await behaviors.runEnabledBehaviorsOnce()
+
+    if (proof) {
+      expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        state: 'completed', outcome: 'resolved',
+      }))
+      expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
+    } else {
+      expect(behaviors.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
+        error: 'github-interface resolution returned malformed or unsafe state',
+      }))
+    }
+  })
+
   it.each([
     { name: 'waiting', activity: { resolveResolvedCount: 0, resolveUnresolvedCount: 2 }, outcome: 'waiting' },
     { name: 'settled no-op', activity: { resolveResolvedCount: 0, resolveUnresolvedCount: 0 }, outcome: 'no_op' },

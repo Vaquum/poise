@@ -6238,7 +6238,7 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
         || data.changes_requested !== false
         || data.statuses_green !== true
         || data.checks_green !== true
-        || data.checks_present !== true
+        || (data.checks_present !== true && (data.checks_not_required !== true || data.blockers.length !== 0))
         || unresolvedCount !== 0))) {
     throw new Error('github-interface resolution returned malformed or unsafe state')
   }

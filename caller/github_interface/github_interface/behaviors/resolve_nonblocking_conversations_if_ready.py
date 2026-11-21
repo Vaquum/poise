@@ -4,6 +4,7 @@ from typing import Any
 from github_interface.atoms.review_identity import require_owned_reviews
 from github_interface.atoms.pulls import (
     get_combined_status,
+    get_pr_readiness_state,
     get_pull,
     get_pull_check_rollup,
     list_review_threads,
@@ -31,9 +32,13 @@ def _uncertain_suffix(resolved_count: int) -> str:
     )
 
 
+def _native_receipt_requested() -> bool:
+    return bool(os.environ.get("AGENT_INTERFACE_RECEIPT_DB") or os.environ.get("AGENT_INTERFACE_RECEIPT_CALL"))
+
+
 def _checkpoint(owner: str, repo: str, number: int, head: str, actor: str,
                 thread_id: str | None = None, result: dict | None = None) -> dict:
-    if not os.environ.get("AGENT_INTERFACE_RECEIPT_DB") and not os.environ.get("AGENT_INTERFACE_RECEIPT_CALL"):
+    if not _native_receipt_requested():
         return {"confirmed": [], "pending": None}
     from agent_interface.native_action import resolution_checkpoint
     return resolution_checkpoint(f"{owner}/{repo}", number, head, actor, thread_id, result)
@@ -175,6 +180,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             final_gate["checks_present"],
             final_gate["blockers"],
             resolved,
+            checks_not_required=final_gate["checks_not_required"],
         )
     except Exception as error:
         if mutation_attempted:
@@ -219,13 +225,40 @@ async def _read_gate(
         checks_green,
         checks_present,
     )
-    ready = not blockers
+    checks_not_required = False
+    if (
+        blockers == ["checks_missing"]
+        and not _native_receipt_requested()
+        and status.get("statuses") == []
+        and "statusCheckRollup" in commit
+        and commit["statusCheckRollup"] is None
+    ):
+        readiness = await get_pr_readiness_state(client, owner, repo, pull_number)
+        _assert_head(
+            {"head": {"sha": readiness.get("headRefOid")}},
+            expected_head_sha,
+            "during direct merge readiness check",
+        )
+        fresh_commit = (
+            ((readiness.get("commits") or {}).get("nodes") or [{}])[0].get("commit")
+            or {}
+        )
+        checks_not_required = (
+            readiness.get("mergeStateStatus") == "CLEAN"
+            and "mergeQueue" in readiness
+            and readiness["mergeQueue"] is None
+            and "statusCheckRollup" in fresh_commit
+            and fresh_commit["statusCheckRollup"] is None
+        )
+        if checks_not_required:
+            blockers = []
     return {
-        "ready": ready,
+        "ready": not blockers,
         "approval": approval,
         "statuses_green": statuses_green,
         "checks_green": checks_green,
         "checks_present": checks_present,
+        "checks_not_required": checks_not_required,
         "blockers": blockers,
     }
 
@@ -313,8 +346,10 @@ def _result(
     checks_present: bool,
     blockers: list[str],
     conversations: list[dict[str, Any]],
+    *,
+    checks_not_required: bool = False,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "action": "resolved_nonblocking_conversations_if_ready",
         "repository": f"{owner}/{repo}",
         "pull_number": pull_number,
@@ -331,3 +366,6 @@ def _result(
         "latest_reviews": approval["latest_reviews"],
         "conversations": conversations,
     }
+    if checks_not_required:
+        result["checks_not_required"] = True
+    return result
