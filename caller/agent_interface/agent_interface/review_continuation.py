@@ -21,6 +21,7 @@ MAX_STORAGE_BYTES = 32_000_000
 MAX_STALLED_ATTEMPTS = 2
 FINALIZATION_RESERVE_SECONDS = 120
 OBLIGATION_TIME_MS = 2 * review_budget.REVIEW_TIMEOUT_SECONDS * 1000
+CHANGED_BEFORE_SUBMISSION = "material review basis changed before submission; inspect the current review inputs"
 _request: ContextVar[tuple[str, str | None, int | None] | None] = ContextVar("review_continuation_request", default=None)
 
 
@@ -184,14 +185,24 @@ class Session:
                     "and (json_extract(artifact,'$.review_progress.basis')=? or "
                     "(json_extract(artifact,'$.review_progress.finalization.slot')=? "
                     "and json_extract(artifact,'$.review_context.head_sha')=? "
-                    "and json_extract(artifact,'$.review_context.context_sha')=?)) limit 1",
+                    "and json_extract(artifact,'$.review_context.context_sha')=?)) "
+                    "order by json_extract(artifact,'$.review_progress.finalization.slot') is not null desc limit 1",
                     (json.loads(packet)["repository"], str(json.loads(packet)["pull_number"]), row[0], row[1], basis,
                      slot, current["review_context"]["head_sha"], current["review_context"]["context_sha"])).fetchone()
                 if existing:
                     self.root = existing[0]
                     self.saved = json.loads(existing[1])["review_progress"]
                     self.generation = self.saved["generation"]
-                    self.stop(f"saved review already exists; resume {self.root}:{self.generation}")
+                    # A standalone PR can return to the exact packet it had
+                    # before an edit. Keep the original budget and ownership.
+                    paused = self.saved["phase"] == "paused" or (
+                        self.saved["phase"] == "held" and self.saved.get("reason") == CHANGED_BEFORE_SUBMISSION)
+                    if not (row[4] in {"poise:review-new-prs", "poise:approve-prs"} and self.saved["basis"] == basis
+                            and paused and self.saved["owner"] is None and not self.saved.get("finalization")
+                            and not self.saved.get("publisher")):
+                        self.stop(f"saved review already exists; resume {self.root}:{self.generation}")
+                    expected = self.generation
+                    resume = f"{self.root}:{expected}"
             original = _artifact(conn, self.root)
             saved = original.get("review_progress")
             if saved:
@@ -210,7 +221,7 @@ class Session:
                     self.stop("material review basis changed; saved analysis and repair verifications are invalid")
                 if saved["generation"] != expected:
                     self.stop("review continuation generation changed; refresh the saved receipt")
-                if saved["phase"] == "held":
+                if saved["phase"] == "held" and not (requested[1] is None and saved.get("reason") == CHANGED_BEFORE_SUBMISSION):
                     self.stop(saved["reason"])
                 previous = conn.execute("select status,resources_settled_at,resource_ownership,artifact from calls where id=?",
                                         (saved["last_call"],)).fetchone()
@@ -720,7 +731,7 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
             fresh_packet = json.loads(atoms.packet(pwd, pr, actor, head, original_packet.get("p"),
                 reserve=structured_review.VERIFICATION_RESERVE_SECONDS, manifest=True, fresh=True))
             if analysis_basis(fresh_packet, "") != analysis_basis(original_packet, ""):
-                session.pause("material review basis changed before submission; inspect the current review inputs", terminal=True)
+                session.pause(CHANGED_BEFORE_SUBMISSION, terminal=True)
         with caller_store.connect(session.database) as conn:
             conn.execute("begin immediate")
             original, saved = session.owned(conn)

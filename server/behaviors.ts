@@ -3415,9 +3415,17 @@ function nativeReviewEnvironment(): NodeJS.ProcessEnv {
     POISE_NATIVE_PREPARE: resolve(agentInterfaceCwd(), '../../scripts/native-provider-prepare.mjs') }
 }
 
+function supersededReviewCheckpointKey(slot: string, call: LogEntry): string {
+  return META_PREFIX + 'superseded_review_checkpoint:' + chainBasis([
+    call.repo, call.pr_id, call.source, call.expected_head, call.actor?.toLowerCase(), call.model, slot,
+  ])
+}
+
 function legacyReviewCheckpoint(snapshot: AgentLogSnapshot, history: LogEntry[], slot: string): ReviewCheckpoint | undefined {
   const call = history.find(entry => (entry.artifact?.review_resume as { slot?: string } | undefined)?.slot === slot)
   if (!call || !unambiguousAgentCall(snapshot, call) || !resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) return undefined
+  const rejectedAt = getMeta(supersededReviewCheckpointKey(slot, call))
+  if (rejectedAt && Date.parse(agentCallStartedAt(call)) <= Date.parse(rejectedAt)) return undefined
   return yieldedReview(call) ?? yieldedFinalization(call) ?? undefined
 }
 
@@ -4794,13 +4802,17 @@ async function releaseFailedBehaviorIfNoAction(
       }
     }
   }
+  const rejectedSlot = call.error === 'material review basis changed; saved analysis and repair verifications are invalid'
+    && call.diagnostic?.context.submission === 'none' ? failed.launchReviewSlot : null
   if (call.error_code === 'review_continuation_held'
-    && call.error === 'material review basis changed before submission; inspect the current review inputs'
+    && (call.error === 'material review basis changed before submission; inspect the current review inputs' || rejectedSlot)
     && unambiguousAgentCall(snapshot, call)
     && reviewContinuationNoWrite(call)
     && resourceReleaseProven({ ...call, completedAt: Date.parse(call.completed_at ?? '') }, true)) {
     const released = db.transaction(() => {
       if (!releaseFailedBehaviorLaunch(behavior, target, call.id, failed.launchExpectedHead)) return false
+      // A refusal during preparation has no review_resume link to supersede the older receipt.
+      if (rejectedSlot) setMeta(supersededReviewCheckpointKey(rejectedSlot, call), agentCallStartedAt(call))
       const checkedAt = new Date().toISOString()
       cachedStatement(db, `
         UPDATE behavior_dead_letters SET retired_at = ?, resolution = 'superseded', resolution_evidence = ?, resolved_at = ?

@@ -889,7 +889,7 @@ export function getFailedBehaviorLaunch(
     SELECT key, target, seen_at, claim_id, lease_until, launch_behavior,
            launch_repo, launch_pr, launch_requested_at, launch_call_id, launch_error, launch_quarantine, launch_quarantine_may_run,
            launch_expected_head, launch_actor, launch_source, launch_correlation_id,
-           launch_covers
+           launch_review_slot, launch_covers
     FROM behavior_seen
     WHERE key = ? AND target = ? AND claim_id = ''
       AND launch_requested_at IS NOT NULL
@@ -914,6 +914,7 @@ export function getFailedBehaviorLaunch(
     launch_actor: string
     launch_source: string
     launch_correlation_id: string
+    launch_review_slot: string | null
     launch_covers: string | null
   } | undefined
   return row ? {
@@ -934,6 +935,7 @@ export function getFailedBehaviorLaunch(
     launchActor: row.launch_actor,
     launchSource: row.launch_source,
     launchCorrelationId: row.launch_correlation_id,
+    ...(row.launch_review_slot ? { launchReviewSlot: row.launch_review_slot } : {}),
     launchCovers: parseLaunchCovers(row.launch_covers),
   } : null
 }

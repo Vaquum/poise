@@ -467,6 +467,58 @@ class TestReviewContinuation(TestCase):
                     continuation.Session(json.dumps(changed), MODEL.identity)
         self.assertEqual(self.posts, [])
 
+    def test_standalone_review_reuses_the_original_allowance_when_inputs_revert(self):
+        source = "poise:review-new-prs"
+        original = packet()
+        edited = {**original, "pull": {**original["pull"], "body": "Checks now pass."}}
+
+        def pause(node):
+            with self.call(node, source=source, units_per_call=6) as call_id:
+                session = continuation.Session(json.dumps(node), MODEL.identity)
+                session.funded(lambda _grant: setattr(self.clock, "now", self.clock.now + 10), 20)
+                with self.assertRaises(continuation.Continuation):
+                    session.pause("completed the scheduled review units; continue the saved checkpoint")
+            return call_id
+
+        first = pause(original)
+        previous = self.saved(first)
+        with self.call(edited, self.resume(first), source=source, units_per_call=6) as stale:
+            with self.assertRaisesRegex(continuation.Continuation, "material review basis changed") as refusal:
+                continuation.Session(json.dumps(edited), MODEL.identity)
+            self.assertFalse(refusal.exception.result["publication_started"])
+            self.assertNotIn("review_resume", self.artifact(stale))
+        self.assertEqual(self.saved(first), previous)
+
+        replacement = pause(edited)
+        self.assertNotEqual(self.saved(first)["basis"], self.saved(replacement)["basis"])
+        with self.call(original, self.resume(replacement), source=source, units_per_call=6):
+            with self.assertRaisesRegex(continuation.Continuation, "material review basis changed"):
+                continuation.Session(json.dumps(original), MODEL.identity)
+        with self.call(original, source=source, units_per_call=6) as resumed:
+            session = continuation.Session(json.dumps(original), MODEL.identity)
+            self.assertEqual(session.root, first)
+            self.assertEqual(session.generation, previous["generation"] + 1)
+            self.assertEqual(self.saved(first)["last_call"], resumed)
+            self.assertEqual(self.saved(first)["spent_ms"], previous["spent_ms"])
+            self.assertEqual(self.saved(first)["allowance_ms"], previous["allowance_ms"])
+        self.assertEqual(self.posts, [])
+
+    def test_standalone_exact_input_recovery_requires_released_resources(self):
+        source = "poise:review-new-prs"
+        node = packet()
+        with self.call(node, source=source, units_per_call=6) as first:
+            session = continuation.Session(json.dumps(node), MODEL.identity)
+            with self.assertRaises(continuation.Continuation):
+                session.pause("completed the scheduled review units; continue the saved checkpoint")
+        previous = self.saved(first)
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("update calls set resources_settled_at=null where id=?", (first,))
+        with self.call(node, source=source, units_per_call=6):
+            with self.assertRaisesRegex(continuation.Continuation, "has not released its resources"):
+                continuation.Session(json.dumps(node), MODEL.identity)
+        self.assertEqual(self.saved(first), previous)
+        self.assertEqual(self.posts, [])
+
     def test_two_distinct_claimants_cannot_spend_or_overwrite_the_same_generation(self):
         node = packet()
         with self.call(node) as root:
