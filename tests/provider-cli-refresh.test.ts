@@ -32,6 +32,7 @@ console.log(fs.existsSync(state) ? fs.readFileSync(state, 'utf8') : '1.0.0');
 import fs from 'node:fs'; import p from 'node:path';
 const order = fs.readFileSync(p.join(process.env.HOME, 'order'), 'utf8');
 if (!['claude','codex','grok','agy','muse'].every(name => order.includes(name + ':updated'))) process.exit(42);
+if (process.env.CODEX_CLI !== p.join(process.env.HOME, 'bin', 'codex')) process.exit(43);
 fs.appendFileSync(p.join(process.env.HOME, 'order'), 'discovery\\n');
 console.log(JSON.stringify({ checked_at: new Date().toISOString(), changed: true, families: { claude: {status: 'ok'}, codex: {status: 'ok'}, grok: {status: 'ok'}, antigravity: {status: 'ok'}, muse: {status: 'ok'} }, added: ['opus-5.5-high'], removed: ['opus-5-high'] }));
 `

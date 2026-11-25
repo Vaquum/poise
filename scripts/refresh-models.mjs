@@ -66,6 +66,7 @@ const report = await withModelRefreshLock(reportPath, async () => {
       const env = {
         ...process.env,
         CLAUDE_CLI: join(projectRoot, 'scripts', 'claude-subscription.mjs'),
+        CODEX_CLI: process.env.CODEX_CLI || cliUpdates.codex?.launchPath,
         PATH: [callerBin, ...(process.env.PATH || '').split(delimiter).filter(Boolean)].join(delimiter),
       }
       for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN']) delete env[key]
