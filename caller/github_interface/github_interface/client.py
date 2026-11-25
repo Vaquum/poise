@@ -28,7 +28,14 @@ _RETRY_DELAY_SECONDS = 0.25
 _TIMEOUT_SECONDS = 10.0
 
 
-def _raise_for_response(response: httpx.Response, error: httpx.HTTPStatusError) -> NoReturn:
+class GitHubRequestError(RuntimeError):
+    def __init__(self, message: str, method: str, path: str, status: int, read_only: bool) -> None:
+        super().__init__(message)
+        self.method, self.path, self.status, self.read_only = method, path, status, read_only
+
+
+def _raise_for_response(response: httpx.Response, error: httpx.HTTPStatusError,
+                        method: str, path: str, read_only: bool) -> NoReturn:
     """Re-raise as RuntimeError, attaching rate-limit headers on 403/429.
 
     Non-rate-limit errors fall through to the existing minimal format so
@@ -37,10 +44,12 @@ def _raise_for_response(response: httpx.Response, error: httpx.HTTPStatusError) 
     if response.status_code in (403, 429):
         rl = {h: response.headers.get(h) for h in _RATE_LIMIT_HEADERS if response.headers.get(h) is not None}
         if rl:
-            raise RuntimeError(
-                f"GitHub {response.status_code} rate-limit: {rl} body={response.text}"
+            raise GitHubRequestError(
+                f"GitHub {response.status_code} rate-limit: {rl} body={response.text}",
+                method, path, response.status_code, read_only,
             ) from error
-    raise RuntimeError(f"GitHub {response.status_code}: {response.text}") from error
+    raise GitHubRequestError(f"GitHub {response.status_code}: {response.text}",
+                             method, path, response.status_code, read_only) from error
 
 
 class GitHubClient:
@@ -69,8 +78,9 @@ class GitHubClient:
                     response = await client.request(method, path, **kwargs)
                     if response.status_code not in _TRANSIENT_STATUS_CODES:
                         return response
-                except httpx.TransportError:
+                except httpx.TransportError as error:
                     if attempt + 1 == attempts:
+                        error.poise_request = (method, path, retry_transient)
                         raise
                 if attempt + 1 < attempts:
                     await asyncio.sleep(_RETRY_DELAY_SECONDS)
@@ -100,7 +110,7 @@ class GitHubClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
-            _raise_for_response(response, error)
+            _raise_for_response(response, error, method, path, retry_transient)
         if response.content:
             return response.json()
         return None
@@ -122,7 +132,7 @@ class GitHubClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
-            _raise_for_response(response, error)
+            _raise_for_response(response, error, method, path, method.upper() == "GET")
         return response.text
 
     async def get(self, path: str, **kwargs: Any) -> Any:
@@ -139,7 +149,7 @@ class GitHubClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
-            _raise_for_response(response, error)
+            _raise_for_response(response, error, "GET", path, True)
         if len(response.content) > 8 * 1024 * 1024:
             raise ValueError("GitHub evidence download exceeds 8 MiB")
         return response.content

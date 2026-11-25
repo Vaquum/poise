@@ -26,11 +26,11 @@ _request: ContextVar[tuple[str, str | None, int | None] | None] = ContextVar("re
 
 
 class Continuation(review_budget.ReviewLimitError):
-    def __init__(self, reason: str, result: dict):
+    def __init__(self, reason: str, result: dict, *, submission_failure: bool = False):
         held = result["outcome"] == "held"
-        diagnostic = diagnostic_envelope(operation="provider.review", phase=progress.phase() or "analysis",
-                                         outcome="held", message=reason[:500],
-                                         submission="uncertain" if result["publication_started"] else "none") if held else None
+        diagnostic = diagnostic_envelope(operation="github-interface.review-submission" if submission_failure else "provider.review",
+                                         phase=progress.phase() or "analysis", outcome="held" if held else "exit", message=reason[:500],
+                                         submission="uncertain" if result["publication_started"] else "none") if held or submission_failure else None
         super().__init__(reason, "review_continuation_held" if held else "review_continuation_required", diagnostic)
         self.result = {**result, "reason": reason}
 
@@ -324,6 +324,32 @@ class Session:
             self.finalization = saved["finalization"]
             _write(conn, self.root, original)
 
+    def submission_failure(self, reason: str, *, no_write: bool) -> None:
+        """Resume the retained verdict or reconcile its possible publication."""
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            original, saved = self.owned(conn)
+            current = _artifact(conn, self.call)
+            evidence = current.get("github_failure")
+            if (not isinstance(evidence, dict) or evidence.get("call_id") != self.call
+                    or evidence.get("submission") != ("none" if no_write else "uncertain")
+                    or current.get("phase") != ("reviewing" if no_write else "submitting_review")
+                    or not saved.get("finalization") or saved["finalization"].get("step") != "submitting"
+                    or saved["finalization"].get("followup")):
+                self.stop("review submission evidence changed before recovery")
+            saved["spent_ms"] += math.ceil((monotonic() - self.meter) * 1000)
+            attempts = 1
+            if no_write:
+                saved["finalization"]["step"] = "ready"
+                attempts = saved["finalization"].get("pre_submission_recoveries", 0) + 1
+                saved["finalization"]["pre_submission_recoveries"] = attempts
+            self.finalization = saved["finalization"]
+            resumable = attempts == 1 and saved["allowance_ms"] > saved["spent_ms"]
+            saved.update(phase=("finalizing" if no_write else "publishing") if resumable else "held", reason=reason)
+            _write(conn, self.root, original)
+            self.retain_progress(conn, saved, original if self.root == self.call else current)
+        self.stop(reason, resumable=resumable, submission_failure=True)
+
     def finalization_failure(self, error: BaseException) -> None:
         diagnostic = getattr(error, "diagnostic", None) or {}
         transient = getattr(error, "code", None) == "review_budget_exhausted" \
@@ -420,14 +446,15 @@ class Session:
             _write(conn, self.call, current)
         return json.dumps(response, ensure_ascii=False) + "\n" + json.dumps(receipt)
 
-    def stop(self, reason: str, *, resumable: bool = False) -> None:
+    def stop(self, reason: str, *, resumable: bool = False, submission_failure: bool = False) -> None:
         raise Continuation(reason, {"outcome": "continuation_required" if resumable else "held",
                                     "root_call": self.root, "generation": self.saved.get("generation", self.generation),
                                     "unit": getattr(self, "state", {}).get("unit"),
                                     "remaining_ms": max(0, self.saved.get("allowance_ms", 0) - self.saved.get("spent_ms", 0)),
                                     "attempts": self.saved.get("attempts", 0),
                                     "publication_started": bool(self.finalization and
-                                        (self.finalization.get("followup") or self.finalization["step"] == "submitting"))})
+                                        (self.finalization.get("followup") or self.finalization["step"] == "submitting"))},
+                           submission_failure=submission_failure)
 
     def owned(self, conn) -> tuple[dict, dict]:
         original = _artifact(conn, self.root)

@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, nullcontext, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
@@ -14,11 +14,15 @@ from unittest import TestCase
 from unittest.mock import patch
 from uuid import uuid4
 
+import httpx
+
 import agent_interface as api
 from agent_interface import atoms, issue_review, pr_approve, review_budget, review_continuation as continuation, \
     review_receipt, review_repository, review_stages, structured_review
 from agent_interface.model_catalog import CATALOG
 from github_interface.atoms.review_response import qualifying_response
+from github_interface import cli as github_cli
+from github_interface.client import GitHubRequestError
 from review_submission_fixture import submission_args
 
 HEAD, BASE = "a" * 40, "b" * 40
@@ -560,6 +564,174 @@ class TestReviewContinuation(TestCase):
         command = self.posts[0][0]
         self.assertEqual(json.loads(command[command.index("--comments") + 1]), [finding])
         self.assertIn(self.saved(root)["publisher"], ids)
+
+    def test_transient_preflight_reuses_the_completed_approval(self):
+        node = packet()
+        attempts = []
+
+        def failed_read(command, **_kwargs):
+            self.assertIn("--approve-pr", command)
+            attempts.append("read")
+            review_receipt.record_github_failure("GET", "/repos/o/r/pulls/12", 500, True)
+            return SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 500:")
+
+        def approve(*args):
+            result = json.loads(verdict(args[3]))
+            result["action"] = "approve"
+            return json.dumps(result)
+
+        with patch.object(atoms, "packet", return_value=json.dumps(node)), \
+                self.call(node, behavior="pr_approve", source="poise:approve-prs", units_per_call=6) as root:
+            with patch.object(structured_review.subprocess, "run", side_effect=failed_read):
+                with self.assertRaises(continuation.Continuation) as stopped:
+                    self.run_review(node, approve, behavior="pr_approve")
+            self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
+            self.assertIn("GET pull request", str(stopped.exception))
+            self.assertEqual(stopped.exception.diagnostic["operation"], "github-interface.review-submission")
+            self.assertEqual(stopped.exception.diagnostic["submission"], "none")
+            diagnostic = api._caller_context(stopped.exception.diagnostic, root, None, "o/r", 12,
+                                             "reviewer", "pr_approve", HEAD)
+            api.finish(root, "failed", error=str(stopped.exception), error_code=stopped.exception.code,
+                       action="not_started", outcome="incomplete", diagnostic=diagnostic)
+            recorded, = api.logs_selected({"latest": [], "ids": [root]})
+            self.assertEqual(recorded["diagnostic"]["call_id"], root)
+            self.assertIn("GET pull request", recorded["diagnostic"]["message"])
+            self.assertEqual(self.saved(root)["finalization"]["step"], "ready")
+            self.assertEqual(self.artifact(root)["github_failure"]["submission"], "none")
+        with patch.object(atoms, "packet", return_value=json.dumps(node)), \
+                self.call(node, self.resume(root), behavior="pr_approve", source="poise:approve-prs", units_per_call=6):
+            output = self.run_review(node, lambda *_: self.fail("completed approval must not be reviewed again"), behavior="pr_approve")
+            self.assertIn('"review_id": 91', output)
+        self.assertEqual(attempts, ["read"])
+        self.assertEqual(len(self.posts), 1)
+
+    def test_github_cli_records_failure_phase_without_response_body(self):
+        node = packet()
+        for after_write in (False, True):
+            with self.subTest(after_write=after_write), self.call(node, behavior="pr_approve") as call:
+                if after_write:
+                    review_receipt.complete_response(ASSESSMENT, HEAD)
+                    review_receipt.begin_submission("Verdict", HEAD)
+                operation = "POST" if after_write else "GET"
+                path = "/repos/o/r/pulls/12/reviews" if after_write else "/repos/o/r/pulls/12"
+
+                async def fail(_payload):
+                    raise GitHubRequestError("GitHub 500: private response body", operation, path, 500, not after_write)
+
+                stderr = io.StringIO()
+                with patch.object(github_cli, "approve_pr", fail), \
+                        patch.object(sys, "argv", ["github-interface", "--approve-pr", "#12", "--expected-head", HEAD,
+                                                   "--repository", "o/r", "--token-user", "reviewer"]), \
+                        redirect_stderr(stderr), self.assertRaises(SystemExit):
+                    github_cli.main()
+                evidence = self.artifact(call)["github_failure"]
+                self.assertEqual(evidence["submission"], "uncertain" if after_write else "none")
+                self.assertEqual(evidence["operation"], "pull request reviews" if after_write else "pull request")
+                self.assertNotIn("private response body", json.dumps(evidence))
+                self.assertNotIn("private response body", stderr.getvalue())
+                self.assertEqual(review_receipt.pre_submission_failure(), None if after_write else evidence)
+
+    def test_transient_transport_read_yields_a_no_write_continuation(self):
+        node = packet()
+
+        def failed_read(command, **_kwargs):
+            self.assertIn("--reviewed-clean", command)
+            review_receipt.record_github_failure("GET", "/repos/o/r/pulls/12", None, True)
+            return SimpleNamespace(returncode=1, stdout="", stderr="error: httpx.ReadTimeout: private details")
+
+        with patch.object(atoms, "packet", return_value=json.dumps(node)), self.call(node, units_per_call=6), \
+                patch.object(structured_review.subprocess, "run", side_effect=failed_read):
+            with self.assertRaises(continuation.Continuation) as stopped:
+                self.run_review(node, lambda *args: verdict(args[3]))
+            self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
+            self.assertEqual(stopped.exception.diagnostic["submission"], "none")
+            self.assertIn("httpx.ReadTimeout: GET pull request", str(stopped.exception))
+            self.assertNotIn("private details", str(stopped.exception))
+
+    def test_repeated_preflight_failure_holds_after_one_recovery(self):
+        node = packet()
+
+        def failed_read(command, **_kwargs):
+            self.assertIn("--reviewed-clean", command)
+            review_receipt.record_github_failure("GET", "/repos/o/r/pulls/12", 500, True)
+            return SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 500: unavailable")
+
+        with patch.object(atoms, "packet", return_value=json.dumps(node)), \
+                patch.object(structured_review.subprocess, "run", side_effect=failed_read):
+            with self.call(node, units_per_call=6) as root:
+                with self.assertRaises(continuation.Continuation) as first:
+                    self.run_review(node, lambda *args: verdict(args[3]))
+                self.assertEqual(first.exception.result["outcome"], "continuation_required")
+            with self.call(node, self.resume(root), units_per_call=6):
+                with self.assertRaises(continuation.Continuation) as second:
+                    self.run_review(node, lambda *_: self.fail("completed verdict must be reused"))
+                self.assertEqual(second.exception.result["outcome"], "held")
+        self.assertEqual(self.saved(root)["finalization"]["pre_submission_recoveries"], 2)
+        self.assertEqual(self.posts, [])
+
+    def test_post_failure_reconciles_exact_delayed_receipt_without_another_write(self):
+        node = packet()
+        attempts = []
+
+        def failed_post(command, **_kwargs):
+            review_receipt.begin_submission("Original verdict", HEAD)
+            attempts.append(command)
+            review_receipt.record_github_failure("POST", "/repos/o/r/pulls/12/reviews", 500, False)
+            return SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 500: private response body")
+
+        with patch.object(atoms, "packet", return_value=json.dumps(node)), self.call(node, units_per_call=6) as root:
+            with patch.object(structured_review.subprocess, "run", side_effect=failed_post):
+                with self.assertRaises(continuation.Continuation) as stopped:
+                    self.run_review(node, lambda *args: verdict(args[3]))
+            self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
+            self.assertTrue(stopped.exception.result["publication_started"])
+            self.assertEqual(stopped.exception.diagnostic["submission"], "uncertain")
+            self.assertNotIn("private response body", str(stopped.exception))
+        response = self.artifact(root)["review_response"]
+        state = {"repository": "o/r", "pull_number": 12, "head_sha": HEAD, "review_context": response["context_sha"],
+                 "my_reviews": [{"id": 91, "state": "COMMENTED", "commit_id": HEAD,
+                    "submitted_at": api.utc_stamp(api.time()), "invocation_id": root, "review_response": response}]}
+
+        accepted = state["my_reviews"]
+        state["my_reviews"] = []
+
+        def reconcile(command, **_kwargs):
+            self.assertIn("--pull-action-state", command)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(state), stderr="")
+
+        with patch.object(atoms, "packet", return_value=json.dumps(node)), \
+                self.call(node, self.resume(root), units_per_call=6), \
+                patch.object(structured_review.subprocess, "run", side_effect=reconcile):
+            with self.assertRaisesRegex(continuation.Continuation, "original review publication is uncertain"):
+                self.run_review(node, lambda *_: self.fail("missing receipt must not trigger a new review"))
+        state["my_reviews"] = accepted
+        with patch.object(atoms, "packet", return_value=json.dumps(node)), \
+                self.call(node, self.resume(root), units_per_call=6), \
+                patch.object(structured_review.subprocess, "run", side_effect=reconcile):
+            output = self.run_review(node, lambda *_: self.fail("publication reconciliation must not rerun the model"))
+            self.assertIn('"review_id": 91', output)
+        self.assertEqual(len(attempts), 1)
+
+    def test_github_cli_records_transport_operation_as_uncertain_after_write(self):
+        node = packet()
+        with self.call(node, behavior="pr_approve") as call:
+            review_receipt.complete_response(ASSESSMENT, HEAD)
+            review_receipt.begin_submission("Verdict", HEAD)
+
+            async def fail(_payload):
+                error = httpx.ReadTimeout("private transport details")
+                error.poise_request = ("POST", "/repos/o/r/pulls/12/reviews", False)
+                raise error
+
+            stderr = io.StringIO()
+            with patch.object(github_cli, "approve_pr", fail), \
+                    patch.object(sys, "argv", ["github-interface", "--approve-pr", "#12", "--expected-head", HEAD,
+                                               "--repository", "o/r", "--token-user", "reviewer"]), \
+                    redirect_stderr(stderr), self.assertRaises(SystemExit):
+                github_cli.main()
+            evidence = self.artifact(call)["github_failure"]
+            self.assertEqual((evidence["method"], evidence["status"], evidence["submission"]), ("POST", None, "uncertain"))
+            self.assertNotIn("private transport details", stderr.getvalue())
 
     def test_lost_publication_ack_keeps_the_original_publisher_fence(self):
         node = packet()
