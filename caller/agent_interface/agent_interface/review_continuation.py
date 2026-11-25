@@ -26,11 +26,11 @@ _request: ContextVar[tuple[str, str | None, int | None] | None] = ContextVar("re
 
 
 class Continuation(review_budget.ReviewLimitError):
-    def __init__(self, reason: str, result: dict):
+    def __init__(self, reason: str, result: dict, *, submission_failure: bool = False):
         held = result["outcome"] == "held"
-        diagnostic = diagnostic_envelope(operation="provider.review", phase=progress.phase() or "analysis",
-                                         outcome="held", message=reason[:500],
-                                         submission="uncertain" if result["publication_started"] else "none") if held else None
+        diagnostic = diagnostic_envelope(operation="github-interface.review-submission" if submission_failure else "provider.review",
+                                         phase=progress.phase() or "analysis", outcome="held" if held else "exit", message=reason[:500],
+                                         submission="uncertain" if result["publication_started"] else "none") if held or submission_failure else None
         super().__init__(reason, "review_continuation_held" if held else "review_continuation_required", diagnostic)
         self.result = {**result, "reason": reason}
 
@@ -348,7 +348,7 @@ class Session:
             saved.update(phase=("finalizing" if no_write else "publishing") if resumable else "held", reason=reason)
             _write(conn, self.root, original)
             self.retain_progress(conn, saved, original if self.root == self.call else current)
-        self.stop(reason, resumable=resumable)
+        self.stop(reason, resumable=resumable, submission_failure=True)
 
     def finalization_failure(self, error: BaseException) -> None:
         diagnostic = getattr(error, "diagnostic", None) or {}
@@ -446,14 +446,15 @@ class Session:
             _write(conn, self.call, current)
         return json.dumps(response, ensure_ascii=False) + "\n" + json.dumps(receipt)
 
-    def stop(self, reason: str, *, resumable: bool = False) -> None:
+    def stop(self, reason: str, *, resumable: bool = False, submission_failure: bool = False) -> None:
         raise Continuation(reason, {"outcome": "continuation_required" if resumable else "held",
                                     "root_call": self.root, "generation": self.saved.get("generation", self.generation),
                                     "unit": getattr(self, "state", {}).get("unit"),
                                     "remaining_ms": max(0, self.saved.get("allowance_ms", 0) - self.saved.get("spent_ms", 0)),
                                     "attempts": self.saved.get("attempts", 0),
                                     "publication_started": bool(self.finalization and
-                                        (self.finalization.get("followup") or self.finalization["step"] == "submitting"))})
+                                        (self.finalization.get("followup") or self.finalization["step"] == "submitting"))},
+                           submission_failure=submission_failure)
 
     def owned(self, conn) -> tuple[dict, dict]:
         original = _artifact(conn, self.root)

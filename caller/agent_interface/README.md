@@ -777,7 +777,8 @@ HTTP method, bounded operation name, status (or null for a transport error), and
 whether submission was not started or remains uncertain. It retains no GitHub
 response body. An uncapped review can resume its retained verdict after a
 transient read failure only if its original receipt proves no submission began.
-It admits at most one such recovery for the retained verdict.
+It admits at most one such recovery for the retained verdict, and records the
+failure as a diagnostic even when that recovery is admitted.
 After a possible POST, the continuation performs reconciliation only; an absent
 or mismatched review stays held and never authorizes another write.
 Capped follow-up creation likewise records intent before execution and retains

@@ -587,6 +587,15 @@ class TestReviewContinuation(TestCase):
                     self.run_review(node, approve, behavior="pr_approve")
             self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
             self.assertIn("GET pull request", str(stopped.exception))
+            self.assertEqual(stopped.exception.diagnostic["operation"], "github-interface.review-submission")
+            self.assertEqual(stopped.exception.diagnostic["submission"], "none")
+            diagnostic = api._caller_context(stopped.exception.diagnostic, root, None, "o/r", 12,
+                                             "reviewer", "pr_approve", HEAD)
+            api.finish(root, "failed", error=str(stopped.exception), error_code=stopped.exception.code,
+                       action="not_started", outcome="incomplete", diagnostic=diagnostic)
+            recorded, = api.logs_selected({"latest": [], "ids": [root]})
+            self.assertEqual(recorded["diagnostic"]["call_id"], root)
+            self.assertIn("GET pull request", recorded["diagnostic"]["message"])
             self.assertEqual(self.saved(root)["finalization"]["step"], "ready")
             self.assertEqual(self.artifact(root)["github_failure"]["submission"], "none")
         with patch.object(atoms, "packet", return_value=json.dumps(node)), \
@@ -659,6 +668,7 @@ class TestReviewContinuation(TestCase):
                     self.run_review(node, lambda *args: verdict(args[3]))
             self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
             self.assertTrue(stopped.exception.result["publication_started"])
+            self.assertEqual(stopped.exception.diagnostic["submission"], "uncertain")
             self.assertNotIn("private response body", str(stopped.exception))
         response = self.artifact(root)["review_response"]
         state = {"repository": "o/r", "pull_number": 12, "head_sha": HEAD, "review_context": response["context_sha"],
