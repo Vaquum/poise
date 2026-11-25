@@ -631,6 +631,23 @@ class TestReviewContinuation(TestCase):
                 self.assertNotIn("private response body", stderr.getvalue())
                 self.assertEqual(review_receipt.pre_submission_failure(), None if after_write else evidence)
 
+    def test_transient_transport_read_yields_a_no_write_continuation(self):
+        node = packet()
+
+        def failed_read(command, **_kwargs):
+            self.assertIn("--reviewed-clean", command)
+            review_receipt.record_github_failure("GET", "/repos/o/r/pulls/12", None, True)
+            return SimpleNamespace(returncode=1, stdout="", stderr="error: httpx.ReadTimeout: private details")
+
+        with patch.object(atoms, "packet", return_value=json.dumps(node)), self.call(node, units_per_call=6), \
+                patch.object(structured_review.subprocess, "run", side_effect=failed_read):
+            with self.assertRaises(continuation.Continuation) as stopped:
+                self.run_review(node, lambda *args: verdict(args[3]))
+            self.assertEqual(stopped.exception.result["outcome"], "continuation_required")
+            self.assertEqual(stopped.exception.diagnostic["submission"], "none")
+            self.assertIn("httpx.ReadTimeout: GET pull request", str(stopped.exception))
+            self.assertNotIn("private details", str(stopped.exception))
+
     def test_repeated_preflight_failure_holds_after_one_recovery(self):
         node = packet()
 
