@@ -78,6 +78,23 @@ class TestClientRetrySemantics(IsolatedAsyncioTestCase):
         self.assertIn("500", str(raised.exception))
         self.assertEqual(len(self.calls), 2)
 
+    async def test_http_failure_preserves_request_identity_and_read_only_flag(self) -> None:
+        for method, path, read_only in (("GET", "/repos/o/r/pulls/1", True),
+                                        ("POST", "/repos/o/r/pulls/1/reviews", False)):
+            with self.subTest(method=method):
+                self.script[:] = [_response(500), _response(500)]
+                with self.assertRaises(client_module.GitHubRequestError) as raised:
+                    await self.client.request(method, path, retry_transient=read_only)
+                error = raised.exception
+                self.assertEqual((error.method, error.path, error.status, error.read_only), (method, path, 500, read_only))
+
+    async def test_transport_failure_preserves_request_identity_without_retrying_post(self) -> None:
+        self.script[:] = [httpx.ReadTimeout("lost response")]
+        with self.assertRaises(httpx.ReadTimeout) as raised:
+            await self.client.post("/repos/o/r/pulls/1/reviews", json={})
+        self.assertEqual(raised.exception.poise_request, ("POST", "/repos/o/r/pulls/1/reviews", False))
+        self.assertEqual(len(self.calls), 1)
+
     async def test_get_does_not_retry_non_transient_status(self) -> None:
         self.script.extend([_response(404), _response(200)])
 

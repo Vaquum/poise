@@ -192,6 +192,74 @@ def invocation_environment(database: Path, call_id: str, managed: bool, *, initi
                 os.environ[key] = value
 
 
+def record_github_failure(method: str, path: str, status: int | None, read_only: bool) -> dict | None:
+    """Retain the failed review request without retaining GitHub response content."""
+    database = os.environ.get("AGENT_INTERFACE_RECEIPT_DB")
+    call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database and not call_id:
+        return
+    if not database or not call_id or not re.fullmatch(r"[0-9a-f]{32}", call_id):
+        raise RuntimeError("review failure lacks its native receipt binding")
+    if method not in {"GET", "POST", "PATCH", "PUT", "DELETE"} or status is not None and (type(status) is not int or not 400 <= status <= 599):
+        raise RuntimeError("review failure has invalid request evidence")
+    if path == "/graphql":
+        operation = "graphql query" if read_only else "graphql mutation"
+    elif re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[0-9]+/reviews", path):
+        operation = "pull request reviews"
+    elif re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[0-9]+", path):
+        operation = "pull request"
+    else:
+        operation = "other GitHub request"
+    with caller_store.connect(database, timeout=30) as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select artifact from calls where id=? and status='running' "
+                           "and behavior in ('pr_review','pr_approve')", (call_id,)).fetchone()
+        if not row:
+            raise RuntimeError("review failure does not own a running Call")
+        artifact = json.loads(row[0] or "{}")
+        phase = artifact.get("phase")
+        evidence = {"call_id": call_id, "method": method, "operation": operation, "status": status,
+                    "submission": "none" if phase == "reviewing" and read_only else "uncertain"}
+        if artifact.get("github_failure") not in (None, evidence):
+            raise RuntimeError("review Call already has different GitHub failure evidence")
+        artifact["github_failure"] = evidence
+        conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), call_id))
+        return evidence
+
+
+def github_failure() -> dict | None:
+    bound = _call.get()
+    if bound is None:
+        return None
+    database, call_id = bound
+    with caller_store.connect(database, timeout=30) as conn:
+        row = conn.execute("select artifact from calls where id=?", (call_id,)).fetchone()
+    if not row:
+        return None
+    evidence = json.loads(row[0] or "{}").get("github_failure")
+    if (not isinstance(evidence, dict) or set(evidence) != {"call_id", "method", "operation", "status", "submission"}
+            or evidence["call_id"] != call_id or evidence["method"] not in {"GET", "POST", "PATCH", "PUT", "DELETE"}
+            or evidence["operation"] not in {"graphql query", "graphql mutation", "pull request reviews", "pull request", "other GitHub request"}
+            or evidence["status"] is not None and (type(evidence["status"]) is not int or not 400 <= evidence["status"] <= 599)
+            or evidence["submission"] not in {"none", "uncertain"}):
+        return None
+    return evidence
+
+
+def pre_submission_failure() -> dict | None:
+    evidence = github_failure()
+    if (evidence is None or evidence["submission"] != "none" or evidence["status"] is not None and evidence["status"] < 500
+            or not (evidence["method"] == "GET" or evidence["method"] == "POST" and evidence["operation"] == "graphql query")):
+        return None
+    database, call_id = _call.get()
+    with caller_store.connect(database, timeout=30) as conn:
+        row = conn.execute("select artifact,review_id,receipts,head_sha from calls where id=? and status='running'", (call_id,)).fetchone()
+    if (not row or json.loads(row[0] or "{}").get("phase") != "reviewing"
+            or any(value is not None for value in row[1:])):
+        return None
+    return evidence
+
+
 def begin_submission(body: str, head: str) -> str:
     """Cross-process native receipt: reserve the one review write before POST.
     An unacknowledged request retains its identity in GitHub's review body."""
