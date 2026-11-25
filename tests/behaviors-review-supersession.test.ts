@@ -104,8 +104,11 @@ describe('verified replacement of a stale continuation', () => {
         started_at_precise: replacement.launchRequestedAt, completed_at: new Date().toISOString(),
         head_sha: HEAD_SHA, resources_settled_at: new Date().toISOString(), resource_ownership: ownership }))
       arrangeCli(false, false, { headSha: HEAD_SHA, requestedReviewers: [replacement.launchActor], reviewerReviewIdsSince: [91] })
-      await resetLogCache()
-      await restarted.behaviors.runEnabledBehaviorsOnce()
+      // Settlement and approval admission can complete in adjacent sweeps.
+      for (let sweep = 0; sweep < 3 && mocks.spawnDetached.mock.calls.length < 4; sweep++) {
+        await resetLogCache()
+        await restarted.behaviors.runEnabledBehaviorsOnce()
+      }
       expect(mocks.spawnDetached).toHaveBeenCalledTimes(4)
       expect(mocks.spawnDetached.mock.lastCall![1]).toContain('--pr-approve')
     } finally { vi.unstubAllEnvs() }
