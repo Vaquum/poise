@@ -46,6 +46,8 @@ it('reports missing and contradictory records without inferring a safe retry', a
     quarantined: [] } as unknown as Awaited<ReturnType<typeof fetchSelectedAgentLogSnapshot>>)
   const result = await readMcpPull({ repository: 'Acme/Repo', pull: 20 }, grant)
   expect(result).toMatchObject({ coverage: 'partial', runs: [] })
+  vi.mocked(fetchSelectedAgentLogSnapshot).mockResolvedValue({ entries: [], quarantined: [] } as unknown as Awaited<ReturnType<typeof fetchSelectedAgentLogSnapshot>>)
+  expect(await readMcpPull({ repository: 'Acme/Repo', pull: 20 }, grant)).toMatchObject({ coverage: 'partial', runs: [] })
   await expect(readMcpPull({ repository: 'Acme/Other', pull: 20 }, grant)).rejects.toThrow('outside this grant')
   await expect(readMcpPull({ repository: 'Acme/Repo', pull: 20 }, { ...grant, pullDiagnostics: undefined })).rejects.toThrow('consent is required')
 })

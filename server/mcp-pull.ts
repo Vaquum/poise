@@ -39,7 +39,7 @@ export async function readMcpPull(args: McpPullArguments, grant: McpGrantScope) 
       pull: { repository: args.repository, number: args.pull, limit: 11 } }, { fresh: true })
     calls = snapshot.entries.filter(row => row.repo?.toLowerCase() === args.repository.toLowerCase()
       && String(row.pr_id) === String(args.pull) && row.behavior === 'pr_approve')
-    incomplete ||= snapshot.quarantined.length > 0 || calls.length !== snapshot.entries.length || calls.length > 10
+    incomplete ||= snapshot.quarantined.length > 0 || !calls.length || calls.length !== snapshot.entries.length || calls.length > 10
     calls = calls.slice(-10)
   } catch { incomplete = true }
   return { repository: args.repository, pull: args.pull, observedAt,
