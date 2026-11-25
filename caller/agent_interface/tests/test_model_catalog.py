@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import tempfile
+from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
@@ -305,7 +306,7 @@ class TestCatalogRefresh(TestCase):
 import sys
 
 if sys.argv[1:] == ["--version"]:
-    print("codex-cli 0.172.0")
+    print("\\x1b[32mcodex-cli 0.172.0\\x1b[0m")
     raise SystemExit(0)
 assert sys.argv[1:] == ["app-server", "--listen", "stdio://"]
 ''' + body)
@@ -352,6 +353,14 @@ sys.stdin.read()
         self.assertIn("exited with code 7", report["families"]["codex"]["error"])
         self.assertFalse(report["changed"])
         self.assertFalse(self.target.exists())
+
+    def test_codex_discovery_ignores_incomplete_or_wrong_version_snapshots(self) -> None:
+        cache = Path(self.work.name) / "models_cache.json"
+        started = datetime(2025, 12, 31, tzinfo=timezone.utc)
+        for snapshot in ({"client_version": "0.172.0"}, {"client_version": "0.171.0", "models": []}):
+            with self.subTest(snapshot=snapshot):
+                cache.write_text(json.dumps({**snapshot, "fetched_at": "2026-01-01T00:00:00Z"}))
+                self.assertIsNone(catalog_refresh.refreshed_codex_cache(cache, "0.172.0", started))
 
     def test_a_missing_codex_line_keeps_the_family_as_it_is(self) -> None:
         models = [

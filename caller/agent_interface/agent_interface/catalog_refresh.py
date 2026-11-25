@@ -129,12 +129,13 @@ def refreshed_codex_cache(cache: Path, version: str, started: datetime) -> list[
     try:
         payload = json.loads(cache.read_text())
         fetched_at = datetime.fromisoformat(payload["fetched_at"])
+        models = payload["models"]
     except (FileNotFoundError, KeyError, TypeError, ValueError):
         # The cache may not exist yet, or Codex may still be writing it.
         return None
-    if payload.get("client_version") != version or fetched_at.tzinfo is None:
+    if payload.get("client_version") != version or fetched_at.tzinfo is None or not isinstance(models, list):
         return None
-    return payload["models"] if started <= fetched_at <= datetime.now(timezone.utc) else None
+    return models if started <= fetched_at <= datetime.now(timezone.utc) else None
 
 
 def codex_models() -> list[dict]:
@@ -144,7 +145,8 @@ def codex_models() -> list[dict]:
     for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
         env.pop(key, None)
     version = run([executable, "--version"], timeout_s=10, env=env, cwd=Path.home())
-    match = re.match(r"^codex-cli (\d+\.\d+\.\d+)\b", version.stdout)
+    version_text = re.sub(r"\x1b\[[0-9;]*m", "", version.stdout).strip()
+    match = re.match(r"^codex-cli (\d+\.\d+\.\d+)\b", version_text)
     if version.returncode or match is None:
         raise RuntimeError("Codex did not report a verifiable CLI version for model discovery")
 
