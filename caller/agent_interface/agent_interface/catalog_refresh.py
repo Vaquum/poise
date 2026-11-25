@@ -4,10 +4,10 @@ Claude and Codex each keep two lines (Opus and Fable; Astra and Sol), the
 latest model of each line.
 
 Discovery never runs inference: every family is read from a free source —
-Claude Code's local model cache, Codex's and Grok Build's model caches,
-Antigravity's model listing, and Muse's catalog over MSP (which names each
-model's quality levels). A family whose source is unavailable keeps its
-current rows; nothing is ever dropped silently.
+Claude Code's local model cache, Codex's online startup refresh, Grok Build's
+model cache, Antigravity's model listing, and Muse's catalog over MSP (which
+names each model's quality levels). A family whose source is unavailable
+keeps its current rows; nothing is ever dropped silently.
 """
 from __future__ import annotations
 
@@ -125,16 +125,66 @@ def claude() -> list[Model]:
 
 
 # ── Codex ─────────────────────────────────────────────────────────────
+def refreshed_codex_cache(cache: Path, version: str, started: datetime) -> list[dict] | None:
+    try:
+        payload = json.loads(cache.read_text())
+        fetched_at = datetime.fromisoformat(payload["fetched_at"])
+        models = payload["models"]
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        # The cache may not exist yet, or Codex may still be writing it.
+        return None
+    if payload.get("client_version") != version or fetched_at.tzinfo is None or not isinstance(models, list):
+        return None
+    return models if started <= fetched_at <= datetime.now(timezone.utc) else None
+
+
+def codex_models() -> list[dict]:
+    cache = Path(os.getenv("CODEX_HOME") or Path.home() / ".codex") / "models_cache.json"
+    executable = os.getenv("CODEX_CLI") or "codex"
+    env = os.environ.copy()
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
+        env.pop(key, None)
+    version = run([executable, "--version"], timeout_s=10, env=env, cwd=Path.home())
+    version_text = re.sub(r"\x1b\[[0-9;]*m", "", version.stdout).strip()
+    match = re.match(r"^codex-cli (\d+\.\d+\.\d+)\b", version_text)
+    if version.returncode or match is None:
+        raise RuntimeError("Codex did not report a verifiable CLI version for model discovery")
+
+    # App Server starts an online model refresh on boot. Its picker RPC can
+    # return cached or bundled rows, so require a fresh provider fetch receipt.
+    started = datetime.now(timezone.utc)
+    deadline = monotonic() + 45
+    with subprocess.Popen(
+        [executable, "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, cwd=Path.home(),
+    ) as proc:
+        try:
+            while monotonic() < deadline:
+                models = refreshed_codex_cache(cache, match[1], started)
+                if models is not None:
+                    return models
+                if (code := proc.poll()) is not None:
+                    raise RuntimeError(f"Codex App Server exited with code {code} before refreshing its model list")
+                sleep(0.1)
+            raise RuntimeError("Codex did not refresh its model list within 45 seconds. Check sign-in and network access.")
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+
 def codex() -> list[Model]:
-    cache = Path(os.getenv("CODEX_HOME", Path.home() / ".codex")) / "models_cache.json"
-    listed = [m for m in json.loads(cache.read_text())["models"] if m.get("visibility") == "list"]
+    listed = [m for m in codex_models() if m.get("visibility") == "list"]
     found: list[Model] = []
     for line in CODEX_LINES:
         # A line's models share its suffix (gpt-6-astra, gpt-5.6-sol); the
         # cache ranks them by priority, lowest first.
         candidates = [m for m in listed if str(m.get("slug", "")).endswith(f"-{line}")]
         if not candidates:
-            raise RuntimeError(f"{cache} lists no visible {line} model")
+            raise RuntimeError(f"Codex lists no visible {line} model")
         latest = min(candidates, key=lambda m: m.get("priority", 10**6))
         levels = [level["effort"] if isinstance(level, dict) else level for level in latest.get("supported_reasoning_levels") or []]
         found += rows("codex", latest["slug"], latest["slug"], levels)

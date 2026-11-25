@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import tempfile
+from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
@@ -296,13 +297,76 @@ class TestCatalogRefresh(TestCase):
         with self.assertRaisesRegex(ValueError, "unknown model family nope"):
             catalog_refresh.refresh(self.probes(), self.target, families=["claude", "nope"])
 
-    def test_a_missing_codex_line_keeps_the_family_as_it_is(self) -> None:
+    def fake_codex(self, body: str) -> dict[str, str]:
         home = Path(self.work.name)
-        (home / ".codex").mkdir()
-        (home / ".codex" / "models_cache.json").write_text(json.dumps({"models": [
+        codex_home = home / ".codex"
+        codex_home.mkdir()
+        launcher = home / "codex"
+        launcher.write_text(f"#!{sys.executable}\n" + '''
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("\\x1b[32mcodex-cli 0.172.0\\x1b[0m")
+    raise SystemExit(0)
+assert sys.argv[1:] == ["app-server", "--listen", "stdio://"]
+''' + body)
+        launcher.chmod(0o700)
+        (codex_home / "models_cache.json").write_text(json.dumps({
+            "fetched_at": "2026-01-01T00:00:00Z", "client_version": "0.172.0", "models": [
+                {"slug": "gpt-6-astra", "priority": 2, "visibility": "list", "supported_reasoning_levels": ["max", "ultra"]},
+                {"slug": "gpt-6.1-sol", "priority": 3, "visibility": "list", "supported_reasoning_levels": ["max", "ultra"]},
+            ],
+        }))
+        return {"HOME": str(home), "CODEX_HOME": str(codex_home), "CODEX_CLI": str(launcher)}
+
+    def test_codex_refresh_replaces_stale_cache_rows_with_provider_results(self) -> None:
+        env = self.fake_codex('''
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+assert all(key not in os.environ for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"))
+cache = Path(os.environ["CODEX_HOME"]) / "models_cache.json"
+payload = json.loads(cache.read_text())
+payload["fetched_at"] = datetime.now(timezone.utc).isoformat()
+payload["models"].append({"slug": "gpt-6.2-sol", "priority": 1, "visibility": "list", "supported_reasoning_levels": ["high", "max", "ultra"]})
+cache.write_text(json.dumps(payload))
+sys.stdin.read()
+''')
+        self.target.write_text(CATALOG_PATH.read_text().replace("gpt-5.6-sol", "gpt-6.1-sol"))
+        with (
+            patch.dict(catalog_refresh.os.environ, {**env, "OPENAI_API_KEY": "fixture", "CODEX_API_KEY": "fixture", "OPENAI_BASE_URL": "https://fixture.invalid"}),
+            patch.object(catalog_refresh, "catalog_path", return_value=self.target),
+        ):
+            report = catalog_refresh.refresh(path=self.target, families=["codex"])
+        self.assertEqual(report["families"]["codex"]["status"], "ok")
+        self.assertEqual(report["added"], ["gpt-6.2-sol-max", "gpt-6.2-sol-ultra"])
+        self.assertEqual(report["removed"], ["gpt-6.1-sol-max", "gpt-6.1-sol-ultra"])
+        self.assertEqual(load_catalog(self.target).resolve("gpt-6.2-sol-max").selector, "gpt-6.2-sol")
+
+    def test_codex_exit_before_refresh_keeps_existing_rows(self) -> None:
+        env = self.fake_codex("raise SystemExit(7)\n")
+        with patch.dict(catalog_refresh.os.environ, env):
+            report = catalog_refresh.refresh(path=self.target, families=["codex"])
+        self.assertEqual(report["families"]["codex"]["status"], "unavailable")
+        self.assertIn("exited with code 7", report["families"]["codex"]["error"])
+        self.assertFalse(report["changed"])
+        self.assertFalse(self.target.exists())
+
+    def test_codex_discovery_ignores_incomplete_or_wrong_version_snapshots(self) -> None:
+        cache = Path(self.work.name) / "models_cache.json"
+        started = datetime(2025, 12, 31, tzinfo=timezone.utc)
+        for snapshot in ({"client_version": "0.172.0"}, {"client_version": "0.171.0", "models": []}):
+            with self.subTest(snapshot=snapshot):
+                cache.write_text(json.dumps({**snapshot, "fetched_at": "2026-01-01T00:00:00Z"}))
+                self.assertIsNone(catalog_refresh.refreshed_codex_cache(cache, "0.172.0", started))
+
+    def test_a_missing_codex_line_keeps_the_family_as_it_is(self) -> None:
+        models = [
             {"slug": "gpt-6-astra", "priority": 1, "visibility": "list", "supported_reasoning_levels": ["max", "ultra"]},
-        ]}))
-        with patch.dict(catalog_refresh.os.environ, {"CODEX_HOME": str(home / ".codex")}):
+        ]
+        with patch.object(catalog_refresh, "codex_models", return_value=models):
             with self.assertRaisesRegex(RuntimeError, "no visible sol model"):
                 catalog_refresh.codex()
             report = catalog_refresh.refresh(self.probes(codex=catalog_refresh.codex), self.target)
@@ -352,22 +416,23 @@ class TestCatalogRefresh(TestCase):
             ["opus-5-max", "opus-5-xhigh", "opus-5-high", "fable-5.1-max", "fable-5.1-xhigh", "fable-5.1-high"],
         )
 
-    def test_sources_are_read_from_the_cli_caches(self) -> None:
-        home = Path(self.work.name)
-        (home / ".codex").mkdir()
-        (home / ".codex" / "models_cache.json").write_text(json.dumps({"models": [
-            {"slug": "gpt-6-astra", "priority": 1, "visibility": "list", "supported_reasoning_levels": [{"effort": e, "description": ""} for e in ("low", "medium", "high", "xhigh", "max", "ultra")]},
-            {"slug": "gpt-reserve", "priority": 3, "visibility": "hide", "supported_reasoning_levels": ["low", "max"]},
-            {"slug": "gpt-5.6-sol", "priority": 4, "visibility": "list", "supported_reasoning_levels": [{"effort": e, "description": ""} for e in ("low", "medium", "high", "xhigh", "max", "ultra")]},
+    def test_codex_uses_priority_and_keeps_only_visible_model_lines(self) -> None:
+        models = [
+            {"slug": "gpt-6-astra", "priority": 1, "visibility": "list", "supported_reasoning_levels": [{"effort": e} for e in ("max", "ultra")]},
+            {"slug": "gpt-reserve-sol", "priority": 3, "visibility": "hide", "supported_reasoning_levels": ["low", "max"]},
+            {"slug": "gpt-5.6-sol", "priority": 4, "visibility": "list", "supported_reasoning_levels": ["max", "ultra"]},
             {"slug": "gpt-5.5-sol", "priority": 9, "visibility": "list", "supported_reasoning_levels": ["low", "high", "xhigh"]},
-            {"slug": "gpt-5.6-terra", "priority": 7, "visibility": "list", "supported_reasoning_levels": ["low", "ultra"]},
-        ]}))
+        ]
+        with patch.object(catalog_refresh, "codex_models", return_value=models):
+            self.assertEqual([m.identity for m in catalog_refresh.codex()], ["gpt-6-astra-ultra", "gpt-6-astra-max", "gpt-5.6-sol-ultra", "gpt-5.6-sol-max"])
+
+    def test_grok_and_antigravity_discovery(self) -> None:
+        home = Path(self.work.name)
         (home / ".grok").mkdir()
         (home / ".grok" / "models_cache.json").write_text(json.dumps({"models": {"grok-4.6": {"info": {"reasoning_efforts": [{"id": "xhigh"}, {"id": "high"}, {"id": "medium"}]}}}}))
         listing = SimpleNamespace(returncode=0, stdout="You are not authenticated.\n\nDefault model: grok-4.6\n\nAvailable models:\n  * grok-4.6 (default)\n", stderr="")
         agy = SimpleNamespace(returncode=0, stdout="gemini-3.8-flash-high\tGemini 3.8 Flash (High)\ngemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\ngemini-3.1-pro-high\tGemini 3.1 Pro (High)\nclaude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n", stderr="")
-        with patch.dict(catalog_refresh.os.environ, {"CODEX_HOME": str(home / ".codex"), "GROK_HOME": str(home / ".grok")}):
-            self.assertEqual([m.identity for m in catalog_refresh.codex()], ["gpt-6-astra-ultra", "gpt-6-astra-max", "gpt-5.6-sol-ultra", "gpt-5.6-sol-max"])
+        with patch.dict(catalog_refresh.os.environ, {"GROK_HOME": str(home / ".grok")}):
             with patch.object(catalog_refresh, "run", return_value=listing):
                 self.assertEqual([m.identity for m in catalog_refresh.grok()], ["grok-4.6-xhigh", "grok-4.6-high"])
             with patch.object(catalog_refresh, "run", return_value=agy):

@@ -46,10 +46,14 @@ trying another installation or PATH. The receipt records `caller_executable`
 on success and failure, with bounded failure diagnostics when spawning fails.
 Direct script runs resolve the same setting themselves.
 
-Discovery never runs inference. Claude reads its local model cache, Codex and
-Grok read their model caches, Antigravity lists its models, and Muse reads the
-quality levels straight from its free model list. A family whose free source is
-unavailable keeps its current rows and reports the cause; nothing is dropped.
+Discovery never runs inference. Claude and Grok read their model caches,
+Antigravity lists its models, and Muse reads the quality levels from its free
+model list. Caller starts Codex App Server with the maintained launcher or the
+configured `CODEX_CLI`. Its startup refresh checks the signed-in account's
+models. Caller accepts a catalogue fetched during the check by that CLI
+version. If Codex cannot refresh it within 45 seconds, the check reports the
+failure and keeps the existing Codex rows. Every other unavailable family also
+keeps its current rows and reports its failure.
 
 Muse discovery considers only explicit `muse-…-contributor` selectors. An ordinary
 Muse default is never admitted. No contributor model means discovery
