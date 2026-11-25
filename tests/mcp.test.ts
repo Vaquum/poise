@@ -122,7 +122,7 @@ const fetcher: typeof fetch = async (input, init) => {
 
 /** A fresh SDK client performs discovery/registration; its owner signs in through fake GitHub. */
 async function connect(login: string, serverEndpoint = endpoint,
-  options: { chatMetadata?: boolean; chatTranscript?: boolean; chatArtifacts?: boolean; workspaceData?: boolean; contentData?: boolean; repository?: string; managerControls?: boolean; ownerControls?: boolean } = {}) {
+  options: { chatMetadata?: boolean; chatTranscript?: boolean; chatArtifacts?: boolean; workspaceData?: boolean; contentData?: boolean; pullDiagnostics?: boolean; repository?: string; managerControls?: boolean; ownerControls?: boolean } = {}) {
   let clientInformation: OAuthClientInformationMixed | undefined, tokens: OAuthTokens | undefined
   let verifier = '', authorizationUrl: URL | undefined
   const redirectUrl = 'http://127.0.0.1:19876/callback'
@@ -155,6 +155,7 @@ async function connect(login: string, serverEndpoint = endpoint,
   }, body: new URLSearchParams({ request: authorizationUrl!.searchParams.toString(), csrf, decision: 'approve',
     ...(options.chatMetadata ? { chatMetadata: '1' } : {}), ...(options.chatTranscript ? { chatTranscript: '1' } : {}),
     ...(options.workspaceData ? { workspaceData: '1' } : {}),
+    ...(options.pullDiagnostics ? { pullDiagnostics: '1' } : {}),
     ...(options.contentData ? { contentData: '1' } : {}),
     ...(options.chatArtifacts ? { chatArtifacts: '1' } : {}),
     ...(options.managerControls ? { managerControls: '1' } : {}),
@@ -633,7 +634,7 @@ it('reports the running workspace inventory through describe and the matching MC
     const result = await describe(client) as { inventory: { surfaces: Array<{ id: string; href: string }> } }
     const expected = [...PLACES, ...PARTS.map(id => `observe/${id}`), ...SECTIONS.map(id => `settings/${id}`),
       ...listCapabilities().map(id => `capability/${id}`), 'chat/sessions', 'chat/transcript', 'chat/artifacts',
-      ...MCP_WORKSPACE_VIEWS.map(id => 'workspace/' + id), 'workspace/caller', 'settings/link-devices']
+      ...MCP_WORKSPACE_VIEWS.map(id => 'workspace/' + id), 'workspace/caller', 'workspace/pull-diagnostics', 'settings/link-devices']
     expect(result.inventory.surfaces.map(surface => surface.id)).toEqual(expected)
     expect(result.inventory.surfaces.every(surface => new URL(surface.href).origin === 'https://alice.poise.test')).toBe(true)
     expect(result).toMatchObject({ access: { resource: endpoint, scope: 'poise:read' }, instructions: expect.any(String),
@@ -974,7 +975,7 @@ conn.close()
   const bundle = join(root, 'bundle')
   await packagePoisePlugin('https://poise.test', bundle)
   const manifest = JSON.parse(await readFile(join(bundle, 'plugins/poise/mcp.json'), 'utf8'))
-  const connection = await connect('Alice', manifest.mcpServers.poise.url, { repository: 'Acme/Repo' })
+  const connection = await connect('Alice', manifest.mcpServers.poise.url, { repository: 'Acme/Repo', pullDiagnostics: true })
   const other = await connect('bob', manifest.mcpServers.poise.url)
   const run = vi.spyOn(processes, 'runFile')
   const reads = vi.spyOn(BehaviorChainJournal.prototype, 'read')
@@ -1147,6 +1148,13 @@ conn.close()
     expect(partial.items[0].stage).toBe('unknown')
     expect(partial.items[0].ledger[0].coverage.status).toBe('partial')
     expect(partial.items[0].ledger[0].health.gaps.length).toBeGreaterThan(0)
+    const pullResult = await connection.client.callTool({ name: 'poise_pull', arguments: { repository: 'acme/repo', pull: 23 } })
+    expect(pullResult.isError).not.toBe(true)
+    const pullContent = pullResult.content as { text: string }[]
+    const pull = JSON.parse(pullContent[0].text).pull
+    expect(pull).toMatchObject({ repository: 'acme/repo', pull: 23, coverage: 'partial', runs: [],
+      liveGitHub: { coverage: 'complete', record: { number: 23, gates: { approved: true } } } })
+    expect((await other.client.callTool({ name: 'poise_pull', arguments: { repository: 'acme/repo', pull: 23 } })).isError).toBe(true)
     await ledger.stopBehaviorLedger()
     const unavailable = await work({ repository: 'acme/repo', issue: 1 })
     expect(unavailable.items[0].stage).toBe('unknown')

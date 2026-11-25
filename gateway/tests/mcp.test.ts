@@ -237,6 +237,21 @@ it('withholds poise_work from grants consented before it existed', async () => {
   expect(h.workspace.requests).toHaveLength(0)
 })
 
+it('requires separate consent for exact pull diagnostics and enforces the repository restriction', async () => {
+  const old = await connect()
+  const allowed = await connect('Alice', { pullDiagnostics: '1', repository: 'fixtures/work' })
+  const names = (reply: Awaited<ReturnType<typeof rpc>>) =>
+    ((reply.json() as { result: { tools: { name: string }[] } }).result.tools).map(tool => tool.name)
+  expect(names(await rpc(old.access))).not.toContain('poise_pull')
+  expect(names(await rpc(allowed.access))).toContain('poise_pull')
+  const call = (access: string, repository: string) => rpc(access, 'tools/call', {
+    name: 'poise_pull', arguments: { repository, pull: 20 },
+  })
+  expect((await call(old.access, 'fixtures/work')).json()).toMatchObject({ result: { isError: true } })
+  expect((await call(allowed.access, 'fixtures/other')).json()).toMatchObject({ result: { isError: true } })
+  expect(h.workspace.requests).toHaveLength(0)
+})
+
 it('retains a consented registration past its original deadline while its grant lives', async () => {
   const client = await register()
   h.advance(20 * 86_400_000)

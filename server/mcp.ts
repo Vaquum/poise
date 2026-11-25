@@ -7,6 +7,7 @@ import { sourceItems } from './chat/switchboard-store'
 import { HttpError, readJson, type RequestAuthority } from './http'
 import { mcpInventory } from './mcp-inventory'
 import { readMcpWork } from './mcp-work'
+import { readMcpPull } from './mcp-pull'
 import { readMcpChatChanges, readMcpChatList } from './mcp-chat-pages'
 import { listCallerRecords, readCallerRecord } from './mcp-caller'
 import { listContentDocuments, readContentRecord } from './mcp-editor-content'
@@ -68,6 +69,7 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
   if (req.method !== 'POST' || req.url !== MCP_READ_PATH) throw new HttpError(405, `MCP reads require POST ${MCP_READ_PATH}`)
   const read = parseMcpRead(await readJson<unknown>(req, 16 * 1024))
   const work = read.name === 'poise_work' ? await readMcpWork(read.arguments, service, authority.mcp) : undefined
+  const pull = read.name === 'poise_pull' ? await readMcpPull(read.arguments, authority.mcp) : undefined
   let lookup
   let page
   if (read.name === 'poise_get') {
@@ -106,10 +108,11 @@ export async function handleMcpRead(req: IncomingMessage, res: ServerResponse, s
         : readMcpChatChanges(chatInstance, authority.mcp, read.arguments)
     } else throw new HttpError(403, 'the selected read belongs to the gateway')
   }
-  const tools = mcpToolNames({ ...(chatInstance ? authority.mcp : { workspaceData: authority.mcp.workspaceData, contentData: authority.mcp.contentData }), managerClientId: managerRunning ? authority.mcp.managerClientId : undefined, ownerClientId: authority.mcp.ownerClientId })
+  const tools = mcpToolNames({ ...(chatInstance ? authority.mcp : { workspaceData: authority.mcp.workspaceData, contentData: authority.mcp.contentData,
+    pullDiagnostics: authority.mcp.pullDiagnostics }), managerClientId: managerRunning ? authority.mcp.managerClientId : undefined, ownerClientId: authority.mcp.ownerClientId })
   const text = JSON.stringify({ workspace: service.handle, owner: service.owner, capabilities: { tools },
     ...(read.name === 'poise_describe' ? { inventory: mcpInventory() } : {}),
-    ...(work ? { work } : {}), ...(lookup ? { lookup } : {}), ...(page ? { page } : {}) })
+    ...(work ? { work } : {}), ...(pull ? { pull } : {}), ...(lookup ? { lookup } : {}), ...(page ? { page } : {}) })
   if (Buffer.byteLength(text) > MCP_RESPONSE_BYTES) throw new HttpError(503, 'work response exceeds its bound; request a smaller page')
   res.statusCode = 200
   res.setHeader('Content-Type', 'application/json')

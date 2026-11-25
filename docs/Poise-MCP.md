@@ -82,6 +82,24 @@ or merge SHA and current queue, review, conversation and check gates where
 applicable. A head change across reads reports partial coverage. Live GitHub
 evidence never alters Poise's original receipt or review-completion status.
 
+## Read pull request diagnostics
+
+On the consent page, select pull request diagnostics to enable `poise_pull`.
+The optional repository restriction applies; existing grants do not gain the
+new tool until the owner reconnects and selects it. For example:
+
+```json
+{"repository":"autonomio/poise","pull":20}
+```
+
+The result combines bounded approval-run evidence from the Behavior Ledger and
+exact Caller records with current GitHub readiness. The run includes its Call,
+head, timestamps and bounded failure operation, status and submission certainty
+when retained. Older failures may report an HTTP status with unknown operation
+and submission certainty. Missing, truncated or unavailable records report
+partial coverage; absence never proves a review was not submitted. No prompts,
+response bodies or unrelated workspace records are returned.
+
 ## Read Chat metadata
 
 On the Poise consent page, allow Chat metadata to enable `poise_get` and

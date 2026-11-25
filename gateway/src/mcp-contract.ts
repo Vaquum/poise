@@ -28,6 +28,10 @@ export const MCP_TOOLS = [
       cursor: { type: 'string', maxLength: 2048 },
     }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false } },
+  { name: 'poise_pull', description: 'Read retained approval diagnostics and live GitHub evidence for one exact pull request. Requires separate pull request diagnostics consent.',
+    inputSchema: { type: 'object', required: ['repository', 'pull'], properties: {
+      repository: { type: 'string', maxLength: 140 }, pull: { type: 'integer', minimum: 1 },
+    }, additionalProperties: false }, annotations: { readOnlyHint: true, openWorldHint: false } },
   { name: 'poise_get', description: 'Read an exact retained record or named workspace snapshot. Requires consent for the selected data.',
     inputSchema: { type: 'object', required: ['kind', 'id'], properties: {
       kind: { enum: ['chat', 'timer', 'chat-attachment', 'chat-diff', 'workspace', 'call', 'invocation', 'document', 'snippet', 'memory', 'gateway', ...LOG_KINDS] },
@@ -86,11 +90,13 @@ export interface McpGrantScope {
   workspaceData?: true
   operatorLogs?: true
   contentData?: true
+  pullDiagnostics?: true
   managerClientId?: string
   ownerClientId?: string
   repository?: string
 }
 export interface McpWorkArguments { repository: string; issue?: number; live?: true; label?: string; limit?: number; cursor?: string; since?: string; until?: string }
+export interface McpPullArguments { repository: string; pull: number }
 export interface McpChatMetadataArguments { kind: 'chat' | 'timer'; id: string }
 export interface McpChatArtifactArguments { kind: 'chat-attachment' | 'chat-diff'; id: string; chatId: string }
 export type McpGetArguments = McpChatMetadataArguments | McpChatArtifactArguments | { kind: 'workspace'; id: McpWorkspaceView }
@@ -105,6 +111,7 @@ export interface McpLoggingArguments { kind: McpLoggingKind; repository: string 
   limit: number; cursor?: string; afterWatermark?: string }
 export type McpRead = { name: 'poise_describe'; arguments: Record<string, never> }
   | { name: 'poise_work'; arguments: McpWorkArguments }
+  | { name: 'poise_pull'; arguments: McpPullArguments }
   | { name: 'poise_get'; arguments: McpGetArguments }
   | { name: 'poise_list'; arguments: McpChatListArguments | McpDocumentListArguments | McpCallerListArguments | McpLoggingArguments }
   | { name: 'poise_changes'; arguments: McpChatChangesArguments | McpLoggingArguments }
@@ -178,8 +185,9 @@ export const isMcpRepository = (value: unknown): value is string => typeof value
 export const mcpRepositoryAllowed = (scope: McpGrantScope, repository: string | null): boolean =>
   scope.repository === undefined || scope.repository.toLowerCase() === repository?.toLowerCase()
 
-export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'chatArtifacts' | 'workspaceData' | 'operatorLogs' | 'contentData' | 'repository' | 'managerClientId' | 'ownerClientId'>): string[] {
+export function mcpToolNames(scope: Pick<McpGrantScope, 'chatMetadata' | 'chatList' | 'chatTranscript' | 'chatArtifacts' | 'workspaceData' | 'operatorLogs' | 'contentData' | 'pullDiagnostics' | 'repository' | 'managerClientId' | 'ownerClientId'>): string[] {
   const tools: string[] = [...MCP_WORK_TOOL_NAMES]
+  if (scope.pullDiagnostics === true) tools.push('poise_pull')
   const gatewayRead = mcpWorkspaceAllowed(scope) || (scope.operatorLogs === true && scope.repository === undefined)
   if (scope.chatMetadata === true || scope.chatArtifacts === true || gatewayRead || mcpContentAllowed(scope)) tools.push('poise_get')
   if (scope.chatMetadata === true && scope.chatList === true || gatewayRead || mcpContentAllowed(scope)) tools.push('poise_list')
@@ -217,6 +225,13 @@ export function parseMcpRead(value: unknown): McpRead {
   const args = row.arguments ?? {}
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('invalid tool arguments')
   if (row.name === 'poise_describe' && !Object.keys(args).length) return { name: row.name, arguments: {} }
+  if (row.name === 'poise_pull') {
+    const { repository, pull } = args as Record<string, unknown>
+    if (Object.keys(args).length !== 2 || !isMcpRepository(repository) || !Number.isSafeInteger(pull) || Number(pull) < 1) {
+      throw new Error('provide an exact repository and pull request number')
+    }
+    return { name: row.name, arguments: { repository, pull: Number(pull) } }
+  }
   if (row.name === 'poise_get') {
     const { kind, id, chatId } = args as Record<string, unknown>
     if ((kind === 'chat-attachment' || kind === 'chat-diff') && Object.keys(args).length === 3 && isMcpRecordId(id) && isMcpRecordId(chatId)) {
