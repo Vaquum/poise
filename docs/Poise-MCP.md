@@ -97,7 +97,8 @@ exact Caller records with current GitHub readiness. The run includes its Call,
 head, timestamps and bounded failure operation, status and submission certainty
 when retained. Older failures may report an HTTP status with unknown operation
 and submission certainty. Missing, truncated or unavailable records report
-partial coverage; absence never proves a review was not submitted. No prompts,
+partial coverage. `ledgerCoverage` names the retained start, observation time,
+gap count and page truncation; absence never proves a review was not submitted. No prompts,
 response bodies or unrelated workspace records are returned.
 
 ## Read Chat metadata

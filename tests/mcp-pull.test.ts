@@ -17,7 +17,8 @@ const id = 'a'.repeat(32), head = 'b'.repeat(40)
 
 beforeEach(() => {
   vi.resetAllMocks()
-  vi.mocked(readBehaviorLedger).mockResolvedValue({ status: 200, body: { health: { status: 'ok', pending: 0 }, nextCursor: null,
+  vi.mocked(readBehaviorLedger).mockResolvedValue({ status: 200, body: { health: { status: 'ok', pending: 0,
+    coverageStart: '2026-11-01T00:00:00Z', observedAt: '2026-11-25T16:00:00Z', gaps: [], detailFloor: null }, nextCursor: null,
     records: [{ behavior: 'approve-prs', refs: [{ kind: 'caller', availability: 'available', identity: id }] }] } } as unknown as Awaited<ReturnType<typeof readBehaviorLedger>>)
   vi.mocked(readLivePull).mockResolvedValue({ source: 'Live GitHub through Caller', observedAt: new Date().toISOString(),
     coverage: 'complete', record: null, reason: 'Fixture' } as Awaited<ReturnType<typeof readLivePull>>)
@@ -32,6 +33,7 @@ it('projects only the exact approval run and bounded failure evidence', async ()
   const result = await readMcpPull({ repository: 'Acme/Repo', pull: 20 }, grant)
   expect(result).toMatchObject({ coverage: 'complete', runs: [{ id, expectedHead: head, failure: {
     method: 'POST', operation: 'pull request reviews', status: 500, submission: 'uncertain' } }] })
+  expect(result.ledgerCoverage).toMatchObject({ from: '2026-11-01T00:00:00Z', gaps: 0, truncated: false })
   expect(JSON.stringify(result)).not.toContain('private response body')
   expect(JSON.stringify(result)).not.toContain('hidden')
   expect(readBehaviorLedger).toHaveBeenCalledWith({ operation: 'list', repository: 'Acme/Repo', number: 20, limit: 10 })

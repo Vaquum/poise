@@ -31,11 +31,16 @@ export async function readMcpPull(args: McpPullArguments, grant: McpGrantScope) 
     readLivePull(args.repository, args.pull, null, null),
   ])
   const records = (ledger?.body.records ?? []).filter(record => record.behavior === 'approve-prs')
-  const ids = [...new Set(records.flatMap(record => record.refs.filter(ref => ref.kind === 'caller' && ref.availability === 'available'
-    && /^[a-f0-9]{32}$/.test(ref.identity)).map(ref => ref.identity)))].slice(0, 10)
+  const retainedIds = [...new Set(records.flatMap(record => record.refs.filter(ref => ref.kind === 'caller' && ref.availability === 'available'
+    && /^[a-f0-9]{32}$/.test(ref.identity)).map(ref => ref.identity)))]
+  const ids = retainedIds.slice(0, 10)
   let calls: LogEntry[] = []
   let incomplete = !ledger || ledger.status !== 200 || ledger.body.health.status !== 'ok' || ledger.body.health.pending > 0
-    || !!ledger.body.nextCursor || !records.length || records.some(record => !record.refs.some(ref => ref.kind === 'caller' && ref.availability === 'available'))
+    || !ledger.body.health.coverageStart || ledger.body.health.gaps.length > 0 || ledger.body.health.detailFloor !== null
+    || !!ledger.body.nextCursor || retainedIds.length > ids.length || !records.length
+    || records.some(record => !record.refs.some(ref => ref.kind === 'caller' && ref.availability === 'available'
+      && /^[a-f0-9]{32}$/.test(ref.identity)) || record.refs.some(ref => ref.kind === 'caller'
+        && (ref.availability !== 'available' || !/^[a-f0-9]{32}$/.test(ref.identity))))
   if (ids.length) {
     try {
       const snapshot = await fetchSelectedAgentLogSnapshot({ latest: [], ids }, { fresh: true })
@@ -49,6 +54,8 @@ export async function readMcpPull(args: McpPullArguments, grant: McpGrantScope) 
     ...(incomplete ? { reason: !ledger || ledger.status !== 200 ? 'Behavior Ledger is unavailable'
       : !records.length ? 'No approval run is recorded in retained ledger coverage'
         : 'Retained approval runs or Caller receipts are incomplete' } : {}),
+    ledgerCoverage: ledger ? { from: ledger.body.health.coverageStart, observedAt: ledger.body.health.observedAt,
+      gaps: ledger.body.health.gaps.length, truncated: !!ledger.body.nextCursor } : null,
     source: 'Behavior Ledger and exact Caller records', liveGitHub: live,
     runs: calls.map(row => ({ id: row.id, status: row.status, action: row.action, outcome: row.outcome,
       expectedHead: row.expected_head, head: row.head_sha, reviewId: row.review_id ?? null,
