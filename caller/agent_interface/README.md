@@ -911,6 +911,9 @@ behavior/source/owner needle plus exact call-ID lookups. Missing kinds return
 no row without traversing history. There are at most 256 latest needles and
 1,000 IDs; invalid or larger requests fail. Poise shares identical selections
 in flight and for five seconds, and decodes large responses off its main thread.
+An optional `pull` selector with an exact `repository`, PR `number` and `limit`
+from 1 to 11 reads the latest approval Calls through a dedicated index. The
+extra eleventh Call lets consumers report truncation of their ten-Call result.
 Development parses share one temporary build while workers are active, then
 remove that owned directory after the final worker stops, including failures.
 Production continues to use its packaged worker asset.

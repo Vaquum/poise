@@ -651,6 +651,7 @@ export interface AgentLogSelection {
   latest: Array<{ behavior: string, source: string, owner: string }>
   ids: string[]
   correlations?: string[]
+  pull?: { repository: string, number: number, limit: number }
 }
 
 export async function fetchSelectedAgentLogSnapshot(

@@ -1,6 +1,6 @@
 ---
 name: poise-manager
-description: Trace an issue or repository label page through the connected Poise workspace, explaining work stages, blockers and recorded proof.
+description: Trace issue work or exact pull request diagnostics through the connected Poise workspace, explaining blockers and recorded proof.
 ---
 
 Use `poise_describe` to identify the authorized workspace, then `poise_work`
@@ -9,6 +9,11 @@ with `repository` and either an exact `issue` number or `label`. Follow
 Keep stable issue, chain, invocation and Call identities in the explanation
 and use the returned links to open the owner's records. Request `live: true`
 for an exact issue to corroborate its recorded pull request with GitHub.
+
+When `poise_describe` lists `poise_pull`, use it with an exact `repository` and
+`pull` number to inspect approval runs and live GitHub evidence. The tool needs
+separate pull request diagnostics consent; an older grant requires reconnection.
+Distinguish the failed operation and submission certainty from missing evidence.
 
 When `poise_describe` lists `poise_get`, read a known Chat ID with `kind: "chat"`
 and follow its live timer IDs with `kind: "timer"`. Follow its workers, inbox and supervision records within the approved scope.

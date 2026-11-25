@@ -100,6 +100,7 @@ export class McpGateway {
         <label><input type="checkbox" name="chatTranscript" value="1"> Allow Chat transcript and retained turn events</label>
         <label><input type="checkbox" name="chatArtifacts" value="1"> Allow retained Chat attachment text and checkout diffs</label>
         <label><input type="checkbox" name="workspaceData" value="1"> Allow workspace settings and operational data (workspace-wide grants)</label>
+        <label><input type="checkbox" name="pullDiagnostics" value="1"> Allow diagnostics for exact pull requests</label>
         <label><input type="checkbox" name="contentData" value="1"> Allow document, snippet and saved memory content (workspace-wide grants)</label>
         ${principal.isAdmin ? html`<label><input type="checkbox" name="operatorLogs" value="1"> Allow instance Logging as an administrator</label>` : ''}
         <label>Repository restriction (optional) <input name="repository" maxlength="140" placeholder="owner/repository"></label>
@@ -127,6 +128,7 @@ export class McpGateway {
             ...(form.get('chatTranscript') === '1' ? { chatTranscript: true } : {}),
             ...(form.get('chatArtifacts') === '1' ? { chatArtifacts: true } : {}),
             ...(!repository && form.get('workspaceData') === '1' ? { workspaceData: true } : {}),
+            ...(form.get('pullDiagnostics') === '1' ? { pullDiagnostics: true } : {}),
             ...(!repository && form.get('contentData') === '1' ? { contentData: true } : {}),
             ...(!repository && principal.isAdmin && form.get('operatorLogs') === '1' ? { operatorLogs: true } : {}),
             ...(form.get('managerControls') === '1' ? { managerClientId: auth.client } : {}),
@@ -225,7 +227,7 @@ export class McpGateway {
     if (!grant.tools.includes(read.name)) {
       return result({ isError: true, content: [{ type: 'text', text: 'tool not authorized by this grant; reconnect to grant consent' }] })
     }
-    if ((read.name === 'poise_work' || read.name === 'poise_chain_preview') && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
+    if ((read.name === 'poise_work' || read.name === 'poise_pull' || read.name === 'poise_chain_preview') && !mcpRepositoryAllowed(grant, read.arguments.repository)) {
       return result({ isError: true, content: [{ type: 'text', text: 'repository is outside this grant' }] })
     }
     const direct = gatewayMcpRead(read)
@@ -282,6 +284,7 @@ export class McpGateway {
       ...(grant.chatTranscript && grant.tools.includes('poise_changes') ? { chatTranscript: true } : {}),
       ...(grant.chatArtifacts && grant.tools.includes('poise_get') ? { chatArtifacts: true } : {}),
       ...(mcpWorkspaceAllowed(grant) && grant.tools.includes('poise_get') ? { workspaceData: true } : {}),
+      ...(grant.pullDiagnostics && grant.tools.includes('poise_pull') ? { pullDiagnostics: true } : {}),
       ...(mcpContentAllowed(grant) && grant.tools.includes('poise_get') ? { contentData: true } : {}),
       ...(grant.managerClientId === grant.clientId && grant.tools.includes('poise_action_apply') ? { managerClientId: grant.clientId } : {}),
       ...(grant.ownerClientId === grant.clientId && grant.tools.includes('poise_chain_apply') ? { ownerClientId: grant.clientId } : {}),
@@ -376,6 +379,7 @@ export class McpGateway {
     if (read.name === 'poise_describe') return { ...described,
       access: { resource: grant.resource, scope: MCP_SCOPE, expiresAt: new Date(grant.expiresAt).toISOString(),
         repository: grant.repository ?? null, workspaceData: mcpWorkspaceAllowed(grant), contentData: mcpContentAllowed(grant),
+        pullDiagnostics: scope.pullDiagnostics === true,
         chatArtifacts: scope.chatArtifacts === true, operatorLogs,
         managerControls: scope.managerClientId !== undefined && tools.includes('poise_action_apply'),
         ownerControls: scope.ownerClientId !== undefined && tools.includes('poise_chain_apply') },
@@ -474,6 +478,23 @@ export class McpGateway {
         throw new HttpError(502, 'invalid_workspace_chat_change_scope')
       }
       return { ...described, page: { ...page, source: 'chat', link: page.found ? chatLink(read.arguments.id) : null } }
+    }
+    if (read.name === 'poise_pull') {
+      const pull = body.pull as Record<string, unknown> | undefined
+      const live = pull?.liveGitHub as { record?: { repository?: unknown; number?: unknown } | null } | undefined
+      if (!pull || pull.repository !== read.arguments.repository || pull.pull !== read.arguments.pull
+        || !['complete', 'partial'].includes(String(pull.coverage)) || !Array.isArray(pull.runs) || pull.runs.length > 10
+        || pull.runs.some(run => !run || typeof run.id !== 'string' || !/^[a-f0-9]{32}$/.test(run.id))
+        || !live || live.record && (typeof live.record.repository !== 'string'
+          || live.record.repository.toLowerCase() !== read.arguments.repository.toLowerCase() || live.record.number !== read.arguments.pull)) {
+        throw new HttpError(502, 'invalid_workspace_pull_scope')
+      }
+      const origin = ctx.workspaceOrigin(owner.handle)
+      return { ...described, pull: { ...pull, links: {
+        pull: `https://github.com/${read.arguments.repository}/pull/${read.arguments.pull}`,
+        runs: `${origin}/?view=observe&part=behaviors`,
+        calls: pull.runs.map(run => ({ id: run.id, url: `${origin}/api/agent-response/${run.id}` })),
+      } } }
     }
     const work = body.work as Record<string, unknown> | undefined
     const { since, until } = read.arguments

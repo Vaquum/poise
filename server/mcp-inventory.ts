@@ -9,7 +9,7 @@ interface Surface {
   source: string
   retention: string
   permission: string
-  tool?: 'poise_work' | 'poise_get' | 'poise_list' | 'poise_changes'
+  tool?: 'poise_work' | 'poise_pull' | 'poise_get' | 'poise_list' | 'poise_changes'
   requiresWorkspace?: true
   requiresChat?: true
   requiresChatList?: true
@@ -116,6 +116,9 @@ export function mcpInventory() {
       entry('workspace/caller', placeHref('observe', { part: 'tasks' }), { ...workspace('behaviors'), kind: 'call',
         tool: 'poise_list', source: 'Caller retained Call log and Behavior chain journal', retention: 'Retained Call and invocation records',
         reason: 'Paged Caller archive and exact Call or invocation reads with settlement and quarantine coverage' }),
+      entry('workspace/pull-diagnostics', placeHref('observe', { part: 'behaviors' }), {
+        kind: 'pull-diagnostics', source: 'Behavior Ledger, Caller and live GitHub', retention: 'Retained runs and current GitHub evidence',
+        permission: 'Pull request diagnostics consent', tool: 'poise_pull', reason: 'Exact pull request approval diagnostics' }),
       entry('settings/link-devices', placeHref('settings', { settings: 'link' }), {
         ...workspace('accounts'), kind: 'gateway', source: 'Gateway Poise Link device inventory',
         retention: 'Current and retained pairings', reason: 'Exact link-devices snapshot' }),

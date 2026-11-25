@@ -87,6 +87,7 @@ export function verifyIdentityAssertion(token: string, expected: AssertionExpect
       || (value.chatList !== undefined && (value.chatList !== true || value.chatMetadata !== true))
       || (value.chatTranscript !== undefined && value.chatTranscript !== true)
       || (value.workspaceData !== undefined && (value.workspaceData !== true || value.repository !== undefined))
+      || (value.pullDiagnostics !== undefined && value.pullDiagnostics !== true)
       || (value.contentData !== undefined && (value.contentData !== true || value.repository !== undefined))
       || (value.chatArtifacts !== undefined && value.chatArtifacts !== true)
       || (value.managerClientId !== undefined && (typeof value.managerClientId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.managerClientId)))
