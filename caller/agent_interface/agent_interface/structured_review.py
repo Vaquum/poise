@@ -862,6 +862,23 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         if done.returncode:
             transient = review_receipt.record_failure(done.stderr or done.stdout)
             if transient is not None:
+                evidence = review_receipt.github_failure()
+                if evidence and evidence["status"] is None:
+                    kind = transient.split(":", 1)[0]
+                    transient = (f"{kind}: {evidence['method']} {evidence['operation']} "
+                                 f"failed; review submission {evidence['submission']}")
+                elif evidence and evidence["status"] >= 500:
+                    transient = (f"error: GitHub {evidence['status']}: {evidence['method']} {evidence['operation']} "
+                                 f"failed; review submission {evidence['submission']}")
+                if evidence and (evidence["status"] is None or evidence["status"] >= 500):
+                    review_receipt.record_failure(transient)
+                preflight = review_receipt.pre_submission_failure()
+                if (checkpoint is not None and not capped and preflight
+                        and (preflight["status"] is None or f"GitHub {preflight['status']}:" in transient)):
+                    checkpoint.submission_failure(transient, no_write=True)
+                if (checkpoint is not None and not capped and evidence and evidence["submission"] == "uncertain"
+                        and (evidence["status"] is None or evidence["status"] >= 500)):
+                    checkpoint.submission_failure(transient, no_write=False)
                 raise review_receipt.SubmissionError(transient)
             output = (done.stderr or done.stdout).strip()
             superseded = _refused_head(output)
