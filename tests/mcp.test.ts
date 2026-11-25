@@ -993,7 +993,7 @@ conn.close()
       $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
       mcpServers: { poise: { type: 'streamable-http', url: endpoint } },
     })
-    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.3.0' })
+    expect(JSON.parse(await readFile(join(bundle, 'plugins/poise/plugin.json'), 'utf8'))).toMatchObject({ name: 'poise', version: '1.3.1' })
     expect(JSON.parse(await readFile(join(bundle, '.agents/plugins/marketplace.json'), 'utf8')).plugins[0].source).toEqual({ source: 'local', path: './plugins/poise' })
     expect(await readFile(join(bundle, 'plugins/poise/skills/poise-manager/SKILL.md'), 'utf8')).toBe(await readFile('plugins/poise/skills/poise-manager/SKILL.md', 'utf8'))
     await expect(packagePoisePlugin('https://poise.test', bundle)).rejects.toThrow('EEXIST')
