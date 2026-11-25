@@ -324,6 +324,32 @@ class Session:
             self.finalization = saved["finalization"]
             _write(conn, self.root, original)
 
+    def submission_failure(self, reason: str, *, no_write: bool) -> None:
+        """Resume the retained verdict or reconcile its possible publication."""
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            original, saved = self.owned(conn)
+            current = _artifact(conn, self.call)
+            evidence = current.get("github_failure")
+            if (not isinstance(evidence, dict) or evidence.get("call_id") != self.call
+                    or evidence.get("submission") != ("none" if no_write else "uncertain")
+                    or current.get("phase") != ("reviewing" if no_write else "submitting_review")
+                    or not saved.get("finalization") or saved["finalization"].get("step") != "submitting"
+                    or saved["finalization"].get("followup")):
+                self.stop("review submission evidence changed before recovery")
+            saved["spent_ms"] += math.ceil((monotonic() - self.meter) * 1000)
+            attempts = 1
+            if no_write:
+                saved["finalization"]["step"] = "ready"
+                attempts = saved["finalization"].get("pre_submission_recoveries", 0) + 1
+                saved["finalization"]["pre_submission_recoveries"] = attempts
+            self.finalization = saved["finalization"]
+            resumable = attempts == 1 and saved["allowance_ms"] > saved["spent_ms"]
+            saved.update(phase=("finalizing" if no_write else "publishing") if resumable else "held", reason=reason)
+            _write(conn, self.root, original)
+            self.retain_progress(conn, saved, original if self.root == self.call else current)
+        self.stop(reason, resumable=resumable)
+
     def finalization_failure(self, error: BaseException) -> None:
         diagnostic = getattr(error, "diagnostic", None) or {}
         transient = getattr(error, "code", None) == "review_budget_exhausted" \

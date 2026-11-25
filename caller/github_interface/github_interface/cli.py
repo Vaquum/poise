@@ -1,11 +1,15 @@
 import argparse
 import asyncio
 import json
+import os
 import sys
 from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+import httpx
+
+from .client import GitHubRequestError
 from .interface import close_old_pr_if_ready, issue_work, review_clearance
 from .behaviors.merge_if_ready import MergeAdmissionError
 from .behaviors.issue_work import failure_diagnostic as issue_work_failure_diagnostic
@@ -175,13 +179,29 @@ def main() -> None:
     }[argv[0]]
     try:
         result = asyncio.run(behavior(payload))
-    except (RuntimeError, ValueError) as error:
+    except (RuntimeError, ValueError, httpx.TransportError) as error:
+        request = ((error.method, error.path, error.status, error.read_only) if isinstance(error, GitHubRequestError)
+                   else (*error.poise_request[:2], None, error.poise_request[2])
+                   if isinstance(error, httpx.TransportError) and hasattr(error, "poise_request") else None)
+        managed_review = (argv[0] in {"--approve-pr", "--request-changes", "--reviewed-clean"}
+                          and (os.environ.get("AGENT_INTERFACE_RECEIPT_DB") or os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")))
+        if isinstance(error, httpx.TransportError) and not (request and managed_review):
+            raise
+        evidence = None
+        if request and managed_review:
+            from agent_interface.review_receipt import record_github_failure
+            evidence = record_github_failure(*request)
         diagnostic = getattr(error, "diagnostic", None)
         if argv[0] == "--merge-if-ready" and not diagnostic:
             diagnostic = MergeAdmissionError(error).diagnostic
         if argv[0] == "--issue-work" and not diagnostic:
             diagnostic = issue_work_failure_diagnostic(error, payload["mode"])
-        print("caller_diagnostic: " + json.dumps(diagnostic) if diagnostic else f"error: {error}", file=sys.stderr)
+        message = f"httpx.{type(error).__name__}" if isinstance(error, httpx.TransportError) else str(error)
+        if evidence and (evidence["status"] is None or evidence["status"] >= 500):
+            prefix = message if evidence["status"] is None else f"GitHub {evidence['status']}"
+            message = (f"{prefix}: {evidence['method']} {evidence['operation']} failed; "
+                       f"review submission {evidence['submission']}")
+        print("caller_diagnostic: " + json.dumps(diagnostic) if diagnostic else f"error: {message}", file=sys.stderr)
         raise SystemExit(1) from error
     print(json.dumps(result, separators=(",", ":")) if argv[0] == "--pr-review" else json.dumps(result, indent=2))
 
