@@ -37,7 +37,8 @@ it('projects only the exact approval run and bounded failure evidence', async ()
   expect(JSON.stringify(result)).not.toContain('private response body')
   expect(JSON.stringify(result)).not.toContain('hidden')
   expect(readBehaviorLedger).toHaveBeenCalledWith({ operation: 'list', repository: 'Acme/Repo', number: 20, limit: 10 })
-  expect(fetchSelectedAgentLogSnapshot).toHaveBeenCalledWith({ latest: [], ids: [id] }, { fresh: true })
+  expect(fetchSelectedAgentLogSnapshot).toHaveBeenCalledWith({ latest: [], ids: [],
+    pull: { repository: 'Acme/Repo', number: 20, limit: 11 } }, { fresh: true })
 })
 
 it('reports missing and contradictory records without inferring a safe retry', async () => {
@@ -61,4 +62,14 @@ it('keeps an older 500 uncertain and distinguishes a retained approval', async (
     outcome: 'approved', head_sha: head, review_id: 91, error: null }], quarantined: [] } as unknown as Awaited<ReturnType<typeof fetchSelectedAgentLogSnapshot>>)
   const approved = await readMcpPull({ repository: 'Acme/Repo', pull: 20 }, grant)
   expect(approved.runs[0]).toMatchObject({ action: 'approved', outcome: 'approved', reviewId: 91, head, failure: null })
+})
+
+it('finds the original approval even when the ledger is unavailable', async () => {
+  vi.mocked(readBehaviorLedger).mockRejectedValue(new Error('ledger unavailable'))
+  vi.mocked(fetchSelectedAgentLogSnapshot).mockResolvedValue({ entries: [{ id, repo: 'Acme/Repo', pr_id: '20', behavior: 'pr_approve',
+    status: 'failed', action: null, outcome: null, expected_head: head, head_sha: null, started_at: '2026-11-25T15:53:00Z',
+    error: 'error: GitHub 500: private body', artifact: { phase: 'reviewing' } }], quarantined: [] } as unknown as Awaited<ReturnType<typeof fetchSelectedAgentLogSnapshot>>)
+  const result = await readMcpPull({ repository: 'Acme/Repo', pull: 20 }, grant)
+  expect(result).toMatchObject({ coverage: 'partial', ledgerCoverage: null, runs: [{ id, failure: { status: 500, submission: 'unknown' } }] })
+  expect(JSON.stringify(result)).not.toContain('private body')
 })

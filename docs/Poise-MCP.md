@@ -92,8 +92,8 @@ new tool until the owner reconnects and selects it. For example:
 {"repository":"autonomio/poise","pull":20}
 ```
 
-The result combines bounded approval-run evidence from the Behavior Ledger and
-exact Caller records with current GitHub readiness. The run includes its Call,
+The result combines bounded exact-PR approval runs from Caller with Behavior
+Ledger coverage and current GitHub readiness. The run includes its Call,
 head, timestamps and bounded failure operation, status and submission certainty
 when retained. Older failures may report an HTTP status with unknown operation
 and submission certainty. Missing, truncated or unavailable records report

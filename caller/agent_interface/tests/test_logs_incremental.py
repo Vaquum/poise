@@ -378,6 +378,30 @@ class LogsIncrementalCase(TestCase):
         self.assertEqual([row["status"] for row in json.loads(selected.stdout)], ["completed", "failed"])
         self.assertEqual(agent_interface.logs_session_since(agent_interface.logs_watermark(), "session", "author_content", "--topic"), [])
 
+    def test_pull_selection_uses_exact_target_and_bounded_approval_index(self):
+        self.seed(15)
+        with agent_interface.db() as conn:
+            conn.execute("update calls set behavior='pr_approve', repo='OWNER/repo', pr_id='20' where rowid <= 12")
+            conn.execute("update calls set behavior='pr_approve', repo='owner/other', pr_id='20' where rowid=13")
+            conn.execute("update calls set behavior='pr_approve', repo='owner/repo', pr_id='21' where rowid=14")
+            conn.execute("update calls set behavior='pr_review', repo='owner/repo', pr_id='20' where rowid=15")
+            plan = conn.execute("explain query plan " + agent_interface.LOGS_PULL_QUERY, ("owner/repo", "20", 11)).fetchall()
+        details = " ".join(row[3] for row in plan)
+        self.assertIn("calls_pull_approval", details)
+        self.assertNotIn("SCAN", details)
+        self.assertNotIn("TEMP B-TREE", details)
+        selection = {"latest": [], "ids": [], "pull": {"repository": "owner/REPO", "number": 20, "limit": 11}}
+        rows = agent_interface.logs_selected(selection)
+        self.assertEqual([row["id"] for row in rows], [f"{n:032x}" for n in range(1, 12)])
+        done = self.cli("--logs", "--select", json.dumps(selection))
+        self.assertEqual((done.returncode, done.stderr), (0, ""))
+        self.assertEqual(json.loads(done.stdout), rows)
+        for invalid in [{"repository": "owner/repo", "number": True, "limit": 11},
+                        {"repository": "owner/repo", "number": 20, "limit": 12},
+                        {"repository": "../repo", "number": 20, "limit": 11}]:
+            with self.assertRaises(ValueError):
+                agent_interface.logs_selected({"latest": [], "ids": [], "pull": invalid})
+
     def test_resource_recovery_isolates_only_the_unreadable_correlations(self):
         self.seed(3)
         with agent_interface.db() as conn:

@@ -1148,12 +1148,23 @@ conn.close()
     expect(partial.items[0].stage).toBe('unknown')
     expect(partial.items[0].ledger[0].coverage.status).toBe('partial')
     expect(partial.items[0].ledger[0].health.gaps.length).toBeGreaterThan(0)
+    const callId = 'e'.repeat(32)
+    const approval = { id: callId, pr_id: '23', repo: 'acme/repo', actor: 'reviewer', model: 'fixture', behavior: 'pr_approve',
+      session_id: null, started_at: new Date().toISOString(), time_elapsed: '0', status: 'failed', outcome: 'incomplete',
+      head_sha: null, expected_head: 'a'.repeat(40), source: 'poise:approve-prs', correlation_id: randomUUID(), action: null,
+      response: null, error: 'GitHub 500: fixture private body', prompt: 'fixture private prompt',
+      artifact: { phase: 'submitting_review', github_failure: { call_id: callId, method: 'POST', operation: 'pull request reviews',
+        status: 500, submission: 'uncertain' } } } satisfies agent.LogEntry
+    const selected = vi.spyOn(agent, 'fetchSelectedAgentLogSnapshot').mockResolvedValue({ entries: [approval], quarantined: [] })
     const pullResult = await connection.client.callTool({ name: 'poise_pull', arguments: { repository: 'acme/repo', pull: 23 } })
     expect(pullResult.isError).not.toBe(true)
     const pullContent = pullResult.content as { text: string }[]
     const pull = JSON.parse(pullContent[0].text).pull
-    expect(pull).toMatchObject({ repository: 'acme/repo', pull: 23, coverage: 'partial', runs: [],
+    expect(pull).toMatchObject({ repository: 'acme/repo', pull: 23, coverage: 'partial', runs: [{ id: callId,
+      failure: { status: 500, operation: 'pull request reviews', submission: 'uncertain' } }],
       liveGitHub: { coverage: 'complete', record: { number: 23, gates: { approved: true } } } })
+    expect(JSON.stringify(pull)).not.toContain('fixture private')
+    selected.mockRestore()
     expect((await other.client.callTool({ name: 'poise_pull', arguments: { repository: 'acme/repo', pull: 23 } })).isError).toBe(true)
     await ledger.stopBehaviorLedger()
     const unavailable = await work({ repository: 'acme/repo', issue: 1 })

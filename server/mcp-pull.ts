@@ -30,30 +30,22 @@ export async function readMcpPull(args: McpPullArguments, grant: McpGrantScope) 
     readBehaviorLedger({ operation: 'list', repository: args.repository, number: args.pull, limit: 10 }).catch(() => null),
     readLivePull(args.repository, args.pull, null, null),
   ])
-  const records = (ledger?.body.records ?? []).filter(record => record.behavior === 'approve-prs')
-  const retainedIds = [...new Set(records.flatMap(record => record.refs.filter(ref => ref.kind === 'caller' && ref.availability === 'available'
-    && /^[a-f0-9]{32}$/.test(ref.identity)).map(ref => ref.identity)))]
-  const ids = retainedIds.slice(0, 10)
   let calls: LogEntry[] = []
   let incomplete = !ledger || ledger.status !== 200 || ledger.body.health.status !== 'ok' || ledger.body.health.pending > 0
     || !ledger.body.health.coverageStart || ledger.body.health.gaps.length > 0 || ledger.body.health.detailFloor !== null
-    || !!ledger.body.nextCursor || retainedIds.length > ids.length || !records.length
-    || records.some(record => !record.refs.some(ref => ref.kind === 'caller' && ref.availability === 'available'
-      && /^[a-f0-9]{32}$/.test(ref.identity)) || record.refs.some(ref => ref.kind === 'caller'
-        && (ref.availability !== 'available' || !/^[a-f0-9]{32}$/.test(ref.identity))))
-  if (ids.length) {
-    try {
-      const snapshot = await fetchSelectedAgentLogSnapshot({ latest: [], ids }, { fresh: true })
-      calls = snapshot.entries.filter(row => row.repo?.toLowerCase() === args.repository.toLowerCase()
-        && String(row.pr_id) === String(args.pull) && row.behavior === 'pr_approve')
-      incomplete ||= snapshot.quarantined.length > 0 || calls.length !== ids.length
-    } catch { incomplete = true }
-  }
+    || !!ledger.body.nextCursor
+  try {
+    const snapshot = await fetchSelectedAgentLogSnapshot({ latest: [], ids: [],
+      pull: { repository: args.repository, number: args.pull, limit: 11 } }, { fresh: true })
+    calls = snapshot.entries.filter(row => row.repo?.toLowerCase() === args.repository.toLowerCase()
+      && String(row.pr_id) === String(args.pull) && row.behavior === 'pr_approve')
+    incomplete ||= snapshot.quarantined.length > 0 || calls.length !== snapshot.entries.length || calls.length > 10
+    calls = calls.slice(-10)
+  } catch { incomplete = true }
   return { repository: args.repository, pull: args.pull, observedAt,
     coverage: incomplete ? 'partial' : 'complete',
     ...(incomplete ? { reason: !ledger || ledger.status !== 200 ? 'Behavior Ledger is unavailable'
-      : !records.length ? 'No approval run is recorded in retained ledger coverage'
-        : 'Retained approval runs or Caller receipts are incomplete' } : {}),
+      : 'Retained approval runs or ledger coverage are incomplete' } : {}),
     ledgerCoverage: ledger ? { from: ledger.body.health.coverageStart, observedAt: ledger.body.health.observedAt,
       gaps: ledger.body.health.gaps.length, truncated: !!ledger.body.nextCursor } : null,
     source: 'Behavior Ledger and exact Caller records', liveGitHub: live,

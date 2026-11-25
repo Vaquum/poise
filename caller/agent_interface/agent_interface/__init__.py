@@ -184,6 +184,8 @@ def init_db():
                 lower(substr(repo || '/',1,instr(repo || '/','/')-1))
             );
             create index if not exists calls_session_behavior on calls(session_id, behavior);
+            create index if not exists calls_pull_approval on calls(lower(repo), pr_id, started_at desc, id desc)
+                where behavior='pr_approve';
             create trigger if not exists calls_diagnostic_insert after insert on calls
             when new.status != 'running' and (coalesce(new.error,'') != '' or new.error_code is not null or new.diagnostic is not null)
             begin insert or ignore into diagnostic_calls(call_id) values(new.id); end;
@@ -1034,17 +1036,29 @@ def logs_watermark() -> str:
         return str(conn.execute("select coalesce(max(rowid),0) from calls").fetchone()[0])
 
 
+LOGS_PULL_QUERY = (f"select {LOG_ROW_COLUMNS} from calls where lower(repo)=? and pr_id=? and behavior='pr_approve' "
+                   "order by started_at desc,id desc limit ?")
+
+
 def logs_selected(selection: object) -> list[dict]:
     """Exact latest-trigger and call-id reads; absence is checked at the source.
 
     Each latest needle seeks one indexed row; each id seeks the primary key.
     Missing kinds and old incidents never require walking retained history.
     """
-    if not isinstance(selection, dict) or set(selection) - {"resourceRecovery"} not in (
+    if not isinstance(selection, dict) or set(selection) - {"resourceRecovery", "pull"} not in (
         {"latest", "ids"}, {"latest", "ids", "correlations"}
     ):
         raise ValueError("logs selection requires latest and ids, with optional correlations and resourceRecovery")
     latest, ids = selection["latest"], selection["ids"]
+    pull = selection.get("pull")
+    if "pull" in selection and (not isinstance(pull, dict) or set(pull) != {"repository", "number", "limit"}
+            or not isinstance(pull["repository"], str) or len(pull["repository"]) > 140
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]+", pull["repository"])
+            or pull["repository"].split("/", 1)[1] in {".", ".."}
+            or type(pull["number"]) is not int or pull["number"] < 1
+            or type(pull["limit"]) is not int or not 1 <= pull["limit"] <= 11):
+        raise ValueError("logs pull requires an exact repository, number and limit from 1 to 11")
     correlations = selection.get("correlations", [])
     if not isinstance(correlations, list) or len(correlations) > 256 or any(
         not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value) for value in correlations
@@ -1059,7 +1073,7 @@ def logs_selected(selection: object) -> list[dict]:
     if any(not isinstance(id_, str) or not re.fullmatch(r"[0-9a-f]{32}", id_) for id_ in ids):
         raise ValueError("logs selection requires full call ids")
     if "resourceRecovery" in selection:
-        if selection["resourceRecovery"] is not True or latest or ids or not 1 <= len(correlations) <= 32:
+        if selection["resourceRecovery"] is not True or latest or ids or pull is not None or not 1 <= len(correlations) <= 32:
             raise ValueError("resource recovery requires 1..32 exact correlations only")
         return _resource_recovery_logs(correlations)
     reap_interrupted()
@@ -1079,6 +1093,10 @@ def logs_selected(selection: object) -> list[dict]:
         for correlation in correlations:
             row = conn.execute(f"select {LOG_ROW_COLUMNS} from calls where correlation_id=?", (correlation,)).fetchone()
             if row is not None:
+                found[row["id"]] = row
+        if pull is not None:
+            rows = conn.execute(LOGS_PULL_QUERY, (pull["repository"].lower(), str(pull["number"]), pull["limit"])).fetchall()
+            for row in rows:
                 found[row["id"]] = row
     rows = sorted(found.values(), key=lambda row: (row["started_at"], row["id"]))
     return [_log_row(row) for row in rows]
