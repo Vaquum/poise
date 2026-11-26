@@ -17,6 +17,7 @@ import { callReviewResponse } from './review-response'
 import { reviewClearanceConfigured, runReviewClearance } from './review-clearance'
 import { DEFAULT_PR_REVIEW_CAP, reviewRoundArgs, reviewContinuationArgs, reviewContinuationCode, reviewContinuationNoWrite, yieldedFinalization, yieldedReview, type ReviewCheckpoint } from './review-continuation'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
+import { addReviewBasis } from './behavior-chain-review-basis'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
 import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun, reapAbandonedDirectBehaviorRuns } from './behavior-metrics'
@@ -8852,10 +8853,7 @@ async function runBehaviorChains(): Promise<void> {
           const page = await readWorkReviews(target, cursor)
           if (!page) throw new Error('behavior chain cannot read existing review observations')
           if (!page.found) return chainBasis(['datastore-not-yet-indexed', repository, number])
-          for (const review of page.reviews) revisions.set(`review:${review.id}`, [review.state, review.revision])
-          for (const comment of page.comments ?? []) if (comment.author?.toLowerCase() !== getSettings().me.toLowerCase()) {
-            revisions.set(`comment:${comment.id}`, [comment.thread, comment.resolved, comment.revision])
-          }
+          addReviewBasis(revisions, page, getSettings().me)
           if (!page.truncated) break
           if (!page.page || (page.page.reviewAfter === cursor.reviewAfter && page.page.commentAfter === cursor.commentAfter)) throw new Error('behavior chain review pagination did not advance')
           cursor = page.page
