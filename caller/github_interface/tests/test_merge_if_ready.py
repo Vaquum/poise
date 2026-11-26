@@ -3,14 +3,17 @@ from io import StringIO
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 from github_interface import cli, interface
 from github_interface.behaviors import merge_if_ready
+from github_interface.client import GitHubRequestError
 from review_response_fixture import published_review, response
 
 HEAD = 'a' * 40
 PULL = {'state': 'open', 'draft': False, 'mergeable': True, 'mergeable_state': 'clean',
         'head': {'sha': HEAD}, 'user': {'login': 'octocat'}, 'merged': False,
-        'base': {'sha': 'b' * 40}, 'title': 'Fix review ordering', 'body': 'Retain final-context review responses.'}
+        'base': {'sha': 'b' * 40, 'ref': 'main'}, 'title': 'Fix review ordering', 'body': 'Retain final-context review responses.'}
 READY = {'state': 'OPEN', 'isDraft': False, 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN',
          'headRefOid': HEAD, 'commits': {'nodes': [{'commit': {'statusCheckRollup': {'state': 'SUCCESS'}}}]},
          'reviewThreads': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}
@@ -29,7 +32,9 @@ class TestMergeIfReady(IsolatedAsyncioTestCase):
         self.client = AsyncMock()
         self.client.get.return_value = {'allow_squash_merge': True, 'allow_merge_commit': True}
         self.client.request.return_value = {'merged': True, 'sha': 'b' * 40}
-        self.client.paginate.return_value = [published_review(PAYLOAD['review_response'])]
+        self.client.paginate.side_effect = lambda path, **_: (
+            [] if '/rules/branches/' in path else [published_review(PAYLOAD['review_response'])]
+        )
         self.pull = deepcopy(PULL)
         self.ready = deepcopy(READY)
         self.pulls = AsyncMock(side_effect=lambda *_: deepcopy(self.pull))
@@ -63,12 +68,12 @@ class TestMergeIfReady(IsolatedAsyncioTestCase):
         review = published_review(PAYLOAD['review_response'])
         for changed in ({**review, 'body': ''}, {**review, 'body': review['body'].replace('c' * 32, 'd' * 32)},
                         {**review, 'submitted_at': '2000-01-01T00:00:00Z'}):
-            self.client.paginate.return_value = [changed]
+            self.client.paginate.side_effect = lambda path, **_: [] if '/rules/branches/' in path else [changed]
             self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'not_ready')
             self.client.request.assert_not_awaited()
 
     async def test_context_change_at_final_read_invalidates_response(self):
-        self.pulls.side_effect = [PULL, {**PULL, 'base': {'sha': 'd' * 40}}]
+        self.pulls.side_effect = [PULL, {**PULL, 'base': {'sha': 'd' * 40, 'ref': 'main'}}]
         self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'not_ready')
         self.client.request.assert_not_awaited()
 
@@ -78,6 +83,108 @@ class TestMergeIfReady(IsolatedAsyncioTestCase):
                 self.client.get.return_value = config
                 await merge_if_ready.run(self.client, PAYLOAD)
                 self.assertEqual(self.client.request.call_args.kwargs['json']['merge_method'], expected)
+
+    async def test_effective_branch_policy_overrides_repository_merge_options(self):
+        # Nexus #118: the repository allowed all three methods while main allowed only merge.
+        head = '3109aa08358500a7b33956999a3c26f67f74a1c3'
+        self.pull['head']['sha'] = head
+        self.ready['headRefOid'] = head
+        payload = {**PAYLOAD, 'repository': 'Vaquum/Nexus', 'pr': '#118', 'expected_head': head}
+        payload['review_response'] = response(self.pull, 'Vaquum/Nexus', 118, 'review-bot')
+        review = published_review(payload['review_response'])
+        self.client.get.return_value = {'allow_squash_merge': True, 'allow_merge_commit': True, 'allow_rebase_merge': True}
+        self.client.paginate.side_effect = lambda path, **_: (
+            [{'type': 'pull_request', 'parameters': {'allowed_merge_methods': ['merge']}}]
+            if '/rules/branches/' in path else [review]
+        )
+        result = await merge_if_ready.run(self.client, payload)
+        self.assertEqual(result['merge_method'], 'merge')
+        self.client.request.assert_awaited_once_with('PUT', '/repos/Vaquum/Nexus/pulls/118/merge',
+                                                    json={'sha': head, 'merge_method': 'merge'})
+
+    async def test_intersects_multiple_rules_and_rejects_unverified_policy(self):
+        review = published_review(PAYLOAD['review_response'])
+        for rules, expected in [
+            ([{'type': 'pull_request', 'parameters': {'allowed_merge_methods': ['merge', 'squash']}},
+              {'type': 'pull_request', 'parameters': {'allowed_merge_methods': ['merge', 'rebase']}}], 'merge'),
+            ([{'type': 'pull_request', 'parameters': {}}], None),
+            ([{'type': 'pull_request', 'parameters': {'allowed_merge_methods': ['rebase']}}], None),
+        ]:
+            with self.subTest(rules=rules):
+                self.client.request.reset_mock()
+                self.client.paginate.side_effect = lambda path, **_: rules if '/rules/branches/' in path else [review]
+                if expected:
+                    self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['merge_method'], expected)
+                else:
+                    with self.assertRaises(merge_if_ready.MergeAdmissionError) as error:
+                        await merge_if_ready.run(self.client, PAYLOAD)
+                    self.assertEqual(error.exception.diagnostic['submission'], 'none')
+                    self.client.request.assert_not_awaited()
+
+    async def test_rejected_merge_retains_target_head_method_and_refusal_once(self):
+        request = httpx.Request('PUT', 'https://api.github.com/repos/acme/app/pulls/7/merge')
+        response = httpx.Response(405, request=request)
+        self.client.request.side_effect = httpx.HTTPStatusError('Squash merges are not allowed', request=request, response=response)
+        with self.assertRaises(merge_if_ready.MergeAdmissionError) as failure:
+            await merge_if_ready.run(self.client, PAYLOAD)
+        evidence = failure.exception.diagnostic
+        self.assertEqual((evidence['submission'], evidence['repository'], evidence['pr'], evidence['expected_head']),
+                         ('rejected', 'acme/app', '7', HEAD))
+        self.assertIn('merge method squash', evidence['stderr'])
+        self.assertIn('Squash merges are not allowed', evidence['stderr'])
+        self.client.request.assert_awaited_once()
+
+    async def test_changed_base_branch_cannot_use_old_policy(self):
+        self.pulls.side_effect = [PULL, {**PULL, 'base': {**PULL['base'], 'ref': 'release'}}]
+        self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'superseded')
+        self.client.request.assert_not_awaited()
+
+    async def test_private_free_repository_can_merge_when_rules_are_not_a_plan_feature(self):
+        self.client.get.return_value = {'private': True, 'fork': False, 'allow_squash_merge': True}
+        request = httpx.Request('GET', 'https://api.github.com/repos/acme/app/rules/branches/main')
+        response = httpx.Response(403, request=request, json={
+            'message': 'Upgrade to GitHub Pro or make this repository public to enable this feature.',
+        })
+        cause = httpx.HTTPStatusError('forbidden', request=request, response=response)
+        denial = GitHubRequestError('GitHub 403', 'GET', request.url.path, 403, True)
+        denial.__cause__ = cause
+        review = published_review(PAYLOAD['review_response'])
+        async def pages(path, **_):
+            if '/rules/branches/' in path:
+                raise denial
+            return [review]
+        self.client.paginate.side_effect = pages
+        self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['merge_method'], 'squash')
+        self.client.request.assert_awaited_once()
+
+    async def test_other_rules_permission_denial_never_merges(self):
+        request = httpx.Request('GET', 'https://api.github.com/repos/acme/app/rules/branches/main')
+        review = published_review(PAYLOAD['review_response'])
+        plan_message = 'Upgrade to GitHub Pro or make this repository public to enable this feature.'
+        for private, fork, message in [(True, False, 'Resource not accessible by integration'),
+                                       (False, False, plan_message), (True, True, plan_message),
+                                       (True, None, plan_message)]:
+            with self.subTest(private=private, fork=fork, message=message):
+                self.client.get.return_value = {'private': private, 'fork': fork, 'allow_squash_merge': True}
+                response = httpx.Response(403, request=request, json={'message': message})
+                denial = GitHubRequestError('GitHub 403', 'GET', request.url.path, 403, True)
+                denial.__cause__ = httpx.HTTPStatusError('forbidden', request=request, response=response)
+                async def pages(path, **_):
+                    if '/rules/branches/' in path:
+                        raise denial
+                    return [review]
+                self.client.paginate.side_effect = pages
+                with self.assertRaises(merge_if_ready.MergeAdmissionError) as failure:
+                    await merge_if_ready.run(self.client, PAYLOAD)
+                self.assertEqual(failure.exception.diagnostic['submission'], 'none')
+                self.client.request.assert_not_awaited()
+
+    async def test_unconfirmed_mutation_is_not_retried(self):
+        self.client.request.side_effect = httpx.ReadTimeout('response lost')
+        with self.assertRaises(merge_if_ready.MergeAdmissionError) as failure:
+            await merge_if_ready.run(self.client, PAYLOAD)
+        self.assertEqual(failure.exception.diagnostic['submission'], 'uncertain')
+        self.client.request.assert_awaited_once()
 
     async def test_unsafe_or_unknown_pull_never_merges(self):
         for fields in [{'draft': True}, {'state': 'closed'}, {'mergeable': None}, {'mergeable': False},
