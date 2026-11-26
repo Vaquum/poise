@@ -203,6 +203,9 @@ class RuntimeBaseTest(LibTest):
         os.makedirs(self.runtime)
         for name in ('Dockerfile', 'entrypoint.sh', 'install-clis.sh', 'supervisor.mjs', 'resource-witness.mjs', 'install-release.sh'):
             shutil.copy(os.path.join(ROOT, 'deploy', 'runtime', name), self.runtime)
+        tools_dir = os.path.join(self.work.name, 'gateway', 'src')
+        os.makedirs(tools_dir)
+        shutil.copy(os.path.join(ROOT, 'gateway', 'src', 'document-tools.sh'), tools_dir)
         with open(os.path.join(ROOT, 'package-lock.json')) as file:
             self.lock = json.load(file)
         self.write_lock()
@@ -255,6 +258,12 @@ sys.exit(0)
         before = self.runtime_base()
         with open(os.path.join(self.runtime, 'Dockerfile'), 'a') as file:
             file.write('\n# changed runtime\n')
+        self.assertNotEqual(self.runtime_base(), before)
+
+    def test_document_tool_changes_change_the_base(self):
+        before = self.runtime_base()
+        with open(os.path.join(self.work.name, 'gateway', 'src', 'document-tools.sh'), 'a') as file:
+            file.write('\n# changed tools\n')
         self.assertNotEqual(self.runtime_base(), before)
 
     def test_invalid_lock_identity_stops_the_build(self):

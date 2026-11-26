@@ -7,7 +7,8 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq
 apt-get install --yes -qq --no-install-recommends \
-  build-essential curl fuse-overlayfs git iptables jq less locales openssh-client procps ripgrep shellcheck tini unzip xz-utils
+  build-essential curl fuse-overlayfs git iptables jq less locales openssh-client procps ripgrep shellcheck tini unzip xz-utils zip
+install_document_tools
 sed -i 's/^# *\(en_US.UTF-8 UTF-8\)$/\1/' /etc/locale.gen
 locale-gen
 

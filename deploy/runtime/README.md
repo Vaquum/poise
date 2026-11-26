@@ -37,8 +37,8 @@ docker build --file deploy/runtime/Dockerfile --tag poise-runtime \
   base every release of this image runs on
   ([Updates in place](../../docs/Service-architecture.md#updates-in-place)).
 - `gh` from GitHub's apt repository, `git`, `build-essential`,
-  `openssh-client`, `curl`, `ripgrep`, `jq`, `unzip`, `xz-utils`, `less`,
-  `procps`, `tini` and the `en_US.UTF-8` locale.
+  `openssh-client`, `curl`, `ripgrep`, `jq`, `zip`, `unzip`, `xz-utils`, `less`,
+  `procps`, `tini`, Pandoc 3.6.4, Typst 0.13.1 and the `en_US.UTF-8` locale.
 - The user `poise`, uid and gid 10001, with the home `/home/poise`.
 
 `PATH` starts with `~/.local/bin`, then the Caller virtualenv. The image holds
