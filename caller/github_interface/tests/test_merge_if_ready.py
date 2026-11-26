@@ -7,6 +7,7 @@ import httpx
 
 from github_interface import cli, interface
 from github_interface.behaviors import merge_if_ready
+from github_interface.client import GitHubRequestError
 from review_response_fixture import published_review, response
 
 HEAD = 'a' * 40
@@ -137,6 +138,46 @@ class TestMergeIfReady(IsolatedAsyncioTestCase):
         self.pulls.side_effect = [PULL, {**PULL, 'base': {**PULL['base'], 'ref': 'release'}}]
         self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'superseded')
         self.client.request.assert_not_awaited()
+
+    async def test_private_free_repository_can_merge_when_rules_are_not_a_plan_feature(self):
+        self.client.get.return_value = {'private': True, 'fork': False, 'allow_squash_merge': True}
+        request = httpx.Request('GET', 'https://api.github.com/repos/acme/app/rules/branches/main')
+        response = httpx.Response(403, request=request, json={
+            'message': 'Upgrade to GitHub Pro or make this repository public to enable this feature.',
+        })
+        cause = httpx.HTTPStatusError('forbidden', request=request, response=response)
+        denial = GitHubRequestError('GitHub 403', 'GET', request.url.path, 403, True)
+        denial.__cause__ = cause
+        review = published_review(PAYLOAD['review_response'])
+        async def pages(path, **_):
+            if '/rules/branches/' in path:
+                raise denial
+            return [review]
+        self.client.paginate.side_effect = pages
+        self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['merge_method'], 'squash')
+        self.client.request.assert_awaited_once()
+
+    async def test_other_rules_permission_denial_never_merges(self):
+        request = httpx.Request('GET', 'https://api.github.com/repos/acme/app/rules/branches/main')
+        review = published_review(PAYLOAD['review_response'])
+        plan_message = 'Upgrade to GitHub Pro or make this repository public to enable this feature.'
+        for private, fork, message in [(True, False, 'Resource not accessible by integration'),
+                                       (False, False, plan_message), (True, True, plan_message),
+                                       (True, None, plan_message)]:
+            with self.subTest(private=private, fork=fork, message=message):
+                self.client.get.return_value = {'private': private, 'fork': fork, 'allow_squash_merge': True}
+                response = httpx.Response(403, request=request, json={'message': message})
+                denial = GitHubRequestError('GitHub 403', 'GET', request.url.path, 403, True)
+                denial.__cause__ = httpx.HTTPStatusError('forbidden', request=request, response=response)
+                async def pages(path, **_):
+                    if '/rules/branches/' in path:
+                        raise denial
+                    return [review]
+                self.client.paginate.side_effect = pages
+                with self.assertRaises(merge_if_ready.MergeAdmissionError) as failure:
+                    await merge_if_ready.run(self.client, PAYLOAD)
+                self.assertEqual(failure.exception.diagnostic['submission'], 'none')
+                self.client.request.assert_not_awaited()
 
     async def test_unconfirmed_mutation_is_not_retried(self):
         self.client.request.side_effect = httpx.ReadTimeout('response lost')

@@ -8,7 +8,7 @@ from github_interface.atoms.process_diagnostic import STDERR_BYTES, redact
 from github_interface.atoms.pulls import enqueue_pull_request, get_pr_readiness_state, get_pull, list_reviews
 from github_interface.atoms.review_response import context_sha, matches_review, qualifying_response
 from github_interface.behaviors.mergeable import QUEUE_ADMISSIBLE, queue_enabled, readiness_status, status
-from github_interface.client import GitHubClient
+from github_interface.client import GitHubClient, GitHubRequestError
 from github_interface.context import expected_head
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository
@@ -103,7 +103,21 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         base = (pull.get("base") or {}).get("ref")
         if not isinstance(base, str) or not base:
             raise RuntimeError("GitHub returned no base branch for merge policy")
-        rules = await client.paginate(f"/repos/{owner}/{repo}/rules/branches/{quote(base, safe='')}")
+        rules_path = f"/repos/{owner}/{repo}/rules/branches/{quote(base, safe='')}"
+        try:
+            rules = await client.paginate(rules_path)
+        except GitHubRequestError as error:
+            # GitHub Free cannot enable rulesets on a private, non-fork repository.
+            cause = error.__cause__
+            try:
+                message = cause.response.json().get("message") if isinstance(cause, httpx.HTTPStatusError) else None
+            except (ValueError, AttributeError):
+                message = None
+            if not (config.get("private") is True and config.get("fork") is False and error.status == 403
+                    and error.method == "GET" and error.path == rules_path and error.read_only
+                    and message == "Upgrade to GitHub Pro or make this repository public to enable this feature."):
+                raise
+            rules = []
         allowed = {"squash", "merge", "rebase"}
         for rule in rules:
             if not isinstance(rule, dict):
