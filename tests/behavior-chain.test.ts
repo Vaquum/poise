@@ -9,6 +9,8 @@ import { CheckSemaphore } from '../server/check-semaphore'
 import { nativeRequestSha } from '../server/behavior-chain-action'
 import { markReplacementPending, releaseReplacementPending } from '../server/release-background'
 import { reviewContinuationArgs } from '../server/review-continuation'
+import { addReviewBasis } from '../server/behavior-chain-review-basis'
+import type { ReviewsObservation } from '../server/chat/control'
 
 const NOW = 1_800_000_000_000
 const HEAD = '1'.repeat(40)
@@ -70,6 +72,53 @@ function pull(obs: ChainObservation): void {
       response: reviewResponse(chainBasis(id).slice(0, 32)) })),
     reviewRevision: 'findings-1', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
 }
+
+it('replays #893 reply envelopes without resetting the repair basis, while retaining new review input', () => {
+  const empty = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+  const finding = { id: '5819409482', author: 'bit-mis', state: 'CHANGES_REQUESTED',
+    revision: '7e4de00eda213f936433e4ee39889882377435775cdf7a1bbbbdb0fe8e2041a5' }
+  const page = (reviews: ReviewsObservation['reviews'], comments: NonNullable<ReviewsObservation['comments']> = []): ReviewsObservation =>
+    ({ found: true, truncated: false, reviews, comments, threads: [] })
+  const basis = (reviews: ReviewsObservation['reviews'], comments: NonNullable<ReviewsObservation['comments']> = []) => {
+    const revisions = new Map<string, unknown>()
+    addReviewBasis(revisions, page(reviews, comments), 'mikkokotila')
+    return chainBasis([...revisions].sort(([a], [b]) => a.localeCompare(b)))
+  }
+  const original = basis([finding])
+  const replies = ['5819457846', '5819457911', '5819458004', '5819458131', '5819458204',
+    '5819458309', '5819458412', '5819458494', '5819458600', '5819458741']
+    .map(id => ({ id, author: 'mikkokotila', state: 'COMMENTED', revision: empty }))
+  const replyComments = [{ id: 'reply', author: 'mikkokotila', thread: 'thread', resolved: false, revision: 'reply' }]
+  expect(basis([finding, ...replies], replyComments)).toBe(original)
+
+  const { journal, chain } = setup(); const obs = observation(); pull(obs)
+  let current = reviewed(journal, chain, obs)
+  current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+    { status: 'completed', action: 'requested_changes', outcome: 'changes_requested', review_id: 27, head_sha: HEAD })
+  obs.pull!.reviewReceipts[0].state = 'CHANGES_REQUESTED'
+  Object.assign(obs.pull!, { changesRequested: true, unresolved: 1, reviewRevision: original })
+  const repair = invocation('reply-repair', 'repair-pr', 'repair')
+  repair.request.context = { head: HEAD, reviewRevision: original }
+  current = record(journal, current, { type: 'invocation.admitted', invocation: repair })
+  current = record(journal, current, { type: 'invocation.settled', invocationId: repair.id, callId: 'reply-call', outcome: 'no_changes',
+    evidence: { status: 'completed', action: 'no_changes', outcome: 'no_changes', head_sha: HEAD } })
+  obs.pull!.reviewRevision = basis([finding, ...replies], replyComments)
+  expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+  for (const changed of [
+    [...replies, { id: 'new', author: 'bit-mis', state: 'COMMENTED', revision: empty }],
+    [...replies, { id: 'new', author: 'mikkokotila', state: 'COMMENTED', revision: 'substantive' }],
+    [...replies, { id: 'new', author: 'mikkokotila', state: 'COMMENTED' }],
+    [...replies, { ...finding, revision: 'edited' }],
+    [...replies, { ...finding, state: 'DISMISSED' }],
+  ]) {
+    obs.pull!.reviewRevision = basis([finding, ...changed], replyComments)
+    expect(obs.pull!.reviewRevision).not.toBe(original)
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+  }
+  const reviewerComment = { id: 'reviewer-comment', author: 'bit-mis', thread: 'thread', resolved: false, revision: 'finding' }
+  expect(basis([finding, ...replies], [reviewerComment])).not.toBe(
+    basis([finding, ...replies], [{ ...reviewerComment, resolved: true }]))
+})
 
 describe('progress clock', () => {
   it('continues a chain’s clock over its new events only, as a replay from the start reads it', () => {
