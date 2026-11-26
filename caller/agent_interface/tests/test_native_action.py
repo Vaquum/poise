@@ -233,6 +233,7 @@ def test_resolution_checkpoint_requires_original_actor_head_and_request(database
 @pytest.mark.parametrize("mode,submission", [
     ("pre_request", "none"), ("rejected", "rejected"), ("lost", "uncertain"),
     ("graphql", "uncertain"), ("unconfirmed", "uncertain"), ("accepted", None),
+    ("direct_rejected", "rejected"),
 ])
 @pytest.mark.skipif(sys.platform != "linux", reason="Native v2 receipt identity requires Linux /proc")
 def test_merge_failure_survives_cli_original_call_and_chain(database, monkeypatch, mode, submission):
@@ -258,12 +259,25 @@ pull = {pull!r}
 ready = {READY!r}
 if mode == 'pre_request':
     ready['id'] = None
+if mode == 'direct_rejected':
+    ready['mergeQueue'] = None
+    ready['mergeStateStatus'] = 'CLEAN'
+    pull['mergeable_state'] = 'clean'
+    pull['base']['ref'] = 'main'
 secret = 'ephemeral-client-credential'
 async def request(self, method, path, headers, retry_transient, follow_redirects, **kwargs):
     if method == 'GET' and path.endswith('/pulls/21'):
         payload = pull
     elif method == 'GET' and path.endswith('/reviews'):
         payload = {[published_review(review)]!r}
+    elif method == 'GET' and path == '/repos/example/repo':
+        payload = {{'allow_squash_merge': True, 'allow_merge_commit': True}}
+    elif method == 'GET' and path == '/repos/example/repo/rules/branches/main':
+        payload = [{{'type': 'pull_request', 'parameters': {{'allowed_merge_methods': ['merge']}}}}]
+    elif method == 'PUT' and path == '/repos/example/repo/pulls/21/merge':
+        Path({str(writes)!r}).write_text(json.dumps(kwargs['json']))
+        return httpx.Response(405, json={{'message': 'merge refused ' + secret}},
+                              request=httpx.Request(method, 'https://api.github.com' + path))
     elif path == '/graphql' and kwargs['json']['query'].lstrip().startswith('query'):
         payload = {{'data': {{'repository': {{'pullRequest': ready}}}}}}
     elif path == '/graphql':
@@ -349,6 +363,12 @@ if mode == 'accepted':
     if mode == "rejected":
         assert call["diagnostic"]["stderr_truncated"] is True
         assert "Queue admission denied" in call["diagnostic"]["stderr"]
+    if mode == "direct_rejected":
+        assert json.loads(writes.read_text()) == {"sha": "a" * 40, "merge_method": "merge"}
+        assert call["diagnostic"]["repository"] == "example/repo"
+        assert call["diagnostic"]["pr"] == "21"
+        assert call["diagnostic"]["expected_head"] == "a" * 40
+        assert "merge method merge" in call["diagnostic"]["stderr"]
 
     output = repo / "test-results"
     output.mkdir(exist_ok=True)
