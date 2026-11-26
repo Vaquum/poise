@@ -116,7 +116,7 @@ import { getOrganizations, organizationAccounts, readyOrganizations, organizatio
 import { readDatastoreView } from './datastore-reader'
 import { behaviorHeld, providerFailure, providerRecovered, providerSignInRejected, providerSignInVerified } from './alerts/producers'
 import { retireClearedBehaviorAlerts } from './alerts/notices'
-import { consumeProviderRecovery, providerRecoveryAvailable, providerSignInFailure, recordProviderRecovery } from './accounts/logins'
+import { consumeProviderRecovery, providerRecoveryAvailable, providerSignInFailure, recordCodexReviewSuccess, recordProviderRecovery } from './accounts/logins'
 import { getWorkerCapacity, type WorkerCapacity } from './worker-capacity'
 
 const DATASTORE = 'github-datastore'
@@ -1021,16 +1021,15 @@ function observeProviderRejection(call: LogEntry): void {
     const provider = preparation.context.provider
     providerFailure(provider, preparation.stderr || `${provider} CLI has no verified launcher`)
   }
-  if (call.status !== 'failed' || reviewAccountFailure(call) !== 'signin' || call.diagnostic?.operation !== 'provider.review') return
+  if (call.status !== 'failed' || call.error_code !== 'authentication_failed' || call.diagnostic?.operation !== 'provider.review') return
   const identity = tripIdentity(call)
   if (!identity) return
   const provider = loadedCatalog()?.models.find(model => model.identity === identity)?.provider
-  if (provider !== 'codex') {
-    // Caller only writes authentication_failed for Codex. After a restart
-    // with an empty catalog cache, that code must not lose the rejection.
-    if (provider !== undefined || call.error_code !== 'authentication_failed') return
-  }
+  // Caller only writes authentication_failed for Codex. Preserve that evidence
+  // after a restart with an empty catalog cache.
+  if (provider !== undefined && provider !== 'codex') return
   providerSignInRejected('codex', { callId: call.id, model: identity, rejectedAt: Date.parse(call.completed_at ?? ''),
+    startedAt: Date.parse(agentCallStartedAt(call)),
     phase: `${call.behavior} / ${call.diagnostic.phase}`, work: `${call.repo}#${call.pr_id}`, cause: call.error })
 }
 
@@ -1097,16 +1096,17 @@ function reviewerSucceeded(call: LogEntry): void {
   providerRecovered(loadedCatalog()?.models.find(model => model.identity === identity)?.provider ?? identity)
   const catalog = loadedCatalog()
   if (catalog?.models.find(model => model.identity === identity)?.provider === 'codex') {
+    const startedAt = Date.parse(agentCallStartedAt(call))
+    const completedAt = Date.parse(call.completed_at ?? '')
+    recordCodexReviewSuccess(startedAt, completedAt)
     const failure = providerSignInFailure('codex')
     if (failure) {
       // Record completion, not request start: a second Connect during the
       // successful request must still read as older than its verification.
       // A Call started before the latest rejection must not verify even
       // when it completes afterward without post-rejection sign-in.
-      const startedAt = Date.parse(agentCallStartedAt(call))
-      const completedAt = Date.parse(call.completed_at ?? '')
       if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt) || startedAt <= failure.rejectedAt || completedAt <= failure.rejectedAt) return
-      recordProviderRecovery('codex', failure.callId, completedAt)
+      recordProviderRecovery('codex', failure.callId, completedAt, startedAt)
       providerSignInVerified('codex')
       // A successful review after the bounded probe releases sibling auth
       // trips for this provider. Quota and other causes keep their clocks.

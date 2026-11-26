@@ -59,6 +59,8 @@ export interface ConnectedAccount {
   /** The account name the status command prints, and nothing more. */
   identity: string | null
   detail: string | null
+  /** Codex only. An observation of the isolated review credential route. */
+  reviewSignIn?: { state: 'rejected' | 'verified' | 'stale', at: number }
   /** The command a Connect terminal runs. */
   login: { label: string }
   /** gh only: every account it holds for github.com. */

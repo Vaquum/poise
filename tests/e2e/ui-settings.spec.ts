@@ -1,6 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 import type { AdminOverview, GatewayAccount, PairedDevice, PhoneCode, SignedInPhone } from '../../src/gateway-client'
 import { BEHAVIORS } from '../../src/behaviors'
+import type { ConnectedAccount } from '../../server/accounts/types'
 
 // Settings in the new interface (#556 PR 4): one section at a time, each with
 // its own address, Find, and rows that save themselves one field at a time
@@ -19,6 +20,7 @@ interface World {
   wakes: Array<{ everyMinutes: number, revision: number }>
   mode?: 'service' | 'local'
   admin?: boolean
+  accounts?: ConnectedAccount[]
   /** First-run setup's state behind the gateway. */
   onboarding?: { status: 'pending' | 'done', step: string }
   /** Signing in on a phone, as the gateway would answer it. */
@@ -165,7 +167,8 @@ async function settings(page: Page, world: Partial<World> = {}, address = '/?vie
     if (path === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', reason: null, checkedAt: null, verifiedAt: null, authMethod: null, subscriptionType: null, loginInProgress: false } })
     if (path === '/api/notices') return route.fulfill({ json: { enabled: true, notices: [] } })
     if (path === '/api/repos') return route.fulfill({ json: { repos: ['acme/site', 'acme/api'] } })
-    if (path === '/api/accounts') return route.fulfill({ json: { accounts: [] } })
+    if (path === '/api/accounts') return route.fulfill({ json: { accounts: (w.accounts ?? [])
+      .filter(account => !url.searchParams.has('id') || account.id === url.searchParams.get('id')) } })
     if (path === '/api/ssh-keys') return route.fulfill({ json: { keys: [] } })
     if (path === '/api/google/accounts') return route.fulfill({ json: { configured: false, accounts: [] } })
     // Behaviors' run counts read the agent logs, which this server cannot: answered here, so no fault reaches other specs' bells.
@@ -180,6 +183,33 @@ async function settings(page: Page, world: Partial<World> = {}, address = '/?vie
 
 const row = (page: Page, key: string) => page.locator(`[data-setting="${key}"]`)
 const section = (page: Page, name: string) => page.getByRole('navigation', { name: 'Settings sections' }).getByRole('link', { name, exact: true })
+
+test('Accounts distinguishes Codex CLI sign-in from isolated review authentication', async ({ page }) => {
+  const at = Date.UTC(2026, 10, 26, 12)
+  const codex: ConnectedAccount = { id: 'codex', installed: true, version: '0.169.0',
+    signedIn: true, identity: null, detail: 'Signed in with ChatGPT',
+    login: { label: 'codex login --device-auth' }, reviewSignIn: { state: 'rejected', at } }
+  await settings(page, { mode: 'service', accounts: [codex] }, '/?settings=accounts')
+  const row = page.locator('[data-account="codex"]')
+  await expect(row.getByText('CLI reports: Signed in with ChatGPT')).toBeVisible()
+  await expect(row.locator('.st-help-warn')).toContainText('An isolated Codex PR review Call failed authentication at')
+  await expect(row.getByRole('button', { name: 'Reconnect Codex' })).toBeVisible()
+  await expect(row.getByText('Current review sign-in is unverified.', { exact: false })).toBeVisible()
+
+  codex.reviewSignIn = { state: 'verified', at }
+  await page.reload()
+  await expect(row.getByText('Caller verified isolated Codex review sign-in at', { exact: false })).toBeVisible()
+  await expect(row.locator('.st-help-warn')).toHaveCount(0)
+
+  codex.reviewSignIn = { state: 'stale', at }
+  await page.reload()
+  await expect(row.getByText('The last isolated Codex review sign-in observation was at', { exact: false })).toBeVisible()
+  await expect(row.locator('.st-help-warn')).toHaveCount(0)
+
+  delete codex.reviewSignIn
+  await page.reload()
+  await expect(row.getByText('Current review sign-in is unverified.', { exact: true })).toBeVisible()
+})
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => { if (!sessionStorage.getItem('settings-spec')) { localStorage.clear(); sessionStorage.setItem('settings-spec', '1') } })

@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invalidateAccounts, listAccounts, AccountsCache, ACCOUNTS_CACHE_MS, ACCOUNTS_CHECK_MS, scheduleAccountsCheck } from '../server/accounts'
 import { probeAccount, probeAccounts, type RunCommand } from '../server/accounts/status'
 import type { ConnectedAccount } from '../server/accounts/types'
-import { accountLogins, consumeProviderRecovery, markLogin, recordLogin, recordProviderRejection, providerRecoveryAvailable, providerSignInFailure } from '../server/accounts/logins'
+import { accountLogins, consumeProviderRecovery, markLogin, recordCodexReviewSuccess, recordLogin, recordProviderRejection, providerRecoveryAvailable, providerSignInFailure } from '../server/accounts/logins'
 import * as processes from '../server/process'
 import * as models from '../server/models'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
@@ -30,6 +30,8 @@ let home = ''
 beforeEach(async () => {
   setMeta('account_logins', '{}')
   setMeta('account_runtime_rejection:codex', '')
+  setMeta('account_last_connect:codex', '')
+  setMeta('account_last_review_success:codex', '')
   db.prepare('DELETE FROM alerts').run()
   invalidateAccounts()
   root = await mkdtemp(join(tmpdir(), 'poise-accounts-'))
@@ -109,13 +111,48 @@ async function checkedCodex(): Promise<void> {
 }
 
 describe('GET /api/accounts', () => {
+  it('reports isolated review evidence independently of cached CLI sign-in status', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
+    const requests = vi.spyOn(processes, 'runFile')
+    const now = Date.now()
+    const read = async () => (await listAccounts('codex'))[0]
+    expect(await read()).toMatchObject({ signedIn: true })
+    expect((await read()).reviewSignIn).toBeUndefined()
+    recordProviderRejection('claude', 'other-provider', 'claude', now - 500)
+    expect((await read()).reviewSignIn).toBeUndefined()
+    recordCodexReviewSuccess(now - 900, now - 800)
+    expect((await read()).reviewSignIn).toEqual({ state: 'verified', at: now - 800 })
+    recordProviderRejection('codex', 'failed-call', 'codex', now - 600, now - 700)
+    expect(await read()).toMatchObject({ signedIn: true, reviewSignIn: { state: 'rejected', at: now - 600 } })
+    recordCodexReviewSuccess(now - 650, now - 400)
+    expect((await read()).reviewSignIn).toEqual({ state: 'rejected', at: now - 600 })
+    recordCodexReviewSuccess(now - 300, now - 200)
+    expect((await read()).reviewSignIn).toEqual({ state: 'verified', at: now - 200 })
+    vi.spyOn(Date, 'now').mockReturnValue(now + 24 * 60 * 60_000)
+    expect((await read()).reviewSignIn).toEqual({ state: 'stale', at: now - 200 })
+    expect(requests.mock.calls.some(([, args]) => args[0] === '--verify-codex-login')).toBe(false)
+  })
+
+  it('ignores evidence from Calls that began before the latest Connect, even when reported later', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
+    const now = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(now - 500)
+    recordLogin('codex', 0)
+    vi.mocked(Date.now).mockReturnValue(now)
+    recordProviderRejection('codex', 'old-call', 'codex', now - 400, now - 600)
+    recordCodexReviewSuccess(now - 700, now - 300)
+    expect((await listAccounts('codex'))[0].reviewSignIn).toBeUndefined()
+    recordCodexReviewSuccess(now - 200, now - 100)
+    expect((await listAccounts('codex'))[0].reviewSignIn).toEqual({ state: 'verified', at: now - 100 })
+  })
+
   it('keeps canonical credential-store success blocked until a fresh Connect succeeds through Caller', async () => {
     await credentialFixture('store')
     const requests = vi.spyOn(processes, 'runFile')
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
     const rejectedAt = rejectCodex()
     recordLogin('codex', 1)
-    expect((await listAccounts('codex'))[0].signedIn).toBe(true)
+    expect((await listAccounts('codex'))[0]).toMatchObject({ signedIn: true, reviewSignIn: { state: 'rejected', at: rejectedAt } })
     await connectCodex()
     expect((await runFile('codex', ['exec', '--json', 'Reply with exactly OK. Do not use tools.'])).stdout).toContain('turn.completed')
     await checkedCodex()

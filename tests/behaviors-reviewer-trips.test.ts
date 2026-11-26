@@ -83,6 +83,7 @@ describe('reviewer account trips', () => {
 
     const evidence = await import('../server/accounts/logins')
     const rejection = evidence.providerSignInFailure('codex')!
+    expect(rejection.startedAt).toBe(Date.parse(String(fixture.agentLogs[0].started_at_precise)))
     evidence.recordProviderRecovery('codex', rejection.callId, Date.now())
     if (expired) expireBackoff(db, 'review_new_prs', `reviewer:${identity}`)
     fixture.listedPrs = [pr, { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18' }]
@@ -97,6 +98,7 @@ describe('reviewer account trips', () => {
       ...(kind === 'rate limit' ? { error: 'HTTP 429 Too Many Requests', error_code: 'review_provider_exit' } : {}) })]
     await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
+    expect(evidence.providerSignInFailure('codex')?.callId).toBe(kind === 'rate limit' ? rejection.callId : '2'.repeat(32))
     // Re-reading the successful native request cannot rearm its allowance.
     evidence.recordProviderRecovery('codex', rejection.callId, Date.now())
     await runtime.runEnabledBehaviorsOnce()
@@ -419,6 +421,8 @@ describe('reviewer account trips', () => {
     expect(openAlerts({ kind: 'provider_unavailable' })).toEqual([
       expect.objectContaining({ dedupeKey: 'provider-unavailable:grok' }),
     ])
+    const { providerSignInFailure } = await import('../server/accounts/logins')
+    expect(providerSignInFailure('codex')).toBeNull()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(mocks.spawnDetached.mock.calls[1][1]).toContain(`#${pr.number}`)
     expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')

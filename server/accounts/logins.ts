@@ -17,13 +17,39 @@ interface ProviderSignInFailure {
   model: string
   since: number
   rejectedAt: number
+  startedAt?: number
   verifiedAt: number | null
+  verificationStartedAt?: number
   consumedAt: number | null
   reconnectedAt: number | null
   verificationLogin: string | null
   retainedVerificationLogin?: string | null
 }
 const rejectionKey = (id: AccountId) => `account_runtime_rejection:${id}`
+const CODEX_CONNECT_KEY = 'account_last_connect:codex'
+const CODEX_REVIEW_SUCCESS_KEY = 'account_last_review_success:codex'
+
+export function lastCodexConnect(): number | null {
+  const value = getMeta(CODEX_CONNECT_KEY)
+  return value && Number.isSafeInteger(Number(value)) ? Number(value) : null
+}
+
+export function lastCodexReviewSuccess(): { startedAt: number, completedAt: number } | null {
+  const raw = getMeta(CODEX_REVIEW_SUCCESS_KEY)
+  if (!raw) return null
+  const value = JSON.parse(raw) as { startedAt: number, completedAt: number }
+  if (!value || !Number.isSafeInteger(value.startedAt) || !Number.isSafeInteger(value.completedAt)
+    || value.startedAt > value.completedAt) throw new Error('The Codex review sign-in evidence is corrupt')
+  return value
+}
+
+export function recordCodexReviewSuccess(startedAt: number, completedAt: number): void {
+  if (!Number.isSafeInteger(startedAt) || !Number.isSafeInteger(completedAt) || startedAt > completedAt) return
+  db.transaction(() => {
+    if ((lastCodexReviewSuccess()?.completedAt ?? 0) >= completedAt) return
+    setMeta(CODEX_REVIEW_SUCCESS_KEY, JSON.stringify({ startedAt, completedAt }))
+  }).immediate()
+}
 
 export function providerSignInFailure(id: AccountId): ProviderSignInFailure | null {
   const raw = getMeta(rejectionKey(id))
@@ -32,6 +58,7 @@ export function providerSignInFailure(id: AccountId): ProviderSignInFailure | nu
   if (!value || typeof value.callId !== 'string' || typeof value.model !== 'string'
     || !Number.isSafeInteger(value.since) || !Number.isSafeInteger(value.rejectedAt) || value.since > value.rejectedAt
     || ![value.verifiedAt, value.consumedAt, value.reconnectedAt].every(at => at === null || Number.isSafeInteger(at))
+    || ![value.startedAt, value.verificationStartedAt].every(at => at === undefined || Number.isSafeInteger(at))
     || !(value.verificationLogin === null || typeof value.verificationLogin === 'string')
     || !(value.retainedVerificationLogin === undefined || value.retainedVerificationLogin === null
       || typeof value.retainedVerificationLogin === 'string')) {
@@ -40,7 +67,7 @@ export function providerSignInFailure(id: AccountId): ProviderSignInFailure | nu
   return value
 }
 
-export function recordProviderRejection(id: AccountId, callId: string, model: string, rejectedAt: number): void {
+export function recordProviderRejection(id: AccountId, callId: string, model: string, rejectedAt: number, startedAt?: number): void {
   if (!Number.isSafeInteger(rejectedAt)) throw new Error('Provider rejection has no completion time')
   db.transaction(() => {
     const previous = providerSignInFailure(id)
@@ -60,6 +87,7 @@ export function recordProviderRejection(id: AccountId, callId: string, model: st
     // past the held attempts: an automatic hold swept after this record
     // still needs its older failures eligible for a later verification.
     setMeta(rejectionKey(id), JSON.stringify({ callId, model, rejectedAt,
+      startedAt: startedAt !== undefined && Number.isSafeInteger(startedAt) && startedAt <= rejectedAt ? startedAt : undefined,
       since: !previous ? rejectedAt : previous.since,
       verifiedAt: null, consumedAt: null, reconnectedAt, verificationLogin: null,
       retainedVerificationLogin: null } satisfies ProviderSignInFailure))
@@ -102,11 +130,11 @@ export function releaseProviderVerification(id: AccountId, login: string | null)
 }
 
 /** Called only for successful native requests on the review's credential route. */
-export function recordProviderRecovery(id: AccountId, callId: string, startedAt: number): void {
+export function recordProviderRecovery(id: AccountId, callId: string, completedAt: number, startedAt = completedAt): void {
   db.transaction(() => {
     const failure = providerSignInFailure(id)
-    if (!failure || failure.callId !== callId || startedAt <= failure.rejectedAt || failure.verifiedAt !== null) return
-    setMeta(rejectionKey(id), JSON.stringify({ ...failure, verifiedAt: startedAt }))
+    if (!failure || failure.callId !== callId || completedAt <= failure.rejectedAt || failure.verifiedAt !== null) return
+    setMeta(rejectionKey(id), JSON.stringify({ ...failure, verifiedAt: completedAt, verificationStartedAt: startedAt }))
   }).immediate()
 }
 
@@ -173,6 +201,7 @@ export function recordLogin(preset: string, code: number): void {
   if (code !== 0 || !isAccountId(id) || EXIT_IS_NO_LOGIN.has(id)) return
   const completedAt = Date.now()
   setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [id]: new Date(completedAt).toISOString() }))
+  if (id === 'codex') setMeta(CODEX_CONNECT_KEY, String(completedAt))
   const failure = providerSignInFailure(id)
   // First resolving Connect wins while unverified: a later Connect after
   // physical Call completion but before its receipt is reconciled must not
