@@ -1,4 +1,5 @@
 """Pinned review source and bounded, read-only access to tracked files."""
+import base64
 import json
 import re
 import shutil
@@ -143,8 +144,26 @@ def inspect(root: Path, requests: list[dict]) -> dict:
         selected = sorted(path for path in files if relative in ("", ".") or path == relative or path.startswith(relative + "/"))
         result = {"request": request}
         if operation == "diff":
-            if relative != "." or query or "diff_files" not in manifest:
+            if relative != "." or "diff_files" not in manifest:
                 raise ValueError("inspection diff requires the pinned diff manifest")
+            if query:
+                match = re.fullmatch(r"byte-offset:(0|[1-9][0-9]{0,8})", query)
+                if not match or start != 1:
+                    raise ValueError("invalid inspection diff byte offset")
+                offset = int(match[1])
+                chunk_size = max(1, ((page_bytes - 512) // 4) * 3)
+                with (root / ".git" / "caller-review.diff").open("rb") as handle:
+                    handle.seek(0, 2)
+                    size = handle.tell()
+                    if size > MAX_CHECKOUT_BYTES or offset > size:
+                        raise ValueError("inspection diff byte offset exceeds the pinned diff")
+                    handle.seek(offset)
+                    chunk = handle.read(chunk_size)
+                result.update(data_base64=base64.b64encode(chunk).decode("ascii"),
+                              total_bytes=size,
+                              next_offset=offset + len(chunk) if offset + len(chunk) < size else None)
+                results.append(result)
+                continue
             with (root / ".git" / "caller-review.diff").open(encoding="utf-8") as handle:
                 items = ({"line": number, "text": line.rstrip("\n")} for number, line in enumerate(handle, 1)
                          if number >= start)

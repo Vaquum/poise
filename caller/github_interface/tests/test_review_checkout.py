@@ -183,6 +183,74 @@ class TestInspection(TestCase):
     def request(self, operation="read", path="src/code.py", query="", start=1):
         return {"operation": operation, "path": path, "query": query, "start_line": start}
 
+    def test_deferred_diff_reassembles_oversized_utf8_line_without_losing_later_files(self):
+        from agent_interface.review_repository import Repository
+
+        first = "diff --git a/src/code.py b/src/code.py\n--- a/src/code.py\n+++ b/src/code.py\n@@ -1 +1 @@\n-old\n+"
+        source = first + ("µ\\\"" * 40_000) + "\ndiff --git a/later.py b/later.py\n--- /dev/null\n+++ b/later.py\n@@ -0,0 +1 @@\n+danger()\n"
+        manifest = {"head_sha": "a" * 40, "files": ["src/code.py", "later.py"],
+                    "diff_files": ["src/code.py", "later.py"]}
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps(manifest))
+        (self.root / ".git" / "caller-review.diff").write_text(source, encoding="utf-8")
+        repository = Repository(self.root, {"head_sha": "a" * 40})
+        pages = []
+
+        def inspect(requests, **_kwargs):
+            response = rc.inspect(self.root, requests)
+            self.assertLessEqual(len(json.dumps(response, indent=2).encode()) + 1, rc.MAX_RESPONSE_BYTES)
+            pages.append(response)
+            return response
+
+        repository.inspect = inspect
+        packet = {"diff_deferred": True, "coverage": "incomplete", "head_sha": "a" * 40,
+                  "files": [{"filename": "src/code.py"}, {"filename": "later.py"}]}
+        hydrated = json.loads(repository.diff_packet(json.dumps(packet), 1_000_000))
+        self.assertEqual(hydrated["diff"], source)
+        self.assertEqual(hydrated["coverage"], "complete")
+        self.assertGreater(len(pages), 1)
+
+    def test_byte_diff_refuses_skipped_truncated_or_corrupt_pages(self):
+        from agent_interface.review_repository import Repository
+
+        source = "diff --git a/src/code.py b/src/code.py\n--- a/src/code.py\n+++ b/src/code.py\n@@ -1 +1 @@\n-old\n+" + "x" * 120_000 + "\n"
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": "a" * 40,
+            "files": ["src/code.py"], "diff_files": ["src/code.py"]}))
+        (self.root / ".git" / "caller-review.diff").write_text(source)
+        packet = json.dumps({"diff_deferred": True, "coverage": "incomplete",
+                             "files": [{"filename": "src/code.py"}]})
+        for corruption in ("offset", "premature_end", "invalid_base64", "changed_size"):
+            with self.subTest(corruption=corruption):
+                repo = Repository(self.root, {"head_sha": "a" * 40})
+
+                def inspect(requests, **_kwargs):
+                    response = rc.inspect(self.root, requests)
+                    result = response["results"][0]
+                    if requests[0]["query"].startswith("byte-offset:"):
+                        if corruption == "offset":
+                            result["next_offset"] += 1
+                        elif corruption == "premature_end":
+                            result["next_offset"] = None
+                        elif corruption == "invalid_base64":
+                            result["data_base64"] = "!"
+                        elif requests[0]["query"] != "byte-offset:0":
+                            result["total_bytes"] += 1
+                    return response
+
+                repo.inspect = inspect
+                hydrated = json.loads(repo.diff_packet(packet, 1_000_000))
+                self.assertEqual(hydrated["coverage"], "incomplete")
+                self.assertTrue(repo.warnings)
+
+    def test_byte_diff_refuses_invalid_offsets_and_unmanifested_source(self):
+        with self.assertRaises(ValueError):
+            rc.inspect(self.root, [self.request("diff", path=".", query="byte-offset:0")])
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": "a" * 40,
+            "files": ["src/code.py"], "diff_files": ["src/code.py"]}))
+        (self.root / ".git" / "caller-review.diff").write_text("small diff\n")
+        for query in ("byte-offset:-1", "byte-offset:01", "byte-offset:9999999999", "bytes:0"):
+            with self.subTest(query=query), self.assertRaises(ValueError):
+                rc.inspect(self.root, [self.request("diff", path=".", query=query)])
+
     def test_reads_searches_and_pages_unchanged_consumers(self):
         first = rc.inspect(self.root, [self.request()])["results"][0]
         self.assertEqual(first["next_line"], 201)

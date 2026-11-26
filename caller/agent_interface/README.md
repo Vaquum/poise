@@ -633,6 +633,9 @@ The packet builder records `coverage` as `complete` or `incomplete`, separately
 from declared `excluded_files`. Capacity omissions in `omitted_files` leave
 coverage incomplete even when every retained file group finishes. Caller pins
 this disposition in the native response; model assessments cannot change it.
+If a deferred diff contains a line larger than an inspection response, Caller
+re-reads the pinned diff in bounded byte pages and verifies their offsets and
+total length before using it. A failed or incomplete read remains incomplete.
 Incomplete reviews can submit genuine change requests and retain their receipts,
 but cannot submit clean reviews or approvals, including capped approvals.
 Their outcome remains `incomplete`, and they cannot qualify for automated merge.
