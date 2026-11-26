@@ -33,13 +33,17 @@ def execute():
 def interface(*args, **_kwargs):
     commands.append(args[0])
     if args[0] == "--issue-work":
-        assert args[args.index("--mode") + 1] == "prepare"
+        mode = args[args.index("--mode") + 1]
+        if mode == "validate" and request.get("publicationRefusal"):
+            return {"outcome": "validated", "has_changes": False}
+        assert mode == "prepare"
         return {"outcome": "prepared", "checkout_head": ci["head_sha"],
                 "head_sha": ci["head_sha"], "base_sha": ci["base_sha"]}
     if args[0] == "--list-failing-ci" and "--ref" in args:
         return request["integration"] if args[-1] == request["integration"]["ref"] else request["baseline"]
     if args[0] == "--read-failing-ci-log":
-        return {"repository": ci["repository"], "log": request["dependency"]["failures"][0]["evidence"]}
+        return {"repository": ci["repository"], "log": "different original log" if request.get("publicationRefusal")
+                else request["dependency"]["failures"][0]["evidence"]}
     if args[0] == "--read-issue":
         return {"issue": {"number": 99}}
     return {"--list-failing-ci": ci, "--pr-review": {"review_threads": []}, "--pull-action-state": request.get("queue", {})}[args[0]]
@@ -47,7 +51,9 @@ def interface(*args, **_kwargs):
 
 def worker(_lease, _args, **kwargs):
     (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
-        "blocked": {"cause": "ci_only", "reason": "The supplied unit job failed"},
+        **({"blocked": None, "commitMessage": "fix: candidate", "title": "fix: candidate",
+            "body": "Fix the candidate", "replies": []} if request.get("publicationRefusal")
+           else {"blocked": {"cause": "ci_only", "reason": "The supplied unit job failed"}}),
         **({"ciDependency": request["dependency"]} if request.get("dependency") else {})}))
     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -59,6 +65,8 @@ with TemporaryDirectory(dir="/dev/shm" if sys.platform == "linux" else None) as 
     api.init_db()
     with patch.object(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _identity: SimpleNamespace(identity="fixture", provider="codex"))), \
             patch.object(issue_review, "packet", return_value={"issue": {"title": "Seed", "body": "", "state": "open"}}), \
+            patch.object(issue_review, "_issue", return_value={}), \
+            patch.object(issue_review, "revision", return_value=argv[argv.index("--expected-issue-revision") + 1] if "--expected-issue-revision" in argv else ""), \
             patch.object(issue_review, "sweep"), \
             patch.object(issue_review, "interface", side_effect=interface), \
             patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
@@ -75,5 +83,5 @@ with TemporaryDirectory(dir="/dev/shm" if sys.platform == "linux" else None) as 
         else:
             raise AssertionError("expected a native CI-only repair failure")
     assert commands[:4] == ["--issue-work", "--list-failing-ci", "--pr-review", "--pull-action-state"]
-    assert commands.count("--issue-work") == 1  # Preparation only; no publication or validation.
+    assert commands.count("--issue-work") == (2 if request.get("publicationRefusal") else 1)
     print(json.dumps({"pending": pending, "released": api.logs()}))

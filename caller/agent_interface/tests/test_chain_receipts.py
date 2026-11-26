@@ -1393,6 +1393,75 @@ class AtomicWorkLimits(TestCase):
                 if shared:
                     self.assertNotIn("evidence", json.dumps(blocker["ci_dependency"]))
 
+    def test_publication_with_rejected_baseline_keeps_only_verified_unchanged_queue_hold(self):
+        # Real PR #1808 head, integration, base and failed job, rebound to the isolated repository fixture.
+        head = 'a4311c48780bc8a117be2fd8972ef9019ad250f5'
+        integration, base = 'c595e6804ad959fe4a6eb9eed17ee8e0cdff2bd3', '8a85b76a8b049e55561b8e504775fbbf836cd362'
+        ci = {'action': 'list_failing_ci', 'repository': 'example/repo', 'pull_number': 3, 'head_sha': head, 'failing': []}
+        queue = {'head_sha': head, 'queue_removals': [{'id': 'RFMQE_lADOU59AVM8AAAABfNl6Is8AAAAIaUjd_w', 'reason': 'failed_checks', 'beforeCommit': {'oid': integration}}]}
+        check = {'type': 'check_run', 'name': 'Unit & integration (1)', 'state': 'completed', 'conclusion': 'failure',
+                 'check_run_id': 132463172632, 'log_id': 132463172632, 'run_id': 43600196598, 'head_sha': integration,
+                 'url': 'https://github.com/autonomio/poise/actions/runs/43600196598/job/132463172632'}
+        run = {'id': 43600196598, 'workflow_id': 373804671, 'run_attempt': 1, 'event': 'merge_group', 'head_sha': integration}
+        packet = {**ci, 'ref': integration, 'parents': [base, head], 'failing': [check], 'runs': [run]}
+        for index, mode in enumerate(('verified', 'edited', 'missing_queue', 'unanswered', 'replies', 'wrong_head', 'missing_job', 'unknown_validation')):
+            with self.subTest(mode=mode):
+                modes = []
+                def interface(*args, **_kwargs):
+                    if args[0] == '--issue-work':
+                        work_mode = args[args.index('--mode') + 1]
+                        modes.append(work_mode)
+                        return {'outcome': 'prepared', 'checkout_head': head} if work_mode == 'prepare' else {
+                            'outcome': 'validated', **({} if mode == 'unknown_validation' else {'has_changes': mode == 'edited'})}
+                    if args[0] == '--list-failing-ci':
+                        if '--ref' not in args:
+                            return ci
+                        if mode == 'wrong_head':
+                            return {**packet, 'head_sha': base}
+                        if mode == 'missing_job':
+                            return {**packet, 'failing': [{**check, 'log_id': None}]}
+                        return packet
+                    if args[0] == '--pr-review':
+                        return {'review_threads': [{'root_comment_id': 123, 'is_resolved': False}] if mode == 'unanswered' else []}
+                    if args[0] == '--pull-action-state':
+                        return {'head_sha': head, 'queue_removals': []} if mode == 'missing_queue' else queue
+                    raise AssertionError(args)
+
+                def worker(_lease, _args, **kwargs):
+                    (Path(kwargs['cwd']).parent / 'publication.json').write_text(json.dumps({
+                        'blocked': None, 'commitMessage': 'fix: candidate', 'title': 'fix: candidate',
+                        'body': 'Fix the candidate', 'replies': [{'commentId': 123, 'body': 'Reply'}] if mode == 'replies' else [],
+                        'ciDependency': {'head': head}}))
+                    return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+                with patch.object(issue_review, 'packet', return_value={'issue': {'state': 'open'}}), \
+                        patch.object(issue_review, 'interface', side_effect=interface), \
+                        patch.object(issue_review, 'command', return_value=(['fixture'], '', {})), \
+                        patch.object(issue_review, '_terminal_failure', return_value=None), \
+                        patch.object(issue_review, 'stop_leftovers'), patch.object(issue_review, '_cwd_pids', return_value=[]), \
+                        patch.object(api.atomic_work.checkout_lock, 'Lease', return_value=MagicMock()), \
+                        patch.object(api.atomic_work.checkout_lock, 'run_gated', side_effect=worker), \
+                        patch.object(api.atomic_work, '_verify_ci_dependency', side_effect=api.atomic_work.AtomicWorkFailed('baseline excerpt rejected')), \
+                        self.assertRaises(ValueError):
+                    self.run_behavior(pull=3, expected_head=head,
+                                      correlation_id=f'00000000-0000-4000-8000-{index + 30:012d}')
+                with sqlite3.connect(self.path) as conn:
+                    code, action, artifact, plan = conn.execute(
+                        'select error_code,action,artifact,action_plan from calls order by rowid desc limit 1').fetchone()
+                artifact = json.loads(artifact)
+                self.assertIsNone(plan)
+                self.assertEqual(action, 'not_started')
+                if mode == 'verified':
+                    self.assertEqual(code, 'atomic_work_blocked')
+                    self.assertEqual(artifact['ci_blocker']['queue']['integration'], integration)
+                    self.assertNotIn('ci_dependency', artifact['ci_blocker'])
+                    self.assertIn('baseline excerpt rejected', artifact['ci_verifier_refusal'])
+                    self.assertEqual(modes, ['prepare', 'validate'])
+                else:
+                    self.assertNotEqual(code, 'atomic_work_blocked')
+                    self.assertNotIn('ci_blocker', artifact)
+                    self.assertNotIn('publish', modes)
+
     def test_relay_dependency_uses_original_caller_binding_and_retained_runner_receipts(self):
         for index, missing in enumerate((False, True)):
             dependency = {"source": "relay", "base": HEAD, "run": "1" * 32, "baselineRun": "2" * 32,
