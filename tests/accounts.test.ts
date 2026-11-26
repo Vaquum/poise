@@ -144,6 +144,11 @@ describe('GET /api/accounts', () => {
     expect((await listAccounts('codex'))[0].reviewSignIn).toBeUndefined()
     recordCodexReviewSuccess(now - 200, now - 100)
     expect((await listAccounts('codex'))[0].reviewSignIn).toEqual({ state: 'verified', at: now - 100 })
+    recordCodexReviewSuccess(now - 700, now - 90)
+    expect((await listAccounts('codex'))[0].reviewSignIn).toEqual({ state: 'verified', at: now - 100 })
+    recordProviderRejection('codex', 'current-call', 'codex', now - 80, now - 90)
+    recordProviderRejection('codex', 'late-old-call', 'codex', now - 10, now - 700)
+    expect((await listAccounts('codex'))[0].reviewSignIn).toEqual({ state: 'rejected', at: now - 80 })
   })
 
   it('keeps canonical credential-store success blocked until a fresh Connect succeeds through Caller', async () => {

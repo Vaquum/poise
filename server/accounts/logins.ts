@@ -46,6 +46,7 @@ export function lastCodexReviewSuccess(): { startedAt: number, completedAt: numb
 export function recordCodexReviewSuccess(startedAt: number, completedAt: number): void {
   if (!Number.isSafeInteger(startedAt) || !Number.isSafeInteger(completedAt) || startedAt > completedAt) return
   db.transaction(() => {
+    if (startedAt < (lastCodexConnect() ?? 0)) return
     if ((lastCodexReviewSuccess()?.completedAt ?? 0) >= completedAt) return
     setMeta(CODEX_REVIEW_SUCCESS_KEY, JSON.stringify({ startedAt, completedAt }))
   }).immediate()
@@ -69,9 +70,15 @@ export function providerSignInFailure(id: AccountId): ProviderSignInFailure | nu
 
 export function recordProviderRejection(id: AccountId, callId: string, model: string, rejectedAt: number, startedAt?: number): void {
   if (!Number.isSafeInteger(rejectedAt)) throw new Error('Provider rejection has no completion time')
+  const callStartedAt = startedAt !== undefined && Number.isSafeInteger(startedAt) && startedAt <= rejectedAt ? startedAt : undefined
   db.transaction(() => {
     const previous = providerSignInFailure(id)
     if (previous && previous.rejectedAt >= rejectedAt) return
+    const connectedAt = id === 'codex' ? lastCodexConnect() : null
+    // A late observation from the previous sign-in cannot replace evidence
+    // from a Call already observed on the latest sign-in.
+    if (connectedAt !== null && callStartedAt !== undefined && callStartedAt < connectedAt
+      && previous && (previous.startedAt ?? previous.rejectedAt) >= connectedAt) return
     // A Connect that finished after the call completed but before this record
     // must keep its eligibility: carry a fresh reconnect forward instead of
     // resetting it to null.
@@ -87,7 +94,7 @@ export function recordProviderRejection(id: AccountId, callId: string, model: st
     // past the held attempts: an automatic hold swept after this record
     // still needs its older failures eligible for a later verification.
     setMeta(rejectionKey(id), JSON.stringify({ callId, model, rejectedAt,
-      startedAt: startedAt !== undefined && Number.isSafeInteger(startedAt) && startedAt <= rejectedAt ? startedAt : undefined,
+      startedAt: callStartedAt,
       since: !previous ? rejectedAt : previous.since,
       verifiedAt: null, consumedAt: null, reconnectedAt, verificationLogin: null,
       retainedVerificationLogin: null } satisfies ProviderSignInFailure))
