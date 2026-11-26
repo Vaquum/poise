@@ -587,12 +587,16 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                     blocked = blocked["reason"]
                 raise AtomicWorkBlocked(blocked)
             dependency = None
+            rejected_dependency = None
             if publication.get("ciDependency") is not None:
                 progress.stage("verifying_ci_dependency", "Verifying exact-base CI dependency evidence")
                 if pull is None or not expected_head:
                     raise AtomicWorkFailed("CI dependencies require an exact repair candidate")
-                dependency = _verify_ci_dependency(publication["ciDependency"], repo, pull, expected_head, actor, evidence["queue"])
-                if dependency["remediation"] in {f"https://github.com/{repo}/issues/{number}", f"https://github.com/{repo}/pull/{pull}"}:
+                try:
+                    dependency = _verify_ci_dependency(publication["ciDependency"], repo, pull, expected_head, actor, evidence["queue"])
+                except AtomicWorkFailed as error:
+                    rejected_dependency = error
+                if dependency is not None and dependency["remediation"] in {f"https://github.com/{repo}/issues/{number}", f"https://github.com/{repo}/pull/{pull}"}:
                     raise AtomicWorkFailed("CI dependency cannot use its own repair as the external remediation")
             progress.stage("validating_publication", "Validating publication metadata and review replies")
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
@@ -623,6 +627,21 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                 return validated
             if validated.get("outcome") != "validated":
                 raise AtomicWorkFailed("publication validation returned no confirmation; no publication attempted")
+            if rejected_dependency is not None:
+                if validated.get("has_changes") is not False or replies:
+                    raise rejected_dependency
+                try:
+                    blocker = _ci_only_blocker(evidence["ci"], evidence["queue"], expected_head or "", actor)
+                except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                    raise rejected_dependency
+                if not isinstance(blocker, dict) or not blocker.get("queue") or blocker.get("action") != "list_failing_ci" \
+                        or blocker.get("repository") != repo or blocker.get("pull_number") != pull \
+                        or blocker.get("head_sha") != expected_head:
+                    raise rejected_dependency
+                refused = AtomicWorkBlocked(f"Original merge-group failure; baseline verification refused: {rejected_dependency}")
+                record({"phase": "executing", "prepared": prepared, "ci_blocker": blocker,
+                        "ci_verifier_refusal": refused.diagnostic["stderr"]})
+                raise refused from rejected_dependency
             if dependency is not None:
                 if type(validated.get("has_changes")) is not bool:
                     raise AtomicWorkFailed("CI dependency requires a complete checkout validation")

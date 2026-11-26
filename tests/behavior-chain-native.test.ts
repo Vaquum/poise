@@ -968,8 +968,8 @@ it('selects the preceding settled repair deadline capture in the existing attemp
   } finally { db.close() }
 })
 
-it.each(['PR head rerun', 'PR head conflict', 'queue', 'baseline'])('retains a Caller-produced %s CI hold through settlement, restart and verified recovery', async source => {
-  const queued = source === 'queue' || source === 'baseline'
+it.each(['PR head rerun', 'PR head conflict', 'queue', 'baseline', 'publication baseline refusal'])('retains a Caller-produced %s CI hold through settlement, restart and verified recovery', async source => {
+  const queued = source === 'queue' || source === 'baseline' || source === 'publication baseline refusal'
   const conflictMode = source === 'PR head conflict'
   const failedHead = 'fcea77111bf5842239e81afb5e069b1fafa78fd6'
   const integration = '5a3763807ae617c534c5e3d28224039cf4ec4946', base = 'c'.repeat(40)
@@ -1050,7 +1050,8 @@ it.each(['PR head rerun', 'PR head conflict', 'queue', 'baseline'])('retains a C
     if (invocation.behavior === 'repair-pr' && wire === '[]') {
       const receipts = JSON.parse(execFileSync('python3', ['tests/fixtures/ci-only-repair.py'], {
         input: JSON.stringify({ argv: invocation.request.argv, ci, ...(queued ? { queue, integration: integrationPacket, baseline,
-          ...(source === 'baseline' ? { dependency } : {}) } : {}) }), encoding: 'utf8', timeout: 10_000,
+          ...(source === 'baseline' || source === 'publication baseline refusal' ? { dependency } : {}),
+          ...(source === 'publication baseline refusal' ? { publicationRefusal: true } : {}) } : {}) }), encoding: 'utf8', timeout: 10_000,
         env: { ...process.env, PYTHONPATH: resolve('caller/agent_interface') },
       })) as { pending: unknown[], released: unknown[] }
       wire = JSON.stringify(receipts.pending)
@@ -1083,6 +1084,7 @@ it.each(['PR head rerun', 'PR head conflict', 'queue', 'baseline'])('retains a C
         pull_number: ci.pull_number, head_sha: failedHead, failing: ci.failing } } })
     if (queued) expect(call.artifact?.ci_blocker).toMatchObject({ queue: { removal: 'removed', integration, base,
       failures: [{ check: integrationCheck.check_run_id, run: 43469739427, workflow: 1, attempt: 1 }] } })
+    if (source === 'publication baseline refusal') expect(call.artifact?.ci_verifier_refusal).toBeTruthy()
     expect(call.artifact).not.toHaveProperty('plan_sha')
     const retainedQueue = (call.artifact?.ci_blocker as { queue?: NonNullable<BehaviorChain['ciHold']>['queue'] }).queue
     const hold = { invocationId: call.correlation_id, callId: call.id, head: failedHead, ...(queued ? { queue: retainedQueue } : {}) }
