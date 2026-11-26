@@ -38,8 +38,8 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
   if (/pull-request head or base changed (?:while building review packet|before checkout|during checkout)\b|pull-request head changed(?: [a-z ]+)?: expected [a-f0-9]{40}, got [a-f0-9]{40}/.test(error)) return null
   // Review verdicts alone are routine; recorded failure evidence takes precedence.
   if (!diagnostic && !error && !row.error_code && !priorWarning) return null
-  const repository = text(row.repo)
-  const pr = text(row.pr_id)
+  const repository = text(row.repo) ?? text(context.repository)
+  const pr = text(row.pr_id) ?? text(context.pr)
   const heldRepair = row.behavior === 'repair_pr' && row.status === 'failed'
     && row.action === 'not_started' && row.outcome === 'preflight_failed' && row.head_sha == null
     && (row.error_code === 'atomic_work_blocked' || row.error_code === 'atomic_work_failed'
@@ -76,7 +76,7 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
         && (row.action == null || row.action === 'not_started')
         && (row.outcome == null || row.outcome === 'preflight_failed') ? { submission: 'none' }
         : approvalWait ? { submission: 'blocked' } : {}),
-      expectedHead: text(row.expected_head), observedHead: text(row.head_sha), executable: text(context.executable),
+      expectedHead: text(row.expected_head) ?? text(context.expected_head), observedHead: text(row.head_sha), executable: text(context.executable),
       resolvedExecutable: text(context.resolved_executable), cwd: text(context.cwd), elapsedMs: number(context.elapsed_ms),
       startedAt: text(row.started_at_precise) ?? text(row.started_at), source: text(row.source),
       inputBytes: number(context.actual_input_bytes), inputLimitBytes: number(context.input_limit_bytes),

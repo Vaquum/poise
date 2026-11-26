@@ -1,5 +1,6 @@
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -16,15 +17,18 @@ REQUIRE_TOKEN_USER = True
 
 
 class MergeAdmissionError(RuntimeError):
-    def __init__(self, error: Exception, submission: str = "uncertain", token: str | None = None):
+    def __init__(self, error: Exception, submission: str = "uncertain", token: str | None = None,
+                 repository: str | None = None, pr: str | None = None, expected_head: str | None = None,
+                 method: str | None = None):
         env = dict(os.environ)
         if isinstance(token, str):
             env["GITHUB_INTERFACE_TOKEN"] = token
-        cause = redact(str(error) or type(error).__name__, env).encode("utf-8")
+        cause = redact((f"merge method {method}: " if method else "") + (str(error) or type(error).__name__), env).encode("utf-8")
         self.diagnostic = {
             "version": 1, "source": "caller", "severity": "error", "operation": "merge_if_ready",
             "phase": "merge_admission", "outcome": "unknown" if submission == "uncertain" else "refused",
             "submission": submission, "refusal": "pre_request" if submission == "none" else "github" if submission == "rejected" else None,
+            "repository": repository, "pr": pr, "expected_head": expected_head,
             "stderr": cause[:STDERR_BYTES].decode("utf-8", errors="replace"), "stderr_truncated": len(cause) > STDERR_BYTES,
         }
         super().__init__(self.diagnostic["stderr"])
@@ -43,6 +47,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
     submission = "none"
+    method = None
     try:
         pull = await get_pull(client, owner, repo, number)
         if (pull.get("head") or {}).get("sha") != head:
@@ -95,15 +100,32 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             return {**result, "outcome": "enqueued", "queue_entry_id": entry["id"]}
 
         config = await client.get(f"/repos/{owner}/{repo}")
+        base = (pull.get("base") or {}).get("ref")
+        if not isinstance(base, str) or not base:
+            raise RuntimeError("GitHub returned no base branch for merge policy")
+        rules = await client.paginate(f"/repos/{owner}/{repo}/rules/branches/{quote(base, safe='')}")
+        allowed = {"squash", "merge", "rebase"}
+        for rule in rules:
+            if not isinstance(rule, dict):
+                raise RuntimeError("GitHub returned malformed branch rules")
+            if rule.get("type") != "pull_request":
+                continue
+            parameters = rule.get("parameters")
+            methods = parameters.get("allowed_merge_methods") if isinstance(parameters, dict) else None
+            if not isinstance(methods, list) or not all(isinstance(item, str) and item in {"squash", "merge", "rebase"} for item in methods):
+                raise RuntimeError("GitHub did not verify the branch's allowed merge methods")
+            allowed.intersection_update(methods)
         method = next((method for method, flag in (
             ("squash", "allow_squash_merge"), ("merge", "allow_merge_commit"),
             ("rebase", "allow_rebase_merge"),
-        ) if config.get(flag) is True), None)
+        ) if config.get(flag) is True and method in allowed), None)
         if method is None:
             raise RuntimeError("repository has no allowed merge method")
 
         pull = await get_pull(client, owner, repo, number)
         if (pull.get("head") or {}).get("sha") != head:
+            return {**result, "outcome": "superseded"}
+        if (pull.get("base") or {}).get("ref") != base:
             return {**result, "outcome": "superseded"}
         if status(pull, None, 0) != "green" or str((pull.get("user") or {}).get("login") or "").lower() != author.lower():
             return result
@@ -126,4 +148,4 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         if submission == "uncertain" and isinstance(response_error, httpx.HTTPStatusError) \
                 and response_error.response.status_code in {400, 401, 403, 404, 405, 409, 410, 412, 415, 422, 429}:
             submission = "rejected"
-        raise MergeAdmissionError(error, submission, client.token) from error
+        raise MergeAdmissionError(error, submission, client.token, f"{owner}/{repo}", str(number), head, method) from error
