@@ -47,7 +47,9 @@ export function recordCodexReviewSuccess(startedAt: number, completedAt: number)
   if (!Number.isSafeInteger(startedAt) || !Number.isSafeInteger(completedAt) || startedAt > completedAt) return
   db.transaction(() => {
     if (startedAt < (lastCodexConnect() ?? 0)) return
-    if ((lastCodexReviewSuccess()?.completedAt ?? 0) >= completedAt) return
+    const previous = lastCodexReviewSuccess()
+    if (previous && (previous.startedAt > startedAt
+      || previous.startedAt === startedAt && previous.completedAt >= completedAt)) return
     setMeta(CODEX_REVIEW_SUCCESS_KEY, JSON.stringify({ startedAt, completedAt }))
   }).immediate()
 }

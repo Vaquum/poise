@@ -128,6 +128,8 @@ describe('GET /api/accounts', () => {
     expect((await read()).reviewSignIn).toEqual({ state: 'rejected', at: now - 600 })
     recordCodexReviewSuccess(now - 300, now - 200)
     expect((await read()).reviewSignIn).toEqual({ state: 'verified', at: now - 200 })
+    recordCodexReviewSuccess(now - 650, now - 100)
+    expect((await read()).reviewSignIn).toEqual({ state: 'verified', at: now - 200 })
     vi.spyOn(Date, 'now').mockReturnValue(now + 24 * 60 * 60_000)
     expect((await read()).reviewSignIn).toEqual({ state: 'stale', at: now - 200 })
     expect(requests.mock.calls.some(([, args]) => args[0] === '--verify-codex-login')).toBe(false)
