@@ -99,7 +99,7 @@ class RefreshTestJobImageTest(unittest.TestCase):
         self.commits = {}
         for name, path in [('first', 'deploy/runtime/Dockerfile'), ('poise', 'src/app.ts'),
                            ('caller', 'caller/agent_interface/run.py'), ('runtime', 'deploy/runtime/Dockerfile'),
-                           ('lock', 'package-lock.json')]:
+                           ('lock', 'package-lock.json'), ('tools', 'gateway/src/document-tools.sh')]:
             os.makedirs(os.path.join(self.repo, os.path.dirname(path)), exist_ok=True)
             with open(os.path.join(self.repo, path), 'a') as file:
                 file.write(f'{name}\n')
@@ -134,7 +134,7 @@ class RefreshTestJobImageTest(unittest.TestCase):
         self.assertEqual([call['method'] for call in calls], ['GET'])
 
     def test_builds_the_branch_when_the_image_caller_or_the_lock_changed(self):
-        for since, sha in [('poise', 'caller'), ('caller', 'runtime'), ('runtime', 'lock')]:
+        for since, sha in [('poise', 'caller'), ('caller', 'runtime'), ('runtime', 'lock'), ('lock', 'tools')]:
             with self.subTest(since=since, sha=sha):
                 result, calls = self.refresh(self.commits[sha], [self.built(self.commits[since])])
                 self.assertIn('finished', result.stdout, result.stderr)
