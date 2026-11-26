@@ -21,6 +21,7 @@ from agent_interface import atoms, issue_review, pr_approve, review_budget, revi
     review_receipt, review_repository, review_stages, structured_review
 from agent_interface.model_catalog import CATALOG
 from github_interface.atoms.review_response import qualifying_response
+from github_interface.atoms import review_checkout
 from github_interface import cli as github_cli
 from github_interface.client import GitHubRequestError
 from review_submission_fixture import submission_args
@@ -129,6 +130,46 @@ class TestReviewContinuation(TestCase):
 
     def test_twenty_two_groups_resume_a_later_deadline_and_publish_one_verified_verdict(self):
         self.later_deadline(176, 22)
+
+    def test_oversized_diff_line_continues_all_files_before_one_review(self):
+        node = packet(40)
+        source = node["diff"].replace("+contract = 'value'", "+contract = '" + "x" * 120_000 + "'", 1) + "\n"
+        paths = [entry["filename"] for entry in node["files"]]
+        checkout = Path(self.directory.name) / "checkout"
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / ".git" / "caller-review.diff").write_text(source)
+        (checkout / ".git" / review_checkout.MANIFEST).write_text(json.dumps({"head_sha": HEAD,
+            "files": paths, "diff_files": paths}))
+        self.repository = review_repository.Repository(checkout, {"head_sha": HEAD})
+        self.repository.inspect = lambda requests, **_kwargs: review_checkout.inspect(checkout, requests)
+        node.update(diff="", diff_deferred=True, coverage="incomplete")
+        seen = set()
+
+        def ask(*args):
+            value = supplied(args[3])
+            seen.update(entry["filename"] for entry in value["files"])
+            return verdict(args[3])
+
+        root = resume = None
+        with patch.object(atoms, "packet", return_value=json.dumps(node)):
+            for _ in range(10):
+                with self.call(node, resume, units_per_call=2) as call_id:
+                    try:
+                        result = self.run_review(node, ask)
+                    except continuation.Continuation as held:
+                        self.assertEqual(held.result["outcome"], "continuation_required")
+                        self.assertEqual(self.posts, [])
+                    else:
+                        self.assertIn('"review_id": 91', result)
+                        break
+                    root = root or call_id
+                resume = self.resume(root)
+            else:
+                self.fail("bounded review did not reach finalization")
+        self.assertEqual(seen, set(paths))
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("--reviewed-clean", self.posts[0][0])
+        self.assertEqual(self.repository.warnings, [])
 
     def test_six_unit_slices_of_a_22_group_review_keep_original_receipts(self):
         node = packet(176)

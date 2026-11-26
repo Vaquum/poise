@@ -1,4 +1,5 @@
 """Temporary source for PR reviews; providers can only inspect it through Caller."""
+import base64
 import json
 import os
 import signal
@@ -179,6 +180,43 @@ class Repository:
                   "Read/list return 200 entries; search returns 100 matches. Follow next_line "
                   "when truncated. Inspection cannot read .git, untracked files, or symlinks.")
 
+    def _diff_bytes(self, byte_limit: int, deadline: float) -> str:
+        """Read an oversized diff line without increasing the response bound."""
+        offset = 0
+        data = bytearray()
+        total = None
+        while True:
+            request = {"operation": "diff", "path": ".", "query": f"byte-offset:{offset}", "start_line": 1}
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise ValueError("diff paging exhausted its time allowance")
+            response = self.inspect([request], timeout_s=min(30, remaining))
+            results = response.get("results")
+            if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
+                raise ValueError("the inspection command omitted the diff result")
+            result = results[0]
+            if result.get("request") != request or result.get("error"):
+                raise ValueError("the byte diff result did not match its request")
+            encoded = result.get("data_base64")
+            declared = result.get("total_bytes")
+            if not isinstance(encoded, str) or "next_offset" not in result \
+                    or type(declared) is not int or declared < 0 or declared > byte_limit \
+                    or (total is not None and declared != total):
+                raise ValueError("the byte diff result omitted its data or continuation")
+            total = declared
+            chunk = base64.b64decode(encoded, validate=True)
+            data.extend(chunk)
+            if len(data) > byte_limit:
+                raise ValueError("the diff reached its retained review storage allowance")
+            next_offset = result["next_offset"]
+            if next_offset is None:
+                if len(data) != total:
+                    raise ValueError("the diff page ended before the declared byte count")
+                return data.decode("utf-8")
+            if type(next_offset) is not int or not chunk or next_offset != offset + len(chunk) or next_offset >= total:
+                raise ValueError("the diff page omitted a usable next byte offset")
+            offset = next_offset
+
     def diff_packet(self, packet: str, byte_limit: int, *, timeout_s: float | None = None) -> str:
         """Hydrate deferred required source through the bounded internal reader."""
         node = json.loads(packet)
@@ -200,6 +238,9 @@ class Repository:
                 page = result.get("lines")
                 if result.get("request") != request:
                     raise ValueError("the diff result did not match its request")
+                if result.get("error") == "Entry exceeds this batch's page budget; request it separately.":
+                    diff = self._diff_bytes(byte_limit, deadline)
+                    return json.dumps({**node, "diff": diff, "diff_deferred": False, "coverage": "complete"})
                 if result.get("error"):
                     raise ValueError(atoms.bounded_cause(result["error"]))
                 if not isinstance(page, list):
