@@ -218,7 +218,7 @@ check_tools() {
   output=$(docker exec "$workspace" sh -c 'command -v python3 && python3 --version')
   [[ $output == $'/opt/caller/venv/bin/python3\nPython 3.13.'* ]] || fail "python3 is $output"
   pass "python3: ${output//$'\n'/, }"
-  for command in "gh --version" "git --version" "make --version" "gcc --version" "g++ --version" "rg --version" "jq --version"; do
+  for command in "gh --version" "git --version" "make --version" "gcc --version" "g++ --version" "rg --version" "jq --version" "zip -v" "pandoc --version" "typst --version"; do
     # shellcheck disable=SC2086 # each command is a name and an option
     output=$(docker exec "$workspace" $command) || fail "$command failed"
     pass "${output%%$'\n'*}"

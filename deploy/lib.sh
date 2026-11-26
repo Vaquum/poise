@@ -279,6 +279,7 @@ process.stdout.write(JSON.stringify([version, integrity]));
 ' < "$root/package-lock.json") || return 1
   {
     (cd "$root/deploy/runtime" && cat Dockerfile entrypoint.sh install-clis.sh supervisor.mjs resource-witness.mjs install-release.sh)
+    cat "$root/gateway/src/document-tools.sh"
     printf '%s\n' "$playwright"
   } | sha256sum | cut -c1-16
 }
@@ -350,7 +351,7 @@ refresh_test_job_image() {
     return 0
   fi
   if [ -n "$built" ] && git -C "$root" cat-file -e "$built^{commit}" 2>/dev/null \
-    && git -C "$root" diff --quiet "$built" "$sha" -- deploy/runtime caller package-lock.json; then
+    && git -C "$root" diff --quiet "$built" "$sha" -- deploy/runtime gateway/src/document-tools.sh caller package-lock.json; then
     return 0
   fi
   say "Having Render build the test jobs' image again, from the newest commit of its branch."

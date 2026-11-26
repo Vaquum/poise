@@ -547,7 +547,9 @@ describe('a suite on a test box', () => {
     const event = (name: string, data: unknown) => res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`)
     if (command === SETUP_COMMAND) {
       setups += 1
-      expect(readFileSync(join(box.dir, 'tmp/poise-setup.sh'))).toEqual(readFileSync('gateway/src/test-box-setup.sh'))
+      expect(readFileSync(join(box.dir, 'tmp/poise-setup.sh'))).toEqual(Buffer.concat([
+        readFileSync('gateway/src/document-tools.sh'), readFileSync('gateway/src/test-box-setup.sh'),
+      ]))
       const finish = () => {
         event('output', { data: 'set up\n', stream: 'stdout' })
         event('exit', { exit_code: setupExit })
