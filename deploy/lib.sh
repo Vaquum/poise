@@ -279,6 +279,7 @@ process.stdout.write(JSON.stringify([version, integrity]));
 ' < "$root/package-lock.json") || return 1
   {
     (cd "$root/deploy/runtime" && cat Dockerfile entrypoint.sh install-clis.sh supervisor.mjs resource-witness.mjs install-release.sh)
+    cat "$root/gateway/src/document-tools.sh"
     printf '%s\n' "$playwright"
   } | sha256sum | cut -c1-16
 }

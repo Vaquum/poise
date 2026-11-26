@@ -270,7 +270,10 @@ export class TestRelay {
     this.owner = `ownerId=${encodeURIComponent(deps.config.workspace)}`
     this.renderHeaders = { authorization: `Bearer ${deps.config.renderApiKey}`, 'content-type': 'application/json', accept: 'application/json' }
     this.boxScript = readFileSync(new URL('./test-box.cjs', import.meta.url))
-    this.setupScript = readFileSync(new URL('./test-box-setup.sh', import.meta.url))
+    this.setupScript = Buffer.concat([
+      readFileSync(new URL('./document-tools.sh', import.meta.url)),
+      readFileSync(new URL('./test-box-setup.sh', import.meta.url)),
+    ])
     this.instanceScript = readFileSync(new URL('./test-instance.cjs', import.meta.url))
     this.dependencies = new TestDependencyCache((error) => {
       deps.log.warn('test_relay.dependency_cache.failed', { error: errorMessage(error) })

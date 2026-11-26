@@ -95,11 +95,14 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubc
   > /etc/apt/sources.list.d/github-cli.list
 apt-get update
 apt-get install --yes --no-install-recommends \
-  build-essential curl gh git gpgv jq less locales openssh-client procps ripgrep tini unzip xz-utils
+  build-essential curl gh git gpgv jq less locales openssh-client procps ripgrep tini unzip xz-utils zip
 sed -i 's/^# *\(en_US.UTF-8 UTF-8\)$/\1/' /etc/locale.gen
 locale-gen
 rm -rf /var/lib/apt/lists/*
 EOF
+
+COPY gateway/src/document-tools.sh /tmp/poise-document-tools.sh
+RUN set -eu; . /tmp/poise-document-tools.sh; install_document_tools; rm /tmp/poise-document-tools.sh
 
 # The gateway runs the container as uid 10001. A new named volume mounted at
 # /home/poise starts as a copy of this directory, ownership included.
