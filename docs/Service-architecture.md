@@ -991,6 +991,15 @@ not use the gateway's discarded OAuth token.
   active, signedIn, detail }]`, every account gh holds for github.com, and
   Muse's has `credential: 'api-key' | 'account-login'` when its auth file
   names one.
+  - Codex can include `reviewSignIn: { state, at }` for installed CLI rows.
+    This records a rejected provider review or a verified review credential
+    route, with the observation time in milliseconds. Observations at least
+    24 hours old have state `stale`; recent ones are `rejected` or `verified`.
+    Calls that started before the latest recorded Connect do not establish
+    that reconnect's review sign-in. The row labels the canonical CLI status
+    separately and shows review sign-in as unverified when evidence is missing
+    or stale. Rendering the row adds no provider request. The existing bounded
+    Caller check after a completed Connect still verifies recovery.
   - Each CLI's own status command answers, never its credential files:
     `claude auth status --json` through Poise's Claude wrapper (signed in
     means a Claude subscription), `codex login status`, and `gh auth status

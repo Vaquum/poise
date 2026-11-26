@@ -108,8 +108,8 @@ export function claudeAuthStatusChanged(status: ClaudeAuthStatus): void {
 const ACCOUNT_NAMES: Partial<Record<AccountId, string>> = { codex: 'Codex', grok: 'Grok', muse: 'Muse', antigravity: 'Antigravity' }
 
 export function providerSignInRejected(id: AccountId, failure: { callId: string, model: string, rejectedAt: number,
-  phase: string, work: string, cause: string }): void {
-  recordProviderRejection(id, failure.callId, failure.model, failure.rejectedAt)
+  startedAt?: number, phase: string, work: string, cause: string }): void {
+  recordProviderRejection(id, failure.callId, failure.model, failure.rejectedAt, failure.startedAt)
   if (providerSignInFailure(id)?.verifiedAt != null) return
   const name = ACCOUNT_NAMES[id] ?? id
   const dedupeKey = `sign-in:${id}`

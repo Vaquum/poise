@@ -9,7 +9,7 @@ import { runFile } from '../process'
 import { agentInterfaceCwd, loadCatalog } from '../models'
 import { codexVerificationDetail, providerSignInVerificationFailed, type CodexVerificationReason } from '../alerts/producers'
 import { probeAccount } from './status'
-import { accountLogins, claimProviderVerification, recordObservedSignIn, recordProviderRecovery, releaseProviderVerification } from './logins'
+import { accountLogins, claimProviderVerification, lastCodexConnect, lastCodexReviewSuccess, providerSignInFailure, recordObservedSignIn, recordProviderRecovery, releaseProviderVerification } from './logins'
 import { ACCOUNT_IDS, hasRecordedSignIn, type AccountId, type ConnectedAccount } from './types'
 
 export const ACCOUNTS_CACHE_MS = 15_000
@@ -57,6 +57,25 @@ export function scheduleAccountsCheck(check: () => Promise<unknown>, intervalMs 
 
 const accounts = new Map(ACCOUNT_IDS.map(id => [id, new AccountsCache(async () => [await probeAccount(id, runFile)])]))
 
+const REVIEW_SIGN_IN_FRESH_MS = 24 * 60 * 60_000
+
+function codexReviewSignIn(): ConnectedAccount['reviewSignIn'] {
+  const failure = providerSignInFailure('codex')
+  const success = lastCodexReviewSuccess()
+  const connectedAt = lastCodexConnect() ?? 0
+  const now = Date.now()
+  const rejectedAt = failure && failure.rejectedAt <= now && (failure.startedAt ?? failure.rejectedAt) >= connectedAt
+    ? failure.rejectedAt : 0
+  const verificationAt = failure?.verifiedAt && failure.verifiedAt <= now
+    && (failure.verificationStartedAt ?? failure.verifiedAt) >= connectedAt ? failure.verifiedAt : 0
+  const successAt = success && success.completedAt <= now && success.startedAt >= connectedAt && success.startedAt > rejectedAt
+    ? success.completedAt : 0
+  const verifiedAt = Math.max(verificationAt, successAt)
+  const at = Math.max(rejectedAt, verifiedAt)
+  if (!at) return undefined
+  return { state: now - at >= REVIEW_SIGN_IN_FRESH_MS ? 'stale' : verifiedAt > rejectedAt ? 'verified' : 'rejected', at }
+}
+
 export async function listAccounts(id?: AccountId): Promise<ConnectedAccount[]> {
   const result = id ? await accounts.get(id)!.list() : (await Promise.all(ACCOUNT_IDS.map(id => accounts.get(id)!.list()))).flat()
   // Join after the cached probe settles: setup edits must be visible at once,
@@ -73,6 +92,10 @@ export async function listAccounts(id?: AccountId): Promise<ConnectedAccount[]> 
   }
   if (result.some(account => account.id === 'codex' && account.installed && account.signedIn === true)) await verifyCodexRecovery()
   return result.map(account => {
+    if (account.id === 'codex' && account.installed) {
+      const reviewSignIn = codexReviewSignIn()
+      if (reviewSignIn) return { ...account, reviewSignIn }
+    }
     const recorded = { ...account, signInRecordedAt: logins[account.id] }
     return hasRecordedSignIn(recorded) ? recorded : account
   })
@@ -103,6 +126,7 @@ async function verifyCodexRecovery(): Promise<void> {
     work = await mkdtemp(join(tmpdir(), 'poise-codex-verification-'))
     // Caller owns the worker credential home and tool-free request options.
     // The probe owns its diagnostics: provider output never reaches Logging.
+    const startedAt = Date.now()
     const { stdout } = await runFile('agent-interface', ['--verify-codex-login', model.identity, '--pwd', work], {
       cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 64 * 1024, reportFailure: false,
       env: { CODEX_HOME: process.env.CODEX_HOME, OPENAI_API_KEY: undefined, CODEX_API_KEY: undefined, OPENAI_BASE_URL: undefined },
@@ -118,7 +142,7 @@ async function verifyCodexRecovery(): Promise<void> {
     }
     // Record completion, not request start: a second Connect during verification
     // must still read as older than the verification it did not cause.
-    recordProviderRecovery('codex', failure.callId, Date.now())
+    recordProviderRecovery('codex', failure.callId, Date.now(), startedAt)
   } catch (error) {
     // Never publish provider text: opaque auth.json values survive redaction.
     const reason = classifyCodexVerificationFailure(error)

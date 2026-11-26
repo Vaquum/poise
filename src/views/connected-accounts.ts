@@ -34,6 +34,22 @@ function state(account: ConnectedAccount): { text: string, tone: 'on' | 'off' | 
   return { text: 'Sign-in not reported', tone: 'unknown' }
 }
 
+function codexReviewSignIn(account: ConnectedAccount): string {
+  if (account.id !== 'codex' || !account.installed) return ''
+  const evidence = account.reviewSignIn
+  const at = evidence && new Date(evidence.at).toLocaleString()
+  const action = account.signedIn === true ? 'Reconnect' : 'Connect'
+  const text = evidence?.state === 'rejected'
+    ? `An isolated Codex PR review Call failed authentication at ${at}. Current review sign-in is unverified. Use ${action} to check a fresh sign-in.`
+    : evidence?.state === 'verified'
+      ? `Caller verified isolated Codex review sign-in at ${at}. This is the last observed result.`
+      : evidence?.state === 'stale'
+        ? `Current review sign-in is unverified. The last isolated Codex review sign-in observation was at ${at}.`
+        : 'Current review sign-in is unverified.'
+  const tone = evidence?.state === 'rejected' ? 'warn' : 'info'
+  return `<div class="st-help st-help-${tone} st-account-review-sign-in">${escapeHtml(text)}</div>`
+}
+
 /** The two GitHub accounts Settings → General names (`me` and `agentAccount`). */
 export interface GitHubIdentities {
   me: string
@@ -99,6 +115,7 @@ export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIde
     const { text, tone } = state(account)
     const action = tone === 'on' ? 'Reconnect' : 'Connect'
     const disabled = busy || !account.installed
+    const cliStatus = account.id === 'codex' && account.installed && account.signedIn !== null
     const detail = hasRecordedSignIn(account) ? 'Sign-in completed or confirmed in Poise. The CLI cannot verify its current status.' : account.detail
     const help = account.id === 'muse' ? `Opens a sign-in terminal: ${account.login.label}. Warning: this ${MUSE_LOGIN_WARNING}.` : `Opens a sign-in terminal: ${account.login.label}`
     return `
@@ -109,10 +126,11 @@ export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIde
         <button type="button" class="st-clear st-account-connect" data-connect="${account.id}" data-help="${escapeHtml(help)}" aria-label="${action} ${escapeHtml(name)}"${disabled ? ' disabled' : ''}>${action}</button>
         ${museApiKeyButton(account, disabled)}
       </div>
-      <div class="st-account-state st-account-state-${tone}">${escapeHtml(text)}</div>
+      <div class="st-account-state st-account-state-${cliStatus && tone === 'on' ? 'unknown' : tone}">${escapeHtml(cliStatus ? `CLI reports: ${detail ?? text}` : text)}</div>
       ${museCredential(account)}
       ${museLoginWarning(account)}
-      ${detail ? `<div class="st-help st-help-info st-account-detail">${escapeHtml(detail)}</div>` : ''}
+      ${detail && !cliStatus ? `<div class="st-help st-help-info st-account-detail">${escapeHtml(detail)}</div>` : ''}
+      ${codexReviewSignIn(account)}
       ${ghAccounts(account, identities)}
     </div>`
   }).join('')
