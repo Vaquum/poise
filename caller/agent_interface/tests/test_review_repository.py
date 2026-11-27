@@ -11,7 +11,7 @@ from unittest import TestCase
 from unittest.mock import AsyncMock, patch
 
 import agent_interface
-from agent_interface import atoms, pr_review, review_budget, review_repository as rr, structured_review as sr
+from agent_interface import atoms, pr_review, review_budget, review_continuation, review_repository as rr, structured_review as sr
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 from github_interface import cli, interface
@@ -34,8 +34,7 @@ class TestRepositoryLifecycle(TestCase):
     def test_packet_drift_crosses_cli_and_settles_without_provider_or_publication(self):
         saved = json.loads((Path(__file__).resolve().parents[3]
                             / "tests/fixtures/review-checkout-superseded.json").read_text())
-        for phase, changed in (("before", "head"), ("during", "head"),
-                               ("during", "base"), ("during", "failure")):
+        for phase, changed in (("before", "head"), ("during", "head"), ("during", "failure")):
             pull = {"head": {"sha": HEAD}, "base": {"sha": BASE}}
             latest = {**pull, changed: {"sha": saved["head_sha"]}}
             client = AsyncMock()
@@ -98,7 +97,7 @@ class TestRepositoryLifecycle(TestCase):
         from agent_interface.review_watch import ReviewSuperseded
 
         receipt = {"action": "read", "repository": "o/r", "pull_number": 12,
-                   "outcome": "superseded", "head_sha": HEAD}
+                   "outcome": "superseded", "head_sha": "c" * 40}
         for invalid in ({}, {"action": "wrong"}, {"repository": "other/repo"}, {"pull_number": 13},
                         {"pull_number": "12"}, {"pull_number": True}, {"head_sha": None}, {"head_sha": "z" * 40}):
             done = SimpleNamespace(returncode=0, stdout=json.dumps({**receipt, **invalid}), stderr="")
@@ -110,12 +109,60 @@ class TestRepositoryLifecycle(TestCase):
                     self.assertEqual(review_budget.packet_cache(), {})
                 self.assertEqual(command.call_count, 2)
 
+    def test_fresh_automatic_packet_selection_bypasses_both_cached_packets(self):
+        initial = json.loads(INSPECTION_PACKET)
+        initial["files"] = [{"filename": f"file-{index}.py"} for index in range(20)]
+        latest = json.loads(json.dumps(initial))
+        latest["pull"]["base"]["sha"] = latest["merge_base_sha"] = "c" * 40
+        state = {"packet": initial}
+
+        def command(args, **_kwargs):
+            node = state["packet"]
+            if "--manifest-only" in args:
+                node = {**node, "diff": "", "diff_deferred": True, "coverage": "incomplete"}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(node), stderr="")
+
+        with review_budget.ReviewBudget(), review_continuation.request("slot", None, 6), \
+                patch.object(atoms.subprocess, "run", side_effect=command) as fetch:
+            old = json.loads(atoms.packet("/repo", PR, "bot", HEAD))
+            state["packet"] = latest
+            fresh = json.loads(atoms.packet("/repo", PR, "bot", HEAD, fresh=True))
+        self.assertEqual(old["merge_base_sha"], BASE)
+        self.assertEqual(fresh["merge_base_sha"], "c" * 40)
+        self.assertEqual(fetch.call_count, 4)
+
+    def test_packet_refetches_immediately_after_repeated_same_head_base_moves(self):
+        moved = {"action": "read", "repository": "o/r", "pull_number": 12,
+                 "outcome": "superseded", "head_sha": HEAD}
+        current = {"action": "read", "repository": "o/r", "pull_number": 12, "head_sha": HEAD}
+        replies = [SimpleNamespace(returncode=0, stdout=json.dumps(item), stderr="")
+                   for item in (moved, moved, current)]
+        with review_budget.ReviewBudget(), patch.object(atoms.subprocess, "run", side_effect=replies) as command:
+            self.assertEqual(json.loads(atoms.packet("/repo", PR, "bot", HEAD)), current)
+            self.assertEqual(command.call_count, 3)
+
+    def test_checkout_refetches_repeated_same_head_base_moves_before_review(self):
+        from agent_interface.review_watch import ReviewSuperseded
+        first = json.loads(INSPECTION_PACKET)
+        middle = json.loads(INSPECTION_PACKET)
+        final = json.loads(INSPECTION_PACKET)
+        middle["pull"]["base"]["sha"] = middle["merge_base_sha"] = "c" * 40
+        final["pull"]["base"]["sha"] = final["merge_base_sha"] = "d" * 40
+        repository = SimpleNamespace()
+        with review_budget.ReviewBudget(), \
+                patch.object(rr, "prepare", side_effect=[ReviewSuperseded(HEAD), ReviewSuperseded(HEAD), nullcontext(repository)]) as checkout, \
+                patch.object(atoms, "packet", side_effect=[json.dumps(middle), json.dumps(final)]) as fetch:
+            with rr.prepare_current("/repo", PR, "bot", HEAD, json.dumps(first)) as (actual, packet):
+                self.assertIs(actual, repository)
+                self.assertEqual(json.loads(packet), final)
+            self.assertEqual(checkout.call_count, 3)
+            self.assertEqual(fetch.call_count, 2)
+
     def test_checkout_drift_saves_superseded_without_invoking_a_provider(self):
         saved = json.loads((Path(__file__).resolve().parents[3]
                             / "tests/fixtures/review-checkout-superseded.json").read_text())
         original_handler = signal.getsignal(signal.SIGTERM)
-        for phase, changed in (("before", "head"), ("before", "base"),
-                               ("during", "head"), ("during", "base"), ("during", "failure")):
+        for phase, changed in (("before", "head"), ("during", "head"), ("during", "failure")):
             pull = {"head": {"sha": HEAD}, "base": {"sha": BASE}}
             latest = {**pull, changed: {"sha": saved["head_sha"]}}
             client = AsyncMock()

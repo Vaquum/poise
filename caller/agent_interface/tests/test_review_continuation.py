@@ -115,7 +115,7 @@ class TestReviewContinuation(TestCase):
         with (patch.dict(structured_review.ASK, {"codex": ask}) if ask is not None else nullcontext()):
             return structured_review.run(self.directory.name, "system", "PR packet:\n" + raw, MODEL, behavior,
                                         "https://github.com/o/r/pull/12", "reviewer", HEAD, 1413,
-                                        repository=self.repository, packet=raw, **kwargs)
+                                        repository=self.repository, packet=raw, continuation_policy="policy", **kwargs)
 
     def artifact(self, call):
         with sqlite3.connect(api.DB) as conn:
@@ -492,7 +492,268 @@ class TestReviewContinuation(TestCase):
         self.assertIn("No further inspection rounds will follow", final_rounds[0])
         self.assertEqual(len(self.posts), 1)
 
-    def test_changed_answer_revision_same_head_and_changed_policy_invalidate_progress(self):
+    def test_review_restarts_immediately_for_repeated_material_changes(self):
+        original = packet()
+        edited = json.loads(json.dumps(original))
+        edited["pull"]["body"] = "New verification evidence."
+        revised = json.loads(json.dumps(edited))
+        revised["linked_issues"] = [{"number": 19, "title": "New issue", "body": "Context"}]
+        seen = []
+
+        def ask(*args):
+            current = supplied(args[3])
+            seen.append((current["pull"]["body"], len(current["linked_issues"])))
+            return verdict(args[3])
+
+        with self.call(original, units_per_call=6) as call_id, \
+                patch.object(atoms, "packet", side_effect=[json.dumps(edited), json.dumps(revised), json.dumps(revised)]):
+            self.run_review(original, ask)
+            saved = self.saved(call_id)
+        self.assertEqual(seen, [("Review context", 0)] * 2 + [("New verification evidence.", 0)] * 2
+                         + [("New verification evidence.", 1)] * 2)
+        self.assertEqual(saved["supersessions"], 2)
+        self.assertEqual(saved["superseded_fields"], ["linked_issues"])
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.artifact(call_id)["review_response"]["context_sha"],
+                         self.artifact(call_id)["review_context"]["context_sha"])
+
+    def test_pre_post_context_refusal_restarts_only_when_no_write_occurred(self):
+        for refusal in ("pull-request review context changed before approval",
+                        "retained review response differs from the current PR context"):
+            with self.subTest(refusal=refusal):
+                original = packet()
+                original["pull"]["title"] = refusal
+                changed = json.loads(json.dumps(original))
+                changed["pull"]["body"] = "Latest evidence"
+                seen, attempts = [], []
+                fresh_repo = SimpleNamespace(warnings=[], diff_packet=lambda value, _limit, **_kwargs: value,
+                                             inspect=self.inspect)
+
+                def ask(*args):
+                    seen.append(supplied(args[3])["pull"]["body"])
+                    return verdict(args[3])
+
+                def submit(command, **kwargs):
+                    attempts.append(command)
+                    if len(attempts) == 1:
+                        return SimpleNamespace(returncode=1, stderr="error: " + refusal, stdout="")
+                    return self.submit(command, **kwargs)
+
+                self.posts.clear()
+                with self.call(original, units_per_call=6) as call_id, \
+                        patch.object(atoms, "packet", side_effect=[json.dumps(original), json.dumps(changed), json.dumps(changed)]), \
+                        patch.object(review_repository, "prepare", return_value=nullcontext(fresh_repo)), \
+                        patch.object(structured_review.subprocess, "run", side_effect=submit):
+                    self.run_review(original, ask)
+                    self.assertEqual(self.saved(call_id)["supersessions"], 1)
+                self.assertEqual(seen, ["Review context"] * 2 + ["Latest evidence"] * 2)
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(len(self.posts), 1)
+
+    def test_pre_post_refusal_does_not_retry_uncertain_publication_or_unchanged_inputs(self):
+        for published in (False, True):
+            with self.subTest(publication_uncertain=published):
+                original = packet()
+                original["pull"]["title"] = str(published)
+                changed = json.loads(json.dumps(original))
+                changed["pull"]["body"] = "Latest evidence"
+                attempts = []
+                fresh_repo = SimpleNamespace(warnings=[], diff_packet=lambda value, _limit, **_kwargs: value,
+                                             inspect=self.inspect)
+
+                def submit(command, **kwargs):
+                    attempts.append(command)
+                    if published:
+                        self.submit(command, **kwargs)
+                    return SimpleNamespace(returncode=1, stderr="error: pull-request review context changed before approval", stdout="")
+
+                self.posts.clear()
+                next_packet = changed if published else original
+                with self.call(original, units_per_call=6), \
+                        patch.object(atoms, "packet", side_effect=[json.dumps(original), json.dumps(next_packet)]), \
+                        patch.object(review_repository, "prepare", return_value=nullcontext(fresh_repo)), \
+                        patch.object(structured_review.subprocess, "run", side_effect=submit):
+                    with self.assertRaises((continuation.Continuation, review_budget.ReviewLimitError)):
+                        self.run_review(original, lambda *args: verdict(args[3]))
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(len(self.posts), int(published))
+
+    def test_recorded_failure_shapes_continue_in_the_same_call(self):
+        # The observed history contains 40 pre-submission and 13 resume
+        # failures. The original packets are not available for every Call;
+        # exercise each failure shape with independently varied inputs.
+        def changed(node, index):
+            value = json.loads(json.dumps(node))
+            if index % 4 == 0:
+                value["pull"]["body"] = f"New evidence {index}"
+            elif index % 4 == 1:
+                value["pull"]["title"] += " updated"
+            elif index % 4 == 2:
+                value["linked_issues"] = [{"number": index + 1, "title": "New issue", "body": "Context"}]
+            else:
+                value["review_threads"] = [{"root_comment_id": index + 1, "id": "thread",
+                                            "repair_answer": {"revision": "v2", "body": "Updated"}}]
+            return value
+
+        for index in range(53):
+            with self.subTest(incident=index):
+                original = packet()
+                original["pull"]["title"] = f"Recorded failure shape {index}"
+                fresh = changed(original, index)
+                behavior = "pr_approve" if index % 2 else "pr_review"
+                observed = []
+
+                def ask(*args):
+                    observed.append(supplied(args[3]))
+                    result = json.loads(verdict(args[3]))
+                    if behavior == "pr_approve":
+                        result["action"] = "approve"
+                    return json.dumps(result)
+
+                self.posts.clear()
+                if index < 40:
+                    with self.call(original, behavior=behavior, units_per_call=6) as current, \
+                            patch.object(atoms, "packet", side_effect=[json.dumps(fresh), json.dumps(fresh)]):
+                        self.run_review(original, ask, behavior=behavior)
+                else:
+                    with self.call(original, behavior=behavior, units_per_call=6) as root:
+                        session = continuation.Session(json.dumps(original), MODEL.identity)
+                        session.initialize(self.repository)
+                        with self.assertRaises(continuation.Continuation):
+                            session.pause("completed the scheduled review units; continue the saved checkpoint")
+                    with self.call(fresh, self.resume(root), behavior=behavior, units_per_call=6) as current, \
+                            patch.object(atoms, "packet", return_value=json.dumps(fresh)):
+                        self.run_review(fresh, ask, behavior=behavior)
+                self.assertEqual(len(self.posts), 1)
+                self.assertEqual(observed[-1]["pull"], fresh["pull"])
+                self.assertEqual(observed[-1]["linked_issues"], fresh["linked_issues"])
+                self.assertEqual(observed[-1].get("review_threads", []), fresh.get("review_threads", []))
+                self.assertEqual(self.artifact(current)["review_response"]["context_sha"],
+                                 self.artifact(current)["review_context"]["context_sha"])
+
+    def test_same_checkout_restart_retains_inspection_warnings(self):
+        original = packet()
+        changed = json.loads(json.dumps(original))
+        changed["pull"]["body"] = "New evidence"
+        self.repository.warnings = ["Pinned source inspection was unavailable."]
+        assessments = []
+        original_submit = self.submit
+
+        def submit(command, **kwargs):
+            assessment = json.loads(command[command.index("--assessment-json") + 1])
+            assessments.append(assessment)
+            return original_submit(command, **kwargs)
+
+        with self.call(original, units_per_call=6), \
+                patch.object(atoms, "packet", side_effect=[json.dumps(changed), json.dumps(changed)]), \
+                patch.object(structured_review.subprocess, "run", side_effect=submit):
+            self.run_review(original, lambda *args: verdict(args[3]))
+        self.assertIn("Pinned source inspection was unavailable.", assessments[0]["limitations"])
+
+    def test_changed_base_rebuilds_the_pinned_checkout(self):
+        original = packet()
+        changed = json.loads(json.dumps(original))
+        changed["pull"]["base"]["sha"] = changed["merge_base_sha"] = "c" * 40
+        fresh = SimpleNamespace(warnings=[], diff_packet=lambda value, _limit, **_kwargs: value, inspect=self.inspect)
+        seen = []
+
+        def ask(*args):
+            seen.append(supplied(args[3])["pull"]["base"]["sha"])
+            return verdict(args[3])
+
+        with self.call(original, units_per_call=6), \
+                patch.object(atoms, "packet", side_effect=[json.dumps(changed), json.dumps(changed)]), \
+                patch.object(review_repository, "prepare", return_value=nullcontext(fresh)) as checkout:
+            self.run_review(original, ask)
+        self.assertEqual(seen, [BASE, BASE, "c" * 40, "c" * 40])
+        self.assertEqual(json.loads(checkout.call_args.args[4]), changed)
+        self.assertEqual(len(self.posts), 1)
+
+    def test_refreshed_packet_cannot_change_the_admitted_target(self):
+        for field, value in (("repository", "another/repo"), ("pull_number", 13), ("head_sha", "c" * 40)):
+            with self.subTest(field=field):
+                original = packet()
+                original["pull"]["title"] = f"Target {field}"
+                changed = {**original, field: value}
+                with self.call(original, units_per_call=6), \
+                        patch.object(atoms, "packet", return_value=json.dumps(changed)):
+                    with self.assertRaisesRegex(atoms.AgentPreflightError, "differs from the pinned target"):
+                        self.run_review(original, lambda *args: verdict(args[3]))
+                self.assertEqual(self.posts, [])
+
+    def test_resumed_moved_input_does_not_retry_possible_publication(self):
+        for phase, response in (("submitting_review", None), ("reviewing", {})):
+            with self.subTest(phase=phase, response=response):
+                original = packet()
+                original["pull"]["title"] = f"Prior phase {phase}"
+                with self.call(original, units_per_call=6) as root:
+                    session = continuation.Session(json.dumps(original), MODEL.identity)
+                    session.initialize(self.repository)
+                    with self.assertRaises(continuation.Continuation):
+                        session.pause("completed the scheduled review units; continue the saved checkpoint")
+                with sqlite3.connect(api.DB) as conn:
+                    artifact = self.artifact(root)
+                    artifact["phase"] = phase
+                    if response is not None:
+                        artifact["review_response"] = response
+                    conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), root))
+                changed = json.loads(json.dumps(original))
+                changed["pull"]["body"] = "New evidence"
+                with self.call(changed, self.resume(root), units_per_call=6):
+                    with self.assertRaisesRegex(continuation.Continuation, "material review basis changed"):
+                        self.run_review(changed, lambda *_: self.fail("possible publication launched analysis"))
+                self.assertEqual(self.posts, [])
+
+    def test_changed_repair_answer_discards_saved_verifications_on_resume(self):
+        original = packet()
+        original.update(verification_candidates=[17], review_threads=[{"root_comment_id": 17, "id": "thread",
+                        "repair_answer": {"revision": "v1", "body": "First answer"}}])
+        with self.call(original, units_per_call=6) as root:
+            session = continuation.Session(json.dumps(original), MODEL.identity)
+            session.initialize(self.repository)
+            session.state["verified"] = session.verified([17])
+            session.checkpoint()
+            with self.assertRaises(continuation.Continuation):
+                session.pause("completed the scheduled review units; continue the saved checkpoint")
+        changed = json.loads(json.dumps(original))
+        changed["review_threads"][0]["repair_answer"].update(revision="v2", body="New answer")
+        seen = []
+
+        def ask(*args):
+            seen.append(supplied(args[3])["review_threads"][0]["repair_answer"]["revision"])
+            return verdict(args[3])
+
+        with self.call(changed, self.resume(root), units_per_call=6) as current, \
+                patch.object(atoms, "packet", return_value=json.dumps(changed)):
+            self.run_review(changed, ask)
+            response = self.artifact(current)["review_response"]
+        self.assertEqual(seen, ["v2", "v2"])
+        self.assertEqual(response.get("verified_fixes", {}), {})
+        self.assertEqual(len(self.posts), 1)
+
+    def test_resumed_changed_head_uses_the_new_admitted_head(self):
+        node = packet()
+        with self.call(node, units_per_call=6) as root:
+            session = continuation.Session(json.dumps(node), MODEL.identity)
+            session.initialize(self.repository)
+            with self.assertRaises(continuation.Continuation):
+                session.pause("completed the scheduled review units; continue the saved checkpoint")
+        new = json.loads(json.dumps(node))
+        new["head_sha"] = "c" * 40
+        call_id = api.track(MODEL.identity, "", "12", "o/r", "reviewer", "pr_review",
+                            expected_head=new["head_sha"], source="poise:behavior-chain", managed_review=True)
+        review_receipt.bind(api.DB, call_id)
+        with review_budget.ReviewBudget(), review_receipt.invocation_environment(api.DB, call_id, True), \
+                continuation.request("sol", self.resume(root), 6):
+            review_receipt.prepare_response(json.dumps(new), MODEL.identity, policy="policy")
+            session = continuation.Session(json.dumps(new), MODEL.identity)
+            self.assertIsNone(session.manifest)
+            self.assertEqual(session.state["unit"], 0)
+            self.assertEqual(session.saved["supersessions"], 1)
+        api.resource_ownership.cleanup_remaining(api.DB, call_id)
+        self.assertEqual(self.posts, [])
+
+    def test_changed_policy_discards_progress_and_changed_slot_is_refused(self):
         node = packet()
         node.update(verification_candidates=[17], review_threads=[{"root_comment_id": 17, "id": "thread",
                     "repair_answer": {"revision": "answer-v1", "body": "Fixed the caller"}}])
@@ -503,16 +764,16 @@ class TestReviewContinuation(TestCase):
             session.checkpoint()
             with self.assertRaises(continuation.Continuation):
                 session.pause("inspection checkpoint committed before acknowledgement")
-        for changed, policy, slot in ((node, "changed policy", "sol"), (node, "policy", "other-slot"),
-                                      (json.loads(json.dumps(node)), "policy", "sol")):
-            if changed is not node:
-                changed["review_threads"][0]["repair_answer"].update(revision="answer-v2", body="Different repair")
-            with self.subTest(policy=policy, slot=slot), self.call(changed, self.resume(root), slot, policy):
-                with self.assertRaisesRegex(continuation.Continuation, "material review basis changed"):
-                    continuation.Session(json.dumps(changed), MODEL.identity)
+        with self.call(node, self.resume(root), "other-slot", "policy"):
+            with self.assertRaisesRegex(continuation.Continuation, "material review basis changed"):
+                continuation.Session(json.dumps(node), MODEL.identity)
+        with self.call(node, self.resume(root), "sol", "changed policy"):
+            session = continuation.Session(json.dumps(node), MODEL.identity)
+            self.assertIsNone(session.manifest)
+            self.assertEqual(session.state["verified"], {})
         self.assertEqual(self.posts, [])
 
-    def test_standalone_review_reuses_the_original_allowance_when_inputs_revert(self):
+    def test_standalone_review_keeps_its_allowance_when_inputs_change_and_revert(self):
         source = "poise:review-new-prs"
         original = packet()
         edited = {**original, "pull": {**original["pull"], "body": "Checks now pass."}}
@@ -528,21 +789,17 @@ class TestReviewContinuation(TestCase):
         first = pause(original)
         previous = self.saved(first)
         with self.call(edited, self.resume(first), source=source, units_per_call=6) as stale:
-            with self.assertRaisesRegex(continuation.Continuation, "material review basis changed") as refusal:
-                continuation.Session(json.dumps(edited), MODEL.identity)
-            self.assertFalse(refusal.exception.result["publication_started"])
-            self.assertNotIn("review_resume", self.artifact(stale))
-        self.assertEqual(self.saved(first), previous)
-
-        replacement = pause(edited)
-        self.assertNotEqual(self.saved(first)["basis"], self.saved(replacement)["basis"])
-        with self.call(original, self.resume(replacement), source=source, units_per_call=6):
-            with self.assertRaisesRegex(continuation.Continuation, "material review basis changed"):
-                continuation.Session(json.dumps(original), MODEL.identity)
-        with self.call(original, source=source, units_per_call=6) as resumed:
+            session = continuation.Session(json.dumps(edited), MODEL.identity)
+            self.assertIsNone(session.manifest)
+            self.assertNotEqual(session.saved["basis"], previous["basis"])
+            self.assertEqual(session.saved["spent_ms"], previous["spent_ms"])
+            with self.assertRaises(continuation.Continuation):
+                session.pause("completed the scheduled review units; continue the saved checkpoint")
+        with self.call(original, self.resume(first), source=source, units_per_call=6) as resumed:
             session = continuation.Session(json.dumps(original), MODEL.identity)
             self.assertEqual(session.root, first)
-            self.assertEqual(session.generation, previous["generation"] + 1)
+            self.assertIsNone(session.manifest)
+            self.assertEqual(session.saved["supersessions"], 2)
             self.assertEqual(self.saved(first)["last_call"], resumed)
             self.assertEqual(self.saved(first)["spent_ms"], previous["spent_ms"])
             self.assertEqual(self.saved(first)["allowance_ms"], previous["allowance_ms"])
@@ -973,7 +1230,7 @@ class TestReviewContinuation(TestCase):
         self.assertEqual(len(creations), 1)
         self.assertIn("--approve-pr", self.posts[0][0])
 
-    def test_completed_finalization_refuses_changed_basis_altered_result_and_unreleased_worker(self):
+    def test_completed_finalization_refuses_wrong_head_altered_result_and_unreleased_worker(self):
         node = packet()
 
         def deadline(phase, *_args, **_kwargs):
@@ -983,15 +1240,10 @@ class TestReviewContinuation(TestCase):
         with self.call(node) as root, patch.object(structured_review.progress, "stage", side_effect=deadline):
             with self.assertRaises(continuation.Continuation):
                 self.run_review(node, lambda *args: verdict(args[3]))
-        for field in ("head_sha", "title", "body", "coverage"):
-            changed = json.loads(json.dumps(node))
-            if field in {"title", "body"}:
-                changed["pull"][field] = "Changed context"
-            else:
-                changed[field] = "d" * 40 if field == "head_sha" else "incomplete"
-            with self.subTest(field=field), self.call(changed, self.resume(root)):
-                with self.assertRaisesRegex(continuation.Continuation, "material review basis changed"):
-                    self.run_review(changed, lambda *_: self.fail("changed basis launched analysis"))
+        changed = {**node, "head_sha": "d" * 40}
+        with self.call(changed, self.resume(root)):
+            with self.assertRaisesRegex(RuntimeError, "differs from its admitted target"):
+                self.run_review(changed, lambda *_: self.fail("wrong target launched analysis"))
         with sqlite3.connect(api.DB) as conn:
             conn.execute("update calls set resources_settled_at=null where id=?", (root,))
         with self.call(node, self.resume(root)):
@@ -1005,6 +1257,30 @@ class TestReviewContinuation(TestCase):
             with self.assertRaisesRegex(continuation.Continuation, "digest or length differs"):
                 self.run_review(node, lambda *_: self.fail("altered retained verdict launched analysis"))
         self.assertEqual(self.posts, [])
+
+    def test_unsubmitted_finalization_restarts_on_changed_inputs(self):
+        node = packet()
+
+        def deadline(phase, *_args, **_kwargs):
+            if phase == "submitting":
+                raise review_budget.ReviewLimitError("pre-write deadline", "review_budget_exhausted")
+
+        with self.call(node) as root, patch.object(structured_review.progress, "stage", side_effect=deadline):
+            with self.assertRaises(continuation.Continuation):
+                self.run_review(node, lambda *args: verdict(args[3]))
+        changed = json.loads(json.dumps(node))
+        changed["pull"]["body"] = "Evidence added before publication"
+        seen = []
+
+        def ask(*args):
+            seen.append(supplied(args[3])["pull"]["body"])
+            return verdict(args[3])
+
+        with self.call(changed, self.resume(root)):
+            self.run_review(changed, ask)
+        self.assertEqual(seen, ["Evidence added before publication"] * 2)
+        self.assertIn("superseded_finalization", self.saved(root))
+        self.assertEqual(len(self.posts), 1)
 
     def test_completed_finalization_cannot_spend_its_cumulative_verification_reserve(self):
         node = packet()

@@ -113,7 +113,9 @@ def run(
         text += (f"\n\nThe last reviewed head ({lost_since}) is no longer fetchable; "
                  "this round reviews the full diff instead.")
     if bounded:
-        with review_repository.prepare(pwd, pr, actor, expected_head, packet_text, allow_unavailable=True) as repository:
+        with review_repository.prepare_current(pwd, pr, actor, expected_head, packet_text, allow_unavailable=True) as (repository, current_packet):
+            text = text.replace(packet_text, current_packet, 1)
+            packet_text = current_packet
             return atoms.run_agent(pwd, SYSTEM + " " + review_repository.POLICY,
                 text + repository.prompt(), tools, "pr_approve", timeout_s,
                 model=spec.identity, pr=pr, actor_name=actor, head=expected_head, repository=repository,

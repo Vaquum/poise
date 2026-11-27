@@ -6,9 +6,10 @@ import math
 import os
 import re
 import subprocess
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from functools import partial
 from hashlib import sha256
 from time import monotonic, time
 from uuid import uuid4
@@ -33,6 +34,11 @@ class Continuation(review_budget.ReviewLimitError):
                                          submission="uncertain" if result["publication_started"] else "none") if held or submission_failure else None
         super().__init__(reason, "review_continuation_held" if held else "review_continuation_required", diagnostic)
         self.result = {**result, "reason": reason}
+
+
+class InputsChanged(Exception):
+    def __init__(self, packet: str):
+        self.packet = packet
 
 
 @contextmanager
@@ -94,6 +100,18 @@ def analysis_basis(packet: dict, policy: str) -> str:
     material = {key: value for key, value in packet.items() if key != "pull"}
     return digest({"packet": material, "base": pull["base"]["sha"], "title": pull["title"],
                    "body": pull.get("body") or "", "policy": policy})
+
+
+def changed_fields(old: dict, fresh: dict) -> list[str]:
+    """Record which material inputs moved, without storing their contents."""
+    changed = [key for key in sorted(set(old) | set(fresh))
+               if key != "pull" and old.get(key) != fresh.get(key)]
+    if old["pull"]["base"]["sha"] != fresh["pull"]["base"]["sha"]:
+        changed.append("pull.base.sha")
+    for key in ("title", "body"):
+        if old["pull"].get(key) != fresh["pull"].get(key):
+            changed.append("pull." + key)
+    return changed
 
 
 def _artifact(conn, call_id: str) -> dict:
@@ -174,10 +192,13 @@ class Session:
         with caller_store.connect(self.database) as conn:
             conn.execute("begin immediate")
             current = _artifact(conn, self.call)
-            row = conn.execute(f"select actor,behavior,status,{resource_ownership.MANAGED_CALLS},source from calls where id=?",
+            row = conn.execute(f"select actor,behavior,status,{resource_ownership.MANAGED_CALLS},source,expected_head,repo,pr_id from calls where id=?",
                                (self.call,)).fetchone()
             if row[2] != "running" or not row[3] or row[1] not in {"pr_review", "pr_approve"}:
                 raise RuntimeError("review continuation requires a running managed PR review")
+            context = current["review_context"]
+            if (context["head_sha"], context["repository"], str(context["pull_number"])) != (row[5], row[6], str(row[7])):
+                raise RuntimeError("review continuation differs from its admitted target")
             basis = digest({"analysis": current["review_context"]["analysis_sha"], "actor": row[0],
                             "behavior": row[1], "model": model, "slot": slot, "policy": review_budget.REVIEW_POLICY})
             if not resume:
@@ -217,17 +238,43 @@ class Session:
                     self.stop(f"review finalization belongs to Call {saved.get('publisher') or saved['owner']}; reconcile that Call")
                 self.finalization = saved.get("finalization")
                 reconciling = self.finalization and self.finalization["step"] == "submitting"
-                if saved["basis"] != basis and not reconciling:
-                    self.stop("material review basis changed; saved analysis and repair verifications are invalid")
                 if saved["generation"] != expected:
                     self.stop("review continuation generation changed; refresh the saved receipt")
-                if saved["phase"] == "held" and not (requested[1] is None and saved.get("reason") == CHANGED_BEFORE_SUBMISSION):
-                    self.stop(saved["reason"])
-                previous = conn.execute("select status,resources_settled_at,resource_ownership,artifact from calls where id=?",
+                previous = conn.execute("select status,resources_settled_at,resource_ownership,artifact,review_id,receipts,head_sha from calls where id=?",
                                         (saved["last_call"],)).fetchone()
                 if not previous or previous[0] == "running" or not resource_ownership.publication_released(
                         previous[1], previous[2], json.loads(previous[3] or "{}")):
                     self.stop("previous review claimant has not released its resources")
+                if saved["basis"] != basis and not reconciling:
+                    previous_artifact = json.loads(previous[3] or "{}")
+                    previous_identity = conn.execute("select actor,behavior,repo,pr_id from calls where id=?", (saved["last_call"],)).fetchone()
+                    old_response = previous_artifact.get("review_response")
+                    unsubmitted_finalization = (self.finalization is not None
+                        and self.finalization.get("step") in {"remap", "ready"}
+                        and not self.finalization.get("followup")
+                        and old_response is not None
+                        and self.finalization.get("response_sha") == digest(old_response))
+                    safe = (saved["phase"] in {"paused", "finalizing"} or saved["phase"] == "held"
+                            and saved.get("reason") == CHANGED_BEFORE_SUBMISSION) \
+                        and (self.finalization is None and old_response is None or unsubmitted_finalization) \
+                        and not saved.get("publisher") \
+                        and previous_identity == (row[0], row[1], row[6], row[7]) \
+                        and previous_artifact.get("phase") == "reviewing" \
+                        and all(value is None for value in previous[4:]) \
+                        and previous_artifact.get("review_resume", {}).get("slot") == slot
+                    if not safe:
+                        self.stop("material review basis changed; saved analysis and repair verifications are invalid")
+                    saved["superseded_basis"] = saved["basis"]
+                    saved["supersessions"] = saved.get("supersessions", 0) + 1
+                    saved["superseded_fields"] = ["prior inputs unavailable"]
+                    if self.finalization:
+                        saved["superseded_finalization"] = saved.pop("finalization")
+                        self.finalization = None
+                    for key in ("checkpoint", "manifest", "coverage", "unit", "required_units", "last_progress_at", "progress_call", "reason"):
+                        saved.pop(key, None)
+                    saved.update(basis=basis, phase="analyzing", complete=False)
+                if saved["phase"] == "held" and not (requested[1] is None and saved.get("reason") == CHANGED_BEFORE_SUBMISSION):
+                    self.stop(saved["reason"])
                 if self.finalization:
                     publisher = _artifact(conn, self.finalization["call"])
                     identity = conn.execute("select actor,behavior from calls where id=?", (self.finalization["call"],)).fetchone()
@@ -542,6 +589,54 @@ class Session:
             _write(conn, self.root, original)
         self.checkpoint(advanced=True)
 
+    def restart(self, packet: str, model: str, policy: str, review_scope: str, *, reserved: bool = False) -> None:
+        """Discard obsolete analysis before any publication, retaining its budget."""
+        context, fixes = review_receipt.response_context(packet, model, review_scope, policy=policy)
+        with caller_store.connect(self.database) as conn:
+            conn.execute("begin immediate")
+            original, saved = self.owned(conn)
+            current = _artifact(conn, self.call)
+            row = conn.execute("select actor,behavior,review_id,receipts,head_sha from calls where id=?", (self.call,)).fetchone()
+            finalization = saved.get("finalization")
+            response = current.get("review_response")
+            unsubmitted = (reserved and finalization and finalization.get("step") == "submitting"
+                and not finalization.get("followup") and response is not None
+                and finalization.get("response_sha") == digest(response))
+            if current.get("phase") != "reviewing" or saved.get("publisher") \
+                    or any(value is not None for value in row[2:]) \
+                    or not (finalization is None and response is None or unsubmitted):
+                self.stop("review publication must be reconciled before restarting")
+            slot = _request.get()[0]
+            basis = digest({"analysis": context["analysis_sha"], "actor": row[0],
+                            "behavior": row[1], "model": model, "slot": slot, "policy": review_budget.REVIEW_POLICY})
+            saved["spent_ms"] += math.ceil((monotonic() - self.meter) * 1000)
+            saved["superseded_basis"] = saved["basis"]
+            saved["supersessions"] = saved.get("supersessions", 0) + 1
+            saved["superseded_fields"] = changed_fields(json.loads(self.live_packet), json.loads(packet))
+            if finalization:
+                saved["superseded_finalization"] = saved.pop("finalization")
+                self.finalization = None
+            for key in ("checkpoint", "manifest", "coverage", "unit", "required_units", "last_progress_at", "progress_call"):
+                saved.pop(key, None)
+            self.generation += 1
+            saved.update(basis=basis, generation=self.generation, phase="analyzing", complete=False)
+            _write(conn, self.root, original)
+            current = _artifact(conn, self.call)
+            current.pop("review_checkpoint", None)
+            current.pop("review_response", None)
+            current["review_context"] = context
+            current["verification_candidates"] = fixes
+            current["review_scope"] = review_scope or None
+            current["review_resume"].update(generation=self.generation, basis=basis,
+                analysis_sha=current["review_context"]["analysis_sha"],
+                verification_sha=digest(current.get("verification_candidates", {})))
+            _write(conn, self.call, current)
+        self.meter = monotonic()
+        self.live_packet = self.packet = packet
+        self.state = {"unit": 0, "results": [], "inspection": [], "pending": [],
+                      "provisional": [], "verified": {}, "stalled": 0}
+        self.manifest = None
+
     def funded(self, function, seconds: float, *, reserve: float = 0):
         with caller_store.connect(self.database) as conn:
             conn.execute("begin immediate")
@@ -681,10 +776,52 @@ class Unit:
         return verdict
 
 
-def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, repository, packet, root, watch, ask, warnings):
+def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, repository, packet, root, watch, ask, warnings,
+            *, policy="", review_scope="", session=None):
+    session = session or Session(packet, model.identity)
+    with ExitStack() as checkouts:
+        while True:
+            try:
+                active_ask = partial(ask.func, repository=repository) if model.provider == "claude" else ask
+                return _analyze_once(pwd, system, text, model, behavior, pr, actor, head, seconds,
+                                     repository, packet, root, watch, active_ask, warnings, session)
+            except InputsChanged as changed:
+                watch.check_closed()
+                text, repository, packet = refresh(pwd, pr, actor, head, text, repository, packet, changed.packet,
+                                                   checkouts, warnings, session, model.identity, policy, review_scope)
+
+
+def refresh(pwd, pr, actor, head, text, repository, packet, fresh_packet, checkouts, warnings,
+            session, model, policy, review_scope, *, reserved=False, force_checkout=False):
+    from . import review_repository
+    old, fresh = json.loads(packet), json.loads(fresh_packet)
+    if (fresh.get("repository"), fresh.get("pull_number"), fresh.get("head_sha")) != \
+            (old.get("repository"), old.get("pull_number"), head):
+        raise ValueError("refreshed review packet differs from the pinned target")
+    if force_checkout or (old["pull"]["base"]["sha"], old["merge_base_sha"]) != \
+            (fresh["pull"]["base"]["sha"], fresh["merge_base_sha"]):
+        warnings.clear()
+        new_repository, fresh_packet = checkouts.enter_context(review_repository.prepare_current(
+            pwd, pr, actor, head, fresh_packet, allow_unavailable=True))
+        fresh = json.loads(fresh_packet)
+        if (fresh.get("repository"), fresh.get("pull_number"), fresh.get("head_sha")) != \
+                (old.get("repository"), old.get("pull_number"), head):
+            raise ValueError("refreshed review packet differs from the pinned target")
+        warnings.extend(new_repository.warnings)
+        new_repository.warnings = warnings
+        suffix = text.find("\n\nPinned review repository:", text.find(packet) + len(packet))
+        if suffix >= 0:
+            text = text[:suffix] + new_repository.prompt()
+        repository = new_repository
+    text = text.replace(packet, fresh_packet, 1)
+    session.restart(fresh_packet, model, policy, review_scope, reserved=reserved)
+    progress.stage("reviewing", "Review inputs changed; reviewing the latest inputs")
+    return text, repository, fresh_packet
+
+
+def _analyze_once(pwd, system, text, model, behavior, pr, actor, head, seconds, repository, packet, root, watch, ask, warnings, session):
     from . import atoms, structured_review
     from .atoms import AgentPreflightError, ReviewVerdictError
-    session = Session(packet, model.identity)
     warnings[:] = list(dict.fromkeys([*session.state.get("warnings", []), *warnings]))
     session.state["warnings"] = warnings
     try:
@@ -758,7 +895,7 @@ def analyze(pwd, system, text, model, behavior, pr, actor, head, seconds, reposi
             fresh_packet = json.loads(atoms.packet(pwd, pr, actor, head, original_packet.get("p"),
                 reserve=structured_review.VERIFICATION_RESERVE_SECONDS, manifest=True, fresh=True))
             if analysis_basis(fresh_packet, "") != analysis_basis(original_packet, ""):
-                session.pause(CHANGED_BEFORE_SUBMISSION, terminal=True)
+                raise InputsChanged(json.dumps(fresh_packet))
         with caller_store.connect(session.database) as conn:
             conn.execute("begin immediate")
             original, saved = session.owned(conn)

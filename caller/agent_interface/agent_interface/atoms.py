@@ -204,7 +204,7 @@ def packet(
     from . import review_continuation, review_stages
     if manifest is None and review_continuation.select_automatically():
         try:
-            ordinary = packet(pwd, pr, actor_name, head, p, since_head, reserve=reserve, manifest=False)
+            ordinary = packet(pwd, pr, actor_name, head, p, since_head, reserve=reserve, manifest=False, fresh=fresh)
         except AgentPreflightError as error:
             if error.code != "review_packet_too_large":
                 raise
@@ -221,54 +221,58 @@ def packet(
     key = (pwd, pr, actor_name, head, p, since_head, manifest)
     if cache is not None and key in cache:
         return cache[key]
-    limit = review_budget.timeout(600, reserve=reserve)
-    progress.stage("preparing_packet", "Preparing PR packet", timeout=limit)
-    args = [
-        os.getenv("GITHUB_INTERFACE_CLI", "github-interface"),
-        "--pr-review",
-        pr_ref(pr),
-        "--expected-head",
-        expected_head(head),
-        "--token-user",
-        actor(actor_name),
-    ]
-    if p:
-        args.extend(["--p", _priority(p)])
-    if since_head:
-        args.extend(["--since-head", since_head])
-    if manifest:
-        args.append("--manifest-only")
-    try:
-        done = subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=limit)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        diagnostic = command_failure(error, "packet_acquisition", pwd, limit)
+    while True:
+        limit = review_budget.timeout(600, reserve=reserve)
+        progress.stage("preparing_packet", "Preparing PR packet", timeout=limit)
+        args = [
+            os.getenv("GITHUB_INTERFACE_CLI", "github-interface"),
+            "--pr-review",
+            pr_ref(pr),
+            "--expected-head",
+            expected_head(head),
+            "--token-user",
+            actor(actor_name),
+        ]
+        if p:
+            args.extend(["--p", _priority(p)])
+        if since_head:
+            args.extend(["--since-head", since_head])
+        if manifest:
+            args.append("--manifest-only")
         try:
-            review_budget.timeout(1, reserve=reserve)
-        except review_budget.ReviewLimitError as exhausted:
-            exhausted.diagnostic = diagnostic
-            raise
-        raise AgentPreflightError(str(error), diagnostic=diagnostic) from error
-    if done.returncode:
-        error = (done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}"
-        code = ("review_packet_too_large" if error.startswith("error: review_packet_too_large:")
-                else "review_since_head_unknown" if error.startswith("error: review_since_head_unknown:")
-                else None)
-        diagnostic = diagnostic_from_stderr(done.stderr, "packet_acquisition")
-        raise AgentPreflightError(diagnostic_message(diagnostic) if diagnostic else error, code, diagnostic)
-    try:
-        reply = json.loads(done.stdout)
-        if not isinstance(reply, dict):
-            raise ValueError("PR packet is not an object")
-        if reply.get("outcome") == "superseded":
-            if (reply.get("action") != "read" or reply.get("repository") != repo_name(pr, pwd)
-                    or type(reply.get("pull_number")) is not int
-                    or reply["pull_number"] != int(pr_number(pr))):
-                raise ValueError("superseded packet differs from the review target")
-            observed_head = expected_head(reply.get("head_sha"))
-            from .review_watch import ReviewSuperseded
-            raise ReviewSuperseded(observed_head)
-    except ValueError as error:
-        raise AgentPreflightError(f"cannot read PR packet: {error}") from error
+            done = subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=limit)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            diagnostic = command_failure(error, "packet_acquisition", pwd, limit)
+            try:
+                review_budget.timeout(1, reserve=reserve)
+            except review_budget.ReviewLimitError as exhausted:
+                exhausted.diagnostic = diagnostic
+                raise
+            raise AgentPreflightError(str(error), diagnostic=diagnostic) from error
+        if done.returncode:
+            error = (done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}"
+            code = ("review_packet_too_large" if error.startswith("error: review_packet_too_large:")
+                    else "review_since_head_unknown" if error.startswith("error: review_since_head_unknown:")
+                    else None)
+            diagnostic = diagnostic_from_stderr(done.stderr, "packet_acquisition")
+            raise AgentPreflightError(diagnostic_message(diagnostic) if diagnostic else error, code, diagnostic)
+        try:
+            reply = json.loads(done.stdout)
+            if not isinstance(reply, dict):
+                raise ValueError("PR packet is not an object")
+            if reply.get("outcome") == "superseded":
+                if (reply.get("action") != "read" or reply.get("repository") != repo_name(pr, pwd)
+                        or type(reply.get("pull_number")) is not int
+                        or reply["pull_number"] != int(pr_number(pr))):
+                    raise ValueError("superseded packet differs from the review target")
+                observed_head = expected_head(reply.get("head_sha"))
+                if observed_head == expected_head(head):
+                    continue
+                from .review_watch import ReviewSuperseded
+                raise ReviewSuperseded(observed_head)
+        except ValueError as error:
+            raise AgentPreflightError(f"cannot read PR packet: {error}") from error
+        break
     if cache is not None:
         cache[key] = done.stdout
     return done.stdout
@@ -358,7 +362,8 @@ def run_agent(
         # the runner admits each stage against the same limit.
         from .structured_review import run
         return run(pwd, system, text, spec, behavior, pr, actor_name, head, timeout_s, repository=repository,
-                   packet=packet, capped=capped, review_round=review_round, review_cap=review_cap)
+                   packet=packet, capped=capped, review_round=review_round, review_cap=review_cap,
+                   continuation_policy=policy, review_scope=review_scope)
     from .review_watch import ReviewWatch
     with ReviewWatch(pwd, pr, actor_name, head) as watch:
         done = watch.run(
