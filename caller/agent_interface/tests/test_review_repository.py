@@ -11,7 +11,7 @@ from unittest import TestCase
 from unittest.mock import AsyncMock, patch
 
 import agent_interface
-from agent_interface import atoms, pr_review, review_budget, review_repository as rr, structured_review as sr
+from agent_interface import atoms, pr_review, review_budget, review_continuation, review_repository as rr, structured_review as sr
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 from github_interface import cli, interface
@@ -108,6 +108,28 @@ class TestRepositoryLifecycle(TestCase):
                         atoms.packet("/repo", PR, "bot", HEAD)
                     self.assertEqual(review_budget.packet_cache(), {})
                 self.assertEqual(command.call_count, 2)
+
+    def test_fresh_automatic_packet_selection_bypasses_both_cached_packets(self):
+        initial = json.loads(INSPECTION_PACKET)
+        initial["files"] = [{"filename": f"file-{index}.py"} for index in range(20)]
+        latest = json.loads(json.dumps(initial))
+        latest["pull"]["base"]["sha"] = latest["merge_base_sha"] = "c" * 40
+        state = {"packet": initial}
+
+        def command(args, **_kwargs):
+            node = state["packet"]
+            if "--manifest-only" in args:
+                node = {**node, "diff": "", "diff_deferred": True, "coverage": "incomplete"}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(node), stderr="")
+
+        with review_budget.ReviewBudget(), review_continuation.request("slot", None, 6), \
+                patch.object(atoms.subprocess, "run", side_effect=command) as fetch:
+            old = json.loads(atoms.packet("/repo", PR, "bot", HEAD))
+            state["packet"] = latest
+            fresh = json.loads(atoms.packet("/repo", PR, "bot", HEAD, fresh=True))
+        self.assertEqual(old["merge_base_sha"], BASE)
+        self.assertEqual(fresh["merge_base_sha"], "c" * 40)
+        self.assertEqual(fetch.call_count, 4)
 
     def test_packet_refetches_immediately_after_repeated_same_head_base_moves(self):
         moved = {"action": "read", "repository": "o/r", "pull_number": 12,

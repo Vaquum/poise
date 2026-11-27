@@ -204,7 +204,7 @@ def packet(
     from . import review_continuation, review_stages
     if manifest is None and review_continuation.select_automatically():
         try:
-            ordinary = packet(pwd, pr, actor_name, head, p, since_head, reserve=reserve, manifest=False)
+            ordinary = packet(pwd, pr, actor_name, head, p, since_head, reserve=reserve, manifest=False, fresh=fresh)
         except AgentPreflightError as error:
             if error.code != "review_packet_too_large":
                 raise
