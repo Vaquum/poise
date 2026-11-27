@@ -659,10 +659,44 @@ def _refused_head(output: str) -> str | None:
     return match[1] if match else None
 
 
+class PostGuardMoved(Exception):
+    def __init__(self, checkpoint, error):
+        self.checkpoint, self.error = checkpoint, error
+
+
 def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         pr: str, actor_name: str, head: str, timeout_s: int, *, repository=None,
         packet: str = "", capped: bool = False,
-        review_round: int | None = None, review_cap: int | None = None) -> str:
+        review_round: int | None = None, review_cap: int | None = None,
+        continuation_policy: str = "", review_scope: str = "") -> str:
+    from . import atoms, review_continuation
+    checkpoint = None
+    with ExitStack() as checkouts:
+        while True:
+            try:
+                return _run_once(pwd, system, text, model, behavior, pr, actor_name, head, timeout_s,
+                    repository=repository, packet=packet, capped=capped, review_round=review_round,
+                    review_cap=review_cap, continuation_policy=continuation_policy,
+                    review_scope=review_scope, continuation_session=checkpoint)
+            except PostGuardMoved as moved:
+                checkpoint = moved.checkpoint
+                current = checkpoint.live_packet
+                fresh = atoms.packet(pwd, pr, actor_name, head, json.loads(current).get("p"),
+                                     reserve=VERIFICATION_RESERVE_SECONDS, manifest=True, fresh=True)
+                if review_continuation.analysis_basis(json.loads(fresh), "") == review_continuation.analysis_basis(json.loads(current), ""):
+                    raise moved.error
+                text = text.replace(packet, current, 1)
+                warnings = getattr(repository, "warnings", [])
+                text, repository, packet = review_continuation.refresh(pwd, pr, actor_name, head, text, repository,
+                    current, fresh, checkouts, warnings, checkpoint, model.identity, continuation_policy,
+                    review_scope, reserved=True, force_checkout=True)
+
+
+def _run_once(pwd: str, system: str, text: str, model: Model, behavior: str,
+        pr: str, actor_name: str, head: str, timeout_s: int, *, repository=None,
+        packet: str = "", capped: bool = False,
+        review_round: int | None = None, review_cap: int | None = None,
+        continuation_policy: str = "", review_scope: str = "", continuation_session=None) -> str:
     # Target and credentials are controller-owned, never model output.
     fixed = ["--expected-head", expected_head(head), "--token-user", actor(actor_name)]
     ref = pr_ref(pr)
@@ -690,7 +724,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             expected_group_seconds = None
             if review_continuation.enabled():
                 verdict, packet, checkpoint = review_continuation.analyze(pwd, system, text, model, behavior, pr, actor_name,
-                    head, timeout_s, repository, packet, root, watch, ask, warnings)
+                    head, timeout_s, repository, packet, root, watch, ask, warnings,
+                    policy=continuation_policy, review_scope=review_scope, session=continuation_session)
                 if checkpoint.finalization and checkpoint.finalization["step"] == "submitting":
                     return checkpoint.reconcile_review(pwd, pr, actor_name)
                 staged = False
@@ -897,10 +932,16 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     "approval_blocked_unresolved_conversations",
                     diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
                                         stderr=cause, provider=model.provider, submission="blocked"))
-            raise review_budget.ReviewLimitError(
+            error = review_budget.ReviewLimitError(
                 f"review submission rejected: {cause}", "review_contract_violation",
                 diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
                                     stderr=cause, provider=model.provider, submission="rejected"))
+            refusal = output.removeprefix("error: ").strip()
+            if checkpoint is not None and refusal in {
+                    "pull-request review context changed before approval",
+                    "retained review response differs from the current PR context"}:
+                raise PostGuardMoved(checkpoint, error)
+            raise error
         receipt = review_receipt.record(done.stdout)
         if receipt is None:
             # A repeat-only refusal restated already-published bodies in every

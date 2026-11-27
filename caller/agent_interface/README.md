@@ -713,7 +713,17 @@ native release proof as chain Calls.
 Caller binds progress to the repository, PR, exact head, base and merge base,
 complete material packet (including thread/repair-answer revisions and linked
 issues), supplied policy/note/scope, actor, behavior, slot and model. A changed
-basis refuses reuse. Verifications retain the original answered-thread revision.
+packet on the admitted head discards the old analysis and immediately reviews
+the refreshed packet within the same Call before publication. A resumed checkpoint can likewise
+restart after its previous claimant released resources, provided its target,
+reviewer and slot are unchanged and no publication was attempted. The existing
+cumulative limits still apply across these restarts. A changed base prepares a
+new pinned checkout. The same restart applies when a pre-publication guard
+refuses a stale context and the Call proves no write occurred. A changed head
+still ends the pinned Call and requires a newly admitted Call. Changes of
+authority and uncertain publication remain held. The checkpoint records the previous basis, restart count and changed input fields
+when available, so the restart remains visible in the Call's evidence.
+Verifications retain the original answered-thread revision.
 Starting again without the saved root cannot reset the same basis's allowance.
 An immediate SQLite transaction claims the generation before work. A previous
 claimant must have settled its native resources; stale generations cannot spend,

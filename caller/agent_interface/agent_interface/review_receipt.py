@@ -46,12 +46,8 @@ def coverage_disposition(packet: dict) -> str:
         and isinstance(packet.get("files"), list) and packet.get("omitted_files", []) == [] else "incomplete"
 
 
-def prepare_response(packet: str, model: str, review_scope: str = "", *, policy: str = "") -> None:
-    """Pin controller-owned context before invoking the configured reviewer."""
+def response_context(packet: str, model: str, review_scope: str = "", *, policy: str = "") -> tuple[dict, dict]:
     from hashlib import sha256
-    bound = _call.get()
-    if bound is None:
-        return
     value = json.loads(packet)
     from .review_continuation import analysis_basis, enabled
     pull = value["pull"]
@@ -60,15 +56,23 @@ def prepare_response(packet: str, model: str, review_scope: str = "", *, policy:
     candidates = set(value.get("verification_candidates", []))
     fixes = {str(thread["root_comment_id"]): {"id": thread["id"], "revision": thread["repair_answer"]["revision"]}
              for thread in value.get("review_threads", []) if thread.get("root_comment_id") in candidates}
+    return ({"repository": value["repository"], "pull_number": value["pull_number"],
+             "head_sha": value["head_sha"], "context_sha": context, "model": model,
+             **({"analysis_sha": analysis_basis(value, policy + "\n" + review_scope)} if enabled() else {}),
+             "coverage": coverage_disposition(value)}, fixes)
+
+
+def prepare_response(packet: str, model: str, review_scope: str = "", *, policy: str = "") -> None:
+    """Pin controller-owned context before invoking the configured reviewer."""
+    bound = _call.get()
+    if bound is None:
+        return
+    context, fixes = response_context(packet, model, review_scope, policy=policy)
     database, call_id = bound
     with caller_store.connect(database, timeout=30) as conn:
         conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?),'$.review_scope',?,"
                      "'$.verification_candidates',json(?)) where id=? and status='running'",
-                     (json.dumps({"repository": value["repository"], "pull_number": value["pull_number"],
-                                  "head_sha": value["head_sha"], "context_sha": context, "model": model,
-                                  **({"analysis_sha": analysis_basis(value, policy + "\n" + review_scope)} if enabled() else {}),
-                                  "coverage": coverage_disposition(value)}),
-                      review_scope or None, json.dumps(fixes), call_id))
+                     (json.dumps(context), review_scope or None, json.dumps(fixes), call_id))
 
 
 def verified_fix_ids(assessment: dict) -> list[int]:

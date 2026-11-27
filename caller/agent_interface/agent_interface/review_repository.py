@@ -4,7 +4,7 @@ import json
 import os
 import signal
 import subprocess
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import current_thread, main_thread
 from time import monotonic
@@ -264,6 +264,25 @@ class Repository:
                 return json.dumps({**node, "diff": "".join(lines) or node.get("diff") or "",
                                    "diff_deferred": False, "coverage": "incomplete"})
         return json.dumps({**node, "diff": "".join(lines), "diff_deferred": False, "coverage": "complete"})
+
+
+@contextmanager
+def prepare_current(pwd: str, pr: str, actor: str, head: str, packet: str, *, allow_unavailable: bool = False):
+    """Refetch a moved base before admitting the corresponding checkout."""
+    while True:
+        stack = ExitStack()
+        try:
+            repository = stack.enter_context(prepare(pwd, pr, actor, head, packet, allow_unavailable=allow_unavailable))
+        except ReviewSuperseded as error:
+            stack.close()
+            if error.head_sha != head or error.closed_target is not None or error.submission_attempted:
+                raise
+            previous = json.loads(packet)
+            packet = atoms.packet(pwd, pr, actor, head, previous.get("p"), previous.get("since_head_sha"), fresh=True)
+        else:
+            with stack:
+                yield repository, packet
+            return
 
 
 @contextmanager

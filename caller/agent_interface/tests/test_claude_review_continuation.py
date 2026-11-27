@@ -228,17 +228,36 @@ class TestGovernedClaudeContinuation(TestCase):
         self.assertEqual(result["continuation"]["outcome"], "continuation_required")
         self.assertEqual(self.posts, [])
 
-    def test_same_head_context_changes_and_missing_coverage_never_publish(self):
+    def test_base_move_restarts_claude_in_the_new_pinned_checkout(self):
+        original = json.loads(json.dumps(self.node))
+        changed = json.loads(json.dumps(original))
+        changed["pull"]["base"]["sha"] = changed["merge_base_sha"] = "c" * 40
+        checkout = self.root / "fresh-checkout"
+        checkout.mkdir()
+        fresh = SimpleNamespace(root=checkout, warnings=[], prompt=lambda: "\n\nPinned review repository: fresh",
+            diff_packet=self.repository.diff_packet, inspect=self.repository.inspect)
+        with patch.object(atoms, "packet", side_effect=[json.dumps(original), json.dumps(changed), json.dumps(changed)]), \
+                patch.object(review_repository, "prepare", side_effect=[nullcontext(self.repository), nullcontext(fresh)]):
+            row, result = self.execute(units=6)
+        self.assertEqual((row["status"], result["outcome"]), ("completed", "clean"))
+        self.assertEqual([launch[2]["cwd"] for launch in self.launches],
+                         [str(self.root)] * 3 + [str(checkout)] * 3)
+        self.assertEqual(len(self.posts), 1)
+
+    def test_changed_context_restarts_claude_and_missing_coverage_never_publishes(self):
         row, _result = self.execute()
         root = row["id"]
-        for key, value in (("head_sha", "c" * 40), ("pull", {**self.node["pull"], "body": "changed context"})):
-            original = self.node[key]
-            self.node[key] = value
-            launches = len(self.launches)
-            _row, result = self.execute(resume=self.resume(root))
-            self.assertIn("material review basis changed", result["error"])
-            self.assertEqual(len(self.launches), launches)
-            self.node[key] = original
+        self.node["head_sha"] = "c" * 40
+        launches = len(self.launches)
+        _row, result = self.execute(resume=self.resume(root))
+        self.assertIn("differs from its admitted target", result["error"])
+        self.assertEqual(len(self.launches), launches)
+        self.node["head_sha"] = HEAD
+        self.node["pull"]["body"] = "changed context"
+        _row, result = self.execute(resume=self.resume(root))
+        self.assertEqual(result["continuation"]["outcome"], "continuation_required")
+        self.assertEqual(len(self.launches), launches + 1)
+        self.assertEqual(self.posts, [])
         self.reply = lambda prompt: json.dumps({**json.loads(verdict(prompt)), "evidence": []})
         _row, result = self.execute(resume=self.resume(root))
         self.assertEqual(result["error_code"], "review_contract_violation")
